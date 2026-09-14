@@ -1,0 +1,49 @@
+{
+  "id": "/",
+  "name": "SAIMETRIC POS & Inventory",
+  "short_name": "SAIMETRIC",
+  "description": "Field Sales, Cash Count & Google Sheets Room DB",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#020617",
+  "theme_color": "#6A4DFF",
+  "categories": ["business", "finance", "productivity"],
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "POS Register",
+      "short_name": "Register",
+      "description": "Open POS checkout terminal",
+      "url": "/?source=pwa&view=register",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Stock & GRN",
+      "short_name": "Inventory",
+      "description": "Goods Received and Inventory",
+      "url": "/?source=pwa&view=grn",
+      "icons": [{ "src": "/pwa-192x192.png", "sizes": "192x192" }]
+    }
+  ]
+}

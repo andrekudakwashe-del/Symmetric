@@ -1,0 +1,6 @@
+{
+  "name": "SAIMETRIC",
+  "description": "Saimetric V5.0 Multi-Tenant SaaS POS and inventory system with Branch Isolation, 52-Permission RBAC Matrix, Direct Supplier Deliveries (GRV) with Cashier lock & Supervisor approval, Sharding by Customer & Month, P2P WiFi Mesh Sync, and Google Apps Script backend router.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
