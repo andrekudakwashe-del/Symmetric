@@ -151,6 +151,7 @@ export interface Product {
   category: string;
   price: number;
   costPrice?: number;
+  costPerUnit?: number;
   stockQuantity: number;
   unit?: string;
   description?: string;
@@ -234,8 +235,10 @@ export interface SaleInvoice {
   status: 'Completed' | 'Refunded' | 'Pending' | 'Voided';
   companyId?: string;
   company_id?: string;
+  companyName?: string;
   branchId?: string;
   branch_id?: string;
+  branchName?: string;
   refundReason?: string;
   refundedAt?: string;
   refundApprovedBy?: string;
@@ -510,6 +513,7 @@ export interface Branch {
   name: string; // e.g. "Main Branch & Central Warehouse"
   code: string; // e.g. "HQ-01"
   location: string;
+  phone?: string;
   isMain?: boolean;
   id?: string;
   company_id?: string;

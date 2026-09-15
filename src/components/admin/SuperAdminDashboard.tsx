@@ -36,7 +36,9 @@ import {
   Globe,
   Link2,
   Eye,
+  Package,
 } from 'lucide-react';
+import { PackageSetupView } from './PackageSetupView';
 import {
   getCompanies,
   saveCompany,
@@ -72,17 +74,24 @@ interface SuperAdminDashboardProps {
   isOpen: boolean;
   onClose: () => void;
   currentUser?: Salesperson | null;
+  onOpenSheetSetup?: () => void;
+  onOpenReportBuilder?: () => void;
+  initialTab?: 'tenants' | 'packages' | 'sheets' | 'reports';
 }
 
 export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   isOpen,
   onClose,
   currentUser,
+  onOpenSheetSetup,
+  onOpenReportBuilder,
+  initialTab = 'tenants',
 }) => {
   const isSuperAdmin =
     currentUser?.role === 'SUPER_ADMIN' ||
     currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
 
+  const [adminTab, setAdminTab] = useState<'tenants' | 'packages' | 'sheets' | 'reports'>(initialTab);
   const [companies, setCompanies] = useState<Company[]>(() => getCompanies());
   const [branches, setBranches] = useState(() => getBranches());
   const [searchTerm, setSearchTerm] = useState('');
@@ -661,6 +670,88 @@ function setupMasterSheets() {
           </div>
         </div>
 
+        {/* Navigation Tabs for Super Admin Hub */}
+        <div className="flex items-center gap-1.5 px-3 sm:px-4 py-2 bg-slate-950/70 border-b border-slate-800/80 overflow-x-auto no-scrollbar shrink-0">
+          <button
+            type="button"
+            onClick={() => setAdminTab('tenants')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer whitespace-nowrap ${
+              adminTab === 'tenants'
+                ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Building2 className="w-3.5 h-3.5" />
+            <span>Tenants &amp; Subscriptions</span>
+            <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+              adminTab === 'tenants' ? 'bg-slate-950/30 text-slate-950' : 'bg-slate-800 text-slate-300'
+            }`}>
+              {companies.length}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setAdminTab('packages')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer whitespace-nowrap ${
+              adminTab === 'packages'
+                ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Package className="w-3.5 h-3.5" />
+            <span>Package Setup &amp; Capabilities</span>
+            <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+              adminTab === 'packages' ? 'bg-slate-950/30 text-slate-950' : 'bg-indigo-500/20 text-indigo-300'
+            }`}>
+              45 Functions
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setAdminTab('sheets')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer whitespace-nowrap ${
+              adminTab === 'sheets'
+                ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5" />
+            <span>Google Sheets Setup</span>
+            <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+              adminTab === 'sheets' ? 'bg-slate-950/30 text-slate-950' : 'bg-emerald-500/20 text-emerald-300'
+            }`}>
+              Super Admin
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              if (onOpenReportBuilder) {
+                onClose();
+                onOpenReportBuilder();
+              } else {
+                setAdminTab('reports');
+              }
+            }}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer whitespace-nowrap ${
+              adminTab === 'reports'
+                ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5" />
+            <span>Universal Report Builder</span>
+            <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+              adminTab === 'reports' ? 'bg-slate-950/30 text-slate-950' : 'bg-purple-500/20 text-purple-300'
+            }`}>
+              Super Admin
+            </span>
+          </button>
+        </div>
+
         {/* Scrollable Content Container */}
         <div className="flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-4">
           {/* Toast alert */}
@@ -671,6 +762,236 @@ function setupMasterSheets() {
             </div>
           )}
 
+          {/* PACKAGE SETUP VIEW TAB */}
+          {adminTab === 'packages' && (
+            <div className="animate-fadeIn">
+              <PackageSetupView
+                onClose={onClose}
+                onOpenReportBuilder={() => {
+                  if (onOpenReportBuilder) {
+                    onClose();
+                    onOpenReportBuilder();
+                  } else {
+                    setAdminTab('reports');
+                  }
+                }}
+                onOpenSheetSetup={() => {
+                  if (onOpenSheetSetup) {
+                    onClose();
+                    onOpenSheetSetup();
+                  } else {
+                    setAdminTab('sheets');
+                  }
+                }}
+              />
+            </div>
+          )}
+
+          {/* GOOGLE SHEETS SETUP TAB (SUPER ADMIN EXCLUSIVE) */}
+          {adminTab === 'sheets' && (
+            <div className="space-y-4 animate-fadeIn">
+              <div className="p-4 sm:p-6 rounded-3xl bg-gradient-to-br from-emerald-950/50 via-slate-900 to-slate-950 border border-emerald-500/30 shadow-2xl space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-center space-x-3">
+                    <div className="w-12 h-12 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 flex items-center justify-center">
+                      <FileSpreadsheet className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <div className="flex items-center space-x-2">
+                        <h3 className="text-base sm:text-lg font-black text-white">Super Admin Google Sheets Setup</h3>
+                        <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold border border-emerald-500/30">
+                          Restricted Function
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400">
+                        Google Sheets synchronization and script setup are reserved for Super Administrators to protect master spreadsheets and API webhooks.
+                      </p>
+                    </div>
+                  </div>
+
+                  {onOpenSheetSetup && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onClose();
+                        onOpenSheetSetup();
+                      }}
+                      className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold text-xs shadow-lg flex items-center justify-center space-x-2 cursor-pointer transition active:scale-95 shrink-0"
+                    >
+                      <RefreshCw className="w-4 h-4 text-slate-950" />
+                      <span>Open Live Sync Hub</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2">
+                  {/* Master Apps Script Webhook Controls */}
+                  <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                        <Radio className="w-4 h-4 text-indigo-400" />
+                        Master Apps Script Webhook URL
+                      </span>
+                      <span className="text-[10px] text-emerald-400 font-mono">Global Router</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      <input
+                        type="text"
+                        value={masterWebhookInput}
+                        onChange={(e) => setMasterWebhookInput(e.target.value)}
+                        placeholder="https://script.google.com/macros/s/.../exec"
+                        className="w-full bg-slate-900 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs font-mono focus:border-emerald-500 focus:outline-none"
+                      />
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={handleSaveMasterWebhook}
+                          disabled={isSavingWebhook}
+                          className="flex-1 py-1.5 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                        >
+                          <Save className="w-3.5 h-3.5" />
+                          <span>{isSavingWebhook ? 'Broadcasting...' : 'Save & Share to All Devices'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleTestWebhookConnection}
+                          disabled={isTestingWebhook}
+                          className="py-1.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                        >
+                          <Zap className="w-3.5 h-3.5 text-amber-400" />
+                          <span>{isTestingWebhook ? 'Testing...' : 'Test'}</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 1-Click Apps Script Tools */}
+                  <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-3">
+                    <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                      <Sparkles className="w-4 h-4 text-amber-400" />
+                      Self-Healing Deployment Tools
+                    </span>
+                    <p className="text-[11px] text-slate-400">
+                      Generate all master tabs with precise column headers, or view the complete Google Apps Script ready for copy-pasting.
+                    </p>
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setIsInitTabsModalOpen(true)}
+                        className="py-2 px-3 rounded-xl bg-amber-500/20 border border-amber-500/40 hover:bg-amber-500/30 text-amber-200 text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Zap className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Auto-Create Tabs</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setIsViewCodeModalOpen(true)}
+                        className="py-2 px-3 rounded-xl bg-purple-500/20 border border-purple-500/40 hover:bg-purple-500/30 text-purple-200 text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer"
+                      >
+                        <Eye className="w-3.5 h-3.5 text-purple-400" />
+                        <span>View Code.gs</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Tenants Sheet Linker Overview */}
+              <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h4 className="text-xs font-bold text-white uppercase tracking-wider">
+                    Tenant Sheet Connections ({companies.filter(companyHasValidSheet).length} Linked / {companies.length} Total)
+                  </h4>
+                  <span className="text-[11px] text-slate-400">
+                    Tenants cannot modify their sheet IDs — only Super Admins can link them.
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                  {companies.map((comp) => {
+                    const hasSheet = companyHasValidSheet(comp);
+                    return (
+                      <div
+                        key={comp.company_id}
+                        className={`p-3 rounded-xl border flex items-center justify-between ${
+                          hasSheet
+                            ? 'bg-slate-950/60 border-emerald-500/30'
+                            : 'bg-slate-950/60 border-amber-500/30'
+                        }`}
+                      >
+                        <div className="min-w-0 pr-2">
+                          <p className="text-xs font-bold text-white truncate">{comp.company_name}</p>
+                          <p className="text-[10px] text-slate-400 font-mono truncate">
+                            {hasSheet ? `Sheet: ${comp.sheet_id?.slice(0, 14)}...` : 'No dedicated sheet linked'}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setLinkingSheetCompany(comp);
+                            setSheetUrlOrIdInput(comp.sheet_id || '');
+                          }}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer transition shrink-0 ${
+                            hasSheet
+                              ? 'bg-slate-800 hover:bg-slate-700 text-slate-300'
+                              : 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+                          }`}
+                        >
+                          {hasSheet ? 'Edit' : 'Link Sheet'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* UNIVERSAL REPORT BUILDER TAB (SUPER ADMIN EXCLUSIVE) */}
+          {adminTab === 'reports' && (
+            <div className="p-6 rounded-3xl bg-gradient-to-br from-purple-950/50 via-slate-900 to-slate-950 border border-purple-500/30 shadow-2xl space-y-5 animate-fadeIn text-center max-w-2xl mx-auto my-4">
+              <div className="w-16 h-16 rounded-3xl bg-purple-500/20 border border-purple-500/40 text-purple-300 flex items-center justify-center mx-auto text-3xl shadow-xl">
+                ✨
+              </div>
+              <div className="space-y-2">
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-purple-500/20 text-purple-300 text-xs font-bold border border-purple-500/30">
+                  <Shield className="w-3.5 h-3.5" />
+                  <span>Super Admin Privilege Verified</span>
+                </div>
+                <h3 className="text-xl font-black text-white">Universal No-Code Report Builder</h3>
+                <p className="text-xs text-slate-300 leading-relaxed max-w-lg mx-auto">
+                  The Report Builder is a Super Admin exclusive capability. It allows you to construct any multi-table report across Sales, Products, Customers, Inventory, Staff, and Deliveries with calculated metrics, joins, and custom charts.
+                </p>
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-3 justify-center pt-2">
+                {onOpenReportBuilder && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenReportBuilder();
+                    }}
+                    className="px-6 py-3 rounded-2xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-black text-xs shadow-xl shadow-purple-900/30 flex items-center justify-center gap-2 cursor-pointer transition active:scale-95"
+                  >
+                    <Zap className="w-4 h-4 text-purple-200" />
+                    <span>Launch 5-Step Report Builder Wizard</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setAdminTab('packages')}
+                  className="px-5 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs border border-slate-700 transition flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <Package className="w-4 h-4 text-amber-400" />
+                  <span>Configure Report Access in Packages</span>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* TENANTS LIST VIEW TAB */}
+          {adminTab === 'tenants' && (
+            <>
           {/* Top Quick Stats KPI Bar - High-Contrast & Instant Visibility */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
             <div className="p-3.5 rounded-2xl bg-slate-950/80 border border-slate-800 shadow-sm">
@@ -1180,29 +1501,39 @@ function setupMasterSheets() {
                     </div>
 
                     {/* Admin Actions Bar */}
-                    <div className="grid grid-cols-3 gap-1.5 pt-1">
+                    <div className="grid grid-cols-4 gap-1.5 pt-1">
                       <button
                         type="button"
                         onClick={() => setSelectedCompanyForPayment(comp)}
-                        className="py-2 px-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] flex items-center justify-center gap-1 shadow-sm active:scale-95 transition"
+                        className="py-2 px-1 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] flex items-center justify-center gap-1 shadow-sm active:scale-95 transition"
                       >
                         <CreditCard className="w-3.5 h-3.5" />
-                        <span>Payment</span>
+                        <span>Pay</span>
                       </button>
 
                       <button
                         type="button"
                         onClick={() => handleExtendTrial(comp)}
-                        className="py-2 px-1.5 rounded-xl bg-indigo-950 hover:bg-indigo-900 text-indigo-200 text-[11px] font-semibold border border-indigo-800/80 flex items-center justify-center gap-1 active:scale-95 transition"
+                        className="py-2 px-1 rounded-xl bg-indigo-950 hover:bg-indigo-900 text-indigo-200 text-[11px] font-semibold border border-indigo-800/80 flex items-center justify-center gap-1 active:scale-95 transition"
                       >
                         <Clock className="w-3.5 h-3.5" />
-                        <span>+14d Trial</span>
+                        <span>+14d</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setAdminTab('packages')}
+                        className="py-2 px-1 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-[11px] font-bold border border-amber-500/30 flex items-center justify-center gap-1 active:scale-95 transition"
+                        title="Manage & Save Package"
+                      >
+                        <Package className="w-3.5 h-3.5" />
+                        <span>Pkg</span>
                       </button>
 
                       <button
                         type="button"
                         onClick={() => handleSwitchToTenant(comp)}
-                        className="py-2 px-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold border border-slate-700 flex items-center justify-center gap-1 active:scale-95 transition"
+                        className="py-2 px-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold border border-slate-700 flex items-center justify-center gap-1 active:scale-95 transition"
                       >
                         <span>Switch</span>
                         <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
@@ -1373,6 +1704,16 @@ function setupMasterSheets() {
 
                             <button
                               type="button"
+                              onClick={() => setAdminTab('packages')}
+                              className="px-2 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[11px] font-bold flex items-center gap-1 cursor-pointer transition"
+                              title="Manage & Save Package for this Tenant"
+                            >
+                              <Package className="w-3 h-3 text-amber-400" />
+                              <span>Package</span>
+                            </button>
+
+                            <button
+                              type="button"
                               onClick={() => handleExtendTrial(comp)}
                               className="px-2 py-1 rounded-lg bg-indigo-900/60 hover:bg-indigo-800 text-indigo-200 text-[11px] font-semibold border border-indigo-700/60 cursor-pointer"
                               title="Grant 14 extra trial days"
@@ -1408,6 +1749,8 @@ function setupMasterSheets() {
               </tbody>
             </table>
           </div>
+            </>
+          )}
         </div>
 
         {/* Modal Footer */}

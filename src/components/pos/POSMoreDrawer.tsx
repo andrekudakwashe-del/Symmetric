@@ -469,31 +469,32 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
         </div>
       </div>
 
-      {/* Bluetooth 58mm / 80mm Printer Quick Setup Card */}
+      {/* Bluetooth 58mm / 80mm Printer & Receipt Setup Card */}
       <div className="bg-gradient-to-r from-blue-950/40 via-indigo-950/30 to-slate-900 border border-blue-500/30 rounded-3xl p-4 shadow-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
         <div className="flex items-center space-x-3">
           <div className="p-2.5 rounded-2xl bg-blue-500/20 text-blue-400 border border-blue-500/30">
-            <Bluetooth className="w-5 h-5" />
+            <Printer className="w-5 h-5" />
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <span className="text-sm font-black text-white">Bluetooth Thermal Printer</span>
-              <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 font-bold border border-blue-500/30">
-                58mm & 80mm
+              <span className="text-sm font-black text-white">Printer &amp; Receipt Setup</span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 font-bold border border-blue-500/30 font-mono">
+                58mm &amp; 80mm
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              Connect wireless handheld or desktop ESC/POS thermal printers directly from Chrome.
+              Configure tenant receipt branding, change returned display, auto-print on sale &amp; wireless Bluetooth hardware.
             </p>
           </div>
         </div>
         <button
+          id="btn-more-drawer-open-printer"
           type="button"
           onClick={() => setShowPrinterModal(true)}
           className="shrink-0 px-3.5 py-2 rounded-2xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center space-x-1.5 shadow-md active:scale-95 transition"
         >
-          <Printer className="w-3.5 h-3.5" />
-          <span>Printer Setup & Test</span>
+          <Settings className="w-3.5 h-3.5" />
+          <span>Printer &amp; Receipt Setup</span>
         </button>
       </div>
 

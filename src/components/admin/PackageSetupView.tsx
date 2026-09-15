@@ -23,6 +23,7 @@ import {
   ArrowRight,
   Zap,
   Lock,
+  Save,
 } from 'lucide-react';
 import {
   SaaSPackage,
@@ -80,6 +81,21 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
   const [selectedCategory, setSelectedCategory] = useState<AppFunctionCategory | 'ALL'>('ALL');
   const [activeTab, setActiveTab] = useState<'PACKAGES' | 'TENANT_ASSIGNMENTS'>('PACKAGES');
 
+  // Staged Tenant Package Assignments & Save States
+  const [stagedTenantPackages, setStagedTenantPackages] = useState<Record<string, string>>({});
+  const [savingTenantIds, setSavingTenantIds] = useState<Record<string, boolean>>({});
+  const [savedTenantFeedback, setSavedTenantFeedback] = useState<Record<string, boolean>>({});
+  const [tenantFilterQuery, setTenantFilterQuery] = useState('');
+  const [customizingTenant, setCustomizingTenant] = useState<Company | null>(null);
+
+  // Custom Customer Package Form State
+  const [customPkgName, setCustomPkgName] = useState('');
+  const [customPkgPrice, setCustomPkgPrice] = useState(49);
+  const [customMaxBranches, setCustomMaxBranches] = useState(3);
+  const [customMaxStaff, setCustomMaxStaff] = useState(10);
+  const [customFeatures, setCustomFeatures] = useState<Record<string, boolean>>({});
+  const [customSearchFilter, setCustomSearchFilter] = useState('');
+
   useEffect(() => {
     const handleUpdate = () => {
       const updated = getPackages();
@@ -89,6 +105,25 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
     window.addEventListener('saas_packages_updated', handleUpdate);
     return () => window.removeEventListener('saas_packages_updated', handleUpdate);
   }, []);
+
+  // Initialize staged packages for all companies
+  useEffect(() => {
+    setStagedTenantPackages((prev) => {
+      const next = { ...prev };
+      companies.forEach((comp) => {
+        if (!next[comp.company_id]) {
+          const defaultPkgId =
+            (comp as any).package_id ||
+            packages.find((p) => p.code?.toUpperCase() === comp.plan?.toUpperCase())?.id ||
+            packages[0]?.id;
+          if (defaultPkgId) {
+            next[comp.company_id] = defaultPkgId;
+          }
+        }
+      });
+      return next;
+    });
+  }, [companies, packages]);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -241,12 +276,126 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
   };
 
   const handleAssignTenant = (companyId: string, packageId: string) => {
-    const success = assignCompanyPackage(companyId, packageId);
-    if (success) {
+    // Stage the selection first so the user sees their change and can save it explicitly
+    setStagedTenantPackages((prev) => ({
+      ...prev,
+      [companyId]: packageId,
+    }));
+  };
+
+  const handleSaveTenantPackage = (companyId: string) => {
+    const targetPackageId = stagedTenantPackages[companyId];
+    if (!targetPackageId) return;
+
+    setSavingTenantIds((prev) => ({ ...prev, [companyId]: true }));
+
+    setTimeout(() => {
+      const success = assignCompanyPackage(companyId, targetPackageId);
+      if (success) {
+        const updatedComps = getCompanies();
+        setCompanies(updatedComps);
+        const comp = updatedComps.find((c) => c.company_id === companyId);
+        const p = packages.find((x) => x.id === targetPackageId);
+        showToast(`✓ Package '${p?.name || targetPackageId}' successfully saved for ${comp?.company_name || 'tenant'}!`);
+        
+        setSavedTenantFeedback((prev) => ({ ...prev, [companyId]: true }));
+        setTimeout(() => {
+          setSavedTenantFeedback((prev) => {
+            const copy = { ...prev };
+            delete copy[companyId];
+            return copy;
+          });
+        }, 3000);
+
+        try {
+          confetti({ particleCount: 35, spread: 55, origin: { y: 0.6 } });
+        } catch {
+          // ignore
+        }
+      } else {
+        showToast('Failed to save tenant package');
+      }
+      setSavingTenantIds((prev) => ({ ...prev, [companyId]: false }));
+    }, 200);
+  };
+
+  const handleSaveAllTenantPackages = () => {
+    let savedCount = 0;
+    companies.forEach((comp) => {
+      const stagedId = stagedTenantPackages[comp.company_id];
+      const currentPkgId =
+        (comp as any).package_id ||
+        packages.find((p) => p.code?.toUpperCase() === comp.plan?.toUpperCase())?.id ||
+        packages[0]?.id;
+      if (stagedId && stagedId !== currentPkgId) {
+        assignCompanyPackage(comp.company_id, stagedId);
+        savedCount++;
+      }
+    });
+
+    if (savedCount > 0) {
       setCompanies(getCompanies());
-      const p = packages.find((x) => x.id === packageId);
-      showToast(`✓ Updated tenant to package: ${p?.name || packageId}`);
+      showToast(`✓ Successfully saved packages for ${savedCount} tenant(s)!`);
+      try {
+        confetti({ particleCount: 70, spread: 75, origin: { y: 0.6 } });
+      } catch {
+        // ignore
+      }
+    } else {
+      showToast('All tenant packages are already up-to-date and saved');
     }
+  };
+
+  const handleOpenCustomTenantPackageModal = (comp: Company) => {
+    const currentPkgId =
+      (comp as any).package_id ||
+      packages.find((p) => p.code?.toUpperCase() === comp.plan?.toUpperCase())?.id ||
+      packages[0]?.id;
+    const currentPkg = packages.find((p) => p.id === currentPkgId) || packages[0];
+
+    setCustomizingTenant(comp);
+    setCustomPkgName(`Custom Plan - ${comp.company_name}`);
+    setCustomPkgPrice(currentPkg?.priceMonthly || 49);
+    setCustomMaxBranches(currentPkg?.maxBranches || 3);
+    setCustomMaxStaff(currentPkg?.maxStaff || 10);
+    setCustomFeatures({ ...(currentPkg?.features || {}) });
+    setCustomSearchFilter('');
+  };
+
+  const handleSaveCustomTenantPackage = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!customizingTenant) return;
+
+    const newPkg = createPackage({
+      name: customPkgName.trim() || `Custom - ${customizingTenant.company_name}`,
+      code: `CUST_${customizingTenant.company_id.replace(/[^a-zA-Z0-9]/g, '').slice(-4).toUpperCase()}`,
+      tier: 'CUSTOM',
+      description: `Dedicated custom package tailored for ${customizingTenant.company_name}`,
+      priceMonthly: Number(customPkgPrice) || 0,
+      priceAnnual: (Number(customPkgPrice) || 0) * 10,
+      maxBranches: Number(customMaxBranches) || 1,
+      maxStaff: Number(customMaxStaff) || 3,
+      isDefault: false,
+      features: customFeatures,
+    });
+
+    // Assign to company and persist immediately
+    assignCompanyPackage(customizingTenant.company_id, newPkg.id);
+    const updatedComps = getCompanies();
+    setCompanies(updatedComps);
+    setPackages(getPackages());
+    setStagedTenantPackages((prev) => ({
+      ...prev,
+      [customizingTenant.company_id]: newPkg.id,
+    }));
+
+    showToast(`✓ Custom package '${newPkg.name}' created and saved for ${customizingTenant.company_name}!`);
+    try {
+      confetti({ particleCount: 55, spread: 65, origin: { y: 0.6 } });
+    } catch {
+      // ignore
+    }
+    setCustomizingTenant(null);
   };
 
   // Filtered functions
@@ -486,7 +635,18 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
                     className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold flex items-center gap-1 transition"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Reset to {editTier} Defaults</span>
+                    <span>Reset Defaults</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const form = document.getElementById('package-edit-form') as HTMLFormElement;
+                      if (form) form.requestSubmit();
+                    }}
+                    className="px-4 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center gap-1.5 shadow-lg shadow-amber-500/20 active:scale-95 transition cursor-pointer"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save Package</span>
                   </button>
                   <button
                     type="button"
@@ -498,7 +658,7 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
                 </div>
               </div>
 
-              <form onSubmit={handleSave} className="space-y-4">
+              <form id="package-edit-form" onSubmit={handleSave} className="space-y-4">
                 {/* General Settings */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                   <div className="space-y-1">
@@ -802,77 +962,442 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
       {/* VIEW 2: TENANT SUBSCRIPTION ASSIGNMENTS */}
       {activeTab === 'TENANT_ASSIGNMENTS' && (
         <div className="space-y-4">
-          <div className="p-4 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
-            <h4 className="font-bold text-sm text-white flex items-center gap-2">
-              <Building2 className="w-4 h-4 text-amber-400" />
-              <span>Assign Packages to Registered Tenants</span>
-            </h4>
-            <p className="text-xs text-slate-400">
-              Each tenant's POS terminals, branch creation capacity, staff accounts, and application function access are determined directly by their active package.
-            </p>
+          <div className="p-4 sm:p-5 rounded-3xl bg-slate-900 border border-slate-800 space-y-4">
+            {/* Header Toolbar */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
+              <div>
+                <h4 className="font-bold text-sm text-white flex items-center gap-2">
+                  <Building2 className="w-4 h-4 text-amber-400" />
+                  <span>Assign &amp; Save Packages for Registered Tenants</span>
+                </h4>
+                <p className="text-xs text-slate-400">
+                  Select a package for any tenant and click <strong className="text-emerald-400">"Save Package"</strong> to commit the plan, POS limits, and enabled capabilities.
+                </p>
+              </div>
 
+              {/* Action Buttons & Counters */}
+              <div className="flex items-center gap-2.5 flex-wrap">
+                {(() => {
+                  const unsavedCount = companies.filter((comp) => {
+                    const currentPkgId =
+                      (comp as any).package_id ||
+                      packages.find((p) => p.code?.toUpperCase() === comp.plan?.toUpperCase())?.id ||
+                      packages[0]?.id;
+                    const stagedId = stagedTenantPackages[comp.company_id] || currentPkgId;
+                    return stagedId !== currentPkgId;
+                  }).length;
+
+                  if (unsavedCount > 0) {
+                    return (
+                      <button
+                        type="button"
+                        onClick={handleSaveAllTenantPackages}
+                        className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-lg shadow-emerald-600/30 flex items-center gap-2 active:scale-95 transition cursor-pointer animate-pulse"
+                      >
+                        <Save className="w-4 h-4" />
+                        <span>Save All Tenant Packages ({unsavedCount})</span>
+                      </button>
+                    );
+                  }
+                  return null;
+                })()}
+
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    value={tenantFilterQuery}
+                    onChange={(e) => setTenantFilterQuery(e.target.value)}
+                    placeholder="Search tenant or email..."
+                    className="bg-slate-950 border border-slate-700 rounded-xl pl-8 pr-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 w-48 sm:w-60"
+                  />
+                  {tenantFilterQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setTenantFilterQuery('')}
+                      className="absolute right-2.5 top-2 text-slate-400 hover:text-white"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Tenants Table */}
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead>
                   <tr className="border-b border-slate-800 text-slate-400 uppercase font-bold text-[10px]">
-                    <th className="py-2.5 px-3">Company / Business</th>
-                    <th className="py-2.5 px-3">Owner Email</th>
-                    <th className="py-2.5 px-3">Current Plan</th>
-                    <th className="py-2.5 px-3">Assigned Package</th>
-                    <th className="py-2.5 px-3">Change Package</th>
+                    <th className="py-2.5 px-3">Company / Tenant</th>
+                    <th className="py-2.5 px-3">Owner Contact</th>
+                    <th className="py-2.5 px-3">Current Active Plan</th>
+                    <th className="py-2.5 px-3">Package Selection</th>
+                    <th className="py-2.5 px-3 text-right">Save &amp; Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {companies.map((comp) => {
-                    const currentPkgId =
-                      (comp as any).package_id ||
-                      packages.find(
-                        (p) => p.code?.toUpperCase() === comp.plan?.toUpperCase()
-                      )?.id ||
-                      packages[0]?.id;
+                  {companies
+                    .filter((comp) => {
+                      if (!tenantFilterQuery.trim()) return true;
+                      const q = tenantFilterQuery.toLowerCase();
+                      return (
+                        comp.company_name?.toLowerCase().includes(q) ||
+                        comp.company_id?.toLowerCase().includes(q) ||
+                        comp.owner_email?.toLowerCase().includes(q) ||
+                        comp.owner_name?.toLowerCase().includes(q)
+                      );
+                    })
+                    .map((comp) => {
+                      const currentPkgId =
+                        (comp as any).package_id ||
+                        packages.find(
+                          (p) => p.code?.toUpperCase() === comp.plan?.toUpperCase()
+                        )?.id ||
+                        packages[0]?.id;
 
-                    const assignedPkg = packages.find((p) => p.id === currentPkgId) || packages[0];
+                      const stagedPkgId = stagedTenantPackages[comp.company_id] || currentPkgId;
+                      const isUnsaved = stagedPkgId !== currentPkgId;
+                      const isSaving = savingTenantIds[comp.company_id];
+                      const isSaved = savedTenantFeedback[comp.company_id];
 
-                    return (
-                      <tr key={comp.company_id} className="hover:bg-slate-800/30 transition">
-                        <td className="py-3 px-3">
-                          <span className="font-bold text-white block">{comp.company_name}</span>
-                          <span className="text-[10px] text-slate-500 font-mono">{comp.company_id}</span>
-                        </td>
-                        <td className="py-3 px-3 text-slate-300 font-mono text-[11px]">{comp.owner_email}</td>
-                        <td className="py-3 px-3">
-                          <span className="px-2 py-0.5 rounded bg-slate-800 text-amber-300 font-mono font-bold text-[10px]">
-                            {comp.plan}
-                          </span>
-                        </td>
-                        <td className="py-3 px-3">
-                          <span className="font-bold text-indigo-300 flex items-center gap-1.5">
-                            <Zap className="w-3.5 h-3.5 text-amber-400" />
-                            <span>{assignedPkg?.name}</span>
-                          </span>
-                          <span className="text-[10px] text-slate-400">
-                            {Object.values(assignedPkg?.features || {}).filter(Boolean).length} functions enabled
-                          </span>
-                        </td>
-                        <td className="py-3 px-3">
-                          <select
-                            value={currentPkgId}
-                            onChange={(e) => handleAssignTenant(comp.company_id, e.target.value)}
-                            className="bg-slate-950 border border-slate-700 text-white rounded-xl px-2.5 py-1.5 text-xs focus:outline-none focus:border-amber-500 font-medium"
-                          >
-                            {packages.map((p) => (
-                              <option key={p.id} value={p.id}>
-                                {p.name} (${p.priceMonthly}/mo)
-                              </option>
-                            ))}
-                          </select>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                      const currentPkg = packages.find((p) => p.id === currentPkgId) || packages[0];
+                      const stagedPkg = packages.find((p) => p.id === stagedPkgId) || currentPkg;
+
+                      return (
+                        <tr
+                          key={comp.company_id}
+                          className={`transition ${
+                            isUnsaved ? 'bg-amber-950/20 border-l-2 border-amber-500' : 'hover:bg-slate-800/30'
+                          }`}
+                        >
+                          {/* Tenant Info */}
+                          <td className="py-3 px-3">
+                            <span className="font-bold text-white block text-sm">{comp.company_name}</span>
+                            <div className="flex items-center gap-1.5 text-[10px] text-slate-500 font-mono mt-0.5">
+                              <span className="text-amber-400/90 font-bold">{comp.company_id}</span>
+                              <span>•</span>
+                              <span>{comp.business_category || 'Retail Store'}</span>
+                            </div>
+                          </td>
+
+                          {/* Owner Email */}
+                          <td className="py-3 px-3">
+                            <div className="text-slate-300 font-mono text-[11px]">{comp.owner_email}</div>
+                            {comp.owner_name && (
+                              <div className="text-[10px] text-slate-500">{comp.owner_name}</div>
+                            )}
+                          </td>
+
+                          {/* Current Plan */}
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-1.5">
+                              <span className="px-2 py-0.5 rounded-lg bg-slate-800 text-amber-300 font-mono font-bold text-[10px] border border-slate-700">
+                                {comp.plan || 'STARTER'}
+                              </span>
+                              {comp.subscription_status && (
+                                <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded ${
+                                  comp.subscription_status === 'ACTIVE'
+                                    ? 'bg-emerald-500/20 text-emerald-300'
+                                    : 'bg-blue-500/20 text-blue-300'
+                                }`}>
+                                  {comp.subscription_status}
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-1 flex items-center gap-1">
+                              <Zap className="w-3 h-3 text-amber-400 shrink-0" />
+                              <span className="font-medium text-slate-300">{currentPkg?.name}</span>
+                              <span className="text-slate-500">
+                                ({Object.values(currentPkg?.features || {}).filter(Boolean).length}/45 fn)
+                              </span>
+                            </div>
+                          </td>
+
+                          {/* Package Dropdown Selector */}
+                          <td className="py-3 px-3">
+                            <div className="space-y-1">
+                              <select
+                                value={stagedPkgId}
+                                onChange={(e) => handleAssignTenant(comp.company_id, e.target.value)}
+                                className={`w-full max-w-xs bg-slate-950 border rounded-xl px-3 py-1.5 text-xs text-white font-medium focus:outline-none ${
+                                  isUnsaved
+                                    ? 'border-amber-500 shadow-md shadow-amber-500/20 ring-1 ring-amber-500'
+                                    : 'border-slate-700 focus:border-amber-500'
+                                }`}
+                              >
+                                {packages.map((p) => (
+                                  <option key={p.id} value={p.id}>
+                                    {p.name} — ${p.priceMonthly}/mo ({Object.values(p.features || {}).filter(Boolean).length} functions)
+                                  </option>
+                                ))}
+                              </select>
+
+                              {isUnsaved && (
+                                <div className="text-[10px] text-amber-400 font-bold flex items-center gap-1">
+                                  <span>● Unsaved change:</span>
+                                  <span className="text-white underline">{stagedPkg?.name}</span>
+                                </div>
+                              )}
+                            </div>
+                          </td>
+
+                          {/* Save & Action Buttons */}
+                          <td className="py-3 px-3 text-right">
+                            <div className="flex items-center justify-end gap-2">
+                              {/* Prominent Save Package Button */}
+                              <button
+                                type="button"
+                                onClick={() => handleSaveTenantPackage(comp.company_id)}
+                                disabled={isSaving}
+                                className={`px-3.5 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-md active:scale-95 transition cursor-pointer ${
+                                  isSaved
+                                    ? 'bg-emerald-500 text-slate-950 ring-2 ring-emerald-400'
+                                    : isUnsaved
+                                    ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-600/30 animate-pulse font-black'
+                                    : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
+                                }`}
+                                title="Save this package assignment for this tenant"
+                              >
+                                {isSaving ? (
+                                  <>
+                                    <RotateCcw className="w-3.5 h-3.5 animate-spin" />
+                                    <span>Saving...</span>
+                                  </>
+                                ) : isSaved ? (
+                                  <>
+                                    <Check className="w-3.5 h-3.5 stroke-[3]" />
+                                    <span>Saved ✓</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Save className="w-3.5 h-3.5" />
+                                    <span>Save Package</span>
+                                  </>
+                                )}
+                              </button>
+
+                              {/* Customize Specifically for this Customer */}
+                              <button
+                                type="button"
+                                onClick={() => handleOpenCustomTenantPackageModal(comp)}
+                                className="p-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition"
+                                title="Create or edit a custom tailored package for this customer"
+                              >
+                                <Sliders className="w-3.5 h-3.5 text-amber-400" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CUSTOMIZE PACKAGE FOR SPECIFIC CUSTOMER */}
+      {customizingTenant && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn">
+          <div className="w-full max-w-2xl bg-slate-900 border border-amber-500/50 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+            {/* Modal Header */}
+            <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center font-bold">
+                  <Sliders className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm text-white">
+                    Customize Package for: {customizingTenant.company_name}
+                  </h3>
+                  <p className="text-xs text-slate-400 font-mono">
+                    Tenant ID: {customizingTenant.company_id} • Owner: {customizingTenant.owner_email}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const form = document.getElementById('custom-tenant-pkg-form') as HTMLFormElement;
+                    if (form) form.requestSubmit();
+                  }}
+                  className="px-4 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black flex items-center gap-1.5 shadow-lg shadow-amber-500/20 active:scale-95 transition cursor-pointer"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>Save Customer Package</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCustomizingTenant(null)}
+                  className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal Body Form */}
+            <form
+              id="custom-tenant-pkg-form"
+              onSubmit={handleSaveCustomTenantPackage}
+              className="p-4 sm:p-5 overflow-y-auto space-y-4 flex-1"
+            >
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold uppercase text-slate-400">Package Title</label>
+                  <input
+                    type="text"
+                    value={customPkgName}
+                    onChange={(e) => setCustomPkgName(e.target.value)}
+                    required
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold uppercase text-slate-400">Monthly Price ($)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    value={customPkgPrice}
+                    onChange={(e) => setCustomPkgPrice(Number(e.target.value))}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] font-bold uppercase text-slate-400">Max Branches &amp; Staff</label>
+                  <div className="flex gap-2">
+                    <input
+                      type="number"
+                      min="1"
+                      value={customMaxBranches}
+                      onChange={(e) => setCustomMaxBranches(Number(e.target.value))}
+                      placeholder="Branches"
+                      title="Max Branches"
+                      className="w-1/2 bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-2 text-xs text-white focus:outline-none focus:border-amber-500"
+                    />
+                    <input
+                      type="number"
+                      min="1"
+                      value={customMaxStaff}
+                      onChange={(e) => setCustomMaxStaff(Number(e.target.value))}
+                      placeholder="Staff"
+                      title="Max Staff Accounts"
+                      className="w-1/2 bg-slate-950 border border-slate-700 rounded-xl px-2.5 py-2 text-xs text-white focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* 45 Functions Matrix for this tenant */}
+              <div className="space-y-2 pt-2 border-t border-slate-800">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <h5 className="font-bold text-xs text-white">Application Functions for this Customer</h5>
+                    <p className="text-[10px] text-slate-400">
+                      Enabled: {Object.values(customFeatures).filter(Boolean).length} / 45
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const allOn: Record<string, boolean> = {};
+                        ALL_APP_FUNCTIONS.forEach((fn) => { allOn[fn.id] = true; });
+                        setCustomFeatures(allOn);
+                      }}
+                      className="px-2 py-0.5 rounded bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-300 text-[10px] font-bold border border-emerald-700/50"
+                    >
+                      Enable All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const allOff: Record<string, boolean> = {};
+                        ALL_APP_FUNCTIONS.forEach((fn) => { allOff[fn.id] = false; });
+                        setCustomFeatures(allOff);
+                      }}
+                      className="px-2 py-0.5 rounded bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 text-[10px] font-bold border border-rose-700/50"
+                    >
+                      Disable All
+                    </button>
+                  </div>
+                </div>
+
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    value={customSearchFilter}
+                    onChange={(e) => setCustomSearchFilter(e.target.value)}
+                    placeholder="Filter functions..."
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-8 pr-3 py-1.5 text-xs text-white focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1">
+                  {ALL_APP_FUNCTIONS.filter((fn) => {
+                    if (!customSearchFilter.trim()) return true;
+                    const q = customSearchFilter.toLowerCase();
+                    return fn.name.toLowerCase().includes(q) || fn.categoryLabel.toLowerCase().includes(q);
+                  }).map((fn) => {
+                    const isEnabled = Boolean(customFeatures[fn.id]);
+                    return (
+                      <div
+                        key={fn.id}
+                        onClick={() =>
+                          setCustomFeatures((prev) => ({
+                            ...prev,
+                            [fn.id]: !prev[fn.id],
+                          }))
+                        }
+                        className={`p-2 rounded-xl border flex items-center justify-between gap-2 cursor-pointer transition ${
+                          isEnabled
+                            ? 'bg-emerald-950/20 border-emerald-600/50 text-white'
+                            : 'bg-slate-950/60 border-slate-800/80 text-slate-400 hover:border-slate-700'
+                        }`}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <span className="font-semibold text-xs block truncate">{fn.name}</span>
+                          <span className="text-[10px] text-slate-500">{fn.categoryLabel}</span>
+                        </div>
+                        <div
+                          className={`w-5 h-5 rounded flex items-center justify-center shrink-0 ${
+                            isEnabled ? 'bg-emerald-500 text-slate-950 font-bold' : 'bg-slate-800 text-slate-500'
+                          }`}
+                        >
+                          {isEnabled ? <Check className="w-3 h-3 stroke-[3]" /> : <X className="w-2.5 h-2.5" />}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Modal Footer */}
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setCustomizingTenant(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-black shadow-lg shadow-amber-500/20 active:scale-95 transition cursor-pointer flex items-center gap-1.5"
+                >
+                  <Save className="w-3.5 h-3.5" />
+                  <span>Save Customer Package</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -1073,10 +1073,21 @@ export const getAllBranches = (): Branch[] => {
       continue;
     }
     seenIds.add(id);
+    const branchName = b.name || (b as any).branch_name || (b as any).branchName || 'Main Branch';
+    const branchAddress = b.location || (b as any).address || (b as any).branch_address || '4th Street Commercial Center, Harare';
+    const branchCode = b.code || (b as any).branch_code || 'HQ-01';
+    const compId = b.company_id || b.companyId || 'COMP-001';
+
     deduplicated.push({
       ...b,
       branchId: id,
       id: id,
+      name: branchName,
+      location: branchAddress,
+      address: branchAddress,
+      code: branchCode,
+      companyId: compId,
+      company_id: compId,
     });
   }
 
@@ -1085,10 +1096,15 @@ export const getAllBranches = (): Branch[] => {
     const id = initB.branchId || initB.id;
     if (!seenIds.has(id)) {
       seenIds.add(id);
+      const branchName = initB.name || (initB as any).branch_name || 'Main Branch';
+      const branchAddress = initB.location || (initB as any).address || '4th Street Commercial Center, Harare';
       deduplicated.push({
         ...initB,
         branchId: id,
         id: id,
+        name: branchName,
+        location: branchAddress,
+        address: branchAddress,
       });
       hadDuplicates = true;
     }
@@ -2468,8 +2484,10 @@ export const addSale = (
     fromMesh?: boolean;
     company_id?: string;
     companyId?: string;
+    companyName?: string;
     branch_id?: string;
     branchId?: string;
+    branchName?: string;
   }
 ): SaleInvoice => {
   const all = getAllSales();
@@ -2478,14 +2496,21 @@ export const addSale = (
   const compId = saleData.company_id || saleData.companyId || currentCompany;
   const brId = saleData.branch_id || saleData.branchId || currentBranch;
   const invId = saleData.id || getNextInvoiceId();
+  const companiesList = getCompanies();
+  const matchedComp = companiesList.find((c) => c.company_id === compId);
+  const branchesList = getBranches();
+  const matchedBranch = branchesList.find((b) => b.branchId === brId);
+
   const created: SaleInvoice = {
     ...saleData,
     id: invId,
     synced: false,
     company_id: compId,
     companyId: compId,
+    companyName: saleData.companyName || matchedComp?.company_name || 'SAIMETRIC',
     branch_id: brId,
     branchId: brId,
+    branchName: saleData.branchName || matchedBranch?.name || 'Main Branch',
   };
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.SALES, updated);
@@ -3870,6 +3895,75 @@ export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
 
   setStored(STORAGE_KEYS.INVENTORY_ITEMS, allItems);
   return normalized;
+};
+
+export const addQuickProduct = (params: {
+  name: string;
+  price: number;
+  costPrice?: number;
+  category?: string;
+  stockQuantity?: number;
+  barcode?: string;
+  sku?: string;
+  unit?: string;
+}): Product => {
+  const cleanName = params.name.trim();
+  const slug = cleanName.replace(/[^a-zA-Z0-9]/g, '').slice(0, 6).toUpperCase() || 'ITEM';
+  const timestamp = Date.now();
+  const id = `ITM-${slug}-${timestamp.toString().slice(-4)}`;
+  const sku = params.sku?.trim() || `SKU-${slug}-${timestamp.toString().slice(-4)}`;
+  const price = Math.max(0.01, Number(params.price) || 1.0);
+  const costPrice = params.costPrice !== undefined ? Math.max(0, Number(params.costPrice)) : Math.round(price * 0.7 * 100) / 100;
+  const stockQty = params.stockQuantity !== undefined ? Number(params.stockQuantity) : 50;
+  const category = params.category?.trim() || 'General Merchandise';
+  const unit = params.unit?.trim() || 'Each';
+
+  const invItem: InventoryItem = {
+    itemId: id,
+    itemName: cleanName,
+    category,
+    unitsPerCase: 1,
+    costPerCase: costPrice,
+    costPerUnit: costPrice,
+    sellPriceCase: price,
+    sellPriceUnit: price,
+    stockCases: 0,
+    stockSingles: stockQty,
+    totalUnits: stockQty,
+    reorderLevelCases: 1,
+    reorderLevelUnits: 5,
+    sku,
+    barcode: params.barcode?.trim() || '',
+    description: `Counter quick added item: ${cleanName}`,
+    company_id: getCurrentCompanyId(),
+    branch_id: getCurrentBranchId(),
+    lastUpdated: new Date().toISOString(),
+  };
+
+  saveInventoryItem(invItem);
+
+  const product: Product = {
+    id,
+    name: cleanName,
+    sku,
+    category,
+    price,
+    costPrice,
+    stockQuantity: stockQty,
+    unit,
+    description: invItem.description,
+    barcode: invItem.barcode,
+    sellPriceUnit: price,
+    costPerUnit: costPrice,
+    unitsPerCase: 1,
+    stockSingles: stockQty,
+    totalUnits: stockQty,
+    companyId: getCurrentCompanyId(),
+    branchId: getCurrentBranchId(),
+  };
+
+  notifyListeners();
+  return product;
 };
 
 // ============================================================================
@@ -6585,15 +6679,25 @@ export function setCurrentBranchId(branchId: string): void {
 
 export function getCurrentBranch(): Branch {
   const branchId = getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
   const branches = getBranches();
-  const found = branches.find((b) => b.branchId === branchId);
-  if (found) return found;
-  return branches[0] || {
-    branchId: 'BR-MAIN',
-    name: 'Harare Main',
-    code: 'HQ-01',
-    location: '4th Street Commercial Center, Harare',
-    isMain: true,
+  let found = branches.find((b) => b.branchId === branchId || b.id === branchId || (b as any).branch_id === branchId);
+  if (!found) {
+    found = branches.find((b) => (b.company_id || b.companyId) === currentCompany) || branches[0];
+  }
+  const branchName = found?.name || (found as any)?.branch_name || (found as any)?.branchName || 'Harare Main';
+  const branchLocation = found?.location || (found as any)?.address || (found as any)?.branch_address || '4th Street Commercial Center, Harare';
+  const branchCode = found?.code || (found as any)?.branch_code || 'HQ-01';
+
+  return {
+    branchId: found?.branchId || found?.id || (found as any)?.branch_id || 'BR-MAIN',
+    name: branchName,
+    code: branchCode,
+    location: branchLocation,
+    address: branchLocation,
+    isMain: found?.isMain ?? true,
+    company_id: found?.company_id || found?.companyId || currentCompany,
+    companyId: found?.companyId || found?.company_id || currentCompany,
   };
 }
 

@@ -3,6 +3,8 @@ import { Product, CartItem, Customer, Salesperson, ActiveTab } from '../../types
 import { getSalespeople, logManagerOverride } from '../../db/roomDatabase';
 import { FractionalWeightModal } from './FractionalWeightModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
+import { CartItemGestureRow } from './CartItemGestureRow';
+import { QuickAddProductModal } from './QuickAddProductModal';
 import {
   Menu,
   UserPlus,
@@ -45,6 +47,7 @@ interface POSCounterViewProps {
   onCharge: () => void;
   onOpenMoreMenu?: () => void;
   onOpenCustomerModal?: () => void;
+  onQuickAddProduct?: (product: Product) => void;
   discountAmount: number;
   discountType: 'fixed' | 'percent';
   discountInput: string;
@@ -71,6 +74,7 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   onCharge,
   onOpenMoreMenu,
   onOpenCustomerModal,
+  onQuickAddProduct,
   discountAmount,
   discountType,
   discountInput,
@@ -85,6 +89,10 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   const [editPriceInput, setEditPriceInput] = useState<string>('0');
   const [editDiscountInput, setEditDiscountInput] = useState<string>('0');
   const [editNotesInput, setEditNotesInput] = useState<string>('');
+
+  // Gesture Controls & Quick Add Modals
+  const [showQuickAddModal, setShowQuickAddModal] = useState<boolean>(false);
+  const [itemToRemoveDialog, setItemToRemoveDialog] = useState<CartItem | null>(null);
 
   // NEW: For long press detection
   const longPressTimer = useRef<NodeJS.Timeout | null>(null);
@@ -351,6 +359,54 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
         </div>
       </div>
 
+      {/* Customer Quick Switcher & Active Customer Bar */}
+      <div className="bg-white border border-slate-200 rounded-2xl p-2.5 px-3.5 flex items-center justify-between shadow-sm">
+        <div className="flex items-center space-x-2.5 min-w-0">
+          <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${
+            selectedCustomer ? 'bg-purple-100 text-[#6A4DFF]' : 'bg-slate-100 text-slate-400'
+          }`}>
+            <UserPlus className="w-4 h-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-[10px] font-black text-slate-400 uppercase tracking-wider">
+              Customer Account
+            </div>
+            <div className="text-xs sm:text-sm font-black text-slate-900 truncate">
+              {selectedCustomer ? (
+                <span>
+                  {selectedCustomer.name}{' '}
+                  {selectedCustomer.phone && (
+                    <span className="text-slate-400 font-normal">({selectedCustomer.phone})</span>
+                  )}
+                </span>
+              ) : (
+                <span className="text-slate-500 font-semibold">Walk-in Customer (Unregistered)</span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center space-x-1.5 shrink-0">
+          {selectedCustomer && (
+            <button
+              type="button"
+              onClick={() => onSelectCustomer(null)}
+              className="px-2.5 py-1.5 text-[11px] font-bold text-slate-400 hover:text-rose-600 rounded-xl hover:bg-rose-50 transition"
+              title="Switch to Walk-in customer"
+            >
+              Clear
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onOpenCustomerModal}
+            className="px-3 py-1.5 rounded-xl bg-purple-50 hover:bg-purple-100 text-[#6A4DFF] text-xs font-black transition active:scale-95 border border-purple-200"
+          >
+            {selectedCustomer ? 'Change' : '+ Select Customer'}
+          </button>
+        </div>
+      </div>
+
       {/* 2. Cart Items Container (Exact compact tile size from Screenshot Desired 2) */}
       <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
         {cart.length === 0 ? (
@@ -373,94 +429,35 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
             </button>
           </div>
         ) : (
-          <div className="divide-y divide-slate-100">
-            {cart.map((item) => {
-              const unitPrice =
-                item.customPrice !== undefined ? item.customPrice : item.product.price;
-              const lineTotal = unitPrice * item.quantity;
-              const isOOS = item.product.stockQuantity === 0;
-              const isFractional = item.isFractional || item.product.sellByFraction;
-              const unitLabel = item.fractionUnit || item.product.fractionUnit || item.product.unit || 'unit';
+          <div>
+            {/* Gesture shortcut tips for cashiers */}
+            <div className="px-3.5 py-1.5 bg-slate-50 border-b border-slate-100 flex items-center justify-between text-[11px] font-bold text-slate-500">
+              <span className="flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 inline-block" />
+                Tap to <strong>+1</strong> • Hold 500ms to <strong>-1</strong> • Hold 2s to <strong>remove</strong>
+              </span>
+              <span className="text-[10px] text-slate-400 font-semibold hidden sm:inline">
+                Pencil to edit
+              </span>
+            </div>
 
-              return (
-                <div
+            <div className="divide-y divide-slate-100">
+              {cart.map((item) => (
+                <CartItemGestureRow
                   key={item.product.id}
-                  onClick={() => handleStartEdit(item)}
-                  className="p-3 sm:p-3.5 hover:bg-slate-50/80 transition cursor-pointer flex flex-col justify-between"
-                >
-                  {/* Top Line: Item Name & Edit Pencil (Desired 2) */}
-                  <div className="flex items-start justify-between space-x-2">
-                    <div className="flex-1">
-                      <h4 className="text-xs sm:text-sm font-black text-slate-900 leading-snug break-words">
-                        {item.product.name}
-                      </h4>
-                      {isFractional && (
-                        <div className="flex items-center gap-1 mt-0.5">
-                          <span className="text-[10px] font-bold text-emerald-800 bg-emerald-100 px-1.5 py-0.5 rounded border border-emerald-200 inline-flex items-center gap-0.5">
-                            <Scale className="w-2.5 h-2.5" />
-                            <span>Fractional ({unitLabel})</span>
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleStartEdit(item);
-                      }}
-                      title="Edit quantity & price"
-                      className="p-1 text-slate-400 hover:text-blue-600 transition shrink-0"
-                    >
-                      <Pencil className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-
-                  {/* Bottom Line: Multiplier & Line Total (Desired 2) */}
-                  <div className="flex items-end justify-between mt-1">
-                    <div>
-                      <div className="flex items-center space-x-1 font-mono-num text-xs sm:text-sm">
-                        <span className="font-black text-[#2E7D32]">
-                          {typeof item.quantity === 'number'
-                            ? item.quantity % 1 === 0
-                              ? item.quantity
-                              : item.quantity.toFixed(3).replace(/\.?0+$/, '')
-                            : String(item.quantity)}{' '}
-                          {isFractional ? unitLabel : ''} x
-                        </span>
-                        <span className="font-bold text-slate-900">
-                          ${unitPrice % 1 === 0 ? unitPrice : unitPrice.toFixed(2)}
-                          {isFractional ? `/${unitLabel}` : ''}
-                        </span>
-                      </div>
-
-                      {/* Stock Status */}
-                      {isOOS ? (
-                        <div className="text-[9px] font-black text-rose-600 uppercase tracking-tight mt-0.5">
-                          OUT OF STOCK
-                        </div>
-                      ) : (
-                        <div className="text-[10px] text-slate-400 font-medium">
-                          In stock: {item.product.stockQuantity} {isFractional ? unitLabel : ''}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Line Total */}
-                    <div className="text-right">
-                      <span className="font-mono-num text-sm sm:text-base font-black text-slate-900">
-                        ${lineTotal % 1 === 0 ? lineTotal : lineTotal.toFixed(2)}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
+                  item={item}
+                  onUpdateQuantity={onUpdateQuantity}
+                  onRemoveItem={onRemoveItem}
+                  onStartEdit={handleStartEdit}
+                  onRequestRemoveDialog={(it) => setItemToRemoveDialog(it)}
+                />
+              ))}
+            </div>
           </div>
         )}
       </div>
 
-      {/* 3. "Add New Item" Button + Barcode Scan Button (Desired 2) */}
+      {/* 3. "Add New Item" Button + Quick Item + Barcode Scan Button */}
       <div className="flex items-center space-x-2">
         <button
           type="button"
@@ -468,6 +465,15 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
           className="flex-1 py-3 px-4 rounded-2xl bg-white hover:bg-slate-50 border border-slate-300 text-[#1E40AF] font-black text-xs sm:text-sm tracking-wide shadow-sm flex items-center justify-center transition active:scale-[0.99]"
         >
           Add New Item
+        </button>
+        <button
+          type="button"
+          onClick={() => setShowQuickAddModal(true)}
+          title="Quick Add Unlisted Product to Inventory & Counter"
+          className="py-3 px-3.5 rounded-2xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-emerald-800 font-black text-xs tracking-wide shadow-sm flex items-center justify-center space-x-1.5 transition active:scale-95 shrink-0"
+        >
+          <Sparkles className="w-4 h-4 text-emerald-600" />
+          <span>+ Quick Item</span>
         </button>
         <button
           type="button"
@@ -1065,6 +1071,61 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
           onAuthorize={managerPinModalConfig.onAuthorize}
         />
       )}
+
+      {/* 13. Gesture 2-Second Hold: "Remove Item?" Confirmation Dialog */}
+      {itemToRemoveDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-white rounded-3xl w-full max-w-sm overflow-hidden shadow-2xl p-5 space-y-4 text-slate-900 border border-slate-200">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center shrink-0">
+                <Trash2 className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-slate-900">Remove Item?</h3>
+                <p className="text-xs text-slate-500">
+                  Are you sure you want to remove this item from the cart?
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-50 rounded-2xl border border-slate-200 text-xs font-bold text-slate-800">
+              {itemToRemoveDialog.product.name}
+            </div>
+
+            <div className="flex items-center space-x-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setItemToRemoveDialog(null)}
+                className="flex-1 py-2.5 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  onRemoveItem(itemToRemoveDialog.product.id);
+                  setItemToRemoveDialog(null);
+                }}
+                className="flex-1 py-2.5 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white font-black text-xs shadow-md transition active:scale-95"
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 14. Quick Add Product Modal from Counter */}
+      <QuickAddProductModal
+        isOpen={showQuickAddModal}
+        onClose={() => setShowQuickAddModal(false)}
+        onProductCreated={(newProd) => {
+          if (onQuickAddProduct) {
+            onQuickAddProduct(newProd);
+          }
+          setShowQuickAddModal(false);
+        }}
+      />
     </div>
   );
 };

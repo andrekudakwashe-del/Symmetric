@@ -296,6 +296,12 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     setCart((prev) => prev.filter((item) => item.product.id !== productId));
   };
 
+  const handleQuickAddProduct = (newProduct: Product) => {
+    setProducts((prev) => [newProduct, ...prev.filter((p) => p.id !== newProduct.id)]);
+    addToCart(newProduct);
+    showToast(`Added "${newProduct.name}" to inventory & cart!`);
+  };
+
   const clearCart = () => {
     setCart([]);
     setDiscountInput('0');
@@ -406,8 +412,18 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       tax: taxAmount,
       total: cartTotal,
       paymentMethod,
-      cashTendered: paymentMethod === 'Cash' ? parsedCashTendered : undefined,
-      changeDue: paymentMethod === 'Cash' ? cashChangeDue : undefined,
+      cashTendered:
+        paymentMethod === 'Cash'
+          ? parsedCashTendered > 0
+            ? parsedCashTendered
+            : cartTotal
+          : undefined,
+      changeDue:
+        paymentMethod === 'Cash'
+          ? parsedCashTendered > 0
+            ? Math.max(0, parsedCashTendered - cartTotal)
+            : 0
+          : undefined,
       changeLeftBehind: paymentMethod === 'Cash' ? changeLeftBehind : undefined,
       creditDueDate: paymentMethod === 'Credit' ? creditDueDate : undefined,
       creditDeposit: paymentMethod === 'Credit' ? parsedCreditDeposit : undefined,
@@ -460,9 +476,12 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
           onAddToCart={addToCart}
           onAddFractionalToCart={addFractionalToCart}
           onRemoveOneFromCart={removeOneFromCart}
+          onUpdateQuantity={updateQuantity}
+          onRemoveItem={removeItem}
           onGoToCounter={() => setCurrentView('counter')}
           onOpenMoreMenu={() => setCurrentView('more')}
           onOpenCustomerModal={() => setShowAddCustomerModal(true)}
+          onQuickAddProduct={handleQuickAddProduct}
         />
       )}
 
@@ -484,6 +503,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
           onCharge={handleOpenCheckout}
           onOpenMoreMenu={() => setCurrentView('more')}
           onOpenCustomerModal={() => setShowAddCustomerModal(true)}
+          onQuickAddProduct={handleQuickAddProduct}
           discountAmount={calculatedDiscount}
           discountType={discountType}
           discountInput={discountInput}

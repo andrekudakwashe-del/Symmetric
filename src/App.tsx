@@ -315,30 +315,32 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {/* Universal No-Code Report Builder & Saved Reports */}
-              <div
-                id="card-reports-nocode-builder"
-                onClick={() => setActiveTab('custom_reports')}
-                className="bg-gradient-to-br from-[#6A4DFF]/30 via-indigo-950/80 to-slate-900 border-2 border-[#6A4DFF]/60 hover:border-[#6A4DFF] rounded-3xl p-5 cursor-pointer transition active:scale-[0.99] space-y-2 group shadow-xl md:col-span-2 relative overflow-hidden"
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-base font-black text-white group-hover:text-purple-300 flex items-center gap-2">
-                    <span className="text-xl">✨</span>
-                    <span>Universal No-Code Report Builder &amp; Saved Reports</span>
-                  </span>
-                  <div className="flex items-center space-x-2">
-                    <span className="px-2.5 py-0.5 rounded-full bg-purple-500/30 text-purple-200 text-xs font-bold font-mono border border-purple-500/40">
-                      Data Dictionary Powered
+              {/* Universal No-Code Report Builder & Saved Reports (Super Admin Only) */}
+              {isSuperAdmin && (
+                <div
+                  id="card-reports-nocode-builder"
+                  onClick={() => setActiveTab('custom_reports')}
+                  className="bg-gradient-to-br from-[#6A4DFF]/30 via-indigo-950/80 to-slate-900 border-2 border-[#6A4DFF]/60 hover:border-[#6A4DFF] rounded-3xl p-5 cursor-pointer transition active:scale-[0.99] space-y-2 group shadow-xl md:col-span-2 relative overflow-hidden"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-base font-black text-white group-hover:text-purple-300 flex items-center gap-2">
+                      <span className="text-xl">✨</span>
+                      <span>Universal No-Code Report Builder &amp; Saved Reports</span>
                     </span>
-                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold font-mono border border-emerald-500/30">
-                      5-Step Wizard
-                    </span>
+                    <div className="flex items-center space-x-2">
+                      <span className="px-2.5 py-0.5 rounded-full bg-purple-500/30 text-purple-200 text-xs font-bold font-mono border border-purple-500/40">
+                        Super Admin
+                      </span>
+                      <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold font-mono border border-emerald-500/30">
+                        5-Step Wizard
+                      </span>
+                    </div>
                   </div>
+                  <p className="text-xs text-slate-300">
+                    Build ANY custom report from ANY table (Sales, Products, Inventory, Customers, Suppliers, Staff, Deliveries) without writing code. Auto-suggest joins, role-based access control, interactive charts, and CSV exports.
+                  </p>
                 </div>
-                <p className="text-xs text-slate-300">
-                  Build ANY custom report from ANY table (Sales, Products, Inventory, Customers, Suppliers, Staff, Deliveries) without writing code. Auto-suggest joins, role-based access control, interactive charts, and CSV exports.
-                </p>
-              </div>
+              )}
 
               {/* Audit Log & Security Ledger Card */}
               <div
@@ -673,6 +675,8 @@ export default function App() {
               isOpen={true}
               currentUser={currentUser}
               onClose={() => setActiveTab('home')}
+              onOpenSheetSetup={() => setIsSyncModalOpen(true)}
+              onOpenReportBuilder={() => setActiveTab('custom_reports')}
             />
           ) : (
             <div className="p-8 text-center bg-slate-900 border border-red-500/40 rounded-3xl space-y-4 max-w-lg mx-auto mt-12 shadow-2xl">
@@ -704,53 +708,122 @@ export default function App() {
           />
         )}
 
-        {/* SHEETS SYNC VIEW */}
+        {/* SHEETS SYNC VIEW (SUPER ADMIN EXCLUSIVE) */}
         {activeTab === 'sheets' && (
-          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 text-center space-y-4">
-            <h2 className="text-xl font-bold text-white">Google Sheets Integration</h2>
-            <p className="text-xs text-slate-400 max-w-md mx-auto">
-              Real-time synchronization for Customers, Cash Logs, Sales, Products, and Reconciliations.
-            </p>
-            <button
-              type="button"
-              onClick={() => setIsSyncModalOpen(true)}
-              className="px-5 py-2.5 rounded-2xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white text-xs font-bold shadow-lg"
-            >
-              Open Sync Controls
-            </button>
-          </div>
+          isSuperAdmin ? (
+            <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 text-center space-y-4 max-w-xl mx-auto my-8">
+              <div className="w-14 h-14 rounded-2xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center mx-auto text-2xl">
+                📊
+              </div>
+              <h2 className="text-xl font-bold text-white">Google Sheets Master Sync &amp; Setup</h2>
+              <p className="text-xs text-slate-400 max-w-md mx-auto">
+                Real-time synchronization for Customers, Cash Logs, Sales, Products, and Reconciliations across all tenant sheets.
+              </p>
+              <div className="flex gap-3 justify-center">
+                <button
+                  type="button"
+                  onClick={() => setIsSyncModalOpen(true)}
+                  className="px-5 py-2.5 rounded-2xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white text-xs font-bold shadow-lg cursor-pointer transition active:scale-95"
+                >
+                  Open Live Sync Controls
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsSuperAdminModalOpen(true)}
+                  className="px-5 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold cursor-pointer transition"
+                >
+                  Super Admin Sheet Hub
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="p-8 text-center bg-slate-900 border border-red-500/40 rounded-3xl space-y-4 max-w-lg mx-auto mt-12 shadow-2xl">
+              <div className="w-16 h-16 rounded-full bg-red-500/20 text-red-400 flex items-center justify-center mx-auto text-3xl">
+                🛡️
+              </div>
+              <h2 className="text-xl font-black text-white">Access Restricted</h2>
+              <p className="text-sm text-slate-400 leading-relaxed">
+                Google Sheets setup and live synchronization are platform Super Admin functions. Store owners cannot modify or connect sheets directly.
+              </p>
+              <button
+                type="button"
+                onClick={() => setActiveTab('home')}
+                className="px-6 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm font-bold transition cursor-pointer"
+              >
+                Return to POS Home
+              </button>
+            </div>
+          )
         )}
 
-        {/* UNIVERSAL NO-CODE REPORT BUILDER (5-STEP WIZARD) */}
+        {/* UNIVERSAL NO-CODE REPORT BUILDER (SUPER ADMIN ONLY) */}
         {activeTab === 'report_builder' && (
-          <UniversalReportBuilder
-            currentUser={currentUser}
-            initialTemplateId={editingReportTemplateId}
-            onClose={() => {
-              setEditingReportTemplateId(null);
-              setActiveTab('custom_reports');
-            }}
-            onSaved={(saved) => {
-              setEditingReportTemplateId(null);
-              setActiveTab('custom_reports');
-            }}
-          />
+          isSuperAdmin ? (
+            <UniversalReportBuilder
+              currentUser={currentUser}
+              initialTemplateId={editingReportTemplateId}
+              onClose={() => {
+                setEditingReportTemplateId(null);
+                setActiveTab('custom_reports');
+              }}
+              onSaved={(saved) => {
+                setEditingReportTemplateId(null);
+                setActiveTab('custom_reports');
+              }}
+            />
+          ) : (
+            <div className="p-8 text-center bg-slate-900 border border-red-500/40 rounded-3xl space-y-4 max-w-lg mx-auto mt-12 shadow-2xl">
+              <div className="w-16 h-16 rounded-full bg-red-500/20 text-red-400 flex items-center justify-center mx-auto text-3xl">
+                🛡️
+              </div>
+              <h2 className="text-xl font-black text-white">Access Restricted</h2>
+              <p className="text-sm text-slate-400 leading-relaxed">
+                The Universal Report Builder is a Super Admin function. Store owners and staff cannot build or modify custom multi-table report definitions.
+              </p>
+              <button
+                type="button"
+                onClick={() => setActiveTab('reports')}
+                className="px-6 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm font-bold transition cursor-pointer"
+              >
+                Return to Standard Reports
+              </button>
+            </div>
+          )
         )}
 
-        {/* SAVED CUSTOM REPORTS DIRECTORY (ROLE-PERMITTED) */}
+        {/* SAVED CUSTOM REPORTS DIRECTORY (SUPER ADMIN ONLY) */}
         {activeTab === 'custom_reports' && (
-          <CustomReportsListView
-            currentUser={currentUser}
-            onCreateNewReport={() => {
-              setEditingReportTemplateId(null);
-              setActiveTab('report_builder');
-            }}
-            onEditReport={(templateId) => {
-              setEditingReportTemplateId(templateId);
-              setActiveTab('report_builder');
-            }}
-            onBack={() => setActiveTab('reports')}
-          />
+          isSuperAdmin ? (
+            <CustomReportsListView
+              currentUser={currentUser}
+              onCreateNewReport={() => {
+                setEditingReportTemplateId(null);
+                setActiveTab('report_builder');
+              }}
+              onEditReport={(templateId) => {
+                setEditingReportTemplateId(templateId);
+                setActiveTab('report_builder');
+              }}
+              onBack={() => setActiveTab('reports')}
+            />
+          ) : (
+            <div className="p-8 text-center bg-slate-900 border border-red-500/40 rounded-3xl space-y-4 max-w-lg mx-auto mt-12 shadow-2xl">
+              <div className="w-16 h-16 rounded-full bg-red-500/20 text-red-400 flex items-center justify-center mx-auto text-3xl">
+                🛡️
+              </div>
+              <h2 className="text-xl font-black text-white">Access Restricted</h2>
+              <p className="text-sm text-slate-400 leading-relaxed">
+                Custom No-Code Report management is a Super Admin function. Store owners cannot modify or configure report templates.
+              </p>
+              <button
+                type="button"
+                onClick={() => setActiveTab('reports')}
+                className="px-6 py-2.5 bg-slate-800 hover:bg-slate-700 text-white rounded-xl text-sm font-bold transition cursor-pointer"
+              >
+                Return to Standard Reports
+              </button>
+            </div>
+          )
         )}
 
         {/* SCALABLE P2P WIFI MESH SYNC HUB */}
@@ -798,6 +871,8 @@ export default function App() {
           isOpen={isSuperAdminModalOpen}
           currentUser={currentUser}
           onClose={() => setIsSuperAdminModalOpen(false)}
+          onOpenSheetSetup={() => setIsSyncModalOpen(true)}
+          onOpenReportBuilder={() => setActiveTab('custom_reports')}
         />
       )}
 

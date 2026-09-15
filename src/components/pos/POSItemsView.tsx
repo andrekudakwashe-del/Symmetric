@@ -1,6 +1,9 @@
 import React, { useState, useMemo } from 'react';
 import { Product, CartItem, Salesperson, ActiveTab } from '../../types';
 import { FractionalWeightModal } from './FractionalWeightModal';
+import { QuickAddProductModal } from './QuickAddProductModal';
+import { ProductGestureCard } from './ProductGestureCard';
+import { ProductGestureListRow } from './ProductGestureListRow';
 import {
   Menu,
   LayoutGrid,
@@ -18,6 +21,10 @@ import {
   ArrowRight,
   Filter,
   Scale,
+  Sparkles,
+  Trash2,
+  AlertCircle,
+  X,
 } from 'lucide-react';
 
 interface POSItemsViewProps {
@@ -25,10 +32,13 @@ interface POSItemsViewProps {
   cart: CartItem[];
   onAddToCart: (product: Product) => void;
   onAddFractionalToCart?: (product: Product, quantity: number, customPrice?: number, notes?: string) => void;
-  onRemoveOneFromCart?: (product: Product) => void;
+  onRemoveOneFromCart: (product: Product) => void;
+  onUpdateQuantity?: (productId: string, delta: number) => void;
+  onRemoveItem?: (productId: string) => void;
   onGoToCounter: () => void;
   onOpenMoreMenu?: () => void;
   onOpenCustomerModal?: () => void;
+  onQuickAddProduct?: (product: Product) => void;
   initialSearch?: string;
 }
 
@@ -48,9 +58,12 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
   onAddToCart,
   onAddFractionalToCart,
   onRemoveOneFromCart,
+  onUpdateQuantity,
+  onRemoveItem,
   onGoToCounter,
   onOpenMoreMenu,
   onOpenCustomerModal,
+  onQuickAddProduct,
   initialSearch = '',
 }) => {
   const [searchQuery, setSearchQuery] = useState(initialSearch);
@@ -58,13 +71,37 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
   const [isListView, setIsListView] = useState<boolean>(false);
   const [quickScanOpen, setQuickScanOpen] = useState<boolean>(false);
   const [fractionalModalProduct, setFractionalModalProduct] = useState<Product | null>(null);
+  const [isQuickAddOpen, setIsQuickAddOpen] = useState<boolean>(false);
+  const [removeConfirmProduct, setRemoveConfirmProduct] = useState<Product | null>(null);
 
-  const handleProductClick = (product: Product) => {
+  const handleProductTap = (product: Product) => {
     if (product.sellByFraction) {
       setFractionalModalProduct(product);
     } else {
-      onAddToCart(product);
+      if (onUpdateQuantity && cartMap.has(product.id)) {
+        onUpdateQuantity(product.id, 1);
+      } else {
+        onAddToCart(product);
+      }
     }
+  };
+
+  const handleProductDecrement = (product: Product) => {
+    if (onUpdateQuantity) {
+      const currentQty = cartMap.get(product.id) || 0;
+      if (currentQty <= 1) {
+        if (onRemoveItem) onRemoveItem(product.id);
+        else onRemoveOneFromCart(product);
+      } else {
+        onUpdateQuantity(product.id, -1);
+      }
+    } else {
+      onRemoveOneFromCart(product);
+    }
+  };
+
+  const handleRequestRemove = (product: Product) => {
+    setRemoveConfirmProduct(product);
   };
 
   // Cart helper map for O(1) lookup
@@ -156,7 +193,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
           </div>
         </div>
 
-        {/* Search Bar & Barcode Scanner */}
+        {/* Search Bar & Barcode Scanner & Quick Add Button */}
         <div className="mt-3 flex items-center space-x-2">
           <div className="relative flex-1">
             <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
@@ -185,6 +222,15 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
           >
             <ScanLine className="w-5 h-5" />
           </button>
+          <button
+            type="button"
+            onClick={() => setIsQuickAddOpen(true)}
+            title="Quick Add Product to Inventory & Cart"
+            className="h-10 px-3 rounded-2xl bg-white/20 hover:bg-white/30 text-white flex items-center space-x-1 font-black text-xs shadow-md transition transform active:scale-95 shrink-0 border border-white/30"
+          >
+            <Sparkles className="w-4 h-4 text-amber-300" />
+            <span className="hidden sm:inline">+ Quick Add</span>
+          </button>
         </div>
 
         {/* Horizontal Category Filter Pills */}
@@ -206,269 +252,171 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
         </div>
       </div>
 
+      {/* Gesture shortcut hint bar for cashiers */}
+      <div className="px-3.5 py-1.5 rounded-xl bg-purple-50/80 border border-purple-200/70 flex items-center justify-between text-[11px] font-bold text-purple-900 shadow-2xs">
+        <span className="flex items-center gap-1.5 flex-wrap">
+          <span className="w-2 h-2 rounded-full bg-[#6A4DFF] animate-pulse inline-block" />
+          <span>Tap to <strong>+1</strong></span>
+          <span className="text-purple-300">•</span>
+          <span>Hold 500ms to <strong>-1</strong></span>
+          <span className="text-purple-300">•</span>
+          <span>Hold 2s to <strong>remove</strong></span>
+        </span>
+        <span className="text-[10px] text-purple-700 bg-purple-100/80 px-2 py-0.5 rounded-full font-black hidden sm:inline">
+          {totalCartCount} in cart
+        </span>
+      </div>
+
       {/* 2. Items Display: List or Grid matching Desired 4 (Full item names, no truncation) */}
       {filteredProducts.length === 0 ? (
-        <div className="bg-white border border-slate-200 rounded-3xl p-8 text-center space-y-3 shadow-sm">
-          <div className="w-12 h-12 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mx-auto">
-            <Package className="w-6 h-6" />
+        searchQuery.trim().length > 0 ? (
+          /* Rich Quick Add Card for Admin when item is not found (e.g. searching "moss") */
+          <div className="bg-gradient-to-br from-white via-emerald-50/30 to-teal-50/40 border-2 border-dashed border-emerald-300 rounded-3xl p-6 sm:p-8 text-center space-y-4 shadow-sm animate-fadeIn">
+            <div className="w-14 h-14 rounded-2xl bg-emerald-100 text-emerald-700 flex items-center justify-center mx-auto shadow-inner">
+              <Sparkles className="w-7 h-7 text-emerald-600" />
+            </div>
+            <div>
+              <span className="text-[10px] font-black uppercase tracking-widest text-emerald-800 bg-emerald-100/90 px-3 py-1 rounded-full border border-emerald-200 inline-block mb-1.5">
+                Quick Counter Inventory
+              </span>
+              <h3 className="text-base sm:text-lg font-black text-slate-900">
+                No product found matching &ldquo;{searchQuery}&rdquo;
+              </h3>
+              <p className="text-xs text-slate-600 max-w-sm mx-auto mt-1 leading-relaxed">
+                As an admin, you can instantly register <strong>{searchQuery}</strong> into your store inventory with a name and price and sell it right now!
+              </p>
+            </div>
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5 pt-1 max-w-md mx-auto">
+              <button
+                type="button"
+                onClick={() => setIsQuickAddOpen(true)}
+                className="w-full sm:w-auto px-6 py-3 rounded-2xl bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-black text-xs sm:text-sm tracking-wide shadow-lg shadow-emerald-600/30 flex items-center justify-center space-x-2 transition transform active:scale-95"
+              >
+                <Plus className="w-4 h-4" />
+                <span>+ Quick Add &ldquo;{searchQuery}&rdquo; &amp; Sell</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                  setSelectedCategory('All');
+                }}
+                className="w-full sm:w-auto px-4 py-3 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition"
+              >
+                Reset Search
+              </button>
+            </div>
           </div>
-          <h3 className="text-sm sm:text-base font-black text-slate-800">No items match your search</h3>
-          <p className="text-xs text-slate-500 max-w-xs mx-auto">
-            Try adjusting your search query or select another category filter.
-          </p>
-          <button
-            type="button"
-            onClick={() => {
-              setSearchQuery('');
-              setSelectedCategory('All');
-            }}
-            className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold"
-          >
-            Reset Filters
-          </button>
-        </div>
+        ) : (
+          <div className="bg-white border border-slate-200 rounded-3xl p-8 text-center space-y-3 shadow-sm">
+            <div className="w-12 h-12 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mx-auto">
+              <Package className="w-6 h-6" />
+            </div>
+            <h3 className="text-sm sm:text-base font-black text-slate-800">No items match your category filter</h3>
+            <p className="text-xs text-slate-500 max-w-xs mx-auto">
+              Try selecting another category or add a new quick product.
+            </p>
+            <div className="flex items-center justify-center gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setSelectedCategory('All')}
+                className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold"
+              >
+                Show All Items
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsQuickAddOpen(true)}
+                className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-sm"
+              >
+                + Quick Add Product
+              </button>
+            </div>
+          </div>
+        )
       ) : isListView ? (
-        /* List View Mode with Full Name Display */
+        /* List View Mode with Full Gesture Support */
         <div className="space-y-2">
           {filteredProducts.map((product, idx) => {
             const qty = cartMap.get(product.id) || 0;
-            const inCart = qty > 0;
+            const avatarBg = AVATAR_COLORS[idx % AVATAR_COLORS.length];
+
             return (
-              <div
+              <ProductGestureListRow
                 key={product.id}
-                onClick={() => handleProductClick(product)}
-                className={`p-3 sm:p-3.5 rounded-2xl border transition flex items-center justify-between cursor-pointer active:scale-[0.99] ${
-                  inCart
-                    ? 'bg-slate-50 border-[#6A4DFF] shadow-sm ring-1 ring-[#6A4DFF]/30'
-                    : 'bg-white text-slate-900 border-slate-200 hover:border-slate-300'
-                }`}
-              >
-                <div className="flex items-center space-x-3 flex-1 min-w-0 pr-3">
-                  <div
-                    className={`w-10 h-10 rounded-full flex items-center justify-center text-white font-black text-xs shrink-0 shadow-sm ${
-                      inCart ? 'bg-[#9E2A2B]' : AVATAR_COLORS[idx % AVATAR_COLORS.length]
-                    }`}
-                  >
-                    {inCart ? `x ${qty}` : product.name.replace(/^[* ]+/, '').slice(0, 2).toUpperCase()}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="font-black text-xs sm:text-sm text-slate-900 leading-snug break-words flex items-center gap-1.5 flex-wrap">
-                      <span>{product.name}</span>
-                      {product.sellByFraction && (
-                        <span className="px-1.5 py-0.5 rounded bg-emerald-100 border border-emerald-300 text-emerald-800 text-[10px] font-black flex items-center gap-0.5">
-                          <Scale className="w-2.5 h-2.5" />
-                          <span>By {product.fractionUnit || 'kg'}</span>
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-[11px] text-slate-500 font-medium flex items-center space-x-2 mt-0.5">
-                      <span>{product.category || 'General'}</span>
-                      <span>•</span>
-                      <span>{product.unit || 'Each'}</span>
-                      {product.stockQuantity !== undefined && (
-                        <>
-                          <span>•</span>
-                          <span className={product.stockQuantity === 0 ? 'text-rose-600 font-bold' : 'text-emerald-600 font-bold'}>
-                            {product.stockQuantity} in stock
-                          </span>
-                        </>
-                      )}
-                    </div>
-
-                    {/* Quick Variant Pills in List View */}
-                    {product.packagingVariants && product.packagingVariants.length > 0 && !product.variantId && (
-                      <div className="flex flex-wrap gap-1 mt-1.5" onClick={(e) => e.stopPropagation()}>
-                        {product.packagingVariants.map((v) => {
-                          const vProd = products.find((p) => p.id === `${product.id.replace(/-UNIT$|-CASE$/, '')}__${v.id}`);
-                          return (
-                            <button
-                              key={v.id}
-                              type="button"
-                              onClick={() => {
-                                if (vProd) onAddToCart(vProd);
-                                else {
-                                  onAddToCart({
-                                    ...product,
-                                    id: `${product.id.replace(/-UNIT$|-CASE$/, '')}__${v.id}`,
-                                    name: `${product.name.replace(/ Each$/, '')} (${v.name})`,
-                                    price: v.sellPrice,
-                                    unit: v.name,
-                                    variantId: v.id,
-                                    unitsPerPack: v.unitsPerPack,
-                                  });
-                                }
-                              }}
-                              className="px-2 py-0.5 rounded-lg bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-700 text-[10px] font-bold transition active:scale-95 flex items-center gap-1"
-                            >
-                              <span>{v.name}</span>
-                              <span className="font-mono text-purple-900">${v.sellPrice.toFixed(2)}</span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex items-center space-x-3 shrink-0">
-                  <div className="font-mono-num font-black text-xs sm:text-sm text-[#1E40AF]">
-                    ${product.price % 1 === 0 ? product.price : product.price.toFixed(2)}
-                    {product.sellByFraction && <span className="text-[10px] text-slate-500 font-normal block text-right">/{product.fractionUnit || 'kg'}</span>}
-                  </div>
-                  {product.sellByFraction ? (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setFractionalModalProduct(product);
-                      }}
-                      className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white flex items-center space-x-1 font-bold text-xs shadow-sm transition active:scale-95"
-                    >
-                      <Scale className="w-3.5 h-3.5" />
-                      <span>Calc</span>
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onAddToCart(product);
-                      }}
-                      className="w-8 h-8 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white flex items-center justify-center font-bold shadow-sm transition active:scale-95"
-                    >
-                      <Plus className="w-4 h-4" />
-                    </button>
-                  )}
-                </div>
-              </div>
+                product={product}
+                quantityInCart={qty}
+                avatarBg={avatarBg}
+                onTap={handleProductTap}
+                onDecrement={handleProductDecrement}
+                onRequestRemove={handleRequestRemove}
+              />
             );
           })}
         </div>
       ) : (
-        /* Grid View Mode matching Desired 4 (Full Name Visibility, No Clipping) */
+        /* Grid View Mode matching Screenshot with Full Gesture Support */
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5 sm:gap-3">
           {filteredProducts.map((product, idx) => {
             const qty = cartMap.get(product.id) || 0;
-            const inCart = qty > 0;
             const avatarBg = AVATAR_COLORS[idx % AVATAR_COLORS.length];
 
             return (
-              <div
+              <ProductGestureCard
                 key={product.id}
-                id={`product-card-${product.id}`}
-                onClick={() => handleProductClick(product)}
-                className={`relative rounded-2xl border p-3 sm:p-3.5 flex flex-col justify-between text-center cursor-pointer transition transform active:scale-95 shadow-sm min-h-[185px] ${
-                  inCart
-                    ? 'bg-slate-50 border-purple-400 text-slate-950 ring-2 ring-[#6A4DFF]/30'
-                    : 'bg-white text-slate-900 border-slate-200 hover:border-slate-300 hover:shadow-md'
-                }`}
-              >
-                {/* Stock Indicator Top-Right Badge */}
-                {product.sellByFraction ? (
-                  <span className="absolute top-2 right-2 text-[9px] font-black px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-0.5">
-                    <Scale className="w-2.5 h-2.5" />
-                    <span>By {product.fractionUnit || 'kg'}</span>
-                  </span>
-                ) : product.stockQuantity === 0 && (!product.stockCases || product.stockCases === 0) ? (
-                  <span className="absolute top-2 right-2 text-[9px] font-black px-1.5 py-0.5 rounded bg-rose-100 text-rose-700">
-                    OOS
-                  </span>
-                ) : (
-                  <span className="absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
-                    {product.stockQuantity} {product.unit || 'units'}
-                  </span>
-                )}
-
-                {/* Circular Avatar / Cart Count (Desired 4) */}
-                <div className="flex justify-center mt-1 mb-2">
-                  <div
-                    className={`w-13 h-13 sm:w-14 sm:h-14 rounded-full flex items-center justify-center text-white shadow-md transition-transform ${
-                      inCart
-                        ? 'bg-[#8B0000] scale-105 ring-2 ring-rose-400' // Burgundy badge for active cart selection
-                        : avatarBg
-                    }`}
-                    style={{ width: '3.25rem', height: '3.25rem' }}
-                  >
-                    {inCart ? (
-                      <span className="text-sm font-black tracking-tighter">
-                        x {qty}
-                      </span>
-                    ) : (
-                      <span className="text-xs font-bold opacity-90">
-                        {product.name.replace(/^[* ]+/, '').slice(0, 2).toUpperCase()}
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                {/* Product Name (Full Name Display, wrapping cleanly without truncation - Desired 4) */}
-                <div className="w-full flex-1 flex flex-col justify-center my-1">
-                  <h4 className="text-xs sm:text-sm font-black tracking-tight text-slate-900 leading-snug break-words">
-                    {product.name}
-                  </h4>
-
-                  {/* Variant / Category description */}
-                  <div className="text-[10px] sm:text-[11px] text-slate-500 font-medium break-words mt-0.5">
-                    {product.category || 'General'} {product.unit && product.unit !== 'Each' ? `(${product.unit})` : ''}
-                  </div>
-
-                  {/* Fractional quick indicator */}
-                  {product.sellByFraction && (
-                    <div className="mt-1">
-                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
-                        <Scale className="w-3 h-3" />
-                        <span>Weight / Price Factor</span>
-                      </span>
-                    </div>
-                  )}
-
-                  {/* Variant Quick Pills for Grid View */}
-                  {product.packagingVariants && product.packagingVariants.length > 0 && !product.variantId && (
-                    <div className="flex flex-wrap justify-center gap-1 mt-1.5" onClick={(e) => e.stopPropagation()}>
-                      {product.packagingVariants.map((v) => {
-                        const vProd = products.find((p) => p.id === `${product.id.replace(/-UNIT$|-CASE$/, '')}__${v.id}`);
-                        return (
-                          <button
-                            key={v.id}
-                            type="button"
-                            onClick={() => {
-                              if (vProd) onAddToCart(vProd);
-                              else {
-                                onAddToCart({
-                                  ...product,
-                                  id: `${product.id.replace(/-UNIT$|-CASE$/, '')}__${v.id}`,
-                                  name: `${product.name.replace(/ Each$/, '')} (${v.name})`,
-                                  price: v.sellPrice,
-                                  unit: v.name,
-                                  variantId: v.id,
-                                  unitsPerPack: v.unitsPerPack,
-                                });
-                              }
-                            }}
-                            className="px-1.5 py-0.5 rounded-md bg-purple-50 hover:bg-purple-100 border border-purple-200 text-purple-750 text-[9px] font-bold transition active:scale-95 flex items-center gap-0.5 shadow-2xs"
-                            title={`Add ${v.name} for $${v.sellPrice.toFixed(2)}`}
-                          >
-                            <span>{v.name}</span>
-                            <span className="font-mono text-purple-900">${v.sellPrice.toFixed(2)}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-
-                {/* Price tag (e.g. $2.50, $0.50) matching Desired 4 */}
-                <div className="mt-1 pt-1 border-t border-slate-100 flex items-center justify-between font-mono-num text-xs sm:text-sm font-black text-[#1E40AF]">
-                  <span>${product.price % 1 === 0 ? product.price : product.price.toFixed(2)}</span>
-                  {product.sellByFraction && (
-                    <span className="text-[10px] text-emerald-700 font-bold bg-emerald-100/70 px-1.5 py-0.5 rounded">
-                      /{product.fractionUnit || 'kg'}
-                    </span>
-                  )}
-                </div>
-              </div>
+                product={product}
+                quantityInCart={qty}
+                avatarBg={avatarBg}
+                onTap={handleProductTap}
+                onDecrement={handleProductDecrement}
+                onRequestRemove={handleRequestRemove}
+              />
             );
           })}
+        </div>
+      )}
+
+      {/* Remove Item from Sale Confirmation Modal (Triggered by 2-Second Long Hold) */}
+      {removeConfirmProduct && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/65 backdrop-blur-xs animate-fadeIn">
+          <div className="bg-white rounded-3xl p-5 max-w-sm w-full shadow-2xl border border-slate-100 space-y-4 text-center animate-scaleUp">
+            <div className="w-13 h-13 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center mx-auto shadow-inner">
+              <Trash2 className="w-7 h-7" />
+            </div>
+            <div>
+              <h3 className="text-base font-black text-slate-900">Remove from Sale Cart?</h3>
+              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                Are you sure you want to remove{' '}
+                <strong className="text-slate-900 font-black">
+                  {cartMap.get(removeConfirmProduct.id) || 1}x {removeConfirmProduct.name}
+                </strong>{' '}
+                from the current sale cart?
+              </p>
+            </div>
+            <div className="flex items-center space-x-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setRemoveConfirmProduct(null)}
+                className="flex-1 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (onRemoveItem) {
+                    onRemoveItem(removeConfirmProduct.id);
+                  } else {
+                    onRemoveOneFromCart(removeConfirmProduct);
+                  }
+                  setRemoveConfirmProduct(null);
+                }}
+                className="flex-1 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs shadow-md transition active:scale-95"
+              >
+                Remove Item
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -495,6 +443,22 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
           }}
         />
       )}
+
+      {/* Quick Add Product Modal for Instant Counter Sale */}
+      <QuickAddProductModal
+        isOpen={isQuickAddOpen}
+        initialName={searchQuery.trim()}
+        onClose={() => setIsQuickAddOpen(false)}
+        onProductCreated={(prod) => {
+          if (onQuickAddProduct) {
+            onQuickAddProduct(prod);
+          } else {
+            onAddToCart(prod);
+          }
+          setSearchQuery('');
+          setIsQuickAddOpen(false);
+        }}
+      />
 
       {/* 3. Sticky Bottom Green "Go To Counter" Button (Matching Desired 2 & 4) */}
       <div className="fixed bottom-14 left-0 right-0 z-20 px-3 sm:px-4 pointer-events-auto">

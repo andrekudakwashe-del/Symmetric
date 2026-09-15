@@ -57,7 +57,12 @@ export const CustomReportsListView: React.FC<CustomReportsListViewProps> = ({
     mapUserRoleToRoleId(currentUser.role)
   );
 
-  const isSuperAdmin = simulatedRole === 'super_admin';
+  const isActualSuperAdmin =
+    currentUser.role === 'SUPER_ADMIN' ||
+    (currentUser.role as string) === 'super_admin' ||
+    currentUser.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+
+  const isSuperAdmin = isActualSuperAdmin && simulatedRole === 'super_admin';
 
   const loadReports = () => {
     const list = getUserPermittedReports(simulatedRole);
@@ -149,25 +154,27 @@ export const CustomReportsListView: React.FC<CustomReportsListViewProps> = ({
 
         {/* Role Selector & Create Button */}
         <div className="flex flex-wrap items-center gap-3">
-          {/* Quick Role Simulation Selector for Testing RBAC */}
-          <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-1.5 flex items-center space-x-1.5">
-            <Shield className="w-4 h-4 text-purple-400 ml-2" />
-            <span className="text-[11px] font-bold text-slate-400 mr-1">View as:</span>
-            {(['super_admin', 'manager', 'accountant', 'cashier'] as RoleId[]).map((r) => (
-              <button
-                key={r}
-                type="button"
-                onClick={() => setSimulatedRole(r)}
-                className={`px-2.5 py-1 rounded-xl text-[11px] font-bold font-mono transition ${
-                  simulatedRole === r
-                    ? 'bg-purple-600 text-white shadow-md'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                {r.replace('_', ' ').toUpperCase()}
-              </button>
-            ))}
-          </div>
+          {/* Quick Role Simulation Selector for Testing RBAC (Super Admin Only) */}
+          {isActualSuperAdmin && (
+            <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-1.5 flex items-center space-x-1.5">
+              <Shield className="w-4 h-4 text-purple-400 ml-2" />
+              <span className="text-[11px] font-bold text-slate-400 mr-1">View as:</span>
+              {(['super_admin', 'manager', 'accountant', 'cashier'] as RoleId[]).map((r) => (
+                <button
+                  key={r}
+                  type="button"
+                  onClick={() => setSimulatedRole(r)}
+                  className={`px-2.5 py-1 rounded-xl text-[11px] font-bold font-mono transition ${
+                    simulatedRole === r
+                      ? 'bg-purple-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {r.replace('_', ' ').toUpperCase()}
+                </button>
+              ))}
+            </div>
+          )}
 
           {/* New Report Button (Super Admin) */}
           {isSuperAdmin && (
