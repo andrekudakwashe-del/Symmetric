@@ -24,7 +24,10 @@ import {
 } from '../../db/roomDatabase';
 
 interface InventorySetupViewProps {
-  onRefreshAll: () => void;
+  onRefreshAll?: () => void;
+  currentUser?: any;
+  onGoToMaster?: () => void;
+  onGoToHome?: () => void;
 }
 
 export const InventorySetupView: React.FC<InventorySetupViewProps> = ({ onRefreshAll }) => {

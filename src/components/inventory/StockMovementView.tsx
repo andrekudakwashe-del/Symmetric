@@ -28,6 +28,7 @@ import {
 
 interface StockMovementViewProps {
   currentUser: Salesperson | null;
+  onTriggerGRN?: (itemId?: string) => void;
 }
 
 export const StockMovementView: React.FC<StockMovementViewProps> = ({ currentUser }) => {
@@ -305,8 +306,8 @@ export const StockMovementView: React.FC<StockMovementViewProps> = ({ currentUse
             className="w-full py-2 px-3 bg-white border border-slate-300 rounded-xl text-xs font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900 shadow-sm"
           >
             <option value="ALL">All Products / Items</option>
-            {items.map((i) => (
-              <option key={i.itemId} value={i.itemId}>
+            {items.map((i, idx) => (
+              <option key={`${i.itemId}-${idx}`} value={i.itemId}>
                 {i.itemId} — {i.itemName}
               </option>
             ))}
@@ -441,8 +442,8 @@ export const StockMovementView: React.FC<StockMovementViewProps> = ({ currentUse
                   onChange={(e) => setAdjItemId(e.target.value)}
                   className="w-full py-2.5 px-3 bg-white border border-slate-300 rounded-xl text-sm font-bold text-slate-950 focus:outline-none focus:ring-2 focus:ring-slate-900 shadow-sm"
                 >
-                  {items.map((i) => (
-                    <option key={i.itemId} value={i.itemId}>
+                  {items.map((i, idx) => (
+                    <option key={`${i.itemId}-${idx}`} value={i.itemId}>
                       {i.itemId} — {i.itemName} ({i.stockCases} cs, {i.stockSingles} ea)
                     </option>
                   ))}

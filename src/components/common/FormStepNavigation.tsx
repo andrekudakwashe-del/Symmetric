@@ -23,10 +23,10 @@ export const FormStepNavigation: React.FC<FormStepNavigationProps> = ({
   isAdmin = false,
 }) => {
   const steps = [
-    { num: 1, label: 'Form 1: Cash Count', short: 'Cash Count' },
-    { num: 2, label: 'Form 2: Cash Log', short: 'Cash Log' },
-    { num: 3, label: 'Form 3: Customer Change & Credit', short: 'Change & Credit' },
-    ...(isAdmin ? [{ num: 4, label: 'Form 4: Admin Balancing', short: 'Admin Balancing' }] : []),
+    { num: 1, label: 'Form 1: Physical Cash Count', short: '1. Cash Count' },
+    { num: 2, label: 'Form 2: Daily Cash Log (Cashier EOD)', short: '2. Cash Log (Final)' },
+    { num: 3, label: 'Form 3: Customer Change & Credit (Optional)', short: '3. Change & Credit' },
+    ...(isAdmin ? [{ num: 4, label: 'Form 4: Supervisor End-of-Day Balancing', short: '4. Supervisor EOD' }] : []),
   ];
 
   return (

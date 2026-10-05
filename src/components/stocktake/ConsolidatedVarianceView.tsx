@@ -146,8 +146,48 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
     document.body.removeChild(link);
   };
 
+  const totalCustomerHeld = consolidated.reduce((acc, i) => acc + (i.customerHeldStockUnits || 0), 0);
+  const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
+  const countTypeLabel =
+    session.countType === 'DAILY_BLIND'
+      ? 'Daily Blind Count (Fast Movers)'
+      : session.countType === 'SPOT_CHECK'
+      ? 'Supervisor Spot Check'
+      : session.countType === 'WEEKLY_STRATEGIC'
+      ? 'Weekly Strategic Count'
+      : 'Full Storewide Lockdown Audit';
+
   return (
     <div className="space-y-4">
+      {/* Count Type Scope & Committal Banner */}
+      <div
+        className={`p-4 rounded-xl border flex flex-col md:flex-row items-start md:items-center justify-between gap-3 text-xs ${
+          isFullLockdown
+            ? 'bg-rose-950/30 border-rose-800/60 text-rose-200'
+            : 'bg-blue-950/30 border-blue-800/60 text-blue-200'
+        }`}
+      >
+        <div className="flex items-center gap-2.5">
+          <Info className="w-4 h-4 shrink-0 text-blue-400" />
+          <div>
+            <strong className="text-white block font-semibold">
+              Audit Scope: {countTypeLabel}
+            </strong>
+            <p className="text-[11px] text-slate-300 mt-0.5">
+              {isFullLockdown
+                ? 'Storewide Full Lockdown: Approval will commit all lines; uncounted catalog items default to 0 units on hand.'
+                : 'Targeted Count Mode: Approval will commit ONLY the lines counted in this session. Uncounted items in the catalog remain untouched.'}
+            </p>
+          </div>
+        </div>
+
+        {totalCustomerHeld > 0 && (
+          <div className="bg-amber-950/60 border border-amber-800/80 px-3 py-1.5 rounded-lg text-amber-300 text-xs font-semibold shrink-0 flex items-center gap-1.5">
+            <span>Customer Goods Held: <strong>-{totalCustomerHeld} units</strong> reconciled</span>
+          </div>
+        )}
+      </div>
+
       {/* KPI Metric Summary Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="bg-slate-800/80 p-3.5 rounded-xl border border-slate-700">
@@ -331,13 +371,13 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
-              {filteredItems.map((item) => {
+              {filteredItems.map((item, idx) => {
                 const isExpanded = expandedItemId === item.itemId;
                 const isEditing = editingSkuId === item.itemId;
                 const upc = item.unitsPerCase || 1;
 
                 return (
-                  <React.Fragment key={item.itemId}>
+                  <React.Fragment key={`${item.itemId}-${idx}`}>
                     <tr
                       className={`hover:bg-slate-800/50 transition ${
                         item.recountRequested ? 'bg-purple-950/20' : ''
@@ -402,6 +442,11 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                             <div className="text-[10px] text-slate-400">
                               {item.countedCases} cs + {item.countedSingles} ea
                             </div>
+                            {item.customerHeldStockUnits && item.customerHeldStockUnits > 0 ? (
+                              <div className="text-[10px] text-amber-300 font-sans font-semibold mt-0.5">
+                                -{item.customerHeldStockUnits} u customer hold ({item.adjustedPhysicalUnits} u true)
+                              </div>
+                            ) : null}
                           </>
                         )}
                       </td>

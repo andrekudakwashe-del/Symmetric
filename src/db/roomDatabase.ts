@@ -10,6 +10,7 @@ import {
   SaleInvoice,
   ExpenseEntry,
   ShiftReconciliation,
+  Form4BalancingResult,
   CustomerChangeEntry,
   CreditSaleEntry,
   AdminSalesEntry,
@@ -30,10 +31,14 @@ import {
   StockTxnType,
   StockPromptResponse,
   StocktakeSession,
+  StocktakeCountType,
   StocktakeSegment,
   StocktakeLineCount,
   StocktakeVerifiedLine,
   StocktakeConsolidatedItem,
+  CustomerGoodsLeftBehind,
+  TemporaryCasualAccount,
+  FastMovingChecklistItem,
   StockBatch,
   NegativeBalanceEntry,
   AuditLogEntry,
@@ -43,7 +48,37 @@ import {
   DirectGrvTillPayment,
   GrvStatus,
   GrvType,
+  MultiCurrencyConfig,
+  CurrencyRateConfig,
+  AppCurrency,
+  CashLiftRecord,
+  StoreCreditPolicy,
+  CreditPolicyMode,
+  CompanyBranchSharingSettings,
 } from '../types';
+import {
+  addMovement,
+  updateMovement,
+  deleteMovement,
+  getMovements,
+  getAllMovements,
+  getShiftId,
+  computeDrawerBalance,
+  computeExpectedCash,
+  computeVariance,
+  approveMovement,
+  getShiftLedgerBreakdown,
+  ShiftLedgerBreakdown,
+  matchesShift,
+} from './cashLedger';
+import {
+  addCustomerLedgerEntry,
+  getCustomerLedgerEntries,
+  deleteCustomerLedgerEntry,
+  getAllCustomerLedgerEntries,
+  getDailyReceivablesDelta,
+  getDailyCustomerLedgerSummary,
+} from './customerLedger';
 import {
   Company,
   SaaSBranch,
@@ -72,8 +107,35 @@ import {
   INITIAL_STOCKTAKE_SESSIONS,
   INITIAL_AUDIT_LOGS,
 } from '../data/initialData';
+import { persistentSyncEngine } from '../services/persistentSyncEngine';
+import {
+  getDualReadDirectGrvs,
+  getDualReadSupplierInvoices,
+  getAllGoodsReceivedNotes,
+  saveGoodsReceivedNote,
+  runGrnMigration,
+} from './goodsReceivedNotes';
+import {
+  postDirectDelivery,
+  postGeneralGRV,
+  postGRN,
+  approveGRN,
+} from '../services/grnService';
+import { landedCostService } from '../services/landedCostService';
+import { LandedCostItem } from '../types';
 
-const STORAGE_KEYS = {
+export {
+  getAllGoodsReceivedNotes,
+  saveGoodsReceivedNote,
+  runGrnMigration,
+  postDirectDelivery,
+  postGeneralGRV,
+  postGRN,
+  approveGRN,
+  landedCostService,
+};
+
+export const STORAGE_KEYS = {
   SALESPEOPLE: 'saimetric_room_salespeople',
   CUSTOMERS: 'saimetric_room_customers',
   SUPPLIERS: 'saimetric_room_suppliers',
@@ -85,6 +147,7 @@ const STORAGE_KEYS = {
   STOCK_MOVEMENTS: 'saimetric_room_stock_movements',
   STOCKTAKE_SESSIONS: 'saimetric_room_stocktake_sessions',
   CASH_COUNTS: 'saimetric_room_cash_counts',
+  CASH_LIFTS: 'saimetric_room_cash_lifts',
   CASH_LOGS: 'saimetric_room_cash_logs',
   CUSTOMER_CHANGES: 'saimetric_room_customer_changes',
   CREDIT_SALES: 'saimetric_room_credit_sales',
@@ -102,10 +165,107 @@ const STORAGE_KEYS = {
   CATEGORIES: 'saimetric_room_categories',
   AUDIT_LOGS: 'saimetric_room_audit_logs',
   DIRECT_GRVS: 'saimetric_room_direct_grvs',
+  GOODS_RECEIVED_NOTES: 'saimetric_room_goods_received_notes',
   COMPANIES: 'saimetric_room_companies',
   CURRENT_COMPANY_ID: 'saimetric_room_current_company_id',
   CURRENT_BRANCH_ID: 'saimetric_room_current_branch_id',
   PERMISSIONS: 'saimetric_room_permissions',
+  EXCHANGE_RATES: 'saimetric_room_exchange_rates',
+  CUSTOMER_GOODS_LEFT_BEHIND: 'saimetric_room_customer_goods_left_behind',
+  BRANCH_LOCKDOWNS: 'saimetric_room_branch_lockdowns',
+  FAST_MOVING_CHECKLIST: 'saimetric_room_fast_moving_checklist',
+  TEMPORARY_CASUALS: 'saimetric_room_temporary_casuals',
+};
+
+export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
+  baseCurrency: 'USD',
+  reportingCurrency: 'USD',
+  rates: {
+    ZiG: {
+      currency: 'ZiG',
+      code: 'ZIG',
+      name: 'Zimbabwe Gold (ZiG)',
+      symbol: 'ZiG',
+      rateToBase: 26.5,
+      rateToUsd: 26.5, // 1 Base = 26.50 ZiG
+      allowCashWithdrawal: true,
+      maxWithdrawalRule: 'EQUAL_TO_SALE',
+      customPercent: 100,
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'System Default',
+    },
+    EcoCash: {
+      currency: 'EcoCash',
+      code: 'ECO',
+      name: 'EcoCash Mobile Money',
+      symbol: 'EcoCash',
+      rateToBase: 27.0,
+      rateToUsd: 27.0, // 1 Base = 27.00 EcoCash
+      allowCashWithdrawal: true,
+      maxWithdrawalRule: 'EQUAL_TO_SALE',
+      customPercent: 100,
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'System Default',
+    },
+    ZAR: {
+      currency: 'ZAR',
+      code: 'ZAR',
+      name: 'South African Rand (ZAR)',
+      symbol: 'R',
+      rateToBase: 0, // No rate by default => Inactive in POS and Forms
+      rateToUsd: 0,
+      allowCashWithdrawal: true,
+      maxWithdrawalRule: 'EQUAL_TO_SALE',
+      customPercent: 100,
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'System Default',
+    },
+    BWP: {
+      currency: 'BWP',
+      code: 'BWP',
+      name: 'Botswana Pula (BWP)',
+      symbol: 'P',
+      rateToBase: 0, // No rate by default => Inactive in POS and Forms
+      rateToUsd: 0,
+      allowCashWithdrawal: false,
+      maxWithdrawalRule: 'EQUAL_TO_SALE',
+      customPercent: 100,
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'System Default',
+    },
+    EUR: {
+      currency: 'EUR',
+      code: 'EUR',
+      name: 'Euro (EUR)',
+      symbol: '€',
+      rateToBase: 0,
+      rateToUsd: 0,
+      allowCashWithdrawal: false,
+      maxWithdrawalRule: 'EQUAL_TO_SALE',
+      customPercent: 100,
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'System Default',
+    },
+    GBP: {
+      currency: 'GBP',
+      code: 'GBP',
+      name: 'British Pound (GBP)',
+      symbol: '£',
+      rateToBase: 0,
+      rateToUsd: 0,
+      allowCashWithdrawal: false,
+      maxWithdrawalRule: 'EQUAL_TO_SALE',
+      customPercent: 100,
+      updatedAt: new Date().toISOString(),
+      updatedBy: 'System Default',
+    },
+  },
+  cashWithdrawalPolicy: {
+    enabled: true,
+    maxWithdrawalRule: 'EQUAL_TO_SALE',
+    customPercent: 100,
+  },
+  lastUpdated: new Date().toISOString(),
 };
 
 type Listener = () => void;
@@ -154,6 +314,7 @@ const notifyListeners = () => {
 
 function getStored<T>(key: string, fallback: T): T {
   try {
+    if (typeof localStorage === 'undefined') return fallback;
     const raw = localStorage.getItem(key);
     if (!raw) return fallback;
     return JSON.parse(raw);
@@ -165,6 +326,7 @@ function getStored<T>(key: string, fallback: T): T {
 
 function setStored<T>(key: string, value: T): void {
   try {
+    if (typeof localStorage === 'undefined') return;
     localStorage.setItem(key, JSON.stringify(value));
     notifyListeners();
   } catch (err) {
@@ -172,8 +334,151 @@ function setStored<T>(key: string, value: T): void {
   }
 }
 
+// ==================== MULTI-CURRENCY & EXCHANGE RATES ====================
+export const getMultiCurrencyConfig = (): MultiCurrencyConfig => {
+  const stored = getStored<MultiCurrencyConfig | null>(STORAGE_KEYS.EXCHANGE_RATES, null);
+  if (!stored) {
+    return DEFAULT_MULTI_CURRENCY_CONFIG;
+  }
+  return {
+    ...DEFAULT_MULTI_CURRENCY_CONFIG,
+    ...stored,
+    baseCurrency: stored.baseCurrency || DEFAULT_MULTI_CURRENCY_CONFIG.baseCurrency || 'USD',
+    rates: {
+      ...DEFAULT_MULTI_CURRENCY_CONFIG.rates,
+      ...(stored.rates || {}),
+    },
+    cashWithdrawalPolicy: {
+      ...DEFAULT_MULTI_CURRENCY_CONFIG.cashWithdrawalPolicy,
+      ...(stored.cashWithdrawalPolicy || {}),
+    },
+  };
+};
+
+export const getActiveCurrencies = (): CurrencyRateConfig[] => {
+  const config = getMultiCurrencyConfig();
+  const base = (config.baseCurrency || 'USD').toUpperCase();
+  const ratesObj = config.rates || {};
+  return Object.values(ratesObj)
+    .filter((c: any) => {
+      if (!c) return false;
+      const code = (c.code || c.currency || '').toUpperCase();
+      if (!code || code === base) return false;
+      const rate = Number(c.rateToBase !== undefined ? c.rateToBase : c.rateToUsd || 0);
+      // User core rule: currencies with no rate (> 0) means they are not applicable and should not show
+      return rate > 0;
+    })
+    .map((c: any) => ({
+      currency: c.currency || c.code || 'UNKNOWN',
+      code: c.code || c.currency || 'UNKNOWN',
+      name: c.name || c.code || c.currency || 'Currency',
+      symbol: c.symbol || c.code || '$',
+      rateToBase: Number(c.rateToBase !== undefined ? c.rateToBase : c.rateToUsd || 0),
+      rateToUsd: Number(c.rateToUsd !== undefined ? c.rateToUsd : c.rateToBase || 0),
+      allowCashWithdrawal: c.allowCashWithdrawal ?? true,
+      maxWithdrawalRule: c.maxWithdrawalRule || 'EQUAL_TO_SALE',
+      customPercent: Number(c.customPercent || 100),
+      updatedAt: c.updatedAt || new Date().toISOString(),
+      updatedBy: c.updatedBy || 'System',
+    }));
+};
+
+export const getAllCurrencies = (): CurrencyRateConfig[] => {
+  const config = getMultiCurrencyConfig();
+  return Object.values(config.rates || {});
+};
+
+export const getCurrencyRate = (code: string): number => {
+  if (!code) return 1;
+  const config = getMultiCurrencyConfig();
+  const base = (config.baseCurrency || 'USD').toUpperCase();
+  const cleanCode = code.toUpperCase().trim();
+  if (cleanCode === base || (base === 'USD' && cleanCode === 'USD')) return 1;
+  
+  const curr =
+    config.rates[code] ||
+    config.rates[cleanCode] ||
+    Object.values(config.rates || {}).find(
+      (c: any) => (c.code || '').toUpperCase() === cleanCode || (c.currency || '').toUpperCase() === cleanCode
+    );
+
+  const rate = Number(curr?.rateToBase !== undefined ? curr?.rateToBase : curr?.rateToUsd || 0);
+  return rate > 0 ? rate : 1;
+};
+
+export const saveMultiCurrencyConfig = (
+  config: Partial<MultiCurrencyConfig>,
+  updatedBy?: string
+): MultiCurrencyConfig => {
+  const current = getMultiCurrencyConfig();
+  const now = new Date().toISOString();
+
+  // Merge any incoming rates dynamically while preserving existing ones
+  const mergedRates: Record<string, any> = {
+    ...current.rates,
+    ...(config.rates || {}),
+  };
+
+  if (config.rates) {
+    Object.keys(config.rates).forEach((key) => {
+      const incoming = config.rates![key];
+      if (incoming) {
+        mergedRates[key] = {
+          ...(current.rates[key] || {}),
+          ...incoming,
+          rateToBase: incoming.rateToBase !== undefined ? incoming.rateToBase : incoming.rateToUsd,
+          rateToUsd: incoming.rateToBase !== undefined ? incoming.rateToBase : incoming.rateToUsd,
+          updatedAt: now,
+          updatedBy: updatedBy || incoming.updatedBy || current.rates[key]?.updatedBy || 'Owner',
+        };
+      }
+    });
+  }
+
+  const merged: MultiCurrencyConfig = {
+    ...current,
+    ...config,
+    baseCurrency: config.baseCurrency || current.baseCurrency || 'USD',
+    rates: mergedRates,
+    cashWithdrawalPolicy: {
+      ...current.cashWithdrawalPolicy,
+      ...(config.cashWithdrawalPolicy || {}),
+    },
+    lastUpdated: now,
+  };
+  setStored(STORAGE_KEYS.EXCHANGE_RATES, merged);
+  return merged;
+};
+
+export const calculateMaxCashWithdrawalUsd = (saleAmountUsd: number, currency: AppCurrency): number => {
+  if (!currency || saleAmountUsd <= 0) return 0;
+  const config = getMultiCurrencyConfig();
+  const base = (config.baseCurrency || 'USD').toUpperCase();
+  if (String(currency).toUpperCase() === base) return 0;
+
+  const cleanCurr = String(currency).toUpperCase().trim();
+  const rateConfig =
+    config.rates[currency as string] ||
+    Object.values(config.rates || {}).find(
+      (c: any) => (c.code || '').toUpperCase() === cleanCurr || (c.currency || '').toUpperCase() === cleanCurr
+    );
+
+  if (!rateConfig?.allowCashWithdrawal || !config.cashWithdrawalPolicy.enabled) return 0;
+
+  const rule = rateConfig.maxWithdrawalRule || config.cashWithdrawalPolicy.maxWithdrawalRule;
+  if (rule === 'CUSTOM_PERCENT') {
+    const pct = rateConfig.customPercent ?? config.cashWithdrawalPolicy.customPercent ?? 100;
+    return (saleAmountUsd * pct) / 100;
+  }
+  // Default: Maximum cash withdrawal equals sale amount (e.g. sale = $10 -> max withdrawal = $10)
+  return saleAmountUsd;
+};
+
 // Initialize Database with Defaults if empty
 export const initRoomDatabase = () => {
+  if (!localStorage.getItem(STORAGE_KEYS.EXCHANGE_RATES)) {
+    setStored(STORAGE_KEYS.EXCHANGE_RATES, DEFAULT_MULTI_CURRENCY_CONFIG);
+  }
   if (!localStorage.getItem(STORAGE_KEYS.SALESPEOPLE)) {
     setStored(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE);
   }
@@ -195,7 +500,13 @@ export const initRoomDatabase = () => {
   
   // Unify PRODUCTS with INVENTORY_ITEMS so POS Counter and Inventory Master share the same database
   const currentInv = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
-  setStored(STORAGE_KEYS.PRODUCTS, currentInv.map(inventoryItemToProduct));
+  const initialProdMap = new Map<string, Product>();
+  currentInv.map((item) => inventoryItemToProduct(item)).forEach((p) => {
+    if (p.id && !initialProdMap.has(p.id)) {
+      initialProdMap.set(p.id, p);
+    }
+  });
+  setStored(STORAGE_KEYS.PRODUCTS, Array.from(initialProdMap.values()));
 
   if (!localStorage.getItem(STORAGE_KEYS.CASH_LOGS)) {
     setStored(STORAGE_KEYS.CASH_LOGS, INITIAL_CASH_LOGS);
@@ -344,13 +655,36 @@ export const initRoomDatabase = () => {
     setStored(STORAGE_KEYS.SALESPEOPLE, [...staffList, ...missingStaff]);
   }
 
-  // Ensure initial inventory items for all demo companies exist in inventory store
+  // Ensure initial inventory items for all demo companies exist in inventory store and deduplicate
   const allInvStore = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
-  const existingInvKeys = new Set(allInvStore.map((i) => `${i.itemId}-${i.company_id || (i as any).companyId || 'COMP-001'}`));
-  const missingInv = INITIAL_INVENTORY_ITEMS.filter((i) => !existingInvKeys.has(`${i.itemId}-${i.company_id || (i as any).companyId || 'COMP-001'}`));
-  if (missingInv.length > 0) {
-    setStored(STORAGE_KEYS.INVENTORY_ITEMS, [...allInvStore, ...missingInv]);
+  const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+  const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+  const deletedSet = new Set(deletedList.map((d) => `${(d.itemId || '').toUpperCase()}::${(d.companyId || '').toUpperCase()}`));
+
+  const dedupedInvMap = new Map<string, InventoryItem>();
+  for (const item of allInvStore) {
+    if (!item.itemId) continue;
+    const cleanId = item.itemId.trim().toUpperCase();
+    const comp = (item.company_id || (item as any).companyId || 'COMP-001').trim().toUpperCase();
+    const key = `${cleanId}::${comp}`;
+    // Never restore items that were deleted by user/synced deletion
+    if (deletedSet.has(key)) continue;
+    if (!dedupedInvMap.has(key)) {
+      dedupedInvMap.set(key, item);
+    }
   }
+  for (const initItem of INITIAL_INVENTORY_ITEMS) {
+    if (!initItem.itemId) continue;
+    const cleanId = initItem.itemId.trim().toUpperCase();
+    const comp = (initItem.company_id || (initItem as any).companyId || 'COMP-001').trim().toUpperCase();
+    const key = `${cleanId}::${comp}`;
+    if (deletedSet.has(key)) continue;
+    if (!dedupedInvMap.has(key)) {
+      dedupedInvMap.set(key, initItem);
+    }
+  }
+  const cleanInvStore = Array.from(dedupedInvMap.values());
+  setStored(STORAGE_KEYS.INVENTORY_ITEMS, cleanInvStore);
 
   // Ensure initial sales for all demo companies exist in sales store
   const currentSales = getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
@@ -365,14 +699,25 @@ export const initRoomDatabase = () => {
     const list = getStored<T[]>(key, defaultList);
     let changed = false;
     const migrated = list.map((item) => {
-      if (!item.company_id && !item.companyId) {
+      let itemChanged = false;
+      let comp = item.company_id || item.companyId;
+      if (!comp) {
+        comp = 'COMP-001';
+        itemChanged = true;
+      }
+      let br = item.branch_id || item.branchId;
+      if (!br || br === 'ALL') {
+        br = 'BR-MAIN';
+        itemChanged = true;
+      }
+      if (itemChanged || item.company_id !== comp || item.companyId !== comp || item.branch_id !== br || item.branchId !== br) {
         changed = true;
         return {
           ...item,
-          company_id: 'COMP-001',
-          companyId: 'COMP-001',
-          branch_id: item.branch_id || item.branchId || 'BR-MAIN',
-          branchId: item.branchId || item.branch_id || 'BR-MAIN',
+          company_id: comp,
+          companyId: comp,
+          branch_id: br,
+          branchId: br,
         };
       }
       return item;
@@ -397,6 +742,7 @@ export const initRoomDatabase = () => {
   backfillCompanyBranch(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS);
   backfillCompanyBranch(STORAGE_KEYS.STOCKTAKE_SESSIONS, INITIAL_STOCKTAKE_SESSIONS);
   backfillCompanyBranch(STORAGE_KEYS.CASH_COUNTS, []);
+  backfillCompanyBranch(STORAGE_KEYS.CASH_LIFTS, []);
   backfillCompanyBranch(STORAGE_KEYS.RECONCILIATIONS, []);
   backfillCompanyBranch(STORAGE_KEYS.ADMIN_SALES, []);
   backfillCompanyBranch(STORAGE_KEYS.NEGATIVE_BALANCES, []);
@@ -410,6 +756,10 @@ export const initRoomDatabase = () => {
   if (!localStorage.getItem(STORAGE_KEYS.SYNC_QUEUE)) {
     setStored(STORAGE_KEYS.SYNC_QUEUE, []);
   }
+
+  // Deduplicate any duplicate change_received movements on startup
+  cleanupDuplicateChangeMovements();
+
   if (!localStorage.getItem(STORAGE_KEYS.SHEETS_CONFIG)) {
     const defaultConfig: GoogleSheetsConfig = {
       webhookUrl: '',
@@ -424,7 +774,8 @@ export const initRoomDatabase = () => {
         Salespeople: 'Salespeople',
         CustomerChange: 'CustomerChange',
         CreditSales: 'CreditSales',
-        Products: 'Products',
+        Products: 'InventoryMaster',
+        InventoryMaster: 'InventoryMaster',
         companies: 'companies',
         branches: 'branches',
         users: 'users',
@@ -463,6 +814,60 @@ export const setSessionUser = (user: Salesperson | null): void => {
 export const getCurrentUser = getSessionUser;
 export const setCurrentUser = setSessionUser;
 export const initializeRoomDatabase = initRoomDatabase;
+
+export const cleanupDuplicateChangeMovements = (): void => {
+  try {
+    const all = getAllMovements();
+    const seenChangeIn = new Set<string>();
+    const posCreditDepositInvoices = new Set<string>();
+
+    // Pass 1: find all POS credit upfront deposits
+    all.forEach((m) => {
+      if (m.type === 'credit_upfront_deposit') {
+        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        if (invMatch) {
+          const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
+          posCreditDepositInvoices.add(`${shiftPart}_${invMatch}`);
+        }
+      }
+    });
+
+    // Pass 2: delete duplicate change_received and duplicate credit_cash_payment
+    all.forEach((m) => {
+      if (m.type === 'change_received') {
+        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        if (invMatch) {
+          const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
+          const key = `chg_${shiftPart}_${invMatch}`;
+          if (seenChangeIn.has(key)) {
+            deleteMovement(m.id);
+            return;
+          }
+          seenChangeIn.add(key);
+        }
+      }
+
+      if (m.type === 'credit_cash_payment') {
+        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        const isPosDepositPayment = m.notes?.includes('deposit paid') || m.notes?.includes('POS Credit Sale Invoice');
+        if (invMatch && isPosDepositPayment) {
+          const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
+          if (posCreditDepositInvoices.has(`${shiftPart}_${invMatch}`)) {
+            deleteMovement(m.id);
+            return;
+          }
+        }
+      }
+    });
+  } catch (e) {
+    console.warn('cleanupDuplicateChangeMovements error:', e);
+  }
+};
+
+// Immediate module-level cleanup invocation
+if (typeof window !== 'undefined') {
+  cleanupDuplicateChangeMovements();
+}
 
 // ==================== AUDIT LOG DAO ====================
 export const getAllAuditLogs = (): AuditLogEntry[] => {
@@ -530,7 +935,19 @@ export const addAuditLog = (
 
   const updated = [newLog, ...all];
   setStored(STORAGE_KEYS.AUDIT_LOGS, updated);
-  enqueueSync('Audit_Log', 'INSERT', newLog);
+
+  // Decouple routine INFO audit logs (e.g. logins/logouts/UI checks) from the critical Sheets transactional queue.
+  // Critical compliance events (price changes, overrides, voids, warnings, critical severity) are queued to Sheets.
+  if (
+    newLog.severity === 'WARNING' ||
+    newLog.severity === 'CRITICAL' ||
+    newLog.action === 'PRICE_CHANGE' ||
+    newLog.action === 'DISCOUNT_OVERRIDE' ||
+    newLog.action === 'REFUND_INVOICE' ||
+    newLog.action === 'VOID_INVOICE'
+  ) {
+    enqueueSync('Audit_Log', 'INSERT', newLog);
+  }
   return newLog;
 };
 
@@ -600,17 +1017,32 @@ export const getAllSalespeople = (): Salesperson[] => {
 
 export const getSalespeople = (): Salesperson[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllSalespeople();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((s) => {
     const sComp = s.companyId || s.company_id;
-    if (!sComp) {
-      return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
+    const matchesComp = !sComp ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (sComp === currentCompany);
+    if (!matchesComp) return false;
+
+    // Strict branch isolation with fallback for main branch aliases (1 and BR-MAIN) and unassigned/offline staff:
+    const sBranch = s.branchId || s.branch_id;
+    if (!sBranch || sBranch === 'ALL' || sBranch === currentBranch) return true;
+    const isMainBranchMatch =
+      (currentBranch === '1' || currentBranch === 'BR-MAIN' || !currentBranch) &&
+      (sBranch === '1' || sBranch === 'BR-MAIN');
+    if (isMainBranchMatch) return true;
+    if (
+      s.branchAssignments &&
+      Array.isArray(s.branchAssignments) &&
+      s.branchAssignments.some(
+        (b) => b.branchId === currentBranch || (isMainBranchMatch && (b.branchId === '1' || b.branchId === 'BR-MAIN'))
+      )
+    ) {
+      return true;
     }
-    return sComp === currentCompany;
+    // High-tier roles operate across branches
+    if (s.role === 'OWNER' || s.role === 'SUPER_ADMIN' || s.role === 'MANAGER') return true;
+    return false;
   });
 };
 
@@ -685,6 +1117,7 @@ export const getOwnerDefaultPermissions = () => ({
   canPinOverride: true,
   canManageCompany: true,
   canEditMasterPrice: true,
+  canEditExchangeRate: true,
   canSeeMargin: true,
 });
 
@@ -787,10 +1220,19 @@ export const isStaffAssignedToBranch = (staff: Salesperson, branchId: string): b
     return true; // Owner has an account across the company, but must select which branch to log in to
   }
   if (staff.branchAssignments && Array.isArray(staff.branchAssignments) && staff.branchAssignments.length > 0) {
-    return staff.branchAssignments.some((b) => b.branchId === branchId);
+    const isMainBranch = branchId === '1' || branchId === 'BR-MAIN';
+    return staff.branchAssignments.some((b) => b.branchId === branchId || (isMainBranch && (b.branchId === '1' || b.branchId === 'BR-MAIN')));
   }
   const assigned = staff.branchId || staff.branch_id;
-  return !assigned || assigned === branchId || assigned === 'ALL' || assigned === '1';
+  const isMain = branchId === '1' || branchId === 'BR-MAIN';
+  return (
+    !assigned ||
+    assigned === branchId ||
+    assigned === 'ALL' ||
+    assigned === '1' ||
+    assigned === 'BR-MAIN' ||
+    (isMain && (assigned === '1' || assigned === 'BR-MAIN'))
+  );
 };
 
 export const updateStaffBranchAssignments = (
@@ -825,15 +1267,28 @@ export const getAllCustomers = (): Customer[] => {
 
 export const getCustomers = (): Customer[] => {
   const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
   const all = getAllCustomers();
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
     return all;
   }
-  return all.filter((c) => {
+  const settings = getCompanyBranchSettings();
+  const companyFiltered = all.filter((c) => {
     const compId = c.company_id || c.companyId;
     if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
     return compId === currentCompany;
+  });
+
+  if (settings.shareCustomersAcrossBranches) {
+    return companyFiltered;
+  }
+
+  // Branch-specific directory
+  return companyFiltered.filter((c) => {
+    const brId = c.branch_id || c.branchId;
+    if (!brId) return true; // Legacy unassigned visible
+    return brId === currentBranch;
   });
 };
 
@@ -850,11 +1305,13 @@ export const getNextCustomerId = (): string => {
   return `C${String(next).padStart(3, '0')}`;
 };
 
-export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'createdDate'> & { customerId?: string; createdDate?: string; company_id?: string; companyId?: string }): Customer => {
+export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'createdDate'> & { customerId?: string; createdDate?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string }): Customer => {
   const all = getAllCustomers();
   const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
   const nextId = customerData.customerId || getNextCustomerId();
   const compId = customerData.company_id || customerData.companyId || currentCompany;
+  const brId = customerData.branch_id || customerData.branchId || currentBranch;
   const created: Customer = {
     customerId: nextId,
     name: customerData.name.trim(),
@@ -864,6 +1321,8 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
     createdBy: customerData.createdBy,
     company_id: compId,
     companyId: compId,
+    branch_id: brId,
+    branchId: brId,
   };
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.CUSTOMERS, updated);
@@ -871,6 +1330,7 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
   // Save to Sheet "Customers": CustomerID, Name, Phone, Address, CreatedDate, CreatedBy
   enqueueSync('Customers', 'INSERT', {
     company_id: compId,
+    branch_id: brId,
     CustomerID: created.customerId,
     Name: created.name,
     Phone: created.phone,
@@ -924,15 +1384,28 @@ export const getAllSuppliers = (): Supplier[] => {
 
 export const getSuppliers = (): Supplier[] => {
   const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
   const all = getAllSuppliers();
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
     return all;
   }
-  return all.filter((s) => {
+  const settings = getCompanyBranchSettings();
+  const companyFiltered = all.filter((s) => {
     const compId = s.company_id || s.companyId;
     if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
     return compId === currentCompany;
+  });
+
+  if (settings.shareSuppliersAcrossBranches) {
+    return companyFiltered;
+  }
+
+  // Branch-specific suppliers
+  return companyFiltered.filter((s) => {
+    const brId = s.branch_id || (s as any).branchId;
+    if (!brId) return true; // Legacy unassigned visible
+    return brId === currentBranch;
   });
 };
 
@@ -964,12 +1437,16 @@ export const addSupplier = (
     status?: 'Active' | 'Inactive';
     company_id?: string;
     companyId?: string;
+    branch_id?: string;
+    branchId?: string;
   }
 ): Supplier => {
   const all = getAllSuppliers();
   const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
   const nextId = supplierData.supplierId || getNextSupplierId();
   const compId = supplierData.company_id || supplierData.companyId || currentCompany;
+  const brId = supplierData.branch_id || supplierData.branchId || currentBranch;
   const created: Supplier = {
     supplierId: nextId,
     name: supplierData.name.trim(),
@@ -987,12 +1464,15 @@ export const addSupplier = (
     notes: supplierData.notes?.trim() || '',
     company_id: compId,
     companyId: compId,
+    branch_id: brId,
+    branchId: brId,
   };
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.SUPPLIERS, updated);
 
   enqueueSync('Suppliers', 'INSERT', {
     company_id: compId,
+    branch_id: brId,
     SupplierID: created.supplierId,
     Name: created.name,
     Category: created.category,
@@ -1177,6 +1657,7 @@ export const saveBranch = (branch: Branch): void => {
     updated = [...branches, normalized];
   }
   setStored(STORAGE_KEYS.BRANCHES, updated);
+  enqueueSync('branches', index >= 0 ? 'UPDATE' : 'INSERT', normalized);
   notifyListeners();
 };
 
@@ -1190,14 +1671,26 @@ export const deleteBranch = (branchId: string): boolean => {
 
 // ==================== PRODUCT DAO (POS INVENTORY UNIFIED BRIDGE) ====================
 
-export const inventoryItemToProduct = (item: InventoryItem): Product => {
+export const inventoryItemToProduct = (item: InventoryItem, targetBranch?: string): Product => {
+  const currentBranch = targetBranch || getCurrentBranchId();
+  const override = item.branchOverrides?.[currentBranch];
+
+  const effectiveSellPriceUnit = override?.sellPriceUnit !== undefined ? override.sellPriceUnit : (item.sellPriceUnit !== undefined ? item.sellPriceUnit : 0);
+  const effectiveSellPriceCase = override?.sellPriceCase !== undefined ? override.sellPriceCase : item.sellPriceCase;
+  const effectiveCostPerUnit = override?.costPerUnit !== undefined ? override.costPerUnit : item.costPerUnit;
+  const effectiveCostPerCase = override?.costPerCase !== undefined ? override.costPerCase : item.costPerCase;
+  const effectiveReorderCases = override?.reorderLevelCases !== undefined ? override.reorderLevelCases : item.reorderLevelCases;
+
   return {
     id: item.itemId,
     name: item.itemName,
     sku: item.sku || item.itemId,
     category: item.category || 'General',
-    price: item.sellPriceUnit !== undefined ? item.sellPriceUnit : 0,
-    costPrice: item.costPerUnit,
+    price: effectiveSellPriceUnit,
+    costPrice: effectiveCostPerUnit,
+    costPerUnit: effectiveCostPerUnit,
+    averageCostPerUnit: item.averageCostPerUnit !== undefined ? item.averageCostPerUnit : effectiveCostPerUnit,
+    latestCostPerUnit: item.latestCostPerUnit !== undefined ? item.latestCostPerUnit : effectiveCostPerUnit,
     stockQuantity: item.stockSingles !== undefined ? item.stockSingles : 0,
     unit: item.sellByFraction
       ? (item.fractionUnit || 'kg')
@@ -1208,15 +1701,18 @@ export const inventoryItemToProduct = (item: InventoryItem): Product => {
     fractionUnit: item.fractionUnit || (item.sellByFraction ? 'kg' : undefined),
     canSellAsCase: item.canSellAsCase ?? false,
     unitsPerCase: item.unitsPerCase,
-    costPerCase: item.costPerCase,
-    sellPriceCase: item.sellPriceCase,
-    sellPriceUnit: item.sellPriceUnit,
+    costPerCase: effectiveCostPerCase,
+    sellPriceCase: effectiveSellPriceCase,
+    sellPriceUnit: effectiveSellPriceUnit,
     stockCases: item.stockCases,
     stockSingles: item.stockSingles,
     totalUnits: item.totalUnits,
-    reorderLevelCases: item.reorderLevelCases,
+    reorderLevelCases: effectiveReorderCases,
     reorderLevelUnits: item.reorderLevelUnits,
+    caseReserveThreshold: item.caseReserveThreshold !== undefined ? item.caseReserveThreshold : 0,
     packagingVariants: item.packagingVariants || [],
+    assignedBranchIds: item.assignedBranchIds,
+    branchOverrides: item.branchOverrides,
     companyId: item.companyId || item.company_id,
     company_id: item.companyId || item.company_id,
     branchId: item.branchId || item.branch_id,
@@ -1251,6 +1747,7 @@ export const productToInventoryItem = (prod: Product): InventoryItem => {
     totalUnits,
     reorderLevelCases: prod.reorderLevelCases || 1,
     reorderLevelUnits: prod.reorderLevelUnits || 5,
+    caseReserveThreshold: prod.caseReserveThreshold !== undefined ? prod.caseReserveThreshold : 0,
     sku: prod.sku || prod.id,
     barcode: prod.barcode || '',
     description: prod.description || '',
@@ -1306,19 +1803,21 @@ export const getProducts = (): Product[] => {
 
       // 2. Case (if enabled)
       if (hasCaseSelling) {
+        const caseName = item.casePackageName || 'Case';
         list.push({
           id: `${item.itemId}-CASE`,
-          name: `${item.itemName} Case`,
+          name: `${item.itemName} ${caseName}`,
           sku: item.sku ? `${item.sku}-CS` : `${item.itemId}-CS`,
           category: item.category || 'General',
           price: item.sellPriceCase,
           costPrice: item.costPerCase,
           stockQuantity: item.stockCases !== undefined ? item.stockCases : 0,
-          unit: `Case (${item.unitsPerCase}/cs)`,
-          description: `${item.itemName} (Full Case of ${item.unitsPerCase})`,
+          unit: `${caseName} (${item.unitsPerCase} units)`,
+          description: `${item.itemName} (Full ${caseName} of ${item.unitsPerCase})`,
           barcode: item.barcode || '',
           sellByFraction: false,
           canSellAsCase: true,
+          casePackageName: caseName,
           unitsPerCase: item.unitsPerCase,
           costPerCase: item.costPerCase,
           sellPriceCase: item.sellPriceCase,
@@ -1336,9 +1835,9 @@ export const getProducts = (): Product[] => {
         });
       }
 
-      // 3. Packaging Variants / Prepacks (e.g. Prepack 5s, 10s, 2s)
+      // 3. Packaging Variants / Prepacks (e.g. Prepack 5s, 10s, 2s, Half Loaf 0.5)
       variants.forEach((v) => {
-        const estAvailablePacks = item.totalUnits ? Math.floor(item.totalUnits / Math.max(1, v.unitsPerPack)) : 0;
+        const estAvailablePacks = item.totalUnits ? Math.floor(item.totalUnits / Math.max(0.001, v.unitsPerPack)) : 0;
         list.push({
           id: `${item.itemId}__${v.id}`,
           name: `${item.itemName} (${v.name})`,
@@ -1352,6 +1851,7 @@ export const getProducts = (): Product[] => {
           barcode: v.barcode || '',
           sellByFraction: false,
           canSellAsCase: Boolean(item.canSellAsCase),
+          casePackageName: item.casePackageName || 'Case',
           unitsPerCase: item.unitsPerCase,
           costPerCase: item.costPerCase,
           sellPriceCase: item.sellPriceCase,
@@ -1371,7 +1871,16 @@ export const getProducts = (): Product[] => {
         });
       });
     });
-    return list;
+
+    // Deduplicate by product id to guarantee unique React keys
+    const seen = new Set<string>();
+    const uniqueProducts: Product[] = [];
+    for (const p of list) {
+      if (!p.id || seen.has(p.id)) continue;
+      seen.add(p.id);
+      uniqueProducts.push(p);
+    }
+    return uniqueProducts;
   }
   return [];
 };
@@ -1397,10 +1906,12 @@ export const getProductById = (id: string): Product | undefined => {
   const item = getInventoryItemById(baseId);
   if (!item) return undefined;
 
+  const caseName = item.casePackageName || 'Case';
+
   if (isVariant && variantId) {
     const variant = (item.packagingVariants || []).find((v) => v.id === variantId);
     if (variant) {
-      const estPacks = item.totalUnits ? Math.floor(item.totalUnits / Math.max(1, variant.unitsPerPack)) : 0;
+      const estPacks = item.totalUnits ? Math.floor(item.totalUnits / Math.max(0.001, variant.unitsPerPack)) : 0;
       return {
         id: `${item.itemId}__${variant.id}`,
         name: `${item.itemName} (${variant.name})`,
@@ -1413,6 +1924,7 @@ export const getProductById = (id: string): Product | undefined => {
         description: `${item.itemName} - ${variant.name} (${variant.unitsPerPack} units)`,
         barcode: variant.barcode || '',
         canSellAsCase: Boolean(item.canSellAsCase),
+        casePackageName: caseName,
         unitsPerCase: item.unitsPerCase,
         costPerCase: item.costPerCase,
         sellPriceCase: item.sellPriceCase,
@@ -1432,16 +1944,17 @@ export const getProductById = (id: string): Product | undefined => {
   if (isCase) {
     return {
       id: `${item.itemId}-CASE`,
-      name: `${item.itemName} Case`,
+      name: `${item.itemName} ${caseName}`,
       sku: item.sku ? `${item.sku}-CS` : `${item.itemId}-CS`,
       category: item.category || 'General',
       price: item.sellPriceCase !== undefined ? item.sellPriceCase : 0,
       costPrice: item.costPerCase,
       stockQuantity: item.stockCases !== undefined ? item.stockCases : 0,
-      unit: `Case (${item.unitsPerCase}/cs)`,
-      description: `${item.itemName} (Full Case of ${item.unitsPerCase})`,
+      unit: `${caseName} (${item.unitsPerCase} units)`,
+      description: `${item.itemName} (Full ${caseName} of ${item.unitsPerCase})`,
       barcode: item.barcode || '',
       canSellAsCase: true,
+      casePackageName: caseName,
       unitsPerCase: item.unitsPerCase,
       costPerCase: item.costPerCase,
       sellPriceCase: item.sellPriceCase,
@@ -1487,9 +2000,9 @@ export const getProductById = (id: string): Product | undefined => {
 };
 
 export const getNextProductId = (): string => {
-  const items = getInventoryItems();
-  const count = items.length + 1;
-  return `ITM-${String(count).padStart(3, '0')}`;
+  const time = Date.now().toString(36).slice(-4).toUpperCase();
+  const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
+  return `ITM-${time}-${rand}`;
 };
 
 export const saveProduct = (productData: Omit<Product, 'id'> & { id?: string }): Product => {
@@ -1516,10 +2029,24 @@ export const deleteProduct = (id: string): void => {
   enqueueSync('Products', 'DELETE', { ProductID: id });
 };
 
-export const updateProductStock = (id: string, deltaQty: number, isCase?: boolean, unitsPerPack?: number): void => {
+export const updateProductStock = (
+  id: string,
+  deltaQty: number,
+  isCase?: boolean,
+  unitsPerPack?: number,
+  context?: {
+    staffId?: string;
+    staffName?: string;
+    referenceId?: string;
+    reason?: string;
+    actionTaken?: string;
+    txnType?: 'SALE' | 'RETURN' | 'ADJUSTMENT';
+  }
+): void => {
   let realId = id;
   let sellAsCase = Boolean(isCase);
   let unitsToDeductPerQty = 1;
+  let variantName = '';
 
   if (id.endsWith('-CASE')) {
     realId = id.replace(/-CASE$/, '');
@@ -1536,15 +2063,19 @@ export const updateProductStock = (id: string, deltaQty: number, isCase?: boolea
     const variant = (item?.packagingVariants || []).find((v) => v.id === variantId);
     if (variant) {
       unitsToDeductPerQty = variant.unitsPerPack;
+      variantName = variant.name;
     } else if (unitsPerPack && unitsPerPack > 0) {
       unitsToDeductPerQty = unitsPerPack;
     }
-  } else if (unitsPerPack && unitsPerPack > 1) {
+  } else if (unitsPerPack && unitsPerPack > 0) {
     unitsToDeductPerQty = unitsPerPack;
   }
 
-    const item = getInventoryItemById(realId);
-  if (item) {
+  const item = getInventoryItemById(realId);
+  if (item && deltaQty !== 0) {
+    const prevCases = item.stockCases;
+    const prevSingles = item.stockSingles;
+
     if (deltaQty < 0) {
       const unitsToDeduct = sellAsCase
         ? Math.abs(deltaQty) * item.unitsPerCase
@@ -1553,8 +2084,9 @@ export const updateProductStock = (id: string, deltaQty: number, isCase?: boolea
       deductStockFIFO({
         itemId: realId,
         quantityUnits: unitsToDeduct,
-        staffId: currentUser?.id || '001',
-        staffName: currentUser?.name || 'Staff',
+        staffId: context?.staffId || currentUser?.id || '001',
+        staffName: context?.staffName || currentUser?.name || 'Staff',
+        saleInvoiceId: context?.referenceId,
         allowNegative: true,
       });
     }
@@ -1596,6 +2128,61 @@ export const updateProductStock = (id: string, deltaQty: number, isCase?: boolea
       lastUpdated: new Date().toISOString(),
     };
     saveInventoryItem(updatedItem);
+
+    // Calculate actual case and single deltas for audit trail logging
+    const deltaCases = finalCases - prevCases;
+    const deltaSingles = Number((finalSingles - prevSingles).toFixed(3));
+
+    const isSale = context?.txnType === 'SALE' || (!context?.txnType && deltaQty < 0);
+    const isReturn = context?.txnType === 'RETURN' || (!context?.txnType && deltaQty > 0);
+    const movementType = isSale ? 'SALE' : isReturn ? 'RETURN' : (context?.txnType || 'ADJUSTMENT');
+    const txnType = movementType;
+
+    const currentUser = getCurrentUser();
+    const staffId = context?.staffId || currentUser?.id || 'POS-001';
+    const staffName = context?.staffName || currentUser?.name || 'Cashier / POS';
+    const refId = context?.referenceId || (isSale ? 'POS-SALE' : 'STOCK-ADJUST');
+    const caseLabel = item.casePackageName || 'Case';
+
+    const defaultReason = isSale
+      ? `POS Outflow: Sold ${Math.abs(deltaQty)} ${sellAsCase ? `${caseLabel}(s)` : variantName ? `${variantName}` : 'Singles'} (Invoice: ${refId})`
+      : `Stock Restocked from Sale Refund: +${deltaQty} ${sellAsCase ? `${caseLabel}(s)` : variantName ? `${variantName}` : 'Singles'} (Invoice: ${refId})`;
+
+    const promptLabel = sellAsCase
+      ? `Whole ${caseLabel} Sale`
+      : variantName
+      ? `Packaging Variant: ${variantName} (${unitsToDeductPerQty} units)`
+      : 'Singles Sale';
+
+    const timestampNow = new Date().toISOString();
+    const dateStrNow = timestampNow.split('T')[0];
+    const txnId = `TXN-${dateStrNow.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${Math.floor(Math.random() * 1000)}`;
+
+    addStockMovement({
+      txnId,
+      movementId: txnId,
+      date: dateStrNow,
+      timestamp: timestampNow,
+      staffId,
+      staffName,
+      itemId: realId,
+      itemName: item.itemName,
+      txnType,
+      movementType,
+      actionTaken: context?.actionTaken || (isSale ? 'POS_SALE' : isReturn ? 'REFUND_RESTOCK' : 'STOCK_ADJUSTMENT'),
+      qtyCases: Math.abs(deltaCases),
+      qtySingles: Math.abs(deltaSingles),
+      casesChange: deltaCases,
+      singlesChange: deltaSingles,
+      closingCases: finalCases,
+      closingSingles: finalSingles,
+      resultingStockCases: finalCases,
+      resultingStockSingles: finalSingles,
+      referenceId: refId,
+      reason: context?.reason || defaultReason,
+      promptShown: promptLabel,
+      synced: false,
+    });
   }
 };
 
@@ -1608,14 +2195,15 @@ export const addPackagingVariant = (
 
   const currentVariants = item.packagingVariants || [];
   const variantId = variant.id || `VAR-${Date.now().toString().slice(-4)}`;
-  const costPrice = variant.costPrice !== undefined ? variant.costPrice : item.costPerUnit * variant.unitsPerPack;
+  const unitsPerPack = Math.max(0.01, Number(variant.unitsPerPack) || 0.01);
+  const costPrice = variant.costPrice !== undefined ? variant.costPrice : item.costPerUnit * unitsPerPack;
 
   const newVariant: PackagingVariant = {
     ...variant,
     id: variantId,
     costPrice,
-    unitsPerPack: Math.max(1, variant.unitsPerPack),
-    sellPrice: Math.max(0, variant.sellPrice),
+    unitsPerPack,
+    sellPrice: Math.max(0, Number(variant.sellPrice) || 0),
   };
 
   const updatedVariants = [...currentVariants.filter((v) => v.id !== variantId), newVariant];
@@ -1755,15 +2343,15 @@ export const getAllCashLogs = (): CashLogEntry[] => {
 
 export const getCashLogs = (): CashLogEntry[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllCashLogs();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((l) => {
     const compId = l.company_id || l.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+
+    const brId = (l as any).branch_id || (l as any).branchId;
+    return brId === currentBranch;
   });
 };
 
@@ -1780,12 +2368,25 @@ export const getNextCashLogId = (): string => {
   return `CL-${String(next).padStart(3, '0')}`;
 };
 
-export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string }): CashLogEntry => {
+export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string; skipSync?: boolean; fromMesh?: boolean }): CashLogEntry => {
   const all = getAllCashLogs();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
   const brId = entry.branch_id || entry.branchId || currentBranch;
+
+  // Anti-duplication check: if cash log already exists with this ID or reference, return it
+  if (entry.id) {
+    const existingById = all.find((c) => c.id === entry.id);
+    if (existingById) return existingById;
+  }
+  if (entry.reference) {
+    const existingByRef = all.find(
+      (c) => c.reference === entry.reference && c.line === entry.line && c.date === entry.date
+    );
+    if (existingByRef) return existingByRef;
+  }
+
   const newEntry: CashLogEntry = {
     ...entry,
     id: entry.id || getNextCashLogId(),
@@ -1798,19 +2399,22 @@ export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: s
   const updated = [newEntry, ...all];
   setStored(STORAGE_KEYS.CASH_LOGS, updated);
 
-  // Save to Sheet "CashLog": Timestamp, Date, StaffID, StaffName, Line, Description, In, Out
-  enqueueSync('CashLog', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    Timestamp: newEntry.timestamp,
-    Date: newEntry.date,
-    StaffID: newEntry.staffId,
-    StaffName: newEntry.staffName,
-    Line: newEntry.line,
-    Description: newEntry.description,
-    In: newEntry.in,
-    Out: newEntry.out,
-  });
+  // Only enqueue write to cloud if this action originated locally (not from mesh peer sync)
+  if (!entry.skipSync && !entry.fromMesh) {
+    enqueueSync('CashLog', 'INSERT', {
+      company_id: compId,
+      branch_id: brId,
+      Timestamp: newEntry.timestamp,
+      Date: newEntry.date,
+      StaffID: newEntry.staffId,
+      StaffName: newEntry.staffName,
+      Line: newEntry.line,
+      Description: newEntry.description,
+      In: newEntry.in,
+      Out: newEntry.out,
+      Reference: newEntry.reference || '',
+    });
+  }
 
   return newEntry;
 };
@@ -1865,17 +2469,71 @@ export const saveDailyCashLogSheet = (
     reference?: string;
   }>
 ): CashLogEntry[] => {
+  const allRawLogs = getAllCashLogs();
   const currentLogs = getCashLogs();
-  // Filter out other days / staff to preserve them, but replace this specific staff + date daily report
-  const otherLogs = currentLogs.filter((l) => !(l.staffId === staffId && l.date === date));
-
-  // Filter out any non-zero entries to save
-  const validEntries = entries.filter(
-    (e) => e.in > 0 || e.out > 0 || e.line === 'Float' || e.line === 'Final Cash Out' || e.line === 'Float & Closeout'
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+  
+  // Preserve automated POS register entries (ZiG & EcoCash sales/withdrawals, sale references) and Cash Lift entries for this staff+date
+  const automatedLogsToKeep = currentLogs.filter(
+    (l) =>
+      l.staffId === staffId &&
+      l.date === date &&
+      (l.currency === 'ZiG' ||
+        l.currency === 'EcoCash' ||
+        l.line === 'ecocashSales' ||
+        l.line === 'ecocashWithdrawal' ||
+        l.line === 'zigSales' ||
+        l.line === 'zigWithdrawal' ||
+        l.line === 'ZiG' ||
+        l.line === 'EcoCash' ||
+        l.isWithdrawal ||
+        l.reference?.startsWith('LIFT-') ||
+        l.category?.includes('Cash Lift') ||
+        l.category?.includes('Supervisor Pick-Up') ||
+        l.reference?.startsWith('SALE-') ||
+        l.reference?.startsWith('INV-'))
   );
+
+  // Filter out other days / staff / branches from allRawLogs to preserve them, but replace this specific staff + date daily report
+  // while retaining automated logs
+  const otherLogs = allRawLogs.filter(
+    (l) => {
+      const compId = l.company_id || l.companyId || 'COMP-001';
+      const brId = (l as any).branch_id || (l as any).branchId || 'BR-MAIN';
+      if (compId !== currentCompany || brId !== currentBranch) return true;
+      return (
+        !(l.staffId === staffId && l.date === date) ||
+        automatedLogsToKeep.some((keep) => keep.id === l.id)
+      );
+    }
+  );
+
+  // Filter out any non-zero entries to save (and skip if already in automated logs)
+  const validEntries = entries.filter((e) => {
+    // If it references a LIFT or SALE that is already in automatedLogsToKeep, do not re-create duplicate
+    if (e.reference && automatedLogsToKeep.some((keep) => keep.reference === e.reference || keep.id === e.reference)) {
+      return false;
+    }
+    // Exclude any Final Cash Out rows from Form 2 entirely
+    if (e.line === 'Final Cash Out' || e.description?.toLowerCase().includes('final cash out')) {
+      return false;
+    }
+    return (
+      e.in > 0 ||
+      e.out > 0 ||
+      e.line === 'Float' ||
+      e.line === 'Float & Closeout'
+    );
+  });
   
   const createdList: CashLogEntry[] = [];
   const now = new Date();
+  const shiftId = getShiftId(staffId, date, currentBranch);
+  const currentMovements = getMovements(undefined, currentBranch);
+  const existingOpeningFloat = currentMovements.find(
+    (m) => (m.shiftId === shiftId || (m.staffId === staffId && m.date === date)) && m.type === 'opening_float'
+  );
 
   // Find max ID counter once to avoid duplicate IDs in batch insertion
   const numbers = currentLogs
@@ -1894,6 +2552,10 @@ export const saveDailyCashLogSheet = (
       date,
       staffId,
       staffName,
+      company_id: currentCompany,
+      companyId: currentCompany,
+      branch_id: currentBranch,
+      branchId: currentBranch,
       line: entry.line,
       description: entry.description || entry.line,
       in: entry.in || 0,
@@ -1904,7 +2566,155 @@ export const saveDailyCashLogSheet = (
     };
     createdList.push(newEntry);
 
+    // Map each Form 2 row to cashMovements
+    const lowerLine = entry.line.toLowerCase();
+    const lowerDesc = (entry.description || '').toLowerCase();
+
+    if (lowerLine === 'float' || lowerLine === 'opening float') {
+      const floatAmt = entry.in || 20;
+      if (!existingOpeningFloat) {
+        addMovement({
+          shiftId,
+          staffId,
+          date,
+          timestamp: newEntry.timestamp,
+          type: 'opening_float',
+          amount: floatAmt,
+          currency: 'USD',
+          direction: 'in',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form2',
+          sourceRef: newEntry.id,
+          notes: entry.description,
+          company_id: currentCompany,
+          branch_id: currentBranch,
+        });
+      }
+    } else if (
+      lowerLine.includes('bread') ||
+      lowerLine.includes('airtime') ||
+      lowerLine.includes('home use') ||
+      lowerDesc.includes('bread') ||
+      lowerDesc.includes('airtime') ||
+      lowerDesc.includes('home use') ||
+      lowerLine.includes('utilities')
+    ) {
+      // Petty cash logs default to status "pending" until supervisor approves
+      if (entry.out > 0) {
+        addMovement({
+          shiftId,
+          staffId,
+          date,
+          timestamp: newEntry.timestamp,
+          type: 'petty_cash',
+          amount: entry.out,
+          currency: 'USD',
+          direction: 'out',
+          affectsDrawer: true,
+          status: 'pending',
+          sourceModule: 'form2',
+          sourceRef: newEntry.id,
+          notes: entry.description,
+          company_id: currentCompany,
+          branch_id: currentBranch,
+        });
+      }
+    } else if (lowerLine.includes('procurement') || lowerDesc.includes('procurement')) {
+      if (entry.out > 0) {
+        // Prevent duplicate supplier_payment if this direct procurement GRV is already in cashMovements or DirectGrv
+        const existingMovements = getAllMovements().filter(
+          (m) => matchesShift(m, shiftId, currentBranch) && m.type === 'supplier_payment'
+        );
+        const grvs = getDirectGrvsForStaffAndDate(staffId, date);
+        const isAlreadyInMovements = existingMovements.some((m) => {
+          if (entry.reference && m.sourceRef === entry.reference) return true;
+          if (m.notes && (m.notes.includes(entry.description) || entry.description.includes(m.notes))) return true;
+          const grvMatch = (entry.description + ' ' + (entry.reference || '')).match(/GRV[A-Z0-9_-]*/i);
+          if (grvMatch && (m.sourceRef?.includes(grvMatch[0]) || m.notes?.includes(grvMatch[0]))) return true;
+          return false;
+        });
+        const matchesGrv = grvs.some((g) => {
+          const gRef = g.grvNumber || g.id;
+          const gTotal = g.totalCost || 0;
+          return (
+            (entry.reference && entry.reference === gRef) ||
+            entry.description.includes(gRef) ||
+            Math.abs(gTotal - entry.out) < 0.01
+          );
+        });
+
+        if (!isAlreadyInMovements) {
+          addMovement({
+            shiftId,
+            staffId,
+            date,
+            timestamp: newEntry.timestamp,
+            type: 'supplier_payment',
+            amount: entry.out,
+            currency: 'USD',
+            direction: 'out',
+            affectsDrawer: true,
+            status: 'approved',
+            sourceModule: 'form2',
+            sourceRef: newEntry.id,
+            notes: entry.description,
+            company_id: currentCompany,
+            branch_id: currentBranch,
+          });
+        }
+      }
+    } else if (
+      (lowerLine.includes('ecocash') || lowerDesc.includes('ecocash')) &&
+      (lowerLine.includes('withdrawal') || lowerDesc.includes('withdrawal') || lowerDesc.includes('cash out'))
+    ) {
+      if (entry.out > 0) {
+        addMovement({
+          shiftId,
+          staffId,
+          date,
+          timestamp: newEntry.timestamp,
+          type: 'ecocash_cash_out',
+          amount: entry.out,
+          currency: 'USD',
+          direction: 'out',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form2',
+          sourceRef: newEntry.id,
+          notes: entry.description,
+          company_id: currentCompany,
+          branch_id: currentBranch,
+        });
+      }
+    } else if (
+      (lowerLine.includes('zig') || lowerDesc.includes('zig')) &&
+      (lowerLine.includes('withdrawal') || lowerDesc.includes('withdrawal') || lowerDesc.includes('cash out'))
+    ) {
+      if (entry.out > 0) {
+        addMovement({
+          shiftId,
+          staffId,
+          date,
+          timestamp: newEntry.timestamp,
+          type: 'zig_cash_out',
+          amount: entry.out,
+          currency: 'USD',
+          direction: 'out',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form2',
+          sourceRef: newEntry.id,
+          notes: entry.description,
+          company_id: currentCompany,
+          branch_id: currentBranch,
+        });
+      }
+    }
+
     enqueueSync('CashLog', 'INSERT', {
+      company_id: currentCompany,
+      branch_id: currentBranch,
       Timestamp: newEntry.timestamp,
       Date: newEntry.date,
       StaffID: newEntry.staffId,
@@ -1918,7 +2728,184 @@ export const saveDailyCashLogSheet = (
 
   const updatedAll = [...createdList, ...otherLogs];
   setStored(STORAGE_KEYS.CASH_LOGS, updatedAll);
+  notifyListeners();
   return createdList;
+};
+
+// ==================== CASH LIFT / CASH PICK-UP DAO ====================
+export const getAllCashLifts = (): CashLiftRecord[] => {
+  return getStored<CashLiftRecord[]>(STORAGE_KEYS.CASH_LIFTS, []);
+};
+
+export const getCashLifts = (): CashLiftRecord[] => {
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+  const all = getAllCashLifts();
+  return all.filter((c) => {
+    const compId = (c as any).company_id || (c as any).companyId;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
+  });
+};
+
+export const getCashLiftsForStaffAndDate = (staffId: string, date: string): CashLiftRecord[] => {
+  const lifts = getCashLifts();
+  return lifts.filter((l) => l.cashierId === staffId && l.date === date);
+};
+
+/**
+ * Helper to check if an invoice has already been processed at the POS terminal
+ * to prevent double counting in Form 3.
+ */
+export const isPosInvoiceProcessed = (refOrNotes?: string): boolean => {
+  if (!refOrNotes || !refOrNotes.trim()) return false;
+  const trimmed = refOrNotes.trim();
+  const allSales = getAllSales();
+  const directMatch = allSales.some(
+    (s) => s.id.toLowerCase() === trimmed.toLowerCase() ||
+           s.id.replace(/^INV-0*/i, '') === trimmed.replace(/^INV-0*/i, '')
+  );
+  if (directMatch) return true;
+  const invMatch = trimmed.match(/INV-\d+/i) || trimmed.match(/invoice\s*#?\s*(\d+)/i);
+  if (invMatch) {
+    const invIdStr = invMatch[0].toUpperCase();
+    return allSales.some((s) => s.id.toUpperCase().includes(invIdStr) || invIdStr.includes(s.id.toUpperCase()));
+  }
+  return false;
+};
+
+export const addCashLift = (data: {
+  cashierId: string;
+  cashierName: string;
+  supervisorId: string;
+  supervisorName: string;
+  totalAmount: number;
+  denominations: Record<string, number>;
+  reason?: string;
+  notes?: string;
+  date?: string;
+}): { liftRecord: CashLiftRecord; cashLogRecord: CashLogEntry } => {
+  const now = new Date();
+  const dateStr = data.date || getTodayDateString();
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+
+  const allLifts = getAllCashLifts();
+  const liftId = `LIFT-${Date.now().toString().slice(-6)}`;
+
+  // Validate that supervisor lift does not exceed current drawer balance
+  const shiftId = getShiftId(data.cashierId, dateStr);
+  const currentBal = computeDrawerBalance(shiftId, 'USD');
+  if (data.totalAmount > currentBal) {
+    throw new Error(
+      `Cannot lift $${data.totalAmount.toFixed(2)}. Amount exceeds available drawer balance of $${currentBal.toFixed(2)}.`
+    );
+  }
+
+  const newLift: CashLiftRecord = {
+    id: liftId,
+    timestamp: now.toISOString(),
+    date: dateStr,
+    cashierId: data.cashierId,
+    cashierName: data.cashierName,
+    supervisorId: data.supervisorId,
+    supervisorName: data.supervisorName,
+    totalAmount: data.totalAmount,
+    denominations: data.denominations,
+    reason: data.reason,
+    notes: data.notes,
+    companyId: currentCompany,
+    company_id: currentCompany,
+    branchId: currentBranch,
+    branch_id: currentBranch,
+    synced: false,
+  };
+
+  // Summarize denominations for description/notes
+  const denomSummary = Object.entries(data.denominations)
+    .filter(([_, qty]) => Number(qty) > 0)
+    .map(([note, qty]) => `${qty}x$${note}`)
+    .join(', ');
+
+  // Auto-populate Form 2 CashLog entry for Cash Lift (cash collected OUT of till by supervisor)
+  const cashLogRecord = addCashLog({
+    timestamp: newLift.timestamp,
+    date: dateStr,
+    staffId: data.cashierId,
+    staffName: data.cashierName,
+    companyId: currentCompany,
+    company_id: currentCompany,
+    branchId: currentBranch,
+    branch_id: currentBranch,
+    line: 'Cash',
+    description: `Supervisor Cash Lift: ${data.supervisorName} collected $${data.totalAmount.toFixed(2)} from Cashier ${data.cashierName}${data.reason ? ` (${data.reason})` : ''}`,
+    in: 0,
+    out: data.totalAmount, // Deducted in Form 2 CashLog as base USD so cash drawer balances!
+    category: 'Cash Lift / Supervisor Pick-Up',
+    reference: liftId,
+    notes: `Denominations: ${denomSummary || 'Denominations counted'}. Verified by Cashier (${data.cashierName}) and Supervisor (${data.supervisorName}).`,
+  });
+
+  newLift.cashLogId = cashLogRecord.id;
+
+  // Write supervisor_lift movement to cashMovements
+  addMovement({
+    shiftId: getShiftId(data.cashierId, dateStr),
+    staffId: data.cashierId,
+    date: dateStr,
+    timestamp: newLift.timestamp,
+    type: 'supervisor_lift',
+    amount: data.totalAmount,
+    currency: 'USD',
+    direction: 'out',
+    affectsDrawer: true,
+    status: 'approved',
+    sourceModule: 'form2',
+    sourceRef: liftId,
+    notes: `Supervisor Cash Lift: ${data.supervisorName} collected $${data.totalAmount.toFixed(2)} from Cashier ${data.cashierName}${data.reason ? ` (${data.reason})` : ''}`,
+    approvedBy: data.supervisorId,
+    approvedByName: data.supervisorName,
+    approvedAt: newLift.timestamp,
+    company_id: currentCompany,
+    branch_id: currentBranch,
+  });
+
+  const updatedLifts = [newLift, ...allLifts];
+  setStored(STORAGE_KEYS.CASH_LIFTS, updatedLifts);
+
+  return { liftRecord: newLift, cashLogRecord };
+};
+
+export const deleteCashLift = (liftId: string): boolean => {
+  const allLifts = getAllCashLifts();
+  const target = allLifts.find((l) => l.id === liftId);
+  if (!target) return false;
+
+  const updatedLifts = allLifts.filter((l) => l.id !== liftId);
+  setStored(STORAGE_KEYS.CASH_LIFTS, updatedLifts);
+
+  // Remove corresponding movement from cashMovements
+  const allMovements = getMovements();
+  const matchingMovement = allMovements.find((m) => m.sourceRef === liftId);
+  if (matchingMovement) {
+    deleteMovement(matchingMovement.id);
+  }
+
+  // If there's an associated CashLog entry, delete it as well
+  if (target.cashLogId) {
+    deleteCashLog(target.cashLogId);
+  } else {
+    // Delete by reference
+    const allLogs = getAllCashLogs();
+    const matchingLog = allLogs.find((l) => l.reference === liftId);
+    if (matchingLog) {
+      deleteCashLog(matchingLog.id);
+    }
+  }
+
+  return true;
 };
 
 // ==================== CASH COUNT DAO (FORM 1) ====================
@@ -1928,15 +2915,15 @@ export const getAllCashCounts = (): CashCountRecord[] => {
 
 export const getCashCounts = (): CashCountRecord[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllCashCounts();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((c) => {
     const compId = (c as any).company_id || (c as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+
+    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
   });
 };
 
@@ -1947,23 +2934,27 @@ export const saveFinalCashCount = (data: {
   finalCashOutTotal: number;
   notes?: string;
   date?: string;
-}): { countRecord: CashCountRecord; cashLogRecord: CashLogEntry } => {
+  branchId?: string;
+  branch_id?: string;
+}): { countRecord: CashCountRecord; cashLogRecord: CashLogEntry | null } => {
   const now = new Date();
   const dateStr = data.date || getTodayDateString();
   const currentCounts = getAllCashCounts();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
+  const currentBranch = data.branchId || data.branch_id || getCurrentBranchId();
+
   const existingCountIndex = currentCounts.findIndex(
     (c) => {
       const compId = (c as any).company_id || (c as any).companyId || 'COMP-001';
-      return compId === currentCompany && c.staffId === data.staffId && c.date === dateStr;
+      const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
+      return compId === currentCompany && brId === currentBranch && c.staffId === data.staffId && c.date === dateStr;
     }
   );
 
   let countRecord: CashCountRecord;
 
   if (existingCountIndex >= 0) {
-    // Update existing count record in place for this salesperson and date
+    // Update existing count record in place for this salesperson, date, and branch
     const existing = currentCounts[existingCountIndex];
     countRecord = {
       ...existing,
@@ -1974,15 +2965,15 @@ export const saveFinalCashCount = (data: {
       notes: data.notes !== undefined ? data.notes : existing.notes,
       company_id: (existing as any).company_id || currentCompany,
       companyId: (existing as any).companyId || currentCompany,
-      branch_id: (existing as any).branch_id || currentBranch,
-      branchId: (existing as any).branchId || currentBranch,
+      branch_id: currentBranch,
+      branchId: currentBranch,
       synced: false,
     };
     const updatedCounts = [...currentCounts];
     updatedCounts[existingCountIndex] = countRecord;
     setStored(STORAGE_KEYS.CASH_COUNTS, updatedCounts);
   } else {
-    // New cash count record
+    // New cash count record partitioned by branch
     const countId = `CNT-${Date.now()}`;
     countRecord = {
       id: countId,
@@ -2002,47 +2993,63 @@ export const saveFinalCashCount = (data: {
     setStored(STORAGE_KEYS.CASH_COUNTS, [countRecord, ...currentCounts]);
   }
 
-  // SPEC: Update or Add to Sheet "CashLog": Timestamp, Date, StaffID, StaffName, Line, Description="Final Cash Out", In=0, Out=finalCashOutTotal
-  const currentLogs = getCashLogs();
-  const existingFinalLogIdx = currentLogs.findIndex(
-    (l) =>
-      l.staffId === data.staffId &&
-      l.date === dateStr &&
-      (l.line === 'Final Cash Out' || l.description?.toLowerCase().includes('final cash out'))
+  // Clean up any legacy "Final Cash Out" rows in CASH_LOGS for this staff, date, and branch
+  const allLogs = getAllCashLogs();
+  const cleanedLogs = allLogs.filter(
+    (l) => {
+      const compId = (l as any).company_id || (l as any).companyId || 'COMP-001';
+      const brId = (l as any).branch_id || (l as any).branchId || 'BR-MAIN';
+      if (compId !== currentCompany || brId !== currentBranch) return true;
+      return !(
+        l.staffId === data.staffId &&
+        l.date === dateStr &&
+        (l.line === 'Final Cash Out' || l.description?.toLowerCase().includes('final cash out'))
+      );
+    }
+  );
+  if (cleanedLogs.length !== allLogs.length) {
+    setStored(STORAGE_KEYS.CASH_LOGS, cleanedLogs);
+  }
+
+  // Write ONE movement to cashMovements ledger as physical_count snapshot
+  // Re-saving on the same day updates the existing snapshot (not create a duplicate)
+  const shiftId = getShiftId(data.staffId, dateStr, currentBranch);
+  const movements = getMovements(undefined, currentBranch);
+  const existingSnapshot = movements.find(
+    (m) =>
+      (m.shiftId === shiftId || (m.staffId === data.staffId && m.date === dateStr && ((m as any).branch_id === currentBranch || (m as any).branchId === currentBranch))) &&
+      m.type === 'physical_count'
   );
 
-  let cashLogRecord: CashLogEntry;
-
-  if (existingFinalLogIdx >= 0) {
-    cashLogRecord = {
-      ...currentLogs[existingFinalLogIdx],
-      timestamp: countRecord.timestamp,
-      out: data.finalCashOutTotal,
-      staffName: data.staffName,
-      reference: countRecord.id,
-      synced: false,
-    };
-    const updatedLogs = [...currentLogs];
-    updatedLogs[existingFinalLogIdx] = cashLogRecord;
-    setStored(STORAGE_KEYS.CASH_LOGS, updatedLogs);
+  if (existingSnapshot) {
+    updateMovement(existingSnapshot.id, {
+      amount: data.finalCashOutTotal,
+      timestamp: now.toISOString(),
+      sourceRef: countRecord.id,
+      notes: data.notes || '',
+    });
   } else {
-    cashLogRecord = addCashLog({
-      timestamp: countRecord.timestamp,
-      date: countRecord.date,
+    addMovement({
+      shiftId,
       staffId: data.staffId,
-      staffName: data.staffName,
-      line: 'Final Cash Out',
-      description: 'Final Cash Out',
-      in: 0,
-      out: data.finalCashOutTotal,
-      category: 'Float & Closeout',
-      reference: countRecord.id,
+      date: dateStr,
+      timestamp: now.toISOString(),
+      type: 'physical_count',
+      amount: data.finalCashOutTotal,
+      currency: 'USD',
+      direction: 'snapshot',
+      affectsDrawer: false,
+      status: 'approved',
+      sourceModule: 'form1',
+      sourceRef: countRecord.id,
+      notes: data.notes || '',
+      company_id: currentCompany,
+      branch_id: currentBranch,
     });
   }
 
-  return { countRecord, cashLogRecord };
+  return { countRecord, cashLogRecord: null };
 };
-
 // ==================== CUSTOMER CHANGE DAO (FORM 3) ====================
 export const getAllCustomerChanges = (): CustomerChangeEntry[] => {
   return getStored<CustomerChangeEntry[]>(STORAGE_KEYS.CUSTOMER_CHANGES, INITIAL_CUSTOMER_CHANGES);
@@ -2050,15 +3057,15 @@ export const getAllCustomerChanges = (): CustomerChangeEntry[] => {
 
 export const getCustomerChanges = (): CustomerChangeEntry[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllCustomerChanges();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((c) => {
     const compId = c.company_id || c.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+
+    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
   });
 };
 
@@ -2110,6 +3117,55 @@ export const addCustomerChange = (
     Reference: created.reference || created.id,
   });
 
+  // Ensure cashMovements has change_received (In) or change_paid (Out) if not already recorded
+  const shiftId = getShiftId(created.staffId, created.date);
+  const invRef = created.reference || (created.notes?.match(/INV-[A-Za-z0-9-]+/i)?.[0]);
+  const existingMov = getMovements().find(
+    (m) =>
+      matchesShift(m, shiftId) &&
+      (m.type === 'change_received' || m.type === 'change_paid') &&
+      (m.sourceRef === created.id ||
+        (invRef && (m.sourceRef?.includes(invRef) || m.notes?.includes(invRef))))
+  );
+  if (!existingMov && created.in > 0) {
+    addMovement({
+      shiftId,
+      staffId: created.staffId,
+      date: created.date,
+      timestamp: created.timestamp,
+      type: 'change_received',
+      amount: created.in,
+      currency: 'USD',
+      direction: 'in',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'form3',
+      sourceRef: created.id,
+      notes: `Customer change in: ${created.customerName}${invRef && !created.notes?.includes(invRef) ? ` (POS Invoice #${invRef})` : ''}${created.notes ? ` (${created.notes})` : ''}`,
+      company_id: compId,
+      branch_id: brId,
+    });
+  } else if (!existingMov && created.out > 0) {
+    addMovement({
+      shiftId,
+      staffId: created.staffId,
+      date: created.date,
+      timestamp: created.timestamp,
+      type: 'change_paid',
+      amount: created.out,
+      currency: 'USD',
+      direction: 'out',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'form3',
+      sourceRef: created.id,
+      notes: `Customer change out: ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
+      company_id: compId,
+      branch_id: brId,
+    });
+  }
+
+  notifyListeners();
   return created;
 };
 
@@ -2119,6 +3175,13 @@ export const deleteCustomerChange = (id: string): boolean => {
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.CUSTOMER_CHANGES, filtered);
   enqueueSync('CustomerChange', 'DELETE', { id, company_id: getCurrentCompanyId() });
+
+  // Clean up associated cashMovements and customerLedger entries
+  const movements = getMovements();
+  movements.filter((m) => m.sourceRef === id).forEach((m) => deleteMovement(m.id));
+  const custEntries = getCustomerLedgerEntries((e) => e.sourceRef === id);
+  custEntries.forEach((e) => deleteCustomerLedgerEntry(e.id));
+
   return true;
 };
 
@@ -2148,6 +3211,20 @@ export const saveDailyCustomerChangeSheet = (
     setStored(STORAGE_KEYS.CUSTOMER_CHANGES, otherChanges);
     return [];
   }
+
+  // Clean up existing sourceModule: 'form3' movements for this shift
+  const shiftId = getShiftId(staffId, date);
+  const currentMovements = getMovements();
+  const toDelete = currentMovements.filter(
+    (m) => matchesShift(m, shiftId) && m.sourceModule === 'form3' && (m.type === 'change_received' || m.type === 'change_paid')
+  );
+  toDelete.forEach((m) => deleteMovement(m.id));
+
+  // Clean up existing customerLedger change collected entries for this staff and date
+  const existingCustEntries = getCustomerLedgerEntries(
+    (e) => e.staffId === staffId && e.date === date && e.sourceModule === 'form3' && e.type === 'change_collected'
+  );
+  existingCustEntries.forEach((e) => deleteCustomerLedgerEntry(e.id));
 
   const createdList: CustomerChangeEntry[] = [];
   const now = new Date();
@@ -2181,6 +3258,73 @@ export const saveDailyCustomerChangeSheet = (
     };
     createdList.push(newEntry);
 
+    // Map row types to cashMovements ledger:
+    // Change In: change_received, in, affectsDrawer: true
+    // Prevent double-counting if this change was already recorded from a POS transaction
+    const isExistingPosMovement = currentMovements.some(
+      (m) =>
+        m.sourceModule === 'POS' &&
+        m.type === 'change_received' &&
+        matchesShift(m, shiftId) &&
+        ((item.notes && item.notes.includes(m.sourceRef || '')) ||
+          (m.sourceRef && (item.notes?.includes(m.sourceRef) || item.customerName.toLowerCase() === m.notes?.toLowerCase())))
+    );
+    if (!isExistingPosMovement && newEntry.in > 0) {
+      addMovement({
+        shiftId,
+        staffId,
+        date,
+        timestamp: newEntry.timestamp,
+        type: 'change_received',
+        amount: newEntry.in,
+        currency: 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form3',
+        sourceRef: newEntry.id,
+        notes: `Customer change in: ${newEntry.customerName}${newEntry.notes ? ` (${newEntry.notes})` : ''}`,
+        company_id: currentCompany,
+        branch_id: currentBranch,
+      });
+    }
+
+    // Change Out: change_paid, out, affectsDrawer: true
+    if (newEntry.out > 0) {
+      addMovement({
+        shiftId,
+        staffId,
+        date,
+        timestamp: newEntry.timestamp,
+        type: 'change_paid',
+        amount: newEntry.out,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form3',
+        sourceRef: newEntry.id,
+        notes: `Customer change out: ${newEntry.customerName}${newEntry.notes ? ` (${newEntry.notes})` : ''}`,
+        company_id: currentCompany,
+        branch_id: currentBranch,
+      });
+
+      // Also record delayed change collected in customerLedger
+      addCustomerLedgerEntry({
+        customerId: cust.customerId,
+        customerName: cust.name,
+        date,
+        timestamp: newEntry.timestamp,
+        type: 'change_collected',
+        amount: newEntry.out,
+        sourceRef: newEntry.id,
+        sourceModule: 'form3',
+        notes: `Delayed change paid out to ${cust.name}`,
+        staffId,
+        staffName,
+      });
+    }
+
     enqueueSync('CustomerChange', 'INSERT', {
       company_id: currentCompany,
       branch_id: currentBranch,
@@ -2197,6 +3341,7 @@ export const saveDailyCustomerChangeSheet = (
   });
 
   setStored(STORAGE_KEYS.CUSTOMER_CHANGES, [...createdList, ...otherChanges]);
+  notifyListeners();
   return createdList;
 };
 
@@ -2207,15 +3352,15 @@ export const getAllCreditSales = (): CreditSaleEntry[] => {
 
 export const getCreditSales = (): CreditSaleEntry[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllCreditSales();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((c) => {
     const compId = c.company_id || c.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+
+    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
   });
 };
 
@@ -2271,6 +3416,39 @@ export const addCreditSale = (
     Status: created.status,
   });
 
+  // If cash was repaid (In > 0), record cash movement if not already recorded (e.g., upfront deposit at POS)
+  if (created.in && created.in > 0) {
+    const isPosInitialDeposit = created.notes?.includes('POS Credit Sale Invoice');
+    if (!isPosInitialDeposit) {
+      const shiftId = getShiftId(created.staffId, created.date);
+      const existingMov = getMovements().find(
+        (m) =>
+          (m.type === 'credit_cash_payment' || m.type === 'credit_upfront_deposit') &&
+          (m.sourceRef === created.id || (created.notes && m.sourceRef && created.notes.includes(m.sourceRef)))
+      );
+      if (!existingMov) {
+        addMovement({
+          shiftId,
+          staffId: created.staffId,
+          date: created.date,
+          timestamp: created.timestamp,
+          type: 'credit_cash_payment',
+          amount: created.in,
+          currency: 'USD',
+          direction: 'in',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form3',
+          sourceRef: created.id,
+          notes: `Credit debt cash payment from ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
+          company_id: compId,
+          branch_id: brId,
+        });
+      }
+    }
+  }
+
+  notifyListeners();
   return created;
 };
 
@@ -2280,7 +3458,324 @@ export const deleteCreditSale = (id: string): boolean => {
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.CREDIT_SALES, filtered);
   enqueueSync('CreditSales', 'DELETE', { id, company_id: getCurrentCompanyId() });
+
+  // Clean up associated cashMovements and customerLedger entries
+  const movements = getMovements();
+  movements.filter((m) => m.sourceRef === id).forEach((m) => deleteMovement(m.id));
+  const custEntries = getCustomerLedgerEntries((e) => e.sourceRef === id);
+  custEntries.forEach((e) => deleteCustomerLedgerEntry(e.id));
+
   return true;
+};
+
+export const isSupervisorOrAbove = (role?: string): boolean => {
+  const norm = String(role || '').toUpperCase().trim();
+  return ['SUPERVISOR', 'BRANCH_MANAGER', 'MANAGER', 'ADMIN', 'OWNER', 'SUPER_ADMIN', 'STOCK_CLERK', 'CLERK'].includes(norm);
+};
+
+export const DEFAULT_CREDIT_POLICY: StoreCreditPolicy = {
+  mode: 'CUSTOMER_LIMIT',
+  defaultCreditLimit: 100.0,
+  defaultMaxReceiptCount: 2,
+  allowCashierOverride: false,
+  maxCustomerCreditCap: 300.0, // Absolute max individual limit allowed without Owner PIN
+  branchCreditExposureCap: 2500.0, // Absolute max total cumulative debt allowed for the branch
+};
+
+export const getCreditPolicy = (): StoreCreditPolicy => {
+  try {
+    const raw = localStorage.getItem('saimetric_credit_policy');
+    if (raw) {
+      return { ...DEFAULT_CREDIT_POLICY, ...JSON.parse(raw) };
+    }
+  } catch (e) {}
+  return DEFAULT_CREDIT_POLICY;
+};
+
+export const saveCreditPolicy = (policy: StoreCreditPolicy): void => {
+  try {
+    localStorage.setItem('saimetric_credit_policy', JSON.stringify(policy));
+    notifyListeners();
+  } catch (e) {}
+};
+
+export const DEFAULT_BRANCH_SHARING_SETTINGS: CompanyBranchSharingSettings = {
+  shareCustomersAcrossBranches: false,
+  shareSuppliersAcrossBranches: false,
+  form4AuditPassword: '',
+};
+
+export const getCompanyBranchSettings = (): CompanyBranchSharingSettings => {
+  const currentCompany = getCurrentCompanyId();
+  try {
+    const raw = localStorage.getItem(`saimetric_branch_sharing_${currentCompany}`);
+    if (raw) return { ...DEFAULT_BRANCH_SHARING_SETTINGS, ...JSON.parse(raw) };
+  } catch (e) {}
+  return DEFAULT_BRANCH_SHARING_SETTINGS;
+};
+
+export const saveCompanyBranchSettings = (settings: Partial<CompanyBranchSharingSettings>): CompanyBranchSharingSettings => {
+  const currentCompany = getCurrentCompanyId();
+  const current = getCompanyBranchSettings();
+  const updated = { ...current, ...settings };
+  try {
+    localStorage.setItem(`saimetric_branch_sharing_${currentCompany}`, JSON.stringify(updated));
+    notifyListeners();
+  } catch (e) {}
+  return updated;
+};
+
+export const logDrawerBalanceReveal = (
+  supervisor: { id: string; name: string; role: string },
+  balance: number,
+  context: string = 'Form 2 Cash Log'
+): void => {
+  const currentBranch = getCurrentBranchId();
+  const branches = getBranches();
+  const branchName = branches.find((b) => b.branchId === currentBranch)?.name || currentBranch;
+  addAuditLog({
+    action: 'APPROVAL' as any,
+    severity: 'SECURITY' as any,
+    staffId: supervisor.id,
+    staffName: supervisor.name,
+    staffRole: supervisor.role as any,
+    branch_id: currentBranch,
+    branchId: currentBranch,
+    amount: balance,
+    referenceId: `DRAWER-${currentBranch}`,
+    details: `Strategic live drawer balance ($${balance.toFixed(2)}) unmasked by ${supervisor.role} ${supervisor.name} on register [Branch: ${branchName}, Context: ${context}].`,
+    metadata: { entityType: 'CASH_DRAWER', context },
+  });
+};
+
+export const logForm4AuditUnlock = (
+  supervisor: { id: string; name: string; role: string },
+  date: string,
+  method: 'PASSWORD' | 'PIN'
+): void => {
+  const currentBranch = getCurrentBranchId();
+  const branches = getBranches();
+  const branchName = branches.find((b) => b.branchId === currentBranch)?.name || currentBranch;
+  addAuditLog({
+    action: 'APPROVAL' as any,
+    severity: 'SECURITY' as any,
+    staffId: supervisor.id,
+    staffName: supervisor.name,
+    staffRole: supervisor.role as any,
+    branch_id: currentBranch,
+    branchId: currentBranch,
+    referenceId: `RECON-${currentBranch}-${date}`,
+    details: `End-of-Day Shift Balancing (Form 4) audit unlocked via ${method} by ${supervisor.role} ${supervisor.name} for date ${date} [Branch: ${branchName}].`,
+    metadata: { entityType: 'RECONCILIATION', method, date },
+  });
+};
+
+export const getCustomerCreditSummary = (
+  customerId: string,
+  newSaleAmount: number = 0
+): {
+  totalOutstanding: number;
+  unpaidReceiptsCount: number;
+  creditLimit: number;
+  maxReceiptCount: number;
+  isWithinLimits: boolean;
+  creditAllowed: boolean;
+  limitExceededReason?: string;
+} => {
+  const customers = getCustomers();
+  const customer = customers.find((c) => c.customerId === customerId);
+  const policy = getCreditPolicy();
+
+  const creditLimit = customer?.creditLimit !== undefined ? customer.creditLimit : policy.defaultCreditLimit;
+  const maxReceiptCount = customer?.maxCreditReceiptCount !== undefined ? customer.maxCreditReceiptCount : policy.defaultMaxReceiptCount;
+  const creditAllowed = customer?.creditAllowed !== false;
+
+  const allCredit = getCreditSales().filter(
+    (c) => (c.customerId === customerId || c.customerName === customer?.name) && c.status !== 'Paid'
+  );
+
+  let totalOutstanding = 0;
+  allCredit.forEach((c) => {
+    const out = Number(c.out || c.amount || 0);
+    const rep = Number(c.in || 0);
+    const balance = Math.max(0, out - rep);
+    totalOutstanding += balance;
+  });
+
+  const unpaidReceiptsCount = allCredit.filter((c) => {
+    const out = Number(c.out || c.amount || 0);
+    const rep = Number(c.in || 0);
+    return out - rep > 0.01;
+  }).length;
+
+  if (!creditAllowed) {
+    return {
+      totalOutstanding,
+      unpaidReceiptsCount,
+      creditLimit,
+      maxReceiptCount,
+      creditAllowed: false,
+      isWithinLimits: false,
+      limitExceededReason: 'Customer account is restricted from credit purchases.',
+    };
+  }
+
+  const projectedDebt = totalOutstanding + newSaleAmount;
+  if (creditLimit > 0 && projectedDebt > creditLimit + 0.001) {
+    return {
+      totalOutstanding,
+      unpaidReceiptsCount,
+      creditLimit,
+      maxReceiptCount,
+      creditAllowed: true,
+      isWithinLimits: false,
+      limitExceededReason: `Credit limit ($${creditLimit.toFixed(2)}) exceeded. Current debt: $${totalOutstanding.toFixed(2)}, Cart: $${newSaleAmount.toFixed(2)}.`,
+    };
+  }
+
+  if (maxReceiptCount > 0 && unpaidReceiptsCount >= maxReceiptCount && newSaleAmount > 0) {
+    return {
+      totalOutstanding,
+      unpaidReceiptsCount,
+      creditLimit,
+      maxReceiptCount,
+      creditAllowed: true,
+      isWithinLimits: false,
+      limitExceededReason: `Max unpaid receipts count reached (${unpaidReceiptsCount}/${maxReceiptCount}). Customer must settle previous receipts first.`,
+    };
+  }
+
+  // Enforce Owner's Branch Cumulative Exposure Cap (Risk Management)
+  const branchCap = policy.branchCreditExposureCap || 2500;
+  if (branchCap > 0 && newSaleAmount > 0) {
+    const currentBranch = getCurrentBranchId();
+    const branchCreditSales = getCreditSales().filter((c) => {
+      const bId = c.branch_id || (c as any).branchId;
+      return (!bId || bId === currentBranch) && c.status !== 'Paid';
+    });
+    let branchTotalOutstanding = 0;
+    branchCreditSales.forEach((c) => {
+      const out = Number(c.out || c.amount || 0);
+      const rep = Number(c.in || 0);
+      branchTotalOutstanding += Math.max(0, out - rep);
+    });
+
+    if (branchTotalOutstanding + newSaleAmount > branchCap) {
+      return {
+        totalOutstanding,
+        unpaidReceiptsCount,
+        creditLimit,
+        maxReceiptCount,
+        creditAllowed: true,
+        isWithinLimits: false,
+        limitExceededReason: `Branch cumulative credit exposure cap ($${branchCap.toFixed(2)}) reached! Current branch debt: $${branchTotalOutstanding.toFixed(2)}. Unpaid customer accounts must be collected before issuing new branch credit.`,
+      };
+    }
+  }
+
+  return {
+    totalOutstanding,
+    unpaidReceiptsCount,
+    creditLimit,
+    maxReceiptCount,
+    creditAllowed: true,
+    isWithinLimits: true,
+  };
+};
+
+export const updateCustomerCreditTerms = (
+  customerId: string,
+  updates: {
+    creditLimit?: number;
+    creditAllowed?: boolean;
+    maxCreditReceiptCount?: number;
+  },
+  authorizedBy: { id: string; name: string; role: string }
+): Customer | null => {
+  const all = getAllCustomers();
+  const idx = all.findIndex((c) => c.customerId === customerId);
+  if (idx === -1) return null;
+
+  const current = all[idx];
+  const updated: Customer = {
+    ...current,
+    ...updates,
+    creditApprovedBy: authorizedBy.name,
+    creditApprovalDate: new Date().toISOString(),
+  };
+  all[idx] = updated;
+  setStored(STORAGE_KEYS.CUSTOMERS, all);
+
+  addAuditLog({
+    action: 'PRICE_CHANGE' as any,
+    severity: 'SECURITY' as any,
+    staffId: authorizedBy.id,
+    staffName: authorizedBy.name,
+    staffRole: authorizedBy.role as any,
+    branch_id: getCurrentBranchId(),
+    branchId: getCurrentBranchId(),
+    referenceId: customerId,
+    details: `Customer [${current.name} - ${customerId}] credit terms updated: Limit $${(current.creditLimit ?? 0).toFixed(2)} -> $${(updated.creditLimit ?? 0).toFixed(2)}, Allowed: ${updated.creditAllowed}, Max receipts: ${updated.maxCreditReceiptCount || 2}. Authorized by ${authorizedBy.role} ${authorizedBy.name}.`,
+    metadata: { customerId, oldLimit: current.creditLimit, newLimit: updated.creditLimit },
+  });
+
+  enqueueSync('Customers', 'UPDATE', updated);
+  notifyListeners();
+  return updated;
+};
+
+export const approveCreditSale = (
+  id: string,
+  supervisor: Salesperson
+): boolean => {
+  const all = getAllCreditSales();
+  let found = false;
+  const updated = all.map((c) => {
+    if (c.id === id) {
+      found = true;
+      return {
+        ...c,
+        supervisorApprovalStatus: 'APPROVED' as const,
+        approvedByStaffId: supervisor.id,
+        approvedByStaffName: supervisor.name,
+        approvalTimestamp: new Date().toISOString(),
+      };
+    }
+    return c;
+  });
+  if (found) {
+    setStored(STORAGE_KEYS.CREDIT_SALES, updated);
+    notifyListeners();
+  }
+  return found;
+};
+
+export const flagCreditSale = (
+  id: string,
+  supervisor: Salesperson,
+  reason: string
+): boolean => {
+  const all = getAllCreditSales();
+  let found = false;
+  const updated = all.map((c) => {
+    if (c.id === id) {
+      found = true;
+      return {
+        ...c,
+        supervisorApprovalStatus: 'FLAGGED' as const,
+        approvedByStaffId: supervisor.id,
+        approvedByStaffName: supervisor.name,
+        approvalTimestamp: new Date().toISOString(),
+        notes: c.notes ? `${c.notes} [FLAGGED: ${reason}]` : `[FLAGGED: ${reason}]`,
+      };
+    }
+    return c;
+  });
+  if (found) {
+    setStored(STORAGE_KEYS.CREDIT_SALES, updated);
+    notifyListeners();
+  }
+  return found;
 };
 
 export const saveDailyCreditSalesSheet = (
@@ -2316,6 +3811,20 @@ export const saveDailyCreditSalesSheet = (
     setStored(STORAGE_KEYS.CREDIT_SALES, otherCredits);
     return [];
   }
+
+  // Clean up existing sourceModule: 'form3' credit movements for this shift
+  const shiftId = getShiftId(staffId, date);
+  const currentMovements = getMovements();
+  const toDelete = currentMovements.filter(
+    (m) => matchesShift(m, shiftId) && m.sourceModule === 'form3' && m.type === 'credit_cash_payment'
+  );
+  toDelete.forEach((m) => deleteMovement(m.id));
+
+  // Clean up existing customerLedger entries created by form3 for this staff and date
+  const existingCustEntries = getCustomerLedgerEntries(
+    (e) => e.staffId === staffId && e.date === date && e.sourceModule === 'form3' && (e.type === 'credit_payment' || e.type === 'credit_extended')
+  );
+  existingCustEntries.forEach((e) => deleteCustomerLedgerEntry(e.id));
 
   const createdList: CreditSaleEntry[] = [];
   const now = new Date();
@@ -2355,6 +3864,74 @@ export const saveDailyCreditSalesSheet = (
     };
     createdList.push(newEntry);
 
+    // Map row types:
+    // Credit IN (customer pays debt with cash): credit_cash_payment, in, affectsDrawer: true
+    // Deduplicate against any upfront deposit only if this exact row references the POS invoice
+    const posDepositMovement = currentMovements.find(
+      (m) =>
+        m.sourceModule === 'POS' &&
+        m.type === 'credit_upfront_deposit' &&
+        matchesShift(m, shiftId) &&
+        m.sourceRef &&
+        item.notes &&
+        item.notes.includes(m.sourceRef)
+    );
+    const posDepositAmt = posDepositMovement ? Number(posDepositMovement.amount) || 0 : 0;
+    const netCashPaidInForm3 = Math.max(0, creditRepaid - posDepositAmt);
+
+    if (netCashPaidInForm3 > 0) {
+      addMovement({
+        shiftId,
+        staffId,
+        date,
+        timestamp: newEntry.timestamp,
+        type: 'credit_cash_payment',
+        amount: netCashPaidInForm3,
+        currency: 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form3',
+        sourceRef: newEntry.id,
+        notes: `Credit debt cash repayment from ${newEntry.customerName}${item.notes ? ` (${item.notes})` : ''}`,
+        company_id: currentCompany,
+        branch_id: currentBranch,
+      });
+
+      // Also record debt payment in customerLedger
+      addCustomerLedgerEntry({
+        customerId: cust.customerId,
+        customerName: cust.name,
+        date,
+        timestamp: newEntry.timestamp,
+        type: 'credit_payment',
+        amount: netCashPaidInForm3,
+        sourceRef: newEntry.id,
+        sourceModule: 'form3',
+        notes: `Debt cash repayment from ${newEntry.customerName}`,
+        staffId,
+        staffName,
+      });
+    }
+
+    // Credit OUT (credit extended): affectsDrawer: false
+    // Do NOT write to cashMovements. Write to customerLedger as a receivable!
+    if (creditGiven > 0) {
+      addCustomerLedgerEntry({
+        customerId: cust.customerId,
+        customerName: cust.name,
+        date,
+        timestamp: newEntry.timestamp,
+        type: 'credit_extended',
+        amount: creditGiven,
+        sourceRef: newEntry.id,
+        sourceModule: 'form3',
+        notes: `Credit extended to ${cust.name}: ${item.itemDescription || 'Goods on Credit'}`,
+        staffId,
+        staffName,
+      });
+    }
+
     enqueueSync('CreditSales', 'INSERT', {
       company_id: currentCompany,
       branch_id: currentBranch,
@@ -2376,6 +3953,7 @@ export const saveDailyCreditSalesSheet = (
   });
 
   setStored(STORAGE_KEYS.CREDIT_SALES, [...createdList, ...otherCredits]);
+  notifyListeners();
   return createdList;
 };
 
@@ -2386,11 +3964,22 @@ export const getAllSales = (): SaleInvoice[] => {
 
 export const getSales = (): SaleInvoice[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllSales();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
+  return all.filter((s) => {
+    const compId = s.company_id || s.companyId;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+
+    // Strict branch isolation: only return sales for the current branch
+    const brId = s.branch_id || s.branchId || 'BR-MAIN';
+    return brId === currentBranch;
+  });
+};
+
+export const getAllBranchesSales = (): SaleInvoice[] => {
+  const currentCompany = getCurrentCompanyId();
+  const all = getAllSales();
   return all.filter((s) => {
     const compId = s.company_id || s.companyId;
     if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
@@ -2422,12 +4011,37 @@ export const onSaleCreated = (listener: SaleCreationListener) => {
 };
 
 export const ingestMeshSale = (sale: SaleInvoice): boolean => {
+  if (!sale || !sale.id) return false;
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+  const currentBranchCode = getCurrentBranch()?.code;
+
+  const saleComp = (sale.company_id || sale.companyId || '').trim().toUpperCase();
+  const cleanCurrentComp = (currentCompany || '').trim().toUpperCase();
+  if (saleComp && cleanCurrentComp && saleComp !== cleanCurrentComp) {
+    console.warn(`[ingestMeshSale] Dropping sale from different tenant: [${saleComp}] vs [${cleanCurrentComp}]`);
+    return false;
+  }
+
+  const saleBranch = (sale.branch_id || sale.branchId || '').trim().toUpperCase();
+  const cleanCurrentBranch = (currentBranch || '').trim().toUpperCase();
+  const cleanCurrentBranchCode = (currentBranchCode || '').trim().toUpperCase();
+  if (
+    saleBranch &&
+    cleanCurrentBranch &&
+    saleBranch !== cleanCurrentBranch &&
+    saleBranch !== cleanCurrentBranchCode
+  ) {
+    console.warn(
+      `[ingestMeshSale] Dropping sale from different branch: [${saleBranch}] vs [${cleanCurrentBranch}/${cleanCurrentBranchCode}]`
+    );
+    return false;
+  }
+
   const list = getAllSales();
   if (list.some((s) => s.id === sale.id)) {
     return false; // Already present
   }
-  const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
   const normalized: SaleInvoice = {
     ...sale,
     company_id: sale.company_id || sale.companyId || currentCompany,
@@ -2442,7 +4056,14 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   if (Array.isArray(normalized.items)) {
     normalized.items.forEach((item) => {
       if (item.id && item.quantity > 0) {
-        updateProductStock(item.id, -item.quantity);
+        updateProductStock(item.id, -item.quantity, undefined, undefined, {
+          staffId: normalized.staffId,
+          staffName: normalized.staffName,
+          referenceId: normalized.id,
+          reason: `POS Sale Outflow: Sold ${item.quantity} ${item.name || ''} to ${normalized.customerName || 'Customer'} (Invoice #${normalized.id})`,
+          actionTaken: 'POS_SALE',
+          txnType: 'SALE',
+        });
       }
     });
   }
@@ -2468,6 +4089,8 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
       reference: normalized.id,
       company_id: normalized.company_id,
       branch_id: normalized.branch_id,
+      fromMesh: true,
+      skipSync: true,
     });
   }
 
@@ -2501,8 +4124,32 @@ export const addSale = (
   const branchesList = getBranches();
   const matchedBranch = branchesList.find((b) => b.branchId === brId);
 
+  const snapshottedItems = Array.isArray(saleData.items)
+    ? saleData.items.map((item) => {
+        const invItem = getInventoryItemById(item.id);
+        const avgCost =
+          item.costPerUnitAverage !== undefined
+            ? item.costPerUnitAverage
+            : invItem?.averageCostPerUnit !== undefined && invItem.averageCostPerUnit > 0
+            ? invItem.averageCostPerUnit
+            : invItem?.costPerUnit || (item.unitPrice * 0.7);
+        const latestCost =
+          item.costPerUnitLatest !== undefined
+            ? item.costPerUnitLatest
+            : invItem?.latestCostPerUnit !== undefined && invItem.latestCostPerUnit > 0
+            ? invItem.latestCostPerUnit
+            : invItem?.costPerUnit || (item.unitPrice * 0.7);
+        return {
+          ...item,
+          costPerUnitAverage: Number(avgCost.toFixed(4)),
+          costPerUnitLatest: Number(latestCost.toFixed(4)),
+        };
+      })
+    : [];
+
   const created: SaleInvoice = {
     ...saleData,
+    items: snapshottedItems,
     id: invId,
     synced: false,
     company_id: compId,
@@ -2515,11 +4162,18 @@ export const addSale = (
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.SALES, updated);
 
-  // 1. Decrement product stock in inventory
+  // 1. Decrement product stock in inventory and log audit trail
   if (Array.isArray(created.items)) {
     created.items.forEach((item) => {
       if (item.id && item.quantity > 0) {
-        updateProductStock(item.id, -item.quantity);
+        updateProductStock(item.id, -item.quantity, undefined, undefined, {
+          staffId: created.staffId,
+          staffName: created.staffName,
+          referenceId: created.id,
+          reason: `POS Sale Outflow: Sold ${item.quantity} ${item.name || ''} to ${created.customerName || 'Customer'} (Invoice #${created.id})`,
+          actionTaken: 'POS_SALE',
+          txnType: 'SALE',
+        });
       }
     });
   }
@@ -2538,6 +4192,10 @@ export const addSale = (
       staffName: created.staffName,
       customerId: created.customerId,
       customerName: created.customerName,
+      company_id: compId,
+      companyId: compId,
+      branch_id: brId,
+      branchId: brId,
       in: 0,
       out: created.customerCreditUsed,
       notes: `Applied customer credit/change fund to POS Invoice #${created.id}`,
@@ -2554,12 +4212,35 @@ export const addSale = (
       date: created.date,
       staffId: created.staffId,
       staffName: created.staffName,
+      company_id: compId,
+      companyId: compId,
+      branch_id: brId,
+      branchId: brId,
       line: 'Sales',
-      description: `Cash sale #${created.id} - ${created.customerName} (${created.itemsSummary})${created.customerCreditUsed ? ` (Includes $${created.customerCreditUsed.toFixed(2)} store credit used)` : ''}`,
+      description: `Cash sale #${created.id} - ${created.customerName} (${created.itemsSummary})${created.customerCreditUsed ? ` (Includes ${created.customerCreditUsed.toFixed(2)} store credit used)` : ''}`,
       in: actualCashCollected,
       out: 0,
       category: 'Sales Cash',
       reference: created.id,
+    });
+
+    // Write cash_sale movement to cashMovements
+    addMovement({
+      shiftId: getShiftId(created.staffId, created.date, brId),
+      staffId: created.staffId,
+      date: created.date,
+      timestamp: created.timestamp,
+      type: 'cash_sale',
+      amount: actualCashCollected,
+      currency: 'USD',
+      direction: 'in',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'POS',
+      sourceRef: created.id,
+      notes: `POS Cash sale #${created.id} - ${created.customerName}`,
+      company_id: compId,
+      branch_id: brId,
     });
 
     // If customer leaves change behind with the shop, automatically record in Form 3 Customer Change
@@ -2577,18 +4258,43 @@ export const addSale = (
         staffName: created.staffName,
         customerId: created.customerId,
         customerName: created.customerName,
+        company_id: compId,
+        companyId: compId,
+        branch_id: brId,
+        branchId: brId,
         in: amountToLeaveBehind,
         out: 0,
-        notes: `Change left behind ($${amountToLeaveBehind.toFixed(2)}) from POS Invoice #${created.id}`,
+        notes: `Change left behind (${amountToLeaveBehind.toFixed(2)}) from POS Invoice #${created.id}`,
         reference: created.id,
       });
+
+      // Left-behind change is a customer credit liability in customerLedger
+      addCustomerLedgerEntry({
+        customerId: created.customerId || '',
+        customerName: created.customerName,
+        date: created.date,
+        timestamp: created.timestamp,
+        type: 'change_liability',
+        amount: amountToLeaveBehind,
+        sourceRef: created.id,
+        sourceModule: 'POS',
+        notes: `Change left behind from POS Invoice #${created.id}`,
+        staffId: created.staffId,
+        staffName: created.staffName,
+      });
+
+      // Note: addCustomerChange above already records the canonical change_received movement into cashMovements
+      // with full drawer integration. No second movement is needed to prevent double-counting.
     }
   }
 
   // 4. If Credit sale, AUTOMATICALLY FILL AND RECORD CREDIT FORM (Form 3 Credit Sales)
   if (created.paymentMethod === 'Credit' && saleData.recordCreditEntry !== false) {
     const deposit = Number(created.creditDeposit) || 0;
-    const totalCreditAmount = created.total;
+    const totalCreditAmount =
+      created.creditAmount !== undefined && Number(created.creditAmount) > 0
+        ? Number(created.creditAmount)
+        : created.total;
     const creditStatus: 'Paid' | 'Partial' | 'Pending' =
       deposit >= totalCreditAmount && totalCreditAmount > 0
         ? 'Paid'
@@ -2603,28 +4309,188 @@ export const addSale = (
       staffName: created.staffName,
       customerId: created.customerId,
       customerName: created.customerName,
+      company_id: compId,
+      companyId: compId,
+      branch_id: brId,
+      branchId: brId,
       amount: totalCreditAmount,
       out: totalCreditAmount, // goods value taken on credit
       in: deposit, // cash deposit paid upfront
       itemDescription: created.itemsSummary || 'POS Goods on Credit',
       dueDate: created.creditDueDate || '',
-      notes: `POS Credit Sale Invoice #${created.id}${deposit > 0 ? ` ($${deposit.toFixed(2)} deposit paid)` : ''}`,
+      notes: `POS Credit Sale Invoice #${created.id}${deposit > 0 ? ` (${deposit.toFixed(2)} deposit paid)` : ''}`,
       status: creditStatus,
     });
 
-    // If partial deposit paid in cash, record the deposit into CashLog (Form 2)
+    // POS credit sale with upfront deposit: write remainder ONLY to customerLedger as receivable
+    const creditRemainder = Math.max(0, totalCreditAmount - deposit);
+    if (creditRemainder > 0) {
+      addCustomerLedgerEntry({
+        customerId: created.customerId || '',
+        customerName: created.customerName,
+        date: created.date,
+        timestamp: created.timestamp,
+        type: 'credit_extended',
+        amount: creditRemainder,
+        sourceRef: created.id,
+        sourceModule: 'POS',
+        notes: `Credit receivable for Invoice #${created.id} (Total: $${totalCreditAmount.toFixed(2)}, Upfront deposit: $${deposit.toFixed(2)})`,
+        staffId: created.staffId,
+        staffName: created.staffName,
+      });
+    }
+
+    // If partial deposit paid in cash, record the deposit into CashLog (Form 2) and cashMovements
     if (deposit > 0) {
       addCashLog({
         timestamp: created.timestamp,
         date: created.date,
         staffId: created.staffId,
         staffName: created.staffName,
+        company_id: compId,
+        companyId: compId,
+        branch_id: brId,
+        branchId: brId,
         line: 'Sales',
         description: `Cash deposit for Credit Invoice #${created.id} - ${created.customerName}`,
         in: deposit,
         out: 0,
         category: 'Credit Deposit',
         reference: created.id,
+      });
+
+      addMovement({
+        shiftId: getShiftId(created.staffId, created.date, brId),
+        staffId: created.staffId,
+        date: created.date,
+        timestamp: created.timestamp,
+        type: 'credit_upfront_deposit',
+        amount: deposit,
+        currency: 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'POS',
+        sourceRef: created.id,
+        notes: `Cash deposit for Credit Invoice #${created.id} - ${created.customerName}`,
+        company_id: compId,
+        branch_id: brId,
+      });
+    }
+  }
+
+  // 5. NON-DEFAULT CURRENCIES (ZiG, EcoCash) & CASH WITHDRAWALS:
+  // User mandate:
+  // - "sales from currencies other than the default should be subtracted in form 2 cashlog as usd."
+  // - "zig and ecocash should also support cash with drawals which are not taxed or considered sales but deducted in form 2 cashlog to ensure cashier balances"
+  // - "limits should also be set on cash with drawals for example Maximum cash withdrawal equals sale amount"
+  const saleCurrency = created.currency as string | undefined;
+  const isNonDefaultCurrency =
+    saleCurrency === 'ZiG' ||
+    saleCurrency === 'EcoCash' ||
+    created.paymentMethod === 'ZiG' ||
+    created.paymentMethod === 'EcoCash' ||
+    (created.paymentMethod === 'EcoCash/Mobile' && (saleCurrency === 'EcoCash' || saleCurrency === 'ZiG'));
+
+  if (isNonDefaultCurrency && saleData.recordCashLog !== false) {
+    const cur: 'ZiG' | 'EcoCash' =
+      (saleCurrency as 'ZiG' | 'EcoCash') ||
+      (created.paymentMethod === 'ZiG' ? 'ZiG' : 'EcoCash');
+    const currencyConfig = getMultiCurrencyConfig();
+    const rate = created.exchangeRate || currencyConfig.rates[cur]?.rateToUsd || (cur === 'ZiG' ? 26.5 : 27.0);
+    const saleUsdAmount = created.total; // in USD
+    const curAmount = created.totalInCurrency || (saleUsdAmount * rate);
+
+    // 5a. Deduct non-cash sale in Form 2 as base currency (USD) so cashier balances
+    addCashLog({
+      timestamp: created.timestamp,
+      date: created.date,
+      staffId: created.staffId,
+      staffName: created.staffName,
+      companyId: created.companyId || created.company_id,
+      company_id: created.company_id || created.companyId,
+      branchId: created.branchId || created.branch_id,
+      branch_id: created.branch_id || created.branchId,
+      line: cur,
+      description: `${cur} Sale #${created.id} (${curAmount.toFixed(2)} ${cur} @ ${rate.toFixed(2)}) - ${created.customerName}`,
+      in: 0,
+      out: saleUsdAmount, // Subtracted in Form 2 as base USD!
+      category: `${cur} Non-Cash Sale Deduction`,
+      currency: cur,
+      exchangeRate: rate,
+      currencyAmount: curAmount,
+      reference: created.id,
+      notes: `Electronic ${cur} Payment: ${curAmount.toFixed(2)} ${cur}. Deducted as $${saleUsdAmount.toFixed(2)} USD base currency in Form 2 so cash drawer balances.`,
+    });
+
+    // Write non-cash electronic sale movement (Reporting only, does NOT affect physical drawer)
+    addMovement({
+      shiftId: getShiftId(created.staffId, created.date, brId),
+      staffId: created.staffId,
+      date: created.date,
+      timestamp: created.timestamp,
+      type: cur === 'ZiG' ? 'zig_sale' : 'ecocash_sale',
+      amount: saleUsdAmount,
+      currency: cur,
+      direction: 'none',
+      affectsDrawer: false,
+      status: 'approved',
+      sourceModule: 'POS',
+      sourceRef: created.id,
+      notes: `${cur} Electronic non-cash sale #${created.id} (${curAmount.toFixed(2)} ${cur})`,
+      company_id: compId,
+      branch_id: brId,
+    });
+
+    // 5b. If Cash Withdrawal occurred, deduct withdrawal in Form 2 as base currency (USD)
+    // Untaxed, not considered a sale, but physical USD cash is handed out from till!
+    if (created.cashWithdrawalAmount && Number(created.cashWithdrawalAmount) > 0) {
+      const withdrawalUsd = Number(created.cashWithdrawalAmount);
+      const withdrawalInCur = created.cashWithdrawalInCurrency || (withdrawalUsd * rate);
+      const grossUsd = Number(created.grossTenderUsd) || (saleUsdAmount + withdrawalUsd);
+      const grossInCur = Number(created.totalChargedInCurrency) || (grossUsd * rate);
+      const popRef = created.proofOfPaymentRef || created.paymentReference || '';
+      const refNote = popRef ? ` | Ref/POP: ${popRef}` : '';
+
+      addCashLog({
+        timestamp: created.timestamp,
+        date: created.date,
+        staffId: created.staffId,
+        staffName: created.staffName,
+        companyId: created.companyId || created.company_id,
+        company_id: created.company_id || created.companyId,
+        branchId: created.branchId || created.branch_id,
+        branch_id: created.branch_id || created.branchId,
+        line: cur,
+        description: `${cur} Cash-Out Payout #${created.id} ($${withdrawalUsd.toFixed(2)} USD / ${withdrawalInCur.toFixed(2)} ${cur})${refNote}`,
+        in: 0,
+        out: withdrawalUsd, // Subtracted in Form 2 as base USD!
+        category: `${cur} Cash Withdrawal`,
+        currency: cur,
+        exchangeRate: rate,
+        currencyAmount: withdrawalInCur,
+        isWithdrawal: true,
+        reference: created.id,
+        notes: `Cash Out Payout to Customer: Swiped gross ${grossInCur.toFixed(2)} ${cur} ($${grossUsd.toFixed(2)} USD). Cashier handed $${withdrawalUsd.toFixed(2)} USD physical cash from till. Sale: $${saleUsdAmount.toFixed(2)} USD (${curAmount.toFixed(2)} ${cur}).${refNote}`,
+      });
+
+      // Write Cash-Out movement (affects drawer: true, direction: out)
+      addMovement({
+        shiftId: getShiftId(created.staffId, created.date, brId),
+        staffId: created.staffId,
+        date: created.date,
+        timestamp: created.timestamp,
+        type: cur === 'ZiG' ? 'zig_cash_out' : 'ecocash_cash_out',
+        amount: withdrawalUsd,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'POS',
+        sourceRef: created.id,
+        notes: `${cur} Cash-Out Payout #${created.id} ($${withdrawalUsd.toFixed(2)} USD handed out | Gross Slip: $${grossUsd.toFixed(2)} USD / ${grossInCur.toFixed(2)} ${cur}${refNote})`,
+        company_id: compId,
+        branch_id: brId,
       });
     }
   }
@@ -2689,7 +4555,14 @@ export const refundSaleInvoice = (params: {
   if (Array.isArray(invoice.items)) {
     invoice.items.forEach((item) => {
       if (item.id && item.quantity > 0) {
-        updateProductStock(item.id, item.quantity);
+        updateProductStock(item.id, item.quantity, undefined, undefined, {
+          staffId: params.manager.id,
+          staffName: params.manager.name,
+          referenceId: invoice.id,
+          reason: `Customer Refund Restock: +${item.quantity} ${item.name || ''} (Refunded Invoice #${invoice.id} - ${params.reason})`,
+          actionTaken: 'REFUND_RESTOCK',
+          txnType: 'RETURN',
+        });
       }
     });
   }
@@ -2768,7 +4641,14 @@ export const voidSaleInvoice = (params: {
   if (Array.isArray(invoice.items)) {
     invoice.items.forEach((item) => {
       if (item.id && item.quantity > 0) {
-        updateProductStock(item.id, item.quantity);
+        updateProductStock(item.id, item.quantity, undefined, undefined, {
+          staffId: params.manager.id,
+          staffName: params.manager.name,
+          referenceId: invoice.id,
+          reason: `Invoice Void Restock: +${item.quantity} ${item.name || ''} (Voided Invoice #${invoice.id} - ${params.reason})`,
+          actionTaken: 'VOID_RESTOCK',
+          txnType: 'RETURN',
+        });
       }
     });
   }
@@ -2792,15 +4672,14 @@ export const getAllExpenses = (): ExpenseEntry[] => {
 
 export const getExpenses = (): ExpenseEntry[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllExpenses();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((e) => {
     const compId = e.company_id || e.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+    const brId = (e as any).branch_id || (e as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
   });
 };
 
@@ -2890,15 +4769,14 @@ export const getAllReconciliations = (): ShiftReconciliation[] => {
 
 export const getReconciliations = (): ShiftReconciliation[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllReconciliations();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((r) => {
     const compId = (r as any).company_id || (r as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+    const brId = (r as any).branch_id || (r as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
   });
 };
 
@@ -2949,15 +4827,14 @@ export const getAllAdminSales = (): AdminSalesEntry[] => {
 
 export const getAdminSales = (): AdminSalesEntry[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllAdminSales();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((s) => {
     const compId = (s as any).company_id || (s as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+    const brId = (s as any).branch_id || (s as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
   });
 };
 
@@ -3054,77 +4931,654 @@ export const saveAllAdminSalesEntries = (
   return newDateEntries;
 };
 
+export const getSalesForStaffAndDate = (staffId: string, date: string, staffName?: string): SaleInvoice[] => {
+  const allSales = getSales();
+  const targetStaffId = String(staffId).trim().toLowerCase();
+  const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
+  const targetName = staffName ? staffName.trim().toLowerCase() : '';
+
+  return allSales.filter((s) => {
+    const saleStaffId = s.staffId ? String(s.staffId).trim().toLowerCase() : '';
+    const normSaleStaff = saleStaffId.replace(/^usr-|^staff-|^0+/, '');
+    const saleStaffName = s.staffName ? s.staffName.trim().toLowerCase() : '';
+
+    const isSameStaff =
+      saleStaffId === targetStaffId ||
+      (normTarget && normSaleStaff === normTarget) ||
+      (targetName && saleStaffName === targetName);
+
+    // Support both direct date match and local timestamp date match
+    const saleDate = s.date || '';
+    let isSameDate = saleDate === date;
+    if (!isSameDate && s.timestamp) {
+      const utcDate = s.timestamp.slice(0, 10);
+      try {
+        const localD = new Date(s.timestamp);
+        const y = localD.getFullYear();
+        const m = String(localD.getMonth() + 1).padStart(2, '0');
+        const d = String(localD.getDate()).padStart(2, '0');
+        const localDateStr = `${y}-${m}-${d}`;
+        isSameDate = utcDate === date || localDateStr === date;
+      } catch {
+        isSameDate = utcDate === date;
+      }
+    }
+    const isValidStatus = s.status !== 'Refunded' && s.status !== 'Voided';
+    return isSameStaff && isSameDate && isValidStatus;
+  });
+};
+
+export const getTotalSalesForStaffAndDate = (staffId: string, date: string): number => {
+  const staffSales = getSalesForStaffAndDate(staffId, date);
+  return staffSales.reduce((sum, s) => sum + (s.total || 0), 0);
+};
+
 /**
  * Calculates the exact cash position, net sums, should have, and variance for a salesperson on a given date.
- * Formulas as requested:
- * - Form 2 Net = Form 2 In - Form 2 Out
- * - Form 3 Net = Form 3 In - Form 3 Out (Customer Change + Credit Sales)
- * - Sum of Form 2 & 3 Net = Form 2 Net + Form 3 Net
- * - Should Have = (Sum of Form 2 & 3 Net) - Sales
- * - Variance = Sales - (Sum of Form 2 & 3 Net)
+ * Formulas:/**
+ * ==================== FORM 4: SALESPERSON CASH BALANCING ====================
+ * Expected Cash Formula (Core User Balancing Formula):
+ * expectedCash = float + cashSales + creditPayments - expenses - directProcurements - cashLift - customerChange - deductions - ecocashWithdrawal - zigWithdrawal
+ * 
+ * Non-Cash Sales:
+ * totalNonCashSales = ecocashSales + zigSales (Reporting only, NOT for expected cash)
  */
-export const calculateSalespersonCashBalancing = (
+export const calculateForm4 = (
   staffId: string,
   staffName: string,
   date: string,
-  overrideSales?: number
-) => {
-  // Form 2 Logs
-  const form2Logs = getCashLogsForStaffAndDate(staffId, date);
-  const form2In = form2Logs.reduce((sum, l) => sum + (l.in || 0), 0);
-  const form2Out = form2Logs.reduce((sum, l) => sum + (l.out || 0), 0);
-  const form2Net = form2In - form2Out;
+  overrideSales?: number,
+  branchId?: string
+): Form4BalancingResult => {
+  const currentBranch = branchId || getCurrentBranchId();
+  const shiftId = getShiftId(staffId, date, currentBranch);
+  const breakdown = getShiftLedgerBreakdown(shiftId);
 
-  // Form 3 Customer Change
+  // Non-cash sales (for reporting only, not in expected cash)
+  const staffSales = getSalesForStaffAndDate(staffId, date, staffName);
+  const systemSalesTotal = staffSales.reduce((sum, s) => sum + (s.total || 0), 0);
+
+  const ecocashSales = staffSales
+    .filter((s) => s.paymentMethod === 'EcoCash' || (s.currency === 'EcoCash' && s.paymentMethod !== 'Cash'))
+    .reduce((sum, s) => sum + (s.total || 0), 0);
+  const zigSales = staffSales
+    .filter((s) => s.paymentMethod === 'ZiG' || (s.currency === 'ZiG' && s.paymentMethod !== 'Cash'))
+    .reduce((sum, s) => sum + (s.total || 0), 0);
+
+  // Credit extended from customerLedger (NOT cashMovements)
+  const staffCustomerLedger = getCustomerLedgerEntries((entry) =>
+    (entry.staffId === staffId || !entry.staffId) && entry.date === date
+  );
+  const creditExtended = staffCustomerLedger
+    .filter((e) => e.type === 'credit_extended')
+    .reduce((sum, e) => sum + (e.amount || 0), 0);
+
+  const totalNonCashSales = ecocashSales + zigSales + creditExtended;
+
+  // Form 2 & 3 legacy logs for compatibility
+  const form2Logs = getCashLogsForStaffAndDate(staffId, date);
   const form3Changes = getCustomerChangesForStaffAndDate(staffId, date);
+  const form3Credits = getCreditSalesForStaffAndDate(staffId, date);
+
+  const savedAdminSale = getAdminSaleForStaffAndDate(staffId, date);
+  let totalSales = systemSalesTotal;
+  let isOverridden = false;
+
+  // If cashMovements exist for this shift, use breakdown as the canonical source
+  if (breakdown.movementsCount > 0) {
+    let float = breakdown.openingFloat;
+    let cashSales = breakdown.cashSales;
+    let creditPayments = breakdown.creditPayments;
+    let changeReceived = breakdown.changeReceived;
+    let expenses = breakdown.expenses;
+    let directProcurements = breakdown.directProcurements;
+    let cashLift = breakdown.cashLift;
+    let customerChange = breakdown.changePaid;
+    let deductions = breakdown.pettyCash;
+    let ecocashWithdrawal = breakdown.ecocashCashOut;
+    let zigWithdrawal = breakdown.zigCashOut;
+
+    if (overrideSales !== undefined) {
+      totalSales = overrideSales;
+      isOverridden = Math.abs(overrideSales - systemSalesTotal) > 0.001;
+      cashSales = Math.max(0, overrideSales - (ecocashSales + zigSales));
+    } else if (savedAdminSale && savedAdminSale.notes?.includes('Manual Override')) {
+      totalSales = savedAdminSale.salesAmount;
+      isOverridden = true;
+      cashSales = Math.max(0, savedAdminSale.salesAmount - (ecocashSales + zigSales));
+    }
+
+    const cashInTotal = Math.round((float + cashSales + creditPayments + changeReceived) * 100) / 100;
+    const cashOutTotal = Math.round(
+      (expenses + directProcurements + cashLift + customerChange + deductions + ecocashWithdrawal + zigWithdrawal) * 100
+    ) / 100;
+    const expectedCash = Math.round((cashInTotal - cashOutTotal) * 100) / 100;
+    const shouldHave = expectedCash;
+
+    const actualCashCount = breakdown.physicalCount;
+    const form1Counted = actualCashCount;
+
+    let variance = 0;
+    if (actualCashCount !== null) {
+      variance = Math.round((actualCashCount - expectedCash) * 100) / 100;
+    } else {
+      variance = Math.round((0 - expectedCash) * 100) / 100;
+    }
+
+    let status: 'Balanced' | 'Over' | 'Shortage' | 'No Activity' = 'Balanced';
+    if (actualCashCount !== null) {
+      if (Math.abs(variance) < 0.01) status = 'Balanced';
+      else if (variance < 0) status = 'Shortage';
+      else status = 'Over';
+    } else {
+      status = 'Shortage';
+    }
+
+    const form2In = form2Logs.reduce((sum, l) => sum + (l.in || 0), 0);
+    const form2Out = form2Logs.reduce((sum, l) => sum + (l.out || 0), 0);
+    const form2Net = form2In - form2Out;
+    const changeIn = changeReceived;
+    const changeOut = customerChange;
+    const creditIn = breakdown.creditPayments;
+    const creditOut = creditExtended;
+    const form3In = changeIn + creditIn;
+    const form3Out = changeOut + creditOut;
+    const form3Net = form3In - form3Out;
+    const sumForm2And3Net = form2Net + form3Net;
+
+    return {
+      staffId,
+      staffName,
+      date,
+      float,
+      cashSales,
+      creditPayments,
+      expenses,
+      directProcurements,
+      cashLift,
+      customerChange,
+      deductions,
+      ecocashWithdrawal,
+      zigWithdrawal,
+      expectedCash,
+      shouldHave,
+      ecocashSales,
+      zigSales,
+      creditExtended,
+      totalNonCashSales,
+      cashInTotal,
+      cashOutTotal,
+      changeReceived,
+      changePaid: customerChange,
+      totalSales,
+      sales: totalSales,
+      systemSalesTotal,
+      systemSalesCount: staffSales.length,
+      staffSales,
+      isOverridden,
+      actualCashCount,
+      form1Counted,
+      variance,
+      status,
+      hasActivity: true,
+      notes: savedAdminSale?.notes || '',
+      form2In,
+      form2Out,
+      form2Net,
+      form3In,
+      form3Out,
+      form3Net,
+      changeIn,
+      changeOut,
+      creditIn,
+      creditOut,
+      sumForm2And3Net,
+      form2LogsCount: form2Logs.length,
+      form3ChangesCount: form3Changes.length,
+      form3CreditsCount: form3Credits.length,
+    };
+  }
+
+  // 1. Form 2 Logs for this staff & date (Legacy fallback)
+  // Float (Opening cash drawer float)
+  const floatLog = form2Logs.find(
+    (l) =>
+      l.line === 'Float' ||
+      l.line === 'float' ||
+      l.category === 'Float' ||
+      (l as any).categoryGroup === 'Float & Closeout' ||
+      l.description?.toLowerCase().startsWith('float')
+  );
+  const float = floatLog?.in || 0;
+
+  // Direct Procurements (Out) - deduplicate between approved Direct GRVs and manual Form 2 logs
+  const directGrvs = getDirectGrvsForStaffAndDate(staffId, date);
+  const grvTotal = directGrvs.reduce((sum, g) => sum + (g.totalCost || 0), 0);
+  const nonGrvProcurements = form2Logs
+    .filter(
+      (l) =>
+        (l.out || 0) > 0 &&
+        (l.line === 'Direct Procurement' ||
+          l.category === 'Direct Procurement' ||
+          (l as any).categoryGroup === 'Direct Procurement' ||
+          l.description?.toLowerCase().includes('direct procurement') ||
+          l.description?.toLowerCase().includes('procurement')) &&
+        !directGrvs.some((g) => {
+          const gRef = g.grvNumber || g.id;
+          return (
+            (l.reference && l.reference === gRef) ||
+            (l.description && l.description.includes(gRef)) ||
+            Math.abs((g.totalCost || 0) - (l.out || 0)) < 0.01
+          );
+        })
+    )
+    .reduce((sum, l) => sum + (l.out || 0), 0);
+  const directProcurements = grvTotal > 0 ? (grvTotal + nonGrvProcurements) : nonGrvProcurements;
+
+  // Cash Lift (Out: supervisor pick-ups)
+  const staffLifts = getCashLiftsForStaffAndDate(staffId, date);
+  const liftFromDb = staffLifts.reduce((sum, l) => sum + (l.totalAmount || (l as any).amount || 0), 0);
+  const liftFromLogs = form2Logs
+    .filter(
+      (l) =>
+        (l.out || 0) > 0 &&
+        (l.category?.includes('Cash Lift') ||
+          l.category?.includes('Supervisor Pick-Up') ||
+          l.reference?.startsWith('LIFT-') ||
+          l.description?.toLowerCase().includes('cash lift') ||
+          l.description?.toLowerCase().includes('supervisor pick-up'))
+    )
+    .reduce((sum, l) => sum + (l.out || 0), 0);
+  const cashLift = Math.max(liftFromDb, liftFromLogs);
+
+  // Cash Expenses (Out: utilities, bread, airtime, home use, operational cash expenses)
+  const utilitiesLogs = form2Logs.filter(
+    (l) =>
+      (l.out || 0) > 0 &&
+      (l.line === 'Bread' ||
+        l.line === 'Airtime' ||
+        l.line === 'Home Use' ||
+        l.line === 'Daily Utilities & Home' ||
+        l.category === 'Daily Utilities & Home' ||
+        (l as any).categoryGroup === 'Daily Utilities & Home' ||
+        l.category?.toLowerCase().includes('expense') ||
+        l.description?.toLowerCase().includes('bread') ||
+        l.description?.toLowerCase().includes('airtime') ||
+        l.description?.toLowerCase().includes('home use'))
+  );
+  const expensesFromLogs = utilitiesLogs.reduce((sum, l) => sum + (l.out || 0), 0);
+
+  // Operational cash expenses from expense database that are not already recorded in Form 2 logs
+  const dbExpensesNotLogged = getExpenses()
+    .filter((e) => e.staffId === staffId && e.date === date && (e.paymentMethod === 'Cash' || !e.paymentMethod))
+    .filter(
+      (e) =>
+        !utilitiesLogs.some(
+          (l) =>
+            (l.reference && l.reference === e.id) ||
+            (e.description && l.description?.toLowerCase().includes(e.description.toLowerCase()))
+        )
+    )
+    .reduce((sum, e) => sum + (e.amount || 0), 0);
+  const expenses = expensesFromLogs + dbExpensesNotLogged;
+
+  // EcoCash & ZiG & Dynamic Multi-Currency Cash-Outs / Withdrawals (Physical Cash OUT from till)
+  const activeCurrenciesList = getActiveCurrencies();
+  const currencyWithdrawalsMap: Record<string, number> = {};
+  const currencySalesMap: Record<string, number> = {};
+
+  activeCurrenciesList.forEach((c) => {
+    const code = c.code;
+    const name = c.name || code;
+    const lowerCode = code.toLowerCase();
+    const lowerName = name.toLowerCase();
+
+    // Withdrawals recorded in Form 2 logs
+    const logWithdrawals = form2Logs
+      .filter((l) => {
+        if ((l.out || 0) <= 0) return false;
+        const line = (l.line || '').toLowerCase();
+        const desc = (l.description || '').toLowerCase();
+        const cat = (l.category || '').toLowerCase();
+        const curr = (l.currency || '').toLowerCase();
+        const matchesCurr =
+          curr === lowerCode ||
+          line.includes(lowerCode) ||
+          cat.includes(lowerCode) ||
+          desc.includes(lowerCode) ||
+          desc.includes(lowerName);
+        const isW =
+          l.isWithdrawal ||
+          line.includes('withdrawal') ||
+          cat.includes('withdrawal') ||
+          desc.includes('cash-out') ||
+          desc.includes('withdrawal');
+        return matchesCurr && isW;
+      })
+      .reduce((sum, l) => sum + (l.out || 0), 0);
+
+    // Withdrawals from POS Sales transactions
+    const salesWithdrawals = staffSales
+      .filter((s) => {
+        const sMeth = (s.paymentMethod || '').toLowerCase();
+        const sCurr = (s.currency || '').toLowerCase();
+        const matchesCurr = sMeth === lowerCode || sCurr === lowerCode || sCurr === lowerName;
+        return matchesCurr && s.cashWithdrawalAmount && Number(s.cashWithdrawalAmount) > 0;
+      })
+      .reduce((sum, s) => sum + Number(s.cashWithdrawalAmount), 0);
+
+    const totalCurrWithdrawal = Math.max(logWithdrawals, salesWithdrawals);
+    currencyWithdrawalsMap[code] = totalCurrWithdrawal;
+
+    // Non-cash electronic sales
+    const currSales = staffSales
+      .filter((s) => {
+        const sMeth = (s.paymentMethod || '').toLowerCase();
+        const sCurr = (s.currency || '').toLowerCase();
+        return (sMeth === lowerCode || sCurr === lowerCode || sCurr === lowerName) && (s.total || 0) > 0;
+      })
+      .reduce((sum, s) => sum + (s.total || 0), 0);
+    currencySalesMap[code] = currSales;
+  });
+
+  // Ensure EcoCash and ZiG backward compatibility
+  const ecoWithdrawalLogs = form2Logs
+    .filter(
+      (l) =>
+        (l.out || 0) > 0 &&
+        (l.currency === 'EcoCash' ||
+          l.line === 'EcoCash' ||
+          l.line === 'ecocashWithdrawal' ||
+          l.description?.toLowerCase().includes('ecocash')) &&
+        (l.isWithdrawal ||
+          l.line === 'ecocashWithdrawal' ||
+          l.category?.toLowerCase().includes('withdrawal') ||
+          l.description?.toLowerCase().includes('cash-out') ||
+          l.description?.toLowerCase().includes('withdrawal'))
+    )
+    .reduce((sum, l) => sum + (l.out || 0), 0);
+
+  const ecoWithdrawalSales = staffSales
+    .filter(
+      (s) =>
+        (s.paymentMethod === 'EcoCash' || s.currency === 'EcoCash') &&
+        s.cashWithdrawalAmount &&
+        Number(s.cashWithdrawalAmount) > 0
+    )
+    .reduce((sum, s) => sum + Number(s.cashWithdrawalAmount), 0);
+  const ecocashWithdrawal = Math.max(
+    currencyWithdrawalsMap['EcoCash'] || currencyWithdrawalsMap['ECO'] || 0,
+    Math.max(ecoWithdrawalLogs, ecoWithdrawalSales)
+  );
+
+  const zigWithdrawalLogs = form2Logs
+    .filter(
+      (l) =>
+        (l.out || 0) > 0 &&
+        (l.currency === 'ZiG' ||
+          l.line === 'ZiG' ||
+          l.line === 'zigWithdrawal' ||
+          l.description?.toLowerCase().includes('zig')) &&
+        (l.isWithdrawal ||
+          l.line === 'zigWithdrawal' ||
+          l.category?.toLowerCase().includes('withdrawal') ||
+          l.description?.toLowerCase().includes('cash-out') ||
+          l.description?.toLowerCase().includes('withdrawal'))
+    )
+    .reduce((sum, l) => sum + (l.out || 0), 0);
+
+  const zigWithdrawalSales = staffSales
+    .filter(
+      (s) =>
+        (s.paymentMethod === 'ZiG' || s.currency === 'ZiG') &&
+        s.cashWithdrawalAmount &&
+        Number(s.cashWithdrawalAmount) > 0
+    )
+    .reduce((sum, s) => sum + Number(s.cashWithdrawalAmount), 0);
+  const zigWithdrawal = Math.max(
+    currencyWithdrawalsMap['ZiG'] || currencyWithdrawalsMap['ZIG'] || 0,
+    Math.max(zigWithdrawalLogs, zigWithdrawalSales)
+  );
+
+  // Total multi-currency withdrawals across all active currencies
+  currencyWithdrawalsMap['EcoCash'] = ecocashWithdrawal;
+  currencyWithdrawalsMap['ZiG'] = zigWithdrawal;
+  const totalMultiCurrencyWithdrawals = Object.values(currencyWithdrawalsMap).reduce((sum, v) => sum + v, 0);
+
+  // Base cash sales from POS (less any store credit applied from non-cash credits)
+  let cashSales = staffSales
+    .filter((s) => s.paymentMethod === 'Cash' || (!s.paymentMethod && (!s.currency || s.currency === 'USD')))
+    .reduce((sum, s) => sum + Math.max(0, (s.total || 0) - (s.customerCreditUsed || 0)), 0);
+
+  if (overrideSales !== undefined) {
+    totalSales = overrideSales;
+    isOverridden = Math.abs(overrideSales - systemSalesTotal) > 0.001;
+    cashSales = Math.max(0, overrideSales - totalNonCashSales);
+  } else if (savedAdminSale && savedAdminSale.notes?.includes('Manual Override')) {
+    totalSales = savedAdminSale.salesAmount;
+    isOverridden = true;
+    cashSales = Math.max(0, savedAdminSale.salesAmount - totalNonCashSales);
+  }
+
+  // 3. Form 3 Customer Change & Credit Sales
   const changeIn = form3Changes.reduce((sum, c) => sum + (c.in || 0), 0);
   const changeOut = form3Changes.reduce((sum, c) => sum + (c.out || 0), 0);
+  const customerChange = changeOut;
 
-  // Form 3 Credit Sales
-  const form3Credits = getCreditSalesForStaffAndDate(staffId, date);
   const creditIn = form3Credits.reduce((sum, c) => sum + (c.in || 0), 0);
   const creditOut = form3Credits.reduce((sum, c) => sum + (c.out || c.amount || 0), 0);
 
-  const form3In = changeIn + creditIn;
-  const form3Out = changeOut + creditOut;
-  const form3Net = form3In - form3Out;
+  // Credit payments received into drawer (repayments on account + change left behind in till)
+  const creditPayments = creditIn + changeIn;
 
-  // Sum of Form 2 & 3 Net
-  const sumForm2And3Net = form2Net + form3Net;
+  // 4. Miscellaneous cash deductions in Form 2
+  // Must exclude all items that have their own dedicated calculation terms to prevent double deductions!
+  const deductions = form2Logs
+    .filter((l) => {
+      if ((l.out || 0) <= 0) return false;
 
-  // Sales (from Admin entry or override)
-  const savedAdminSale = getAdminSaleForStaffAndDate(staffId, date);
-  const sales = overrideSales !== undefined ? overrideSales : (savedAdminSale?.salesAmount || 0);
+      const line = (l.line || '').toLowerCase();
+      const desc = (l.description || '').toLowerCase();
+      const cat = (l.category || '').toLowerCase();
+      const ref = (l.reference || '').toLowerCase();
 
-  // Should Have = Net of Form 2 + Net of Form 3 + Sales = (Sum of Form 2 & 3 Net) + Sales
-  const shouldHave = sumForm2And3Net + sales;
+      // Exclude float and closeout
+      if (line.includes('final cash out') || desc.includes('final cash out')) return false;
+      if (line.includes('float') || desc.startsWith('float')) return false;
 
-  // Variance = 0 - Should Have
-  const variance = 0 - shouldHave;
+      // Exclude direct procurement
+      if (
+        line.includes('procurement') ||
+        cat.includes('procurement') ||
+        desc.includes('procurement')
+      ) {
+        return false;
+      }
 
-  // Status
+      // Exclude cash lift / supervisor pick-up
+      if (
+        cat.includes('cash lift') ||
+        cat.includes('supervisor pick-up') ||
+        desc.includes('cash lift') ||
+        desc.includes('supervisor pick-up') ||
+        ref.startsWith('lift-')
+      ) {
+        return false;
+      }
+
+      // Exclude utilities / expenses
+      if (
+        line === 'bread' ||
+        line === 'airtime' ||
+        line === 'home use' ||
+        line.includes('utilities') ||
+        cat.includes('utilities') ||
+        cat.includes('expense') ||
+        desc.includes('bread') ||
+        desc.includes('airtime') ||
+        desc.includes('home use')
+      ) {
+        return false;
+      }
+
+      // Exclude multi-currency logs (both withdrawals and non-cash sales are handled via explicit multi-currency terms)
+      const isMultiCurrencyLog = activeCurrenciesList.some((c) => {
+        const lc = (c.code || '').toLowerCase();
+        const ln = (c.name || '').toLowerCase();
+        return (
+          (l.currency || '').toLowerCase() === lc ||
+          line.includes(lc) ||
+          cat.includes(lc) ||
+          desc.includes(lc) ||
+          (ln && desc.includes(ln))
+        );
+      });
+      if (isMultiCurrencyLog) return false;
+
+      // Exclude EcoCash & ZiG fallback terms
+      if (
+        l.currency === 'EcoCash' ||
+        line.includes('ecocash') ||
+        cat.includes('ecocash') ||
+        desc.includes('ecocash')
+      ) {
+        return false;
+      }
+
+      if (
+        l.currency === 'ZiG' ||
+        line.includes('zig') ||
+        cat.includes('zig') ||
+        desc.includes('zig')
+      ) {
+        return false;
+      }
+
+      return true;
+    })
+    .reduce((sum, l) => sum + (l.out || 0), 0);
+
+  // 5. Expected Cash Formula (Core User Balancing Formula)
+  // expectedCash = float + cashSales + creditPayments - expenses - directProcurements - cashLift - customerChange - deductions - totalMultiCurrencyWithdrawals
+  const expectedCash =
+    float +
+    cashSales +
+    creditPayments -
+    expenses -
+    directProcurements -
+    cashLift -
+    customerChange -
+    deductions -
+    totalMultiCurrencyWithdrawals;
+
+  const shouldHave = expectedCash;
+
+  // 6. Actual physical cash count from Form 1
+  const countRecord = getCashCountForStaffAndDate(staffId, date);
+  const finalCashOutLog = form2Logs.find(
+    (l) => l.line === 'Final Cash Out' || l.description?.toLowerCase().includes('final cash out')
+  );
+  const actualCashCount = countRecord
+    ? countRecord.finalCashOutTotal
+    : finalCashOutLog && (finalCashOutLog.out || 0) > 0
+    ? finalCashOutLog.out
+    : null;
+  const form1Counted = actualCashCount;
+
+  // 7. Variance & Balancing Status
+  // If drawer was counted, variance = actualCashCount - expectedCash
+  // If pending count, variance = 0 - expectedCash
+  let variance = 0;
+  if (actualCashCount !== null) {
+    variance = actualCashCount - expectedCash;
+  } else {
+    variance = 0 - expectedCash;
+  }
+
+  const hasActivity =
+    form2Logs.length > 0 ||
+    form3Changes.length > 0 ||
+    form3Credits.length > 0 ||
+    totalSales > 0 ||
+    staffSales.length > 0 ||
+    actualCashCount !== null;
+
   let status: 'Balanced' | 'Over' | 'Shortage' | 'No Activity' = 'Balanced';
-  const hasActivity = form2Logs.length > 0 || form3Changes.length > 0 || form3Credits.length > 0 || sales > 0;
   if (!hasActivity) {
     status = 'No Activity';
   } else if (Math.abs(variance) < 0.01) {
     status = 'Balanced';
   } else if (variance < 0) {
-    // Variance < 0 (i.e. Should Have > 0) => Shortage / Deficit
     status = 'Shortage';
   } else {
-    // Variance > 0 (i.e. Should Have < 0) => Cash Over / Surplus
     status = 'Over';
   }
 
-  // Form 1 Physical Count for reference
-  const countRecord = getCashCountForStaffAndDate(staffId, date);
-  const form1Counted = countRecord ? countRecord.finalCashOutTotal : null;
+  // Form 2 & Form 3 Net values
+  // Operational Form 2 Net: Cash in drawer from daily operations before final closeout handover
+  // Exclude 'Final Cash Out' from operational outflows so Form 2 Net reflects true operational cash movement
+  const form2In = form2Logs.reduce((sum, l) => sum + (l.in || 0), 0);
+  const form2OperationalOut = form2Logs
+    .filter(
+      (l) =>
+        !l.line?.toLowerCase().includes('final cash out') &&
+        !l.description?.toLowerCase().includes('final cash out')
+    )
+    .reduce((sum, l) => sum + (l.out || 0), 0);
+  const form2Out = form2Logs.reduce((sum, l) => sum + (l.out || 0), 0);
+  const form2Net = form2In - form2OperationalOut;
+
+  // Form 3 Cash Net: Cash transactions only (repayments and change left behind minus customer change handed out)
+  // Note: creditOut is goods delivered on credit, not cash removed from the physical drawer
+  const form3In = changeIn + creditIn;
+  const form3Out = changeOut + creditOut;
+  const form3CashIn = changeIn + creditIn;
+  const form3CashOut = changeOut;
+  const form3Net = form3CashIn - form3CashOut;
+  const sumForm2And3Net = form2Net + form3Net;
 
   return {
     staffId,
     staffName,
     date,
+    // Core user formula components
+    float,
+    cashSales,
+    creditPayments,
+    expenses,
+    directProcurements,
+    cashLift,
+    customerChange,
+    deductions,
+    ecocashWithdrawal,
+    zigWithdrawal,
+    totalMultiCurrencyWithdrawals,
+    currencyWithdrawals: currencyWithdrawalsMap,
+    currencySales: currencySalesMap,
+    activeCurrencies: activeCurrenciesList,
+    expectedCash,
+    shouldHave,
+    cashInTotal: Math.round((float + cashSales + creditPayments + changeIn) * 100) / 100,
+    cashOutTotal: Math.round(
+      (expenses + directProcurements + cashLift + customerChange + deductions + totalMultiCurrencyWithdrawals) * 100
+    ) / 100,
+    // Reporting only
+    ecocashSales,
+    zigSales,
+    totalNonCashSales,
+    totalSales,
+    sales: totalSales,
+    systemSalesTotal,
+    systemSalesCount: staffSales.length,
+    staffSales,
+    isOverridden,
+    actualCashCount,
+    form1Counted,
+    variance,
+    status,
+    hasActivity,
+    notes: savedAdminSale?.notes || '',
+    // Form 2 & 3 legacy
     form2In,
     form2Out,
     form2Net,
@@ -3136,22 +5590,23 @@ export const calculateSalespersonCashBalancing = (
     creditIn,
     creditOut,
     sumForm2And3Net,
-    sales,
-    shouldHave,
-    variance,
-    status,
-    hasActivity,
-    form1Counted,
-    notes: savedAdminSale?.notes || '',
     form2LogsCount: form2Logs.length,
     form3ChangesCount: form3Changes.length,
     form3CreditsCount: form3Credits.length,
   };
 };
 
+export const calculateSalespersonCashBalancing = calculateForm4;
+
 // ==================== SYNC QUEUE DAO ====================
-export const getSyncQueue = (): SyncQueueItem[] => {
-  return getStored<SyncQueueItem[]>(STORAGE_KEYS.SYNC_QUEUE, []);
+export const getSyncQueue = (companyId?: string): SyncQueueItem[] => {
+  const all = getStored<SyncQueueItem[]>(STORAGE_KEYS.SYNC_QUEUE, []);
+  if (!companyId || companyId === 'ALL') return all;
+  const cleanComp = companyId.trim().toUpperCase();
+  return all.filter((i) => {
+    const itemComp = (i.payload?.company_id || i.payload?.CompanyID || '').trim().toUpperCase();
+    return itemComp === cleanComp;
+  });
 };
 
 export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 'DELETE', payload: Record<string, any>) => {
@@ -3160,12 +5615,19 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
   const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
 
+  const clientRequestId =
+    payload.clientRequestId ||
+    (typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
+
   const enhancedPayload = {
     company_id: payload.company_id || currentCompany,
     branch_id: payload.branch_id || currentBranch,
     user_branch_id: payload.user_branch_id || sessionUser?.branch_id || currentBranch,
     user_id: payload.user_id || sessionUser?.user_id || 'USR-001',
     user_role: payload.user_role || sessionUser?.role || 'CASHIER',
+    clientRequestId,
     ...payload,
   };
 
@@ -3178,7 +5640,64 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
     retries: 0,
     status: 'pending',
   };
-  setStored(STORAGE_KEYS.SYNC_QUEUE, [...current, newItem]);
+  // Keep localStorage sync queue bounded to recent 150 items to prevent localStorage 5MB quota exhaustion
+  const boundedQueue = [...current, newItem].slice(-150);
+  setStored(STORAGE_KEYS.SYNC_QUEUE, boundedQueue);
+
+  // Broadcast database mutation across local P2P WiFi mesh (unless originating from mesh)
+  if (!payload.fromMesh) {
+    try {
+      const activeBr = getCurrentBranch();
+      notifyDatabaseMutation({
+        mutationId: newItem.id,
+        sheetName: sheetName as string,
+        action,
+        companyId: enhancedPayload.company_id,
+        branchId: enhancedPayload.branch_id,
+        branchCode: activeBr?.code || 'HQ-01',
+        entityType: resolveEntityType(sheetName as string),
+        recordId: String(payload.id || payload.itemId || payload.grvNumber || payload.invoiceNumber || newItem.id),
+        payload: enhancedPayload,
+        timestamp: newItem.timestamp,
+        clientRequestId,
+      });
+    } catch (e) {
+      console.warn('[enqueueSync] Mutation broadcast error:', e);
+    }
+  }
+
+  // Stage 2: Enqueue to persistent IndexedDB syncQueue with exponential backoff & clientRequestId
+  let mappedAction = action.toLowerCase();
+  let priority: 'HIGH' | 'NORMAL' | 'LOW' = 'NORMAL';
+
+  if (sheetName === 'Sales' && action === 'INSERT') {
+    mappedAction = 'add_sale';
+  } else if (sheetName === 'Direct_GRV') {
+    mappedAction = payload.status === 'APPROVED' ? 'approve_direct_grv' : 'add_direct_grv';
+    priority = 'HIGH';
+  } else if (sheetName === 'users' || sheetName === 'Salespeople') {
+    mappedAction = 'upsert_staff';
+    priority = 'HIGH';
+  } else if (sheetName === 'branches') {
+    mappedAction = 'create_branch';
+    priority = 'HIGH';
+  } else if ((sheetName as string) === 'EOD') {
+    mappedAction = payload.status === 'APPROVED' ? 'approve_eod' : 'submit_eod';
+    priority = 'HIGH';
+  } else if ((sheetName as string) === 'InventoryMaster' || (sheetName as string) === 'Products') {
+    priority = 'HIGH';
+  } else if ((sheetName as string) === 'Audit_Log') {
+    priority = 'LOW';
+  }
+
+  persistentSyncEngine.enqueueWrite({
+    action: mappedAction,
+    sheetName: sheetName as string,
+    payload: enhancedPayload,
+    priority,
+  }).catch((err) => {
+    console.warn('[enqueueSync] IDB enqueue error:', err);
+  });
 };
 
 export const updateSyncQueueItem = (id: string, updates: Partial<SyncQueueItem>) => {
@@ -3191,15 +5710,31 @@ export const clearSyncedQueueItems = () => {
   const current = getSyncQueue();
   const filtered = current.filter((item) => item.status !== 'synced');
   setStored(STORAGE_KEYS.SYNC_QUEUE, filtered);
+  notifyListeners();
+};
+
+export const clearAllSyncQueueItems = () => {
+  setStored(STORAGE_KEYS.SYNC_QUEUE, []);
+  notifyListeners();
+};
+
+export const resetFailedSyncQueueItems = () => {
+  const current = getSyncQueue();
+  const reset = current.map((i) => (i.status === 'failed' ? { ...i, status: 'pending' as const, error: undefined } : i));
+  setStored(STORAGE_KEYS.SYNC_QUEUE, reset);
+  notifyListeners();
 };
 
 export const purgeSyncedRecords = clearSyncedQueueItems;
 
+export const DEFAULT_MASTER_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec';
+
 export const getSheetsConfig = (): GoogleSheetsConfig => {
   const base = getStored<GoogleSheetsConfig>(STORAGE_KEYS.SHEETS_CONFIG, {
-    webhookUrl: '',
+    webhookUrl: DEFAULT_MASTER_WEBHOOK_URL,
     spreadsheetId: '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
     masterSpreadsheetId: '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
+    masterWebhookUrl: DEFAULT_MASTER_WEBHOOK_URL,
     branchIsolationMode: 'ROW_LEVEL',
     sheetNameMap: {
       Customers: 'Customers',
@@ -3211,7 +5746,8 @@ export const getSheetsConfig = (): GoogleSheetsConfig => {
       Salespeople: 'Salespeople',
       CustomerChange: 'CustomerChange',
       CreditSales: 'CreditSales',
-      Products: 'Products',
+      Products: 'InventoryMaster',
+      InventoryMaster: 'InventoryMaster',
       companies: 'companies',
       branches: 'branches',
       users: 'users',
@@ -3234,12 +5770,18 @@ export const getSheetsConfig = (): GoogleSheetsConfig => {
     tenantOverride?.spreadsheetId ||
     currentCompany?.sheet_id ||
     (currentCompId === 'COMP-001' ? '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE' : '');
-  const dedicatedWebhookUrl = tenantOverride?.webhookUrl || currentCompany?.webhook_url || base.webhookUrl || '';
+  const dedicatedWebhookUrl =
+    tenantOverride?.webhookUrl ||
+    currentCompany?.webhook_url ||
+    base.webhookUrl ||
+    base.masterWebhookUrl ||
+    DEFAULT_MASTER_WEBHOOK_URL;
   const branchIsolation =
     tenantOverride?.branchIsolationMode || currentCompany?.branch_isolation_mode || base.branchIsolationMode || 'ROW_LEVEL';
 
   return {
     ...base,
+    masterWebhookUrl: base.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL,
     masterSpreadsheetId: base.masterSpreadsheetId || '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
     spreadsheetId: dedicatedSheetId,
     webhookUrl: dedicatedWebhookUrl,
@@ -3263,7 +5805,8 @@ export const updateSheetsConfig = (updates: Partial<GoogleSheetsConfig>) => {
       Salespeople: 'Salespeople',
       CustomerChange: 'CustomerChange',
       CreditSales: 'CreditSales',
-      Products: 'Products',
+      Products: 'InventoryMaster',
+      InventoryMaster: 'InventoryMaster',
       companies: 'companies',
       branches: 'branches',
       users: 'users',
@@ -3825,26 +6368,95 @@ export const recordCustomerCreditPayment = (
 // ============================================================================
 
 export const getAllInventoryItems = (): InventoryItem[] => {
-  return getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
+  const raw = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
+  const map = new Map<string, InventoryItem>();
+  for (const item of raw) {
+    if (!item.itemId) continue;
+    const cleanId = item.itemId.trim().toUpperCase();
+    const comp = (item.company_id || (item as any).companyId || 'DEFAULT').trim().toUpperCase();
+    const key = `${cleanId}::${comp}`;
+    if (!map.has(key)) {
+      map.set(key, item);
+    }
+  }
+  return Array.from(map.values());
 };
 
 export const getInventoryItems = (): InventoryItem[] => {
   const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
   const all = getAllInventoryItems();
+  let list: InventoryItem[];
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+    list = all;
+  } else {
+    list = all.filter((item) => {
+      const compId = item.company_id || (item as any).companyId;
+      const matchesCompany = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+      if (!matchesCompany) return false;
+
+      // 1. Branch catalog assignment (e.g. Grocery store vs Hardware store)
+      if (item.assignedBranchIds && item.assignedBranchIds.length > 0) {
+        if (!item.assignedBranchIds.includes(currentBranch)) {
+          return false;
+        }
+      } else {
+        // 2. Branch isolation: items specifically created for this branch, or company-wide unassigned
+        const brId = item.branch_id || (item as any).branchId;
+        if (brId && brId !== currentBranch && brId !== 'ALL' && brId !== 'BR-MAIN') {
+          return false;
+        }
+      }
+      return true;
+    });
   }
-  return all.filter((item) => {
-    const compId = item.company_id || (item as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
-  });
+  // Deduplicate by itemId for the current branch and apply branch overrides
+  const seen = new Set<string>();
+  const unique: InventoryItem[] = [];
+  for (const item of list) {
+    const cleanId = (item.itemId || '').trim().toUpperCase();
+    if (!cleanId || seen.has(cleanId)) continue;
+    seen.add(cleanId);
+
+    const override = item.branchOverrides?.[currentBranch];
+    if (override) {
+      unique.push({
+        ...item,
+        sellPriceUnit: override.sellPriceUnit !== undefined ? override.sellPriceUnit : item.sellPriceUnit,
+        sellPriceCase: override.sellPriceCase !== undefined ? override.sellPriceCase : item.sellPriceCase,
+        costPerUnit: override.costPerUnit !== undefined ? override.costPerUnit : item.costPerUnit,
+        costPerCase: override.costPerCase !== undefined ? override.costPerCase : item.costPerCase,
+        reorderLevelCases: override.reorderLevelCases !== undefined ? override.reorderLevelCases : item.reorderLevelCases,
+      });
+    } else {
+      unique.push(item);
+    }
+  }
+  return unique;
 };
 
-export const getInventoryItemById = (itemId: string): InventoryItem | null => {
-  const items = getInventoryItems();
-  return items.find((i) => i.itemId.toUpperCase() === itemId.toUpperCase() || i.sku?.toUpperCase() === itemId.toUpperCase()) || null;
+export const getInventoryItemById = (itemId: string, branchId?: string): InventoryItem | null => {
+  const items = getAllInventoryItems();
+  const targetBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
+  const clean = (itemId || '').trim().toUpperCase();
+  
+  // Prefer exact match on branch and company
+  const exact = items.find((i) => {
+    const matchesId = (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean);
+    if (!matchesId) return false;
+    const itemBr = (i.branch_id || (i as any).branchId || '').trim().toUpperCase();
+    const itemComp = (i.company_id || (i as any).companyId || '').trim().toUpperCase();
+    return (
+      (!itemComp || itemComp === currentCompany.toUpperCase()) &&
+      (!itemBr || itemBr === targetBranch.toUpperCase())
+    );
+  });
+  if (exact) return exact;
+
+  // Fallback to any matching item in company
+  return items.find((i) => (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean)) || null;
 };
 
 export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
@@ -3852,25 +6464,42 @@ export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
 
-  const compId = item.company_id || (item as any).companyId || currentCompany;
-  const brId = item.branch_id || (item as any).branchId || currentBranch;
+  const compId = item.company_id || (item as any).companyId || currentCompany || 'COMP-001';
+  const brId = item.branch_id || (item as any).branchId || currentBranch || 'BR-MAIN';
+
+  const cleanItemId = (item.itemId || '').trim().toUpperCase();
+  const cleanSku = (item.sku || '').trim().toUpperCase();
 
   const index = allItems.findIndex((i) => {
-    const iComp = i.company_id || (i as any).companyId || 'COMP-001';
+    const itemComp = (i.company_id || (i as any).companyId || '').trim().toUpperCase();
+    const matchesTenant = !itemComp || itemComp === compId.trim().toUpperCase() || itemComp === 'DEFAULT' || itemComp === 'COMP-001';
     return (
-      iComp === compId &&
-      (i.itemId.toUpperCase() === item.itemId.toUpperCase() ||
-        (Boolean(i.sku) && Boolean(item.sku) && i.sku.toUpperCase() === item.sku.toUpperCase()))
+      matchesTenant &&
+      ((cleanItemId && i.itemId && i.itemId.trim().toUpperCase() === cleanItemId) ||
+       (cleanSku && i.sku && i.sku.trim().toUpperCase() === cleanSku))
     );
   });
 
   // Enforce mathematical formulas (allow negative singles/total units if selling negative):
   const unitsPerCase = Math.max(1, item.unitsPerCase || 1);
   const costPerCase = item.costPerCase || 0;
-  const costPerUnit = costPerCase / unitsPerCase;
+  const costPerUnit = item.costPerUnit || (costPerCase > 0 ? costPerCase / unitsPerCase : 0);
   const stockCases = Math.max(0, item.stockCases || 0);
   const stockSingles = item.stockSingles !== undefined ? item.stockSingles : 0;
   const totalUnits = (stockCases * unitsPerCase) + stockSingles;
+
+  const averageCostPerUnit = item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0
+    ? item.averageCostPerUnit
+    : costPerUnit;
+  const latestCostPerUnit = item.latestCostPerUnit !== undefined && item.latestCostPerUnit > 0
+    ? item.latestCostPerUnit
+    : costPerUnit;
+  const averageCostPerCase = item.averageCostPerCase !== undefined && item.averageCostPerCase > 0
+    ? item.averageCostPerCase
+    : (averageCostPerUnit * unitsPerCase);
+  const latestCostPerCase = item.latestCostPerCase !== undefined && item.latestCostPerCase > 0
+    ? item.latestCostPerCase
+    : costPerCase;
 
   const normalized: InventoryItem = {
     ...item,
@@ -3881,6 +6510,10 @@ export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
     unitsPerCase,
     costPerCase,
     costPerUnit,
+    averageCostPerUnit: Number(averageCostPerUnit.toFixed(4)),
+    latestCostPerUnit: Number(latestCostPerUnit.toFixed(4)),
+    averageCostPerCase: Number(averageCostPerCase.toFixed(2)),
+    latestCostPerCase: Number(latestCostPerCase.toFixed(2)),
     stockCases,
     stockSingles,
     totalUnits,
@@ -3888,14 +6521,937 @@ export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
   };
 
   if (index >= 0) {
-    allItems[index] = normalized;
+    const existing = allItems[index];
+    const prevSellPrice = Number(existing.sellPriceUnit) || 0;
+    const newSellPrice = Number(normalized.sellPriceUnit) || 0;
+    const sessionUser = getSessionUser();
+
+    // Check single unit sell price change
+    if (prevSellPrice > 0 && newSellPrice > 0 && Math.abs(newSellPrice - prevSellPrice) > 0.001) {
+      recordPriceCostChangeAudit({
+        itemId: normalized.itemId,
+        itemName: normalized.itemName,
+        fieldChanged: 'PRICE',
+        oldValue: prevSellPrice,
+        newValue: newSellPrice,
+        reason: 'Selling price modified in Inventory Master',
+        staffId: sessionUser?.id || '001',
+        staffName: sessionUser?.name || 'Administrator',
+        userRole: sessionUser?.role || 'ADMIN',
+      });
+    }
+
+    // Check single unit cost price change
+    const prevCost = Number(existing.costPerUnit) || 0;
+    const newCost = Number(normalized.costPerUnit) || 0;
+    if (prevCost > 0 && newCost > 0 && Math.abs(newCost - prevCost) > 0.001) {
+      recordPriceCostChangeAudit({
+        itemId: normalized.itemId,
+        itemName: normalized.itemName,
+        fieldChanged: 'COST',
+        oldValue: prevCost,
+        newValue: newCost,
+        reason: 'Cost price modified in Inventory Master',
+        staffId: sessionUser?.id || '001',
+        staffName: sessionUser?.name || 'Administrator',
+        userRole: sessionUser?.role || 'ADMIN',
+      });
+    }
+
+    // Check prepack variants price changes
+    if (existing.packagingVariants && normalized.packagingVariants) {
+      existing.packagingVariants.forEach((oldVar) => {
+        const matchingNew = normalized.packagingVariants?.find((nv) => nv.id === oldVar.id);
+        if (
+          matchingNew &&
+          oldVar.sellPrice !== undefined &&
+          matchingNew.sellPrice !== undefined &&
+          Math.abs(Number(matchingNew.sellPrice) - Number(oldVar.sellPrice)) > 0.001
+        ) {
+          recordPriceCostChangeAudit({
+            itemId: normalized.itemId,
+            itemName: `${normalized.itemName} (${matchingNew.name || 'Prepack'})`,
+            fieldChanged: 'PRICE',
+            oldValue: Number(oldVar.sellPrice) || 0,
+            newValue: Number(matchingNew.sellPrice) || 0,
+            reason: `Prepack variant "${matchingNew.name}" price modified`,
+            staffId: sessionUser?.id || '001',
+            staffName: sessionUser?.name || 'Administrator',
+            userRole: sessionUser?.role || 'ADMIN',
+          });
+        }
+      });
+    }
+
+    // Sync branchOverrides for all branches so stale overrides don't shadow this price change
+    const updatedOverrides = { ...(existing.branchOverrides || normalized.branchOverrides || {}) };
+    Object.keys(updatedOverrides).forEach((b) => {
+      if (updatedOverrides[b]) {
+        updatedOverrides[b] = {
+          ...updatedOverrides[b],
+          sellPriceUnit: normalized.sellPriceUnit,
+          sellPriceCase: normalized.sellPriceCase,
+          costPerUnit: normalized.costPerUnit,
+          costPerCase: normalized.costPerCase,
+        };
+      }
+    });
+    normalized.branchOverrides = updatedOverrides;
+
+    allItems[index] = { ...existing, ...normalized };
+  } else {
+    allItems.unshift(normalized);
+  }
+
+  // Deduplicate allItems before saving to ensure corrupt storage duplicates are purged.
+  // CRITICAL: Ensure the normalized updated item is preserved for this tenant, not an older duplicate.
+  const itemComp = (normalized.company_id || compId || 'DEFAULT').trim().toUpperCase();
+  const primaryKey = `${cleanItemId}::${itemComp}`;
+  const dedupMap = new Map<string, InventoryItem>();
+  dedupMap.set(primaryKey, normalized);
+
+  for (const it of allItems) {
+    const itId = (it.itemId || it.id || '').trim().toUpperCase();
+    if (!itId) continue;
+    const itComp = (it.company_id || (it as any).companyId || 'DEFAULT').trim().toUpperCase();
+    const key = `${itId}::${itComp}`;
+    if (key === primaryKey) {
+      continue; // Superceded by normalized updated item
+    }
+    if (!dedupMap.has(key)) {
+      dedupMap.set(key, it);
+    }
+  }
+  const cleanAllItems = Array.from(dedupMap.values());
+
+  setStored(STORAGE_KEYS.INVENTORY_ITEMS, cleanAllItems);
+  notifyListeners();
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: normalized }));
+  }
+
+  // Sync to PRODUCTS storage
+  try {
+    const prodMap = new Map<string, Product>();
+    cleanAllItems.map((item) => inventoryItemToProduct(item)).forEach((p) => {
+      if (p.id && !prodMap.has(p.id)) {
+        prodMap.set(p.id, p);
+      }
+    });
+    setStored(STORAGE_KEYS.PRODUCTS, Array.from(prodMap.values()));
+  } catch (e) {
+    console.warn('Sync products error:', e);
+  }
+
+  // 1. Enqueue write to Google Sheets for InventoryMaster tab
+  try {
+    enqueueSync('InventoryMaster' as SheetName, 'INSERT', {
+      ItemID: normalized.itemId,
+      CompanyID: normalized.company_id,
+      BranchID: normalized.branch_id,
+      ItemName: normalized.itemName,
+      UnitsPerCase: normalized.unitsPerCase,
+      CostPerCase: normalized.costPerCase,
+      CostPerUnit: normalized.costPerUnit,
+      SellingPrice: normalized.sellPriceUnit,
+      StockCases: normalized.stockCases,
+      StockSingles: normalized.stockSingles,
+      TotalUnits: normalized.totalUnits,
+      SKU: normalized.sku || '',
+      Barcode: normalized.barcode || '',
+      Category: normalized.category || 'General',
+    });
+  } catch (syncErr) {
+    console.warn('[RoomDB] Enqueue inventory sync error:', syncErr);
+  }
+
+  // 2. Notify inventory listeners so meshSyncService broadcasts to peers
+  inventoryCreationListeners.forEach((fn) => {
+    try {
+      fn(normalized);
+    } catch (e) {
+      console.error('inventoryCreationListener error:', e);
+    }
+  });
+
+  // 3. Opportunistic background push to server
+  try {
+    if (typeof fetch !== 'undefined') {
+      fetch('/api/inventory/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: normalized.company_id,
+          branch_id: normalized.branch_id,
+          items: [normalized],
+        }),
+      }).catch(() => {});
+
+      fetch('/api/saas/call-action?action=sync_inventory', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: normalized.company_id,
+          branch_id: normalized.branch_id,
+          items: [normalized],
+        }),
+      }).catch(() => {});
+    }
+  } catch (e) {}
+
+  notifyListeners();
+  return normalized;
+};
+
+type InventoryCreationListener = (item: InventoryItem) => void;
+const inventoryCreationListeners: Set<InventoryCreationListener> = new Set();
+
+export const onInventoryCreated = (listener: InventoryCreationListener) => {
+  inventoryCreationListeners.add(listener);
+  return () => {
+    inventoryCreationListeners.delete(listener);
+  };
+};
+
+export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
+  if (!item || (!item.itemId && !(item as any).id)) return false;
+  const currentCompany = getCurrentCompanyId();
+  const compId = item.company_id || (item as any).companyId || currentCompany;
+  if (compId && compId !== currentCompany) {
+    return false;
+  }
+
+  const allItems = getAllInventoryItems();
+  let cleanId = (item.itemId || (item as any).id || '').trim().toUpperCase();
+
+  // If item was previously deleted on this company, do not re-insert or resurrect
+  const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+  const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+  const isDeleted = deletedList.some(
+    (d) => (d.itemId || '').toUpperCase() === cleanId && (d.companyId || '').toUpperCase() === compId.toUpperCase()
+  );
+  if (isDeleted) {
+    return false;
+  }
+
+  const incomingName = (item.itemName || (item as any).name || '').trim().toLowerCase();
+
+  // Find index by exact ID match (only if names also match or one is missing), or by SKU, or by exact item name
+  let idx = allItems.findIndex((i) => {
+    const iComp = i.company_id || (i as any).companyId || currentCompany;
+    if (iComp !== compId) return false;
+    const iName = (i.itemName || '').trim().toLowerCase();
+
+    if (item.sku && i.sku && i.sku.toUpperCase() === item.sku.toUpperCase()) return true;
+    if (incomingName && iName && incomingName === iName) return true;
+    if (cleanId && i.itemId && i.itemId.toUpperCase() === cleanId) {
+      // If names differ substantially (e.g. "Airtime" vs "Bread"), they are conflicting counter IDs from separate devices!
+      if (incomingName && iName && incomingName !== iName) return false;
+      return true;
+    }
+    return false;
+  });
+
+  // If there's an ID conflict with a completely different product, generate a distinct ID so both survive
+  if (idx < 0) {
+    const idTakenByOther = allItems.some(
+      (i) => (i.company_id || (i as any).companyId) === compId && i.itemId && i.itemId.toUpperCase() === cleanId
+    );
+    if (idTakenByOther) {
+      cleanId = `${cleanId}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+    }
+  }
+
+  const normalized: InventoryItem = {
+    ...item,
+    itemId: cleanId,
+    company_id: compId,
+    companyId: compId,
+    branch_id: item.branch_id || getCurrentBranchId(),
+    branchId: item.branch_id || getCurrentBranchId(),
+    lastUpdated: item.lastUpdated || new Date().toISOString(),
+  };
+
+  if (idx >= 0) {
+    const existing = allItems[idx];
+
+    // Conflict Resolution: Never overwrite locally updated items with older/stale remote data
+    if (existing.lastUpdated && normalized.lastUpdated) {
+      const existingTime = new Date(existing.lastUpdated).getTime();
+      const incomingTime = new Date(normalized.lastUpdated).getTime();
+      if (!isNaN(existingTime) && !isNaN(incomingTime) && existingTime > incomingTime) {
+        return false;
+      }
+    }
+
+    // Check if the item is already identical to prevent unnecessary localStorage serialization and re-render loops
+    const isIdentical =
+      existing.sellPriceUnit === normalized.sellPriceUnit &&
+      existing.sellPriceCase === normalized.sellPriceCase &&
+      existing.stockSingles === normalized.stockSingles &&
+      existing.stockCases === normalized.stockCases &&
+      existing.itemName === normalized.itemName &&
+      existing.costPerUnit === normalized.costPerUnit &&
+      existing.barcode === normalized.barcode &&
+      existing.sku === normalized.sku &&
+      existing.unitsPerCase === normalized.unitsPerCase;
+
+    if (isIdentical) {
+      return false;
+    }
+    allItems[idx] = { ...existing, ...normalized };
   } else {
     allItems.unshift(normalized);
   }
 
   setStored(STORAGE_KEYS.INVENTORY_ITEMS, allItems);
-  return normalized;
+  try {
+    setStored(STORAGE_KEYS.PRODUCTS, allItems.map((item) => inventoryItemToProduct(item)));
+  } catch (e) {}
+  notifyListeners();
+  return true;
 };
+
+export const ingestMeshInventoryDelete = (itemId: string, companyId?: string): boolean => {
+  if (!itemId) return false;
+  const currentCompany = companyId || getCurrentCompanyId();
+  const cleanId = (itemId || '').trim().toUpperCase();
+
+  // 1. Record deleted item tombstone with company and timestamp
+  const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+  const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+  const existsInDeleted = deletedList.some(
+    (d) => (d.itemId || '').toUpperCase() === cleanId && (d.companyId || '').toUpperCase() === currentCompany.toUpperCase()
+  );
+  if (!existsInDeleted) {
+    const updatedDeleted = [
+      ...deletedList,
+      { itemId: cleanId, companyId: currentCompany, deletedAt: new Date().toISOString() },
+    ];
+    setStored(deletedRegistryKey, updatedDeleted);
+  }
+
+  // 2. Remove from active inventory and products store
+  const allItems = getAllInventoryItems();
+  const filtered = allItems.filter((i) => {
+    const cId = (i.company_id || (i as any).companyId || 'COMP-001').toUpperCase();
+    if (cId === currentCompany.toUpperCase() && (i.itemId || '').trim().toUpperCase() === cleanId) {
+      return false;
+    }
+    return true;
+  });
+
+  if (filtered.length !== allItems.length) {
+    setStored(STORAGE_KEYS.INVENTORY_ITEMS, filtered);
+    try {
+      setStored(STORAGE_KEYS.PRODUCTS, filtered.map((item) => inventoryItemToProduct(item)));
+    } catch (e) {}
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('saimetric_inventory_item_deleted', {
+          detail: { itemId: cleanId, companyId: currentCompany, fromMesh: true },
+        })
+      );
+    }
+    notifyListeners();
+    return true;
+  }
+  return false;
+};
+
+export const getDeletedInventoryItems = (): Array<{ itemId: string; companyId: string; deletedAt: string }> => {
+  const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+  return getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+};
+
+// ==================== P2P MESH FULL DATABASE SHARING INGESTORS & EVENT BUS ====================
+
+export type DatabaseEntityType =
+  | 'sale'
+  | 'inventory'
+  | 'branch'
+  | 'staff'
+  | 'setting'
+  | 'supervisor_approval'
+  | 'cash_log'
+  | 'customer'
+  | 'grv'
+  | 'reconciliation'
+  | 'other';
+
+export interface DatabaseMutationEvent {
+  mutationId: string;
+  sheetName: string;
+  action: 'INSERT' | 'UPDATE' | 'DELETE';
+  companyId: string;
+  branchId: string;
+  branchCode: string;
+  entityType: DatabaseEntityType;
+  recordId: string;
+  payload: any;
+  timestamp: number;
+  clientRequestId?: string;
+}
+
+export function resolveEntityType(sheetName: string): DatabaseEntityType {
+  switch (sheetName) {
+    case 'Sales':
+      return 'sale';
+    case 'InventoryMaster':
+    case 'Products':
+      return 'inventory';
+    case 'branches':
+      return 'branch';
+    case 'Salespeople':
+    case 'users':
+      return 'staff';
+    case 'Audit_Log':
+      return 'supervisor_approval';
+    case 'CashLog':
+      return 'cash_log';
+    case 'Customers':
+    case 'CustomerChange':
+    case 'CreditSales':
+      return 'customer';
+    case 'Direct_GRV':
+    case 'GoodsReceived':
+      return 'grv';
+    case 'Reconciliations':
+    case 'EOD':
+      return 'reconciliation';
+    case 'SHEETS_CONFIG':
+    case 'Settings':
+      return 'setting';
+    default:
+      return 'other';
+  }
+}
+
+type DatabaseMutationListener = (mutation: DatabaseMutationEvent) => void;
+const databaseMutationListeners: Set<DatabaseMutationListener> = new Set();
+
+export const onDatabaseMutation = (listener: DatabaseMutationListener) => {
+  databaseMutationListeners.add(listener);
+  return () => {
+    databaseMutationListeners.delete(listener);
+  };
+};
+
+export const notifyDatabaseMutation = (event: DatabaseMutationEvent) => {
+  databaseMutationListeners.forEach((fn) => {
+    try {
+      fn(event);
+    } catch (e) {
+      console.error('Database mutation listener error:', e);
+    }
+  });
+};
+
+export const ingestMeshBranch = (branch: Branch): boolean => {
+  if (!branch) return false;
+  const currentCompany = getCurrentCompanyId();
+  const compId = (branch.company_id || branch.companyId || currentCompany).trim().toUpperCase();
+  if (compId && compId !== currentCompany.trim().toUpperCase()) {
+    console.warn(`[ingestMeshBranch] Discarded branch for other tenant: ${compId} vs ${currentCompany}`);
+    return false;
+  }
+  const branches = getAllBranches();
+  const id = branch.branchId || branch.id || (branch as any).branch_id || 'BR-MAIN';
+  const normalized: Branch = {
+    ...branch,
+    branchId: id,
+    id: id,
+    company_id: compId,
+    companyId: compId,
+  };
+  const index = branches.findIndex(
+    (b) => b.branchId === id || b.id === id || (b as any).branch_id === id
+  );
+  let updated: Branch[];
+  if (index >= 0) {
+    const existing = branches[index];
+    if (
+      existing.name === normalized.name &&
+      existing.code === normalized.code &&
+      existing.location === normalized.location &&
+      (existing as any).status === (normalized as any).status
+    ) {
+      return false;
+    }
+    updated = [...branches];
+    updated[index] = normalized;
+  } else {
+    updated = [...branches, normalized];
+  }
+  setStored(STORAGE_KEYS.BRANCHES, updated);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshStaff = (staff: Salesperson): boolean => {
+  if (!staff || !staff.id) return false;
+  const currentCompany = getCurrentCompanyId();
+  const compId = (staff.company_id || staff.companyId || currentCompany).trim().toUpperCase();
+  if (compId && compId !== currentCompany.trim().toUpperCase()) {
+    console.warn(`[ingestMeshStaff] Discarded staff for other tenant: ${compId} vs ${currentCompany}`);
+    return false;
+  }
+  const all = getAllSalespeople();
+  const index = all.findIndex((s) => s.id === staff.id);
+  const normalized: Salesperson = {
+    ...staff,
+    companyId: compId,
+    company_id: compId,
+  };
+  if (index >= 0) {
+    const existing = all[index];
+    if (
+      existing.name === normalized.name &&
+      existing.role === normalized.role &&
+      existing.pin === normalized.pin &&
+      existing.active === normalized.active &&
+      JSON.stringify(existing.permissions) === JSON.stringify(normalized.permissions) &&
+      JSON.stringify(existing.branchAssignments) === JSON.stringify(normalized.branchAssignments)
+    ) {
+      return false;
+    }
+    all[index] = { ...existing, ...normalized };
+  } else {
+    all.unshift(normalized);
+  }
+  setStored(STORAGE_KEYS.SALESPEOPLE, all);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshSupervisorApproval = (entry: AuditLogEntry): boolean => {
+  if (!entry) return false;
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+  const currentBranchCode = getCurrentBranch()?.code;
+
+  const compId = (entry.company_id || entry.companyId || currentCompany).trim().toUpperCase();
+  if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
+
+  const brId = (entry.branch_id || entry.branchId || currentBranch).trim().toUpperCase();
+  if (
+    brId &&
+    brId !== currentBranch.trim().toUpperCase() &&
+    brId !== (currentBranchCode || '').trim().toUpperCase()
+  ) {
+    return false;
+  }
+
+  const all = getAuditLogs();
+  const exists = all.some(
+    (l) =>
+      (entry.id && l.id === entry.id) ||
+      (l.timestamp === entry.timestamp &&
+        l.referenceId === entry.referenceId &&
+        l.action === entry.action)
+  );
+  if (exists) return false;
+
+  const normalized: AuditLogEntry = {
+    ...entry,
+    company_id: compId,
+    companyId: compId,
+    branch_id: brId,
+    branchId: brId,
+  };
+  const updated = [normalized, ...all];
+  setStored(STORAGE_KEYS.AUDIT_LOGS, updated);
+
+  // If this was an approved GRV or EOD, update corresponding record
+  if (((entry.action as string) === 'APPROVE_DIRECT_GRV' || (entry.action as string) === 'DIRECT_GRV_APPROVE') && entry.referenceId) {
+    const grvs = getDirectGrvs();
+    const grv = grvs.find((g) => g.grvNumber === entry.referenceId);
+    if (grv && grv.status !== 'APPROVED') {
+      grv.status = 'APPROVED';
+      grv.approvedAt = entry.timestamp;
+      (grv as any).approvedByName = entry.staffName;
+      (grv as any).approvedById = entry.staffId;
+      setStored(STORAGE_KEYS.DIRECT_GRVS, grvs);
+    }
+  }
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshCashLog = (entry: CashLogEntry): boolean => {
+  if (!entry) return false;
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+  const currentBranchCode = getCurrentBranch()?.code;
+
+  const compId = (entry.company_id || (entry as any).companyId || currentCompany).trim().toUpperCase();
+  if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
+
+  const brId = (entry.branch_id || (entry as any).branchId || currentBranch).trim().toUpperCase();
+  if (
+    brId &&
+    brId !== currentBranch.trim().toUpperCase() &&
+    brId !== (currentBranchCode || '').trim().toUpperCase()
+  ) {
+    return false;
+  }
+
+  const all = getCashLogs();
+  const exists = all.some(
+    (l) =>
+      (entry.id && l.id === entry.id) ||
+      (entry.reference && l.reference === entry.reference && l.timestamp === entry.timestamp)
+  );
+  if (exists) return false;
+
+  const normalized: CashLogEntry = {
+    ...entry,
+    company_id: compId,
+    branch_id: brId,
+  };
+  const updated = [normalized, ...all];
+  setStored(STORAGE_KEYS.CASH_LOGS, updated);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshGRV = (grv: DirectGrv): boolean => {
+  if (!grv || !grv.grvNumber) return false;
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+  const currentBranchCode = getCurrentBranch()?.code;
+
+  const compId = (grv.companyId || grv.company_id || currentCompany).trim().toUpperCase();
+  if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
+
+  const brId = (grv.branchId || grv.branch_id || currentBranch).trim().toUpperCase();
+  if (
+    brId &&
+    brId !== currentBranch.trim().toUpperCase() &&
+    brId !== (currentBranchCode || '').trim().toUpperCase()
+  ) {
+    return false;
+  }
+
+  const all = getAllDirectGrvs();
+  const idx = all.findIndex((g) => g.grvNumber === grv.grvNumber || g.id === grv.id);
+  const normalized: DirectGrv = {
+    ...grv,
+    companyId: compId,
+    company_id: compId,
+    branchId: brId,
+    branch_id: brId,
+  };
+  if (idx >= 0) {
+    all[idx] = { ...all[idx], ...normalized };
+  } else {
+    all.unshift(normalized);
+  }
+  setStored(STORAGE_KEYS.DIRECT_GRVS, all);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshCustomer = (customer: any): boolean => {
+  if (!customer) return false;
+  const currentCompany = getCurrentCompanyId();
+  const compId = (customer.company_id || customer.companyId || currentCompany).trim().toUpperCase();
+  if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
+
+  const all = getCustomers();
+  const id = customer.id || customer.customerId;
+  const idx = all.findIndex(
+    (c) =>
+      (id && ((c as any).id === id || c.customerId === id)) ||
+      (customer.name && c.name && c.name.toLowerCase() === customer.name.toLowerCase())
+  );
+  if (idx >= 0) {
+    all[idx] = { ...all[idx], ...customer };
+  } else {
+    all.unshift(customer);
+  }
+  setStored(STORAGE_KEYS.CUSTOMERS, all);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshSettings = (settingsPayload: any): boolean => {
+  if (!settingsPayload) return false;
+  const currentCompany = getCurrentCompanyId();
+  const compId = (settingsPayload.company_id || settingsPayload.companyId || currentCompany).trim().toUpperCase();
+  if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
+
+  let changed = false;
+  if (settingsPayload.sheetsConfig) {
+    setStored(STORAGE_KEYS.SHEETS_CONFIG, settingsPayload.sheetsConfig);
+    changed = true;
+  }
+  if (settingsPayload.exchangeRates) {
+    setStored(STORAGE_KEYS.EXCHANGE_RATES, settingsPayload.exchangeRates);
+    changed = true;
+  }
+  if (changed) {
+    notifyListeners();
+  }
+  return changed;
+};
+
+export const ingestMeshCustomerChange = (entry: any): boolean => {
+  if (!entry || !entry.id) return false;
+  const all = getCustomerChanges();
+  if (all.some((c) => c.id === entry.id)) return false;
+  setStored(STORAGE_KEYS.CUSTOMER_CHANGES, [entry, ...all]);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshCreditSale = (entry: any): boolean => {
+  if (!entry || !entry.id) return false;
+  const all = getCreditSales();
+  if (all.some((c) => c.id === entry.id)) return false;
+  setStored(STORAGE_KEYS.CREDIT_SALES, [entry, ...all]);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshStockMovement = (entry: any): boolean => {
+  if (!entry || (!entry.txnId && !entry.movementId)) return false;
+  const all = getStockMovements();
+  const id = entry.txnId || entry.movementId;
+  if (all.some((s) => s.txnId === id || s.movementId === id)) return false;
+  setStored(STORAGE_KEYS.STOCK_MOVEMENTS, [entry, ...all]);
+  notifyListeners();
+  return true;
+};
+
+export const ingestMeshCashLift = (entry: any): boolean => {
+  if (!entry || !entry.id) return false;
+  const all = getAllCashLifts();
+  if (all.some((c) => c.id === entry.id)) return false;
+  setStored(STORAGE_KEYS.CASH_LIFTS, [entry, ...all]);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
+  }
+  return true;
+};
+
+export const ingestMeshGoodsReceived = (entry: any): boolean => {
+  if (!entry || (!entry.id && !entry.reference)) return false;
+  const all = getAllGoodsReceived();
+  const id = entry.id || entry.reference;
+  const idx = all.findIndex((g: any) => (g.id || g.reference) === id);
+  if (idx >= 0) {
+    all[idx] = { ...all[idx], ...entry };
+  } else {
+    all.unshift(entry);
+  }
+  setStored(STORAGE_KEYS.GOODS_RECEIVED, all);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+  }
+  return true;
+};
+
+export const getDeltaRecordsSince = (sinceIsoTimestamp: string) => {
+  const sinceTime = new Date(sinceIsoTimestamp).getTime();
+  const filterByTime = (records: any[]) => {
+    if (!Array.isArray(records)) return [];
+    return records.filter((r) => {
+      if (!r) return false;
+      const t = r.timestamp || r.updatedAt || r.createdAt || r.lastUpdated || r.date;
+      if (!t) return false;
+      const tm = new Date(t).getTime();
+      return !isNaN(tm) && tm >= sinceTime;
+    });
+  };
+
+  return {
+    sales: filterByTime(getAllSales()),
+    cashLogs: filterByTime(getCashLogs()),
+    cashLifts: filterByTime(getAllCashLifts()),
+    customerChanges: filterByTime(getCustomerChanges()),
+    creditSales: filterByTime(getCreditSales()),
+    stockMovements: filterByTime(getStockMovements()),
+    directGrvs: filterByTime(getDirectGrvs()),
+    auditLogs: filterByTime(getAuditLogs()),
+    goodsReceivedNotes: filterByTime(getAllGoodsReceived()),
+    inventoryItems: getAllInventoryItems(),
+  };
+};
+
+export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: string[] = []): number => {
+  const reqIdSet = new Set(clientRequestIds.filter(Boolean));
+  const itemIdSet = new Set(itemIds.filter(Boolean));
+  if (reqIdSet.size === 0 && itemIdSet.size === 0) return 0;
+
+  let markedCount = 0;
+
+  // 1. Update Room Database sync queue
+  const queue = getSyncQueue();
+  let queueChanged = false;
+  const updatedQueue = queue.map((item) => {
+    const itemReqId = item.payload?.clientRequestId;
+    const isMatch = itemIdSet.has(item.id) || (itemReqId && reqIdSet.has(itemReqId));
+    if (isMatch && item.status !== 'synced') {
+      queueChanged = true;
+      markedCount++;
+      return { ...item, status: 'synced' as const, error: undefined };
+    }
+    return item;
+  });
+  if (queueChanged) {
+    setStored(STORAGE_KEYS.SYNC_QUEUE, updatedQueue);
+  }
+
+  // 2. Update Sales syncStatus
+  const sales = getAllSales();
+  let salesChanged = false;
+  const updatedSales = sales.map((sale) => {
+    const saleReqId = (sale as any).clientRequestId || sale.id;
+    const isMatch = itemIdSet.has(sale.id) || (saleReqId && reqIdSet.has(saleReqId)) || itemIdSet.has(saleReqId);
+    if (isMatch && (sale as any).syncStatus !== 'synced') {
+      salesChanged = true;
+      return { ...sale, syncStatus: 'synced' };
+    }
+    return sale;
+  });
+  if (salesChanged) {
+    setStored(STORAGE_KEYS.SALES, updatedSales);
+  }
+
+  // 3. Update CashLogs synced status
+  const cashLogs = getAllCashLogs();
+  let cashLogsChanged = false;
+  const updatedCashLogs = cashLogs.map((log) => {
+    const logReqId = (log as any).clientRequestId || log.id;
+    const isMatch = itemIdSet.has(log.id) || (logReqId && reqIdSet.has(logReqId)) || (log.reference && (itemIdSet.has(log.reference) || reqIdSet.has(log.reference)));
+    if (isMatch && !log.synced) {
+      cashLogsChanged = true;
+      return { ...log, synced: true };
+    }
+    return log;
+  });
+  if (cashLogsChanged) {
+    setStored(STORAGE_KEYS.CASH_LOGS, updatedCashLogs);
+  }
+
+  if (queueChanged || salesChanged || cashLogsChanged) {
+    notifyListeners();
+  }
+  return markedCount;
+};
+
+export async function pullTenantInventory(companyId?: string): Promise<{ added: number; updated: number; count: number }> {
+  const compId = companyId || getCurrentCompanyId();
+  if (!compId) return { added: 0, updated: 0, count: 0 };
+
+  let added = 0;
+  let updated = 0;
+
+  // 1. Fetch from server central store (/api/inventory/items)
+  try {
+    const res = await fetch(`/api/inventory/items?company_id=${encodeURIComponent(compId)}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.success && Array.isArray(data.items)) {
+        const localAll = getAllInventoryItems();
+        let changed = false;
+
+        for (const remote of data.items) {
+          let rId = (remote.itemId || remote.id || '').trim().toUpperCase();
+          if (!rId) continue;
+          const remoteName = (remote.itemName || remote.name || '').trim().toLowerCase();
+
+          const idx = localAll.findIndex((i) => {
+            const iComp = i.company_id || (i as any).companyId || compId;
+            if (iComp !== compId) return false;
+            const iName = (i.itemName || '').trim().toLowerCase();
+
+            if (remote.sku && i.sku && i.sku.toUpperCase() === remote.sku.toUpperCase()) return true;
+            if (remoteName && iName && remoteName === iName) return true;
+            if (i.itemId && i.itemId.toUpperCase() === rId) {
+              if (remoteName && iName && remoteName !== iName) return false;
+              return true;
+            }
+            return false;
+          });
+
+          if (idx >= 0) {
+            const local = localAll[idx];
+            if (!local.lastUpdated || (remote.lastUpdated && remote.lastUpdated >= local.lastUpdated)) {
+              localAll[idx] = { ...local, ...remote };
+              updated++;
+              changed = true;
+            }
+          } else {
+            // Check if ID is taken by a different item
+            const idTaken = localAll.some((i) => (i.company_id || (i as any).companyId) === compId && i.itemId && i.itemId.toUpperCase() === rId);
+            if (idTaken) {
+              rId = `${rId}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+            }
+
+            localAll.unshift({
+              ...remote,
+              itemId: rId,
+              company_id: compId,
+              companyId: compId,
+              branch_id: remote.branch_id || getCurrentBranchId(),
+              branchId: remote.branch_id || getCurrentBranchId(),
+            });
+            added++;
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          setStored(STORAGE_KEYS.INVENTORY_ITEMS, localAll);
+          try {
+            setStored(STORAGE_KEYS.PRODUCTS, localAll.map((item) => inventoryItemToProduct(item)));
+          } catch (e) {}
+          notifyListeners();
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[RoomDB] pullTenantInventory server fetch error:', err);
+  }
+
+  // 2. Also check if Google Sheets has additional products via /api/saas/call-action
+  try {
+    const gasRes = await fetch(`/api/saas/call-action?action=get_inventory&company_id=${encodeURIComponent(compId)}`);
+    if (gasRes.ok) {
+      const gasData = await gasRes.json().catch(() => null);
+      if (gasData && gasData.success && Array.isArray(gasData.items) && gasData.items.length > 0) {
+        for (const item of gasData.items) {
+          ingestMeshInventoryItem(item);
+        }
+      }
+    }
+  } catch (gasErr) {}
+
+  // 3. Opportunistically push newly added/updated local items for this company to central server
+  try {
+    const tenantLocalItems = getInventoryItems().filter((i) => (i.company_id || (i as any).companyId) === compId);
+    if (tenantLocalItems.length > 0 && (added > 0 || updated > 0)) {
+      const deviceId = (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'terminal-local';
+      fetch('/api/inventory/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: compId,
+          device_id: deviceId,
+          items: tenantLocalItems,
+        }),
+      }).catch(() => {});
+    }
+  } catch (syncErr) {}
+
+  return { added, updated, count: getInventoryItems().length };
+}
 
 export const addQuickProduct = (params: {
   name: string;
@@ -4183,11 +7739,15 @@ export const deductStockFIFO = (params: {
   // If remainingToDeduct > 0 (all available batches depleted, goes below 0)
   if (remainingToDeduct > 0) {
     if (!params.allowNegative) {
+      const staff = getSalespeople().find((s) => s.id === params.staffId) || getCurrentUser();
+      const isPrivileged = isSupervisorOrAbove(staff?.role) || Boolean(staff?.permissions?.canManageInventory);
       return {
         success: false,
         deductedFromBatches: deductedBatches,
         negativeQty: 0,
-        error: `Insufficient stock for ${item.itemName} (${item.totalUnits} on hand). Negative selling permission required.`,
+        error: isPrivileged
+          ? `Insufficient stock for ${item.itemName} (${item.totalUnits} on hand). Negative selling permission required.`
+          : `Insufficient stock for ${item.itemName}. Negative selling permission required.`,
       };
     }
 
@@ -4295,7 +7855,7 @@ export const clearNegativeBalancesOnGRN = (params: {
 /**
  * Audit Trail & Fraud Logging for Price and Cost changes in Inventory Master
  */
-export const recordPriceCostChangeAudit = (params: {
+export function recordPriceCostChangeAudit(params: {
   itemId: string;
   itemName: string;
   fieldChanged: 'PRICE' | 'COST';
@@ -4305,13 +7865,19 @@ export const recordPriceCostChangeAudit = (params: {
   staffId: string;
   staffName?: string;
   userRole?: string;
-}): StockMovementEntry => {
+  referenceId?: string;
+}): StockMovementEntry {
   const timestamp = new Date().toISOString();
   const dateStr = timestamp.split('T')[0];
   const txnId = `AUDIT-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
   const percentChange = params.oldValue > 0
     ? Number((((params.newValue - params.oldValue) / params.oldValue) * 100).toFixed(2))
     : 100;
+
+  // Lookup current live stock for item so audit entry captures accurate balance
+  const invItem = getInventoryItemById(params.itemId);
+  const closingCases = invItem ? invItem.stockCases : 0;
+  const closingSingles = invItem ? invItem.stockSingles : 0;
 
   const entry: StockMovementEntry = {
     txnId,
@@ -4327,13 +7893,18 @@ export const recordPriceCostChangeAudit = (params: {
     qtySingles: 0,
     casesChange: 0,
     singlesChange: 0,
-    closingCases: 0,
-    closingSingles: 0,
+    closingCases,
+    closingSingles,
+    resultingStockCases: closingCases,
+    resultingStockSingles: closingSingles,
     oldValue: params.oldValue,
     newValue: params.newValue,
     percentChange,
     fieldChanged: params.fieldChanged,
     reason: params.reason.trim(),
+    actionTaken: params.fieldChanged === 'PRICE' ? 'PRICE_REVISION' : 'COST_REVISION',
+    referenceId: params.referenceId || txnId,
+    promptShown: `Price Revision: ${params.oldValue.toFixed(2)} → ${params.newValue.toFixed(2)}`,
     userRole: params.userRole || 'Staff',
     timestamp,
     synced: false,
@@ -4341,27 +7912,287 @@ export const recordPriceCostChangeAudit = (params: {
 
   addStockMovement(entry);
   return entry;
+}
+
+/**
+ * Remove stock manually (e.g. damages, spoilage, shrinkage, expired stock, audit adjustment)
+ * with full FIFO deduction and StockMovement/Audit Trail record
+ */
+export const removeManualStock = (params: {
+  itemId: string;
+  casesToRemove: number;
+  singlesToRemove: number;
+  reasonType: 'DAMAGE_LOSS' | 'EXPIRY' | 'SPOILAGE' | 'SHRINKAGE' | 'INTERNAL_USE' | 'ADJUSTMENT';
+  notes: string;
+  staffId: string;
+  staffName?: string;
+  referenceId?: string;
+}): {
+  success: boolean;
+  message: string;
+  updatedItem?: InventoryItem;
+  movement?: StockMovementEntry;
+} => {
+  const item = getInventoryItemById(params.itemId);
+  if (!item) {
+    return { success: false, message: `Item not found: ${params.itemId}` };
+  }
+
+  const casesToRemove = Math.max(0, Number(params.casesToRemove) || 0);
+  const singlesToRemove = Math.max(0, Number(params.singlesToRemove) || 0);
+  const unitsPerCase = Math.max(1, item.unitsPerCase || 1);
+  const totalUnitsToRemove = (casesToRemove * unitsPerCase) + singlesToRemove;
+
+  if (totalUnitsToRemove <= 0) {
+    return { success: false, message: 'Please specify a quantity of cases or singles to remove.' };
+  }
+
+  const currentTotalUnits = item.totalUnits !== undefined ? item.totalUnits : ((item.stockCases * unitsPerCase) + item.stockSingles);
+  if (totalUnitsToRemove > currentTotalUnits) {
+    return {
+      success: false,
+      message: `Cannot remove ${totalUnitsToRemove} units. Only ${currentTotalUnits} units available in stock.`,
+    };
+  }
+
+  let newCases = item.stockCases - casesToRemove;
+  let newSingles = item.stockSingles - singlesToRemove;
+
+  // If singles go negative, break down cases
+  if (newSingles < 0 && newCases > 0) {
+    const casesNeeded = Math.ceil(Math.abs(newSingles) / unitsPerCase);
+    if (newCases >= casesNeeded) {
+      newCases -= casesNeeded;
+      newSingles += casesNeeded * unitsPerCase;
+    }
+  }
+
+  // If cases went negative (e.g., casesToRemove > stockCases but total units suffice)
+  if (newCases < 0 && newSingles >= Math.abs(newCases) * unitsPerCase) {
+    newSingles += newCases * unitsPerCase;
+    newCases = 0;
+  }
+
+  const newTotalUnits = (Math.max(0, newCases) * unitsPerCase) + Math.max(0, newSingles);
+
+  // Deduct from FIFO batches
+  deductStockFIFO({
+    itemId: item.itemId,
+    quantityUnits: totalUnitsToRemove,
+    staffId: params.staffId,
+    staffName: params.staffName,
+    saleInvoiceId: params.referenceId || 'MANUAL-REMOVAL',
+    allowNegative: false,
+  });
+
+  const updatedItem: InventoryItem = {
+    ...item,
+    stockCases: Math.max(0, newCases),
+    stockSingles: Math.max(0, newSingles),
+    totalUnits: newTotalUnits,
+    lastUpdated: new Date().toISOString(),
+  };
+
+  saveInventoryItem(updatedItem);
+
+  const timestamp = new Date().toISOString();
+  const dateStr = timestamp.split('T')[0];
+  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+  const refId = params.referenceId || `MAN-REM-${Date.now().toString().slice(-4)}`;
+
+  const movement: StockMovementEntry = {
+    txnId,
+    movementId: txnId,
+    date: dateStr,
+    staffId: params.staffId,
+    staffName: params.staffName || 'Staff',
+    itemId: item.itemId,
+    itemName: item.itemName,
+    txnType: params.reasonType === 'ADJUSTMENT' ? 'ADJUSTMENT' : 'DAMAGE_LOSS',
+    movementType: params.reasonType === 'ADJUSTMENT' ? 'ADJUSTMENT' : 'DAMAGE_LOSS',
+    qtyCases: casesToRemove,
+    qtySingles: singlesToRemove,
+    casesChange: -casesToRemove,
+    singlesChange: -singlesToRemove,
+    promptShown: `Manual Stock Removal: ${params.reasonType}`,
+    actionTaken: 'MANUAL_REMOVAL',
+    closingCases: updatedItem.stockCases,
+    closingSingles: updatedItem.stockSingles,
+    resultingStockCases: updatedItem.stockCases,
+    resultingStockSingles: updatedItem.stockSingles,
+    referenceId: refId,
+    reason: params.notes.trim() || `Manual stock removal (${params.reasonType})`,
+    timestamp,
+    synced: false,
+  };
+
+  addStockMovement(movement);
+
+  addAuditLog({
+    action: 'INVENTORY_ADJUSTMENT',
+    severity: 'WARNING',
+    staffId: params.staffId,
+    staffName: params.staffName || 'Staff',
+    staffRole: 'SUPERVISOR',
+    details: `Manual stock deduction for ${item.itemName} (${item.itemId}): -${casesToRemove} cs, -${singlesToRemove} ea. Reason: ${params.reasonType} - ${params.notes}`,
+    referenceId: refId,
+  });
+
+  return {
+    success: true,
+    message: `Successfully deducted ${casesToRemove > 0 ? `${casesToRemove} Case(s) ` : ''}${singlesToRemove > 0 ? `${singlesToRemove} Single(s)` : ''} of ${item.itemName}. New stock: ${updatedItem.stockCases} Cases, ${updatedItem.stockSingles} Singles.`,
+    updatedItem,
+    movement,
+  };
+};
+
+/**
+ * Retrieve complete history and audit trail for a specific product
+ */
+export const getProductAuditTrail = (itemId: string): StockMovementEntry[] => {
+  const movements = getAllStockMovements();
+  const cleanId = (itemId || '').trim().toUpperCase();
+  const invItem = getInventoryItemById(cleanId);
+  const cleanSku = (invItem?.sku || '').trim().toUpperCase();
+
+  const filtered = movements.filter((m) => {
+    if (!m.itemId) return false;
+    const mId = m.itemId.trim().toUpperCase();
+    return (
+      mId === cleanId ||
+      mId.replace(/-(UNIT|CASE)$/i, '') === cleanId ||
+      mId.startsWith(`${cleanId}__`) ||
+      mId.split('__')[0] === cleanId ||
+      (cleanSku && mId === cleanSku)
+    );
+  });
+
+  // Reconcile POS sales from getAllSales() so sales deductions are always guaranteed to appear
+  const allSales = getAllSales();
+  const existingRefs = new Set(
+    filtered.map((m) => `${(m.referenceId || '').trim().toUpperCase()}_${(m.itemId || '').trim().toUpperCase()}`)
+  );
+
+  allSales.forEach((sale) => {
+    if (sale.status === 'Voided') return;
+    const refKey = (sale.id || '').trim().toUpperCase();
+
+    (sale.items || []).forEach((saleItem) => {
+      const sId = (saleItem.id || '').trim().toUpperCase();
+      const sSku = (saleItem.sku || '').trim().toUpperCase();
+      const matches =
+        sId === cleanId ||
+        sId.replace(/-(UNIT|CASE)$/i, '') === cleanId ||
+        sId.startsWith(`${cleanId}__`) ||
+        sId.split('__')[0] === cleanId ||
+        (cleanSku && (sSku === cleanSku || sId === cleanSku));
+
+      if (matches && saleItem.quantity > 0) {
+        const itemKey = `${refKey}_${cleanId}`;
+        if (!existingRefs.has(itemKey)) {
+          existingRefs.add(itemKey);
+          const isCase = sId.endsWith('-CASE');
+          filtered.push({
+            txnId: `SALE-${sale.id}-${sId}`,
+            movementId: `SALE-${sale.id}-${sId}`,
+            date: sale.date || (sale.timestamp ? sale.timestamp.split('T')[0] : getTodayDateString()),
+            timestamp: sale.timestamp || new Date().toISOString(),
+            staffId: sale.staffId || 'POS-001',
+            staffName: sale.staffName || 'Cashier / POS',
+            itemId: cleanId,
+            itemName: saleItem.name || invItem?.itemName || 'Product',
+            txnType: 'SALE',
+            movementType: 'SALE',
+            actionTaken: 'POS_SALE',
+            qtyCases: isCase ? saleItem.quantity : 0,
+            qtySingles: isCase ? 0 : saleItem.quantity,
+            casesChange: isCase ? -saleItem.quantity : 0,
+            singlesChange: isCase ? 0 : -saleItem.quantity,
+            referenceId: sale.id,
+            reason: `POS Sale Outflow: Sold ${saleItem.quantity} ${saleItem.name || ''} to ${sale.customerName || 'Customer'} (Invoice #${sale.id})`,
+            promptShown: isCase ? 'Whole Case Sale' : 'POS Sale',
+            closingCases: invItem?.stockCases || 0,
+            closingSingles: invItem?.stockSingles || 0,
+            resultingStockCases: invItem?.stockCases || 0,
+            resultingStockSingles: invItem?.stockSingles || 0,
+            synced: false,
+          });
+        }
+      }
+    });
+  });
+
+  return filtered.sort((a, b) => {
+    const timeA = new Date(a.timestamp || a.date || 0).getTime() || 0;
+    const timeB = new Date(b.timestamp || b.date || 0).getTime() || 0;
+    return timeB - timeA;
+  });
 };
 
 export const deleteInventoryItem = (itemId: string): boolean => {
   const currentCompany = getCurrentCompanyId();
   const allItems = getAllInventoryItems();
+  const cleanId = (itemId || '').trim().toUpperCase();
+
+  // 1. Record deleted item tombstone with company and timestamp so offline peer devices know it was deleted
+  const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+  const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+  const existsInDeleted = deletedList.some(
+    (d) => (d.itemId || '').toUpperCase() === cleanId && (d.companyId || '').toUpperCase() === currentCompany.toUpperCase()
+  );
+  if (!existsInDeleted) {
+    const updatedDeleted = [
+      ...deletedList,
+      { itemId: cleanId, companyId: currentCompany, deletedAt: new Date().toISOString() },
+    ];
+    setStored(deletedRegistryKey, updatedDeleted);
+  }
+
+  // 2. Remove from active inventory store
   const filtered = allItems.filter((i) => {
-    const compId = i.company_id || (i as any).companyId || 'COMP-001';
-    if (compId === currentCompany && i.itemId.toUpperCase() === itemId.toUpperCase()) {
+    const compId = (i.company_id || (i as any).companyId || 'COMP-001').toUpperCase();
+    if (compId === currentCompany.toUpperCase() && (i.itemId || '').trim().toUpperCase() === cleanId) {
       return false;
     }
     return true;
   });
+
   if (filtered.length !== allItems.length) {
     setStored(STORAGE_KEYS.INVENTORY_ITEMS, filtered);
+    try {
+      setStored(STORAGE_KEYS.PRODUCTS, filtered.map((item) => inventoryItemToProduct(item)));
+    } catch (e) {}
+
+    // 3. Enqueue sync & Broadcast peer notification across offline devices via mesh & syncQueue
+    try {
+      enqueueSync('InventoryMaster' as SheetName, 'DELETE', {
+        id: itemId,
+        itemId: itemId,
+        ItemID: itemId,
+        CompanyID: currentCompany,
+        company_id: currentCompany,
+        deletedAt: new Date().toISOString(),
+      });
+    } catch (e) {}
+
+    // 4. Broadcast specific local/peer custom event
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('saimetric_inventory_item_deleted', {
+          detail: { itemId: cleanId, companyId: currentCompany },
+        })
+      );
+    }
+
+    notifyListeners();
     return true;
   }
   return false;
 };
 
 export const getAllSupplierInvoiceVouchers = (): SupplierInvoiceVoucher[] => {
-  return getStored<SupplierInvoiceVoucher[]>(STORAGE_KEYS.SUPPLIER_INVOICES, INITIAL_SUPPLIER_INVOICES);
+  const legacy = getStored<SupplierInvoiceVoucher[]>(STORAGE_KEYS.SUPPLIER_INVOICES, INITIAL_SUPPLIER_INVOICES);
+  return getDualReadSupplierInvoices(legacy);
 };
 
 export const getSupplierInvoiceVouchers = (): SupplierInvoiceVoucher[] => {
@@ -4416,6 +8247,7 @@ export const receiveSupplierInvoice = (params: {
   staffId: string;
   staffName?: string;
   notes?: string;
+  landedCosts?: LandedCostItem[];
   items: {
     itemId: string;
     receiveAs?: 'Cases' | 'Singles' | 'Variant';
@@ -4433,6 +8265,7 @@ export const receiveSupplierInvoice = (params: {
     marginPercent?: number;
     expiryDate?: string;
     batchNumber?: string;
+    weight?: number;
   }[];
 }): {
   success: boolean;
@@ -4448,6 +8281,44 @@ export const receiveSupplierInvoice = (params: {
       itemsProcessed: 0,
       ruleATriggeredCount: 0,
     };
+  }
+
+  // Pre-calculate landed cost allocations across line items if landed costs are present
+  const itemLandedCostAllocMap = new Map<string, number>();
+  if (params.landedCosts && params.landedCosts.length > 0) {
+    const tempGrn: any = {
+      lineItems: params.items.map((it) => {
+        const invItem = getInventoryItemById(it.itemId);
+        const unitsPerCase = invItem?.unitsPerCase || 1;
+        const unitsPerPack = it.unitsPerReceivePack || 1;
+        const qty =
+          it.receiveAs === 'Cases'
+            ? (Number(it.receivedCases) || 0) * unitsPerCase
+            : it.receiveAs === 'Variant'
+            ? (Number(it.receivedPacks) || 0) * unitsPerPack
+            : Number(it.receivedSingles) || 0;
+        const baseCost =
+          it.costPerUnit !== undefined && it.costPerUnit >= 0
+            ? it.costPerUnit
+            : it.costPerCase !== undefined && unitsPerCase > 0
+            ? it.costPerCase / unitsPerCase
+            : invItem?.costPerUnit || 0;
+        return {
+          itemId: it.itemId,
+          itemName: invItem?.itemName || it.itemId,
+          quantity: qty,
+          unitCost: baseCost,
+          subtotal: qty * baseCost,
+          sellingPrice: it.sellingPrice !== undefined ? it.sellingPrice : (invItem?.sellPriceUnit || 0),
+          weight: it.weight || 0,
+        };
+      }),
+      landedCosts: params.landedCosts,
+    };
+    landedCostService.allocateLandedCosts(tempGrn);
+    tempGrn.lineItems.forEach((li: any) => {
+      itemLandedCostAllocMap.set(li.itemId, li.landedCostAllocated || 0);
+    });
   }
 
   const timestamp = new Date().toISOString();
@@ -4516,6 +8387,20 @@ export const receiveSupplierInvoice = (params: {
         costPerCase = rawItem.costPerCase;
       }
       costPerUnit = item.unitsPerCase > 0 ? costPerCase / item.unitsPerCase : costPerCase;
+    }
+
+    // Landed cost adjustment (modifies unit cost and case cost only, without affecting cash or approvals)
+    const allocatedLanded = itemLandedCostAllocMap.get(item.itemId) || 0;
+    let landedCostNote = '';
+    const lineTotalUnitsPreview = isReceivingVariant
+      ? recPacks * unitsPerPack
+      : (recCases * item.unitsPerCase) + recSingles;
+
+    if (allocatedLanded > 0 && lineTotalUnitsPreview > 0) {
+      const addedUnitCost = allocatedLanded / lineTotalUnitsPreview;
+      costPerUnit = Number((costPerUnit + addedUnitCost).toFixed(4));
+      costPerCase = Number((costPerUnit * item.unitsPerCase).toFixed(2));
+      landedCostNote = ` [Landed Cost: +$${allocatedLanded.toFixed(2)} total (+$${addedUnitCost.toFixed(4)}/unit)]`;
     }
 
     const sellingPrice =
@@ -4591,7 +8476,7 @@ export const receiveSupplierInvoice = (params: {
       grnId: voucherId,
       invoiceNo,
       branchId,
-      notes: (params.notes || '') + autoBreakNote + clearingNote,
+      notes: (params.notes || '') + autoBreakNote + clearingNote + landedCostNote,
       createdAt: timestamp,
     };
     saveStockBatch(newBatch);
@@ -4621,11 +8506,30 @@ export const receiveSupplierInvoice = (params: {
     const prevStockCases = item.stockCases;
     const prevStockSingles = item.stockSingles;
 
-    // Update item in inventory (including cost and optionally selling price)
+    // Moving Weighted Average Cost (AVCO) calculation:
+    const priorOnHandUnits = Math.max(0, item.totalUnits || 0);
+    const priorAvgCost = item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0
+      ? item.averageCostPerUnit
+      : (item.costPerUnit || 0);
+
+    const totalCostPool = (priorOnHandUnits * priorAvgCost) + (lineTotalUnits * costPerUnit);
+    const combinedTotalUnits = priorOnHandUnits + lineTotalUnits;
+    const computedAverageCostPerUnit = combinedTotalUnits > 0
+      ? Number((totalCostPool / combinedTotalUnits).toFixed(4))
+      : costPerUnit;
+    const computedAverageCostPerCase = Number((computedAverageCostPerUnit * (item.unitsPerCase || 1)).toFixed(2));
+    const computedLatestCostPerUnit = Number(costPerUnit.toFixed(4));
+    const computedLatestCostPerCase = Number(costPerCase.toFixed(2));
+
+    // Update item in inventory (including average & latest cost and optionally selling price)
     const updatedItem: InventoryItem = {
       ...item,
       costPerCase: costPerCase,
       costPerUnit: costPerUnit,
+      averageCostPerUnit: computedAverageCostPerUnit,
+      averageCostPerCase: computedAverageCostPerCase,
+      latestCostPerUnit: computedLatestCostPerUnit,
+      latestCostPerCase: computedLatestCostPerCase,
       sellPriceUnit: sellingPrice,
       sellPriceCase: item.sellPriceCase > 0 ? item.sellPriceCase : sellingPrice * item.unitsPerCase,
       stockCases: newStockCases,
@@ -4716,6 +8620,7 @@ export const receiveSupplierInvoice = (params: {
       itemId: item.itemId,
       itemName: item.itemName,
       txnType: 'RECEIVE',
+      movementType: 'GOODS_RECEIVED',
       qtyCases: recCases,
       qtySingles: recSingles,
       casesChange: finalRecCases,
@@ -4724,6 +8629,7 @@ export const receiveSupplierInvoice = (params: {
       closingSingles: newStockSingles,
       resultingStockCases: newStockCases,
       resultingStockSingles: newStockSingles,
+      reason: `Stock delivery received from ${supplierName} (Invoice: ${invoiceNo})`,
       promptShown: convertedCasesToSingles
         ? 'Converted Cases to Singles (Sell as Case Deactivated)'
         : autoBroken
@@ -4775,6 +8681,13 @@ export const receiveSupplierInvoice = (params: {
   };
 
   saveSupplierInvoiceVoucher(voucher);
+
+  // Sync to unified goodsReceivedNotes store
+  try {
+    postGeneralGRV(voucher, params.landedCosts);
+  } catch (err) {
+    console.warn('[GRN] postGeneralGRV sync warning:', err);
+  }
 
   return {
     success: true,
@@ -5194,6 +9107,7 @@ export const addStockMovement = (entry: StockMovementEntry): StockMovementEntry 
   } as any;
   list.unshift(normalized);
   setStored(STORAGE_KEYS.STOCK_MOVEMENTS, list);
+  notifyListeners();
   return normalized;
 };
 
@@ -5428,8 +9342,12 @@ export const receiveStock = (params: {
     itemId: item.itemId,
     itemName: item.itemName,
     txnType: 'RECEIVE',
+    movementType: 'GOODS_RECEIVED',
     qtyCases: recCases,
     qtySingles: recSingles,
+    casesChange: finalRecCases,
+    singlesChange: finalRecSingles,
+    reason: params.notes || `Stock received via GRN ${grnId}${params.supplier ? ` from ${params.supplier}` : ''}`,
     promptShown: convertedCasesToSingles
       ? 'Auto-Converted Cases to Singles (Sell as Case Deactivated)'
       : autoBroken
@@ -5442,6 +9360,8 @@ export const receiveStock = (params: {
       : 'GOODS_RECEIVED',
     closingCases: newStockCases,
     closingSingles: newStockSingles,
+    resultingStockCases: newStockCases,
+    resultingStockSingles: newStockSingles,
     referenceId: grnId,
     timestamp,
     synced: false,
@@ -5506,15 +9426,27 @@ export const sellStock = (params: {
     return { success: false, message: 'Sell quantity cannot be zero' };
   }
 
+  // CASE RESERVE PROTECTION FOR RETAIL SINGLES (Blind security message: zero quantity leakage)
+  const caseReserve = Math.max(0, Number(item.caseReserveThreshold) || 0);
+  if (reqCases > 0 && caseReserve > 0 && (item.stockCases <= caseReserve || (item.stockCases - reqCases) < caseReserve)) {
+    return {
+      success: false,
+      message: 'Wholesale case sale unavailable for this product. Available for retail singles only.',
+    };
+  }
+
   // CORE RULE 2: FIFO DEDUCTION WITH NEGATIVE ALLOWED
   const totalUnitsRequired = (reqCases * item.unitsPerCase) + reqSingles;
   const staff = getSalespeople().find((s) => s.id === params.staffId) || getCurrentUser();
   const canSellNegative = Boolean(staff?.role === 'Admin' || staff?.permissions?.canSellNegativeStock);
 
   if (totalUnitsRequired > item.totalUnits && !canSellNegative) {
+    const isPrivileged = isSupervisorOrAbove(staff?.role) || Boolean(staff?.permissions?.canManageInventory);
     return {
       success: false,
-      message: `Insufficient stock for ${item.itemName}! Required: ${totalUnitsRequired} total units, Available: ${item.totalUnits} (${item.stockCases} cases, ${item.stockSingles} singles). Negative stock sales disabled for your user account.`,
+      message: isPrivileged
+        ? `Insufficient stock for ${item.itemName}! Required: ${totalUnitsRequired} total units, Available: ${item.totalUnits} (${item.stockCases} cases, ${item.stockSingles} singles). Negative stock sales disabled for your user account.`
+        : `Insufficient stock for ${item.itemName}. The requested quantity exceeds available stock.`,
     };
   }
 
@@ -5850,6 +9782,176 @@ export const deleteStocktakeSession = (sessionId: string): boolean => {
   return false;
 };
 
+// ============================================================================
+// BRANCH STOCKTAKE LOCKDOWN STATE
+// ============================================================================
+export interface BranchLockdownState {
+  branchId: string;
+  isLocked: boolean;
+  lockedAt?: string;
+  lockedBy?: string;
+  lockedByName?: string;
+  reason?: string;
+  sessionId?: string;
+}
+
+export const getBranchLockdowns = (): Record<string, BranchLockdownState> => {
+  return getStored<Record<string, BranchLockdownState>>(STORAGE_KEYS.BRANCH_LOCKDOWNS, {});
+};
+
+export const isBranchInLockdown = (branchId?: string): boolean => {
+  const br = branchId || getCurrentBranchId();
+  const lockdowns = getBranchLockdowns();
+  return Boolean(lockdowns[br]?.isLocked);
+};
+
+export const setBranchLockdown = (
+  branchId: string,
+  locked: boolean,
+  sessionId?: string,
+  staffId?: string,
+  staffName?: string,
+  reason?: string
+): void => {
+  const lockdowns = getBranchLockdowns();
+  lockdowns[branchId] = {
+    branchId,
+    isLocked: locked,
+    lockedAt: locked ? new Date().toISOString() : undefined,
+    lockedBy: staffId,
+    lockedByName: staffName,
+    reason,
+    sessionId,
+  };
+  setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
+  notifyListeners();
+};
+
+// ============================================================================
+// CUSTOMER GOODS LEFT BEHIND (PENDING PICKUP FLOOR HOLD)
+// ============================================================================
+export const getCustomerGoodsLeftBehind = (sessionId?: string): CustomerGoodsLeftBehind[] => {
+  const all = getStored<CustomerGoodsLeftBehind[]>(STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, []);
+  if (!sessionId) return all;
+  return all.filter((i) => i.sessionId === sessionId);
+};
+
+export const addCustomerGoodsLeftBehind = (
+  item: Omit<CustomerGoodsLeftBehind, 'id' | 'recordedAt'>
+): CustomerGoodsLeftBehind => {
+  const all = getStored<CustomerGoodsLeftBehind[]>(STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, []);
+  const created: CustomerGoodsLeftBehind = {
+    ...item,
+    id: `CGL-${Date.now().toString().slice(-6)}`,
+    recordedAt: new Date().toISOString(),
+  };
+  const updated = [created, ...all];
+  setStored(STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, updated);
+  notifyListeners();
+  return created;
+};
+
+export const deleteCustomerGoodsLeftBehind = (id: string): boolean => {
+  const all = getStored<CustomerGoodsLeftBehind[]>(STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, []);
+  const filtered = all.filter((i) => i.id !== id);
+  if (filtered.length !== all.length) {
+    setStored(STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, filtered);
+    notifyListeners();
+    return true;
+  }
+  return false;
+};
+
+// ============================================================================
+// TEMPORARY CASUAL WORKER ACCOUNTS (ACTIVE DURING STOCKTAKE ONLY)
+// ============================================================================
+export const getTemporaryCasuals = (sessionId?: string): TemporaryCasualAccount[] => {
+  const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  if (!sessionId) return all;
+  return all.filter((c) => c.sessionId === sessionId);
+};
+
+export const addTemporaryCasual = (
+  casual: Omit<TemporaryCasualAccount, 'id' | 'createdAt' | 'active'>
+): TemporaryCasualAccount => {
+  const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  const created: TemporaryCasualAccount = {
+    ...casual,
+    id: `CAS-${Date.now().toString().slice(-4)}`,
+    createdAt: new Date().toISOString(),
+    active: true,
+  };
+  const updated = [...all, created];
+  setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updated);
+  notifyListeners();
+  return created;
+};
+
+export const deleteTemporaryCasual = (id: string): boolean => {
+  const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  const filtered = all.filter((c) => c.id !== id);
+  if (filtered.length !== all.length) {
+    setStored(STORAGE_KEYS.TEMPORARY_CASUALS, filtered);
+    notifyListeners();
+    return true;
+  }
+  return false;
+};
+
+export const authenticateCasualWorker = (pin: string): TemporaryCasualAccount | null => {
+  const cleanPin = pin.trim();
+  if (!cleanPin) return null;
+  const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  return all.find((c) => c.active && c.pin === cleanPin) || null;
+};
+
+// ============================================================================
+// FAST-MOVING CHECKLIST FOR DAILY BLIND COUNTS
+// ============================================================================
+export const INITIAL_FAST_MOVING_CHECKLIST: FastMovingChecklistItem[] = [
+  { itemId: 'GAS001', itemName: 'LP Gas 1kg Refill', category: 'Gas', defaultFastMover: true, addedBy: 'System', addedAt: new Date().toISOString() },
+  { itemId: 'AIR001', itemName: 'Econet Airtime $1 PIN', category: 'Airtime', defaultFastMover: true, addedBy: 'System', addedAt: new Date().toISOString() },
+  { itemId: 'AIR002', itemName: 'NetOne Airtime $1 PIN', category: 'Airtime', defaultFastMover: true, addedBy: 'System', addedAt: new Date().toISOString() },
+  { itemId: 'BRD001', itemName: 'Lobels White Bread Loaf', category: 'Bakery', defaultFastMover: true, addedBy: 'System', addedAt: new Date().toISOString() },
+  { itemId: 'OIL001', itemName: 'Pure Drop Cooking Oil 2L', category: 'Groceries', defaultFastMover: true, addedBy: 'System', addedAt: new Date().toISOString() },
+  { itemId: 'SUG001', itemName: 'Huletts White Sugar 2kg', category: 'Groceries', defaultFastMover: true, addedBy: 'System', addedAt: new Date().toISOString() },
+];
+
+export const getFastMovingChecklist = (): FastMovingChecklistItem[] => {
+  return getStored<FastMovingChecklistItem[]>(STORAGE_KEYS.FAST_MOVING_CHECKLIST, INITIAL_FAST_MOVING_CHECKLIST);
+};
+
+export const saveFastMovingChecklist = (items: FastMovingChecklistItem[]): void => {
+  setStored(STORAGE_KEYS.FAST_MOVING_CHECKLIST, items);
+  notifyListeners();
+};
+
+export const addFastMovingChecklistItem = (item: Omit<FastMovingChecklistItem, 'addedAt'>): void => {
+  const list = getFastMovingChecklist();
+  if (list.some((i) => i.itemId.toUpperCase() === item.itemId.toUpperCase())) return;
+  const updated = [...list, { ...item, addedAt: new Date().toISOString() }];
+  saveFastMovingChecklist(updated);
+};
+
+export const removeFastMovingChecklistItem = (itemId: string): void => {
+  const list = getFastMovingChecklist();
+  saveFastMovingChecklist(list.filter((i) => i.itemId.toUpperCase() !== itemId.toUpperCase()));
+};
+
+/**
+ * LIVE INVENTORY FREEZE FOR ACTIVE TRADING (Daily / Weekly counts):
+ * Captures live totalUnits at the instant of line count or recount.
+ */
+export const captureLiveInventoryFreeze = (
+  itemId: string,
+  branchId?: string
+): { frozenSystemUnits: number; frozenTimestamp: string } => {
+  const invItem = getInventoryItemById(itemId, branchId);
+  const frozenSystemUnits = invItem ? (invItem.totalUnits ?? 0) : 0;
+  const frozenTimestamp = new Date().toISOString();
+  return { frozenSystemUnits, frozenTimestamp };
+};
+
 export const getNextStocktakeSessionId = (): string => {
   const sessions = getStocktakeSessions();
   const dateStr = new Date().toISOString().split('T')[0].replace(/-/g, '');
@@ -5860,10 +9962,16 @@ export const getNextStocktakeSessionId = (): string => {
 export const createStocktakeSession = (params: {
   title: string;
   date?: string;
+  countType?: StocktakeCountType;
   branchId?: string;
   branchName?: string;
+  isLockdownActive?: boolean;
+  stocktakeAuditorId?: string;
+  stocktakeAuditorName?: string;
+  stocktakeAuditorPhone?: string;
   notes?: string;
   segmentNames?: string[];
+  predefinedDailyItemIds?: string[];
   staffId: string;
   staffName: string;
 }): StocktakeSession => {
@@ -5872,8 +9980,10 @@ export const createStocktakeSession = (params: {
   const sessionId = getNextStocktakeSessionId();
   const timestamp = new Date().toISOString();
   const date = params.date || timestamp.split('T')[0];
+  const countType: StocktakeCountType = params.countType || 'FULL_LOCKDOWN';
+  const targetBranch = params.branchId || currentBranch;
 
-  const defaultSegments = params.segmentNames && params.segmentNames.length > 0
+  let defaultSegments = params.segmentNames && params.segmentNames.length > 0
     ? params.segmentNames
     : [
         'Aisle 1 - Beverages & Coolers',
@@ -5881,6 +9991,13 @@ export const createStocktakeSession = (params: {
         'Aisle 3 - Bulk Rice & Flours',
         'Front Counter - Toiletries & Razors',
       ];
+
+  // If daily fast-mover count, set single fast-mover focus segment if none provided
+  if (countType === 'DAILY_BLIND' && (!params.segmentNames || params.segmentNames.length === 0)) {
+    defaultSegments = ['Fast-Movers Daily Shelf & Tills'];
+  } else if (countType === 'SPOT_CHECK' && (!params.segmentNames || params.segmentNames.length === 0)) {
+    defaultSegments = ['Supervisor Spot-Check Verification Bay'];
+  }
 
   const segments: StocktakeSegment[] = defaultSegments.map((name, idx) => ({
     segmentId: `SEG-${String(idx + 1).padStart(3, '0')}`,
@@ -5896,11 +10013,17 @@ export const createStocktakeSession = (params: {
 
   const session: StocktakeSession = {
     sessionId,
-    title: params.title || `Stocktake Audit - ${date}`,
+    title: params.title || `${countType.replace('_', ' ')} Audit - ${date}`,
     date,
+    countType,
     status: 'DRAFT',
-    branchId: params.branchId || currentBranch,
+    branchId: targetBranch,
     branchName: params.branchName || 'Main Central Distribution & Warehouse',
+    isLockdownActive: Boolean(params.isLockdownActive),
+    stocktakeAuditorId: params.stocktakeAuditorId,
+    stocktakeAuditorName: params.stocktakeAuditorName,
+    stocktakeAuditorPhone: params.stocktakeAuditorPhone,
+    predefinedDailyItemIds: params.predefinedDailyItemIds,
     createdBy: params.staffId,
     createdByName: params.staffName,
     segments,
@@ -5916,6 +10039,18 @@ export const createStocktakeSession = (params: {
     company_id: currentCompany,
     companyId: currentCompany,
   } as any;
+
+  // If session activates lockdown, lock down the branch
+  if (session.isLockdownActive) {
+    setBranchLockdown(
+      targetBranch,
+      true,
+      sessionId,
+      params.stocktakeAuditorId || params.staffId,
+      params.stocktakeAuditorName || params.staffName,
+      `Full Stocktake Lockdown (${session.title})`
+    );
+  }
 
   saveStocktakeSession(session);
   return session;
@@ -6284,26 +10419,41 @@ export const consolidateStocktakeSession = (
     });
   });
 
-  // Also include any catalog inventory items that might not have been counted (count = 0)
-  const allMasterItems = getInventoryItems();
-  allMasterItems.forEach((invItem) => {
-    const key = invItem.itemId.toUpperCase();
-    if (!skuMap.has(key)) {
-      skuMap.set(key, {
-        itemId: invItem.itemId,
-        itemName: invItem.itemName,
-        category: invItem.category,
-        sku: invItem.sku || invItem.itemId,
-        unitsPerCase: invItem.unitsPerCase || 1,
-        countedCases: 0,
-        countedSingles: 0,
-        countedTotalUnits: 0,
-        segmentBreakdown: [],
-      });
+  // Customer goods left behind reconciliation
+  const customerGoods = getCustomerGoodsLeftBehind(sessionId);
+  const customerHeldMap = new Map<string, number>();
+  customerGoods.forEach((cg) => {
+    if (!cg.collected) {
+      const k = cg.itemId.toUpperCase();
+      customerHeldMap.set(k, (customerHeldMap.get(k) || 0) + (Number(cg.quantity) || 0));
     }
   });
 
-  // 2. Build consolidated items with SOH comparisons
+  // For FULL_LOCKDOWN: include all catalog inventory items (uncounted items default to 0 count)
+  // For DAILY_BLIND, SPOT_CHECK, WEEKLY_STRATEGIC: only consolidate items that were actually counted
+  const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
+
+  if (isFullLockdown) {
+    const allMasterItems = getInventoryItems();
+    allMasterItems.forEach((invItem) => {
+      const key = invItem.itemId.toUpperCase();
+      if (!skuMap.has(key)) {
+        skuMap.set(key, {
+          itemId: invItem.itemId,
+          itemName: invItem.itemName,
+          category: invItem.category,
+          sku: invItem.sku || invItem.itemId,
+          unitsPerCase: invItem.unitsPerCase || 1,
+          countedCases: 0,
+          countedSingles: 0,
+          countedTotalUnits: 0,
+          segmentBreakdown: [],
+        });
+      }
+    });
+  }
+
+  // 2. Build consolidated items with SOH comparisons & Customer Goods Left Behind adjustments
   const consolidatedItems: StocktakeConsolidatedItem[] = [];
   let totalSystemUnits = 0;
   let totalCountedUnits = 0;
@@ -6331,9 +10481,21 @@ export const consolidateStocktakeSession = (
     const countedCostValue = countedTotalUnits * costPerUnit;
     const countedRetailValue = countedTotalUnits * sellPriceUnit;
 
-    const varianceCases = countedCases - systemCases;
-    const varianceSingles = countedSingles - systemSingles;
-    const varianceTotalUnits = countedTotalUnits - systemTotalUnits;
+    // Customer Goods Left Behind reconciliation:
+    // If customers paid for goods but physically left them in store awaiting transport/pickup,
+    // this stock sits on the floor. It must be deducted from counted stock to obtain true available stock!
+    const customerHeldStockUnits = customerHeldMap.get(accum.itemId.toUpperCase()) || 0;
+    const adjustedPhysicalUnits = Math.max(0, countedTotalUnits - customerHeldStockUnits);
+    const trueVarianceUnits = adjustedPhysicalUnits - systemTotalUnits;
+
+    // Standard variance uses adjustedPhysicalUnits to avoid false overage
+    const effectivePhysicalUnits = customerHeldStockUnits > 0 ? adjustedPhysicalUnits : countedTotalUnits;
+    const effectivePhysicalCases = Math.floor(effectivePhysicalUnits / unitsPerCase);
+    const effectivePhysicalSingles = effectivePhysicalUnits % unitsPerCase;
+
+    const varianceCases = effectivePhysicalCases - systemCases;
+    const varianceSingles = effectivePhysicalSingles - systemSingles;
+    const varianceTotalUnits = effectivePhysicalUnits - systemTotalUnits;
     const varianceCostValue = varianceTotalUnits * costPerUnit;
     const varianceRetailValue = varianceTotalUnits * sellPriceUnit;
 
@@ -6343,6 +10505,8 @@ export const consolidateStocktakeSession = (
     } else if (varianceTotalUnits > 0) {
       status = 'OVERAGE';
     }
+
+    const wasCountedInSession = accum.segmentBreakdown.length > 0;
 
     totalSystemUnits += systemTotalUnits;
     totalCountedUnits += countedTotalUnits;
@@ -6371,12 +10535,16 @@ export const consolidateStocktakeSession = (
       countedTotalUnits,
       countedCostValue,
       countedRetailValue,
+      customerHeldStockUnits,
+      adjustedPhysicalUnits,
+      trueVarianceUnits,
       varianceCases,
       varianceSingles,
       varianceTotalUnits,
       varianceCostValue,
       varianceRetailValue,
       status,
+      wasCountedInSession,
       segmentBreakdown: accum.segmentBreakdown,
     });
   });
@@ -6528,6 +10696,22 @@ export const approveAndCommitStocktake = (
     return { success: false, message: `This stocktake session was already approved and posted.`, adjustmentsCount: 0 };
   }
 
+  // Authorization check: Only the Store Owner (SUPER_ADMIN / ADMIN) or the expressly assigned Stocktake Auditor can commit to inventory!
+  const sessionUser = getSessionUser();
+  const isOwner = sessionUser?.role === 'SUPER_ADMIN' || sessionUser?.role === 'ADMIN' || adminId === '001';
+  const isAssignedAuditor = Boolean(
+    session.stocktakeAuditorId &&
+    (adminId === session.stocktakeAuditorId || sessionUser?.id === session.stocktakeAuditorId)
+  );
+
+  if (!isOwner && !isAssignedAuditor) {
+    return {
+      success: false,
+      message: `Access Restricted: During stocktakes, even branch managers are audited. Only the Store Owner or Assigned Stocktake Auditor (${session.stocktakeAuditorName || 'Assigned Auditor'}) has authority to commit stock updates.`,
+      adjustmentsCount: 0,
+    };
+  }
+
   if (!session.consolidatedItems || session.consolidatedItems.length === 0) {
     // Attempt auto-consolidation first if needed
     const consResult = consolidateStocktakeSession(sessionId);
@@ -6539,9 +10723,17 @@ export const approveAndCommitStocktake = (
   const timestamp = new Date().toISOString();
   const dateStr = session.date || timestamp.split('T')[0];
   let adjustmentsCount = 0;
+  const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
 
-  // Process all items that have variances
+  // Process items:
+  // For FULL_LOCKDOWN: all items with variance (including uncounted items defaulted to 0) are committed.
+  // For DAILY_BLIND, SPOT_CHECK, WEEKLY_STRATEGIC: ONLY items actually counted are committed!
   session.consolidatedItems.forEach((cItem) => {
+    // In targeted counts, do NOT alter uncounted catalog items:
+    if (!isFullLockdown && cItem.wasCountedInSession === false) {
+      return;
+    }
+
     if (cItem.varianceTotalUnits !== 0) {
       const invItem = getInventoryItemById(cItem.itemId);
       if (invItem) {
@@ -6580,7 +10772,7 @@ export const approveAndCommitStocktake = (
           closingSingles: newSingles,
           resultingStockCases: newCases,
           resultingStockSingles: newSingles,
-          promptShown: `Stocktake Audit Approval #${sessionId}`,
+          promptShown: `Stocktake Audit Approval #${sessionId} (${session.countType})`,
           actionTaken: cItem.varianceTotalUnits < 0 ? 'STOCKTAKE_SHRINKAGE_ADJUSTMENT' : 'STOCKTAKE_OVERAGE_ADJUSTMENT',
           referenceId: `${sessionId} (Approved by ${adminName})`,
           triggerRule: 'Super User Stocktake Committal',
@@ -6602,14 +10794,57 @@ export const approveAndCommitStocktake = (
     session.notes = (session.notes ? `${session.notes}\n` : '') + `[Approval Note]: ${notes}`;
   }
 
+  // Release branch lockdown if this session held the store in lockdown
+  if (session.isLockdownActive || isFullLockdown) {
+    setBranchLockdown(
+      session.branchId || getCurrentBranchId(),
+      false,
+      undefined,
+      adminId,
+      adminName,
+      `Stocktake ${session.sessionId} committed and approved by ${adminName}. Store lockdown released.`
+    );
+    session.isLockdownActive = false;
+  }
+
   saveStocktakeSession(session);
+
+  const scopeMsg = isFullLockdown
+    ? 'Full Storewide Lockdown inventory overwrite committed'
+    : `Targeted count (${session.countType}) committed for counted lines only (uncounted inventory untouched)`;
 
   return {
     success: true,
-    message: `Stocktake approved successfully! ${adjustmentsCount} inventory item(s) updated in Inventory Master with physical counts. Audit ledger entries created.`,
+    message: `Stocktake approved successfully! ${adjustmentsCount} inventory item(s) updated in Inventory Master. ${scopeMsg}. Audit ledger entries logged.`,
     adjustmentsCount,
     session,
   };
+};
+
+export const logEmergencyLockdownSale = (params: {
+  sessionId: string;
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  supervisorId: string;
+  supervisorName: string;
+  cashierName: string;
+  overrideReason: string;
+  wasCountedPriorToSale: boolean;
+}): void => {
+  const timestamp = new Date().toISOString();
+  addAuditLog({
+    action: 'PIN_OVERRIDE',
+    severity: 'WARNING',
+    staffId: params.supervisorId,
+    staffName: params.supervisorName,
+    staffRole: 'ADMIN',
+    details: `[STOCKTAKE_LOCKDOWN] Emergency sale during lockdown for ${params.quantity}x ${params.itemName} (${params.itemId}). Cashier: ${params.cashierName}. Reason: ${params.overrideReason}. Item was counted prior to sale: ${params.wasCountedPriorToSale ? 'YES' : 'NO'}.`,
+    referenceId: params.sessionId,
+    companyId: getCurrentCompanyId(),
+    branchId: getCurrentBranchId(),
+    timestamp,
+  });
 };
 
 // ============================================================================
@@ -6645,6 +10880,8 @@ export function getCurrentCompanyId(): string {
 }
 
 export function setCurrentCompanyId(companyId: string): void {
+  const current = getStored<string>(STORAGE_KEYS.CURRENT_COMPANY_ID, 'COMP-001');
+  if (current === companyId) return;
   setStored(STORAGE_KEYS.CURRENT_COMPANY_ID, companyId);
   notifyListeners();
 }
@@ -6664,8 +10901,12 @@ export function getCurrentBranchId(): string {
 }
 
 export function setCurrentBranchId(branchId: string): void {
-  setStored(STORAGE_KEYS.CURRENT_BRANCH_ID, branchId);
+  const current = getStored<string>(STORAGE_KEYS.CURRENT_BRANCH_ID, 'BR-MAIN');
   const user = getSessionUser();
+  if (current === branchId && (!user || (user.branchId === branchId && user.branch_id === branchId))) {
+    return;
+  }
+  setStored(STORAGE_KEYS.CURRENT_BRANCH_ID, branchId);
   if (user) {
     user.branchId = branchId;
     user.branch_id = branchId;
@@ -6911,6 +11152,7 @@ export const registerTenantCompany = (
       canPinOverride: true,
       canManageCompany: true,
       canEditMasterPrice: true,
+      canEditExchangeRate: true,
       canSeeMargin: true,
     },
   };
@@ -7119,7 +11361,7 @@ export const hasStaffPermission = (role: string, module: string, action: string)
 // DIRECT SUPPLIER DELIVERIES (DIRECT GRV) DAO
 // ============================================================================
 
-const INITIAL_DIRECT_GRVS: DirectGrv[] = [
+export const INITIAL_DIRECT_GRVS: DirectGrv[] = [
   {
     id: 'DGRV-20260905-001',
     grvNumber: 'DGRV-20260905-001',
@@ -7226,34 +11468,182 @@ const INITIAL_DIRECT_GRVS: DirectGrv[] = [
 ];
 
 export const getAllDirectGrvs = (): DirectGrv[] => {
-  return getStored<DirectGrv[]>(STORAGE_KEYS.DIRECT_GRVS, INITIAL_DIRECT_GRVS);
+  const legacy = getStored<DirectGrv[]>(STORAGE_KEYS.DIRECT_GRVS, INITIAL_DIRECT_GRVS);
+  return getDualReadDirectGrvs(legacy);
 };
 
 export const getDirectGrvs = (): DirectGrv[] => {
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const currentBranch = getCurrentBranchId();
   const all = getAllDirectGrvs();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
   return all.filter((g) => {
     const compId = (g as any).company_id || (g as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    if (!matchesComp) return false;
+    const brId = (g as any).branch_id || (g as any).branchId || 'BR-MAIN';
+    return brId === currentBranch;
   });
 };
 
 export const getDirectGrvById = (id: string): DirectGrv | null => {
-  const list = getDirectGrvs();
+  const list = getAllDirectGrvs();
   return list.find((g) => g.id === id || g.grvNumber === id) || null;
+};
+
+export const getDirectGrvPaymentsForStaff = (
+  staffId: string,
+  date?: string
+): Array<{
+  grv: DirectGrv;
+  payment: DirectGrvTillPayment;
+}> => {
+  const grvs = getAllDirectGrvs();
+  const results: Array<{ grv: DirectGrv; payment: DirectGrvTillPayment }> = [];
+
+  grvs.forEach((grv) => {
+    if (grv.status === 'REJECTED') return;
+    if (date && grv.date !== date) return;
+    if (grv.payments && grv.payments.length > 0) {
+      grv.payments.forEach((p) => {
+        if (p.userId === staffId && p.amount > 0) {
+          results.push({ grv, payment: p });
+        }
+      });
+    }
+  });
+
+  return results;
+};
+
+export const getDirectGrvsForStaffAndDate = (staffId: string, date: string): DirectGrv[] => {
+  const grvs = getAllDirectGrvs();
+  const targetId = String(staffId).trim().toLowerCase();
+  const normTarget = targetId.replace(/^usr-|^staff-|^0+/, '');
+
+  return grvs.filter((g) => {
+    if (g.status === 'REJECTED') return false;
+    const gDate = g.date || (g.createdAt ? g.createdAt.slice(0, 10) : '');
+    if (gDate !== date) return false;
+
+    // Check receivedByStaffId
+    const recId = g.receivedByStaffId ? String(g.receivedByStaffId).trim().toLowerCase() : '';
+    const normRec = recId.replace(/^usr-|^staff-|^0+/, '');
+    if (recId === targetId || (normTarget && normRec === normTarget)) return true;
+
+    // Check payments from till
+    if (g.payments && g.payments.length > 0) {
+      return g.payments.some((p) => {
+        const pId = p.userId ? String(p.userId).trim().toLowerCase() : '';
+        const normP = pId.replace(/^usr-|^staff-|^0+/, '');
+        return pId === targetId || (normTarget && normP === normTarget);
+      });
+    }
+
+    return false;
+  });
+};
+
+export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
+  if (grv.status === 'REJECTED') return;
+  const shiftDate = grv.date || (grv.createdAt ? grv.createdAt.split('T')[0] : new Date().toISOString().split('T')[0]);
+  const now = grv.createdAt || new Date().toISOString();
+  const compId = (grv as any).companyId || (grv as any).company_id || getCurrentCompanyId();
+  const brId = (grv as any).branchId || (grv as any).branch_id || getCurrentBranchId();
+
+  // Determine payments
+  const payments: DirectGrvTillPayment[] =
+    grv.payments && grv.payments.length > 0
+      ? grv.payments
+      : (grv.payFromTill && (grv.totalCost || 0) > 0)
+      ? [
+          {
+            userId: grv.receivedByStaffId || 'USR-003',
+            userName: grv.receivedByStaffName || 'Cashier',
+            amount: grv.totalCost,
+            drawerId: 'Till 1',
+            pinConfirmed: true,
+            confirmedAt: now,
+          },
+        ]
+      : [];
+
+  const existingMovements = getMovements();
+  const currentLogs = getCashLogs();
+
+  payments.forEach((p, pIdx) => {
+    if ((p.amount || 0) <= 0) return;
+    const staffShiftId = getShiftId(p.userId, shiftDate);
+    const voucherKey = payments.length > 1 ? `${grv.grvNumber}-P${pIdx + 1}` : grv.grvNumber;
+
+    const existingM = existingMovements.find(
+      (m) =>
+        m.type === 'supplier_payment' &&
+        (m.sourceRef === grv.grvNumber ||
+          m.sourceRef === voucherKey ||
+          m.sourceRef === grv.id ||
+          (m.notes && m.notes.includes(grv.grvNumber)))
+    );
+
+    if (existingM) {
+      if (existingM.amount !== p.amount || existingM.status !== 'approved' || !existingM.affectsDrawer) {
+        updateMovement(existingM.id, {
+          amount: p.amount,
+          status: 'approved',
+          affectsDrawer: true,
+          direction: 'out',
+        });
+      }
+    } else {
+      addMovement({
+        shiftId: staffShiftId,
+        staffId: p.userId,
+        terminalId: p.drawerId || 'Till 1',
+        date: shiftDate,
+        timestamp: now,
+        type: 'supplier_payment',
+        amount: p.amount,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'DirectGRV',
+        sourceRef: grv.grvNumber,
+        notes: `Direct Supplier Delivery: ${grv.supplierName} (${grv.grvNumber})`,
+        company_id: compId,
+        branch_id: brId,
+      });
+    }
+
+    const hasLog = currentLogs.some(
+      (l) =>
+        l.staffId === p.userId &&
+        l.date === shiftDate &&
+        (l.reference === grv.grvNumber || l.reference === voucherKey || l.description.includes(grv.grvNumber))
+    );
+
+    if (!hasLog) {
+      addCashLog({
+        timestamp: now,
+        date: shiftDate,
+        staffId: p.userId,
+        staffName: p.userName,
+        line: 'Direct Procurement',
+        description: `Direct Supplier Delivery Payout: ${grv.supplierName} (${grv.grvNumber})`,
+        in: 0,
+        out: p.amount,
+        category: 'Direct Procurement',
+        reference: grv.grvNumber,
+      });
+    }
+  });
 };
 
 export const saveDirectGrv = (grv: DirectGrv): DirectGrv => {
   const list = getAllDirectGrvs();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const compId = (grv as any).company_id || (grv as any).companyId || currentCompany;
-  const brId = (grv as any).branch_id || (grv as any).branchId || currentBranch;
+  const compId = (grv as any).company_id || (grv as any).companyId || currentCompany || 'COMP-001';
+  const brId = (grv as any).branch_id || (grv as any).branchId || currentBranch || 'BR-MAIN';
   const normalized: DirectGrv = {
     ...grv,
     companyId: compId,
@@ -7261,13 +11651,26 @@ export const saveDirectGrv = (grv: DirectGrv): DirectGrv => {
     branchId: brId,
     branch_id: brId,
   } as any;
-  const index = list.findIndex((g) => g.id === grv.id);
+  const index = list.findIndex((g) => g.id === grv.id || g.grvNumber === grv.grvNumber);
   if (index >= 0) {
     list[index] = normalized;
   } else {
     list.unshift(normalized);
   }
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
+
+  // If this direct GRV pays cash from till, immediately record the cash payout movement and CashLog
+  // so Live Drawer Balance and Form 4 canonical cash holding are deducted right away.
+  if (normalized.status !== 'REJECTED') {
+    recordDirectGrvTillPayouts(normalized);
+  }
+
+  // Sync to unified goodsReceivedNotes store
+  try {
+    postDirectDelivery(normalized);
+  } catch (err) {
+    console.warn('[GRN] postDirectDelivery sync warning:', err);
+  }
 
   // Log audit
   addAuditLog({
@@ -7281,8 +11684,9 @@ export const saveDirectGrv = (grv: DirectGrv): DirectGrv => {
     amount: grv.totalCost,
   });
 
+  enqueueSync('Direct_GRV', 'INSERT', normalized);
   notifyListeners();
-  return grv;
+  return normalized;
 };
 
 /**
@@ -7297,7 +11701,7 @@ export const approveDirectGrv = (
   approverId: string,
   approverName: string
 ): { success: boolean; message: string; grv?: DirectGrv } => {
-  const list = getDirectGrvs();
+  const list = getAllDirectGrvs();
   const grv = list.find((g) => g.id === id || g.grvNumber === id);
   if (!grv) {
     return { success: false, message: 'GRV voucher not found.' };
@@ -7312,38 +11716,225 @@ export const approveDirectGrv = (
   grv.approvedByStaffName = approverName;
   grv.approvedAt = now;
 
-  // 1. Increment inventory for each item
-  const inventory = getInventoryItems();
+  // 1. Increment inventory for each item with FIFO batches & audit movement logs
+  const allInventory = getAllInventoryItems();
+  const dateStr = grv.date || now.split('T')[0];
+
   grv.items.forEach((item) => {
-    const pName = (item.productName || '').toLowerCase();
-    const invItem = inventory.find((i) => i.itemId === item.productId || (i.itemName && pName && i.itemName.toLowerCase() === pName));
-    if (invItem) {
-      invItem.stockSingles += item.quantity;
-      invItem.totalUnits = (invItem.stockCases * invItem.unitsPerCase) + invItem.stockSingles;
-      invItem.costPerUnit = item.costPrice;
-      invItem.lastUpdated = now;
-      saveInventoryItem(invItem);
+    const cleanId = (item.productId || '').trim().toUpperCase();
+    const cleanName = (item.productName || '').trim().toLowerCase();
+
+    let invItem = allInventory.find((i) => 
+      (cleanId && i.itemId && i.itemId.trim().toUpperCase() === cleanId) ||
+      (cleanId && i.sku && i.sku.trim().toUpperCase() === cleanId) ||
+      (cleanName && i.itemName && i.itemName.trim().toLowerCase() === cleanName)
+    );
+
+    if (!invItem) {
+      // Auto-register item in inventory catalog if not found
+      const fallbackId = cleanId || `ITM-${Date.now().toString().slice(-4)}`;
+      invItem = {
+        itemId: fallbackId,
+        itemName: item.productName || 'Direct Delivery Item',
+        category: 'General',
+        unitsPerCase: item.unitsPerCase || 1,
+        canSellAsCase: item.receiveAs === 'Cases',
+        costPerCase: item.costPerCase || ((item.costPrice || 0) * (item.unitsPerCase || 1)),
+        costPerUnit: item.costPrice || 0,
+        sellPriceCase: item.sellingPrice ? item.sellingPrice * (item.unitsPerCase || 1) : 0,
+        sellPriceUnit: item.sellingPrice || 0,
+        stockCases: 0,
+        stockSingles: 0,
+        totalUnits: 0,
+        reorderLevelCases: 2,
+        reorderLevelUnits: 10,
+        lastUpdated: now,
+      };
     }
+
+    const unitsPerCase = Math.max(1, invItem.unitsPerCase || item.unitsPerCase || 1);
+    const canSellAsCase = Boolean(invItem.canSellAsCase);
+
+    const recCases = Math.max(
+      0,
+      item.quantityCases !== undefined
+        ? Number(item.quantityCases)
+        : (item.receiveAs === 'Cases' ? Math.floor((item.quantity || 0) / unitsPerCase) : 0)
+    );
+    const recSingles = Math.max(
+      0,
+      item.quantitySingles !== undefined
+        ? Number(item.quantitySingles)
+        : (item.receiveAs === 'Singles' ? Number(item.quantity || 0) : 0)
+    );
+    const totalLineUnits = (recCases * unitsPerCase) + recSingles;
+
+    let finalRecCases = recCases;
+    let finalRecSingles = recSingles;
+    let autoBroken = false;
+    let convertedCasesToSingles = false;
+    let ruleNote = '';
+
+    // Rule A:
+    // If "Sell as Case" is deactivated (default), convert all received cases into singles immediately
+    if (!canSellAsCase && recCases > 0) {
+      convertedCasesToSingles = true;
+      const gainedSingles = recCases * unitsPerCase;
+      finalRecCases = 0;
+      finalRecSingles = recSingles + gainedSingles;
+      ruleNote = ` [Converted ${recCases} received case(s) into ${gainedSingles} singles because 'Sell as Case' is deactivated]`;
+    } else if (canSellAsCase && recCases > 0 && (invItem.stockSingles || 0) === 0) {
+      // Auto-break 1 case so singles are immediately salable
+      autoBroken = true;
+      finalRecCases = recCases - 1;
+      finalRecSingles = recSingles + unitsPerCase;
+      ruleNote = ` [Rule A: Auto-broke 1 case to ${unitsPerCase} singles because StockSingles was 0]`;
+    }
+
+    // Clear any negative balances on receiving
+    const clearing = clearNegativeBalancesOnGRN({
+      itemId: invItem.itemId,
+      receivedUnits: totalLineUnits,
+      newCostPerUnit: item.costPrice || (unitsPerCase > 0 ? (item.costPerCase || 0) / unitsPerCase : 0),
+      grnId: grv.grvNumber,
+    });
+
+    // Create StockBatch for FIFO tracking
+    const batchId = `BATCH-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${invItem.itemId}`;
+    const newBatch: StockBatch = {
+      id: batchId,
+      itemId: invItem.itemId,
+      itemName: invItem.itemName,
+      batchNumber: item.batchNumber || `DGRV-${grv.grvNumber}`,
+      qtyReceived: totalLineUnits,
+      qtyOnHand: clearing.remainingUnitsForNewBatch,
+      cost: totalLineUnits * (item.costPrice || 0),
+      costPerUnit: item.costPrice || 0,
+      costPerCase: item.costPerCase || ((item.costPrice || 0) * unitsPerCase),
+      expiryDate: item.expiryDate,
+      receivedDate: dateStr,
+      supplier: grv.supplierName,
+      grnId: grv.grvNumber,
+      invoiceNo: grv.invoiceNo || grv.grvNumber,
+      branchId: grv.branchId || 'BR-001',
+      notes: `Direct GRV ${grv.grvNumber}${ruleNote}`,
+      createdAt: now,
+    };
+    saveStockBatch(newBatch);
+
+    const prevCases = invItem.stockCases || 0;
+    const prevSingles = invItem.stockSingles || 0;
+    const newStockCases = prevCases + finalRecCases;
+    const newStockSingles = prevSingles + finalRecSingles;
+    const newTotalUnits = (newStockCases * unitsPerCase) + newStockSingles;
+
+    invItem.stockCases = newStockCases;
+    invItem.stockSingles = newStockSingles;
+    invItem.totalUnits = newTotalUnits;
+
+    // Moving Weighted Average Cost (AVCO) calculation for Direct GRV:
+    const incomingUnitCost = item.costPrice || (unitsPerCase > 0 ? (item.costPerCase || 0) / unitsPerCase : (invItem.costPerUnit || 0));
+    const priorUnits = Math.max(0, (prevCases * unitsPerCase) + prevSingles);
+    const priorAvgCost = invItem.averageCostPerUnit !== undefined && invItem.averageCostPerUnit > 0
+      ? invItem.averageCostPerUnit
+      : (invItem.costPerUnit || 0);
+
+    const totalCostPool = (priorUnits * priorAvgCost) + (totalLineUnits * incomingUnitCost);
+    const combinedUnits = priorUnits + totalLineUnits;
+    const computedAvgCostUnit = combinedUnits > 0 ? Number((totalCostPool / combinedUnits).toFixed(4)) : incomingUnitCost;
+    const computedAvgCostCase = Number((computedAvgCostUnit * unitsPerCase).toFixed(2));
+    const computedLatestCostUnit = Number(incomingUnitCost.toFixed(4));
+    const computedLatestCostCase = item.costPerCase || Number((incomingUnitCost * unitsPerCase).toFixed(2));
+
+    invItem.costPerUnit = incomingUnitCost;
+    invItem.costPerCase = computedLatestCostCase;
+    invItem.averageCostPerUnit = computedAvgCostUnit;
+    invItem.averageCostPerCase = computedAvgCostCase;
+    invItem.latestCostPerUnit = computedLatestCostUnit;
+    invItem.latestCostPerCase = computedLatestCostCase;
+
+    if (item.sellingPrice) {
+      invItem.sellPriceUnit = item.sellingPrice;
+      if (canSellAsCase) {
+        invItem.sellPriceCase = item.sellingPrice * unitsPerCase;
+      }
+    }
+    invItem.lastUpdated = now;
+
+    saveInventoryItem(invItem);
+
+    // 1b. Add GoodsReceivedEntry log for audit records
+    addGoodsReceived({
+      grnId: grv.grvNumber,
+      invoiceNo: grv.invoiceNo || grv.grvNumber,
+      purchaseOrderNo: grv.purchaseOrderNo,
+      date: dateStr,
+      supplier: grv.supplierName,
+      branchId: grv.branchId || 'BR-001',
+      branchName: grv.branchName || 'Main Store',
+      itemId: invItem.itemId,
+      itemName: invItem.itemName,
+      receivedCases: recCases,
+      receivedSingles: recSingles,
+      receiveAs: item.receiveAs || 'Cases',
+      lastCost: item.costPrice || 0,
+      costPerCase: item.costPerCase || ((item.costPrice || 0) * unitsPerCase),
+      costPerUnit: item.costPrice || 0,
+      sellingPrice: item.sellingPrice || invItem.sellPriceUnit || 0,
+      marginPercent: item.markupPercent || 0,
+      lineTotal: item.lineTotal || (totalLineUnits * (item.costPrice || 0)),
+      autoBreakCaseToSingles: autoBroken,
+      convertedCasesToSingles,
+      notes: `Direct Delivery GRV approved by ${approverName}${ruleNote}`,
+      staffId: approverId,
+      staffName: approverName,
+      timestamp: now,
+      synced: false,
+    });
+
+    // 1c. Add StockMovement log
+    const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${invItem.itemId}`;
+    addStockMovement({
+      txnId,
+      movementId: txnId,
+      date: dateStr,
+      staffId: approverId,
+      staffName: approverName,
+      itemId: invItem.itemId,
+      itemName: invItem.itemName,
+      txnType: 'RECEIVE',
+      movementType: 'GOODS_RECEIVED',
+      qtyCases: recCases,
+      qtySingles: recSingles,
+      casesChange: finalRecCases,
+      singlesChange: finalRecSingles,
+      closingCases: newStockCases,
+      closingSingles: newStockSingles,
+      resultingStockCases: newStockCases,
+      resultingStockSingles: newStockSingles,
+      promptShown: convertedCasesToSingles
+        ? 'Converted Cases to Singles (Sell as Case Deactivated)'
+        : autoBroken
+        ? 'Rule A: Auto-Break on Zero Singles'
+        : `Direct GRV: ${grv.grvNumber}`,
+      actionTaken: 'DIRECT_DELIVERY_RECEIVE',
+      referenceId: grv.grvNumber,
+      reason: `Direct Delivery from ${grv.supplierName} (${grv.invoiceNo || 'No Invoice#'})`,
+      timestamp: now,
+      synced: false,
+    });
   });
 
-  // 2. Till Payouts -> create Cash Log OUT & Expense entries
+  // 2. Till Payouts -> sync movements & CashLog & Expense entries
+  recordDirectGrvTillPayouts(grv);
+
   if (grv.payFromTill && grv.payments && grv.payments.length > 0) {
+    const shiftDate = grv.date || now.split('T')[0];
     grv.payments.forEach((p) => {
       if (p.amount > 0) {
-        addCashLog({
-          timestamp: now,
-          date: now.split('T')[0],
-          staffId: p.userId,
-          staffName: p.userName,
-          line: '1',
-          description: `Direct Supplier Delivery Payout: ${grv.supplierName} (${grv.grvNumber})`,
-          in: 0,
-          out: p.amount,
-        });
-
         addExpense({
           timestamp: now,
-          date: now.split('T')[0],
+          date: shiftDate,
           category: 'Direct Supplier Delivery Payout',
           amount: p.amount,
           paymentMethod: 'Cash',
@@ -7360,6 +11951,13 @@ export const approveDirectGrv = (
   // 3. Save GRV
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
 
+  // Sync to unified goodsReceivedNotes store
+  try {
+    approveGRN(grv.id, approverId, approverName);
+  } catch (err) {
+    console.warn('[GRN] approveGRN sync warning:', err);
+  }
+
   // 4. Audit Log
   addAuditLog({
     action: 'DIRECT_GRV_APPROVE',
@@ -7372,6 +11970,7 @@ export const approveDirectGrv = (
     amount: grv.totalCost,
   });
 
+  enqueueSync('Direct_GRV', 'UPDATE', grv);
   notifyListeners();
   return {
     success: true,
@@ -7386,7 +11985,7 @@ export const rejectDirectGrv = (
   rejectorName: string,
   reason: string
 ): { success: boolean; message: string; grv?: DirectGrv } => {
-  const list = getDirectGrvs();
+  const list = getAllDirectGrvs();
   const grv = list.find((g) => g.id === id || g.grvNumber === id);
   if (!grv) {
     return { success: false, message: 'GRV voucher not found.' };
@@ -7395,6 +11994,14 @@ export const rejectDirectGrv = (
   grv.status = 'REJECTED';
   grv.rejectedReason = reason;
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
+
+  // Update associated cashMovements to rejected status
+  const movements = getMovements();
+  movements.forEach((m) => {
+    if (m.type === 'supplier_payment' && (m.sourceRef === grv.grvNumber || m.sourceRef?.startsWith(grv.grvNumber) || m.sourceRef === grv.id)) {
+      updateMovement(m.id, { status: 'rejected' });
+    }
+  });
 
   addAuditLog({
     action: 'DIRECT_GRV_REJECT',

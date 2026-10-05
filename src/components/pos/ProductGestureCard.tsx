@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Product } from '../../types';
+import { getCurrentUser, isSupervisorOrAbove } from '../../db/roomDatabase';
 import { Scale, Trash2, Plus, Minus, Check } from 'lucide-react';
 
 interface ProductGestureCardProps {
@@ -202,21 +203,52 @@ export const ProductGestureCard: React.FC<ProductGestureCardProps> = ({
         </div>
       )}
 
-      {/* Stock Indicator Top-Right Badge (matches screenshot) */}
-      {product.sellByFraction ? (
-        <span className="absolute top-2 right-2 text-[9px] font-black px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-0.5">
-          <Scale className="w-2.5 h-2.5" />
-          <span>By {product.fractionUnit || 'kg'}</span>
-        </span>
-      ) : product.stockQuantity === 0 && (!product.stockCases || product.stockCases === 0) ? (
-        <span className="absolute top-2 right-2 text-[9px] font-black px-1.5 py-0.5 rounded bg-rose-100 text-rose-700">
-          OOS
-        </span>
-      ) : (
-        <span className="absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
-          {product.stockQuantity} {product.unit || 'Each'}
-        </span>
-      )}
+      {/* Stock Indicator Top-Right Badge (Blind for cashiers to prevent theft/count cheating) */}
+      {(() => {
+        const user = getCurrentUser();
+        const canSeeRawStock = isSupervisorOrAbove(user?.role) || Boolean(user?.permissions?.canManageInventory);
+        const isOOS = product.stockQuantity === 0 && (!product.stockCases || product.stockCases === 0);
+        const totalStockUnits = (Number(product.stockCases) || 0) * (product.unitsPerCase || 1) + (Number(product.stockQuantity) || 0);
+        const reorderLimit = product.reorderLevelUnits || 5;
+        const isLowStock = !isOOS && totalStockUnits <= reorderLimit;
+
+        if (product.sellByFraction) {
+          return (
+            <span className="absolute top-2 right-2 text-[9px] font-black px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-0.5">
+              <Scale className="w-2.5 h-2.5" />
+              <span>By {product.fractionUnit || 'kg'}</span>
+            </span>
+          );
+        }
+
+        if (isOOS) {
+          return (
+            <span className="absolute top-2 right-2 text-[9px] font-black px-1.5 py-0.5 rounded bg-rose-100 text-rose-700">
+              OOS
+            </span>
+          );
+        }
+
+        if (!canSeeRawStock) {
+          return isLowStock ? (
+            <span className="absolute top-2 right-2 text-[9px] font-black px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300">
+              Low Stock
+            </span>
+          ) : (
+            <span className="absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
+              In Stock
+            </span>
+          );
+        }
+
+        return (
+          <span className={`absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded ${
+            isLowStock ? 'bg-amber-100 text-amber-800 border border-amber-300' : 'bg-slate-100 text-slate-600'
+          }`}>
+            {product.stockQuantity} {product.unit || 'Each'}
+          </span>
+        );
+      })()}
 
       {/* Circular Avatar / Cart Count (Matches Screenshot) */}
       <div className="flex justify-center mt-1 mb-2">

@@ -1,16 +1,49 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
   <defs>
-    <linearGradient id="grad" x1="0%" y1="100%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#6A4DFF" />
-      <stop offset="100%" stop-color="#FF8A00" />
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4f46e5" />
+      <stop offset="50%" stop-color="#6366f1" />
+      <stop offset="100%" stop-color="#8b5cf6" />
     </linearGradient>
-    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#0f172a" />
-      <stop offset="100%" stop-color="#020617" />
+    <linearGradient id="goldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fbbf24" />
+      <stop offset="100%" stop-color="#f59e0b" />
     </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#1e1b4b" flood-opacity="0.5" />
+    </filter>
   </defs>
-  <rect width="512" height="512" rx="112" fill="url(#bgGrad)" />
-  <rect x="24" y="24" width="464" height="464" rx="96" fill="none" stroke="url(#grad)" stroke-width="12" opacity="0.85" />
-  <rect x="72" y="72" width="368" height="368" rx="80" fill="#090d16" />
-  <path d="M336 176 C336 140 300 120 256 120 C206 120 172 144 172 186 C172 226 206 244 260 258 C318 274 344 296 344 336 C344 380 306 404 256 404 C198 404 164 374 164 326 L216 326 C216 352 232 368 258 368 C286 368 300 354 300 334 C300 312 284 298 234 284 C180 270 130 248 130 188 C130 138 174 84 256 84 C330 84 378 124 378 176 Z" fill="url(#grad)" />
+
+  <!-- Background Squircle -->
+  <rect width="512" height="512" rx="128" fill="url(#bgGrad)" />
+
+  <!-- Inner Subtle Border -->
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="none" stroke="rgba(255,255,255,0.2)" stroke-width="4" />
+
+  <!-- POS Terminal & Shield Badge Motif -->
+  <g filter="url(#shadow)">
+    <!-- Main Card Body -->
+    <rect x="106" y="126" width="300" height="260" rx="36" fill="#ffffff" />
+    
+    <!-- Top Display Screen -->
+    <rect x="136" y="156" width="240" height="80" rx="18" fill="#0f172a" />
+    <circle cx="166" cy="196" r="8" fill="#10b981" />
+    <rect x="190" y="188" width="120" height="16" rx="8" fill="#38bdf8" />
+    <rect x="325" y="188" width="30" height="16" rx="8" fill="#a855f7" />
+
+    <!-- Keyboard / Cash Dots -->
+    <circle cx="166" cy="276" r="14" fill="#e2e8f0" />
+    <circle cx="216" cy="276" r="14" fill="#e2e8f0" />
+    <circle cx="266" cy="276" r="14" fill="#e2e8f0" />
+    <circle cx="166" cy="326" r="14" fill="#e2e8f0" />
+    <circle cx="216" cy="326" r="14" fill="#e2e8f0" />
+    <circle cx="266" cy="326" r="14" fill="#e2e8f0" />
+
+    <!-- Action Button (Gold / Green) -->
+    <rect x="310" y="262" width="66" height="78" rx="16" fill="url(#goldGrad)" />
+    <path d="M 333 301 L 341 309 L 355 293" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+
+  <!-- Dynamic Lightning Bolt Accent for Speed & Offline Reliability -->
+  <polygon points="270,40 310,40 280,100 325,100 240,190 260,115 225,115" fill="url(#goldGrad)" />
 </svg>

@@ -11,6 +11,7 @@ import {
   StockMovementEntry,
   SaleInvoice,
   Salesperson,
+  PackagingVariant,
 } from '../types';
 import {
   getInventoryItems,
@@ -110,8 +111,121 @@ export function parseCsvText(text: string): string[][] {
 }
 
 // ==========================================
-// 1. INVENTORY IMPORT / EXPORT
+// 1. INVENTORY IMPORT / EXPORT & VARIANT SERIALIZATION
 // ==========================================
+
+/**
+ * Serialize packaging variants (prepacks) into a clean, human-readable & spreadsheet-friendly string:
+ * Format: "Prepack (5s): units=5, price=1.00, barcode=600123; Prepack (10s): units=10, price=1.80"
+ */
+export function serializePackagingVariants(variants?: PackagingVariant[]): string {
+  if (!variants || !Array.isArray(variants) || variants.length === 0) return '';
+  return variants
+    .map((v) => {
+      const parts = [
+        `units=${v.unitsPerPack || 1}`,
+        `price=${(v.sellPrice || 0).toFixed(2)}`,
+      ];
+      if (v.costPrice !== undefined && v.costPrice > 0) parts.push(`cost=${v.costPrice.toFixed(2)}`);
+      if (v.barcode) parts.push(`barcode=${v.barcode}`);
+      if (v.sku) parts.push(`sku=${v.sku}`);
+      return `${v.name || 'Variant'}: ${parts.join(', ')}`;
+    })
+    .join('; ');
+}
+
+/**
+ * Parse packaging variants from either JSON or human-readable format:
+ * Supports:
+ * 1. "Prepack (5s): units=5, price=1.00, barcode=600123; Prepack (10s): units=10, price=1.80"
+ * 2. "Prepack 5s [5 units @ $1.00]"
+ * 3. JSON string: [{"name":"Prepack (5s)","unitsPerPack":5,"sellPrice":1.00}]
+ */
+export function parsePackagingVariantsString(val: any): PackagingVariant[] {
+  if (!val) return [];
+  if (Array.isArray(val)) return val;
+  const str = String(val).trim();
+  if (!str) return [];
+
+  // Try JSON first
+  if (str.startsWith('[') && str.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(str);
+      if (Array.isArray(parsed)) {
+        return parsed.map((p, idx) => ({
+          id: p.id || `VAR-${idx + 1}`,
+          name: p.name || `Pack ${idx + 1}`,
+          unitsPerPack: Math.max(1, Number(p.unitsPerPack) || 1),
+          sellPrice: Math.max(0, Number(p.sellPrice) || 0),
+          costPrice: p.costPrice !== undefined ? Number(p.costPrice) : undefined,
+          barcode: p.barcode || undefined,
+          sku: p.sku || undefined,
+        }));
+      }
+    } catch (e) {}
+  }
+
+  // Parse key-value semicolon-delimited syntax:
+  // "Prepack (5s): units=5, price=1.00, barcode=12345; Prepack (10s): units=10, price=1.80"
+  const segments = str.split(';').map((s) => s.trim()).filter(Boolean);
+  const variants: PackagingVariant[] = [];
+
+  segments.forEach((seg, idx) => {
+    let name = `Variant ${idx + 1}`;
+    let rest = seg;
+
+    if (seg.includes(':')) {
+      const colonIdx = seg.indexOf(':');
+      name = seg.substring(0, colonIdx).trim() || name;
+      rest = seg.substring(colonIdx + 1).trim();
+    }
+
+    let units = 1;
+    let sellPrice = 0;
+    let costPrice: number | undefined;
+    let barcode: string | undefined;
+    let sku: string | undefined;
+
+    // Look for key=value tokens
+    const tokens = rest.split(',').map((t) => t.trim());
+    tokens.forEach((token) => {
+      const eqIdx = token.indexOf('=');
+      if (eqIdx !== -1) {
+        const k = token.substring(0, eqIdx).trim().toLowerCase();
+        const v = token.substring(eqIdx + 1).trim();
+        if (k === 'units' || k === 'qty' || k === 'pack_size' || k === 'packsize') {
+          units = Math.max(1, parseInt(v, 10) || 1);
+        } else if (k === 'price' || k === 'sell_price' || k === 'sellprice') {
+          sellPrice = Math.max(0, parseFloat(v.replace(/[^0-9.]/g, '')) || 0);
+        } else if (k === 'cost' || k === 'cost_price' || k === 'costprice') {
+          costPrice = Math.max(0, parseFloat(v.replace(/[^0-9.]/g, '')) || 0);
+        } else if (k === 'barcode' || k === 'upc' || k === 'ean') {
+          barcode = v;
+        } else if (k === 'sku' || k === 'code') {
+          sku = v;
+        }
+      } else {
+        // Fallback pattern like "5 units @ $1.00"
+        const unitMatch = token.match(/(\d+)\s*(?:units?|pcs?|pk)/i);
+        if (unitMatch) units = Math.max(1, parseInt(unitMatch[1], 10));
+        const priceMatch = token.match(/\$?\s*([0-9]+(?:\.[0-9]{1,2})?)/);
+        if (priceMatch && sellPrice === 0) sellPrice = parseFloat(priceMatch[1]);
+      }
+    });
+
+    variants.push({
+      id: `VAR-${Date.now().toString().slice(-4)}-${idx + 1}`,
+      name,
+      unitsPerPack: units,
+      sellPrice,
+      costPrice,
+      barcode,
+      sku,
+    });
+  });
+
+  return variants;
+}
 
 export const INVENTORY_CSV_HEADERS = [
   'Item ID',
@@ -131,6 +245,9 @@ export const INVENTORY_CSV_HEADERS = [
   'SKU',
   'Barcode',
   'Description',
+  'Packaging Variants (Prepacks)',
+  'Parent Product SKU / ID',
+  'Units in Variant',
 ];
 
 export function exportInventoryToCsv(customItems?: InventoryItem[]): string {
@@ -156,6 +273,9 @@ export function exportInventoryToCsv(customItems?: InventoryItem[]): string {
       escapeCsvValue(item.sku || item.itemId),
       escapeCsvValue(item.barcode || ''),
       escapeCsvValue(item.description || ''),
+      escapeCsvValue(serializePackagingVariants(item.packagingVariants)),
+      '',
+      '',
     ];
     rows.push(row.join(','));
   });
@@ -163,10 +283,90 @@ export function exportInventoryToCsv(customItems?: InventoryItem[]): string {
   return rows.join('\n');
 }
 
+/**
+ * Export inventory with both master items and separate rows for each prepack/packaging variant.
+ * This is ideal for external POS/ERP systems, barcode label printers, or spreadsheet analysis.
+ */
+export function exportInventoryExpandedVariantsToCsv(customItems?: InventoryItem[]): string {
+  const items = customItems || getInventoryItems();
+  const rows: string[] = [INVENTORY_CSV_HEADERS.join(',')];
+
+  items.forEach((item) => {
+    // 1. Master product row
+    const masterRow = [
+      escapeCsvValue(item.itemId),
+      escapeCsvValue(item.itemName),
+      escapeCsvValue(item.category || 'General'),
+      escapeCsvValue(item.canSellAsCase ? 'Y' : 'N'),
+      escapeCsvValue(item.unitsPerCase || 1),
+      escapeCsvValue(item.costPerCase?.toFixed(2) || '0.00'),
+      escapeCsvValue(item.costPerUnit?.toFixed(2) || '0.00'),
+      escapeCsvValue(item.sellPriceCase?.toFixed(2) || '0.00'),
+      escapeCsvValue(item.sellPriceUnit?.toFixed(2) || '0.00'),
+      escapeCsvValue(item.stockCases || 0),
+      escapeCsvValue(item.stockSingles || 0),
+      escapeCsvValue(item.totalUnits || (item.stockCases * item.unitsPerCase + item.stockSingles)),
+      escapeCsvValue(item.reorderLevelCases || 1),
+      escapeCsvValue(item.reorderLevelUnits || 5),
+      escapeCsvValue(item.sku || item.itemId),
+      escapeCsvValue(item.barcode || ''),
+      escapeCsvValue(item.description || ''),
+      escapeCsvValue(serializePackagingVariants(item.packagingVariants)),
+      '',
+      '',
+    ];
+    rows.push(masterRow.join(','));
+
+    // 2. Prepack / Packaging Variant rows
+    if (item.packagingVariants && Array.isArray(item.packagingVariants) && item.packagingVariants.length > 0) {
+      item.packagingVariants.forEach((v) => {
+        const units = v.unitsPerPack || 1;
+        const costPrice = v.costPrice !== undefined ? v.costPrice : Number((item.costPerUnit * units).toFixed(2));
+        const sellPrice = v.sellPrice !== undefined ? v.sellPrice : Number((item.sellPriceUnit * units).toFixed(2));
+        const unitCost = Number((costPrice / units).toFixed(2));
+        const unitSell = Number((sellPrice / units).toFixed(2));
+
+        const variantRow = [
+          escapeCsvValue(`${item.itemId}_${v.id}`),
+          escapeCsvValue(`${item.itemName} (${v.name})`),
+          escapeCsvValue(item.category || 'General'),
+          escapeCsvValue('N'),
+          escapeCsvValue(units),
+          escapeCsvValue(costPrice.toFixed(2)),
+          escapeCsvValue(unitCost.toFixed(2)),
+          escapeCsvValue(sellPrice.toFixed(2)),
+          escapeCsvValue(unitSell.toFixed(2)),
+          escapeCsvValue(0),
+          escapeCsvValue(0),
+          escapeCsvValue(0),
+          escapeCsvValue(1),
+          escapeCsvValue(units),
+          escapeCsvValue(v.sku || `${item.sku || item.itemId}-${v.name.replace(/[^a-zA-Z0-9]/g, '')}`),
+          escapeCsvValue(v.barcode || ''),
+          escapeCsvValue(`Prepack variant of ${item.itemName} (${units} units)`),
+          escapeCsvValue(`Parent: ${item.itemId}; Name: ${v.name}; Units: ${units}; Price: ${sellPrice}`),
+          escapeCsvValue(item.sku || item.itemId),
+          escapeCsvValue(units),
+        ];
+        rows.push(variantRow.join(','));
+      });
+    }
+  });
+
+  return rows.join('\n');
+}
+
 export function downloadInventoryCsv(customItems?: InventoryItem[]) {
-  const csv = exportInventoryToCsv(customItems);
+  // Always include variants so users never lose prepack ratios, variant barcodes, or parent links
+  const csv = exportInventoryExpandedVariantsToCsv(customItems);
   const dateStr = new Date().toISOString().split('T')[0];
   triggerBrowserDownload(csv, `Saimetric_Inventory_Export_${dateStr}.csv`);
+}
+
+export function downloadInventoryExpandedCsv(customItems?: InventoryItem[]) {
+  const csv = exportInventoryExpandedVariantsToCsv(customItems);
+  const dateStr = new Date().toISOString().split('T')[0];
+  triggerBrowserDownload(csv, `Saimetric_Inventory_Expanded_Variants_${dateStr}.csv`);
 }
 
 export function downloadInventoryJson(customItems?: InventoryItem[]) {
@@ -197,6 +397,7 @@ export function downloadInventoryTemplateCsv() {
       'SKU-MAZ001',
       '600123456789',
       'Mazoe Orange 2 Litre cordial bottle',
+      'Prepack (2s): units=2, price=7.50; Prepack (4s): units=4, price=14.80',
     ].map(escapeCsvValue).join(','),
     [
       'SUG001',
@@ -216,6 +417,7 @@ export function downloadInventoryTemplateCsv() {
       'SKU-SUG001',
       '600987654321',
       'Refined white granulated sugar 2kg packets',
+      'Prepack (5s): units=5, price=10.50; Pack of 10s: units=10, price=20.50',
     ].map(escapeCsvValue).join(','),
     [
       'OIL002',
@@ -235,6 +437,7 @@ export function downloadInventoryTemplateCsv() {
       'SKU-OIL002',
       '600555666777',
       'Pure vegetable cooking oil 2L',
+      '',
     ].map(escapeCsvValue).join(','),
   ];
   triggerBrowserDownload(sampleRows.join('\n'), 'Saimetric_Inventory_Template.csv');
@@ -276,10 +479,12 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
   const skuIdx = getColIdx(['sku', 'code']);
   const barcodeIdx = getColIdx(['barcode', 'ean', 'upc']);
   const descIdx = getColIdx(['description', 'notes', 'details']);
+  const variantsIdx = getColIdx(['packagingvariants', 'variants', 'prepacks', 'packaging', 'subpacks']);
+  const parentIdColIdx = getColIdx(['parentproduct', 'parentsku', 'parentid', 'parentcode', 'parent']);
+  const variantUnitsColIdx = getColIdx(['unitsinvariant', 'variantunits', 'unitsperpack', 'packunits']);
 
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
-    const rowNum = r + 1;
 
     const rawId = idIdx >= 0 ? row[idIdx]?.trim() : '';
     const rawName = nameIdx >= 0 ? row[nameIdx]?.trim() : '';
@@ -321,6 +526,98 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
     const sku = (skuIdx >= 0 && row[skuIdx]?.trim()) || itemId;
     const barcode = (barcodeIdx >= 0 && row[barcodeIdx]?.trim()) || '';
     const description = (descIdx >= 0 && row[descIdx]?.trim()) || '';
+    const rawVariantsStr = variantsIdx >= 0 ? row[variantsIdx] : '';
+
+    // Check if this row is an expanded sub-variant of a parent item:
+    // e.g. Parent column is set, or rawVariantsStr starts with "Parent:"
+    const explicitParent = parentIdColIdx >= 0 ? row[parentIdColIdx]?.trim() : '';
+    const isParentVariantRow =
+      Boolean(explicitParent) ||
+      (rawVariantsStr && typeof rawVariantsStr === 'string' && rawVariantsStr.startsWith('Parent:'));
+
+    if (isParentVariantRow) {
+      let parentId = explicitParent;
+      let varName = rawName;
+      let varUnits =
+        variantUnitsColIdx >= 0 && row[variantUnitsColIdx]
+          ? parseFloat(row[variantUnitsColIdx])
+          : unitsPerCase;
+      let varPrice = sellPriceUnit > 0 ? sellPriceUnit : sellPriceCase;
+
+      if (rawVariantsStr && typeof rawVariantsStr === 'string' && rawVariantsStr.startsWith('Parent:')) {
+        const parentMatch = rawVariantsStr.match(/Parent:\s*([^;]+)/i);
+        const nameMatch = rawVariantsStr.match(/Name:\s*([^;]+)/i);
+        const unitsMatch = rawVariantsStr.match(/Units:\s*([0-9.]+)/i);
+        const priceMatch = rawVariantsStr.match(/Price:\s*([0-9.]+)/i);
+
+        if (!parentId && parentMatch) parentId = parentMatch[1].trim();
+        if (nameMatch) varName = nameMatch[1].trim();
+        if (unitsMatch) varUnits = parseFloat(unitsMatch[1]);
+        if (priceMatch) varPrice = parseFloat(priceMatch[1]);
+      }
+
+      if (parentId) {
+        const parentKey = parentId.toUpperCase();
+        let parentItem = items.find(
+          (it) => it.itemId.toUpperCase() === parentKey || (it.sku && it.sku.toUpperCase() === parentKey)
+        );
+
+        if (!parentItem) {
+          // Check existing database items
+          const dbItems = getInventoryItems();
+          parentItem = dbItems.find(
+            (it) => it.itemId.toUpperCase() === parentKey || (it.sku && it.sku.toUpperCase() === parentKey)
+          );
+          if (parentItem) {
+            items.push(parentItem);
+          }
+        }
+
+        if (parentItem) {
+          if (!parentItem.packagingVariants) parentItem.packagingVariants = [];
+          const existingVarIdx = parentItem.packagingVariants.findIndex(
+            (v) => (sku && v.sku === sku) || v.name.toLowerCase() === varName.toLowerCase()
+          );
+
+          const newVariant: PackagingVariant = {
+            id:
+              existingVarIdx >= 0
+                ? parentItem.packagingVariants[existingVarIdx].id
+                : `VAR-${Date.now().toString().slice(-4)}-${parentItem.packagingVariants.length + 1}`,
+            name: varName,
+            unitsPerPack: varUnits || 1,
+            sellPrice: varPrice || 0,
+            costPrice: costPerUnit > 0 ? costPerUnit * (varUnits || 1) : undefined,
+            barcode: barcode || undefined,
+            sku: sku || undefined,
+          };
+
+          if (existingVarIdx >= 0) {
+            parentItem.packagingVariants[existingVarIdx] = newVariant;
+          } else {
+            parentItem.packagingVariants.push(newVariant);
+          }
+
+          // Convert variant stock into parent units (Question 3: convert to parent units)
+          const variantStockQty = stockCases > 0 ? stockCases : stockSingles;
+          const convertedUnits = variantStockQty * (varUnits || 1);
+          if (convertedUnits > 0) {
+            parentItem.totalUnits = (parentItem.totalUnits || 0) + convertedUnits;
+            if (parentItem.unitsPerCase > 1) {
+              parentItem.stockCases = Math.floor(parentItem.totalUnits / parentItem.unitsPerCase);
+              parentItem.stockSingles = parentItem.totalUnits % parentItem.unitsPerCase;
+            } else {
+              parentItem.stockCases = 0;
+              parentItem.stockSingles = parentItem.totalUnits;
+            }
+          }
+          // Do not add expanded variant row as standalone master item
+          continue;
+        }
+      }
+    }
+
+    const packagingVariants = variantsIdx >= 0 ? parsePackagingVariantsString(rawVariantsStr) : [];
 
     const item: InventoryItem = {
       itemId,
@@ -340,6 +637,7 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
       sku,
       barcode,
       description,
+      packagingVariants: packagingVariants.length > 0 ? packagingVariants : undefined,
       lastUpdated: new Date().toISOString(),
     };
 
@@ -358,26 +656,30 @@ export function importInventoryItems(
   let updated = 0;
   const errors: string[] = [];
 
-  if (mode === 'replace') {
-    // In replace mode, clear and save all parsed items
-    try {
-      localStorage.setItem('saimetric_inventory_items', JSON.stringify(items));
-      return { added: items.length, updated: 0, errors: [] };
-    } catch (err: any) {
-      errors.push(`Failed to replace inventory: ${err?.message || 'Storage error'}`);
-      return { added: 0, updated: 0, errors };
+  // Deduplicate items to import by itemId
+  const incomingMap = new Map<string, InventoryItem>();
+  items.forEach((item) => {
+    if (item.itemId) {
+      incomingMap.set(item.itemId.trim().toUpperCase(), item);
     }
-  }
+  });
+  const dedupedIncoming = Array.from(incomingMap.values());
 
-  // Merge mode
   const currentMap = new Map<string, InventoryItem>();
   currentItems.forEach((i) => currentMap.set(i.itemId.toUpperCase(), i));
 
-  items.forEach((item) => {
+  dedupedIncoming.forEach((item) => {
     try {
-      const exists = currentMap.has(item.itemId.toUpperCase());
-      saveInventoryItem(item);
-      if (exists) {
+      const existing = currentMap.get(item.itemId.toUpperCase());
+      const mergedItem: InventoryItem = {
+        ...item,
+        packagingVariants:
+          item.packagingVariants && item.packagingVariants.length > 0
+            ? item.packagingVariants
+            : (existing?.packagingVariants || []),
+      };
+      saveInventoryItem(mergedItem);
+      if (existing) {
         updated++;
       } else {
         added++;

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ArrowLeft,
   Layers,
@@ -19,6 +19,13 @@ import {
   Printer,
   FileText,
   X,
+  PackageOpen,
+  Users,
+  Zap,
+  Lock,
+  Share2,
+  Shield,
+  Eye,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -36,11 +43,18 @@ import {
   submitSkuVarianceRecount,
   approveAndCommitStocktake,
   getStocktakeSessionById,
+  getCustomerGoodsLeftBehind,
+  getTemporaryCasuals,
 } from '../../db/roomDatabase';
 import { DoubleCountTerminal } from './DoubleCountTerminal';
 import { SegmentRecountModal } from './SegmentRecountModal';
 import { ConsolidatedVarianceView } from './ConsolidatedVarianceView';
 import { StocktakeApprovalModal } from './StocktakeApprovalModal';
+import { CustomerGoodsLeftBehindTab } from './CustomerGoodsLeftBehindTab';
+import { CasualWorkersTab } from './CasualWorkersTab';
+import { FastMovingChecklistTab } from './FastMovingChecklistTab';
+import { LockdownEmergencySalesTab } from './LockdownEmergencySalesTab';
+import { P2PMeshSyncTab } from './P2PMeshSyncTab';
 
 interface StocktakeSessionDetailScreenProps {
   session: StocktakeSession;
@@ -49,6 +63,16 @@ interface StocktakeSessionDetailScreenProps {
   onUpdateSession: (session: StocktakeSession) => void;
 }
 
+export type DetailTab =
+  | 'SEGMENTS'
+  | 'VARIANCE'
+  | 'GOODS_LEFT_BEHIND'
+  | 'CASUALS'
+  | 'FAST_MOVERS'
+  | 'LOCKDOWN'
+  | 'P2P_SYNC'
+  | 'AUDIT_CERT';
+
 export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreenProps> = ({
   session: initialSession,
   currentUser,
@@ -56,7 +80,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   onUpdateSession,
 }) => {
   const [session, setSession] = useState<StocktakeSession>(initialSession);
-  const [activeTab, setActiveTab] = useState<'SEGMENTS' | 'VARIANCE' | 'AUDIT_CERT'>('SEGMENTS');
+  const [activeTab, setActiveTab] = useState<DetailTab>('SEGMENTS');
 
   // Terminal state
   const [activeTerminalSegment, setActiveTerminalSegment] = useState<StocktakeSegment | null>(null);
@@ -74,6 +98,10 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   const [newSegmentLocation, setNewSegmentLocation] = useState('');
   const [newSegmentDesc, setNewSegmentDesc] = useState('');
 
+  // Count metrics for tabs
+  const [goodsLeftBehindCount, setGoodsLeftBehindCount] = useState<number>(0);
+  const [casualsCount, setCasualsCount] = useState<number>(0);
+
   // Toast / notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -86,7 +114,17 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     const latest = updated || getStocktakeSessionById(session.sessionId) || session;
     setSession(latest);
     onUpdateSession(latest);
+
+    const cgl = getCustomerGoodsLeftBehind(latest.sessionId);
+    setGoodsLeftBehindCount(cgl.filter((i) => !i.collected).length);
+
+    const cas = getTemporaryCasuals(latest.sessionId);
+    setCasualsCount(cas.length);
   };
+
+  useEffect(() => {
+    refreshSession();
+  }, [session.sessionId]);
 
   // Add Segment Handler
   const handleAddSegment = (e: React.FormEvent) => {
@@ -225,7 +263,6 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     }
   };
 
-  // Print audit certificate
   const handlePrintCertificate = () => {
     window.print();
   };
@@ -250,10 +287,19 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   const verifiedCount = session.segments.filter((s) => s.status === 'VERIFIED').length;
   const isApproved = session.status === 'APPROVED_POSTED';
 
+  const countTypeBadge =
+    session.countType === 'DAILY_BLIND'
+      ? { label: 'Daily Blind Count', color: 'bg-amber-950 text-amber-300 border-amber-800' }
+      : session.countType === 'SPOT_CHECK'
+      ? { label: 'Supervisor Spot Check', color: 'bg-emerald-950 text-emerald-300 border-emerald-800' }
+      : session.countType === 'WEEKLY_STRATEGIC'
+      ? { label: 'Weekly Strategic', color: 'bg-purple-950 text-purple-300 border-purple-800' }
+      : { label: 'Full Store Lockdown', color: 'bg-rose-950 text-rose-300 border-rose-800' };
+
   return (
     <div className="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
       {/* Top Session Header */}
-      <header className="bg-slate-900 border-b border-slate-800 px-6 py-4 sticky top-0 z-20">
+      <header className="bg-slate-900 border-b border-slate-800 px-6 py-4 sticky top-0 z-20 shadow-md">
         <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <button
@@ -264,11 +310,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
               <ArrowLeft className="w-5 h-5" />
             </button>
             <div>
-              <div className="flex items-center gap-2.5">
+              <div className="flex flex-wrap items-center gap-2.5">
                 <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-blue-950 text-blue-300 border border-blue-800">
                   {session.sessionId}
                 </span>
                 <h1 className="text-lg font-bold text-white tracking-tight">{session.title}</h1>
+                <span className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${countTypeBadge.color}`}>
+                  {countTypeBadge.label}
+                </span>
                 <span
                   className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${
                     session.status === 'APPROVED_POSTED'
@@ -286,12 +335,18 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
               <div className="text-xs text-slate-400 mt-1 flex flex-wrap items-center gap-4">
                 <span className="flex items-center gap-1">
                   <Calendar className="w-3.5 h-3.5 text-slate-400" />
-                  Audit Date: <strong className="text-slate-300">{session.date}</strong>
+                  Date: <strong className="text-slate-300">{session.date}</strong>
                 </span>
                 <span className="flex items-center gap-1">
                   <Building className="w-3.5 h-3.5 text-slate-400" />
                   Branch: <strong className="text-slate-300">{session.branchName}</strong>
                 </span>
+                {session.stocktakeAuditorName && (
+                  <span className="flex items-center gap-1">
+                    <Shield className="w-3.5 h-3.5 text-amber-400" />
+                    Auditor: <strong className="text-amber-300">{session.stocktakeAuditorName}</strong>
+                  </span>
+                )}
                 <span>
                   Created by: <strong className="text-slate-300">{session.createdByName}</strong>
                 </span>
@@ -317,7 +372,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                 className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-emerald-900/30 flex items-center gap-2 transition"
               >
                 <ShieldCheck className="w-4 h-4" />
-                Super User Approval
+                Owner / Auditor Committal
               </button>
             )}
 
@@ -334,44 +389,114 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
         </div>
       </header>
 
-      {/* Navigation Tabs */}
-      <div className="bg-slate-900/60 border-b border-slate-800 px-6">
-        <div className="max-w-7xl mx-auto flex items-center gap-6 text-xs font-semibold">
+      {/* Navigation Tabs Bar */}
+      <div className="bg-slate-900/80 border-b border-slate-800 px-6 overflow-x-auto">
+        <div className="max-w-7xl mx-auto flex items-center gap-4 text-xs font-semibold whitespace-nowrap min-w-max">
           <button
             onClick={() => setActiveTab('SEGMENTS')}
-            className={`py-3 border-b-2 flex items-center gap-2 transition ${
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
               activeTab === 'SEGMENTS'
                 ? 'border-blue-500 text-blue-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
             <Layers className="w-4 h-4" />
-            1. Floor Segments & Double Counting ({verifiedCount}/{session.segments.length} Verified)
+            Floor Segments ({verifiedCount}/{session.segments.length})
           </button>
 
           <button
             onClick={() => setActiveTab('VARIANCE')}
-            className={`py-3 border-b-2 flex items-center gap-2 transition ${
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
               activeTab === 'VARIANCE'
                 ? 'border-blue-500 text-blue-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
             <FileSpreadsheet className="w-4 h-4" />
-            2. Consolidated SOH Variance Master ({session.consolidatedItems?.length || 0} SKUs)
+            Consolidated Variance ({session.consolidatedItems?.length || 0})
+          </button>
+
+          <button
+            onClick={() => setActiveTab('GOODS_LEFT_BEHIND')}
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+              activeTab === 'GOODS_LEFT_BEHIND'
+                ? 'border-blue-500 text-blue-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <PackageOpen className="w-4 h-4" />
+            Customer Goods Left Behind
+            {goodsLeftBehindCount > 0 && (
+              <span className="px-1.5 py-0.2 bg-amber-500 text-slate-950 font-bold rounded-full text-[10px]">
+                {goodsLeftBehindCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setActiveTab('CASUALS')}
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+              activeTab === 'CASUALS'
+                ? 'border-amber-500 text-amber-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Users className="w-4 h-4" />
+            Casual Accounts & PINs
+            {casualsCount > 0 && (
+              <span className="px-1.5 py-0.2 bg-amber-950 text-amber-300 border border-amber-800 font-bold rounded-full text-[10px]">
+                {casualsCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            onClick={() => setActiveTab('FAST_MOVERS')}
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+              activeTab === 'FAST_MOVERS'
+                ? 'border-amber-500 text-amber-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Zap className="w-4 h-4" />
+            Fast Movers Airtime Checklist
+          </button>
+
+          <button
+            onClick={() => setActiveTab('LOCKDOWN')}
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+              activeTab === 'LOCKDOWN'
+                ? 'border-rose-500 text-rose-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Lock className="w-4 h-4" />
+            Lockdown & Emergency Sales
+          </button>
+
+          <button
+            onClick={() => setActiveTab('P2P_SYNC')}
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+              activeTab === 'P2P_SYNC'
+                ? 'border-emerald-500 text-emerald-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Share2 className="w-4 h-4" />
+            P2P Mesh & Cloud Throttler
           </button>
 
           {isApproved && (
             <button
               onClick={() => setActiveTab('AUDIT_CERT')}
-              className={`py-3 border-b-2 flex items-center gap-2 transition ${
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
                 activeTab === 'AUDIT_CERT'
                   ? 'border-emerald-500 text-emerald-400'
                   : 'border-transparent text-slate-400 hover:text-slate-200'
               }`}
             >
               <ShieldCheck className="w-4 h-4" />
-              3. Committal & Audit Certificate
+              Audit Certificate
             </button>
           )}
         </div>
@@ -450,9 +575,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                           )}
                         </div>
 
-                        {/* Status Badge */}
                         <span
-                          className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
+                          className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${
                             seg.status === 'VERIFIED'
                               ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
                               : seg.status === 'DISCREPANCY_RECOUNT'
@@ -473,28 +597,28 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                         {/* Counter A Box */}
                         <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800">
                           <div className="flex items-center justify-between text-xs">
-                            <span className="font-semibold text-blue-400">Counter A (1st Count)</span>
+                            <span className="font-semibold text-blue-400">Count 1 (Group 1)</span>
                             {count1Done && <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />}
                           </div>
                           <div className="text-sm font-bold font-mono text-white mt-1">
                             {count1Done ? `${count1Units} units` : 'Not Started'}
                           </div>
                           <div className="text-[11px] text-slate-400 mt-0.5">
-                            {count1Done ? seg.counterAName || 'Counter 1' : 'Awaiting staff submission'}
+                            {count1Done ? seg.counterAName || 'Counter 1' : 'Awaiting submission'}
                           </div>
                         </div>
 
                         {/* Counter B Box */}
                         <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800">
                           <div className="flex items-center justify-between text-xs">
-                            <span className="font-semibold text-purple-400">Counter B (2nd Count)</span>
+                            <span className="font-semibold text-purple-400">Count 2 (Group 2)</span>
                             {count2Done && <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />}
                           </div>
                           <div className="text-sm font-bold font-mono text-white mt-1">
                             {count2Done ? `${count2Units} units` : 'Not Started'}
                           </div>
                           <div className="text-[11px] text-slate-400 mt-0.5">
-                            {count2Done ? seg.counterBName || 'Counter 2' : 'Awaiting staff submission'}
+                            {count2Done ? seg.counterBName || 'Counter 2' : 'Awaiting submission'}
                           </div>
                         </div>
                       </div>
@@ -505,8 +629,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                           <div className="flex items-center gap-2">
                             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
                             <span>
-                              <strong>{seg.discrepancyCount} SKU quantity discrepancy detected</strong>{' '}
-                              between Counter A and Counter B.
+                              <strong>{seg.discrepancyCount} SKU discrepancy detected</strong>{' '}
+                              between Count 1 and Count 2.
                             </span>
                           </div>
                           <button
@@ -544,14 +668,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                           className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 text-blue-300 hover:bg-blue-600 hover:text-white border border-blue-500/30 transition flex items-center gap-1.5"
                         >
                           <UserCheck className="w-3.5 h-3.5" />
-                          {count1Done ? 'Edit Count A' : 'Start Count A'}
+                          {count1Done ? 'Edit Count 1' : 'Start Count 1'}
                         </button>
                         <button
                           onClick={() => handleLaunchTerminal(seg, 'B')}
                           className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600/20 text-purple-300 hover:bg-purple-600 hover:text-white border border-purple-500/30 transition flex items-center gap-1.5"
                         >
                           <UserCheck className="w-3.5 h-3.5" />
-                          {count2Done ? 'Edit Count B' : 'Start Count B'}
+                          {count2Done ? 'Edit Count 2' : 'Start Count 2'}
                         </button>
                       </div>
 
@@ -572,7 +696,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
           </div>
         )}
 
-        {/* TAB 2: CONSOLIDATED SOH VARIANCE MASTER */}
+        {/* TAB 2: CONSOLIDATED VARIANCE VIEW */}
         {activeTab === 'VARIANCE' && (
           <ConsolidatedVarianceView
             session={session}
@@ -583,17 +707,61 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
           />
         )}
 
-        {/* TAB 3: COMMITTAL & AUDIT CERTIFICATE */}
+        {/* TAB 3: CUSTOMER GOODS LEFT BEHIND */}
+        {activeTab === 'GOODS_LEFT_BEHIND' && (
+          <CustomerGoodsLeftBehindTab
+            session={session}
+            currentUser={currentUser}
+            onRefreshSession={refreshSession}
+          />
+        )}
+
+        {/* TAB 4: TEMPORARY CASUAL WORKER ACCOUNTS & PINS */}
+        {activeTab === 'CASUALS' && (
+          <CasualWorkersTab
+            session={session}
+            currentUser={currentUser}
+            onRefreshSession={refreshSession}
+          />
+        )}
+
+        {/* TAB 5: FAST-MOVING AIRTIME CHECKLIST */}
+        {activeTab === 'FAST_MOVERS' && (
+          <FastMovingChecklistTab
+            session={session}
+            currentUser={currentUser}
+            onRefreshSession={refreshSession}
+          />
+        )}
+
+        {/* TAB 6: LOCKDOWN & EMERGENCY SALES */}
+        {activeTab === 'LOCKDOWN' && (
+          <LockdownEmergencySalesTab
+            session={session}
+            currentUser={currentUser}
+            onRefreshSession={refreshSession}
+          />
+        )}
+
+        {/* TAB 7: P2P MESH & SYNC OPTIMIZER */}
+        {activeTab === 'P2P_SYNC' && (
+          <P2PMeshSyncTab session={session} />
+        )}
+
+        {/* TAB 8: AUDIT COMMITTAL CERTIFICATE */}
         {activeTab === 'AUDIT_CERT' && (
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 max-w-4xl mx-auto shadow-2xl space-y-6">
-            <div className="border-b border-slate-700 pb-6 flex items-start justify-between gap-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 max-w-4xl mx-auto shadow-2xl space-y-6 print:bg-white print:text-black print:border-none print:shadow-none">
+            {/* Header */}
+            <div className="border-b border-slate-800 pb-5 flex items-center justify-between">
               <div>
-                <div className="flex items-center gap-2">
-                  <ShieldCheck className="w-6 h-6 text-emerald-400" />
-                  <h2 className="text-xl font-bold text-white">Stocktake Audit & Committal Certificate</h2>
-                </div>
-                <p className="text-xs text-slate-400 mt-1">
-                  Official Verification & Master Stock Level Committal Ledger
+                <span className="text-xs uppercase font-mono text-emerald-400 bg-emerald-950/60 border border-emerald-800 px-2.5 py-1 rounded-full font-bold">
+                  Official Audit Certificate
+                </span>
+                <h2 className="text-xl font-bold text-white mt-2">
+                  Stocktake & Physical Verification Certificate
+                </h2>
+                <p className="text-xs text-slate-400">
+                  {session.branchName} • {session.title}
                 </p>
               </div>
 
@@ -617,14 +785,12 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                 <div className="font-bold text-white mt-0.5">{session.date}</div>
               </div>
               <div>
-                <div className="text-slate-400 font-medium">Approved By (Admin)</div>
-                <div className="font-bold text-emerald-400 mt-0.5">{session.approvedByName || 'Sarah Chidyamakono'}</div>
+                <div className="text-slate-400 font-medium">Count Scope</div>
+                <div className="font-bold text-blue-400 mt-0.5">{session.countType}</div>
               </div>
               <div>
-                <div className="text-slate-400 font-medium">Committal Timestamp</div>
-                <div className="font-mono text-slate-300 mt-0.5">
-                  {session.approvedAt ? new Date(session.approvedAt).toLocaleString() : 'N/A'}
-                </div>
+                <div className="text-slate-400 font-medium">Approved By (Owner/Auditor)</div>
+                <div className="font-bold text-emerald-400 mt-0.5">{session.approvedByName || 'Authorized Auditor'}</div>
               </div>
             </div>
 

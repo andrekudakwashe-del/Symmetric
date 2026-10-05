@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Package,
   Plus,
@@ -28,17 +28,23 @@ import {
   Upload,
   FileSpreadsheet,
   Lock,
+  History,
 } from 'lucide-react';
 import { InventoryItem, Salesperson } from '../../types';
+import { useScrollDirection } from '../../hooks/useScrollDirection';
 import { ProductAddEditModal } from './ProductAddEditModal';
+import { ProductAuditTrailModal } from './ProductAuditTrailModal';
 import {
   downloadInventoryCsv,
+  downloadInventoryExpandedCsv,
+  downloadInventoryJson,
   downloadInventoryTemplateCsv,
   parseInventoryCsv,
   importInventoryItems,
 } from '../../services/dataExportImportService';
 import {
   getInventoryItems,
+  getSessionUser,
   saveInventoryItem,
   deleteInventoryItem,
   breakCase,
@@ -46,7 +52,14 @@ import {
   sellStock,
   getCategories,
   ensureCategoryExists,
+  subscribeRoomDatabase,
 } from '../../db/roomDatabase';
+
+export const getCasePlural = (item?: { casePackageName?: string } | null): string => {
+  const name = item?.casePackageName?.trim();
+  if (!name) return 'Cases';
+  return name.toLowerCase().endsWith('s') ? name : `${name}s`;
+};
 
 interface InventoryMasterViewProps {
   currentUser: Salesperson | null;
@@ -68,34 +81,70 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
   };
 
   const [items, setItems] = useState<InventoryItem[]>(getInventoryItems());
+  const [auditTrailItem, setAuditTrailItem] = useState<InventoryItem | null>(null);
+
+  useEffect(() => {
+    setItems(getInventoryItems());
+    const unsub = subscribeRoomDatabase(() => {
+      setItems(getInventoryItems());
+    });
+    const handleUpdateEvent = () => {
+      setItems(getInventoryItems());
+    };
+    window.addEventListener('saimetric_inventory_item_deleted', handleUpdateEvent);
+    window.addEventListener('saimetric_inventory_updated', handleUpdateEvent);
+    window.addEventListener('saimetric_database_restored', handleUpdateEvent);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_inventory_item_deleted', handleUpdateEvent);
+      window.removeEventListener('saimetric_inventory_updated', handleUpdateEvent);
+      window.removeEventListener('saimetric_database_restored', handleUpdateEvent);
+    };
+  }, [currentUser]);
   const [searchQuery, setSearchQuery] = useState('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [selectedCategory, setSelectedCategory] = useState('ALL');
   const [filterLowStockOnly, setFilterLowStockOnly] = useState(false);
   const [viewMode, setViewMode] = useState<'simplistic' | 'table'>('simplistic');
 
+  // Smart sticky search: hides on scroll down, slides down & freezes at top on scroll up
+  const { isVisible: isSearchVisible, isAtTop, forceReveal } = useScrollDirection({ threshold: 12 });
+
+  const activeUser = currentUser || getSessionUser();
+  const userRole = (activeUser?.role || '').toUpperCase();
   const isSuperAdmin =
-    currentUser?.role === 'SUPER_ADMIN' ||
-    (currentUser?.role as string) === 'super_admin' ||
-    currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
-  const isOwner = currentUser?.role === 'OWNER';
-  const isAdmin = currentUser?.role === 'ADMIN';
-  const isManager = currentUser?.role === 'MANAGER';
+    userRole === 'SUPER_ADMIN' ||
+    userRole === 'OWNER' ||
+    activeUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+  const isOwner = userRole === 'OWNER' || isSuperAdmin;
+  const isAdmin = userRole === 'ADMIN' || isSuperAdmin;
+  const isManager =
+    userRole === 'MANAGER' ||
+    userRole === 'BRANCH_MANAGER' ||
+    userRole === 'SUPERVISOR' ||
+    userRole === 'STOCK_CLERK' ||
+    userRole === 'CLERK' ||
+    isAdmin ||
+    isOwner;
 
   const canManageInventory = useMemo(() => {
-    if (!currentUser) return false;
+    if (!activeUser) return true;
     if (isSuperAdmin || isOwner || isAdmin || isManager) {
-      return currentUser.permissions?.canManageInventory !== false;
+      return activeUser.permissions?.canManageInventory !== false;
     }
-    return Boolean(currentUser.permissions?.canManageInventory);
-  }, [currentUser, isSuperAdmin, isOwner, isAdmin, isManager]);
+    if (userRole === 'CASHIER' && !activeUser.permissions?.canManageInventory) {
+      return false;
+    }
+    return activeUser.permissions?.canManageInventory !== false;
+  }, [activeUser, isSuperAdmin, isOwner, isAdmin, isManager, userRole]);
 
   const canBreakCases = useMemo(() => {
-    if (!currentUser) return false;
+    if (!activeUser) return true;
     if (isSuperAdmin || isOwner || isAdmin || isManager) {
-      return currentUser.permissions?.canBreakCases !== false;
+      return activeUser.permissions?.canBreakCases !== false;
     }
-    return Boolean(currentUser.permissions?.canBreakCases);
-  }, [currentUser, isSuperAdmin, isOwner, isAdmin, isManager]);
+    return Boolean(activeUser.permissions?.canBreakCases);
+  }, [activeUser, isSuperAdmin, isOwner, isAdmin, isManager]);
 
   // Selected item / variant for Simplistic View Inspector
   const [selectedItemVariantId, setSelectedItemVariantId] = useState<string>('');
@@ -154,6 +203,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
   };
 
   const inventoryFileInputRef = useRef<HTMLInputElement>(null);
+  const [showExportMenu, setShowExportMenu] = useState(false);
 
   const handleQuickImportInventory = (file: File) => {
     const reader = new FileReader();
@@ -207,20 +257,35 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
   );
 
   // Filtered items
-  const filteredItems = items.filter((item) => {
-    const q = (searchQuery || '').trim().toLowerCase();
-    const matchesSearch =
-      !q ||
-      (item.itemName && item.itemName.toLowerCase().includes(q)) ||
-      (item.itemId && item.itemId.toLowerCase().includes(q)) ||
-      (item.sku && item.sku.toLowerCase().includes(q)) ||
-      (item.category && item.category.toLowerCase().includes(q));
+  const filteredItems = useMemo(() => {
+    const list = items.filter((item) => {
+      const q = (searchQuery || '').trim().toLowerCase();
+      const matchesSearch =
+        !q ||
+        (item.itemName && item.itemName.toLowerCase().includes(q)) ||
+        (item.itemId && item.itemId.toLowerCase().includes(q)) ||
+        (item.sku && item.sku.toLowerCase().includes(q)) ||
+        (item.category && item.category.toLowerCase().includes(q));
 
-    const matchesCategory = selectedCategory === 'ALL' || item.category === selectedCategory;
-    const matchesLowStock = !filterLowStockOnly || item.stockCases <= item.reorderLevelCases;
+      const matchesCategory = selectedCategory === 'ALL' || item.category === selectedCategory;
+      const matchesLowStock = !filterLowStockOnly || item.stockCases <= item.reorderLevelCases;
 
-    return matchesSearch && matchesCategory && matchesLowStock;
-  });
+      return matchesSearch && matchesCategory && matchesLowStock;
+    });
+
+    const seen = new Set<string>();
+    const deduped = list.filter((item) => {
+      const key = (item.itemId || '').trim().toUpperCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    // Organize alphabetically from A to Z by item name
+    return deduped.sort((a, b) =>
+      (a.itemName || '').localeCompare(b.itemName || '', undefined, { sensitivity: 'base' })
+    );
+  }, [items, searchQuery, selectedCategory, filterLowStockOnly]);
 
   // Default active selected item for simplistic view
   const activeSelectedItem = useMemo(() => {
@@ -290,6 +355,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
       return;
     }
     setShowDetailModal(false);
+    setSelectedItemVariantId(item.itemId);
     setEditingItem(item);
     setFormData({
       ...item,
@@ -403,6 +469,69 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
         </div>
       )}
 
+      {/* Top Inventory Master Header with prominent Add Product Button */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-4 rounded-3xl border border-slate-200 shadow-sm">
+        <div className="flex items-center space-x-3">
+          <div className="w-10 h-10 rounded-2xl bg-indigo-600 flex items-center justify-center text-white shadow-md shadow-indigo-200">
+            <Boxes className="w-5 h-5" />
+          </div>
+          <div>
+            <h1 className="text-lg sm:text-xl font-black text-slate-900 tracking-tight">
+              Inventory Master Catalog
+            </h1>
+            <p className="text-xs text-slate-500 font-medium">
+              Manage stock levels, wholesale case ratios, and retail prepack pricing
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {canManageInventory && (
+            <button
+              type="button"
+              id="btn-inventory-add-product-top"
+              onClick={() => {
+                setEditingItem(null);
+                setFormData({
+                  itemId: `ITM${Math.floor(100 + Math.random() * 900)}`,
+                  itemName: '',
+                  category: 'Dry Grocery & Staples',
+                  canSellAsCase: false,
+                  unitsPerCase: 24,
+                  costPerCase: 24.0,
+                  sellPriceCase: 30.0,
+                  sellPriceUnit: 1.5,
+                  stockCases: 0,
+                  stockSingles: 0,
+                  reorderLevelCases: 2,
+                  reorderLevelUnits: 10,
+                  sku: '',
+                  barcode: '',
+                  description: '',
+                });
+                setCategorySearchTerm('');
+                setCategoryDropdownOpen(false);
+                setShowAddModal(true);
+              }}
+              className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs sm:text-sm rounded-2xl transition flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30 cursor-pointer active:scale-95"
+            >
+              <Plus className="w-4 h-4 stroke-[3]" />
+              <span>+ Add New Product</span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            onClick={() => triggerGRN()}
+            className="px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs sm:text-sm rounded-2xl transition flex items-center justify-center gap-1.5"
+            title="Receive goods into inventory via GRN"
+          >
+            <ArrowDownRight className="w-4 h-4 text-slate-700" />
+            <span className="hidden sm:inline">Receive (GRN)</span>
+          </button>
+        </div>
+      </div>
+
       {/* Top Metrics Banner */}
       <div id="inventory-metrics" className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
         <div className="bg-slate-900 text-white rounded-2xl p-3.5 sm:p-4 shadow-sm border border-slate-800 flex flex-col justify-between">
@@ -461,18 +590,53 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
         </div>
       </div>
 
-      {/* Control Bar: Search, Category, View Mode, Actions */}
-      <div className="bg-white rounded-2xl p-3.5 sm:p-4 shadow-sm border border-slate-200 flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
+      {/* Floating Quick Search Button when scrolled down */}
+      {!isAtTop && (
+        <button
+          type="button"
+          id="btn-floating-quick-search"
+          onClick={() => {
+            forceReveal();
+            if (searchInputRef.current) {
+              searchInputRef.current.focus();
+              searchInputRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } else {
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }
+          }}
+          className="fixed top-4 right-4 z-40 px-3.5 py-2.5 rounded-2xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs shadow-2xl flex items-center gap-2 border border-amber-400/40 active:scale-95 cursor-pointer ring-2 ring-amber-400/20"
+          title="Jump to search and filter products"
+        >
+          <Search className="w-4 h-4 text-amber-400" />
+          <span>Search &amp; Filter</span>
+        </button>
+      )}
+
+      {/* Control Bar: Search, Category, View Mode, Actions - Frozen / Sticky at Top */}
+      <div
+        className="sticky top-2 z-30 bg-white/95 backdrop-blur-md rounded-2xl p-3.5 sm:p-4 shadow-lg border border-slate-200 flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between"
+      >
         <div className="flex flex-1 flex-wrap sm:flex-nowrap items-center gap-2.5">
           <div className="relative flex-1 min-w-[200px]">
             <Search className="w-4 h-4 text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
             <input
+              ref={searchInputRef}
               type="text"
               placeholder="Search by name, ID (e.g. SUG001), category..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-10 pr-4 py-2.5 bg-white border border-slate-300 rounded-xl text-sm font-bold text-slate-950 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-slate-900 shadow-sm"
+              className="w-full pl-10 pr-9 py-2.5 bg-white border border-slate-300 rounded-xl text-sm font-bold text-slate-950 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 focus:border-slate-900 shadow-sm"
             />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs font-bold p-1 rounded-full hover:bg-slate-100"
+                title="Clear search"
+              >
+                ✕
+              </button>
+            )}
           </div>
 
           <select
@@ -519,20 +683,69 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             </button>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              id="btn-export-inventory-csv"
-              onClick={() => {
-                downloadInventoryCsv(filteredItems.length > 0 ? filteredItems : items);
-                showToast('success', 'Inventory CSV export downloaded.');
-              }}
-              title="Export Inventory to CSV file"
-              className="px-2.5 sm:px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl transition flex items-center gap-1.5"
-            >
-              <Download className="w-3.5 h-3.5 text-indigo-600" />
-              <span>Export</span>
-            </button>
+          <div className="flex items-center gap-1.5 relative">
+            <div className="relative">
+              <button
+                type="button"
+                id="btn-export-inventory-csv"
+                onClick={() => setShowExportMenu(!showExportMenu)}
+                title="Export Inventory Catalog"
+                className="px-2.5 sm:px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs sm:text-sm rounded-xl transition flex items-center gap-1.5 cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Export</span>
+              </button>
+
+              {showExportMenu && (
+                <>
+                  <div
+                    className="fixed inset-0 z-30"
+                    onClick={() => setShowExportMenu(false)}
+                  />
+                  <div className="absolute right-0 mt-2 w-72 bg-white rounded-2xl shadow-2xl border border-slate-200 z-40 p-2 space-y-1 text-left animate-in fade-in zoom-in-95 duration-100">
+                    <div className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400 border-b border-slate-100">
+                      Choose Export Format
+                    </div>
+                    
+                    <button
+                      type="button"
+                      onClick={() => {
+                        downloadInventoryExpandedCsv(filteredItems.length > 0 ? filteredItems : items);
+                        showToast('success', 'Complete Inventory CSV (with variants) downloaded.');
+                        setShowExportMenu(false);
+                      }}
+                      className="w-full px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-indigo-50 hover:text-indigo-600 rounded-xl flex items-start gap-2.5 transition text-left cursor-pointer"
+                    >
+                      <Download className="w-4 h-4 text-indigo-600 mt-0.5 shrink-0" />
+                      <div>
+                        <div className="font-bold text-slate-900">Export Inventory CSV</div>
+                        <div className="text-[10px] text-slate-500 font-normal">
+                          Complete CSV export including case ratios, variant barcodes, and prepack units.
+                        </div>
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        downloadInventoryJson(filteredItems.length > 0 ? filteredItems : items);
+                        showToast('success', 'Full Inventory JSON backup downloaded.');
+                        setShowExportMenu(false);
+                      }}
+                      className="w-full px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-xl flex items-start gap-2.5 transition text-left"
+                    >
+                      <FileSpreadsheet className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
+                      <div>
+                        <div className="font-bold text-slate-900">Complete JSON Backup</div>
+                        <div className="text-[10px] text-slate-500 font-normal">
+                          Full hierarchical data dump with nested variants and branch overrides.
+                        </div>
+                      </div>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
 
             {canManageInventory && (
               <>
@@ -593,10 +806,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                 setCategoryDropdownOpen(false);
                 setShowAddModal(true);
               }}
-              className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs sm:text-sm rounded-xl transition flex items-center gap-1.5 shadow-sm cursor-pointer"
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold text-xs sm:text-sm rounded-xl transition flex items-center gap-1.5 shadow-md shadow-indigo-600/30 cursor-pointer shrink-0"
             >
-              <Plus className="w-4 h-4" />
-              <span>Add Item</span>
+              <Plus className="w-4 h-4 stroke-[3]" />
+              <span>+ Add Item</span>
             </button>
           ) : (
             <div className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 text-slate-500 rounded-xl text-xs font-semibold select-none border border-slate-200">
@@ -626,19 +839,51 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
               </div>
 
               {filteredItems.length === 0 ? (
-                <div className="bg-white rounded-2xl p-8 text-center text-slate-400 border border-slate-200">
-                  No inventory items match your search.
+                <div className="bg-white rounded-2xl p-8 text-center text-slate-500 border border-slate-200 space-y-3">
+                  <p>No inventory items match your search or filter.</p>
+                  {canManageInventory && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingItem(null);
+                        setFormData({
+                          itemId: `ITM${Math.floor(100 + Math.random() * 900)}`,
+                          itemName: searchQuery || '',
+                          category: selectedCategory !== 'ALL' ? selectedCategory : 'Dry Grocery & Staples',
+                          canSellAsCase: false,
+                          unitsPerCase: 24,
+                          costPerCase: 24.0,
+                          sellPriceCase: 30.0,
+                          sellPriceUnit: 1.5,
+                          stockCases: 0,
+                          stockSingles: 0,
+                          reorderLevelCases: 2,
+                          reorderLevelUnits: 10,
+                          sku: '',
+                          barcode: '',
+                          description: '',
+                        });
+                        setCategorySearchTerm('');
+                        setCategoryDropdownOpen(false);
+                        setShowAddModal(true);
+                      }}
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow transition inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>+ Create New Product</span>
+                    </button>
+                  )}
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {filteredItems.map((item) => {
+                  {filteredItems.map((item, idx) => {
                     const isSelected = activeSelectedItem?.itemId === item.itemId;
                     const canSellCase = Boolean(item.canSellAsCase);
                     const isLow = item.stockCases <= item.reorderLevelCases || item.stockSingles <= item.reorderLevelUnits;
 
                     return (
                       <div
-                        key={item.itemId}
+                        key={`${item.itemId}-${idx}`}
                         id={`item-card-${item.itemId}`}
                         onClick={() => handleItemCardClick(item)}
                         className={`p-3.5 rounded-2xl border transition-all cursor-pointer ${
@@ -679,6 +924,11 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                               <span className={`text-xs font-medium ${isSelected ? 'text-slate-400' : 'text-slate-500'}`}>
                                 • 1cs = {item.unitsPerCase} ea
                               </span>
+                              <span className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded-md ${
+                                isSelected ? 'bg-amber-500/25 text-amber-200 border border-amber-400/30' : 'bg-amber-50 text-amber-900 border border-amber-200'
+                              }`}>
+                                Avg Cost: ${(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || (item.costPerCase / (item.unitsPerCase || 1)))).toFixed(2)}/ea
+                              </span>
                             </div>
                           </div>
 
@@ -690,7 +940,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                             </div>
                             {canSellCase && item.sellPriceCase > 0 && (
                               <div className={`text-xs font-mono font-bold ${isSelected ? 'text-slate-300' : 'text-slate-600'}`}>
-                                ${item.sellPriceCase.toFixed(2)}/cs
+                                ${item.sellPriceCase.toFixed(2)}/{item.casePackageName || 'cs'}
                               </div>
                             )}
                             <div className="mt-1 flex items-center gap-1">
@@ -699,7 +949,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                                   ? isSelected ? 'bg-rose-500/30 text-rose-200' : 'bg-rose-100 text-rose-800'
                                   : isSelected ? 'bg-slate-800 text-slate-200' : 'bg-slate-100 text-slate-700'
                               }`}>
-                                {item.stockSingles} Singles {item.stockCases > 0 ? `+ ${item.stockCases} cs` : ''}
+                                {item.stockSingles} Singles {item.stockCases > 0 ? `+ ${item.stockCases} ${getCasePlural(item)}` : ''}
                               </span>
                             </div>
                           </div>
@@ -741,6 +991,23 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                           >
                             <ArrowDownRight className="w-3.5 h-3.5" />
                             <span>Receive</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setAuditTrailItem(item);
+                            }}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1 transition cursor-pointer ${
+                              isSelected
+                                ? 'bg-amber-500/20 text-amber-200 hover:bg-amber-500/30'
+                                : 'bg-amber-50 text-amber-700 hover:bg-amber-100'
+                            }`}
+                            title="Product Audit Trail & History"
+                          >
+                            <History className="w-3.5 h-3.5" />
+                            <span>Audit</span>
                           </button>
 
                           <button
@@ -820,7 +1087,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockSingles} Units</span>
                       </div>
                       <div className="text-[10px] text-slate-400 mt-0.5">
-                        Cost: ${(activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)).toFixed(2)}/ea
+                        Latest Cost: ${(activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)).toFixed(2)}/ea
                       </div>
                     </div>
 
@@ -844,10 +1111,29 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                           : 'N/A (Singles only)'}
                       </div>
                       <div className="text-xs text-slate-600 mt-1">
-                        Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockCases} Cases</span>
+                        Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockCases} {getCasePlural(activeSelectedItem)}</span>
                       </div>
                       <div className="text-[10px] text-slate-500 mt-0.5">
-                        1 Case = {activeSelectedItem.unitsPerCase} Units
+                        1 {activeSelectedItem.casePackageName || 'Case'} = {activeSelectedItem.unitsPerCase} Units
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Weighted Average Cost (AVCO) Card */}
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-2xl flex items-center justify-between text-xs">
+                    <div>
+                      <div className="text-amber-800 text-[10px] uppercase font-bold flex items-center gap-1">
+                        <span>Weighted Average Cost (AVCO)</span>
+                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-200 text-amber-900 font-mono">Real-time</span>
+                      </div>
+                      <div className="text-base font-black font-mono text-amber-950 mt-0.5">
+                        ${(activeSelectedItem.averageCostPerUnit !== undefined && activeSelectedItem.averageCostPerUnit > 0 ? activeSelectedItem.averageCostPerUnit : (activeSelectedItem.costPerUnit || (activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)))).toFixed(2)} / unit
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-amber-800 text-[10px] uppercase font-bold">Latest Purchase Invoice</div>
+                      <div className="text-xs font-mono font-bold text-slate-700 mt-0.5">
+                        ${(activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)).toFixed(2)} / unit
                       </div>
                     </div>
                   </div>
@@ -895,6 +1181,15 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                       </button>
                     </div>
 
+                    <button
+                      type="button"
+                      onClick={() => setAuditTrailItem(activeSelectedItem)}
+                      className="w-full py-2.5 px-3 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <History className="w-4 h-4 text-amber-600" />
+                      <span>Product Audit Trail & History</span>
+                    </button>
+
                     {activeSelectedItem.stockCases > 0 && canBreakCases && (
                       <button
                         type="button"
@@ -905,7 +1200,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         className="w-full py-2.5 px-3 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
                       >
                         <Scissors className="w-4 h-4 text-indigo-600" />
-                        <span>Break Case ({activeSelectedItem.stockCases} Cases Available)</span>
+                        <span>Break {activeSelectedItem.casePackageName || 'Case'} ({activeSelectedItem.stockCases} {getCasePlural(activeSelectedItem)} Available)</span>
                       </button>
                     )}
 
@@ -966,6 +1261,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                   <th className="py-3 px-4 text-center">Singles Stock</th>
                   <th className="py-3 px-4 text-center bg-slate-50 font-bold text-slate-900">Total Units</th>
                   <th className="py-3 px-3 text-right">Cost (Cs / Ea)</th>
+                  <th className="py-3 px-3 text-right bg-amber-50/80 text-amber-950 font-black border-x border-amber-200">Avg Cost (AVCO)</th>
                   <th className="py-3 px-3 text-right">Sell (Cs / Ea)</th>
                   <th className="py-3 px-4 text-right">Actions</th>
                 </tr>
@@ -973,19 +1269,19 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
               <tbody className="divide-y divide-slate-100">
                 {filteredItems.length === 0 ? (
                   <tr>
-                    <td colSpan={10} className="py-12 text-center text-slate-400 font-medium">
+                    <td colSpan={11} className="py-12 text-center text-slate-400 font-medium">
                       No inventory items matched your criteria.
                     </td>
                   </tr>
                 ) : (
-                  filteredItems.map((item) => {
+                  filteredItems.map((item, idx) => {
                     const isLowCases = item.stockCases <= item.reorderLevelCases;
                     const isZeroSingles = item.stockSingles === 0;
                     const costPerUnit = item.costPerCase / (item.unitsPerCase || 1);
 
                     return (
                       <tr
-                        key={item.itemId}
+                        key={`${item.itemId}-${idx}`}
                         onClick={() => handleItemCardClick(item)}
                         className="hover:bg-slate-50/75 transition-colors group cursor-pointer"
                       >
@@ -1017,7 +1313,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
 
                         <td className="py-3.5 px-3 text-center">
                           <span className="inline-flex items-center px-2 py-1 rounded-md bg-slate-100 text-slate-800 font-mono font-bold text-xs">
-                            {item.unitsPerCase} / cs
+                            {item.unitsPerCase} / {item.casePackageName || 'cs'}
                           </span>
                         </td>
 
@@ -1031,7 +1327,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                                 : 'text-slate-900'
                             }`}
                           >
-                            {item.stockCases} Cases
+                            {item.stockCases} {getCasePlural(item)}
                           </span>
                         </td>
 
@@ -1058,6 +1354,13 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                           <div className="text-xs text-slate-500">${costPerUnit.toFixed(2)}</div>
                         </td>
 
+                        <td className="py-3.5 px-3 text-right font-mono bg-amber-50/40 border-x border-amber-100">
+                          <span className="text-xs font-black text-amber-950 bg-amber-100/90 px-2 py-0.5 rounded border border-amber-300 inline-block shadow-2xs">
+                            ${(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || costPerUnit)).toFixed(2)}
+                          </span>
+                          <span className="text-[10px] text-amber-700 block mt-0.5 font-sans font-semibold">/ea</span>
+                        </td>
+
                         <td className="py-3.5 px-3 text-right font-mono">
                           <div className="text-emerald-800 font-black">${item.sellPriceUnit.toFixed(2)}/ea</div>
                           {item.canSellAsCase && (
@@ -1076,6 +1379,17 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                               className="p-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-lg text-xs font-bold transition"
                             >
                               <ArrowDownRight className="w-3.5 h-3.5" />
+                            </button>
+
+                            <button
+                              title="Product Audit Trail & History"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setAuditTrailItem(item);
+                              }}
+                              className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg text-xs font-bold transition cursor-pointer"
+                            >
+                              <History className="w-3.5 h-3.5" />
                             </button>
 
                             {item.stockCases > 0 && canBreakCases && (
@@ -1218,10 +1532,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                     : 'N/A (Singles only)'}
                 </div>
                 <div className="text-xs text-slate-600 mt-1">
-                  Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockCases} Cases</span>
+                  Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockCases} {getCasePlural(activeSelectedItem)}</span>
                 </div>
                 <div className="text-[10px] text-slate-500 mt-0.5">
-                  1 Case = {activeSelectedItem.unitsPerCase} Units
+                  1 {activeSelectedItem.casePackageName || 'Case'} = {activeSelectedItem.unitsPerCase} Units
                 </div>
               </div>
             </div>
@@ -1273,6 +1587,18 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                 </button>
               </div>
 
+              <button
+                type="button"
+                onClick={() => {
+                  setShowDetailModal(false);
+                  setAuditTrailItem(activeSelectedItem);
+                }}
+                className="w-full py-2.5 px-3 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
+              >
+                <History className="w-4 h-4 text-amber-600" />
+                <span>Product Audit Trail & History</span>
+              </button>
+
               {activeSelectedItem.stockCases > 0 && canBreakCases && (
                 <button
                   type="button"
@@ -1284,7 +1610,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                   className="w-full py-2.5 px-3 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer"
                 >
                   <Scissors className="w-4 h-4 text-indigo-600" />
-                  <span>Break Case ({activeSelectedItem.stockCases} Cases Available)</span>
+                  <span>Break {activeSelectedItem.casePackageName || 'Case'} ({activeSelectedItem.stockCases} {getCasePlural(activeSelectedItem)} Available)</span>
                 </button>
               )}
 
@@ -1332,22 +1658,22 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
 
             <div className="bg-indigo-50/70 border border-indigo-100 rounded-2xl p-4 space-y-2 text-sm text-indigo-900">
               <div className="flex justify-between font-medium">
-                <span>Current Cases in Stock:</span>
-                <span className="font-mono font-bold">{breakCaseItem.stockCases} Cases</span>
+                <span>Current {getCasePlural(breakCaseItem)} in Stock:</span>
+                <span className="font-mono font-bold">{breakCaseItem.stockCases} {getCasePlural(breakCaseItem)}</span>
               </div>
               <div className="flex justify-between font-medium">
                 <span>Current Singles in Stock:</span>
                 <span className="font-mono font-bold">{breakCaseItem.stockSingles} Singles</span>
               </div>
               <div className="flex justify-between font-medium border-t border-indigo-200/50 pt-2">
-                <span>Case Conversion Rate:</span>
-                <span className="font-mono font-bold">1 Case = {breakCaseItem.unitsPerCase} Singles</span>
+                <span>{breakCaseItem.casePackageName || 'Case'} Conversion Rate:</span>
+                <span className="font-mono font-bold">1 {breakCaseItem.casePackageName || 'Case'} = {breakCaseItem.unitsPerCase} Singles</span>
               </div>
             </div>
 
             <div className="space-y-2">
               <label className="block text-xs font-bold uppercase tracking-wider text-slate-700">
-                Number of Cases to Break
+                Number of {getCasePlural(breakCaseItem)} to Break
               </label>
               <div className="flex items-center gap-3">
                 <button
@@ -1362,6 +1688,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                   min={1}
                   max={breakCaseItem.stockCases}
                   value={breakCasesCount}
+                  onFocus={(e) => e.target.select()}
                   onChange={(e) => setBreakCasesCount(Math.min(breakCaseItem.stockCases, Math.max(1, Number(e.target.value) || 1)))}
                   className="flex-1 py-2.5 text-center font-mono font-black text-xl bg-white border-2 border-slate-300 text-slate-950 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-600"
                 />
@@ -1437,8 +1764,8 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             {/* Current Stock Indicator */}
             <div className="grid grid-cols-2 gap-3 text-xs bg-slate-50 p-3 rounded-2xl border border-slate-200">
               <div>
-                <span className="text-slate-500">Stock Cases:</span>
-                <div className="font-bold font-mono text-sm text-slate-900">{quickSellItem.stockCases} Cases</div>
+                <span className="text-slate-500">Stock {getCasePlural(quickSellItem)}:</span>
+                <div className="font-bold font-mono text-sm text-slate-900">{quickSellItem.stockCases} {getCasePlural(quickSellItem)}</div>
               </div>
               <div>
                 <span className="text-slate-500">Stock Singles:</span>
@@ -1510,12 +1837,14 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-bold text-slate-800 mb-1">
-                      Qty Cases (${quickSellItem.sellPriceCase.toFixed(2)}/cs)
+                      Qty {getCasePlural(quickSellItem)} (${quickSellItem.sellPriceCase.toFixed(2)}/{quickSellItem.casePackageName || 'cs'})
                     </label>
                     <input
                       type="number"
+                      step="any"
                       min={0}
                       value={quickSellCases}
+                      onFocus={(e) => e.target.select()}
                       onChange={(e) => setQuickSellCases(Math.max(0, Number(e.target.value) || 0))}
                       className="w-full py-2.5 px-3 bg-white border border-slate-300 rounded-xl font-mono text-center font-bold text-slate-950 text-base focus:outline-none focus:ring-2 focus:ring-slate-900"
                     />
@@ -1526,8 +1855,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                     </label>
                     <input
                       type="number"
+                      step="any"
                       min={0}
                       value={quickSellSingles}
+                      onFocus={(e) => e.target.select()}
                       onChange={(e) => setQuickSellSingles(Math.max(0, Number(e.target.value) || 0))}
                       className="w-full py-2.5 px-3 bg-white border border-slate-300 rounded-xl font-mono text-center font-bold text-slate-950 text-base focus:outline-none focus:ring-2 focus:ring-slate-900"
                     />
@@ -1571,10 +1902,27 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             setEditingItem(null);
           }}
           onSaved={(savedItem) => {
-            refreshList();
+            const freshItems = getInventoryItems();
+            setItems(freshItems);
+            setSelectedItemVariantId(savedItem.itemId);
             setShowAddModal(false);
             setEditingItem(null);
             showToast("success", `Saved item "${savedItem.itemName}" (${savedItem.itemId})`);
+          }}
+        />
+      )}
+
+      {/* Forensic Product Audit Trail Modal */}
+      {auditTrailItem && (
+        <ProductAuditTrailModal
+          isOpen={Boolean(auditTrailItem)}
+          item={auditTrailItem}
+          currentUser={currentUser}
+          onClose={() => setAuditTrailItem(null)}
+          onStockUpdated={() => {
+            refreshList();
+            const fresh = getInventoryItems().find((i) => i.itemId === auditTrailItem.itemId);
+            if (fresh) setAuditTrailItem(fresh);
           }}
         />
       )}

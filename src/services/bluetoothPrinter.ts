@@ -46,7 +46,19 @@ export interface ReceiptPrintData {
   total: number;
   amountPaid?: number;
   change?: number;
+  changeLeftBehind?: boolean;
+  changeAmountLeftBehind?: number;
+  creditAmount?: number;
+  creditDeposit?: number;
+  creditBalanceOwed?: number;
+  creditDueDate?: string;
   paymentMethod: string;
+  currency?: string;
+  exchangeRate?: number;
+  totalInCurrency?: number;
+  cashWithdrawalAmount?: number;
+  cashWithdrawalInCurrency?: number;
+  totalChargedInCurrency?: number;
   paperWidth?: PaperWidth;
   companyId?: string;
   storeName?: string;
@@ -1263,6 +1275,53 @@ class BluetoothThermalPrinter {
       writeBytes(0x1b, 0x45, 0x01); // Bold
       writeColumns('CHANGE DUE:', `$${effectiveChange.toFixed(2)}`);
       writeBytes(0x1b, 0x45, 0x00); // Bold OFF
+
+      if (data.changeLeftBehind) {
+        const leftAmt =
+          data.changeAmountLeftBehind !== undefined
+            ? data.changeAmountLeftBehind
+            : effectiveChange;
+        writeColumns('Change Stored (Form 3):', `$${leftAmt.toFixed(2)}`);
+        if (leftAmt < effectiveChange) {
+          writeColumns('Cash Handed Out:', `$${(effectiveChange - leftAmt).toFixed(2)}`);
+        }
+      }
+    }
+
+    if (data.paymentMethod === 'Credit') {
+      writeBytes(0x1b, 0x45, 0x01); // Bold
+      writeColumns('PAYMENT:', 'Credit (Form 3)');
+      writeBytes(0x1b, 0x45, 0x00);
+      if (data.creditAmount !== undefined) {
+        writeColumns('Credit Extended:', `$${data.creditAmount.toFixed(2)}`);
+      }
+      if (data.creditDeposit !== undefined && data.creditDeposit > 0) {
+        writeColumns('Upfront Cash Deposit:', `$${data.creditDeposit.toFixed(2)}`);
+      }
+      if (data.creditBalanceOwed !== undefined) {
+        writeBytes(0x1b, 0x45, 0x01);
+        writeColumns('Debt Balance Owed:', `$${data.creditBalanceOwed.toFixed(2)}`);
+        writeBytes(0x1b, 0x45, 0x00);
+      }
+      if (data.creditDueDate) {
+        writeColumns('Repayment Due:', data.creditDueDate);
+      }
+    }
+
+    if (data.currency && data.currency !== 'USD') {
+      writeBytes(0x1b, 0x45, 0x01); // Bold
+      writeColumns('CURRENCY PAY:', `${data.currency} (@ ${data.exchangeRate || 1})`);
+      writeBytes(0x1b, 0x45, 0x00);
+      if (data.totalInCurrency !== undefined) {
+        writeColumns(`Goods Total (${data.currency}):`, `${data.totalInCurrency.toFixed(2)} ${data.currency}`);
+      }
+      if (data.cashWithdrawalAmount && data.cashWithdrawalAmount > 0) {
+        writeColumns('Cash Payout (USD):', `$${data.cashWithdrawalAmount.toFixed(2)} USD`);
+        writeColumns(`Cash Payout (${data.currency}):`, `${(data.cashWithdrawalInCurrency || 0).toFixed(2)} ${data.currency}`);
+        writeBytes(0x1b, 0x45, 0x01);
+        writeColumns(`TOTAL ${data.currency} CHARGED:`, `${(data.totalChargedInCurrency || 0).toFixed(2)} ${data.currency}`);
+        writeBytes(0x1b, 0x45, 0x00);
+      }
     }
 
     divider('-');

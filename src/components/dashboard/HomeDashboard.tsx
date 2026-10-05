@@ -11,6 +11,7 @@ import {
   getCreditSales,
   getCustomerChangeReport,
   getCustomerCreditReport,
+  getInventoryItems,
 } from '../../db/roomDatabase';
 import {
   Coins,
@@ -106,6 +107,68 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
   const customersOwedChangeCount = changeReport?.summary?.totalCustomersOwingChange || 0;
   const customersOwingCreditCount = creditReport?.summary?.totalDebtorsCount || 0;
 
+  // Real-time sales, profit & velocity analytics for Dashboard
+  const inventoryItems = getInventoryItems();
+  const { todayGrossProfit, fastestProduct, topProfitProduct } = useMemo(() => {
+    const costMap = new Map<string, number>();
+    inventoryItems.forEach((inv) => {
+      const idKey = (inv.itemId || '').trim().toUpperCase();
+      const nameKey = (inv.itemName || '').trim().toLowerCase();
+      const cost = inv.averageCostPerUnit || inv.costPerUnit || 0;
+      if (idKey) costMap.set(idKey, cost);
+      if (nameKey) costMap.set(nameKey, cost);
+    });
+
+    let totalProfit = 0;
+    const qtyByProduct = new Map<string, { name: string; qty: number }>();
+    const profitByProduct = new Map<string, { name: string; profit: number }>();
+
+    todaySales.forEach((sale) => {
+      if (sale.status === 'Refunded' || sale.status === 'Voided') return;
+      (sale.items || []).forEach((item) => {
+        const idUpper = (item.id || '').trim().toUpperCase();
+        const nameLower = (item.name || '').trim().toLowerCase();
+        const itemCost =
+          item.costPerUnitAverage !== undefined && item.costPerUnitAverage >= 0
+            ? item.costPerUnitAverage
+            : costMap.get(idUpper) ?? (nameLower ? costMap.get(nameLower) : undefined) ?? (item.unitPrice * 0.7);
+        const qty = Number(item.quantity) || 0;
+        const lineRev = Number(item.total) || (qty * item.unitPrice);
+        const lineProfit = lineRev - (qty * itemCost);
+        totalProfit += lineProfit;
+
+        const pName = item.name || 'Unknown Item';
+        const curQty = qtyByProduct.get(pName) || { name: pName, qty: 0 };
+        curQty.qty += qty;
+        qtyByProduct.set(pName, curQty);
+
+        const curProf = profitByProduct.get(pName) || { name: pName, profit: 0 };
+        curProf.profit += lineProfit;
+        profitByProduct.set(pName, curProf);
+      });
+    });
+
+    let fastest: { name: string; qty: number } | null = null;
+    qtyByProduct.forEach((val) => {
+      if (!fastest || val.qty > fastest.qty) {
+        fastest = val;
+      }
+    });
+
+    let topProfit: { name: string; profit: number } | null = null;
+    profitByProduct.forEach((val) => {
+      if (!topProfit || val.profit > topProfit.profit) {
+        topProfit = val;
+      }
+    });
+
+    return {
+      todayGrossProfit: totalProfit,
+      fastestProduct: fastest,
+      topProfitProduct: topProfit,
+    };
+  }, [todaySales, inventoryItems]);
+
   const allQuickActions = [
     {
       id: 'pos' as ActiveTab,
@@ -136,7 +199,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
       title: 'Cash Balancing Module',
       subtitle: 'Unified Forms 1, 2, 3 & 4 (Reconciliation)',
       icon: Banknote,
-      badge: `$${drawerNetCash.toFixed(2)} Net Cash`,
+      badge: `$${(Number(drawerNetCash) || 0).toFixed(2)} Net Cash`,
       badgeColor: 'bg-purple-500/20 text-purple-300',
       gradient: 'from-purple-900/60 to-slate-900',
       borderColor: 'border-purple-500/40',
@@ -144,23 +207,24 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
       adminOnly: false,
     },
     {
-      id: 'orders' as ActiveTab,
-      title: 'Sales & Invoices History',
-      subtitle: 'Complete list of POS sales, thermal receipts & audit trail',
-      icon: Receipt,
-      badge: `${sales.length} Invoices`,
-      badgeColor: 'bg-blue-500/20 text-blue-300',
-      gradient: 'from-slate-900 to-blue-950/40',
-      borderColor: 'border-blue-500/30',
-      iconBg: 'bg-gradient-to-tr from-blue-600 to-cyan-500',
+      id: 'sales_report' as ActiveTab,
+      title: 'Sales, Profit & Top Stocks Report',
+      subtitle: 'Real-time sales velocity, gross profit & product contribution analysis',
+      icon: TrendingUp,
+      badge: `$${(Number(todayGrossProfit) || 0).toFixed(2)} Profit`,
+      badgeColor: 'bg-emerald-500/20 text-emerald-300',
+      gradient: 'from-blue-950/70 via-slate-900 to-emerald-950/40',
+      borderColor: 'border-emerald-500/40',
+      iconBg: 'bg-gradient-to-tr from-blue-600 to-emerald-500',
       adminOnly: false,
+      isSalesReportCard: true,
     },
     {
       id: 'credit_report' as ActiveTab,
       title: 'Credit Debtors Ledger',
       subtitle: 'Form 3 credit sales & customer debt tracking',
       icon: CreditCard,
-      badge: `$${totalCreditOwed.toFixed(2)} Owed`,
+      badge: `$${(Number(totalCreditOwed) || 0).toFixed(2)} Owed`,
       badgeColor: 'bg-rose-500/20 text-rose-300',
       gradient: 'from-slate-900 to-rose-950/40',
       borderColor: 'border-rose-500/30',
@@ -169,7 +233,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
     },
     {
       id: 'customers' as ActiveTab,
-      title: 'Customer Database (Merged)',
+      title: 'Customer Accounts & Credit Ledger',
       subtitle: 'Unified customers across POS and Cash Balancing',
       icon: Users,
       badge: `${customers.length} Customers`,
@@ -182,7 +246,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
     {
       id: 'reconciliation' as ActiveTab,
       title: 'Shift Reconciliation (Admin)',
-      subtitle: 'Form 4 • Sum of Form 2 & 3 Net vs External Sales Audit',
+      subtitle: 'Form 4 • Sum of Form 2 & 3 Net vs Total Sales Audit',
       icon: Scale,
       badge: todayReconciliation ? todayReconciliation.status : 'Admin Sheet',
       badgeColor: todayReconciliation ? 'bg-emerald-500/20 text-emerald-300' : 'bg-purple-500/20 text-purple-300',
@@ -261,7 +325,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
           <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800">
             <span className="text-[10px] uppercase font-bold text-slate-400 block">Today's Revenue</span>
             <div className="text-lg font-black font-mono-num text-emerald-400 mt-0.5">
-              ${todayRevenue.toFixed(2)}
+              ${(Number(todayRevenue) || 0).toFixed(2)}
             </div>
             <span className="text-[10px] text-slate-500 font-medium font-mono-num">{todaySales.length} invoices</span>
           </div>
@@ -270,7 +334,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
           <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800">
             <span className="text-[10px] uppercase font-bold text-slate-400 block">Drawer Cash In Hand</span>
             <div className="text-lg font-black font-mono-num text-white mt-0.5">
-              ${drawerNetCash.toFixed(2)}
+              ${(Number(drawerNetCash) || 0).toFixed(2)}
             </div>
             <span className="text-[10px] text-purple-300 font-medium">Net calculated</span>
           </div>
@@ -332,17 +396,64 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                   </span>
                 </div>
 
-                <div className="mt-4">
-                  <h4 className="text-base font-bold text-white group-hover:text-purple-300 transition">
-                    {action.title}
-                  </h4>
-                  <p className="text-xs text-slate-400 mt-0.5">{action.subtitle}</p>
-                </div>
+                {action.isSalesReportCard ? (
+                  <div className="mt-3">
+                    <h4 className="text-base font-bold text-white group-hover:text-emerald-300 transition">
+                      {action.title}
+                    </h4>
+                    <p className="text-xs text-slate-400 mt-0.5">{action.subtitle}</p>
 
-                <div className="mt-3 pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs font-bold text-[#FF8A00]">
-                  <span>Open Form</span>
-                  <ArrowRight className="w-4 h-4 transform group-hover:translate-x-1 transition" />
-                </div>
+                    {/* Top 4 Performance Badges: Sales, Profit, Fastest Line, Most Profitable Product */}
+                    <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-2">
+                        <span className="text-[10px] text-slate-400 uppercase font-bold block">Today Sales</span>
+                        <span className="text-sm font-black font-mono text-white mt-0.5 block">
+                          ${(Number(todayRevenue) || 0).toFixed(2)}
+                        </span>
+                      </div>
+
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-2">
+                        <span className="text-[10px] text-emerald-400 uppercase font-bold block">Gross Profit</span>
+                        <span className="text-sm font-black font-mono text-emerald-400 mt-0.5 block">
+                          +${(Number(todayGrossProfit) || 0).toFixed(2)}
+                        </span>
+                      </div>
+
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-2">
+                        <span className="text-[10px] text-amber-400 uppercase font-bold block">Fastest Line</span>
+                        <span className="text-xs font-bold text-slate-200 mt-0.5 block truncate" title={fastestProduct?.name}>
+                          {fastestProduct ? `${fastestProduct.name} (${fastestProduct.qty} u)` : 'None today'}
+                        </span>
+                      </div>
+
+                      <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-2">
+                        <span className="text-[10px] text-purple-400 uppercase font-bold block">Top Profit Line</span>
+                        <span className="text-xs font-bold text-slate-200 mt-0.5 block truncate" title={topProfitProduct?.name}>
+                          {topProfitProduct ? `${topProfitProduct.name} (+$${topProfitProduct.profit.toFixed(2)})` : 'None today'}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs font-bold text-emerald-400">
+                      <span>Open Full Analysis Report</span>
+                      <ArrowRight className="w-4 h-4 transform group-hover:translate-x-1 transition" />
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="mt-4">
+                      <h4 className="text-base font-bold text-white group-hover:text-purple-300 transition">
+                        {action.title}
+                      </h4>
+                      <p className="text-xs text-slate-400 mt-0.5">{action.subtitle}</p>
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs font-bold text-[#FF8A00]">
+                      <span>Open Form</span>
+                      <ArrowRight className="w-4 h-4 transform group-hover:translate-x-1 transition" />
+                    </div>
+                  </>
+                )}
               </button>
             );
           })}
@@ -361,7 +472,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
               <Users className="w-5 h-5" />
             </div>
             <div>
-              <h4 className="text-sm font-bold text-white">Customer Database (CRM)</h4>
+              <h4 className="text-sm font-bold text-white">Customer Accounts &amp; Credit Ledger</h4>
               <p className="text-xs text-slate-400">{customers.length} Registered (C001, C002...)</p>
             </div>
           </div>
@@ -459,7 +570,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
             <div>
               <span className="text-[10px] uppercase font-bold text-slate-500 block">Total Change Held</span>
               <span className="text-base font-black text-emerald-400 font-mono-num">
-                ${totalChangeOwed.toFixed(2)}
+                ${(Number(totalChangeOwed) || 0).toFixed(2)}
               </span>
             </div>
             <span className="text-xs font-bold text-emerald-400 flex items-center space-x-1">
@@ -497,7 +608,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
             <div>
               <span className="text-[10px] uppercase font-bold text-slate-500 block">Total Credit Outstanding</span>
               <span className="text-base font-black text-[#FF8A00] font-mono-num">
-                ${totalCreditOwed.toFixed(2)}
+                ${(Number(totalCreditOwed) || 0).toFixed(2)}
               </span>
             </div>
             <span className="text-xs font-bold text-[#FF8A00] flex items-center space-x-1">
@@ -519,34 +630,41 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
         </div>
 
         <div className="space-y-2">
-          {cashLogs.slice(0, 4).map((log, logIdx) => (
-            <div
-              key={`${log.id}-${log.timestamp || logIdx}`}
-              className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800/80 flex items-center justify-between text-xs"
-            >
-              <div className="flex items-center space-x-2.5">
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    log.in > 0 ? 'bg-emerald-400' : 'bg-rose-400'
-                  }`}
-                />
-                <div>
-                  <span className="font-bold text-white">{log.description}</span>
-                  <span className="text-[10px] text-slate-400 block font-mono-num">
-                    {log.date} • {log.staffName} (#{log.staffId}) • {log.line}
-                  </span>
-                </div>
-              </div>
+          {(cashLogs || []).slice(0, 4).map((log, logIdx) => {
+            const inVal = Number(log?.in) || 0;
+            const outVal = Number(log?.out) || 0;
+            const isPositive = inVal > 0;
+            const displayAmt = isPositive ? inVal : outVal;
 
-              <span
-                className={`font-mono-num font-black ${
-                  log.in > 0 ? 'text-emerald-400' : 'text-rose-400'
-                }`}
+            return (
+              <div
+                key={`${log?.id || 'cl'}-${log?.timestamp || logIdx}`}
+                className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800/80 flex items-center justify-between text-xs"
               >
-                {log.in > 0 ? `+$${log.in.toFixed(2)}` : `-$${log.out.toFixed(2)}`}
-              </span>
-            </div>
-          ))}
+                <div className="flex items-center space-x-2.5">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      isPositive ? 'bg-emerald-400' : 'bg-rose-400'
+                    }`}
+                  />
+                  <div>
+                    <span className="font-bold text-white">{log?.description || 'Cash Transaction'}</span>
+                    <span className="text-[10px] text-slate-400 block font-mono-num">
+                      {log?.date || ''} • {log?.staffName || 'Staff'} (#{log?.staffId || ''}) • {log?.line || ''}
+                    </span>
+                  </div>
+                </div>
+
+                <span
+                  className={`font-mono-num font-black ${
+                    isPositive ? 'text-emerald-400' : 'text-rose-400'
+                  }`}
+                >
+                  {isPositive ? `+$${inVal.toFixed(2)}` : `-$${outVal.toFixed(2)}`}
+                </span>
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -554,16 +672,16 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
       <div className="bg-gradient-to-r from-slate-900 via-slate-900 to-slate-950 border border-slate-800 rounded-3xl p-4 sm:p-5 shadow-lg flex flex-col sm:flex-row items-center justify-between gap-4">
         <div className="flex items-center space-x-3.5 w-full sm:w-auto">
           <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-[#6A4DFF] to-[#FF8A00] flex items-center justify-center font-black text-base text-white shadow-md shrink-0">
-            {currentUser.name.charAt(0)}
+            {currentUser?.name ? currentUser.name.charAt(0).toUpperCase() : 'A'}
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <h4 className="text-sm font-black text-white">{currentUser.name}</h4>
+              <h4 className="text-sm font-black text-white">{currentUser?.name || 'Administrator'}</h4>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-mono-num font-bold">
-                Staff #{currentUser.id}
+                Staff #{currentUser?.id || '001'}
               </span>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-orange-500/20 text-orange-300 font-bold">
-                {currentUser.role}
+                {currentUser?.role || 'Admin'}
               </span>
             </div>
             <p className="text-xs text-slate-400 mt-0.5 flex items-center gap-2">
@@ -574,7 +692,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
         </div>
 
         <div className="flex items-center space-x-2.5 w-full sm:w-auto">
-          {currentUser.role === 'Admin' && (
+          {(currentUser?.role === 'Admin' || currentUser?.role === 'ADMIN' || currentUser?.role === 'OWNER' || currentUser?.role === 'SUPER_ADMIN') && (
             <button
               type="button"
               onClick={onOpenAdminModal}

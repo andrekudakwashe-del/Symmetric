@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { SheetName } from '../../types';
 import {
   getCustomers,
@@ -11,6 +11,8 @@ import {
   getSheetsConfig,
   updateSheetsConfig,
   clearSyncedQueueItems,
+  clearAllSyncQueueItems,
+  resetFailedSyncQueueItems,
   getCurrentCompany,
   getCurrentBranch,
   getCompanies,
@@ -18,6 +20,8 @@ import {
   updateTenantSheetBinding,
   setCurrentCompanyId,
   saveCompany,
+  getInventoryItems,
+  pullTenantInventory,
 } from '../../db/roomDatabase';
 import {
   processSyncQueue,
@@ -30,6 +34,9 @@ import {
   isRealGoogleSheetId,
   extractGoogleSheetId,
   getGoogleSheetUrl,
+  initializeTenantBusinessTabs,
+  fetchProductsFromSheet,
+  syncCompanyToCloud,
 } from '../../services/googleSheetsSync';
 import {
   FileSpreadsheet,
@@ -78,11 +85,29 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
   const currentBranch = getCurrentBranch();
   const sheetsConfig = getSheetsConfig();
 
-  const [webhookUrl, setWebhookUrl] = useState(() => sheetsConfig.webhookUrl || '');
-  const [tenantSpreadsheetId, setTenantSpreadsheetId] = useState(() => sheetsConfig.spreadsheetId || '');
-  const [branchIsolationMode, setBranchIsolationMode] = useState<'ROW_LEVEL' | 'BRANCH_TABS' | 'HYBRID'>(
-    () => sheetsConfig.branchIsolationMode || 'ROW_LEVEL'
+  const [webhookUrl, setWebhookUrl] = useState(
+    () => sheetsConfig.webhookUrl || currentComp.webhook_url || sheetsConfig.masterWebhookUrl || 'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec'
   );
+  const [tenantSpreadsheetId, setTenantSpreadsheetId] = useState(
+    () => currentComp.sheet_id || sheetsConfig.spreadsheetId || ''
+  );
+  const [branchIsolationMode, setBranchIsolationMode] = useState<'ROW_LEVEL' | 'BRANCH_TABS' | 'HYBRID'>(
+    () => currentComp.branch_isolation_mode || sheetsConfig.branchIsolationMode || 'ROW_LEVEL'
+  );
+
+  useEffect(() => {
+    if (isOpen) {
+      const cfg = getSheetsConfig();
+      const resolvedWebhook =
+        currentComp.webhook_url ||
+        cfg.webhookUrl ||
+        cfg.masterWebhookUrl ||
+        'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec';
+      setWebhookUrl(resolvedWebhook);
+      setTenantSpreadsheetId(currentComp.sheet_id || cfg.spreadsheetId || '');
+      setBranchIsolationMode(currentComp.branch_isolation_mode || cfg.branchIsolationMode || 'ROW_LEVEL');
+    }
+  }, [isOpen, currentComp.company_id, currentComp.sheet_id, currentComp.webhook_url, currentComp.branch_isolation_mode]);
   const [scriptType, setScriptType] = useState<'tenant-dedicated' | 'master-saas'>('tenant-dedicated');
   const [isSyncing, setIsSyncing] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
@@ -98,17 +123,17 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
   const [inputSheetUrlOrId, setInputSheetUrlOrId] = useState('');
   const [linkModalError, setLinkModalError] = useState<string | null>(null);
 
-  const syncQueue = getSyncQueue();
+  const syncQueue = isOpen ? getSyncQueue() : [];
   const pendingCount = syncQueue.filter((i) => i.status === 'pending' || i.status === 'failed').length;
 
-  const customers = getCustomers();
-  const cashLogs = getCashLogs();
-  const sales = getSales();
-  const expenses = getExpenses();
-  const reconciliations = getReconciliations();
-  const salespeople = getSalespeople();
-  const allCompanies = getCompanies();
-  const allBranches = getBranches();
+  const customers = isOpen ? getCustomers() : [];
+  const cashLogs = isOpen ? getCashLogs() : [];
+  const sales = isOpen ? getSales() : [];
+  const expenses = isOpen ? getExpenses() : [];
+  const reconciliations = isOpen ? getReconciliations() : [];
+  const salespeople = isOpen ? getSalespeople() : [];
+  const allCompanies = isOpen ? getCompanies() : [];
+  const allBranches = isOpen ? getBranches() : [];
 
   if (!isOpen) return null;
 
@@ -212,11 +237,15 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
     });
     updateTenantSheetBinding(currentComp.company_id, cleanSheetId, webhookUrl.trim(), branchIsolationMode);
     
-    // Also sync to active company object
-    saveCompany({
+    // Also sync to active company object and server
+    const updatedComp = {
       ...currentComp,
       sheet_id: cleanSheetId,
-    });
+      webhook_url: webhookUrl.trim(),
+      branch_isolation_mode: branchIsolationMode,
+    };
+    saveCompany(updatedComp);
+    syncCompanyToCloud(updatedComp).catch(() => {});
 
     setSyncStatusMsg(`✓ Tenant ${currentComp.company_name} Google Sheet bindings updated successfully!`);
     confetti({ particleCount: 35, spread: 60, origin: { y: 0.7 } });
@@ -725,7 +754,18 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                   <span>Room DB Outbound Sync Queue ({syncQueue.length})</span>
                 </h3>
 
-                <div className="flex items-center space-x-2">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      resetFailedSyncQueueItems();
+                      handleSyncNow();
+                    }}
+                    className="text-xs text-amber-300 hover:text-amber-200 font-bold bg-amber-950/60 px-2.5 py-1 rounded-lg border border-amber-800 transition"
+                    title="Reset all failed records back to pending and immediately retry sync"
+                  >
+                    Retry Failed Records
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
@@ -735,14 +775,26 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                     className="text-xs text-indigo-300 hover:text-indigo-200 font-bold bg-indigo-950/60 px-2.5 py-1 rounded-lg border border-indigo-800 transition"
                     title="Queue all sales, customers, cash logs, expenses tagged with the current active company and branch"
                   >
-                    Re-queue Store Records
+                    Re-queue Records
                   </button>
                   <button
                     type="button"
                     onClick={clearSyncedQueueItems}
-                    className="text-xs text-slate-400 hover:text-white font-bold bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-800 transition"
+                    className="text-xs text-slate-300 hover:text-white font-bold bg-slate-900 px-2.5 py-1 rounded-lg border border-slate-800 transition"
                   >
                     Clear Synced
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (confirm('Are you sure you want to clear all queued sync records?')) {
+                        clearAllSyncQueueItems();
+                        setSyncStatusMsg('All sync queue records cleared.');
+                      }
+                    }}
+                    className="text-xs text-red-400 hover:text-red-300 font-bold bg-red-950/40 px-2.5 py-1 rounded-lg border border-red-900/60 transition"
+                  >
+                    Purge Queue
                   </button>
                 </div>
               </div>
@@ -1295,33 +1347,28 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                     <button
                       type="button"
                       onClick={async () => {
-                        if (!webhookUrl || !webhookUrl.startsWith('http')) {
-                          alert('Please enter your Google Apps Script URL first!');
-                          return;
-                        }
                         const cleanSheetId = extractGoogleSheetId(tenantSpreadsheetId) || currentComp.sheet_id;
                         if (!cleanSheetId) {
                           alert('Please link your dedicated Google Sheet ID first!');
                           return;
                         }
                         setIsSyncing(true);
-                        setSyncStatusMsg('Initializing all business tabs in your dedicated Google Sheet...');
+                        setSyncStatusMsg('Initializing all 11 business tabs and populating inventory in Google Sheets...');
                         try {
-                          await fetch(webhookUrl.trim(), {
-                            method: 'POST',
-                            mode: 'no-cors',
-                            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                            body: JSON.stringify({
-                              action: 'initialize_tenant_sheet',
-                              company_id: currentComp.company_id,
-                              company_name: currentComp.company_name,
-                              tenant_sheet_id: cleanSheetId,
-                              sheet_id: cleanSheetId,
-                              branch_id: currentBranch.branchId,
-                            }),
+                          const res = await initializeTenantBusinessTabs({
+                            companyId: currentComp.company_id,
+                            companyName: currentComp.company_name,
+                            sheetId: cleanSheetId,
+                            webhookUrl: webhookUrl.trim(),
+                            initialProducts: getInventoryItems(),
                           });
-                          setSyncStatusMsg('✓ Initialization command dispatched! Open your dedicated sheet: Sales, InventoryMaster, GoodsReceived, CashLog, Expenses tabs are generated.');
-                          confetti({ particleCount: 60, spread: 80, origin: { y: 0.6 } });
+                          if (res.success) {
+                            setSyncStatusMsg(res.message);
+                            confetti({ particleCount: 70, spread: 80, origin: { y: 0.6 } });
+                            if (onSyncCompleted) onSyncCompleted();
+                          } else {
+                            setSyncStatusMsg(`Initialization issue: ${res.message}`);
+                          }
                         } catch (err: any) {
                           setSyncStatusMsg(`Initialization error: ${err?.message || 'Network error'}`);
                         } finally {
@@ -1329,10 +1376,33 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         }
                       }}
                       className="py-2.5 px-3 rounded-xl bg-indigo-700 hover:bg-indigo-600 text-white text-xs font-bold shadow-md transition whitespace-nowrap active:scale-95 flex items-center space-x-1"
-                      title="Automatically create Sales, InventoryMaster, GoodsReceived, CashLog, Expenses tabs"
+                      title="Automatically create Sales, InventoryMaster, GoodsReceived, CashLog, Expenses tabs and populate inventory"
                     >
                       <Layers className="w-3.5 h-3.5" />
                       <span>Initialize Sheet Tabs</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setIsSyncing(true);
+                        setSyncStatusMsg('Pulling latest inventory items from Google Sheets / central server...');
+                        try {
+                          const res = await fetchProductsFromSheet(currentComp.company_id);
+                          setSyncStatusMsg(res.message);
+                          if (res.count > 0) {
+                            confetti({ particleCount: 40, spread: 60, origin: { y: 0.65 } });
+                          }
+                        } catch (err: any) {
+                          setSyncStatusMsg(`Failed to pull products: ${err?.message || 'Network error'}`);
+                        } finally {
+                          setIsSyncing(false);
+                        }
+                      }}
+                      className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 text-xs font-bold shadow-md transition whitespace-nowrap active:scale-95 flex items-center space-x-1"
+                      title="Synchronize products from Google Sheets InventoryMaster into local device"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      <span>Pull Products from Sheets</span>
                     </button>
                   </div>
                 </div>
@@ -1343,13 +1413,13 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                   </p>
                   <ol className="list-decimal list-inside space-y-1 text-slate-400">
                     <li>
-                      Paste the code into <strong className="text-white">Extensions → Apps Script</strong> in this tenant's dedicated sheet.
+                      Paste the code into <strong className="text-white">Extensions → Apps Script</strong> in this tenant's dedicated sheet (or click <strong className="text-indigo-400">Download Code.gs</strong> below).
                     </li>
                     <li>
                       Deploy as <strong className="text-white">Web app</strong> with <strong className="text-white">Who has access: Anyone</strong>.
                     </li>
                     <li>
-                      Branch isolation is automatically enforced inside the script so cashiers cannot inject cross-branch rows.
+                      Ensure the Google Sheet is shared with edit access or set to <strong className="text-white">"Anyone with the link can edit"</strong>.
                     </li>
                   </ol>
                 </div>
@@ -1365,7 +1435,16 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                     </span>
                   </div>
 
-                  <div className="flex items-center space-x-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <a
+                      href="/api/download/code-gs"
+                      download="Code.gs"
+                      className="py-1.5 px-3 rounded-xl bg-indigo-950 hover:bg-indigo-900 border border-indigo-800 text-indigo-200 text-xs font-bold flex items-center space-x-1 transition"
+                      title="Download the full 4,500-line Code.gs file"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Download Code.gs</span>
+                    </a>
                     <div className="flex bg-slate-900 p-0.5 rounded-xl border border-slate-800 text-xs">
                       <button
                         type="button"

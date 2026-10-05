@@ -148,7 +148,7 @@ export const SegmentRecountModal: React.FC<SegmentRecountModalProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
-              {initialDiscrepancies.map((item) => {
+              {initialDiscrepancies.map((item, idx) => {
                 const itemA = mapA.get(item.itemId.toUpperCase());
                 const itemB = mapB.get(item.itemId.toUpperCase());
                 const upc = item.unitsPerCase || 1;
@@ -164,7 +164,7 @@ export const SegmentRecountModal: React.FC<SegmentRecountModalProps> = ({
                 };
 
                 return (
-                  <tr key={item.itemId} className="hover:bg-slate-800/40 transition">
+                  <tr key={`${item.itemId}-${idx}`} className="hover:bg-slate-800/40 transition">
                     {/* Item */}
                     <td className="py-3 px-3">
                       <div className="font-semibold text-white text-sm">{item.itemName}</div>

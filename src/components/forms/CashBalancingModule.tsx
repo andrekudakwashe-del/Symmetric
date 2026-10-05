@@ -4,6 +4,7 @@ import { Form1CashCount } from './Form1CashCount';
 import { Form2CashLog } from './Form2CashLog';
 import { Form3SalesEntry } from './Form3SalesEntry';
 import { Form4Reconciliation } from './Form4Reconciliation';
+import { isSupervisorOrAbove } from '../../db/roomDatabase';
 import {
   Coins,
   ReceiptText,
@@ -13,6 +14,7 @@ import {
   LayoutDashboard,
   CreditCard,
   ShoppingCart,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface CashBalancingModuleProps {
@@ -22,6 +24,7 @@ interface CashBalancingModuleProps {
   onNavigateHome: () => void;
   onNavigateToPOS: () => void;
   onNavigateToCreditReport?: () => void;
+  onNavigateToDirectGrv?: (grvId?: string) => void;
 }
 
 export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
@@ -31,12 +34,22 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
   onNavigateHome,
   onNavigateToPOS,
   onNavigateToCreditReport,
+  onNavigateToDirectGrv,
 }) => {
   const [subTab, setSubTab] = useState<'form1' | 'form2' | 'form3' | 'form4'>(
     initialSubTab
   );
 
-  const isAdmin = currentUser.role === 'Admin';
+  const isAdmin =
+    currentUser.role === 'Admin' ||
+    currentUser.role === 'OWNER' ||
+    currentUser.role === 'SUPER_ADMIN' ||
+    (currentUser.role as string) === 'super_admin';
+
+  const canAccessSupervisorEOD =
+    isAdmin ||
+    isSupervisorOrAbove(currentUser.role) ||
+    Boolean(currentUser.permissions?.canPerformShiftEnd);
 
   return (
     <div id="cash-balancing-module" className="space-y-4 pb-24">
@@ -98,8 +111,8 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
           >
             <ReceiptText className={`w-4 h-4 ${subTab === 'form2' ? 'text-blue-400' : 'text-slate-400'}`} />
             <div className="text-left">
-              <span className="block text-[10px] text-slate-400 font-medium">Form 2</span>
-              <span>Cash Log</span>
+              <span className="block text-[10px] text-emerald-400 font-medium">Form 2 • Cashier EOD</span>
+              <span>Daily Cash Log</span>
             </div>
           </button>
 
@@ -115,7 +128,7 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
           >
             <ArrowLeftRight className={`w-4 h-4 ${subTab === 'form3' ? 'text-orange-400' : 'text-slate-400'}`} />
             <div className="text-left">
-              <span className="block text-[10px] text-slate-400 font-medium">Form 3</span>
+              <span className="block text-[10px] text-amber-400 font-medium">Form 3 • Auto-Filled</span>
               <span>Change & Credit</span>
             </div>
           </button>
@@ -124,11 +137,11 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
             type="button"
             id="subtab-form4"
             onClick={() => {
-              if (isAdmin) setSubTab('form4');
+              if (canAccessSupervisorEOD) setSubTab('form4');
             }}
-            disabled={!isAdmin}
+            disabled={!canAccessSupervisorEOD}
             className={`flex items-center space-x-2 p-2.5 rounded-2xl border transition-all text-xs font-bold ${
-              !isAdmin
+              !canAccessSupervisorEOD
                 ? 'opacity-40 cursor-not-allowed bg-slate-950 border-slate-800 text-slate-500'
                 : subTab === 'form4'
                 ? 'bg-emerald-950/80 border-emerald-500 text-emerald-200 ring-1 ring-emerald-500/50 shadow-md'
@@ -137,8 +150,8 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
           >
             <Scale className={`w-4 h-4 ${subTab === 'form4' ? 'text-emerald-400' : 'text-slate-400'}`} />
             <div className="text-left">
-              <span className="block text-[10px] text-slate-400 font-medium">Form 4 {!isAdmin ? '(Admin)' : ''}</span>
-              <span>Reconcile</span>
+              <span className="block text-[10px] text-purple-400 font-medium">Form 4 • Supervisor</span>
+              <span>Balancing & EOD</span>
             </div>
           </button>
         </div>
@@ -151,7 +164,7 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
             currentUser={currentUser}
             onNavigateToCashLog={() => setSubTab('form2')}
             onNavigateToHome={onNavigateHome}
-            onNavigateToReconcile={isAdmin ? () => setSubTab('form4') : undefined}
+            onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
           />
         )}
 
@@ -160,7 +173,9 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
             currentUser={currentUser}
             onNavigateToCashCount={() => setSubTab('form1')}
             onNavigateToCustomerChange={() => setSubTab('form3')}
+            onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
             onNavigateToHome={onNavigateHome}
+            onNavigateToDirectGrv={onNavigateToDirectGrv}
           />
         )}
 
@@ -170,12 +185,12 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
             preselectedCustomer={preselectedCustomer}
             onNavigateToCashLog={() => setSubTab('form2')}
             onNavigateToHome={onNavigateHome}
-            onNavigateToReconcile={isAdmin ? () => setSubTab('form4') : undefined}
+            onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
           />
         )}
 
         {subTab === 'form4' && (
-          isAdmin ? (
+          canAccessSupervisorEOD ? (
             <Form4Reconciliation
               currentUser={currentUser}
               onNavigateToCashCount={() => setSubTab('form1')}
@@ -187,9 +202,9 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
               <div className="w-12 h-12 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto text-xl font-bold">
                 🔒
               </div>
-              <h3 className="text-lg font-bold text-white">Administrator Access Required</h3>
+              <h3 className="text-lg font-bold text-white">Supervisor or Manager Access Required</h3>
               <p className="text-xs text-slate-400 max-w-md mx-auto">
-                Form 4 is restricted to Administrator roles.
+                Form 4 is restricted to Supervisors, Managers, and Business Owners. Cashiers finish their end-of-day on Form 2.
               </p>
             </div>
           )

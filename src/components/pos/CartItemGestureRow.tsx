@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { CartItem } from '../../types';
+import { getCurrentUser, isSupervisorOrAbove } from '../../db/roomDatabase';
 import { Pencil, Scale, Trash2 } from 'lucide-react';
 
 interface CartItemGestureRowProps {
@@ -256,16 +257,35 @@ export const CartItemGestureRow: React.FC<CartItemGestureRowProps> = ({
             </span>
           </div>
 
-          {/* Stock Status */}
-          {isOOS ? (
-            <div className="text-[9px] font-black text-rose-600 uppercase tracking-tight mt-0.5">
-              OUT OF STOCK
-            </div>
-          ) : (
-            <div className="text-[10px] text-slate-400 font-medium mt-0.5">
-              In stock: {item.product.stockQuantity} {isFractional ? unitLabel : ''}
-            </div>
-          )}
+          {/* Stock Status (Blind for cashiers) */}
+          {(() => {
+            const user = getCurrentUser();
+            const canSeeRaw = isSupervisorOrAbove(user?.role) || Boolean(user?.permissions?.canManageInventory);
+            const totalStockUnits = (Number(item.product.stockCases) || 0) * (item.product.unitsPerCase || 1) + (Number(item.product.stockQuantity) || 0);
+            const isLow = !isOOS && totalStockUnits <= (item.product.reorderLevelUnits || 5);
+
+            if (isOOS) {
+              return (
+                <div className="text-[9px] font-black text-rose-600 uppercase tracking-tight mt-0.5">
+                  OUT OF STOCK
+                </div>
+              );
+            }
+
+            if (!canSeeRaw) {
+              return (
+                <div className={`text-[10px] font-bold mt-0.5 ${isLow ? 'text-amber-600' : 'text-emerald-700'}`}>
+                  {isLow ? 'Low stock' : 'In stock'}
+                </div>
+              );
+            }
+
+            return (
+              <div className="text-[10px] text-slate-400 font-medium mt-0.5">
+                In stock: {item.product.stockQuantity} {isFractional ? unitLabel : ''}
+              </div>
+            );
+          })()}
         </div>
 
         {/* Line Total */}

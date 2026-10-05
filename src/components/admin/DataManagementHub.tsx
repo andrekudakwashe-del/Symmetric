@@ -27,6 +27,7 @@ import {
   Info,
 } from 'lucide-react';
 import { Salesperson, InventoryItem, Customer, Supplier } from '../../types';
+import { persistentSyncEngine } from '../../services/persistentSyncEngine';
 import {
   getInventoryItems,
   getCustomers,
@@ -44,6 +45,7 @@ import {
 } from '../../db/roomDatabase';
 import {
   downloadInventoryCsv,
+  downloadInventoryExpandedCsv,
   downloadInventoryJson,
   downloadInventoryTemplateCsv,
   parseInventoryCsv,
@@ -63,28 +65,46 @@ import {
   downloadReportCsv,
   downloadAllReportsCombinedJson,
 } from '../../services/dataExportImportService';
+import { DatabaseBackupModal } from '../common/DatabaseBackupModal';
+import { DatabaseRestoreModal } from '../common/DatabaseRestoreModal';
+import { UniversalMigrationWizard } from '../migration/UniversalMigrationWizard';
+import {
+  getLastBackupTimestamp,
+  calculateDeltaCutoff,
+  STORAGE_BACKUP_HISTORY,
+  STORAGE_LAST_BACKUP_TYPE,
+  BackupType,
+} from '../../services/databaseBackupService';
 
 interface DataManagementHubProps {
   currentUser: Salesperson | null;
-  initialTab?: 'inventory' | 'customers' | 'suppliers' | 'reports';
+  initialTab?: 'migration' | 'inventory' | 'customers' | 'suppliers' | 'reports' | 'backup';
   onNavigateHome?: () => void;
   onNavigateTab?: (tab: any) => void;
 }
 
 export const DataManagementHub: React.FC<DataManagementHubProps> = ({
   currentUser,
-  initialTab = 'inventory',
+  initialTab = 'migration',
   onNavigateHome,
   onNavigateTab,
 }) => {
   const isAdmin = currentUser?.role === 'Admin';
-  const [activeTab, setActiveTab] = useState<'inventory' | 'customers' | 'suppliers' | 'reports'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'migration' | 'inventory' | 'customers' | 'suppliers' | 'reports' | 'backup'>(initialTab);
+
+  // Backup & Restore modal states
+  const [showBackupModal, setShowBackupModal] = useState(false);
+  const [backupModalType, setBackupModalType] = useState<BackupType>('DELTA');
+  const [showRestoreModal, setShowRestoreModal] = useState(false);
+  const [restoreModalMode, setRestoreModalMode] = useState<'replace' | 'append'>('append');
 
   // File upload states
   const [dragActive, setDragActive] = useState(false);
   const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSyncRefreshing, setIsSyncRefreshing] = useState(false);
+  const [syncStatusMsg, setSyncStatusMsg] = useState<string | null>(null);
 
   // Parsed preview states
   const [parsedInventory, setParsedInventory] = useState<InventoryItem[] | null>(null);
@@ -108,7 +128,7 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
   const recons = getReconciliations();
 
   // Reset file preview on tab change
-  const handleTabChange = (tab: 'inventory' | 'customers' | 'suppliers' | 'reports') => {
+  const handleTabChange = (tab: 'migration' | 'inventory' | 'customers' | 'suppliers' | 'reports' | 'backup') => {
     setActiveTab(tab);
     setUploadedFileName(null);
     setParsedInventory(null);
@@ -337,8 +357,106 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
         </div>
       </div>
 
+      {/* Cloud Sync & Delta Refresh Bar (Work Stream B.9) */}
+      <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3.5 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-sm">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-cyan-500/20 text-cyan-400 flex items-center justify-center">
+            <RefreshCw className={`w-4 h-4 ${isSyncRefreshing ? 'animate-spin' : ''}`} />
+          </div>
+          <div>
+            <div className="text-xs font-bold text-white flex items-center gap-2">
+              <span>Cloud Delta Sync &amp; Multi-Device Replication</span>
+              <span className="text-[10px] font-mono bg-cyan-950 text-cyan-300 border border-cyan-800/60 px-1.5 py-0.5 rounded">
+                &lt; 60s
+              </span>
+            </div>
+            <div className="text-[11px] text-slate-400">
+              {syncStatusMsg || 'Propagate staff, branch partitions, and tenant context across devices'}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2 w-full sm:w-auto">
+          <button
+            type="button"
+            id="btn-settings-refresh-staff"
+            onClick={async () => {
+              setIsSyncRefreshing(true);
+              try {
+                const count = await persistentSyncEngine.forceRefreshStaff();
+                setSyncStatusMsg(`Staff refreshed successfully (${count} updated).`);
+              } catch (e: any) {
+                setSyncStatusMsg(`Staff refresh failed: ${e.message || String(e)}`);
+              } finally {
+                setIsSyncRefreshing(false);
+              }
+            }}
+            disabled={isSyncRefreshing}
+            className="flex-1 sm:flex-initial px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 border border-slate-700 disabled:opacity-50 transition cursor-pointer"
+          >
+            <Users className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Refresh Staff</span>
+          </button>
+
+          <button
+            type="button"
+            id="btn-settings-refresh-branches"
+            onClick={async () => {
+              setIsSyncRefreshing(true);
+              try {
+                const count = await persistentSyncEngine.forceRefreshBranches();
+                setSyncStatusMsg(`Branches refreshed successfully (${count} updated).`);
+              } catch (e: any) {
+                setSyncStatusMsg(`Branch refresh failed: ${e.message || String(e)}`);
+              } finally {
+                setIsSyncRefreshing(false);
+              }
+            }}
+            disabled={isSyncRefreshing}
+            className="flex-1 sm:flex-initial px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 border border-slate-700 disabled:opacity-50 transition cursor-pointer"
+          >
+            <Building2 className="w-3.5 h-3.5 text-cyan-400" />
+            <span>Refresh Branches</span>
+          </button>
+
+          <button
+            type="button"
+            id="btn-settings-refresh-tenant"
+            onClick={async () => {
+              setIsSyncRefreshing(true);
+              try {
+                await persistentSyncEngine.forceRefreshTenantContext();
+                setSyncStatusMsg('Tenant context refreshed from cloud.');
+              } catch (e: any) {
+                setSyncStatusMsg(`Tenant refresh failed: ${e.message || String(e)}`);
+              } finally {
+                setIsSyncRefreshing(false);
+              }
+            }}
+            disabled={isSyncRefreshing}
+            className="flex-1 sm:flex-initial px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center justify-center gap-1.5 border border-slate-700 disabled:opacity-50 transition cursor-pointer"
+          >
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Refresh Tenant</span>
+          </button>
+        </div>
+      </div>
+
       {/* Main Tab Bar */}
       <div className="flex bg-slate-900 p-1.5 rounded-2xl border border-slate-800 gap-1 overflow-x-auto">
+        <button
+          type="button"
+          onClick={() => handleTabChange('migration')}
+          className={`flex-1 min-w-[190px] py-2.5 px-3 rounded-xl font-bold text-xs transition flex items-center justify-center gap-2 ${
+            activeTab === 'migration'
+              ? 'bg-gradient-to-r from-purple-600 via-indigo-600 to-pink-600 text-white shadow-md shadow-purple-950/40 ring-1 ring-purple-400/50'
+              : 'text-purple-300 hover:text-white hover:bg-slate-800/80 bg-purple-950/20'
+          }`}
+        >
+          <Sparkles className="w-4 h-4 text-amber-400" />
+          <span>🚀 Universal Migration Wizard</span>
+        </button>
+
         <button
           type="button"
           onClick={() => handleTabChange('inventory')}
@@ -390,6 +508,19 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
           <FileSpreadsheet className="w-4 h-4" />
           <span>📊 Export All Reports (12)</span>
         </button>
+
+        <button
+          type="button"
+          onClick={() => handleTabChange('backup')}
+          className={`flex-1 min-w-[170px] py-2.5 px-3 rounded-xl font-bold text-xs transition flex items-center justify-center gap-2 ${
+            activeTab === 'backup'
+              ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-md shadow-purple-950/40'
+              : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+          }`}
+        >
+          <ShieldCheck className="w-4 h-4 text-amber-400" />
+          <span>🔒 Encrypted Backup &amp; Recovery</span>
+        </button>
       </div>
 
       {/* Notification / Success Alerts */}
@@ -420,6 +551,14 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
             {parseErrors.length > 5 && <li>...and {parseErrors.length - 5} more issues.</li>}
           </ul>
         </div>
+      )}
+
+      {/* TAB 0: UNIVERSAL MIGRATION WIZARD */}
+      {activeTab === 'migration' && (
+        <UniversalMigrationWizard
+          currentUser={currentUser}
+          onNavigateHome={onNavigateHome}
+        />
       )}
 
       {/* TAB 1: INVENTORY IMPORT & EXPORT */}
@@ -459,23 +598,33 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
             </div>
 
             <div className="space-y-2.5 pt-2">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
                 <button
                   type="button"
                   onClick={() => downloadInventoryCsv()}
-                  className="py-3 px-4 rounded-2xl bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 text-white font-bold text-xs shadow-lg shadow-indigo-950/50 flex items-center justify-center gap-2 transition active:scale-95"
+                  className="py-3 px-3 rounded-2xl bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 text-white font-bold text-xs shadow-lg shadow-indigo-950/50 flex items-center justify-center gap-2 transition active:scale-95"
                 >
-                  <FileSpreadsheet className="w-4 h-4" />
-                  <span>Download Inventory CSV</span>
+                  <FileSpreadsheet className="w-4 h-4 shrink-0" />
+                  <span>Standard CSV</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => downloadInventoryExpandedCsv()}
+                  className="py-3 px-3 rounded-2xl bg-gradient-to-r from-purple-600 to-purple-700 hover:from-purple-500 hover:to-purple-600 text-white font-bold text-xs shadow-lg shadow-purple-950/50 flex items-center justify-center gap-2 transition active:scale-95"
+                  title="Exports separate rows for every packaging variant / prepack"
+                >
+                  <Layers className="w-4 h-4 shrink-0" />
+                  <span>Expanded Variants CSV</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => downloadInventoryJson()}
-                  className="py-3 px-4 rounded-2xl bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 font-bold text-xs flex items-center justify-center gap-2 transition active:scale-95"
+                  className="py-3 px-3 rounded-2xl bg-slate-800 hover:bg-slate-750 text-slate-200 border border-slate-700 font-bold text-xs flex items-center justify-center gap-2 transition active:scale-95"
                 >
-                  <FileJson className="w-4 h-4 text-indigo-400" />
-                  <span>Download JSON Backup</span>
+                  <FileJson className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <span>JSON Backup</span>
                 </button>
               </div>
 
@@ -1147,6 +1296,275 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
           </div>
         </div>
       )}
+
+      {/* ========================================================================= */}
+      {/* TAB 5: ENCRYPTED OFFLINE BACKUP & DISASTER RECOVERY */}
+      {/* ========================================================================= */}
+      {activeTab === 'backup' && (
+        <div className="space-y-6 animate-fadeIn">
+          {/* Header Banner */}
+          <div className="bg-gradient-to-r from-purple-950/70 via-indigo-950/70 to-slate-900 border border-purple-500/30 rounded-3xl p-6 shadow-xl relative overflow-hidden">
+            <div className="relative z-10 flex flex-col md:flex-row md:items-center justify-between gap-4">
+              <div className="space-y-1.5 max-w-2xl">
+                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-purple-500/20 border border-purple-500/30 text-purple-300 text-xs font-bold">
+                  <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Bank-Grade AES-256-GCM Client-Side Encryption</span>
+                </div>
+                <h3 className="text-xl font-black text-white">
+                  Offline Database Backups &amp; Disaster Recovery
+                </h3>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Safeguard your business against lost devices, browser cache resets, and hardware failures. Encrypted backup files (<code className="text-purple-300 font-mono">.saimetric.enc</code>) can be saved locally, uploaded to your Google Drive, or stored on a USB drive.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  id="btn-trigger-eod-backup"
+                  onClick={() => {
+                    setBackupModalType('DELTA');
+                    setShowBackupModal(true);
+                  }}
+                  className="px-4 py-2.5 rounded-2xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] hover:opacity-95 text-white font-bold text-xs shadow-lg shadow-purple-900/40 flex items-center gap-2 transition cursor-pointer active:scale-95"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>EOD Delta Backup</span>
+                </button>
+
+                <button
+                  type="button"
+                  id="btn-trigger-restore"
+                  onClick={() => {
+                    setRestoreModalMode('append');
+                    setShowRestoreModal(true);
+                  }}
+                  className="px-4 py-2.5 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white font-bold text-xs border border-slate-700 flex items-center gap-2 transition cursor-pointer"
+                >
+                  <Upload className="w-4 h-4 text-indigo-400" />
+                  <span>Restore from Backup</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* Backup Status Overview Metrics */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 space-y-1">
+              <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
+                Last Recorded Backup
+              </span>
+              <div className="text-base font-black text-white font-mono">
+                {getLastBackupTimestamp() ? getLastBackupTimestamp()?.slice(0, 10) : 'Never'}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                {getLastBackupTimestamp()
+                  ? `Time: ${new Date(getLastBackupTimestamp()!).toLocaleTimeString()}`
+                  : 'Recommended to run daily'}
+              </p>
+            </div>
+
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 space-y-1">
+              <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
+                Delta Cutoff Threshold
+              </span>
+              <div className="text-base font-black text-amber-400 font-mono">
+                {calculateDeltaCutoff().cutoffIso.slice(0, 10)}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                Covers active month + unsynced delta
+              </p>
+            </div>
+
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 space-y-1">
+              <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
+                Active Store Records
+              </span>
+              <div className="text-base font-black text-emerald-400 font-mono">
+                {inventoryItems.length + customers.length + suppliers.length + sales.length + vouchers.length + recons.length}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                Products, Customers, Sales, GRVs, Cash
+              </p>
+            </div>
+
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 space-y-1">
+              <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block">
+                Encryption Protocol
+              </span>
+              <div className="text-base font-black text-indigo-400 font-mono">
+                AES-GCM-256
+              </div>
+              <p className="text-[11px] text-slate-500">
+                PBKDF2 100,000 iterations (SHA-256)
+              </p>
+            </div>
+          </div>
+
+          {/* Backup & Restore Operation Cards */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Card 1: EOD Delta Backup */}
+            <div className="bg-slate-900 border border-slate-800 hover:border-purple-500/40 rounded-3xl p-5 flex flex-col justify-between space-y-4 transition shadow-sm">
+              <div className="space-y-3">
+                <div className="w-10 h-10 rounded-2xl bg-purple-500/10 border border-purple-500/30 flex items-center justify-center text-purple-400">
+                  <Download className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-black text-white">1. End of Day Delta Backup</h4>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                      Recommended Daily
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                    Designed for fast daily closings. Automatically extracts records from the start of the current month or since your last backup date. Takes seconds and generates a tiny, bandwidth-friendly file.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setBackupModalType('DELTA');
+                  setShowBackupModal(true);
+                }}
+                className="w-full py-2.5 px-4 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-xs shadow-md transition flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Download className="w-4 h-4" />
+                <span>Create EOD Delta Backup</span>
+              </button>
+            </div>
+
+            {/* Card 2: Full System Snapshot */}
+            <div className="bg-slate-900 border border-slate-800 hover:border-indigo-500/40 rounded-3xl p-5 flex flex-col justify-between space-y-4 transition shadow-sm">
+              <div className="space-y-3">
+                <div className="w-10 h-10 rounded-2xl bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+                  <Database className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-black text-white">2. Full System Snapshot</h4>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                      Complete Archive
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                    Captures 100% of the entire database: all historical records, products, customers, suppliers, audit logs, and terminal registration tokens. Ideal for monthly archives or fresh machine installations.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setBackupModalType('FULL');
+                  setShowBackupModal(true);
+                }}
+                className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-md transition flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Database className="w-4 h-4" />
+                <span>Create Full Snapshot</span>
+              </button>
+            </div>
+
+            {/* Card 3: Disaster Recovery Restore */}
+            <div className="bg-slate-900 border border-slate-800 hover:border-emerald-500/40 rounded-3xl p-5 flex flex-col justify-between space-y-4 transition shadow-sm">
+              <div className="space-y-3">
+                <div className="w-10 h-10 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                  <Upload className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h4 className="text-sm font-black text-white">3. Restore / Append Database</h4>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                      Password Protected
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                    Upload an encrypted backup file from your device or Google Drive. Choose between Smart Append (merging records without erasing existing data) or Fresh Setup (overwriting for new machines).
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setRestoreModalMode('append');
+                  setShowRestoreModal(true);
+                }}
+                className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white font-bold text-xs border border-slate-700 flex items-center justify-center gap-2 transition cursor-pointer"
+              >
+                <Upload className="w-4 h-4 text-emerald-400" />
+                <span>Upload &amp; Restore</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Educational Guidance & FAQ */}
+          <div className="bg-slate-900/60 border border-slate-800 rounded-3xl p-6 space-y-4">
+            <h4 className="text-sm font-black text-white flex items-center gap-2">
+              <Info className="w-4 h-4 text-amber-400" />
+              <span>Backup Strategy &amp; Disaster Recovery FAQ</span>
+            </h4>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs text-slate-300">
+              <div className="p-4 rounded-2xl bg-slate-950/70 border border-slate-800/80 space-y-1.5">
+                <strong className="text-white block font-bold">
+                  Q: Does the system download the whole database everyday for End of Day?
+                </strong>
+                <p className="text-slate-400 leading-relaxed">
+                  <span className="text-emerald-400 font-bold">No.</span> The End of Day backup creates an incremental Delta backup. It dynamically computes the cutoff date (the earlier of the 1st of the current month and your last backup date). Only records created or modified in that window are included, keeping daily backups fast and lightweight.
+                </p>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-slate-950/70 border border-slate-800/80 space-y-1.5">
+                <strong className="text-white block font-bold">
+                  Q: How do I save and retrieve backups with Google Drive?
+                </strong>
+                <p className="text-slate-400 leading-relaxed">
+                  When you generate a backup, it downloads immediately to your computer or phone's Downloads folder. You can upload this file directly to your Google Drive. If your device ever crashes, download the file from Google Drive and upload it via the Restore option.
+                </p>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-slate-950/70 border border-slate-800/80 space-y-1.5">
+                <strong className="text-white block font-bold">
+                  Q: What happens if a device is lost or replacing with a new terminal?
+                </strong>
+                <p className="text-slate-400 leading-relaxed">
+                  Open Saimetric on the new device. Before registering or logging in, click <strong className="text-purple-300">"Lost or New Device? Restore from Encrypted Backup"</strong> on Stage 1 or Stage 2. Enter your decryption passphrase and the entire store database, branches, and terminal credentials will be restored!
+                </p>
+              </div>
+
+              <div className="p-4 rounded-2xl bg-slate-950/70 border border-slate-800/80 space-y-1.5">
+                <strong className="text-white block font-bold">
+                  Q: Why is AES-256 encryption required?
+                </strong>
+                <p className="text-slate-400 leading-relaxed">
+                  Backups contain sensitive sales totals, cash counts, customer debt, and ledger balances. AES-256-GCM ensures that even if an unauthorized person gets hold of the file, they cannot inspect or tamper with your company records without your secret passphrase.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Database Backup Modal */}
+      <DatabaseBackupModal
+        isOpen={showBackupModal}
+        onClose={() => setShowBackupModal(false)}
+        defaultType={backupModalType}
+        staffName={currentUser?.name || 'Administrator'}
+      />
+
+      {/* Database Restore Modal */}
+      <DatabaseRestoreModal
+        isOpen={showRestoreModal}
+        onClose={() => setShowRestoreModal(false)}
+        defaultMode={restoreModalMode}
+        onRestoreSuccess={() => {
+          window.location.reload();
+        }}
+      />
     </div>
   );
 };

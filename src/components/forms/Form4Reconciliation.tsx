@@ -5,6 +5,7 @@ import {
   Customer,
   AdminSalesEntry,
   ShiftReconciliation,
+  SaleInvoice,
 } from '../../types';
 import {
   getSalespeople,
@@ -13,14 +14,25 @@ import {
   getCreditSales,
   getCashCounts,
   getAdminSales,
+  getAdminSaleForStaffAndDate,
   saveAllAdminSalesEntries,
   saveAdminSalesEntry,
   calculateSalespersonCashBalancing,
+  getSales,
+  getSalesForStaffAndDate,
+  getTotalSalesForStaffAndDate,
   getExpenses,
   addExpense,
   getTodayDateString,
   subscribeToDatabase,
+  isSupervisorOrAbove,
+  getCompanyBranchSettings,
+  saveCompanyBranchSettings,
+  logForm4AuditUnlock,
+  getActiveCurrencies,
 } from '../../db/roomDatabase';
+import { ManagerPinModal } from '../common/ManagerPinModal';
+import { getAllMovements, getShiftId, matchesShift, CashMovement } from '../../db/cashLedger';
 import { CustomerSearchModal } from '../common/CustomerSearchModal';
 import { downloadCsvFile } from '../../services/googleSheetsSync';
 import {
@@ -48,9 +60,21 @@ import {
   Sparkles,
   Home,
   ArrowLeft,
+  Pencil,
+  RotateCcw,
+  Check,
+  ShoppingBag,
+  Calculator,
+  Smartphone,
+  History,
+  Lock,
+  KeyRound,
+  Database,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
+import { DatabaseBackupModal } from '../common/DatabaseBackupModal';
+import { DatabaseRestoreModal } from '../common/DatabaseRestoreModal';
 
 interface Form4ReconciliationProps {
   currentUser: Salesperson;
@@ -77,21 +101,35 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   onNavigateToCustomerChange,
   onNavigateToHome,
 }) => {
-  // If user is not an administrator, block access
-  if (currentUser.role !== 'Admin') {
+  // Company Owners, Super Admins, Managers, and Admins can access Form 4
+  const canAccessForm4 =
+    isSupervisorOrAbove(currentUser.role) ||
+    Boolean(currentUser.permissions?.canPerformShiftEnd);
+
+  if (!canAccessForm4) {
     return (
       <div className="p-8 text-center bg-slate-900 border border-slate-800 rounded-3xl space-y-4 max-w-lg mx-auto my-8">
         <div className="w-14 h-14 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto text-2xl font-bold">
           <ShieldAlert className="w-8 h-8" />
         </div>
-        <h3 className="text-xl font-bold text-white">Administrator Access Required</h3>
+        <h3 className="text-xl font-bold text-white">Supervisor or Manager Access Required</h3>
         <p className="text-xs text-slate-400 leading-relaxed">
-          Form 4 (Salesperson Cash Balancing & Reconciliation) is strictly restricted to Administrator accounts.
-          Non-admin staff members cannot view or manage balancing records.
+          Form 4 (End-of-Day Shift Balancing & Reconciliation) is restricted to Managers, Supervisors, and Administrator accounts.
+          Cashiers cannot view or access balancing records.
         </p>
       </div>
     );
   }
+
+  // Dedicated Form 4 Audit Password Security Gate
+  const branchSettings = getCompanyBranchSettings();
+  const configuredPassword = branchSettings.form4AuditPassword?.trim() || '';
+  const [isForm4Unlocked, setIsForm4Unlocked] = useState<boolean>(() => !configuredPassword);
+  const [form4PasswordInput, setForm4PasswordInput] = useState('');
+  const [form4PasswordError, setForm4PasswordError] = useState<string | null>(null);
+  const [showManagerPinModal, setShowManagerPinModal] = useState(false);
+  const [showPasswordSetupModal, setShowPasswordSetupModal] = useState(false);
+  const [newPasswordInput, setNewPasswordInput] = useState(configuredPassword);
 
   // Active view tab
   const [activeTab, setActiveTab] = useState<'balancing' | 'expenses' | 'history'>('balancing');
@@ -99,10 +137,29 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState<'ALL' | 'BALANCED' | 'DISCREPANCY' | 'ACTIVE'>('ALL');
 
-  // Local state for editable sales amounts per salesperson { staffId: salesAmountString }
+  // Handle password unlock
+  const handlePasswordUnlock = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!configuredPassword) {
+      setIsForm4Unlocked(true);
+      return;
+    }
+    if (form4PasswordInput.trim() === configuredPassword) {
+      logForm4AuditUnlock(currentUser, date, 'PASSWORD');
+      setIsForm4Unlocked(true);
+      setForm4PasswordError(null);
+    } else {
+      setForm4PasswordError('Incorrect Form 4 Audit Password. Please try again.');
+    }
+  };
+
+  // Local state for optional manual override of sales amounts per salesperson { staffId: overrideAmountString }
   const [salesInputs, setSalesInputs] = useState<Record<string, string>>({});
+  const [editingStaffId, setEditingStaffId] = useState<string | null>(null);
   const [isSavingAll, setIsSavingAll] = useState(false);
   const [saveSuccessBanner, setSaveSuccessBanner] = useState<string | null>(null);
+  const [showEodBackupModal, setShowEodBackupModal] = useState(false);
+  const [showRestoreModal, setShowRestoreModal] = useState(false);
 
   // Selected salesperson for detailed transaction audit drawer/modal
   const [auditStaffId, setAuditStaffId] = useState<string | null>(null);
@@ -120,24 +177,29 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   // DB Data
   const [salespeople, setSalespeople] = useState<Salesperson[]>(() => getSalespeople());
   const [expenses, setExpenses] = useState<ExpenseEntry[]>(() => getExpenses());
+  const [salesList, setSalesList] = useState<SaleInvoice[]>(() => getSales());
 
   // Subscribe to DB changes
   useEffect(() => {
     const unsub = subscribeToDatabase(() => {
       setSalespeople(getSalespeople());
       setExpenses(getExpenses());
+      setSalesList(getSales());
     });
     return () => unsub();
   }, []);
 
-  // Initialize or update sales inputs whenever date or admin sales change
+  // Initialize or update sales overrides whenever date changes
   useEffect(() => {
     const adminSales = getAdminSales().filter((s) => s.date === date);
     const initialMap: Record<string, string> = {};
     adminSales.forEach((s) => {
-      initialMap[s.staffId] = s.salesAmount.toString();
+      if (s.notes?.includes('Manual Override')) {
+        initialMap[s.staffId] = s.salesAmount.toString();
+      }
     });
     setSalesInputs(initialMap);
+    setEditingStaffId(null);
     setSaveSuccessBanner(null);
   }, [date]);
 
@@ -146,9 +208,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     return salespeople.map((staff) => {
       const rawInput = salesInputs[staff.id];
       const parsedSales = rawInput !== undefined && rawInput.trim() !== '' ? parseFloat(rawInput) || 0 : undefined;
-      return calculateSalespersonCashBalancing(staff.id, staff.name, date, parsedSales);
+      return calculateSalespersonCashBalancing(staff.id, staff.name, date, parsedSales, currentUser?.branchId);
     });
-  }, [salespeople, date, salesInputs]);
+  }, [salespeople, date, salesInputs, salesList, currentUser?.branchId]);
 
   // Filtered salespeople rows
   const filteredRows = useMemo(() => {
@@ -176,7 +238,39 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     let totalSumForm2And3Net = 0;
     let totalSales = 0;
     let totalShouldHave = 0;
+    let totalExpectedCash = 0;
+    let totalPhysicalCount = 0;
+    let hasAnyCount = false;
     let totalVariance = 0;
+    let totalCashIn = 0;
+    let totalCashOut = 0;
+
+    let totalFloat = 0;
+    let totalCashSales = 0;
+    let totalCreditPayments = 0;
+    let totalChangeIn = 0;
+    let totalExpenses = 0;
+    let totalDirectProcurements = 0;
+    let totalCashLift = 0;
+    let totalChangeOut = 0;
+    let totalEcocashCashOut = 0;
+    let totalZigCashOut = 0;
+    let totalPettyCash = 0;
+
+    let totalEcocashSales = 0;
+    let totalZigSales = 0;
+    let totalCreditExtended = 0;
+
+    const activeCurrenciesList = getActiveCurrencies();
+    const currencyWithdrawalTotals: Record<string, number> = {};
+    const currencySalesTotals: Record<string, number> = {};
+    activeCurrenciesList.forEach((c) => {
+      currencyWithdrawalTotals[c.currency] = 0;
+      currencySalesTotals[c.currency] = 0;
+    });
+    let totalMultiCurrencyWithdrawalsAll = 0;
+    let totalMultiCurrencySalesAll = 0;
+
     let countBalanced = 0;
     let countShortage = 0;
     let countOver = 0;
@@ -188,7 +282,45 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       totalSumForm2And3Net += r.sumForm2And3Net;
       totalSales += r.sales;
       totalShouldHave += r.shouldHave;
+      totalExpectedCash += r.expectedCash || 0;
+      if (r.actualCashCount !== null) {
+        totalPhysicalCount += r.actualCashCount;
+        hasAnyCount = true;
+      }
       totalVariance += r.variance;
+      totalCashIn += r.cashInTotal || 0;
+      totalCashOut += r.cashOutTotal || 0;
+
+      totalFloat += r.float || 0;
+      totalCashSales += r.cashSales || 0;
+      totalCreditPayments += r.creditPayments || 0;
+      totalChangeIn += (r.changeReceived ?? r.changeIn) || 0;
+      totalExpenses += r.expenses || 0;
+      totalDirectProcurements += r.directProcurements || 0;
+      totalCashLift += r.cashLift || 0;
+      totalChangeOut += (r.changePaid ?? r.customerChange) || 0;
+      totalEcocashCashOut += r.ecocashWithdrawal || 0;
+      totalZigCashOut += r.zigWithdrawal || 0;
+      totalPettyCash += r.deductions || 0;
+
+      totalEcocashSales += r.ecocashSales || 0;
+      totalZigSales += r.zigSales || 0;
+      totalCreditExtended += r.creditExtended || 0;
+
+      activeCurrenciesList.forEach((c) => {
+        const wVal =
+          (r.currencyWithdrawals && r.currencyWithdrawals[c.currency]) ??
+          (c.currency === 'EcoCash' ? r.ecocashWithdrawal : c.currency === 'ZiG' ? r.zigWithdrawal : 0) ??
+          0;
+        const sVal =
+          (r.currencySales && r.currencySales[c.currency]) ??
+          (c.currency === 'EcoCash' ? r.ecocashSales : c.currency === 'ZiG' ? r.zigSales : 0) ??
+          0;
+        currencyWithdrawalTotals[c.currency] = (currencyWithdrawalTotals[c.currency] || 0) + wVal;
+        currencySalesTotals[c.currency] = (currencySalesTotals[c.currency] || 0) + sVal;
+        totalMultiCurrencyWithdrawalsAll += wVal;
+        totalMultiCurrencySalesAll += sVal;
+      });
 
       if (r.hasActivity) countActive++;
       if (r.status === 'Balanced') countBalanced++;
@@ -196,13 +328,41 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       if (r.status === 'Over') countOver++;
     });
 
+    const netDrawerImpact = Math.round((totalCashIn - totalCashOut) * 100) / 100;
+    const totalNonCash = Math.round((totalMultiCurrencySalesAll + totalCreditExtended) * 100) / 100;
+
     return {
       totalForm2Net,
       totalForm3Net,
       totalSumForm2And3Net,
       totalSales,
       totalShouldHave,
-      totalVariance,
+      totalExpectedCash: Math.round(totalExpectedCash * 100) / 100,
+      totalPhysicalCount: hasAnyCount ? Math.round(totalPhysicalCount * 100) / 100 : null,
+      totalVariance: Math.round(totalVariance * 100) / 100,
+      totalCashIn: Math.round(totalCashIn * 100) / 100,
+      totalCashOut: Math.round(totalCashOut * 100) / 100,
+      netDrawerImpact,
+      totalFloat: Math.round(totalFloat * 100) / 100,
+      totalCashSales: Math.round(totalCashSales * 100) / 100,
+      totalCreditPayments: Math.round(totalCreditPayments * 100) / 100,
+      totalChangeIn: Math.round(totalChangeIn * 100) / 100,
+      totalExpenses: Math.round(totalExpenses * 100) / 100,
+      totalDirectProcurements: Math.round(totalDirectProcurements * 100) / 100,
+      totalCashLift: Math.round(totalCashLift * 100) / 100,
+      totalChangeOut: Math.round(totalChangeOut * 100) / 100,
+      totalEcocashCashOut: Math.round(totalEcocashCashOut * 100) / 100,
+      totalZigCashOut: Math.round(totalZigCashOut * 100) / 100,
+      totalPettyCash: Math.round(totalPettyCash * 100) / 100,
+      totalEcocashSales: Math.round(totalEcocashSales * 100) / 100,
+      totalZigSales: Math.round(totalZigSales * 100) / 100,
+      totalCreditExtended: Math.round(totalCreditExtended * 100) / 100,
+      activeCurrencies: activeCurrenciesList,
+      currencyWithdrawalTotals,
+      currencySalesTotals,
+      totalMultiCurrencyWithdrawalsAll: Math.round(totalMultiCurrencyWithdrawalsAll * 100) / 100,
+      totalMultiCurrencySalesAll: Math.round(totalMultiCurrencySalesAll * 100) / 100,
+      totalNonCash,
       countBalanced,
       countShortage,
       countOver,
@@ -219,6 +379,40 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     }));
   };
 
+  const handleStartEditing = (staffId: string, currentSales: number) => {
+    setEditingStaffId(staffId);
+    if (salesInputs[staffId] === undefined) {
+      setSalesInputs((prev) => ({
+        ...prev,
+        [staffId]: currentSales.toString(),
+      }));
+    }
+  };
+
+  const handleSaveSingleOverride = (staffId: string) => {
+    const staff = salespeople.find((s) => s.id === staffId);
+    if (!staff) return;
+    const val = salesInputs[staffId];
+    const num = val !== undefined && val.trim() !== '' ? parseFloat(val) || 0 : 0;
+    saveAdminSalesEntry(date, staff.id, staff.name, num, 'Manual Override');
+    setEditingStaffId(null);
+    setSaveSuccessBanner(`Updated sales figure override for ${staff.name} ($${num.toFixed(2)}).`);
+  };
+
+  const handleResetSingleOverride = (staffId: string) => {
+    const staff = salespeople.find((s) => s.id === staffId);
+    setSalesInputs((prev) => {
+      const next = { ...prev };
+      delete next[staffId];
+      return next;
+    });
+    setEditingStaffId(null);
+    if (staff) {
+      saveAdminSalesEntry(date, staff.id, staff.name, 0, '');
+      setSaveSuccessBanner(`Reverted ${staff.name} to recorded system sales.`);
+    }
+  };
+
   // Save all entered sales amounts for this date
   const handleSaveAllSales = () => {
     setIsSavingAll(true);
@@ -230,6 +424,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
           staffId: staff.id,
           staffName: staff.name,
           salesAmount: num,
+          notes: 'Manual Override',
         };
       });
 
@@ -242,7 +437,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         colors: ['#6A4DFF', '#FF8A00', '#10B981'],
       });
 
-      setSaveSuccessBanner(`All sales figures and cash balancing records for ${date} have been saved successfully!`);
+      setSaveSuccessBanner(`Sales balancing records for ${date} have been saved successfully!`);
     } catch (err) {
       console.error('Failed to save sales balancing figures:', err);
       alert('Error saving sales figures.');
@@ -254,14 +449,31 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   // Selected staff details for audit modal
   const selectedAuditData = useMemo(() => {
     if (!auditStaffId) return null;
-    const staff = salespeople.find((s) => s.id === auditStaffId);
-    if (!staff) return null;
+    const staff = salespeople.find((s) => s.id === auditStaffId) || {
+      id: auditStaffId,
+      name: `Staff #${auditStaffId}`,
+      role: 'Cashier',
+      email: '',
+      phone: '',
+      active: true,
+      createdAt: '',
+    };
 
-    const row = balancingData.find((b) => b.staffId === auditStaffId);
+    const row =
+      balancingData.find((b) => b.staffId === auditStaffId) ||
+      calculateSalespersonCashBalancing(staff.id, staff.name, date, undefined, currentUser?.branchId);
+
     const form2Logs = getCashLogs().filter((l) => l.staffId === auditStaffId && l.date === date);
     const form3Changes = getCustomerChanges().filter((c) => c.staffId === auditStaffId && c.date === date);
     const form3Credits = getCreditSales().filter((c) => c.staffId === auditStaffId && c.date === date);
     const form1Count = getCashCounts().find((c) => c.staffId === auditStaffId && c.date === date);
+    const staffSales =
+      (row as any)?.staffSales && (row as any).staffSales.length > 0
+        ? (row as any).staffSales
+        : getSalesForStaffAndDate(auditStaffId, date, staff.name);
+    const adminSale = getAdminSaleForStaffAndDate(auditStaffId, date);
+    const shiftId = getShiftId(auditStaffId, date, currentUser?.branchId);
+    const staffMovements = getAllMovements().filter((m) => matchesShift(m, shiftId, currentUser?.branchId));
 
     return {
       staff,
@@ -270,8 +482,11 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       form3Changes,
       form3Credits,
       form1Count,
+      staffSales,
+      adminSale,
+      staffMovements,
     };
-  }, [auditStaffId, salespeople, balancingData, date]);
+  }, [auditStaffId, salespeople, balancingData, date, salesList]);
 
   // Handle logging new company expense
   const handleAddExpense = (e: React.FormEvent) => {
@@ -330,7 +545,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       'Form3_Out',
       'Form3_Net',
       'Sum_Form2_and_3_Net',
-      'External_Sales',
+      'Total_Sales',
       'Should_Have',
       'Variance',
       'Status',
@@ -376,6 +591,85 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         isAdmin={true}
       />
 
+      {!isForm4Unlocked ? (
+        <div className="max-w-md mx-auto my-12 p-6 sm:p-8 bg-slate-900 border border-purple-500/30 rounded-3xl shadow-2xl text-center space-y-6">
+          <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-purple-600 to-indigo-600 flex items-center justify-center text-white mx-auto shadow-lg shadow-purple-500/20">
+            <KeyRound className="w-8 h-8" />
+          </div>
+          <div>
+            <div className="inline-block px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-[10px] font-bold border border-purple-500/30 uppercase tracking-wider mb-2">
+              Form 4 • Shift Reconciliation Gate
+            </div>
+            <h2 className="text-xl font-black text-white">End-of-Day Shift Audit Security</h2>
+            <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+              Shift balancing and register variance calculations require manager authorization to unlock.
+            </p>
+          </div>
+
+          <form onSubmit={handlePasswordUnlock} className="space-y-3 text-left">
+            {configuredPassword ? (
+              <div>
+                <label className="block text-xs font-bold text-slate-300 mb-1">
+                  Enter Form 4 Audit Password
+                </label>
+                <input
+                  type="password"
+                  value={form4PasswordInput}
+                  onChange={(e) => {
+                    setForm4PasswordInput(e.target.value);
+                    setForm4PasswordError(null);
+                  }}
+                  placeholder="Enter dedicated shift password..."
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  autoFocus
+                />
+                {form4PasswordError && (
+                  <p className="text-xs text-rose-400 font-bold mt-1">{form4PasswordError}</p>
+                )}
+                <button
+                  type="submit"
+                  className="w-full mt-3 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-bold text-sm shadow-md transition active:scale-95"
+                >
+                  Unlock Shift Audit
+                </button>
+              </div>
+            ) : (
+              <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-400 text-center">
+                No separate Form 4 password is currently configured. Unlock using your Supervisor/Manager PIN.
+              </div>
+            )}
+
+            <div className="pt-2 flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => setShowManagerPinModal(true)}
+                className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-purple-300 font-bold text-xs border border-purple-500/30 flex items-center justify-center space-x-1.5 transition active:scale-95"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span>Unlock with Supervisor / Manager PIN</span>
+              </button>
+            </div>
+          </form>
+
+          {showManagerPinModal && (
+            <ManagerPinModal
+              isOpen={showManagerPinModal}
+              onClose={() => setShowManagerPinModal(false)}
+              title="Supervisor Authorization: Unlock Form 4 Audit"
+              subtitle="Accessing Form 4 End-of-Day Shift Balancing logs an immutable entry in the audit trail."
+              actionType="VOID"
+              actionDescription="Unlock End-of-Day Shift Balancing and register variance sheet"
+              reasonRequired={false}
+              onAuthorize={(manager) => {
+                logForm4AuditUnlock(manager, date, 'PIN');
+                setIsForm4Unlocked(true);
+                setShowManagerPinModal(false);
+              }}
+            />
+          )}
+        </div>
+      ) : (
+        <>
       {/* Top Header Card */}
       <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-4 sm:p-5 shadow-lg backdrop-blur-md">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -385,13 +679,13 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
             </div>
             <div>
               <div className="flex items-center space-x-2">
-                <h2 className="text-xl font-black text-white tracking-tight">Form 4: Salesperson Cash Balancing</h2>
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30">
-                  ADMIN ONLY
+                <h2 className="text-xl font-black text-white tracking-tight">End-of-Day Shift Balancing (Z-Report)</h2>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-bold border border-purple-500/30">
+                  Form 4 • Shift Audit
                 </span>
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Reconciliation Sheet • Sum of Form 2 & 3 Net vs External System Sales & Variance Audit
+                Reconciliation Sheet • Till Cash Counts vs Inflows/Outflows & Variance Audit
               </p>
             </div>
           </div>
@@ -479,10 +773,32 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
           {/* Quick Action Buttons */}
           <div className="flex items-center space-x-2">
             <button
+              id="btn-eod-backup-form4"
+              type="button"
+              onClick={() => setShowEodBackupModal(true)}
+              className="px-3 py-1.5 rounded-xl bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-500/40 text-indigo-200 font-bold flex items-center space-x-1.5 transition shadow-sm cursor-pointer"
+              title="End of Day (EOD) Delta Backup • Fast AES-256 Encrypted Handover for Store Owner"
+            >
+              <ShieldAlert className="w-3.5 h-3.5 text-indigo-400" />
+              <span className="hidden sm:inline">EOD Handover</span>
+            </button>
+
+            <button
+              id="btn-upload-master-backup-form4"
+              type="button"
+              onClick={() => setShowRestoreModal(true)}
+              className="px-3 py-1.5 rounded-xl bg-amber-950/80 hover:bg-amber-900 border border-amber-500/40 text-amber-200 font-bold flex items-center space-x-1.5 transition shadow-sm cursor-pointer"
+              title="Upload Owner Master Update • Safely merges catalog & rates without affecting today's branch sales"
+            >
+              <Database className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline">Upload Owner Update</span>
+            </button>
+
+            <button
               id="btn-export-csv-form4"
               type="button"
               onClick={handleExportCsv}
-              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-bold flex items-center space-x-1.5 transition"
+              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-bold flex items-center space-x-1.5 transition cursor-pointer"
             >
               <Download className="w-3.5 h-3.5 text-[#FF8A00]" />
               <span className="hidden sm:inline">Export CSV</span>
@@ -523,101 +839,217 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       {/* ========================================================================= */}
       {activeTab === 'balancing' && (
         <div className="space-y-4">
-          {/* Key Formula Explanation Banner */}
-          <div className="p-3.5 rounded-2xl bg-gradient-to-r from-purple-950/40 via-slate-900 to-orange-950/30 border border-purple-500/20 text-xs">
-            <div className="flex items-center space-x-1.5 text-purple-300 font-bold uppercase tracking-wider text-[11px] mb-1">
-              <Sparkles className="w-3.5 h-3.5 text-[#FF8A00]" />
-              <span>Form 4 Core Balancing Formulas</span>
+          {/* Summary Card Layout */}
+          <div className="space-y-3">
+            {/* Top Row: Expected Cash | Physical Count | Variance */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {/* Top Row Card 1: Expected Cash */}
+              <div className="bg-slate-900/90 border border-indigo-500/30 rounded-2xl p-4 shadow-md space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-xs font-semibold">
+                  <span>Expected Cash</span>
+                  <TrendingUp className="w-4 h-4 text-indigo-400" />
+                </div>
+                <div className="text-2xl font-black font-mono-num text-white">
+                  ${summaryTotals.totalExpectedCash.toFixed(2)}
+                </div>
+                <div className="text-[11px] text-indigo-300 font-medium">
+                  Target physical cash drawer balance (Ledger)
+                </div>
+              </div>
+
+              {/* Top Row Card 2: Physical Count */}
+              <div className="bg-slate-900/90 border border-emerald-500/30 rounded-2xl p-4 shadow-md space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-xs font-semibold">
+                  <span>Physical Count</span>
+                  <Coins className="w-4 h-4 text-emerald-400" />
+                </div>
+                <div className="text-2xl font-black font-mono-num text-emerald-400">
+                  {summaryTotals.totalPhysicalCount !== null
+                    ? `$${summaryTotals.totalPhysicalCount.toFixed(2)}`
+                    : '$0.00'}
+                </div>
+                <div className="text-[11px] text-slate-400">
+                  {summaryTotals.totalPhysicalCount !== null
+                    ? 'Form 1 verified cash counts recorded'
+                    : 'Pending Form 1 physical cash counts'}
+                </div>
+              </div>
+
+              {/* Top Row Card 3: Variance with Colored Badge */}
+              <div
+                className={`border rounded-2xl p-4 shadow-md space-y-1.5 ${
+                  Math.abs(summaryTotals.totalVariance) < 0.01
+                    ? 'bg-emerald-950/30 border-emerald-500/40 text-emerald-300'
+                    : summaryTotals.totalVariance < 0
+                    ? 'bg-rose-950/30 border-rose-500/40 text-rose-300'
+                    : 'bg-purple-950/30 border-purple-500/40 text-purple-300'
+                }`}
+              >
+                <div className="flex items-center justify-between text-xs font-semibold">
+                  <span>Variance</span>
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
+                      Math.abs(summaryTotals.totalVariance) < 0.01
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                        : summaryTotals.totalVariance < 0
+                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                        : 'bg-orange-500/20 text-orange-300 border border-orange-500/40'
+                    }`}
+                  >
+                    {Math.abs(summaryTotals.totalVariance) < 0.01
+                      ? 'Balanced'
+                      : summaryTotals.totalVariance < 0
+                      ? 'Shortage'
+                      : 'Over'}
+                  </span>
+                </div>
+                <div className="text-2xl font-black font-mono-num">
+                  {summaryTotals.totalVariance >= 0
+                    ? `+$${summaryTotals.totalVariance.toFixed(2)}`
+                    : `-$${Math.abs(summaryTotals.totalVariance).toFixed(2)}`}
+                </div>
+                <div className="text-[11px] font-bold flex items-center justify-between text-slate-300">
+                  <span>Physical Count − Expected Cash</span>
+                  <span className="text-[10px] opacity-80">
+                    {summaryTotals.countBalanced} Balanced • {summaryTotals.countShortage} Short • {summaryTotals.countOver} Over
+                  </span>
+                </div>
+              </div>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-slate-300">
-              <div className="p-2 rounded-xl bg-slate-950/60 border border-slate-800">
-                <span className="text-purple-300 font-bold">1. Sum of Form 2 & 3 Net:</span>
-                <p className="text-[11px] text-slate-400 font-mono-num mt-0.5">
-                  (Form 2 Cash Log Net) + (Form 3 Change & Credit Net)
-                </p>
+
+            {/* Second Row: Cash In Total | Cash Out Total | Net Drawer Impact */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              {/* Card 1: Cash In Total */}
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-3.5 shadow-md space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-xs font-semibold">
+                  <span>Cash In Total</span>
+                  <TrendingUp className="w-4 h-4 text-emerald-400" />
+                </div>
+                <div className="text-xl font-black font-mono-num text-emerald-400">
+                  +${summaryTotals.totalCashIn.toFixed(2)}
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  Float, Cash Sales, Change In, Credit Repayments
+                </div>
               </div>
-              <div className="p-2 rounded-xl bg-slate-950/60 border border-slate-800">
-                <span className="text-indigo-300 font-bold">2. Should Have Column:</span>
-                <p className="text-[11px] text-slate-400 font-mono-num mt-0.5">
-                  Net of Form 2 + Net of Form 3 + Sales
-                </p>
+
+              {/* Card 2: Cash Out Total */}
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-3.5 shadow-md space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-xs font-semibold">
+                  <span>Cash Out Total</span>
+                  <DollarSign className="w-4 h-4 text-rose-400" />
+                </div>
+                <div className="text-xl font-black font-mono-num text-rose-400">
+                  -${summaryTotals.totalCashOut.toFixed(2)}
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  Expenses, Procurements, Lifts, Change Out, Cash-Outs
+                </div>
               </div>
-              <div className="p-2 rounded-xl bg-slate-950/60 border border-slate-800">
-                <span className="text-[#FF8A00] font-bold">3. Variance Column:</span>
-                <p className="text-[11px] text-slate-400 font-mono-num mt-0.5">
-                  0 - Should Have
-                </p>
+
+              {/* Card 3: Net Drawer Impact */}
+              <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-3.5 shadow-md space-y-1">
+                <div className="flex items-center justify-between text-slate-400 text-xs font-semibold">
+                  <span>Net Drawer Impact</span>
+                  <Scale className="w-4 h-4 text-indigo-400" />
+                </div>
+                <div className="text-xl font-black font-mono-num text-white">
+                  {summaryTotals.netDrawerImpact >= 0 ? '+' : ''}${summaryTotals.netDrawerImpact.toFixed(2)}
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  Cash In Total − Cash Out Total
+                </div>
+              </div>
+            </div>
+
+            {/* Third Row: Non-Cash Activity (Distinct visual styling) */}
+            <div className="p-3.5 rounded-2xl bg-gradient-to-r from-slate-950 via-slate-900 to-indigo-950/40 border border-indigo-500/25 shadow-md text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <div className="flex items-center space-x-2">
+                  <span className="px-2 py-0.5 rounded-md bg-indigo-500/20 text-indigo-300 font-bold text-[10px] uppercase tracking-wider border border-indigo-500/30">
+                    Non-Cash Activity
+                  </span>
+                  <span className="text-slate-300 font-semibold text-xs">
+                    Tracked for general ledger & sales reporting • Excluded from Physical Cash Drawer
+                  </span>
+                </div>
+                <div className="text-right">
+                  <span className="text-slate-400 text-[10px] mr-1.5">Total Non-Cash:</span>
+                  <span className="font-mono-num font-black text-indigo-300 text-sm">
+                    ${summaryTotals.totalNonCash.toFixed(2)}
+                  </span>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-slate-300">
+                {summaryTotals.activeCurrencies.map((c) => {
+                  const sAmt = summaryTotals.currencySalesTotals[c.currency] || 0;
+                  return (
+                    <div key={c.currency} className="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between">
+                      <div>
+                        <span className="text-slate-400 text-[11px] block">{c.name} Sales</span>
+                        <span className="text-[10px] text-slate-500">{c.code} Digital / Swipe</span>
+                      </div>
+                      <span className="font-mono-num font-bold text-sm text-purple-300">
+                        ${sAmt.toFixed(2)}
+                      </span>
+                    </div>
+                  );
+                })}
+                <div className="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between">
+                  <div>
+                    <span className="text-slate-400 text-[11px] block">Credit Extended</span>
+                    <span className="text-[10px] text-slate-500">Customer Receivables</span>
+                  </div>
+                  <span className="font-mono-num font-bold text-sm text-blue-300">
+                    ${summaryTotals.totalCreditExtended.toFixed(2)}
+                  </span>
+                </div>
               </div>
             </div>
           </div>
 
-          {/* Metric KPI Summary Cards */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            {/* Card 1: Total Sum of Form 2 & 3 Net */}
-            <div className="bg-slate-900/80 border border-purple-500/30 rounded-2xl p-3.5 shadow-md space-y-1">
-              <div className="flex items-center justify-between text-slate-400 text-xs">
-                <span>Sum Form 2 & 3 Net</span>
-                <Coins className="w-4 h-4 text-[#6A4DFF]" />
-              </div>
-              <div className="text-lg sm:text-xl font-black font-mono-num text-white">
-                ${summaryTotals.totalSumForm2And3Net.toFixed(2)}
-              </div>
-              <div className="text-[10px] text-slate-400 flex justify-between">
-                <span>F2: ${summaryTotals.totalForm2Net.toFixed(2)}</span>
-                <span>F3: ${summaryTotals.totalForm3Net.toFixed(2)}</span>
-              </div>
+          {/* Key Formula Explanation Banner with Live Substituted Numbers */}
+          <div className="p-4 rounded-2xl bg-gradient-to-r from-purple-950/40 via-slate-900 to-indigo-950/40 border border-purple-500/30 text-xs shadow-md">
+            <div className="flex items-center space-x-2 text-purple-300 font-bold uppercase tracking-wider text-[11px] mb-2">
+              <Calculator className="w-4 h-4 text-[#FF8A00]" />
+              <span>Form 4 Live Balancing Formula</span>
             </div>
-
-            {/* Card 2: Total External Sales Entered */}
-            <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-3.5 shadow-md space-y-1">
-              <div className="flex items-center justify-between text-slate-400 text-xs">
-                <span>External System Sales</span>
-                <DollarSign className="w-4 h-4 text-emerald-400" />
-              </div>
-              <div className="text-lg sm:text-xl font-black font-mono-num text-emerald-400">
-                ${summaryTotals.totalSales.toFixed(2)}
-              </div>
-              <div className="text-[10px] text-slate-400">
-                Admin entered for {summaryTotals.totalStaffCount} salespeople
-              </div>
-            </div>
-
-            {/* Card 3: Total Should Have */}
-            <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-3.5 shadow-md space-y-1">
-              <div className="flex items-center justify-between text-slate-400 text-xs">
-                <span>Total Should Have</span>
-                <TrendingUp className="w-4 h-4 text-indigo-400" />
-              </div>
-              <div className="text-lg sm:text-xl font-black font-mono-num text-white">
-                ${summaryTotals.totalShouldHave.toFixed(2)}
-              </div>
-              <div className="text-[10px] text-slate-400">
-                (Sum 2&3 Net) + Sales
-              </div>
-            </div>
-
-            {/* Card 4: Total Variance & Balancing Status */}
-            <div
-              className={`border rounded-2xl p-3.5 shadow-md space-y-1 ${
-                Math.abs(summaryTotals.totalVariance) < 0.01
-                  ? 'bg-emerald-950/30 border-emerald-500/40 text-emerald-300'
-                  : summaryTotals.totalVariance < 0
-                  ? 'bg-rose-950/30 border-rose-500/40 text-rose-300'
-                  : 'bg-purple-950/30 border-purple-500/40 text-purple-300'
-              }`}
-            >
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold">Total Variance</span>
-                <Scale className="w-4 h-4" />
-              </div>
-              <div className="text-lg sm:text-xl font-black font-mono-num">
-                {summaryTotals.totalVariance >= 0 ? `+$${summaryTotals.totalVariance.toFixed(2)}` : `-$${Math.abs(summaryTotals.totalVariance).toFixed(2)}`}
-              </div>
-              <div className="text-[10px] font-bold flex justify-between">
-                <span>{summaryTotals.countBalanced} Balanced</span>
-                {summaryTotals.countShortage > 0 && <span className="text-rose-400">{summaryTotals.countShortage} Short</span>}
-                {summaryTotals.countOver > 0 && <span className="text-orange-400">{summaryTotals.countOver} Over</span>}
-              </div>
+            <div className="font-mono-num text-xs sm:text-sm text-slate-200 leading-relaxed bg-slate-950/80 p-3.5 rounded-xl border border-slate-800">
+              <span className="text-emerald-400 font-bold">Float (${summaryTotals.totalFloat.toFixed(2)})</span>
+              {' + '}
+              <span className="text-emerald-400 font-bold">Cash Sales (${summaryTotals.totalCashSales.toFixed(2)})</span>
+              {' + '}
+              <span className="text-emerald-400 font-bold">Credit Payments (${summaryTotals.totalCreditPayments.toFixed(2)})</span>
+              {' + '}
+              <span className="text-emerald-400 font-bold">Change In (${summaryTotals.totalChangeIn.toFixed(2)})</span>
+              <br className="my-1.5" />
+              {' − '}
+              <span className="text-rose-400 font-bold">Expenses (${summaryTotals.totalExpenses.toFixed(2)})</span>
+              {' − '}
+              <span className="text-rose-400 font-bold">Direct Procurements (${summaryTotals.totalDirectProcurements.toFixed(2)})</span>
+              {' − '}
+              <span className="text-rose-400 font-bold">Cash Lift (${summaryTotals.totalCashLift.toFixed(2)})</span>
+              {' − '}
+              <span className="text-rose-400 font-bold">Change Out (${summaryTotals.totalChangeOut.toFixed(2)})</span>
+              <br className="my-1.5" />
+              {summaryTotals.activeCurrencies.map((c) => {
+                const wAmt = summaryTotals.currencyWithdrawalTotals[c.currency] || 0;
+                return (
+                  <React.Fragment key={c.currency}>
+                    {' − '}
+                    <span className="text-rose-400 font-bold">
+                      {c.name} Cash-Out (${wAmt.toFixed(2)})
+                    </span>
+                  </React.Fragment>
+                );
+              })}
+              {' − '}
+              <span className="text-rose-400 font-bold">Petty Cash (${summaryTotals.totalPettyCash.toFixed(2)})</span>
+              <br className="my-1.5" />
+              {' = '}
+              <span className="text-indigo-300 font-black text-sm sm:text-base underline decoration-indigo-400">
+                Expected Cash (${summaryTotals.totalExpectedCash.toFixed(2)})
+              </span>
             </div>
           </div>
 
@@ -693,35 +1125,32 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
               <table id="form4-balancing-table" className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-950/80 border-b border-slate-800 text-slate-400 font-bold uppercase tracking-wider text-[11px]">
-                    <th className="py-3 px-3.5">Sales Person</th>
-                    <th className="py-3 px-3 text-right">Form 2 Net</th>
-                    <th className="py-3 px-3 text-right">Form 3 Net</th>
-                    <th className="py-3 px-3.5 text-right bg-purple-950/40 text-purple-300 font-black border-x border-purple-900/40">
-                      Sum of Form 2 & 3 Net
-                    </th>
-                    <th className="py-3 px-3.5 text-center bg-emerald-950/30 text-emerald-300 font-black">
-                      Sales (External System) *
-                    </th>
+                    <th className="py-3 px-3.5">Staff</th>
                     <th className="py-3 px-3.5 text-right text-indigo-300 font-black">
-                      Should Have
+                      Expected Cash
+                    </th>
+                    <th className="py-3 px-3.5 text-right text-emerald-300 font-black">
+                      Physical Count
                     </th>
                     <th className="py-3 px-3.5 text-center font-black">
                       Variance
                     </th>
-                    <th className="py-3 px-3 text-center">Audit</th>
+                    <th className="py-3 px-3.5 text-center font-black">
+                      Status
+                    </th>
+                    <th className="py-3 px-3 text-center">Actions</th>
                   </tr>
                 </thead>
 
                 <tbody className="divide-y divide-slate-800/80 font-medium text-slate-200">
                   {filteredRows.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="py-12 text-center text-slate-500">
+                      <td colSpan={6} className="py-12 text-center text-slate-500">
                         No salesperson matches the selected filter for {date}.
                       </td>
                     </tr>
                   ) : (
                     filteredRows.map((row) => {
-                      const inputVal = salesInputs[row.staffId] !== undefined ? salesInputs[row.staffId] : '';
                       const isBalanced = row.status === 'Balanced';
                       const isShortage = row.status === 'Shortage';
                       const isOver = row.status === 'Over';
@@ -734,7 +1163,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                             row.hasActivity ? 'bg-slate-900/40' : 'opacity-80'
                           }`}
                         >
-                          {/* 1. Sales Person Name & ID */}
+                          {/* 1. Staff Name & ID */}
                           <td className="py-3 px-3.5">
                             <div className="flex items-center space-x-2">
                               <div className="w-7 h-7 rounded-lg bg-gradient-to-tr from-[#6A4DFF] to-purple-800 text-white font-bold flex items-center justify-center text-xs shrink-0">
@@ -751,66 +1180,50 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                             </div>
                           </td>
 
-                          {/* 2. Form 2 Net */}
-                          <td className="py-3 px-3 text-right">
-                            <span className="font-mono-num font-bold text-white block">
-                              ${row.form2Net.toFixed(2)}
-                            </span>
-                            <span className="text-[10px] text-slate-400 font-mono-num block">
-                              +${row.form2In.toFixed(0)} / -${row.form2Out.toFixed(0)}
-                            </span>
-                          </td>
-
-                          {/* 3. Form 3 Net */}
-                          <td className="py-3 px-3 text-right">
-                            <span className="font-mono-num font-bold text-white block">
-                              ${row.form3Net.toFixed(2)}
-                            </span>
-                            <span className="text-[10px] text-slate-400 font-mono-num block">
-                              +${row.form3In.toFixed(0)} / -${row.form3Out.toFixed(0)}
-                            </span>
-                          </td>
-
-                          {/* 4. Sum of Form 2 & 3 Net */}
-                          <td className="py-3 px-3.5 text-right bg-purple-950/20 border-x border-purple-900/30">
-                            <span className="font-mono-num font-black text-sm text-[#FF8A00] block">
-                              ${row.sumForm2And3Net.toFixed(2)}
-                            </span>
-                            <span className="text-[9px] text-purple-300 font-mono-num block">
-                              (F2: {row.form2Net >= 0 ? '+' : ''}${row.form2Net.toFixed(0)} + F3: {row.form3Net >= 0 ? '+' : ''}${row.form3Net.toFixed(0)})
-                            </span>
-                          </td>
-
-                          {/* 5. Sales (Editable Input) */}
-                          <td className="py-2.5 px-3.5 bg-emerald-950/15 text-center">
-                            <div className="relative max-w-[140px] mx-auto">
-                              <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs font-bold font-mono-num">
-                                $
-                              </span>
-                              <input
-                                id={`input-sales-${row.staffId}`}
-                                type="number"
-                                step="0.01"
-                                min="0"
-                                placeholder="0.00"
-                                value={inputVal}
-                                onChange={(e) => handleSalesInputChange(row.staffId, e.target.value)}
-                                className="w-full pl-6 pr-2.5 py-1.5 bg-slate-950 border border-slate-700 focus:border-[#FF8A00] focus:ring-1 focus:ring-[#FF8A00] rounded-xl text-xs font-mono-num font-bold text-emerald-300 text-right outline-none transition"
-                              />
-                            </div>
-                          </td>
-
-                          {/* 6. Should Have Column = (Sum of Form 2 & 3 Net) + Sales */}
+                          {/* 2. Expected Cash Column */}
                           <td className="py-3 px-3.5 text-right">
-                            <span className="font-mono-num font-black text-xs text-indigo-300 block">
-                              ${row.shouldHave.toFixed(2)}
+                            <span className="font-mono-num font-black text-sm text-indigo-300 block">
+                              ${(row.expectedCash ?? 0).toFixed(2)}
                             </span>
-                            <span className="text-[9px] text-slate-500 font-mono-num block">
-                              ({row.sumForm2And3Net.toFixed(0)} + {row.sales.toFixed(0)})
+                            <span className="text-[9px] text-slate-400 font-mono-num block">
+                              In: ${(row.cashInTotal ?? 0).toFixed(0)} / Out: ${(row.cashOutTotal ?? 0).toFixed(0)}
                             </span>
                           </td>
 
-                          {/* 7. Variance Column = 0 - Should Have */}
+                          {/* 3. Physical Count Column */}
+                          <td className="py-3 px-3.5 text-right">
+                            {row.actualCashCount !== null ? (
+                              <span className="font-mono-num font-black text-sm text-emerald-300 block">
+                                ${row.actualCashCount.toFixed(2)}
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 text-[11px] italic block">
+                                Not Counted
+                              </span>
+                            )}
+                            <span className="text-[9px] text-slate-500 block">
+                              Form 1 Snapshot
+                            </span>
+                          </td>
+
+                          {/* 4. Variance Column */}
+                          <td className="py-3 px-3.5 text-center font-mono-num font-bold">
+                            <span
+                              className={`text-xs ${
+                                Math.abs(row.variance) < 0.01
+                                  ? 'text-emerald-400 font-bold'
+                                  : row.variance < 0
+                                  ? 'text-rose-400 font-black'
+                                  : 'text-orange-400 font-black'
+                              }`}
+                            >
+                              {row.variance >= 0
+                                ? `+$${row.variance.toFixed(2)}`
+                                : `-$${Math.abs(row.variance).toFixed(2)}`}
+                            </span>
+                          </td>
+
+                          {/* 5. Status Column */}
                           <td className="py-3 px-3.5 text-center">
                             <div className="inline-flex flex-col items-center">
                               {row.status === 'No Activity' ? (
@@ -820,7 +1233,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                               ) : isBalanced ? (
                                 <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-black flex items-center space-x-1">
                                   <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                                  <span>Exact Balanced ($0.00)</span>
+                                  <span>Balanced</span>
                                 </span>
                               ) : isShortage ? (
                                 <span className="px-2.5 py-1 rounded-full bg-rose-500/20 border border-rose-500/40 text-rose-300 text-[11px] font-black flex items-center space-x-1">
@@ -830,22 +1243,23 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                               ) : (
                                 <span className="px-2.5 py-1 rounded-full bg-orange-500/20 border border-orange-500/40 text-orange-300 text-[11px] font-black flex items-center space-x-1">
                                   <TrendingUp className="w-3 h-3 text-orange-400" />
-                                  <span>Cash Over (+${row.variance.toFixed(2)})</span>
+                                  <span>Over (+${row.variance.toFixed(2)})</span>
                                 </span>
                               )}
                             </div>
                           </td>
 
-                          {/* 8. Audit Trail View Button */}
+                          {/* 6. Actions (Drill-down) */}
                           <td className="py-3 px-3 text-center">
                             <button
                               id={`btn-audit-staff-${row.staffId}`}
                               type="button"
                               onClick={() => setAuditStaffId(row.staffId)}
-                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition"
-                              title={`View Audit Trail for ${row.staffName}`}
+                              className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white text-[11px] font-bold inline-flex items-center space-x-1.5 transition border border-slate-700"
+                              title={`Drill-down to see movements for ${row.staffName}`}
                             >
-                              <Eye className="w-4 h-4 text-[#6A4DFF]" />
+                              <Eye className="w-3.5 h-3.5 text-[#6A4DFF]" />
+                              <span>View Movements</span>
                             </button>
                           </td>
                         </tr>
@@ -861,24 +1275,15 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                       <td className="py-3 px-3.5 font-black uppercase text-slate-300">
                         Grand Total ({filteredRows.length} Staff)
                       </td>
-                      <td className="py-3 px-3 text-right font-mono-num text-white">
-                        ${summaryTotals.totalForm2Net.toFixed(2)}
+                      <td className="py-3 px-3.5 text-right font-mono-num font-black text-sm text-indigo-300">
+                        ${summaryTotals.totalExpectedCash.toFixed(2)}
                       </td>
-                      <td className="py-3 px-3 text-right font-mono-num text-white">
-                        ${summaryTotals.totalForm3Net.toFixed(2)}
-                      </td>
-                      <td className="py-3 px-3.5 text-right font-mono-num font-black text-sm text-[#FF8A00] bg-purple-950/30 border-x border-purple-900/40">
-                        ${summaryTotals.totalSumForm2And3Net.toFixed(2)}
-                      </td>
-                      <td className="py-3 px-3.5 text-center font-mono-num font-black text-sm text-emerald-300 bg-emerald-950/20">
-                        ${summaryTotals.totalSales.toFixed(2)}
-                      </td>
-                      <td className="py-3 px-3.5 text-right font-mono-num font-black text-xs text-indigo-300">
-                        ${summaryTotals.totalShouldHave.toFixed(2)}
+                      <td className="py-3 px-3.5 text-right font-mono-num font-black text-sm text-emerald-300">
+                        ${(summaryTotals.totalPhysicalCount ?? 0).toFixed(2)}
                       </td>
                       <td className="py-3 px-3.5 text-center font-mono-num font-black text-xs">
                         <span
-                          className={`px-2.5 py-1 rounded-full text-xs ${
+                          className={`px-2 py-0.5 rounded-full text-xs ${
                             Math.abs(summaryTotals.totalVariance) < 0.01
                               ? 'bg-emerald-500/20 text-emerald-300'
                               : summaryTotals.totalVariance < 0
@@ -886,12 +1291,13 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                               : 'bg-orange-500/20 text-orange-300'
                           }`}
                         >
-                          {Math.abs(summaryTotals.totalVariance) < 0.01
-                            ? '$0.00 Balanced'
-                            : summaryTotals.totalVariance < 0
-                            ? `-$${Math.abs(summaryTotals.totalVariance).toFixed(2)}`
-                            : `+$${summaryTotals.totalVariance.toFixed(2)}`}
+                          {summaryTotals.totalVariance >= 0
+                            ? `+$${summaryTotals.totalVariance.toFixed(2)}`
+                            : `-$${Math.abs(summaryTotals.totalVariance).toFixed(2)}`}
                         </span>
+                      </td>
+                      <td className="py-3 px-3.5 text-center text-[10px] text-slate-400">
+                        {summaryTotals.countBalanced} Balanced
                       </td>
                       <td></td>
                     </tr>
@@ -905,20 +1311,39 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
               <div className="flex items-center space-x-2 text-slate-400">
                 <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                 <span>
-                  Admin entered figures are automatically stored in the local Room Database and synced.
+                  Total sales figures are calculated automatically from recorded POS sales for each salesperson on this date.
                 </span>
               </div>
 
               <div className="flex items-center space-x-2">
-                <button
-                  type="button"
-                  onClick={handleSaveAllSales}
-                  disabled={isSavingAll}
-                  className="py-2 px-4 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] hover:opacity-95 text-white font-black flex items-center space-x-1.5 shadow-md transition"
-                >
-                  <Save className="w-3.5 h-3.5" />
-                  <span>{isSavingAll ? 'Saving Entries...' : 'Save & Confirm All Sales'}</span>
-                </button>
+                {Object.keys(salesInputs).length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      salespeople.forEach((staff) => {
+                        saveAdminSalesEntry(date, staff.id, staff.name, 0, '');
+                      });
+                      setSalesInputs({});
+                      setEditingStaffId(null);
+                      setSaveSuccessBanner('Reset all salespeople to system recorded sales.');
+                    }}
+                    className="py-1.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold flex items-center space-x-1.5 transition text-xs"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Reset All Overrides</span>
+                  </button>
+                )}
+                {Object.keys(salesInputs).length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleSaveAllSales}
+                    disabled={isSavingAll}
+                    className="py-1.5 px-3.5 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] hover:opacity-95 text-white font-bold flex items-center space-x-1.5 shadow-md transition"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>{isSavingAll ? 'Saving...' : 'Save Overrides'}</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -1133,7 +1558,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                 Salesperson Cash Balancing Archive
               </h3>
               <p className="text-xs text-slate-400">
-                Historical records of external sales, Form 2 & Form 3 nets, and variance outcomes
+                Historical records of total sales, Form 2 & Form 3 nets, and variance outcomes
               </p>
             </div>
             <button
@@ -1193,31 +1618,31 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                 <div>
                   <span className="text-[10px] text-slate-400 block">Form 2 Net</span>
                   <span className="text-sm font-bold font-mono-num text-white">
-                    ${selectedAuditData.row?.form2Net.toFixed(2)}
+                    ${(selectedAuditData.row?.form2Net ?? 0).toFixed(2)}
                   </span>
                 </div>
                 <div>
                   <span className="text-[10px] text-slate-400 block">Form 3 Net</span>
                   <span className="text-sm font-bold font-mono-num text-white">
-                    ${selectedAuditData.row?.form3Net.toFixed(2)}
+                    ${(selectedAuditData.row?.form3Net ?? 0).toFixed(2)}
                   </span>
                 </div>
                 <div>
                   <span className="text-[10px] text-purple-300 block font-bold">Sum 2 & 3 Net</span>
                   <span className="text-sm font-black font-mono-num text-[#FF8A00]">
-                    ${selectedAuditData.row?.sumForm2And3Net.toFixed(2)}
+                    ${(selectedAuditData.row?.sumForm2And3Net ?? 0).toFixed(2)}
                   </span>
                 </div>
                 <div>
                   <span className="text-[10px] text-emerald-300 block font-bold">Sales</span>
                   <span className="text-sm font-bold font-mono-num text-emerald-400">
-                    ${selectedAuditData.row?.sales.toFixed(2)}
+                    ${(selectedAuditData.row?.sales ?? 0).toFixed(2)}
                   </span>
                 </div>
                 <div>
                   <span className="text-[10px] text-indigo-300 block font-bold">Should Have</span>
                   <span className="text-sm font-black font-mono-num text-indigo-300">
-                    ${selectedAuditData.row?.shouldHave.toFixed(2)}
+                    ${(selectedAuditData.row?.shouldHave ?? 0).toFixed(2)}
                   </span>
                 </div>
                 <div>
@@ -1238,6 +1663,125 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                 </div>
               </div>
 
+              {/* Form 4 Cash Balancing Breakdown */}
+              {selectedAuditData.row && (
+                <div className="p-4 rounded-2xl bg-slate-950/80 border border-indigo-500/30 space-y-3">
+                  <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                    <div className="flex items-center space-x-2">
+                      <Calculator className="w-4 h-4 text-indigo-400" />
+                      <span className="font-bold text-xs uppercase tracking-wider text-indigo-200">
+                        Form 4 Cash Balancing Breakdown
+                      </span>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[10px] text-slate-400 block">Expected Cash in Till</span>
+                      <span className="text-sm font-mono-num font-black text-indigo-300">
+                        ${(selectedAuditData.row.expectedCash ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Formula Breakdown Items Grid */}
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 text-[11px]">
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">+ Float</span>
+                      <span className="font-mono-num font-bold text-emerald-400">
+                        +${(selectedAuditData.row.float ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">+ Cash Sales</span>
+                      <span className="font-mono-num font-bold text-emerald-400">
+                        +${(selectedAuditData.row.cashSales ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">+ Credit Payments</span>
+                      <span className="font-mono-num font-bold text-emerald-400">
+                        +${(selectedAuditData.row.creditPayments ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">- Expenses</span>
+                      <span className="font-mono-num font-bold text-rose-400">
+                        -${(selectedAuditData.row.expenses ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">- Direct Procurements</span>
+                      <span className="font-mono-num font-bold text-rose-400">
+                        -${(selectedAuditData.row.directProcurements ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">- Cash Lift</span>
+                      <span className="font-mono-num font-bold text-rose-400">
+                        -${(selectedAuditData.row.cashLift ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">- Customer Change</span>
+                      <span className="font-mono-num font-bold text-rose-400">
+                        -${(selectedAuditData.row.customerChange ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">- Deductions</span>
+                      <span className="font-mono-num font-bold text-rose-400">
+                        -${(selectedAuditData.row.deductions ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                    {/* Active currencies till cash-outs */}
+                    {(selectedAuditData.row.activeCurrencies || getActiveCurrencies()).map((c) => {
+                      const wVal =
+                        (selectedAuditData.row.currencyWithdrawals && selectedAuditData.row.currencyWithdrawals[c.currency]) ??
+                        (c.currency === 'EcoCash'
+                          ? selectedAuditData.row.ecocashWithdrawal
+                          : c.currency === 'ZiG'
+                          ? selectedAuditData.row.zigWithdrawal
+                          : 0) ??
+                        0;
+                      return (
+                        <div key={c.currency} className="p-2 rounded-xl bg-purple-950/30 border border-purple-800/40">
+                          <span className="text-purple-300 block text-[10px] font-semibold">- {c.name} Cash-Out</span>
+                          <span className="font-mono-num font-bold text-rose-400">
+                            -${(Number(wVal) || 0).toFixed(2)}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Reporting-only non-cash sales */}
+                  <div className="p-2.5 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between text-[11px] text-slate-400 gap-2">
+                    <div className="flex items-center space-x-1.5">
+                      <Smartphone className="w-3.5 h-3.5 text-slate-400" />
+                      <span>Non-Cash Sales (Reporting Only — Not in Expected Physical Cash):</span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono-num">
+                      {(selectedAuditData.row.activeCurrencies || getActiveCurrencies()).map((c) => {
+                        const sVal =
+                          (selectedAuditData.row.currencySales && selectedAuditData.row.currencySales[c.currency]) ??
+                          (c.currency === 'EcoCash'
+                            ? selectedAuditData.row.ecocashSales
+                            : c.currency === 'ZiG'
+                            ? selectedAuditData.row.zigSales
+                            : 0) ??
+                          0;
+                        return (
+                          <span key={c.currency}>
+                            {c.name}: ${sVal.toFixed(2)}
+                          </span>
+                        );
+                      })}
+                      <span className="text-slate-200 font-bold">
+                        Total Non-Cash: ${(selectedAuditData.row.totalNonCashSales ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Form 1 Physical Count if available */}
               {selectedAuditData.form1Count && (
                 <div className="p-3 rounded-2xl bg-emerald-950/40 border border-emerald-500/30 flex items-center justify-between text-xs">
@@ -1246,17 +1790,99 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                     <span>Form 1 (Physical Cash Count Counted):</span>
                   </div>
                   <span className="font-mono-num font-black text-emerald-300 text-sm">
-                    ${selectedAuditData.form1Count.finalCashOutTotal.toFixed(2)}
+                    ${(selectedAuditData.form1Count.finalCashOutTotal ?? 0).toFixed(2)}
                   </span>
                 </div>
               )}
+
+              {/* Section 0: Canonical Cash Movements (cashMovements ledger) */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
+                  <span className="flex items-center space-x-1.5">
+                    <History className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Canonical Cash Movements ({selectedAuditData.staffMovements.length})</span>
+                  </span>
+                  <span className="text-indigo-300 font-mono-num font-bold">
+                    Expected: ${(selectedAuditData.row?.expectedCash ?? 0).toFixed(2)}
+                  </span>
+                </h4>
+
+                {selectedAuditData.staffMovements.length === 0 ? (
+                  <p className="p-3 text-center text-slate-500 bg-slate-950/40 rounded-xl">
+                    No canonical ledger movements recorded for this staff on this date.
+                  </p>
+                ) : (
+                  <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+                    {selectedAuditData.staffMovements.map((mov) => {
+                      const isIn = mov.direction === 'in';
+                      const isOut = mov.direction === 'out';
+                      const timeStr = new Date(mov.timestamp).toLocaleTimeString([], {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      });
+
+                      return (
+                        <div
+                          key={mov.id}
+                          className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between text-[11px] gap-2"
+                        >
+                          <div className="space-y-0.5 min-w-0">
+                            <div className="flex items-center space-x-1.5">
+                              <span
+                                className={`px-1.5 py-0.2 rounded text-[9px] font-black uppercase tracking-wider ${
+                                  isIn
+                                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                    : isOut
+                                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                                    : 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
+                                }`}
+                              >
+                                {mov.direction}
+                              </span>
+                              <span className="font-bold text-white uppercase tracking-tight text-[10px]">
+                                {mov.type.replace(/_/g, ' ')}
+                              </span>
+                              <span className="text-[10px] text-slate-500 font-mono-num">
+                                {timeStr}
+                              </span>
+                              <span className="text-[9px] px-1 py-0.2 rounded bg-slate-800 text-slate-400">
+                                {mov.sourceModule}
+                              </span>
+                            </div>
+                            <p className="text-slate-400 truncate text-[10px]">
+                              {mov.notes || mov.sourceRef || 'No details'}
+                            </p>
+                          </div>
+
+                          <div className="text-right shrink-0">
+                            <span
+                              className={`font-mono-num font-black text-xs block ${
+                                isIn
+                                  ? 'text-emerald-400'
+                                  : isOut
+                                  ? 'text-rose-400'
+                                  : 'text-indigo-300'
+                              }`}
+                            >
+                              {isIn ? '+' : isOut ? '-' : ''}${(mov.amount ?? 0).toFixed(2)}
+                            </span>
+                            <span className="text-[9px] text-slate-500 block">
+                              {mov.affectsDrawer ? 'Drawer' : 'Non-Drawer'}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
 
               {/* Section 1: Form 2 Cash Log Transactions */}
               <div className="space-y-2">
                 <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
                   <span>Form 2: Cash Log Movements ({selectedAuditData.form2Logs.length})</span>
                   <span className="text-purple-300 font-mono-num font-bold">
-                    Net: ${selectedAuditData.row?.form2Net.toFixed(2)}
+                    Net: ${(selectedAuditData.row?.form2Net ?? 0).toFixed(2)}
                   </span>
                 </h4>
 
@@ -1276,8 +1902,8 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                           <span className="text-slate-400 ml-1.5">({log.description})</span>
                         </div>
                         <div className="text-right font-mono-num font-bold">
-                          {log.in > 0 && <span className="text-emerald-400">+${log.in.toFixed(2)}</span>}
-                          {log.out > 0 && <span className="text-rose-400">-${log.out.toFixed(2)}</span>}
+                          {log.in > 0 && <span className="text-emerald-400">+${(log.in ?? 0).toFixed(2)}</span>}
+                          {log.out > 0 && <span className="text-rose-400">-${(log.out ?? 0).toFixed(2)}</span>}
                         </div>
                       </div>
                     ))}
@@ -1290,7 +1916,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                 <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
                   <span>Form 3: Customer Change Records ({selectedAuditData.form3Changes.length})</span>
                   <span className="text-slate-400 font-mono-num">
-                    Net: ${(selectedAuditData.row?.changeIn! - selectedAuditData.row?.changeOut!).toFixed(2)}
+                    Net: ${(((selectedAuditData.row?.changeReceived ?? selectedAuditData.row?.changeIn ?? 0) - (selectedAuditData.row?.changePaid ?? selectedAuditData.row?.customerChange ?? 0))).toFixed(2)}
                   </span>
                 </h4>
 
@@ -1336,13 +1962,90 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                           <span className="text-slate-400 ml-1.5">({cr.itemDescription})</span>
                         </div>
                         <div className="text-right font-mono-num font-bold text-amber-300">
-                          ${cr.amount.toFixed(2)}
+                          ${(cr.amount ?? 0).toFixed(2)}
                         </div>
                       </div>
                     ))}
                   </div>
                 </div>
               )}
+
+              {/* Section 4: Recorded System Sales */}
+              <div className="space-y-2">
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
+                  <span className="flex items-center space-x-1.5">
+                    <ShoppingBag className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>
+                      Recorded Sales (
+                      {selectedAuditData.staffSales.length + (selectedAuditData.adminSale ? 1 : 0)})
+                    </span>
+                  </span>
+                  <span className="text-emerald-400 font-mono-num font-bold">
+                    Total: $
+                    {(
+                      selectedAuditData.staffSales.reduce((sum, s) => sum + (s.total || 0), 0) +
+                      (selectedAuditData.adminSale && selectedAuditData.staffSales.length === 0
+                        ? selectedAuditData.adminSale.salesAmount || 0
+                        : 0)
+                    ).toFixed(2)}
+                  </span>
+                </h4>
+
+                {/* Display Admin / Form 4 Sales Entry if recorded */}
+                {selectedAuditData.adminSale && (
+                  <div className="p-2.5 rounded-xl bg-indigo-950/50 border border-indigo-500/40 flex items-center justify-between text-[11px] mb-2">
+                    <div className="space-y-0.5">
+                      <div className="flex items-center space-x-2">
+                        <span className="font-bold text-indigo-300">Balancing / Admin Sales Record</span>
+                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-900/80 text-indigo-200 font-semibold">
+                          Form 4 Entry
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-slate-400">
+                        {selectedAuditData.adminSale.notes ||
+                          `Reconciliation sales record for ${selectedAuditData.staff.name}`}
+                      </div>
+                    </div>
+                    <div className="text-right font-mono-num font-bold text-emerald-400 text-xs">
+                      ${(selectedAuditData.adminSale.salesAmount ?? 0).toFixed(2)}
+                    </div>
+                  </div>
+                )}
+
+                {selectedAuditData.staffSales.length === 0 && !selectedAuditData.adminSale ? (
+                  <p className="p-3 text-center text-slate-500 bg-slate-950/40 rounded-xl">
+                    No sales invoices recorded for this salesperson on this date.
+                  </p>
+                ) : (
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                    {selectedAuditData.staffSales.map((sale) => (
+                      <div
+                        key={sale.id}
+                        className="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
+                      >
+                        <div className="space-y-0.5">
+                          <div className="flex items-center space-x-2">
+                            <span className="font-bold text-white font-mono-num">{sale.id || 'POS-INV'}</span>
+                            <span className="text-slate-400">• {sale.customerName || 'Walk-in Customer'}</span>
+                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-semibold">
+                              {sale.paymentMethod || sale.currency || 'Cash'}
+                            </span>
+                          </div>
+                          <div className="text-[10px] text-slate-400 truncate max-w-sm">
+                            {sale.itemsSummary ||
+                              (sale.items && sale.items.length > 0
+                                ? sale.items.map((i) => `${i.quantity}x ${i.name}`).join(', ')
+                                : 'General Store Sale Items')}
+                          </div>
+                        </div>
+                        <div className="text-right font-mono-num font-bold text-emerald-400 text-xs">
+                          ${(sale.total ?? 0).toFixed(2)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Modal Footer */}
@@ -1366,6 +2069,81 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         onSelectCustomer={(c) => setLinkedCustomer(c)}
         currentUser={currentUser}
       />
+
+      {/* End of Day (EOD) Encrypted Database Backup Modal */}
+      <DatabaseBackupModal
+        isOpen={showEodBackupModal}
+        onClose={() => setShowEodBackupModal(false)}
+        defaultType="EOD_HANDOVER"
+        staffName={currentUser.name}
+      />
+
+      {/* Database Restore Modal for Supervisor to Upload Owner Master Update */}
+      <DatabaseRestoreModal
+        isOpen={showRestoreModal}
+        onClose={() => setShowRestoreModal(false)}
+        defaultMode="master_only"
+        onRestoreSuccess={() => {
+          window.location.reload();
+        }}
+      />
+        </>
+      )}
+
+      {/* Form 4 Dedicated Password Configuration Modal */}
+      {showPasswordSetupModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-purple-500/40 rounded-3xl p-6 max-w-sm w-full space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2">
+                <div className="w-8 h-8 rounded-xl bg-purple-600/20 text-purple-400 flex items-center justify-center font-bold">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <h3 className="font-bold text-white text-sm">Form 4 Audit Password</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPasswordSetupModal(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-400">
+              Set a dedicated password for End-of-Day Shift Balancing (Z-Report). Leave empty to allow any authorized manager to unlock via PIN.
+            </p>
+            <div>
+              <input
+                type="password"
+                value={newPasswordInput}
+                onChange={(e) => setNewPasswordInput(e.target.value)}
+                placeholder="Enter new audit password..."
+                className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-white text-xs focus:ring-2 focus:ring-purple-500"
+              />
+            </div>
+            <div className="flex justify-end space-x-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowPasswordSetupModal(false)}
+                className="px-3 py-1.5 rounded-xl bg-slate-800 text-slate-300 text-xs font-bold"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  saveCompanyBranchSettings({ form4AuditPassword: newPasswordInput.trim() });
+                  setShowPasswordSetupModal(false);
+                  alert('Form 4 Audit Password updated successfully!');
+                }}
+                className="px-3 py-1.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-xs font-bold"
+              >
+                Save Password
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

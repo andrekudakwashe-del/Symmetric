@@ -19,11 +19,19 @@ import {
   ShieldCheck,
   Wifi,
   QrCode,
+  AlertCircle,
+  Activity,
+  Layers,
+  Menu,
+  Printer,
+  Crown,
 } from 'lucide-react';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import { ShareDeviceModal } from '../common/ShareDeviceModal';
 import { meshSyncService } from '../../services/meshSyncService';
 import { TenantBranchSwitcher } from '../admin/TenantBranchSwitcher';
+import { persistentSyncEngine, SyncQueueStats } from '../../services/persistentSyncEngine';
+import { getCurrentCompany } from '../../db/roomDatabase';
 
 interface TopHeaderProps {
   currentUser: Salesperson | null;
@@ -38,6 +46,11 @@ interface TopHeaderProps {
   onTriggerSync?: () => void;
   onOpenPermissions?: () => void;
   onOpenSuperAdmin?: () => void;
+  onOpenDiagnostics?: () => void;
+  onOpenTenantDiagnostics?: () => void;
+  onOpenHamburgerMenu?: () => void;
+  onOpenPrinterModal?: () => void;
+  onBranchChange?: (branchId: string, branchName: string) => void;
 }
 
 export const TopHeader: React.FC<TopHeaderProps> = ({
@@ -53,22 +66,48 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   onTriggerSync,
   onOpenPermissions,
   onOpenSuperAdmin,
+  onOpenDiagnostics,
+  onOpenTenantDiagnostics,
+  onOpenHamburgerMenu,
+  onOpenPrinterModal,
+  onBranchChange,
 }) => {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [peerCount, setPeerCount] = useState<number>(0);
+  const [syncStats, setSyncStats] = useState<SyncQueueStats>({
+    total: 0,
+    pending: 0,
+    syncing: 0,
+    done: 0,
+    failed: 0,
+  });
   const menuRef = useRef<HTMLDivElement>(null);
 
   const isSuperAdmin =
     currentUser?.role === 'SUPER_ADMIN' ||
     currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
 
+  const canAccessAdmin =
+    isSuperAdmin ||
+    currentUser?.role === 'Admin' ||
+    currentUser?.role === 'Supervisor' ||
+    (currentUser?.role as any) === 'OWNER' ||
+    (currentUser?.role as any) === 'ADMIN';
+
   useEffect(() => {
-    const unsub = meshSyncService.subscribePeers((count) => {
+    const unsubMesh = meshSyncService.subscribePeers((count) => {
       setPeerCount(count);
     });
-    return () => unsub();
+    const comp = getCurrentCompany();
+    const unsubStats = persistentSyncEngine.subscribeStats((stats) => {
+      setSyncStats(stats);
+    }, comp.company_id);
+    return () => {
+      unsubMesh();
+      unsubStats();
+    };
   }, []);
 
   // Close profile dropdown on outside click
@@ -103,7 +142,20 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
 
         <div className="max-w-7xl mx-auto px-3 sm:px-4 py-2.5 sm:py-3 flex items-center justify-between relative z-10">
           {/* Left: Branding & Tenant Branch Switcher */}
-          <div className="flex items-center space-x-3 sm:space-x-4">
+          <div className="flex items-center space-x-2 sm:space-x-4">
+            {/* Functional Hamburger Menu Trigger */}
+            {onOpenHamburgerMenu && (
+              <button
+                type="button"
+                id="btn-header-hamburger-menu"
+                onClick={onOpenHamburgerMenu}
+                className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-white/15 hover:bg-white/30 border border-white/25 flex items-center justify-center text-white transition active:scale-95 shadow cursor-pointer shrink-0"
+                title="Open Navigation Menu (Grouped by Core Role & Functionality)"
+              >
+                <Menu className="w-5 h-5 text-white" />
+              </button>
+            )}
+
             <div
               className="flex items-center space-x-2.5 cursor-pointer"
               onClick={() => onTabChange?.('home')}
@@ -135,6 +187,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 currentUser={currentUser}
                 onOpenPermissions={onOpenPermissions}
                 onOpenSuperAdmin={isSuperAdmin ? onOpenSuperAdmin : undefined}
+                onBranchChange={onBranchChange}
               />
             </div>
           </div>
@@ -171,6 +224,20 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
             {/* PWA Offline Install Button */}
             <PWAInstallButton variant="pill" />
 
+            {/* Thermal Receipt Printer Setup Button */}
+            {onOpenPrinterModal && (
+              <button
+                id="btn-quick-printer-setup"
+                type="button"
+                onClick={onOpenPrinterModal}
+                className="flex items-center space-x-1 sm:space-x-1.5 text-xs font-semibold px-2 sm:px-3 py-1.5 min-h-[38px] sm:min-h-[44px] rounded-full transition-all border shadow-sm cursor-pointer bg-slate-900/80 hover:bg-slate-800 border-slate-700/80 text-slate-200"
+                title="Thermal Receipt Printer Setup (ESC/POS 58mm / 80mm)"
+              >
+                <Printer className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">Printer</span>
+              </button>
+            )}
+
             {/* P2P WiFi Mesh Hub Button */}
             <button
               id="btn-open-p2p-mesh"
@@ -188,29 +255,43 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               <span className="sm:hidden">{peerCount > 0 ? `${peerCount + 1}` : '1'}</span>
             </button>
 
-            {/* Sheets Sync Hub Button - Super Admin only */}
-            {isSuperAdmin && onOpenSyncModal && (
-              <button
-                id="btn-open-sheets-sync"
-                type="button"
-                onClick={onOpenSyncModal}
-                className={`flex items-center space-x-1 sm:space-x-1.5 text-xs font-semibold px-2 sm:px-3 py-1.5 min-h-[38px] sm:min-h-[44px] rounded-full transition-all border shadow-sm ${
-                  pendingSyncCount > 0
-                    ? 'bg-amber-500 hover:bg-amber-400 text-slate-950 border-amber-300 animate-pulse font-bold'
-                    : 'bg-white/20 hover:bg-white/30 text-white border-white/30'
-                }`}
-              >
-                <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${isSyncing ? 'animate-spin' : ''}`} />
-                <span className="hidden md:inline">Sheets Sync</span>
-                {pendingSyncCount > 0 ? (
-                  <span className="bg-slate-950 text-amber-300 text-[10px] font-black px-1.5 py-0.2 rounded-full">
-                    {pendingSyncCount}
-                  </span>
-                ) : (
-                  <span className="text-[10px] text-white/90">✓</span>
-                )}
-              </button>
-            )}
+            {/* Stage 2 Work Stream A.4: Sync status badge in top bar:
+                - Green "Synced" — queue empty
+                - Yellow "Syncing N" — pending
+                - Red "Sync error (N)" — failed
+                Tap opens the queue with a manual retry button. */}
+            <button
+              id="btn-sync-status-badge"
+              type="button"
+              onClick={() => (onOpenDiagnostics ? onOpenDiagnostics() : onOpenSyncModal?.())}
+              title="Persistent Sync Engine Status (Click to open queue & diagnostics)"
+              className={`flex items-center space-x-1 sm:space-x-1.5 text-xs font-semibold px-2 sm:px-3 py-1.5 min-h-[38px] sm:min-h-[44px] rounded-full transition-all border shadow-sm cursor-pointer ${
+                syncStats.failed > 0
+                  ? 'bg-rose-500/25 hover:bg-rose-500/35 border-rose-400/80 text-rose-200 shadow-rose-900/40 animate-pulse'
+                  : syncStats.pending + syncStats.syncing > 0
+                  ? 'bg-amber-500/25 hover:bg-amber-500/35 border-amber-400/80 text-amber-200 shadow-amber-900/30'
+                  : 'bg-emerald-500/20 hover:bg-emerald-500/30 border-emerald-400/50 text-emerald-200 shadow-emerald-900/20'
+              }`}
+            >
+              {syncStats.failed > 0 ? (
+                <>
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-400" />
+                  <span className="hidden sm:inline font-bold">Sync error ({syncStats.failed})</span>
+                  <span className="sm:hidden font-bold">Error ({syncStats.failed})</span>
+                </>
+              ) : syncStats.pending + syncStats.syncing > 0 ? (
+                <>
+                  <RefreshCw className="w-3.5 h-3.5 shrink-0 text-amber-300 animate-spin" />
+                  <span className="hidden sm:inline font-bold">Syncing {syncStats.pending + syncStats.syncing}</span>
+                  <span className="sm:hidden font-bold">Sync {syncStats.pending + syncStats.syncing}</span>
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+                  <span>Synced</span>
+                </>
+              )}
+            </button>
 
             {/* User Profile Pill & Dropdown */}
             {currentUser && (
@@ -273,6 +354,49 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                     </div>
 
                     <div className="pt-2 border-t border-slate-800 space-y-2">
+                      {/* Super Admin Console - Exclusive to Platform Owner */}
+                      {isSuperAdmin && (
+                        <button
+                          type="button"
+                          id="btn-dropdown-super-admin"
+                          onClick={() => {
+                            setIsProfileOpen(false);
+                            if (onOpenSuperAdmin) onOpenSuperAdmin();
+                            else onTabChange?.('super_admin');
+                          }}
+                          className="w-full py-2.5 px-3 rounded-xl bg-gradient-to-r from-amber-950/80 via-purple-950/80 to-amber-950/80 hover:from-amber-900/90 hover:to-purple-900/90 text-amber-200 text-xs font-black flex items-center justify-between transition border border-amber-500/50 shadow-md cursor-pointer"
+                        >
+                          <div className="flex items-center space-x-2">
+                            <Crown className="w-4 h-4 text-amber-400" />
+                            <span>Platform Super Admin</span>
+                          </div>
+                          <span className="text-[10px] text-slate-950 font-black bg-amber-400 px-1.5 py-0.5 rounded shadow-sm">
+                            CONSOLE
+                          </span>
+                        </button>
+                      )}
+
+                      {/* Thermal Printer Setup */}
+                      {onOpenPrinterModal && (
+                        <button
+                          type="button"
+                          id="btn-dropdown-printer-setup"
+                          onClick={() => {
+                            setIsProfileOpen(false);
+                            onOpenPrinterModal();
+                          }}
+                          className="w-full py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-between transition border border-slate-700/60 cursor-pointer"
+                        >
+                          <div className="flex items-center space-x-2">
+                            <Printer className="w-4 h-4 text-indigo-400" />
+                            <span>Thermal Printer Setup</span>
+                          </div>
+                          <span className="text-[10px] text-indigo-300 font-mono font-bold bg-indigo-950/80 px-1.5 py-0.5 rounded border border-indigo-800/60">
+                            ESC/POS
+                          </span>
+                        </button>
+                      )}
+
                       <button
                         type="button"
                         id="btn-dropdown-audit-log"
@@ -290,6 +414,46 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                           ON
                         </span>
                       </button>
+
+                      <button
+                        type="button"
+                        id="btn-dropdown-sync-diagnostics"
+                        onClick={() => {
+                          setIsProfileOpen(false);
+                          if (onOpenDiagnostics) onOpenDiagnostics();
+                          else onOpenSyncModal?.();
+                        }}
+                        className="w-full py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center justify-between transition border border-slate-700/60"
+                      >
+                        <div className="flex items-center space-x-2">
+                          <Activity className="w-4 h-4 text-cyan-400" />
+                          <span>Sync Diagnostics &amp; Queue</span>
+                        </div>
+                        <span className="text-[10px] text-cyan-300 font-mono font-bold bg-cyan-950/80 px-1.5 py-0.5 rounded border border-cyan-800/60">
+                          {syncStats.pending + syncStats.failed > 0 ? `${syncStats.pending + syncStats.failed} queued` : 'Ready'}
+                        </span>
+                      </button>
+
+                      {/* Work Stream E: Tenant Diagnostics (Owner / Supervisor only) */}
+                      {canAccessAdmin && (
+                        <button
+                          type="button"
+                          id="btn-dropdown-tenant-diagnostics"
+                          onClick={() => {
+                            setIsProfileOpen(false);
+                            if (onOpenTenantDiagnostics) onOpenTenantDiagnostics();
+                          }}
+                          className="w-full py-2 px-3 rounded-xl bg-indigo-950/40 hover:bg-indigo-900/60 text-indigo-200 text-xs font-bold flex items-center justify-between transition border border-indigo-700/50"
+                        >
+                          <div className="flex items-center space-x-2">
+                            <Layers className="w-4 h-4 text-indigo-400" />
+                            <span>Tenant Diagnostics &amp; Health</span>
+                          </div>
+                          <span className="text-[10px] text-indigo-300 font-mono font-bold bg-indigo-950 px-1.5 py-0.5 rounded border border-indigo-800/60">
+                            Schema
+                          </span>
+                        </button>
+                      )}
 
                       <button
                         type="button"

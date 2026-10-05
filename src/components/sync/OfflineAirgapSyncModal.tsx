@@ -61,7 +61,7 @@ export const OfflineAirgapSyncModal: React.FC<OfflineAirgapSyncModalProps> = ({
     try {
       if (html5QrCodeRef.current) {
         await html5QrCodeRef.current.applyVideoConstraints({
-          advanced: [{ torch: nextState }],
+          advanced: [{ torch: nextState } as any],
         });
         setIsTorchOn(nextState);
         return;
@@ -135,7 +135,10 @@ export const OfflineAirgapSyncModal: React.FC<OfflineAirgapSyncModalProps> = ({
         } catch (e) {}
       }
 
-      const qr = new Html5Qrcode(qrRegionId);
+      const qr = new Html5Qrcode(qrRegionId, {
+        useBarCodeDetectorIfSupported: false,
+        verbose: false,
+      });
       html5QrCodeRef.current = qr;
 
       const config = {

@@ -42,9 +42,11 @@ import {
   MapPin,
   Laptop,
   Unlink,
+  Database,
 } from 'lucide-react';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import { RegistrationScreen } from './RegistrationScreen';
+import { DatabaseRestoreModal } from '../common/DatabaseRestoreModal';
 import { initializeSystemConfigAndSync } from '../../services/systemConfig';
 import {
   authenticateOwnerWithAppsScript,
@@ -145,7 +147,15 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   useEffect(() => {
     const unsub = subscribeRoomDatabase(() => {
       const fresh = getCompanies();
-      setCompanies(fresh);
+      setCompanies((prev) => {
+        if (
+          prev.length === fresh.length &&
+          prev.every((p, idx) => p.company_id === fresh[idx]?.company_id && p.company_name === fresh[idx]?.company_name)
+        ) {
+          return prev;
+        }
+        return fresh;
+      });
     });
     return unsub;
   }, []);
@@ -200,8 +210,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       const validIds = companyBranches.map((b) => b.branchId || b.id || (b as any).branch_id);
       if (!validIds.includes(selectedBranchId) || selectedBranchId === 'ALL') {
         const firstId = validIds[0];
-        setSelectedBranchId(firstId);
-        setCurrentBranchId(firstId);
+        if (selectedBranchId !== firstId) {
+          setSelectedBranchId(firstId);
+        }
       }
     }
   }, [companyBranches, selectedBranchId]);
@@ -278,6 +289,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [showForgotPasswordModal, setShowForgotPasswordModal] = useState(false);
   const [recoveryEmail, setRecoveryEmail] = useState('');
   const [recoveryStatus, setRecoveryStatus] = useState<string | null>(null);
+
+  // Encrypted Backup Restore Modal (Stage 1 & Stage 2 Disaster Recovery)
+  const [showRestoreModal, setShowRestoreModal] = useState(false);
+  const [restoreMode, setRestoreMode] = useState<'replace' | 'append'>('replace');
 
   const handleDeregisterDevice = () => {
     try {
@@ -581,22 +596,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
             <button
               type="button"
               onClick={() => setMode('login')}
-              className={`flex-1 py-2 rounded-xl transition-all ${
-                mode === 'login'
-                  ? 'bg-[#6A4DFF] text-white shadow-md'
-                  : 'text-slate-400 hover:text-white'
-              }`}
+              className="flex-1 py-2 rounded-xl transition-all bg-[#6A4DFF] text-white shadow-md"
             >
               Sign In to Store
             </button>
             <button
               type="button"
               onClick={() => setMode('register')}
-              className={`flex-1 py-2 rounded-xl transition-all flex items-center justify-center gap-1.5 ${
-                mode === 'register'
-                  ? 'bg-amber-500 text-slate-950 shadow-md'
-                  : 'text-amber-400 hover:text-amber-300'
-              }`}
+              className="flex-1 py-2 rounded-xl transition-all flex items-center justify-center gap-1.5 text-amber-400 hover:text-amber-300"
             >
               <Sparkles className="w-3.5 h-3.5" />
               <span>14-Day Free Trial</span>
@@ -730,9 +737,23 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               )}
             </button>
 
-            {/* Quick Resume Link if Device is already registered */}
-            {isDeviceRegistered && (
-              <div className="pt-2 text-center border-t border-slate-800/80">
+            {/* Lost / Replacement Device Restore from Backup */}
+            <div className="pt-2 text-center border-t border-slate-800/80 space-y-2">
+              <button
+                id="btn-login-restore-backup"
+                type="button"
+                onClick={() => {
+                  setRestoreMode('replace');
+                  setShowRestoreModal(true);
+                }}
+                className="w-full py-2.5 px-3 rounded-xl bg-slate-950/80 hover:bg-slate-800 border border-slate-700/80 text-slate-300 hover:text-white font-semibold text-xs transition flex items-center justify-center gap-2 cursor-pointer shadow-sm"
+              >
+                <Database className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                <span>Lost or New Device? Restore from Encrypted Backup</span>
+              </button>
+
+              {/* Quick Resume Link if Device is already registered */}
+              {isDeviceRegistered && (
                 <button
                   type="button"
                   onClick={() => setAuthTier('staff')}
@@ -742,8 +763,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   <span>Resume Staff PIN Login for {registeredCompanyName || selectedCompanyId}</span>
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
-              </div>
-            )}
+              )}
+            </div>
           </form>
         ) : (
           /* TIER 2: STAFF SELECTION & 4-DIGIT PIN AUTHENTICATION */
@@ -1001,6 +1022,23 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   <LogIn className="w-4 h-4" />
                   <span>{isLoading ? 'Verifying PIN...' : `Log In as ${selectedStaff?.name || 'Staff'}`}</span>
                 </button>
+
+                {/* Tier 2 Disaster Recovery / Restore Option */}
+                <div className="pt-2 text-center border-t border-slate-800/80">
+                  <button
+                    id="btn-staff-restore-backup"
+                    type="button"
+                    onClick={() => {
+                      setRestoreMode('append');
+                      setShowRestoreModal(true);
+                    }}
+                    className="w-full py-2 px-3 rounded-xl bg-slate-950/60 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-slate-200 font-medium text-[11px] transition flex items-center justify-center gap-1.5 cursor-pointer"
+                    title="Restore or append records from encrypted backup file (.saimetric.enc)"
+                  >
+                    <Database className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                    <span>Disaster Recovery &amp; Restore from Backup</span>
+                  </button>
+                </div>
               </>
             )}
           </div>
@@ -1127,6 +1165,17 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           </div>
         </div>
       )}
+
+      {/* Encrypted Backup Restore Modal (Stage 1 & Stage 2) */}
+      <DatabaseRestoreModal
+        isOpen={showRestoreModal}
+        onClose={() => setShowRestoreModal(false)}
+        defaultMode={restoreMode}
+        onRestoreSuccess={() => {
+          // Force page refresh so restored company, staff, and state are immediately active
+          window.location.reload();
+        }}
+      />
 
       {/* Footer info & Install App option */}
       <div className="text-center text-xs text-slate-500 pb-2 flex flex-col items-center space-y-2 max-w-sm mx-auto w-full">

@@ -25,6 +25,7 @@ import {
   Trash2,
   AlertCircle,
   X,
+  Coins,
 } from 'lucide-react';
 
 interface POSItemsViewProps {
@@ -37,9 +38,11 @@ interface POSItemsViewProps {
   onRemoveItem?: (productId: string) => void;
   onGoToCounter: () => void;
   onOpenMoreMenu?: () => void;
+  onOpenCurrencySelector?: () => void;
   onOpenCustomerModal?: () => void;
   onQuickAddProduct?: (product: Product) => void;
   initialSearch?: string;
+  selectedCurrency?: string;
 }
 
 // Avatar background colors to make items distinct & appealing
@@ -62,9 +65,11 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
   onRemoveItem,
   onGoToCounter,
   onOpenMoreMenu,
+  onOpenCurrencySelector,
   onOpenCustomerModal,
   onQuickAddProduct,
   initialSearch = '',
+  selectedCurrency = 'USD',
 }) => {
   const [searchQuery, setSearchQuery] = useState(initialSearch);
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
@@ -135,7 +140,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
 
   // Filtered products
   const filteredProducts = useMemo(() => {
-    return products.filter((p) => {
+    const list = products.filter((p) => {
       const matchesCategory = selectedCategory === 'All' || p.category === selectedCategory;
       const q = (searchQuery || '').toLowerCase().trim();
       const matchesSearch =
@@ -147,20 +152,31 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
         (p.barcode && String(p.barcode).includes(q));
       return matchesCategory && matchesSearch;
     });
+    // Deduplicate by product.id to guarantee no duplicate React keys
+    const seen = new Set<string>();
+    return list.filter((p) => {
+      const key = p.id || p.sku;
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }, [products, selectedCategory, searchQuery]);
 
   return (
     <div className="space-y-3 pb-28 select-none animate-fadeIn">
-      {/* 1. Top Header Bar (Matching Desired 2 & Desired 4) */}
-      <div className="bg-gradient-to-r from-[#6A4DFF] via-[#7B5BFF] to-[#FF8A00] text-white rounded-3xl p-3.5 sm:p-4 shadow-xl">
+      {/* 1. Top Header Bar (Matching Desired 2 & Desired 4) - Sticky Frozen Search */}
+      <div className="sticky top-0 z-30 bg-gradient-to-r from-[#6A4DFF] via-[#7B5BFF] to-[#FF8A00] text-white rounded-3xl p-3.5 sm:p-4 shadow-xl backdrop-blur-md">
         <div className="flex items-center justify-between">
-          {/* Left: Menu */}
+          {/* Left: Currency Selection & Rates Option */}
           <button
             type="button"
-            onClick={onOpenMoreMenu}
-            className="w-10 h-10 rounded-2xl bg-white/15 hover:bg-white/25 flex items-center justify-center transition active:scale-95 text-white"
+            id="btn-pos-items-currency"
+            onClick={onOpenCurrencySelector || onOpenMoreMenu}
+            title="Select Currency & Exchange Rates"
+            className="h-10 px-3 rounded-2xl bg-white/20 hover:bg-white/30 flex items-center space-x-1.5 transition active:scale-95 text-white font-bold text-xs border border-white/30 shadow-sm"
           >
-            <Menu className="w-5 h-5" />
+            <Coins className="w-4 h-4 text-amber-300" />
+            <span className="font-mono">{selectedCurrency}</span>
           </button>
 
           {/* Center: Title */}
@@ -343,7 +359,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
 
             return (
               <ProductGestureListRow
-                key={product.id}
+                key={`${product.id}-${idx}`}
                 product={product}
                 quantityInCart={qty}
                 avatarBg={avatarBg}
@@ -363,7 +379,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
 
             return (
               <ProductGestureCard
-                key={product.id}
+                key={`${product.id}-${idx}`}
                 product={product}
                 quantityInCart={qty}
                 avatarBg={avatarBg}

@@ -54,8 +54,12 @@ import {
   FileSpreadsheet,
   Crown,
   BadgeCheck,
+  RefreshCw,
+  Star,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import { persistentSyncEngine } from '../../services/persistentSyncEngine';
+import { RoleConfigurationManager } from './RoleConfigurationManager';
 
 interface StaffAccessManagementScreenProps {
   currentUser: Salesperson;
@@ -92,6 +96,7 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canPinOverride: true,
       canManageCompany: true,
       canEditMasterPrice: true,
+      canEditExchangeRate: true, // Owner-only by default
       canSeeMargin: true,
     };
   }
@@ -122,6 +127,7 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canPinOverride: true,
       canManageCompany: false, // Manage Company OFF
       canEditMasterPrice: false, // Edit Master Price OFF
+      canEditExchangeRate: false, // Exchange Rate OFF without Owner assignment
       canSeeMargin: true,
     };
   }
@@ -152,6 +158,7 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canPinOverride: true, // PIN Override ON
       canManageCompany: false,
       canEditMasterPrice: false,
+      canEditExchangeRate: false,
       canSeeMargin: true,
     };
   }
@@ -182,6 +189,7 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canPinOverride: false,
       canManageCompany: false,
       canEditMasterPrice: false,
+      canEditExchangeRate: false,
       canSeeMargin: false, // See Margin OFF
     };
   }
@@ -212,6 +220,7 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canPinOverride: false,
       canManageCompany: false,
       canEditMasterPrice: false,
+      canEditExchangeRate: false,
       canSeeMargin: false,
     };
   }
@@ -228,11 +237,13 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
   const [branches, setBranches] = useState<Branch[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRoleFilter, setSelectedRoleFilter] = useState<string>('All');
+  const [mainTab, setMainTab] = useState<'staff' | 'roles'>('staff');
 
   // Unified Staff Editor Modal
   const [isEditorOpen, setIsEditorOpen] = useState(false);
   const [editingStaff, setEditingStaff] = useState<Salesperson | null>(null);
   const [activeEditorTab, setActiveEditorTab] = useState<'profile' | 'permissions'>('profile');
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   // Form State
   const [formName, setFormName] = useState('');
@@ -360,6 +371,17 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
     if (!/^\d{4}$/.test(formPin)) {
       setFormError('PIN must be exactly 4 numeric digits (e.g. 1234).');
       return;
+    }
+
+    if (formEmail.trim()) {
+      const emailLower = formEmail.trim().toLowerCase();
+      const duplicate = salespeople.find(
+        (s) => s.id !== editingStaff?.id && s.email && s.email.trim().toLowerCase() === emailLower
+      );
+      if (duplicate) {
+        setFormError(`A staff member with email "${formEmail.trim()}" already exists. Please use a unique email address.`);
+        return;
+      }
     }
 
     // Ensure at least one branch assignment exists
@@ -655,6 +677,12 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           description: 'Configure tenant company details, branches, and subscription settings',
           critical: true,
         },
+        {
+          key: 'canEditExchangeRate' as keyof StaffPermissions,
+          title: 'Edit Multi-Currency Exchange Rates & Cash Out',
+          description: 'Owner-governed privilege to change ZiG/EcoCash rates to USD and cash withdrawal policies',
+          critical: true,
+        },
       ],
     },
   ];
@@ -691,50 +719,112 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
             </div>
           </div>
 
+          <div className="flex items-center space-x-2">
+            <button
+              type="button"
+              id="btn-refresh-staff-delta"
+              onClick={async () => {
+                setIsRefreshing(true);
+                try {
+                  const count = await persistentSyncEngine.forceRefreshStaff();
+                  loadData();
+                  alert(`Staff refreshed from server: ${count} staff records updated.`);
+                } catch (e: any) {
+                  alert(`Refresh error: ${e.message || String(e)}`);
+                } finally {
+                  setIsRefreshing(false);
+                }
+              }}
+              disabled={isRefreshing}
+              className="px-3.5 py-2.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center space-x-1.5 transition active:scale-95 disabled:opacity-50 cursor-pointer"
+              title="Refresh staff from Google Sheets / server"
+            >
+              <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">Refresh Staff</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleOpenAdd}
+              className="px-4 py-2.5 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-amber-400/20 transition active:scale-95 cursor-pointer"
+            >
+              <UserPlus className="w-4 h-4" />
+              <span>Add Staff</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Sub-Navigation Switcher: Staff Directory vs Role Ranking & Configuration */}
+        <div className="mt-4 pt-3 border-t border-white/20 flex items-center space-x-2">
           <button
             type="button"
-            onClick={handleOpenAdd}
-            className="px-4 py-2.5 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-amber-400/20 transition active:scale-95"
+            id="tab-subnav-staff-directory"
+            onClick={() => setMainTab('staff')}
+            className={`px-4 py-2 rounded-2xl text-xs font-bold transition flex items-center space-x-2 cursor-pointer ${
+              mainTab === 'staff'
+                ? 'bg-white text-slate-950 shadow-md font-black'
+                : 'bg-white/15 text-white hover:bg-white/25'
+            }`}
           >
-            <UserPlus className="w-4 h-4" />
-            <span>Add Staff</span>
+            <Users className="w-4 h-4" />
+            <span>Staff Directory &amp; Terminals</span>
+          </button>
+
+          <button
+            type="button"
+            id="tab-subnav-role-ranking"
+            onClick={() => setMainTab('roles')}
+            className={`px-4 py-2 rounded-2xl text-xs font-bold transition flex items-center space-x-2 cursor-pointer ${
+              mainTab === 'roles'
+                ? 'bg-amber-400 text-slate-950 shadow-md font-black'
+                : 'bg-white/15 text-white hover:bg-white/25'
+            }`}
+          >
+            <Star className="w-4 h-4 fill-current text-amber-950" />
+            <span>Role Configuration &amp; Priority Ranking</span>
           </button>
         </div>
 
-        {/* Filter Bar */}
-        <div className="mt-4 pt-4 border-t border-white/15 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
-          <div className="relative flex-1">
-            <Search className="w-4 h-4 text-white/60 absolute left-3.5 top-3 pointer-events-none" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search staff by name, PIN, email or phone..."
-              className="w-full bg-black/20 border border-white/20 rounded-2xl pl-10 pr-4 py-2 text-xs font-medium text-white placeholder:text-white/50 focus:outline-none focus:border-amber-300 backdrop-blur-md"
-            />
-          </div>
+        {/* Filter Bar (Visible only on Staff Directory tab) */}
+        {mainTab === 'staff' && (
+          <div className="mt-3 pt-3 border-t border-white/15 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-white/60 absolute left-3.5 top-3 pointer-events-none" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search staff by name, PIN, email or phone..."
+                className="w-full bg-black/20 border border-white/20 rounded-2xl pl-10 pr-4 py-2 text-xs font-medium text-white placeholder:text-white/50 focus:outline-none focus:border-amber-300 backdrop-blur-md"
+              />
+            </div>
 
-          <div className="flex items-center space-x-1 overflow-x-auto pb-1 sm:pb-0">
-            {['All', 'OWNER', 'BRANCH_MANAGER', 'SUPERVISOR', 'CASHIER', 'STOCK_CLERK'].map((role) => (
-              <button
-                key={role}
-                type="button"
-                onClick={() => setSelectedRoleFilter(role)}
-                className={`px-3 py-1.5 rounded-xl text-[11px] font-bold transition whitespace-nowrap ${
-                  selectedRoleFilter === role
-                    ? 'bg-white text-slate-950 shadow-md'
-                    : 'bg-white/10 hover:bg-white/20 text-white'
-                }`}
-              >
-                {role === 'All' ? 'All Roles' : role.replace('_', ' ')}
-              </button>
-            ))}
+            <div className="flex items-center space-x-1 overflow-x-auto pb-1 sm:pb-0">
+              {['All', 'OWNER', 'BRANCH_MANAGER', 'SUPERVISOR', 'CASHIER', 'STOCK_CLERK'].map((role) => (
+                <button
+                  key={role}
+                  type="button"
+                  onClick={() => setSelectedRoleFilter(role)}
+                  className={`px-3 py-1.5 rounded-xl text-[11px] font-bold transition whitespace-nowrap ${
+                    selectedRoleFilter === role
+                      ? 'bg-white text-slate-950 shadow-md'
+                      : 'bg-white/10 hover:bg-white/20 text-white'
+                  }`}
+                >
+                  {role === 'All' ? 'All Roles' : role.replace('_', ' ')}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
-      {/* 2. Staff Cards Grid */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+      {/* Main Tab Content */}
+      {mainTab === 'roles' ? (
+        <RoleConfigurationManager currentUser={currentUser} />
+      ) : (
+        /* 2. Staff Cards Grid */
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {filteredStaff.map((staff) => {
           const isCurrentUser = staff.id === currentUser.id;
           const isActive = staff.active === 'Y';
@@ -898,6 +988,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           );
         })}
       </div>
+      )}
 
       {/* 3. Unified Staff Editor Modal (Tabs: Profile + Permissions) */}
       {isEditorOpen && (
@@ -1036,7 +1127,6 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
                       <option value="SUPERVISOR">SUPERVISOR (Approve, PIN Override, Variance)</option>
                       <option value="CASHIER">CASHIER (Till Sales, Direct GRV, EOD)</option>
                       <option value="STOCK_CLERK">STOCK_CLERK (GRN Stock Inward)</option>
-                      <option value="SUPER_ADMIN">SUPER_ADMIN (Multi-Tenant Platform)</option>
                     </select>
                   </div>
 
@@ -1281,7 +1371,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
 
                             return (
                               <div
-                                key={item.key}
+                                key={String(item.key)}
                                 onClick={() =>
                                   setTempPermissions((prev) => ({
                                     ...prev,

@@ -11,6 +11,9 @@ import {
   logSessionTimeout,
   getCurrentCompany,
   getSubscriptionStatus,
+  getSessionUser,
+  setSessionUser,
+  saveSalesperson,
 } from './db/roomDatabase';
 import { AndroidStatusBar } from './components/layout/AndroidStatusBar';
 import { TopHeader } from './components/layout/TopHeader';
@@ -33,19 +36,37 @@ import { AuditLogView } from './components/admin/AuditLogView';
 import { GoogleSheetsSyncModal } from './components/sheets/GoogleSheetsSyncModal';
 import { SalespersonManagementModal } from './components/admin/SalespersonManagementModal';
 import { StaffAccessManagementScreen } from './components/admin/StaffAccessManagementScreen';
-import { InventoryHubScreen } from './components/inventory/InventoryHubScreen';
+import { DirectGoodsReceivedView } from './components/inventory/DirectGoodsReceivedView';
+import { InventoryMasterView } from './components/inventory/InventoryMasterView';
+import { GoodsReceivedView } from './components/inventory/GoodsReceivedView';
+import { StockMovementView } from './components/inventory/StockMovementView';
+import { BatchTrackingView } from './components/inventory/BatchTrackingView';
+import { InventorySetupView } from './components/inventory/InventorySetupView';
+import { StocktakeHubScreen } from './components/stocktake/StocktakeHubScreen';
+import { historyNavigationService } from './services/historyNavigationService';
 import { SupplierListScreen } from './components/suppliers/SupplierListScreen';
 import { DailyGoodsReceivedReport } from './components/inventory/DailyGoodsReceivedReport';
 import { DataManagementHub } from './components/admin/DataManagementHub';
 import { OfflineIndicator } from './components/pwa/OfflineIndicator';
+import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
 import { UniversalReportBuilder } from './components/reports/UniversalReportBuilder';
 import { CustomReportsListView } from './components/reports/CustomReportsListView';
 import { P2PMeshSyncHub } from './components/sync/P2PMeshSyncHub';
 import { PermissionsMatrixModal } from './components/admin/PermissionsMatrixModal';
 import { SuperAdminDashboard } from './components/admin/SuperAdminDashboard';
+import { TenantDiagnosticsModal } from './components/admin/TenantDiagnosticsModal';
 import { BranchSetupScreen } from './components/admin/BranchSetupScreen';
-import { ShieldCheck, Clock, Wifi, Crown } from 'lucide-react';
+import { SyncDiagnosticsModal } from './components/sync/SyncDiagnosticsModal';
+import { BluetoothPrinterModal } from './components/common/BluetoothPrinterModal';
+import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield } from 'lucide-react';
 import { initializeSystemConfigAndSync } from './services/systemConfig';
+import { persistentSyncEngine } from './services/persistentSyncEngine';
+import { FunctionalHamburgerMenu } from './components/layout/FunctionalHamburgerMenu';
+import {
+  getLandingTabForUser,
+  isModuleAllowedForUser,
+  getUserPrimaryModules,
+} from './services/roleNavigationService';
 
 const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes inactivity timeout
 
@@ -61,8 +82,13 @@ export default function App() {
   const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
   const [isPermissionsModalOpen, setIsPermissionsModalOpen] = useState(false);
   const [isSuperAdminModalOpen, setIsSuperAdminModalOpen] = useState(false);
+  const [isDiagnosticsModalOpen, setIsDiagnosticsModalOpen] = useState(false);
+  const [isTenantDiagnosticsModalOpen, setIsTenantDiagnosticsModalOpen] = useState(false);
+  const [tenantAlert, setTenantAlert] = useState<{ type: string; message: string } | null>(null);
   const [isOfflineMode, setIsOfflineMode] = useState(false);
   const [editingReportTemplateId, setEditingReportTemplateId] = useState<string | null>(null);
+  const [isHamburgerOpen, setIsHamburgerOpen] = useState(false);
+  const [isPrinterModalOpen, setIsPrinterModalOpen] = useState(false);
 
   // Inactivity tracking state
   const lastActivityRef = useRef<number>(Date.now());
@@ -71,6 +97,125 @@ export default function App() {
 
   // Cross-form navigation state (e.g. from Customer directory -> create sale for customer)
   const [salePreselectedCustomer, setSalePreselectedCustomer] = useState<Customer | string | null>(null);
+  const [targetDirectGrvId, setTargetDirectGrvId] = useState<string | null>(null);
+
+  // Navigation & Android Phone Hardware Back Button Handler
+  const [toastNotification, setToastNotification] = useState<string | null>(null);
+
+  const handleNavigateTab = (newTab: ActiveTab) => {
+    historyNavigationService.pushTab(newTab);
+    setActiveTab(newTab);
+  };
+
+  const handleNavigateToDirectGrv = (grvId?: string) => {
+    if (grvId) {
+      setTargetDirectGrvId(grvId);
+    }
+    handleNavigateTab('direct_grv');
+  };
+
+  // Initialize Android / Mobile Back Key listener
+  useEffect(() => {
+    historyNavigationService.init(
+      activeTab,
+      (targetTab) => {
+        setActiveTab(targetTab as ActiveTab);
+      },
+      (msg) => {
+        setToastNotification(msg);
+        setTimeout(() => setToastNotification(null), 2500);
+      }
+    );
+  }, []);
+
+  // Sync open modals with hardware back button (so pressing back closes modal first)
+  useEffect(() => {
+    if (isHamburgerOpen) {
+      historyNavigationService.registerModalHandler('hamburger', () => {
+        setIsHamburgerOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('hamburger');
+    }
+  }, [isHamburgerOpen]);
+
+  useEffect(() => {
+    if (isSyncModalOpen) {
+      historyNavigationService.registerModalHandler('sync_modal', () => {
+        setIsSyncModalOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('sync_modal');
+    }
+  }, [isSyncModalOpen]);
+
+  useEffect(() => {
+    if (isAdminModalOpen) {
+      historyNavigationService.registerModalHandler('admin_modal', () => {
+        setIsAdminModalOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('admin_modal');
+    }
+  }, [isAdminModalOpen]);
+
+  useEffect(() => {
+    if (isPermissionsModalOpen) {
+      historyNavigationService.registerModalHandler('permissions_modal', () => {
+        setIsPermissionsModalOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('permissions_modal');
+    }
+  }, [isPermissionsModalOpen]);
+
+  useEffect(() => {
+    if (isSuperAdminModalOpen) {
+      historyNavigationService.registerModalHandler('super_admin_modal', () => {
+        setIsSuperAdminModalOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('super_admin_modal');
+    }
+  }, [isSuperAdminModalOpen]);
+
+  useEffect(() => {
+    if (isDiagnosticsModalOpen) {
+      historyNavigationService.registerModalHandler('diagnostics_modal', () => {
+        setIsDiagnosticsModalOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('diagnostics_modal');
+    }
+  }, [isDiagnosticsModalOpen]);
+
+  useEffect(() => {
+    if (isTenantDiagnosticsModalOpen) {
+      historyNavigationService.registerModalHandler('tenant_diag_modal', () => {
+        setIsTenantDiagnosticsModalOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('tenant_diag_modal');
+    }
+  }, [isTenantDiagnosticsModalOpen]);
+
+  useEffect(() => {
+    if (isPrinterModalOpen) {
+      historyNavigationService.registerModalHandler('printer_modal', () => {
+        setIsPrinterModalOpen(false);
+        return true;
+      });
+    } else {
+      historyNavigationService.unregisterModalHandler('printer_modal');
+    }
+  }, [isPrinterModalOpen]);
 
   // Inactivity timer effect (5 minutes)
   useEffect(() => {
@@ -109,17 +254,42 @@ export default function App() {
     };
   }, [currentUser]);
 
-  // Subscribe to Room DB changes
+  // Subscribe to Room DB changes & sync active session user branch
   useEffect(() => {
     const unsubscribe = subscribeToDatabase(() => {
       setDbVersion((v) => v + 1);
+      const sess = getSessionUser();
+      if (sess && currentUser && (sess.branchId !== currentUser.branchId || sess.branch_id !== currentUser.branch_id)) {
+        setLoggedInUser(sess);
+      }
     });
     return () => unsubscribe();
-  }, []);
+  }, [currentUser]);
 
-  // Sync global system config and tenants on boot
+  const handleBranchChange = (branchId: string, branchName: string) => {
+    if (currentUser) {
+      const updated: Salesperson = {
+        ...currentUser,
+        branchId,
+        branch_id: branchId,
+        branchName,
+      };
+      setLoggedInUser(updated);
+      setSessionUser(updated);
+      saveSalesperson(updated);
+    }
+    setDbVersion((v) => v + 1);
+  };
+
+  // Sync global system config, tenants, and persistent sync engine on boot
   useEffect(() => {
     initializeSystemConfigAndSync().catch(() => {});
+    persistentSyncEngine.initialize().catch((err) => console.warn('[App] Sync engine init error:', err));
+
+    const unsubAlerts = persistentSyncEngine.subscribeAlerts((alert) => {
+      setTenantAlert(alert);
+    });
+    return () => unsubAlerts();
   }, []);
 
   const handleLoginSuccess = (user: Salesperson) => {
@@ -129,7 +299,12 @@ export default function App() {
     logLogin(user);
     setCurrentUser(user);
     setLoggedInUser(user);
-    setActiveTab('home');
+    const landingTab = getLandingTabForUser(user);
+    setActiveTab(landingTab);
+
+    // Run login tenant schema version migration check & queue drain
+    persistentSyncEngine.handleLoginMigrationCheck();
+    persistentSyncEngine.drainSyncQueue().catch(() => {});
   };
 
   const handleLogout = (reason: string = 'User Logged Out') => {
@@ -158,7 +333,7 @@ export default function App() {
   // If user is not logged in, display the Android Material 3 Login Screen
   if (!currentUser) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans w-full max-w-[100vw] overflow-x-hidden">
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans w-full max-w-[100vw] overflow-x-clip">
         <AndroidStatusBar
           isOffline={isOfflineMode}
           onToggleOffline={() => setIsOfflineMode(!isOfflineMode)}
@@ -179,7 +354,7 @@ export default function App() {
   // If trial has expired and user is not Super Admin, display the TrialExpiredLockScreen
   if (!isSuperAdmin && subStatus.isExpired) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans w-full max-w-[100vw] overflow-x-hidden">
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans w-full max-w-[100vw] overflow-x-clip">
         <AndroidStatusBar
           isOffline={isOfflineMode}
           onToggleOffline={() => setIsOfflineMode(!isOfflineMode)}
@@ -192,17 +367,25 @@ export default function App() {
     );
   }
 
-  // Calculate sync queue status
-  const queue = getSyncQueue();
+  // Calculate sync queue status isolated to active tenant
+  const activeCompany = getCurrentCompany();
+  const queue = getSyncQueue(activeCompany.company_id);
   const pendingCount = queue.filter((i) => i.status === 'pending' || i.status === 'failed').length;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-[#6A4DFF] selection:text-white relative w-full max-w-[100vw] overflow-x-hidden">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-[#6A4DFF] selection:text-white relative w-full max-w-[100vw] overflow-x-clip">
       {/* 5-minute inactivity countdown warning (< 30s) */}
       {warningSeconds !== null && warningSeconds > 0 && (
         <div className="fixed top-3 left-1/2 -translate-x-1/2 z-50 bg-amber-500 text-slate-950 px-4 py-2 rounded-full shadow-2xl font-black text-xs flex items-center space-x-2 border-2 border-amber-300 animate-bounce">
           <Clock className="w-4 h-4 text-slate-950" />
           <span>Inactivity Lock in {warningSeconds}s — Move cursor or tap screen to stay active</span>
+        </div>
+      )}
+
+      {/* Toast Notification (e.g. Android Hardware Back Key "Press back again to exit") */}
+      {toastNotification && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white px-5 py-2.5 rounded-full shadow-2xl font-bold text-xs flex items-center space-x-2 border border-slate-700 backdrop-blur-md animate-fadeIn">
+          <span>{toastNotification}</span>
         </div>
       )}
 
@@ -224,13 +407,36 @@ export default function App() {
         onOpenAdminModal={() => setIsAdminModalOpen(true)}
         onOpenPermissions={() => setIsPermissionsModalOpen(true)}
         onOpenSuperAdmin={isSuperAdmin ? () => setIsSuperAdminModalOpen(true) : undefined}
+        onOpenDiagnostics={() => setIsDiagnosticsModalOpen(true)}
+        onOpenTenantDiagnostics={() => setIsTenantDiagnosticsModalOpen(true)}
+        onOpenHamburgerMenu={() => setIsHamburgerOpen(true)}
+        onOpenPrinterModal={() => setIsPrinterModalOpen(true)}
+        onBranchChange={handleBranchChange}
         onTabChange={(tab) => {
           if (tab !== 'pos' && tab !== 'items' && tab !== 'counter' && tab !== 'sales') {
             setSalePreselectedCustomer(null);
           }
-          setActiveTab(tab);
+          handleNavigateTab(tab);
         }}
       />
+
+      {/* Tenant Context Alert Banner (Subscription status, sheet switch, isolation mode) */}
+      {tenantAlert && (
+        <div className="bg-gradient-to-r from-indigo-950 via-purple-950 to-indigo-950 border-b border-indigo-700/60 px-3 sm:px-4 py-2 flex items-center justify-between text-xs text-indigo-200 animate-fadeIn">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>
+              <strong>Tenant Update:</strong> {tenantAlert.message}
+            </span>
+          </div>
+          <button
+            onClick={() => setTenantAlert(null)}
+            className="text-[11px] text-indigo-300 hover:text-white underline ml-3"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* SaaS Trial Status Alert Banner */}
       {!isSuperAdmin && subStatus.isTrial && !subStatus.isExpired && (
@@ -276,8 +482,43 @@ export default function App() {
       )}
 
       {/* 3. Main Screen View Area */}
-      <main className="flex-1 w-full max-w-6xl mx-auto px-2 sm:px-4 pt-2 sm:pt-4 overflow-x-hidden">
-        {/* POS REGISTER WORKFLOW (Screens 1, 2, 3) */}
+      <main className="flex-1 w-full max-w-6xl mx-auto px-2 sm:px-4 pt-2 sm:pt-4 overflow-x-clip">
+        {/* Role Access Restriction Screen */}
+        {currentUser && !isModuleAllowedForUser(currentUser, activeTab) ? (
+          <div className="bg-slate-900 border border-amber-500/40 rounded-3xl p-6 sm:p-8 max-w-xl mx-auto my-8 text-center space-y-4 shadow-2xl animate-fadeIn">
+            <div className="w-16 h-16 rounded-3xl bg-amber-400/20 text-amber-300 flex items-center justify-center mx-auto border border-amber-400/30">
+              <Shield className="w-8 h-8" />
+            </div>
+            <h2 className="text-xl font-black text-white">Module Access Restricted</h2>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Your assigned role (<strong className="text-amber-400 font-mono">{currentUser.role}</strong>) does not have access to the <strong className="text-white">{activeTab.replace('_', ' ')}</strong> module. The system ensures each staff member sees only what their role is meant for.
+            </p>
+            <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 text-left text-xs space-y-2">
+              <p className="font-bold text-amber-300">Your Primary Role Modules:</p>
+              <div className="flex flex-wrap gap-2 pt-1">
+                {getUserPrimaryModules(currentUser).map((m, idx) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setActiveTab(m.id)}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-purple-900/60 text-slate-200 hover:text-white font-bold text-xs border border-slate-700 transition cursor-pointer"
+                  >
+                    #{idx + 1} {m.shortLabel}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setActiveTab(getLandingTabForUser(currentUser))}
+              className="py-2.5 px-6 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white font-black text-xs shadow-lg transition active:scale-95 cursor-pointer"
+            >
+              Return to Your Primary Screen
+            </button>
+          </div>
+        ) : (
+          <>
+            {/* POS REGISTER WORKFLOW (Screens 1, 2, 3) */}
         {(activeTab === 'home' ||
           activeTab === 'pos' ||
           activeTab === 'items' ||
@@ -296,8 +537,8 @@ export default function App() {
           />
         )}
 
-        {/* TODAY / ORDERS & INVOICE HISTORY (Screenshot Tab "Today") */}
-        {(activeTab === 'today' || activeTab === 'orders') && (
+        {/* RECEIPTS & INVOICE HISTORY (Screenshot Tab "Today" / Receipts) */}
+        {(activeTab === 'today' || activeTab === 'orders' || activeTab === 'receipts') && (
           <POSOrdersHistory
             currentUser={currentUser}
             onNavigate={handleNavigateWithContext}
@@ -497,7 +738,27 @@ export default function App() {
             onNavigateHome={() => setActiveTab('home')}
             onNavigateToPOS={() => setActiveTab('pos')}
             onNavigateToCreditReport={() => setActiveTab('credit_report')}
+            onNavigateToDirectGrv={handleNavigateToDirectGrv}
           />
+        )}
+
+        {/* MULTI-CURRENCY & EXCHANGE RATES */}
+        {activeTab === 'multi_currency' && (
+          <div className="space-y-4">
+            <CashBalancingModule
+              currentUser={currentUser}
+              initialSubTab="form1"
+              onNavigateHome={() => setActiveTab('home')}
+              onNavigateToPOS={() => setActiveTab('pos')}
+              onNavigateToCreditReport={() => setActiveTab('credit_report')}
+              onNavigateToDirectGrv={handleNavigateToDirectGrv}
+            />
+            <ExchangeRatesModal
+              isOpen={true}
+              onClose={() => setActiveTab('cash_balancing')}
+              currentUser={currentUser}
+            />
+          </div>
         )}
 
         {/* HOME & EXECUTIVE DASHBOARD */}
@@ -518,6 +779,7 @@ export default function App() {
             initialSubTab="form1"
             onNavigateHome={() => setActiveTab('home')}
             onNavigateToPOS={() => setActiveTab('pos')}
+            onNavigateToDirectGrv={handleNavigateToDirectGrv}
           />
         )}
 
@@ -527,20 +789,17 @@ export default function App() {
             initialSubTab="form2"
             onNavigateHome={() => setActiveTab('home')}
             onNavigateToPOS={() => setActiveTab('pos')}
+            onNavigateToDirectGrv={handleNavigateToDirectGrv}
           />
         )}
 
-        {activeTab === 'sales' && (
-          <CashBalancingModule
+        {/* SALES, PROFIT & TOP STOCKS REPORT (All Sales & Transactions) */}
+        {(activeTab === 'sales_report' || activeTab === 'sales') && (
+          <SalesReport
             currentUser={currentUser}
-            initialSubTab="form3"
-            preselectedCustomer={
-              typeof salePreselectedCustomer === 'string'
-                ? salePreselectedCustomer
-                : salePreselectedCustomer?.name
-            }
-            onNavigateHome={() => setActiveTab('home')}
             onNavigateToPOS={() => setActiveTab('pos')}
+            onNavigateToInventory={() => setActiveTab('inventory')}
+            onClose={() => setActiveTab('home')}
           />
         )}
 
@@ -550,6 +809,7 @@ export default function App() {
             initialSubTab="form4"
             onNavigateHome={() => setActiveTab('home')}
             onNavigateToPOS={() => setActiveTab('pos')}
+            onNavigateToDirectGrv={handleNavigateToDirectGrv}
           />
         )}
 
@@ -569,23 +829,13 @@ export default function App() {
           />
         )}
 
-        {/* SALES, PROFIT & TOP STOCKS REPORT */}
-        {activeTab === 'sales_report' && (
-          <SalesReport
-            currentUser={currentUser}
-            onNavigateToPOS={() => setActiveTab('pos')}
-            onNavigateToInventory={() => setActiveTab('inventory')}
-            onClose={() => setActiveTab('reports')}
-          />
-        )}
-
         {/* CUSTOMER CHANGE REPORT */}
         {activeTab === 'change_report' && (
           <CustomerChangeReport
             currentUser={currentUser}
             onNavigateToForm3={(customerName) => {
               if (customerName) setSalePreselectedCustomer(customerName);
-              setActiveTab('sales');
+              setActiveTab('cash_balancing');
             }}
             onClose={() => setActiveTab('home')}
           />
@@ -626,27 +876,87 @@ export default function App() {
           />
         )}
 
-        {/* INVENTORY & WAREHOUSE SUITE (TABS 1-4 & STOCKTAKE) */}
-        {(activeTab === 'inventory' ||
-          activeTab === 'goods_received' ||
-          activeTab === 'stock_movement' ||
-          activeTab === 'stocktake' ||
-          activeTab === 'inventory_setup') && (
-          <InventoryHubScreen
+        {/* DIRECT SUPPLIES DELIVERY (GRV) - Standalone module accessible to Cashiers, Supervisors & Managers */}
+        {activeTab === 'direct_grv' && (
+          <div className="space-y-4 animate-fadeIn">
+            <div className="flex items-center justify-between pb-1">
+              <button
+                type="button"
+                onClick={() => handleNavigateTab('home')}
+                className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-bold transition border border-slate-800 flex items-center gap-1.5 cursor-pointer"
+              >
+                &larr; Back to Home
+              </button>
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-slate-400 font-mono">
+                  Direct Delivery Receiving Voucher (GRV)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleNavigateTab('pos')}
+                  className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow cursor-pointer"
+                >
+                  POS
+                </button>
+              </div>
+            </div>
+            <DirectGoodsReceivedView
+              currentUser={currentUser}
+              preselectedGrvId={targetDirectGrvId}
+              onClearPreselectedGrv={() => setTargetDirectGrvId(null)}
+            />
+          </div>
+        )}
+
+        {/* INVENTORY MASTER CATALOG - Standalone module guarded by role */}
+        {activeTab === 'inventory' && (
+          <InventoryMasterView
             currentUser={currentUser}
-            activeSubTab={
-              activeTab === 'goods_received'
-                ? 'grn'
-                : activeTab === 'stock_movement'
-                ? 'movement'
-                : activeTab === 'stocktake'
-                ? 'stocktake'
-                : activeTab === 'inventory_setup'
-                ? 'setup'
-                : 'master'
-            }
-            onNavigateHome={() => setActiveTab('home')}
-            onNavigateToPOS={() => setActiveTab('pos')}
+            onTriggerGRN={() => handleNavigateTab('goods_received')}
+            onOpenGRN={() => handleNavigateTab('goods_received')}
+          />
+        )}
+
+        {/* GOODS RECEIVED NOTES (GRN) - Standalone module guarded by role */}
+        {activeTab === 'goods_received' && (
+          <GoodsReceivedView
+            currentUser={currentUser}
+            onGoToMaster={() => handleNavigateTab('inventory')}
+            onGoToHome={() => handleNavigateTab('home')}
+          />
+        )}
+
+        {/* STOCK MOVEMENTS & TRANSFERS - Standalone module guarded by role */}
+        {activeTab === 'stock_movement' && (
+          <StockMovementView
+            currentUser={currentUser}
+            onTriggerGRN={() => handleNavigateTab('goods_received')}
+          />
+        )}
+
+        {/* STOCKTAKE & PHYSICAL AUDIT - Standalone module guarded by role */}
+        {activeTab === 'stocktake' && (
+          <StocktakeHubScreen
+            currentUser={currentUser}
+            onGoToMaster={() => handleNavigateTab('inventory')}
+            onGoToHome={() => handleNavigateTab('home')}
+          />
+        )}
+
+        {/* FIFO BATCH TRACKING & EXPIRY */}
+        {activeTab === 'fifo_reports' && (
+          <BatchTrackingView
+            currentUser={currentUser}
+            onOpenGRN={() => handleNavigateTab('goods_received')}
+          />
+        )}
+
+        {/* INVENTORY SETUP & RULES */}
+        {activeTab === 'inventory_setup' && (
+          <InventorySetupView
+            currentUser={currentUser}
+            onGoToMaster={() => handleNavigateTab('inventory')}
+            onGoToHome={() => handleNavigateTab('home')}
           />
         )}
 
@@ -830,43 +1140,69 @@ export default function App() {
         {(activeTab === 'p2p_mesh' || activeTab === 'connectivity') && (
           <P2PMeshSyncHub onBack={() => setActiveTab('home')} />
         )}
+          </>
+        )}
       </main>
 
-      {/* 3. Android Material 3 Bottom Navigation with 5 tabs from screenshot */}
+      {/* 3. Android Material 3 Bottom Navigation with Role-Ranked Tabs */}
       <BottomNavigation
         activeTab={activeTab}
         currentUser={currentUser}
         pendingSyncCount={pendingCount}
+        onOpenMenu={() => setIsHamburgerOpen(true)}
         onTabChange={(tab) => {
           if (tab !== 'pos' && tab !== 'items' && tab !== 'counter' && tab !== 'sales') {
             setSalePreselectedCustomer(null);
           }
-          setActiveTab(tab);
+          handleNavigateTab(tab);
         }}
       />
 
-      {/* 4. Google Sheets Sync Modal */}
-      <GoogleSheetsSyncModal
-        isOpen={isSyncModalOpen}
-        onClose={() => setIsSyncModalOpen(false)}
-        onSyncCompleted={() => setDbVersion((v) => v + 1)}
+      {/* Core Functional Grouping Hamburger Menu Drawer */}
+      <FunctionalHamburgerMenu
+        isOpen={isHamburgerOpen}
+        onClose={() => setIsHamburgerOpen(false)}
+        currentUser={currentUser}
+        activeTab={activeTab}
+        onSelectTab={(tab) => {
+          if (tab !== 'pos' && tab !== 'items' && tab !== 'counter' && tab !== 'sales') {
+            setSalePreselectedCustomer(null);
+          }
+          handleNavigateTab(tab);
+        }}
+        onLogout={handleLogout}
+        onOpenPrinterModal={() => setIsPrinterModalOpen(true)}
+        onOpenSuperAdmin={isSuperAdmin ? () => setIsSuperAdminModalOpen(true) : undefined}
       />
+
+      {/* 4. Google Sheets Sync Modal */}
+      {isSyncModalOpen && (
+        <GoogleSheetsSyncModal
+          isOpen={isSyncModalOpen}
+          onClose={() => setIsSyncModalOpen(false)}
+          onSyncCompleted={() => setDbVersion((v) => v + 1)}
+        />
+      )}
 
       {/* 5. Admin Salesperson Management Modal */}
-      <SalespersonManagementModal
-        isOpen={isAdminModalOpen}
-        onClose={() => setIsAdminModalOpen(false)}
-        currentUser={currentUser}
-      />
+      {isAdminModalOpen && (
+        <SalespersonManagementModal
+          isOpen={isAdminModalOpen}
+          onClose={() => setIsAdminModalOpen(false)}
+          currentUser={currentUser}
+        />
+      )}
 
       {/* 6. 52 Granular Permissions Matrix Modal (RBAC) */}
-      <PermissionsMatrixModal
-        isOpen={isPermissionsModalOpen}
-        onClose={() => setIsPermissionsModalOpen(false)}
-      />
+      {isPermissionsModalOpen && (
+        <PermissionsMatrixModal
+          isOpen={isPermissionsModalOpen}
+          onClose={() => setIsPermissionsModalOpen(false)}
+        />
+      )}
 
       {/* 7. SaaS Multi-Tenant Management Dashboard */}
-      {isSuperAdmin && (
+      {isSuperAdmin && isSuperAdminModalOpen && (
         <SuperAdminDashboard
           isOpen={isSuperAdminModalOpen}
           currentUser={currentUser}
@@ -876,7 +1212,33 @@ export default function App() {
         />
       )}
 
-      {/* 8. PWA Offline Status Banner */}
+      {/* 8. Stage 2 Persistent Sync Engine Diagnostics & Queue Modal */}
+      {isDiagnosticsModalOpen && (
+        <SyncDiagnosticsModal
+          isOpen={isDiagnosticsModalOpen}
+          onClose={() => setIsDiagnosticsModalOpen(false)}
+          currentUser={currentUser}
+        />
+      )}
+
+      {/* 9. Stage 3 Tenant Diagnostics & Health Modal */}
+      {isTenantDiagnosticsModalOpen && (
+        <TenantDiagnosticsModal
+          isOpen={isTenantDiagnosticsModalOpen}
+          onClose={() => setIsTenantDiagnosticsModalOpen(false)}
+          onShowToast={(msg) => setTenantAlert({ type: 'info', message: msg })}
+        />
+      )}
+
+      {/* 10. Thermal Receipt Printer Setup Modal */}
+      {isPrinterModalOpen && (
+        <BluetoothPrinterModal
+          isOpen={isPrinterModalOpen}
+          onClose={() => setIsPrinterModalOpen(false)}
+        />
+      )}
+
+      {/* 11. PWA Offline Status Banner */}
       <OfflineIndicator isSimulatedOffline={isOfflineMode} />
     </div>
   );

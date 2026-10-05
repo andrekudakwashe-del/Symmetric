@@ -18,6 +18,7 @@ import {
   HelpCircle,
   WifiOff,
   Wifi,
+  LogIn,
 } from 'lucide-react';
 import { registerTenantCompany } from '../../db/roomDatabase';
 import { syncCompanyToCloud } from '../../services/googleSheetsSync';
@@ -56,6 +57,11 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
   const [confirmPin, setConfirmPin] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [existingAccountModal, setExistingAccountModal] = useState<{
+    open: boolean;
+    companyName: string;
+    companyId: string;
+  } | null>(null);
   const [isOnline, setIsOnline] = useState<boolean>(
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
@@ -84,7 +90,84 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const executeRegistration = async () => {
+    setIsSubmitting(true);
+    setError(null);
+    setExistingAccountModal(null);
+
+    try {
+      const { company, branch, owner } = registerTenantCompany({
+        companyName,
+        businessCategory,
+        ownerName,
+        ownerEmail,
+        ownerPhone,
+        branchName,
+        branchCode,
+        branchLocation,
+        ownerPin,
+      });
+
+      // 1. Synchronize to central server store
+      try {
+        await fetch('/api/saas/signup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            company_name: company.company_name,
+            company_id: company.company_id,
+            owner_email: ownerEmail,
+            full_name: ownerName,
+            phone: ownerPhone,
+            business_category: businessCategory,
+            branch_name: branchName,
+            branch_code: branchCode,
+            branch_location: branchLocation,
+            password: ownerPin,
+            plan: 'PROFESSIONAL',
+          }),
+        });
+      } catch {
+        // resilient local fallback
+      }
+
+      // 2. Cloud sync to Master Google Sheet companies tab
+      try {
+        await syncCompanyToCloud(company, branch, owner);
+      } catch {
+        // non-blocking
+      }
+
+      // Register this device to this newly created company
+      try {
+        localStorage.setItem('saimetric_device_registered', 'true');
+        localStorage.setItem('saimetric_device_registered_company_id', company.company_id);
+        localStorage.setItem('saimetric_device_registered_company_name', company.company_name);
+        localStorage.setItem('saimetric_device_registered_email', ownerEmail);
+        localStorage.setItem('saimetric_device_registered_branch_id', branch.branchId);
+        localStorage.setItem('saimetric_device_registered_at', new Date().toISOString());
+      } catch {
+        // localStorage resilience
+      }
+
+      try {
+        confetti({
+          particleCount: 100,
+          spread: 80,
+          origin: { y: 0.6 },
+        });
+      } catch {
+        // ignore
+      }
+
+      onRegistrationSuccess(owner);
+    } catch (err: any) {
+      setError(err?.message || 'Failed to setup company. Please try again.');
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSubmit = async (e: React.FormEvent, forceNewTenant: boolean = false) => {
     e.preventDefault();
     setError(null);
 
@@ -115,81 +198,29 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
       return;
     }
 
-    setIsSubmitting(true);
-    setError(null);
-
-    (async () => {
+    // Work Stream C.6: Check if company already exists for entered email
+    if (!forceNewTenant) {
+      setIsSubmitting(true);
       try {
-        const { company, branch, owner } = registerTenantCompany({
-          companyName,
-          businessCategory,
-          ownerName,
-          ownerEmail,
-          ownerPhone,
-          branchName,
-          branchCode,
-          branchLocation,
-          ownerPin,
-        });
-
-        // 1. Synchronize to central server store
-        try {
-          await fetch('/api/saas/signup', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              company_name: company.company_name,
-              company_id: company.company_id,
-              owner_email: ownerEmail,
-              full_name: ownerName,
-              phone: ownerPhone,
-              business_category: businessCategory,
-              branch_name: branchName,
-              branch_code: branchCode,
-              branch_location: branchLocation,
-              password: ownerPin,
-              plan: 'PROFESSIONAL',
-            }),
-          });
-        } catch {
-          // resilient local fallback
+        const lookupRes = await fetch(`/api/saas/call-action?action=lookup_company&email=${encodeURIComponent(ownerEmail.trim())}`);
+        if (lookupRes.ok) {
+          const lookupData = await lookupRes.json();
+          if (lookupData.exists && lookupData.company) {
+            setIsSubmitting(false);
+            setExistingAccountModal({
+              open: true,
+              companyName: lookupData.company.company_name || 'Existing Business',
+              companyId: lookupData.company.company_id,
+            });
+            return;
+          }
         }
-
-        // 2. Cloud sync to Master Google Sheet companies tab
-        try {
-          await syncCompanyToCloud(company, branch, owner);
-        } catch {
-          // non-blocking
-        }
-
-        // Register this device to this newly created company
-        try {
-          localStorage.setItem('saimetric_device_registered', 'true');
-          localStorage.setItem('saimetric_device_registered_company_id', company.company_id);
-          localStorage.setItem('saimetric_device_registered_company_name', company.company_name);
-          localStorage.setItem('saimetric_device_registered_email', ownerEmail);
-          localStorage.setItem('saimetric_device_registered_branch_id', branch.branchId);
-          localStorage.setItem('saimetric_device_registered_at', new Date().toISOString());
-        } catch {
-          // localStorage resilience
-        }
-
-        try {
-          confetti({
-            particleCount: 100,
-            spread: 80,
-            origin: { y: 0.6 },
-          });
-        } catch {
-          // ignore
-        }
-
-        onRegistrationSuccess(owner);
-      } catch (err: any) {
-        setError(err?.message || 'Failed to setup company. Please try again.');
-        setIsSubmitting(false);
+      } catch {
+        // Fail-open on network lookup error
       }
-    })();
+    }
+
+    await executeRegistration();
   };
 
   return (
@@ -467,17 +498,78 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
         </form>
 
         {/* Switch to Existing Login */}
-        <div className="pt-3 border-t border-slate-800 text-center text-xs text-slate-400">
-          <span>Already registered a business on this terminal? </span>
-          <button
-            type="button"
-            onClick={onSwitchToLogin}
-            className="text-amber-400 hover:text-amber-300 font-bold ml-1 inline-flex items-center gap-1"
-          >
-            Sign In to Existing Company &rarr;
-          </button>
+        <div className="pt-3 border-t border-slate-800 text-center text-xs text-slate-400 space-y-1.5">
+          <div>
+            <span>Already registered a business on this terminal? </span>
+            <button
+              type="button"
+              onClick={onSwitchToLogin}
+              className="text-amber-400 hover:text-amber-300 font-bold ml-1 inline-flex items-center gap-1 cursor-pointer"
+            >
+              Sign In to Existing Company &rarr;
+            </button>
+          </div>
+          <div>
+            <span>Replacing a device or disaster recovery? </span>
+            <button
+              type="button"
+              onClick={onSwitchToLogin}
+              className="text-indigo-400 hover:text-indigo-300 font-bold ml-1 inline-flex items-center gap-1 cursor-pointer"
+            >
+              Restore from Encrypted Backup &rarr;
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* Work Stream C.6: Duplicate Account Modal Prompt */}
+      {existingAccountModal && existingAccountModal.open && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fadeIn">
+          <div className="bg-slate-900 border border-amber-500/40 rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400 mx-auto">
+              <Building2 className="w-6 h-6" />
+            </div>
+
+            <div className="text-center space-y-1.5">
+              <h3 className="text-lg font-black text-white">Account Already Exists</h3>
+              <p className="text-xs text-slate-300 leading-relaxed">
+                An account already exists for <strong className="text-amber-300">{ownerEmail}</strong> under workspace{' '}
+                <strong className="text-white font-bold">"{existingAccountModal.companyName}"</strong>.
+              </p>
+              <p className="text-xs text-slate-400 pt-1">
+                Would you like to log in to your existing workspace instead, or create another separate company?
+              </p>
+            </div>
+
+            <div className="pt-2 space-y-2">
+              <button
+                type="button"
+                onClick={onSwitchToLogin}
+                className="w-full py-3 px-4 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-slate-950 font-black text-xs shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2"
+              >
+                <LogIn className="w-4 h-4" />
+                <span>Log In to Existing Workspace Instead</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={(e) => handleSubmit(e, true)}
+                className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs border border-slate-700/80 transition"
+              >
+                Create New Separate Company Anyway
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setExistingAccountModal(null)}
+                className="w-full py-2 text-center text-slate-500 hover:text-slate-400 text-xs font-semibold"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

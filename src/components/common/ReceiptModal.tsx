@@ -224,7 +224,19 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
           total: invoice.total,
           amountPaid: effectivePaid,
           change: effectiveChange,
+          changeLeftBehind: invoice.changeLeftBehind,
+          changeAmountLeftBehind: invoice.changeAmountLeftBehind,
+          creditAmount: invoice.creditAmount,
+          creditDeposit: invoice.creditDeposit,
+          creditBalanceOwed: invoice.creditBalanceOwed,
+          creditDueDate: invoice.creditDueDate,
           paymentMethod: invoice.paymentMethod,
+          currency: invoice.currency,
+          exchangeRate: invoice.exchangeRate,
+          totalInCurrency: invoice.totalInCurrency,
+          cashWithdrawalAmount: invoice.cashWithdrawalAmount,
+          cashWithdrawalInCurrency: invoice.cashWithdrawalInCurrency,
+          totalChargedInCurrency: invoice.totalChargedInCurrency,
           paperWidth: paperWidth,
           companyId: invoiceCompanyId,
           storeName: effectiveStoreName,
@@ -269,7 +281,20 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
       (invoice.discount > 0 ? `Discount: -$${invoice.discount.toFixed(2)}\n` : '') +
       `*TOTAL: $${invoice.total.toFixed(2)}* (${invoice.paymentMethod})\n` +
       (invoice.paymentMethod === 'Cash' || effectivePaid > 0
-        ? `Tendered: $${effectivePaid.toFixed(2)}\n*CHANGE DUE: $${effectiveChange.toFixed(2)}*\n`
+        ? `Tendered: $${effectivePaid.toFixed(2)}\n*CHANGE DUE: $${effectiveChange.toFixed(2)}*\n` +
+          (invoice.changeLeftBehind
+            ? `Change Left in Fund (Form 3): $${(invoice.changeAmountLeftBehind !== undefined ? invoice.changeAmountLeftBehind : effectiveChange).toFixed(2)}\n` +
+              (invoice.changeAmountLeftBehind !== undefined && invoice.changeAmountLeftBehind < effectiveChange
+                ? `Physical Cash Handed Out: $${(effectiveChange - invoice.changeAmountLeftBehind).toFixed(2)}\n`
+                : '')
+            : '')
+        : '') +
+      (invoice.paymentMethod === 'Credit'
+        ? `*CREDIT SALE (FORM 3)*\n` +
+          (invoice.creditAmount !== undefined ? `Credit Amount: $${invoice.creditAmount.toFixed(2)}\n` : '') +
+          (invoice.creditDeposit !== undefined && invoice.creditDeposit > 0 ? `Upfront Cash Deposit: $${invoice.creditDeposit.toFixed(2)}\n` : '') +
+          `*DEBT BALANCE OWED: $${(invoice.creditBalanceOwed !== undefined ? invoice.creditBalanceOwed : (invoice.creditAmount ?? invoice.total)).toFixed(2)}*\n` +
+          (invoice.creditDueDate ? `Repayment Due Date: ${invoice.creditDueDate}\n` : '')
         : '') +
       `Status: Completed\n` +
       `Thank you for your business!`;
@@ -350,11 +375,11 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
             </div>
           </div>
 
-          {/* 2. Highlights Banner (Customer Change Due Summary) */}
+          {/* 2. Highlights Banner (Customer Change Due & Credit Summary) */}
           <div className="bg-gradient-to-r from-emerald-50 via-teal-50/70 to-emerald-50 px-5 py-3 border-b border-emerald-100 flex items-center justify-between">
             <div>
               <span className="text-[10px] font-black uppercase tracking-wider text-emerald-800 block">
-                Total Paid ({invoice.paymentMethod})
+                Total ({invoice.paymentMethod})
               </span>
               <span className="text-xl font-black font-mono-num text-slate-950">
                 ${invoice.total.toFixed(2)}
@@ -365,10 +390,37 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
             {(invoice.paymentMethod === 'Cash' || effectivePaid > 0) && (
               <div className="text-right">
                 <span className="text-[10px] font-black uppercase tracking-wider text-emerald-800 block">
-                  Change Due to Customer
+                  {invoice.changeLeftBehind ? 'Change Stored (Form 3)' : 'Change Due to Customer'}
                 </span>
-                <span className="text-xl font-black font-mono-num text-emerald-700">
-                  ${effectiveChange.toFixed(2)}
+                <div className="flex items-baseline justify-end space-x-2">
+                  {invoice.changeLeftBehind &&
+                    invoice.changeAmountLeftBehind !== undefined &&
+                    invoice.changeAmountLeftBehind < effectiveChange && (
+                      <span className="text-xs font-bold text-slate-500 line-through">
+                        ${effectiveChange.toFixed(2)}
+                      </span>
+                    )}
+                  <span className="text-xl font-black font-mono-num text-emerald-700">
+                    ${(invoice.changeLeftBehind && invoice.changeAmountLeftBehind !== undefined
+                      ? invoice.changeAmountLeftBehind
+                      : effectiveChange
+                    ).toFixed(2)}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Prominent Credit Debt Pill for Credit Sales */}
+            {invoice.paymentMethod === 'Credit' && (
+              <div className="text-right">
+                <span className="text-[10px] font-black uppercase tracking-wider text-rose-800 block">
+                  Debt Balance (Form 3)
+                </span>
+                <span className="text-xl font-black font-mono-num text-rose-700">
+                  ${(invoice.creditBalanceOwed !== undefined
+                    ? invoice.creditBalanceOwed
+                    : Math.max(0, (invoice.creditAmount ?? invoice.total) - (invoice.creditDeposit || 0))
+                  ).toFixed(2)}
                 </span>
               </div>
             )}
@@ -566,8 +618,107 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
                     </div>
 
                     {invoice.changeLeftBehind && (
-                      <div className="text-[10px] text-amber-700 italic text-right">
-                        Customer opted to store change in Credit Fund
+                      <div className="mt-1 pt-1 border-t border-dashed border-amber-300 text-[10px] space-y-0.5 bg-amber-50/70 p-1.5 rounded">
+                        <div className="flex justify-between text-amber-900 font-bold">
+                          <span>Left in Shop Fund (Form 3):</span>
+                          <span>
+                            ${(invoice.changeAmountLeftBehind !== undefined
+                              ? invoice.changeAmountLeftBehind
+                              : effectiveChange
+                            ).toFixed(2)}
+                          </span>
+                        </div>
+                        {invoice.changeAmountLeftBehind !== undefined &&
+                          invoice.changeAmountLeftBehind < effectiveChange && (
+                            <div className="flex justify-between text-slate-700 font-semibold">
+                              <span>Cash Handed to Customer:</span>
+                              <span>
+                                ${(
+                                  effectiveChange - invoice.changeAmountLeftBehind
+                                ).toFixed(2)}
+                              </span>
+                            </div>
+                          )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Credit Sale Breakdown */}
+                {invoice.paymentMethod === 'Credit' && (
+                  <div className="pt-2 border-t border-slate-100 space-y-1 text-[11px]">
+                    <div className="flex justify-between text-slate-600">
+                      <span className="font-sans">Payment Method:</span>
+                      <span className="font-bold text-rose-700">Credit Sale (Form 3)</span>
+                    </div>
+                    {invoice.creditAmount !== undefined && (
+                      <div className="flex justify-between text-slate-600">
+                        <span className="font-sans">Credit Authorized:</span>
+                        <span>${invoice.creditAmount.toFixed(2)}</span>
+                      </div>
+                    )}
+                    {invoice.creditDeposit !== undefined && invoice.creditDeposit > 0 && (
+                      <div className="flex justify-between text-emerald-700 font-semibold">
+                        <span className="font-sans">Upfront Cash Deposit:</span>
+                        <span>${invoice.creditDeposit.toFixed(2)}</span>
+                      </div>
+                    )}
+                    <div className="flex justify-between text-rose-700 font-black text-xs py-0.5 bg-rose-50/70 px-1.5 rounded-sm">
+                      <span className="font-sans uppercase">Debt Balance Owed:</span>
+                      <span>
+                        ${(
+                          invoice.creditBalanceOwed !== undefined
+                            ? invoice.creditBalanceOwed
+                            : Math.max(0, (invoice.creditAmount ?? invoice.total) - (invoice.creditDeposit || 0))
+                        ).toFixed(2)}
+                      </span>
+                    </div>
+                    {invoice.creditDueDate && (
+                      <div className="flex justify-between text-slate-500 text-[10px]">
+                        <span className="font-sans">Repayment Due Date:</span>
+                        <span>{invoice.creditDueDate}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Multi-Currency & Cash Withdrawal Breakdown */}
+                {invoice.currency && invoice.currency !== 'USD' && (
+                  <div className="pt-2 border-t border-slate-100 space-y-1 text-[11px] bg-amber-50/50 p-2 rounded-lg border border-amber-200/60">
+                    <div className="flex justify-between text-amber-950 font-bold">
+                      <span className="font-sans">Paid In Currency:</span>
+                      <span>{invoice.currency} (@ {invoice.exchangeRate || 1})</span>
+                    </div>
+                    {invoice.totalInCurrency !== undefined && (
+                      <div className="flex justify-between text-slate-700">
+                        <span className="font-sans">Goods Converted:</span>
+                        <span className="font-bold">{invoice.totalInCurrency.toFixed(2)} {invoice.currency}</span>
+                      </div>
+                    )}
+                    {invoice.cashWithdrawalAmount && invoice.cashWithdrawalAmount > 0 ? (
+                      <>
+                        <div className="flex justify-between text-emerald-800 font-semibold pt-1 border-t border-dashed border-amber-300">
+                          <span className="font-sans">💵 Cash-Out Handed to Customer:</span>
+                          <span className="font-bold font-mono">${invoice.cashWithdrawalAmount.toFixed(2)} USD</span>
+                        </div>
+                        <div className="flex justify-between text-purple-900 text-[10px]">
+                          <span className="font-sans">Cash-Out in {invoice.currency}:</span>
+                          <span className="font-bold font-mono">{(invoice.cashWithdrawalInCurrency || 0).toFixed(2)} {invoice.currency}</span>
+                        </div>
+                        <div className="flex justify-between text-indigo-950 font-black text-xs py-0.5 bg-indigo-100/70 px-1.5 rounded">
+                          <span className="font-sans uppercase">Total {invoice.currency} Charged (Slip):</span>
+                          <span className="font-mono">{(invoice.totalChargedInCurrency || 0).toFixed(2)} {invoice.currency}</span>
+                        </div>
+                        <div className="flex justify-between text-amber-900 font-bold text-[10px]">
+                          <span className="font-sans">Gross Electronic Tender:</span>
+                          <span className="font-mono">${(Number(invoice.grossTenderUsd) || (invoice.total + invoice.cashWithdrawalAmount)).toFixed(2)} USD</span>
+                        </div>
+                      </>
+                    ) : null}
+                    {(invoice.proofOfPaymentRef || invoice.paymentReference) && (
+                      <div className="flex justify-between text-slate-800 font-bold text-[10px] pt-1 border-t border-dashed border-slate-300">
+                        <span className="font-sans">Swipe / POP Ref #:</span>
+                        <span className="font-mono">{invoice.proofOfPaymentRef || invoice.paymentReference}</span>
                       </div>
                     )}
                   </div>

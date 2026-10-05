@@ -6,6 +6,15 @@ import {
 } from '../../services/meshSyncService';
 import { P2PMeshPeer } from '../../types';
 import {
+  getBranches,
+  getCurrentBranchId,
+  setCurrentBranchId,
+  getCurrentCompanyId,
+  getCurrentCompany,
+  saveInventoryItem,
+  addAuditLog,
+} from '../../db/roomDatabase';
+import {
   Wifi,
   Radio,
   Server,
@@ -20,6 +29,7 @@ import {
   ShoppingCart,
   Send,
   ShieldCheck,
+  ShieldAlert,
   Zap,
   Layers,
   ArrowRight,
@@ -38,6 +48,12 @@ import {
   BellRing,
   Camera,
   WifiOff,
+  Building2,
+  Package,
+  FileCheck,
+  Lock,
+  Trash2,
+  RefreshCw,
 } from 'lucide-react';
 import { ShareDeviceModal } from '../common/ShareDeviceModal';
 import { OfflineAirgapSyncModal } from './OfflineAirgapSyncModal';
@@ -47,25 +63,29 @@ interface P2PMeshSyncHubProps {
 }
 
 export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
-  // 1. Settings (ONLY 2 Settings + Optional LAN Gateway)
+  // 1. Settings & Auto-Detected Tenant / Branch
   const [branchCode, setBranchCode] = useState('HARARE-01');
   const [deviceName, setDeviceName] = useState('POS-Terminal-1');
   const [localGatewayUrl, setLocalGatewayUrl] = useState(() => meshSyncService.getLocalGatewayUrl());
   const [settingsSavedToast, setSettingsSavedToast] = useState(false);
+  const [testActionToast, setTestActionToast] = useState<string | null>(null);
   const [showSetupGuide, setShowSetupGuide] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [showAirgapModal, setShowAirgapModal] = useState(false);
   const [pingSentToast, setPingSentToast] = useState(false);
   const [incomingPingNotice, setIncomingPingNotice] = useState<string | null>(null);
   const [incomingSaleNotice, setIncomingSaleNotice] = useState<string | null>(null);
+  const [incomingAckNotice, setIncomingAckNotice] = useState<string | null>(null);
 
-  // 2. Mesh Live State (Real Physical Devices + Virtual)
+  // 2. Mesh Live State & Auto-Detection
   const [peerCount, setPeerCount] = useState<number>(0);
   const [peers, setPeers] = useState<P2PMeshPeer[]>([]);
   const [virtualDevices, setVirtualDevices] = useState<VirtualDevice[]>([]);
   const [logs, setLogs] = useState<MeshEventLog[]>([]);
+  const [logFilter, setLogFilter] = useState<'all' | 'sales' | 'inventory' | 'approvals' | 'ack' | 'drops'>('all');
   const [showSimulationLab, setShowSimulationLab] = useState(false);
   const [connStatus, setConnStatus] = useState(() => meshSyncService.getConnectionStatus());
+  const [branchesList, setBranchesList] = useState(() => getBranches());
 
   // 3. Test Plan State
   const [testRunning, setTestRunning] = useState(false);
@@ -80,6 +100,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
     setBranchCode(cfg.branchCode);
     setDeviceName(cfg.deviceName);
     setVirtualDevices(meshSyncService.getVirtualDevices());
+    setBranchesList(getBranches());
 
     const unsubLogs = meshSyncService.subscribeLogs((newLogs) => {
       setLogs(newLogs);
@@ -91,7 +112,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
       setVirtualDevices(meshSyncService.getVirtualDevices());
     });
 
-    // Listen for incoming ping/sale events from other physical terminals
+    // Listen for incoming ping/sale/ack events from other physical terminals
     const onMeshPing = (e: any) => {
       const { originName, message } = e.detail || {};
       setIncomingPingNotice(`Ping from ${originName}: "${message}"`);
@@ -106,11 +127,19 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
       }
     };
 
+    const onMeshAck = (e: any) => {
+      const { originName, count } = e.detail || {};
+      setIncomingAckNotice(`Cloud Post ACK: ${originName} uploaded ${count || 1} records to Apps Script. Marked SYNCED locally!`);
+      setTimeout(() => setIncomingAckNotice(null), 6000);
+    };
+
     window.addEventListener('mesh-ping-received', onMeshPing);
     window.addEventListener('mesh-sale-received', onMeshSale);
+    window.addEventListener('mesh-sync-receipt-received', onMeshAck);
 
     const statusTimer = window.setInterval(() => {
       setConnStatus(meshSyncService.getConnectionStatus());
+      setBranchesList(getBranches());
     }, 2500);
 
     return () => {
@@ -119,16 +148,35 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
       clearInterval(statusTimer);
       window.removeEventListener('mesh-ping-received', onMeshPing);
       window.removeEventListener('mesh-sale-received', onMeshSale);
+      window.removeEventListener('mesh-sync-receipt-received', onMeshAck);
     };
   }, []);
 
   // Save the settings
   const handleSaveSettings = (e: React.FormEvent) => {
     e.preventDefault();
-    meshSyncService.saveConfig(branchCode, deviceName);
+    meshSyncService.saveConfig(
+      branchCode,
+      deviceName,
+      connStatus.companyId,
+      connStatus.branchId,
+      connStatus.branchName,
+      connStatus.autoDetectTenantBranch
+    );
     meshSyncService.setLocalGatewayUrl(localGatewayUrl);
     setSettingsSavedToast(true);
     setTimeout(() => setSettingsSavedToast(false), 3000);
+  };
+
+  // Switch roaming branch directly
+  const handleSelectBranch = (brId: string) => {
+    setCurrentBranchId(brId);
+    meshSyncService.syncContextWithActiveSession(true);
+    const updatedStatus = meshSyncService.getConnectionStatus();
+    setConnStatus(updatedStatus);
+    setBranchCode(updatedStatus.branchCode);
+    setTestActionToast(`Switched active branch to ${updatedStatus.branchName} (${updatedStatus.branchCode}). Mesh recalibrated.`);
+    setTimeout(() => setTestActionToast(null), 4000);
   };
 
   // Send Live Test Ping to all physical devices
@@ -136,6 +184,97 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
     setPingSentToast(true);
     await meshSyncService.sendTestPing();
     setTimeout(() => setPingSentToast(false), 4000);
+  };
+
+  // Broadcast sample Inventory Change over mesh
+  const handleTestBroadcastInventory = () => {
+    const item = saveInventoryItem({
+      itemId: `PRD-${Date.now().toString().slice(-4)}`,
+      itemName: `Demo Mesh Item ${new Date().toLocaleTimeString()}`,
+      category: 'Beverages',
+      costPerUnit: 1.2,
+      costPerCase: 28.8,
+      sellPriceUnit: 2.0,
+      sellPriceCase: 48.0,
+      stockSingles: 48,
+      stockCases: 2,
+      totalUnits: 96,
+      unitsPerCase: 24,
+      reorderLevelCases: 1,
+      reorderLevelUnits: 24,
+      sku: `SKU-MESH-${Math.floor(100 + Math.random() * 900)}`,
+      barcode: `6001${Math.floor(1000000 + Math.random() * 9000000)}`,
+    });
+    setTestActionToast(`Product "${item.itemName}" created & broadcasted to WiFi mesh!`);
+    setTimeout(() => setTestActionToast(null), 4000);
+  };
+
+  // Broadcast sample Supervisor Approval over mesh
+  const handleTestSupervisorApproval = () => {
+    addAuditLog({
+      action: 'DISCOUNT_OVERRIDE',
+      severity: 'WARNING',
+      staffId: 'MGR-001',
+      staffName: 'Branch Supervisor',
+      staffRole: 'SUPERVISOR',
+      authorizedById: 'MGR-001',
+      authorizedByName: 'Branch Supervisor',
+      authorizedByRole: 'SUPERVISOR',
+      details: `Manager approved 20% discount override for Customer (PIN Authorized at ${new Date().toLocaleTimeString()})`,
+      amount: 15.5,
+      referenceId: `INV-${Math.floor(1000 + Math.random() * 9000)}`,
+    });
+    setTestActionToast('Supervisor PIN Override approved & broadcasted across WiFi mesh!');
+    setTimeout(() => setTestActionToast(null), 4000);
+  };
+
+  // Broadcast sample Apps Script Sync Receipt (Anti-Double-Posting)
+  const handleTestSyncReceipt = () => {
+    const fakeRequestId = `req_receipt_${Date.now()}`;
+    meshSyncService.broadcastSyncReceipt({
+      postedClientRequestIds: [fakeRequestId],
+      postedIds: [`sync_${Date.now()}`],
+      sheetName: 'Sales',
+    });
+    setTestActionToast('Cloud Upload ACK broadcasted! Peer devices marked records as SYNCED to prevent double posting.');
+    setTimeout(() => setTestActionToast(null), 4500);
+  };
+
+  const [clearingQueue, setClearingQueue] = useState(false);
+  const [testingCloud, setTestingCloud] = useState(false);
+
+  // Clear cloud sync queue
+  const handleClearCloudQueue = async () => {
+    setClearingQueue(true);
+    try {
+      await meshSyncService.clearAllSyncQueues();
+      setConnStatus(meshSyncService.getConnectionStatus());
+      setTestActionToast('All records in cloud sync queue cleared successfully!');
+    } catch (e: any) {
+      setTestActionToast(`Error clearing queue: ${e?.message || 'Failed'}`);
+    } finally {
+      setClearingQueue(false);
+      setTimeout(() => setTestActionToast(null), 4000);
+    }
+  };
+
+  // Test cloud sync with live Google Sheet
+  const handleTestCloudSync = async () => {
+    setTestingCloud(true);
+    try {
+      const res = await meshSyncService.testCloudSync();
+      setConnStatus(meshSyncService.getConnectionStatus());
+      if (res.success) {
+        setTestActionToast(`Cloud Sync ONLINE: Google Sheets connection verified (${res.durationMs}ms)!`);
+      } else {
+        setTestActionToast(`Cloud Sync Warning: ${res.message}`);
+      }
+    } catch (e: any) {
+      setTestActionToast(`Cloud test error: ${e?.message || 'Failed'}`);
+    } finally {
+      setTestingCloud(false);
+      setTimeout(() => setTestActionToast(null), 5000);
+    }
   };
 
   // Trigger Sale on a Virtual Device
@@ -275,6 +414,32 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
             >
               <Activity className="w-3.5 h-3.5" />
               <span>{pingSentToast ? 'Ping Sent!' : 'Send Test Ping'}</span>
+            </button>
+
+            {/* TEST CLOUD SYNC */}
+            <button
+              type="button"
+              id="btn-test-cloud-sync"
+              onClick={handleTestCloudSync}
+              disabled={testingCloud}
+              className="px-3.5 py-2 rounded-xl bg-blue-600/80 hover:bg-blue-600 text-white text-xs font-bold flex items-center space-x-1.5 transition border border-blue-400/40 shadow-sm cursor-pointer disabled:opacity-50"
+              title="Verify active connection to Google Sheets master webhook"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${testingCloud ? 'animate-spin' : ''}`} />
+              <span>{testingCloud ? 'Testing...' : 'Test Cloud Sync'}</span>
+            </button>
+
+            {/* CLEAR CLOUD SYNC QUEUE */}
+            <button
+              type="button"
+              id="btn-clear-cloud-queue"
+              onClick={handleClearCloudQueue}
+              disabled={clearingQueue}
+              className="px-3.5 py-2 rounded-xl bg-red-950/60 hover:bg-red-900/70 text-red-200 text-xs font-bold flex items-center space-x-1.5 transition border border-red-800 shadow-sm cursor-pointer disabled:opacity-50"
+              title="Clear all pending sync queue items from terminal storage"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-red-400" />
+              <span>{clearingQueue ? 'Clearing...' : 'Clear Sync Queue'}</span>
             </button>
 
             {/* OFFLINE QR & AIR-GAP SYNC */}
@@ -525,42 +690,143 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
         </div>
       </div>
 
-      {/* SECTION: SETTINGS (ONLY 2 SETTINGS: Branch Code, Device Name) */}
-      <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-5 shadow-lg">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center space-x-2">
-            <Radio className="w-5 h-5 text-[#6A4DFF]" />
-            <h2 className="text-base font-black text-white">Terminal Identity &amp; Branch Matching</h2>
+      {/* Action Notification Toasts */}
+      {testActionToast && (
+        <div className="fixed top-16 right-4 z-50 p-4 rounded-2xl bg-indigo-950/95 border-2 border-indigo-500 text-white text-xs font-bold shadow-2xl flex items-center space-x-2 animate-bounce">
+          <Sparkles className="w-4 h-4 text-indigo-300" />
+          <span>{testActionToast}</span>
+        </div>
+      )}
+      {incomingAckNotice && (
+        <div className="fixed top-28 right-4 z-50 p-4 rounded-2xl bg-teal-950/95 border-2 border-teal-500 text-teal-200 text-xs font-bold shadow-2xl flex items-center space-x-2 animate-fade-in">
+          <CheckCircle2 className="w-4 h-4 text-teal-300" />
+          <span>{incomingAckNotice}</span>
+        </div>
+      )}
+
+      {/* SECTION: AUTO-DETECTED TENANT & BRANCH WITH STRICT ISOLATION */}
+      <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-5 shadow-lg space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pb-3 border-b border-slate-800">
+          <div className="flex items-center space-x-3">
+            <div className="p-2.5 rounded-2xl bg-indigo-500/10 border border-indigo-500/30 text-indigo-400">
+              <Building2 className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h2 className="text-base font-black text-white">Active Tenant &amp; Branch Isolation</h2>
+                <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 font-mono font-bold flex items-center gap-1">
+                  <ShieldCheck className="w-3 h-3" />
+                  Strict Isolation Active
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                P2P mesh strictly prevents cross-tenant leaks and prevents roaming users from polluting wrong branches.
+              </p>
+            </div>
           </div>
-          {settingsSavedToast && (
-            <span className="text-xs text-emerald-400 font-bold flex items-center gap-1 bg-emerald-950/60 px-2.5 py-1 rounded-full border border-emerald-500/40 animate-fade-in">
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              Settings Saved &amp; Mesh Reconnected
-            </span>
-          )}
+
+          <div className="flex items-center space-x-2 text-xs">
+            <button
+              type="button"
+              onClick={() => {
+                const nextVal = !connStatus.autoDetectTenantBranch;
+                meshSyncService.setAutoDetectTenantBranch(nextVal);
+                setConnStatus(meshSyncService.getConnectionStatus());
+                setTestActionToast(`Auto-detect Tenant & Branch set to ${nextVal ? 'ON (Recommended)' : 'MANUAL'}`);
+                setTimeout(() => setTestActionToast(null), 3000);
+              }}
+              className={`px-3 py-1.5 rounded-xl font-mono text-xs font-bold border transition flex items-center space-x-1.5 cursor-pointer ${
+                connStatus.autoDetectTenantBranch
+                  ? 'bg-emerald-950/80 border-emerald-500 text-emerald-200'
+                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+              }`}
+            >
+              <Lock className="w-3.5 h-3.5" />
+              <span>Auto-Detect: {connStatus.autoDetectTenantBranch ? 'LOCKED & SYNCED' : 'MANUAL OVERRIDE'}</span>
+            </button>
+          </div>
         </div>
 
-        <form onSubmit={handleSaveSettings} className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
-          {/* Setting 1: Branch Code */}
-          <div>
-            <label className="block text-xs font-mono font-bold text-slate-400 mb-1">
-              1. Branch Code (Must match)
-            </label>
-            <input
-              type="text"
-              id="input-mesh-branch-code"
-              value={branchCode}
-              onChange={(e) => setBranchCode(e.target.value.toUpperCase())}
-              placeholder="e.g. HARARE-01"
-              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm font-mono focus:border-[#6A4DFF] focus:outline-none transition"
-              required
-            />
+        {/* Current Identity Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 font-mono text-xs">
+          <div className="p-3.5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-1">
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">Authenticated Tenant</span>
+            <div className="text-sm font-bold text-white flex items-center justify-between">
+              <span>{connStatus.companyName || 'Saimetric Tenant'}</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800">
+                {connStatus.companyId}
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-400">Terminals from other tenants on this Wi-Fi are automatically dropped.</p>
           </div>
 
-          {/* Setting 2: Device Name */}
+          <div className="p-3.5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-1">
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">Active Branch Station</span>
+            <div className="text-sm font-bold text-white flex items-center justify-between">
+              <span>{connStatus.branchName || 'Main Branch'}</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-purple-950 text-purple-300 border border-purple-800">
+                {connStatus.branchCode}
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-400">Branch ID: {connStatus.branchId}</p>
+          </div>
+
+          <div className="p-3.5 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-1">
+            <span className="text-[10px] text-slate-500 uppercase tracking-wider font-bold">Terminal ID &amp; Type</span>
+            <div className="text-sm font-bold text-white flex items-center justify-between">
+              <span>{connStatus.deviceName}</span>
+              <span className="text-[10px] px-2 py-0.5 rounded bg-slate-900 text-slate-300 border border-slate-700">
+                {connStatus.deviceId}
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-400">Channel: {connStatus.companyId}_{connStatus.branchId}</p>
+          </div>
+        </div>
+
+        {/* Roaming Multi-Branch Switcher */}
+        <div className="pt-2">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-mono font-bold text-slate-400 flex items-center gap-1.5">
+              <Share2 className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Multi-Branch Roaming Access: Switch Branch Station</span>
+            </span>
+            <span className="text-[10px] text-slate-500 font-mono">
+              Auto-rebinds P2P mesh &amp; prevents wrong branch population
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {branchesList.map((br) => {
+              const bId = br.branchId || br.id || (br as any).branch_id || 'BR-MAIN';
+              const bCode = br.code || (br as any).branch_code || 'HQ-01';
+              const isSelected = connStatus.branchId === bId || connStatus.branchCode === bCode;
+              return (
+                <button
+                  key={bId}
+                  type="button"
+                  onClick={() => handleSelectBranch(bId)}
+                  className={`px-3 py-2 rounded-xl font-mono text-xs font-bold border transition flex items-center space-x-2 cursor-pointer ${
+                    isSelected
+                      ? 'bg-purple-950/90 border-purple-500 text-purple-200 shadow-md ring-1 ring-purple-500/40'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700 hover:text-white'
+                  }`}
+                >
+                  <Building2 className={`w-3.5 h-3.5 ${isSelected ? 'text-purple-400' : 'text-slate-500'}`} />
+                  <span>{br.name}</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 font-bold">
+                    {bCode}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Manual Terminal Override Form */}
+        <form onSubmit={handleSaveSettings} className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end pt-3 border-t border-slate-800">
           <div>
             <label className="block text-xs font-mono font-bold text-slate-400 mb-1">
-              2. Terminal Identifier
+              Terminal Identifier
             </label>
             <input
               type="text"
@@ -573,10 +839,24 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
             />
           </div>
 
-          {/* Setting 3: Optional Offline LAN Server / Hotspot IP */}
           <div>
             <label className="block text-xs font-mono font-bold text-slate-400 mb-1">
-              3. Offline LAN Server IP (Optional)
+              Branch Code Override
+            </label>
+            <input
+              type="text"
+              id="input-mesh-branch-code"
+              value={branchCode}
+              onChange={(e) => setBranchCode(e.target.value.toUpperCase())}
+              placeholder="e.g. HARARE-01"
+              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm font-mono focus:border-[#6A4DFF] focus:outline-none transition"
+              required
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-mono font-bold text-slate-400 mb-1">
+              Offline LAN Host IP (Optional)
             </label>
             <input
               type="text"
@@ -588,98 +868,181 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
             />
           </div>
 
-          {/* Save Button */}
           <div>
             <button
               type="submit"
               id="btn-save-mesh-settings"
               className="w-full py-2.5 px-4 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-indigo-600 hover:opacity-90 text-white text-xs font-black shadow-md transition cursor-pointer"
             >
-              Save &amp; Reconnect Mesh
+              Update &amp; Rebind Mesh
             </button>
           </div>
         </form>
 
-        {/* Quick presets */}
-        <div className="flex items-center space-x-2 mt-3 pt-3 border-t border-slate-800 text-xs">
-          <span className="text-slate-400">Quick Branch Presets:</span>
-          {['HARARE-01', 'BULAWAYO-01', 'MUTARE-01'].map((preset) => (
+        {/* WHOLE DATABASE SHARING & ANTI-DOUBLE-POSTING VERIFICATION BUTTONS */}
+        <div className="pt-3 border-t border-slate-800">
+          <div className="text-xs font-mono font-bold text-slate-400 mb-2 flex items-center justify-between">
+            <span className="flex items-center gap-1.5">
+              <Layers className="w-3.5 h-3.5 text-amber-400" />
+              <span>Full Database P2P Mesh Sharing &amp; Anti-Double-Posting Verification</span>
+            </span>
+            <span className="text-[10px] text-slate-500">Test live replication across terminals without internet</span>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             <button
-              key={preset}
               type="button"
-              onClick={() => {
-                setBranchCode(preset);
-                meshSyncService.saveConfig(preset, deviceName);
-                setSettingsSavedToast(true);
-                setTimeout(() => setSettingsSavedToast(false), 3000);
-              }}
-              className={`px-2.5 py-1 rounded-lg font-mono text-xs font-bold border transition ${
-                branchCode === preset
-                  ? 'bg-purple-950/80 border-purple-500 text-purple-200'
-                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
-              }`}
+              onClick={handleSendPing}
+              className="px-3 py-2 rounded-xl bg-slate-950 hover:bg-slate-800 border border-slate-700 text-slate-300 hover:text-white text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer"
             >
-              {preset}
+              <Send className="w-3.5 h-3.5 text-amber-400" />
+              <span>Send Live Ping</span>
             </button>
-          ))}
+
+            <button
+              type="button"
+              onClick={handleTestBroadcastInventory}
+              className="px-3 py-2 rounded-xl bg-purple-950/40 hover:bg-purple-900/50 border border-purple-700 text-purple-200 text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer"
+            >
+              <Package className="w-3.5 h-3.5 text-purple-400" />
+              <span>Share Inventory Change</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleTestSupervisorApproval}
+              className="px-3 py-2 rounded-xl bg-amber-950/40 hover:bg-amber-900/50 border border-amber-700 text-amber-200 text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+              <span>Share Supervisor Approval</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleTestSyncReceipt}
+              className="px-3 py-2 rounded-xl bg-teal-950/40 hover:bg-teal-900/50 border border-teal-700 text-teal-200 text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer"
+            >
+              <FileCheck className="w-3.5 h-3.5 text-teal-400" />
+              <span>Simulate Cloud Post ACK</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleTestCloudSync}
+              disabled={testingCloud}
+              className="px-3 py-2 rounded-xl bg-blue-950/40 hover:bg-blue-900/50 border border-blue-700 text-blue-200 text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-blue-400 ${testingCloud ? 'animate-spin' : ''}`} />
+              <span>Test Cloud Sync Status</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleClearCloudQueue}
+              disabled={clearingQueue}
+              className="px-3 py-2 rounded-xl bg-red-950/40 hover:bg-red-900/50 border border-red-800 text-red-200 text-xs font-bold transition flex items-center justify-center space-x-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-red-400" />
+              <span>Clear Cloud Sync Queue</span>
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* SECTION: LIVE EVENT LEDGER */}
+      {/* SECTION: LIVE EVENT LEDGER WITH FILTER TABS */}
       <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-5 shadow-lg space-y-3">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
           <div className="flex items-center space-x-2">
             <Zap className="w-5 h-5 text-amber-400" />
             <h2 className="text-base font-black text-white">Live WiFi Mesh Event Ledger</h2>
           </div>
-          <span className="text-[11px] font-mono text-slate-400">
-            {logs.length} events logged
-          </span>
+
+          {/* Filter Tabs */}
+          <div className="flex flex-wrap items-center gap-1 text-[11px] font-mono">
+            {[
+              { id: 'all', label: `All (${logs.length})` },
+              { id: 'sales', label: 'Sales' },
+              { id: 'inventory', label: 'Inventory' },
+              { id: 'approvals', label: 'Approvals & Staff' },
+              { id: 'ack', label: 'Cloud Post ACKs' },
+              { id: 'drops', label: 'Security Drops' },
+            ].map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setLogFilter(tab.id as any)}
+                className={`px-2.5 py-1 rounded-lg font-bold transition cursor-pointer ${
+                  logFilter === tab.id
+                    ? 'bg-[#6A4DFF] text-white shadow-sm'
+                    : 'bg-slate-950 text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 max-h-[300px] overflow-y-auto space-y-2 font-mono text-xs">
+        <div className="bg-slate-950 border border-slate-800 rounded-2xl p-4 max-h-[320px] overflow-y-auto space-y-2 font-mono text-xs">
           {logs.length === 0 && (
             <div className="text-center py-10 text-slate-500">
               Listening for mesh packets &amp; discovery events...
             </div>
           )}
 
-          {logs.map((log) => {
-            let badgeColor = 'bg-slate-800 text-slate-300 border-slate-700';
-            if (log.type === 'BROADCAST') badgeColor = 'bg-purple-900/60 text-purple-300 border-purple-700';
-            if (log.type === 'EPIDEMIC_HOP') badgeColor = 'bg-indigo-900/60 text-indigo-300 border-indigo-700';
-            if (log.type === 'CONFLICT_RESOLVED') badgeColor = 'bg-emerald-900/60 text-emerald-300 border-emerald-700';
-            if (log.type === 'CLOUD_SYNC') badgeColor = 'bg-blue-900/60 text-blue-300 border-blue-700';
-            if (log.type === 'ACK') badgeColor = 'bg-teal-900/60 text-teal-300 border-teal-700';
-            if (log.type === 'DISCOVERY') badgeColor = 'bg-amber-900/60 text-amber-300 border-amber-700';
+          {logs
+            .filter((log) => {
+              if (logFilter === 'all') return true;
+              if (logFilter === 'sales') return log.type === 'BROADCAST' || log.message.toLowerCase().includes('sale');
+              if (logFilter === 'inventory') return log.message.toLowerCase().includes('inventory') || log.message.toLowerCase().includes('product');
+              if (logFilter === 'approvals') return log.message.toLowerCase().includes('supervisor') || log.message.toLowerCase().includes('staff') || log.message.toLowerCase().includes('approval');
+              if (logFilter === 'ack') return log.type === 'ACK' || log.type === 'CLOUD_SYNC' || log.message.toLowerCase().includes('ack') || log.message.toLowerCase().includes('double-posting');
+              if (logFilter === 'drops') return log.type === 'SECURITY_DROP' || log.message.toLowerCase().includes('blocked');
+              return true;
+            })
+            .map((log) => {
+              let badgeColor = 'bg-slate-800 text-slate-300 border-slate-700';
+              if (log.type === 'BROADCAST') badgeColor = 'bg-purple-900/60 text-purple-300 border-purple-700';
+              if (log.type === 'EPIDEMIC_HOP') badgeColor = 'bg-indigo-900/60 text-indigo-300 border-indigo-700';
+              if (log.type === 'CONFLICT_RESOLVED') badgeColor = 'bg-emerald-900/60 text-emerald-300 border-emerald-700';
+              if (log.type === 'CLOUD_SYNC') badgeColor = 'bg-blue-900/60 text-blue-300 border-blue-700';
+              if (log.type === 'ACK') badgeColor = 'bg-teal-900/60 text-teal-200 border-teal-600 font-black';
+              if (log.type === 'DISCOVERY') badgeColor = 'bg-amber-900/60 text-amber-300 border-amber-700';
+              if (log.type === 'SECURITY_DROP') badgeColor = 'bg-rose-950 text-rose-300 border-rose-700 font-bold';
 
-            return (
-              <div
-                key={log.id}
-                className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800/80 space-y-1 hover:border-slate-700 transition"
-              >
-                <div className="flex items-center justify-between text-[10px]">
-                  <span className={`px-2 py-0.5 rounded border font-bold ${badgeColor}`}>
-                    {log.type}
-                  </span>
-                  <span className="text-slate-500">{log.timestamp}</span>
-                </div>
-
-                <p className="text-slate-200 text-[11px] leading-relaxed break-words">
-                  {log.message}
-                </p>
-
-                <div className="flex items-center justify-between text-[10px] text-slate-400 pt-0.5">
-                  <span>Source: {log.sourceDevice}</span>
-                  {log.ttl !== undefined && (
-                    <span className="px-1.5 py-0.2 rounded bg-purple-950 text-purple-300 border border-purple-800 font-bold">
-                      TTL={log.ttl}
+              return (
+                <div
+                  key={log.id}
+                  className={`p-2.5 rounded-xl border space-y-1 transition ${
+                    log.type === 'SECURITY_DROP'
+                      ? 'bg-rose-950/30 border-rose-800/80'
+                      : log.type === 'ACK'
+                      ? 'bg-teal-950/30 border-teal-800/80'
+                      : 'bg-slate-900/80 border-slate-800/80 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center justify-between text-[10px]">
+                    <span className={`px-2 py-0.5 rounded border font-bold ${badgeColor}`}>
+                      {log.type === 'SECURITY_DROP' ? '🛡️ SECURITY DROP' : log.type === 'ACK' ? '✅ ANTI-DOUBLE-POST ACK' : log.type}
                     </span>
-                  )}
+                    <span className="text-slate-500">{log.timestamp}</span>
+                  </div>
+
+                  <p className="text-slate-200 text-[11px] leading-relaxed break-words">
+                    {log.message}
+                  </p>
+
+                  <div className="flex items-center justify-between text-[10px] text-slate-400 pt-0.5">
+                    <span>Source: {log.sourceDevice}</span>
+                    {log.ttl !== undefined && (
+                      <span className="px-1.5 py-0.2 rounded bg-purple-950 text-purple-300 border border-purple-800 font-bold">
+                        TTL={log.ttl}
+                      </span>
+                    )}
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
         </div>
       </div>
 

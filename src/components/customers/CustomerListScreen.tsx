@@ -7,6 +7,7 @@ import {
   getCustomerChangeReport,
 } from '../../db/roomDatabase';
 import { CustomerRegistrationModal } from './CustomerRegistrationModal';
+import { CustomerCreditModal } from './CustomerCreditModal';
 import {
   downloadCustomersCsv,
   parseCustomersCsv,
@@ -47,6 +48,7 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
 }) => {
   const [search, setSearch] = useState('');
   const [isRegisterModalOpen, setIsRegisterModalOpen] = useState(false);
+  const [selectedCustomerForCredit, setSelectedCustomerForCredit] = useState<Customer | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const customerFileInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -136,7 +138,7 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
               <Users className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl font-black text-white tracking-tight">Customer Database (Merged)</h2>
+              <h2 className="text-xl font-black text-white tracking-tight">Customer Accounts &amp; Credit Ledger</h2>
               <p className="text-xs text-slate-400">
                 Unified across POS & Cash Balancing • <span className="font-mono-num font-bold text-orange-400">{customers.length}</span> Registered Customers
               </p>
@@ -333,7 +335,18 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center space-x-1.5">
+                  <div className="flex items-center space-x-1.5 flex-wrap gap-y-1">
+                    <button
+                      type="button"
+                      id={`btn-credit-terms-${customer.customerId}`}
+                      onClick={() => setSelectedCustomerForCredit(customer)}
+                      className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-purple-500/30 text-purple-200 text-[11px] font-bold flex items-center space-x-1 transition active:scale-95 shadow-sm"
+                      title="Set / Edit Customer Credit Limits & Terms"
+                    >
+                      <CreditCard className="w-3 h-3 text-[#FF8A00]" />
+                      <span>{customer.creditAllowed === false ? 'Cash Only' : `Limit: $${(customer.creditLimit !== undefined ? customer.creditLimit : 100).toFixed(0)}`}</span>
+                    </button>
+
                     {onNavigateToCreditReport && creditDebt > 0 && (
                       <button
                         type="button"
@@ -369,6 +382,17 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
         isOpen={isRegisterModalOpen}
         onClose={() => setIsRegisterModalOpen(false)}
         currentUser={currentUser}
+      />
+
+      {/* Credit Limits & Exposure Terms Management Modal */}
+      <CustomerCreditModal
+        isOpen={Boolean(selectedCustomerForCredit)}
+        customer={selectedCustomerForCredit}
+        onClose={() => setSelectedCustomerForCredit(null)}
+        currentUser={currentUser}
+        onSuccess={(updated) => {
+          showToast(`Credit limit for ${updated.name} updated to $${(updated.creditLimit || 0).toFixed(2)}.`);
+        }}
       />
     </div>
   );

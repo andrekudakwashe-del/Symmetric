@@ -228,7 +228,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
             <div>
               <h2 className="text-xl font-black text-white tracking-tight">Final Cash Count</h2>
               <p className="text-xs text-slate-400">
-                FORM 1 • Saves <span className="font-mono-num font-semibold text-orange-300">finalCashOutTotal</span> to Sheet "CashLog"
+                FORM 1 • Saves physical cash count snapshot to ledger for Form 4 reconciliation
               </p>
             </div>
           </div>
@@ -576,8 +576,8 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
                   <span className="text-sm font-bold text-white">Cash Count Saved & Queued!</span>
                 </div>
                 <p className="text-xs text-emerald-300/90 leading-relaxed">
-                  Saved <strong>${savedSuccess.finalCashOutTotal.toFixed(2)}</strong> as <span className="font-mono-num">finalCashOutTotal</span> for {savedSuccess.staffName} on {savedSuccess.date}.
-                  Logged to Sheet <strong>"CashLog"</strong> (In=0, Out=${savedSuccess.finalCashOutTotal.toFixed(2)}).
+                  Saved <strong>${savedSuccess.finalCashOutTotal.toFixed(2)}</strong> as <span className="font-mono-num">physical_count</span> for {savedSuccess.staffName} on {savedSuccess.date}.
+                  Recorded to unified <strong>cashMovements</strong> ledger for Form 4 reconciliation.
                 </p>
 
                 <div className="flex flex-col sm:flex-row items-center gap-2 pt-1">

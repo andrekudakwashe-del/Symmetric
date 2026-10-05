@@ -19,7 +19,14 @@ import {
   BadgeCheck,
   Check,
   Briefcase,
+  RefreshCw,
+  Database,
+  ToggleLeft,
+  ToggleRight,
+  ShieldCheck,
+  Share2,
 } from 'lucide-react';
+import { persistentSyncEngine } from '../../services/persistentSyncEngine';
 import {
   getBranches,
   saveBranch,
@@ -32,6 +39,8 @@ import {
   isStaffAssignedToBranch,
   getStaffRoleInBranch,
   updateStaffBranchAssignments,
+  getCompanyBranchSettings,
+  saveCompanyBranchSettings,
 } from '../../db/roomDatabase';
 import { Branch, Salesperson, StaffBranchAssignment } from '../../types';
 
@@ -71,8 +80,10 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
   const [formIsActive, setFormIsActive] = useState(true);
   const [formError, setFormError] = useState('');
   const [showFormTeamConfig, setShowFormTeamConfig] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
 
   const company = getCurrentCompany();
+  const [branchSharing, setBranchSharing] = useState(() => getCompanyBranchSettings());
 
   const isSuperAdmin =
     currentUser?.role === 'SUPER_ADMIN' ||
@@ -86,9 +97,38 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
     const unsub = subscribeRoomDatabase(() => {
       setBranches(getBranches());
       setStaffList(getSalespeople());
+      setBranchSharing(getCompanyBranchSettings());
     });
     return unsub;
   }, []);
+
+  const handleToggleShareCustomers = (val: boolean) => {
+    if (!canManageBranches) {
+      showToast('Permission Denied: Only Business Owners or Super Admins can change database sharing policies.');
+      return;
+    }
+    const updated = saveCompanyBranchSettings({ shareCustomersAcrossBranches: val });
+    setBranchSharing(updated);
+    showToast(
+      val
+        ? 'Customer Directory: Now SHARED across all company branches.'
+        : 'Customer Directory: Now ISOLATED per branch (default).'
+    );
+  };
+
+  const handleToggleShareSuppliers = (val: boolean) => {
+    if (!canManageBranches) {
+      showToast('Permission Denied: Only Business Owners or Super Admins can change database sharing policies.');
+      return;
+    }
+    const updated = saveCompanyBranchSettings({ shareSuppliersAcrossBranches: val });
+    setBranchSharing(updated);
+    showToast(
+      val
+        ? 'Supplier Database: Now SHARED across all company branches.'
+        : 'Supplier Database: Now ISOLATED per branch (default).'
+    );
+  };
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -238,6 +278,26 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
       return;
     }
 
+    const trimmedName = formName.trim().toLowerCase();
+    const trimmedCode = formCode.trim().toUpperCase();
+
+    // Check existing branches locally in current company
+    const localDuplicate = branches.find((b) => {
+      const isSelf = editingBranch && (b.branchId === editingBranch.branchId || b.id === editingBranch.id);
+      if (isSelf) return false;
+      return (
+        (b.name || '').trim().toLowerCase() === trimmedName ||
+        (b.code || '').trim().toUpperCase() === trimmedCode
+      );
+    });
+
+    if (localDuplicate) {
+      setFormError(
+        `A branch with name "${formName.trim()}" or code "${formCode.trim()}" already exists. Please choose a unique name and code.`
+      );
+      return;
+    }
+
     const assignedManager = staffList.find((s) => s.id === formManagerId);
     const branchId = editingBranch
       ? editingBranch.branchId || editingBranch.id || `BR-${Date.now()}`
@@ -371,14 +431,39 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
           </div>
 
           {canManageBranches ? (
-            <button
-              type="button"
-              onClick={handleOpenAdd}
-              className="self-start sm:self-auto px-4 py-2.5 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-amber-400/20 transition active:scale-95 cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              <span>Add New Branch</span>
-            </button>
+            <div className="flex items-center space-x-2">
+              <button
+                type="button"
+                id="btn-refresh-branches-delta"
+                onClick={async () => {
+                  setIsRefreshing(true);
+                  try {
+                    const count = await persistentSyncEngine.forceRefreshBranches();
+                    setBranches(getBranches());
+                    showToast(`Branches refreshed from server: ${count} updated.`);
+                  } catch (e: any) {
+                    showToast(`Refresh failed: ${e.message || String(e)}`);
+                  } finally {
+                    setIsRefreshing(false);
+                  }
+                }}
+                disabled={isRefreshing}
+                className="px-3.5 py-2.5 rounded-2xl bg-white/20 hover:bg-white/30 text-white font-bold text-xs flex items-center space-x-1.5 transition active:scale-95 disabled:opacity-50 cursor-pointer"
+                title="Refresh branches from Google Sheets / server"
+              >
+                <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
+                <span className="hidden sm:inline">Refresh Branches</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleOpenAdd}
+                className="self-start sm:self-auto px-4 py-2.5 rounded-2xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-amber-400/20 transition active:scale-95 cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>Add New Branch</span>
+              </button>
+            </div>
           ) : (
             <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/10 text-white/90 text-xs font-semibold border border-white/20 select-none">
               <Lock className="w-3.5 h-3.5 text-amber-300" />
@@ -445,6 +530,110 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
           <span className="text-[10px] text-slate-500">
             1 Sheet per branch + Monthly tab sharding
           </span>
+        </div>
+      </div>
+
+      {/* 2.5 Multi-Branch Data Sharing & Isolation Policy (Owner & Admin Controls) */}
+      <div className="p-4 sm:p-5 rounded-3xl bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 border border-indigo-800/40 text-white shadow-xl space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-indigo-900/60">
+          <div className="flex items-center space-x-3">
+            <div className="w-10 h-10 rounded-2xl bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 flex items-center justify-center shrink-0">
+              <Database className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm sm:text-base font-black tracking-tight">
+                  Multi-Branch Data Isolation & Sharing Policies
+                </h3>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-400/20 text-emerald-300 text-[10px] font-bold border border-emerald-400/30">
+                  Per-Branch Strict By Default
+                </span>
+              </div>
+              <p className="text-xs text-indigo-200/80">
+                Sales, inventory counts, and cash balancing are strictly locked to each branch. Choose whether customer directories and suppliers are shared across branches.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 text-xs font-mono text-indigo-300 bg-indigo-900/40 px-3 py-1.5 rounded-xl border border-indigo-700/50 self-start sm:self-auto">
+            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <span>Company: {company.company_name}</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+          {/* Customers Policy Toggle */}
+          <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-indigo-900/40 flex items-start justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Share2 className="w-4 h-4 text-sky-400" />
+                <span className="text-xs font-bold text-slate-100">Customer Directory Sharing</span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                {branchSharing.shareCustomersAcrossBranches
+                  ? 'SHARED: Customer accounts and credit logs are visible and usable across all branches of the company.'
+                  : 'ISOLATED (Standard): Each branch maintains its own distinct customer list. Changes in Branch A do not appear in other branches.'}
+              </p>
+            </div>
+            {canManageBranches ? (
+              <button
+                type="button"
+                onClick={() => handleToggleShareCustomers(!branchSharing.shareCustomersAcrossBranches)}
+                className={`p-1.5 rounded-xl transition cursor-pointer shrink-0 ${
+                  branchSharing.shareCustomersAcrossBranches
+                    ? 'text-emerald-400 hover:text-emerald-300'
+                    : 'text-slate-500 hover:text-slate-400'
+                }`}
+                title="Toggle customer directory sharing across branches"
+              >
+                {branchSharing.shareCustomersAcrossBranches ? (
+                  <ToggleRight className="w-7 h-7" />
+                ) : (
+                  <ToggleLeft className="w-7 h-7" />
+                )}
+              </button>
+            ) : (
+              <span className="text-[10px] px-2 py-1 rounded bg-slate-800 text-slate-400 font-mono shrink-0">
+                {branchSharing.shareCustomersAcrossBranches ? 'SHARED' : 'ISOLATED'}
+              </span>
+            )}
+          </div>
+
+          {/* Suppliers Policy Toggle */}
+          <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-indigo-900/40 flex items-start justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Briefcase className="w-4 h-4 text-amber-400" />
+                <span className="text-xs font-bold text-slate-100">Supplier Database Sharing</span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                {branchSharing.shareSuppliersAcrossBranches
+                  ? 'SHARED: Central procurement suppliers and vendor contacts are accessible across all company branches.'
+                  : 'ISOLATED (Standard): Each branch manages its own local suppliers independently. Vendor records are not mirrored.'}
+              </p>
+            </div>
+            {canManageBranches ? (
+              <button
+                type="button"
+                onClick={() => handleToggleShareSuppliers(!branchSharing.shareSuppliersAcrossBranches)}
+                className={`p-1.5 rounded-xl transition cursor-pointer shrink-0 ${
+                  branchSharing.shareSuppliersAcrossBranches
+                    ? 'text-emerald-400 hover:text-emerald-300'
+                    : 'text-slate-500 hover:text-slate-400'
+                }`}
+                title="Toggle supplier database sharing across branches"
+              >
+                {branchSharing.shareSuppliersAcrossBranches ? (
+                  <ToggleRight className="w-7 h-7" />
+                ) : (
+                  <ToggleLeft className="w-7 h-7" />
+                )}
+              </button>
+            ) : (
+              <span className="text-[10px] px-2 py-1 rounded bg-slate-800 text-slate-400 font-mono shrink-0">
+                {branchSharing.shareSuppliersAcrossBranches ? 'SHARED' : 'ISOLATED'}
+              </span>
+            )}
+          </div>
         </div>
       </div>
 

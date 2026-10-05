@@ -39,6 +39,7 @@ import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import { BluetoothPrinterModal } from '../common/BluetoothPrinterModal';
 import { ShareDeviceModal } from '../common/ShareDeviceModal';
 import { meshSyncService } from '../../services/meshSyncService';
+import { isSupervisorOrAbove } from '../../db/roomDatabase';
 
 interface POSMoreDrawerProps {
   isOpen?: boolean;
@@ -47,6 +48,7 @@ interface POSMoreDrawerProps {
   currentUser: Salesperson | null;
   pendingSyncCount: number;
   onLogout?: () => void;
+  onOpenExchangeRates?: () => void;
 }
 
 export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
@@ -56,6 +58,7 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
   currentUser,
   pendingSyncCount,
   onLogout,
+  onOpenExchangeRates,
 }) => {
   const [showPrinterModal, setShowPrinterModal] = React.useState(false);
   const [showShareModal, setShowShareModal] = React.useState(false);
@@ -67,11 +70,13 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
     (currentUser?.role as string) === 'super_admin' ||
     currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
   const isOwner = currentUser?.role === 'OWNER';
+  const isSupervisorOrManager = isSupervisorOrAbove(currentUser?.role);
   const isAdmin = currentUser?.role === 'Admin' || isOwner || isSuperAdmin;
-  const isManager = currentUser?.role === 'MANAGER' || isAdmin;
+  const isManager = currentUser?.role === 'MANAGER' || isAdmin || isSupervisorOrManager;
   const canManageBranches = isSuperAdmin || isOwner;
   const canManageStaff = isSuperAdmin || isOwner || currentUser?.role === 'Admin' || currentUser?.role === 'MANAGER';
   const canManageData = isSuperAdmin || isOwner || currentUser?.role === 'Admin' || currentUser?.role === 'MANAGER';
+  const canViewReports = isSupervisorOrManager || Boolean(currentUser?.permissions?.canViewReports);
 
   React.useEffect(() => {
     setMeshConfig(meshSyncService.getConfig());
@@ -101,10 +106,19 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
         },
         {
           tab: 'today' as ActiveTab,
-          label: "Today's Invoices & Sales",
-          description: 'View sales receipt history and refunds',
+          label: 'Receipts & Invoices',
+          description: 'View receipts, load more, reprint invoices & refunds',
           icon: Receipt,
-          color: 'from-emerald-500 to-teal-600',
+          color: 'from-blue-500 to-cyan-600',
+        },
+        {
+          tab: 'cash_balancing' as ActiveTab,
+          label: 'Multi-Currency & Cash-Out Rates',
+          description: 'Owner-governed USD, ZiG & EcoCash rates & cash withdrawal policy',
+          icon: Coins,
+          color: 'from-amber-500 to-indigo-600',
+          badge: 'Owner Governed',
+          action: 'EXCHANGE_RATES',
         },
       ],
     },
@@ -191,13 +205,17 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
           icon: CreditCard,
           color: 'from-rose-500 to-pink-600',
         },
-        {
-          tab: 'reconciliation' as ActiveTab,
-          label: 'Form 4: Admin Shift Balancing & Audit',
-          description: 'Calculate variances vs external cash registers',
-          icon: ShieldCheck,
-          color: 'from-indigo-600 to-purple-800',
-        },
+        ...((isSupervisorOrManager || isAdmin)
+          ? [
+              {
+                tab: 'reconciliation' as ActiveTab,
+                label: 'Form 4: Admin Shift Balancing & Audit',
+                description: 'Calculate variances vs external cash registers',
+                icon: ShieldCheck,
+                color: 'from-indigo-600 to-purple-800',
+              },
+            ]
+          : []),
       ],
     },
     {
@@ -205,7 +223,7 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
       items: [
         {
           tab: 'customers' as ActiveTab,
-          label: 'Unified Customer Database',
+          label: 'Customer Accounts & Credit Ledger',
           description: 'Customer directory, contact numbers & account balance',
           icon: Users,
           color: 'from-blue-600 to-cyan-600',
@@ -254,39 +272,47 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
         },
       ],
     },
-    {
-      title: 'Admin Data & Reports Center',
-      items: [
-        {
-          tab: 'sales_report' as ActiveTab,
-          label: 'Sales, Profit & Top Stocks Report',
-          description: 'Sales revenue, gross profit margin, items sold & top inventory velocity',
-          icon: TrendingUp,
-          color: 'from-[#6A4DFF] to-[#FF8A00]',
-          badge: 'Financials',
-        },
-        ...(canManageData
-          ? [
-              {
-                tab: 'data_management' as ActiveTab,
-                label: 'Admin Data Center (Import & Export)',
-                description: 'Import & Export: 1. Inventory, 2. Customers, 3. Suppliers, and Full Backups',
-                icon: Database,
-                color: 'from-indigo-600 to-purple-700',
-                badge: 'Import/Export',
-              },
-              {
-                tab: 'data_management' as ActiveTab,
-                label: 'Export All Reports (12 Ledgers)',
-                description: 'Single-click CSV export for Forms 1-4, GRN, Stock Audit, and Sales',
-                icon: Download,
-                color: 'from-emerald-600 to-teal-700',
-                badge: 'Export Only',
-              },
-            ]
-          : []),
-      ],
-    },
+    ...(canViewReports || canManageData
+      ? [
+          {
+            title: 'Admin Data & Reports Center',
+            items: [
+              ...(canViewReports
+                ? [
+                    {
+                      tab: 'sales_report' as ActiveTab,
+                      label: 'Sales, Profit & Top Stocks Report',
+                      description: 'Sales revenue, gross profit margin, items sold & top inventory velocity',
+                      icon: TrendingUp,
+                      color: 'from-[#6A4DFF] to-[#FF8A00]',
+                      badge: 'Financials',
+                    },
+                  ]
+                : []),
+              ...(canManageData
+                ? [
+                    {
+                      tab: 'data_management' as ActiveTab,
+                      label: 'Admin Data Center (Import & Export)',
+                      description: 'Import & Export: 1. Inventory, 2. Customers, 3. Suppliers, and Full Backups',
+                      icon: Database,
+                      color: 'from-indigo-600 to-purple-700',
+                      badge: 'Import/Export',
+                    },
+                    {
+                      tab: 'data_management' as ActiveTab,
+                      label: 'Export All Reports (12 Ledgers)',
+                      description: 'Single-click CSV export for Forms 1-4, GRN, Stock Audit, and Sales',
+                      icon: Download,
+                      color: 'from-emerald-600 to-teal-700',
+                      badge: 'Export Only',
+                    },
+                  ]
+                : []),
+            ],
+          },
+        ]
+      : []),
     {
       title: 'Connectivity, Cloud Sync & Settings',
       items: [
@@ -511,7 +537,11 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
                 <div
                   key={iIdx}
                   onClick={() => {
-                    onNavigate(item.tab);
+                    if ((item as any).action === 'EXCHANGE_RATES' && onOpenExchangeRates) {
+                      onOpenExchangeRates();
+                    } else {
+                      onNavigate(item.tab);
+                    }
                     if (onClose) onClose();
                   }}
                   className="bg-slate-900/80 hover:bg-slate-800/90 border border-slate-800 hover:border-slate-700 rounded-2xl p-3.5 flex items-center justify-between cursor-pointer transition active:scale-[0.99] group shadow-sm"

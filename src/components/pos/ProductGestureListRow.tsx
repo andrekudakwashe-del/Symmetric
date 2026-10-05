@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Product } from '../../types';
+import { getCurrentUser, isSupervisorOrAbove } from '../../db/roomDatabase';
 import { Scale, Plus, Minus } from 'lucide-react';
 
 interface ProductGestureListRowProps {
@@ -205,11 +206,35 @@ export const ProductGestureListRow: React.FC<ProductGestureListRowProps> = ({
           <div className="flex items-center space-x-2 text-[11px] text-slate-500 mt-0.5">
             <span>{product.category || 'General'}</span>
             <span>•</span>
-            <span className="font-bold text-slate-600">
-              {product.sellByFraction
-                ? `By ${product.fractionUnit || 'kg'}`
-                : `${product.stockQuantity} ${product.unit || 'Each'}`}
-            </span>
+            {(() => {
+              const user = getCurrentUser();
+              const canSeeRaw = isSupervisorOrAbove(user?.role) || Boolean(user?.permissions?.canManageInventory);
+              const isOOS = product.stockQuantity === 0 && (!product.stockCases || product.stockCases === 0);
+              const totalStockUnits = (Number(product.stockCases) || 0) * (product.unitsPerCase || 1) + (Number(product.stockQuantity) || 0);
+              const isLow = !isOOS && totalStockUnits <= (product.reorderLevelUnits || 5);
+
+              if (product.sellByFraction) {
+                return (
+                  <span className="font-bold text-emerald-700">
+                    By {product.fractionUnit || 'kg'}
+                  </span>
+                );
+              }
+
+              if (!canSeeRaw) {
+                return (
+                  <span className={`font-bold ${isOOS ? 'text-rose-600' : isLow ? 'text-amber-600' : 'text-emerald-700'}`}>
+                    {isOOS ? 'OOS' : isLow ? 'Low Stock' : 'In Stock'}
+                  </span>
+                );
+              }
+
+              return (
+                <span className={`font-bold ${isLow ? 'text-amber-600' : 'text-slate-600'}`}>
+                  {product.stockQuantity} {product.unit || 'Each'}
+                </span>
+              );
+            })()}
           </div>
         </div>
       </div>

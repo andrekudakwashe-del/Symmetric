@@ -8,20 +8,23 @@ interface CustomerSearchModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSelectCustomer: (customer: Customer) => void;
+  onSelectWalkIn?: () => void;
   selectedCustomerId?: string;
-  currentUser: Salesperson;
+  currentUser?: Salesperson | null;
 }
 
 export const CustomerSearchModal: React.FC<CustomerSearchModalProps> = ({
   isOpen,
   onClose,
   onSelectCustomer,
+  onSelectWalkIn,
   selectedCustomerId,
   currentUser,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [isRegisterModalOpen, setIsRegisterModalOpen] = useState(false);
   const customers = getCustomers();
+  const safeUser: Salesperson = currentUser || { id: '001', name: 'Cashier', role: 'Cashier', pin: '0000', active: 'Y' };
 
   const filteredCustomers = useMemo(() => {
     const q = (searchQuery || '').trim().toLowerCase();
@@ -110,7 +113,64 @@ export const CustomerSearchModal: React.FC<CustomerSearchModalProps> = ({
 
           {/* Customer List */}
           <div className="flex-1 overflow-y-auto p-4 space-y-2.5">
-            {filteredCustomers.length === 0 ? (
+            {/* Walk-in Customer / Unregistered option */}
+            {(!searchQuery || 'walk-in customer unregistered'.includes(searchQuery.toLowerCase().trim())) && (
+              <button
+                type="button"
+                id="customer-item-walk-in"
+                onClick={() => {
+                  if (onSelectWalkIn) {
+                    onSelectWalkIn();
+                  } else {
+                    onSelectCustomer({
+                      customerId: '',
+                      name: 'Walk-in Customer (Unregistered)',
+                      createdBy: safeUser.id,
+                    } as any);
+                  }
+                  onClose();
+                }}
+                className={`w-full text-left p-3.5 rounded-2xl border transition-all flex items-center justify-between ${
+                  !selectedCustomerId
+                    ? 'bg-gradient-to-r from-blue-950/90 to-slate-900 border-blue-500 ring-1 ring-blue-500/60 shadow-lg'
+                    : 'bg-slate-950/60 border-slate-800/80 hover:bg-slate-800/50 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex items-center space-x-3">
+                  <div
+                    className={`w-10 h-10 rounded-2xl flex items-center justify-center font-bold text-xs shrink-0 ${
+                      !selectedCustomerId
+                        ? 'bg-blue-600 text-white shadow-md'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    }`}
+                  >
+                    <User className="w-5 h-5" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-bold text-white flex items-center gap-1.5">
+                      <span>Walk-in Customer (Unregistered)</span>
+                      {!selectedCustomerId && (
+                        <span className="text-[10px] bg-blue-500/20 text-blue-300 px-1.5 py-0.2 rounded-full font-bold">
+                          Selected
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-400">Regular cash / immediate retail sale without ledger</p>
+                  </div>
+                </div>
+                <div className="ml-2 shrink-0 text-slate-500">
+                  {!selectedCustomerId ? (
+                    <div className="w-6 h-6 rounded-full bg-blue-500 flex items-center justify-center text-white font-black">
+                      <Check className="w-4 h-4" />
+                    </div>
+                  ) : (
+                    <ChevronRight className="w-5 h-5 text-slate-600" />
+                  )}
+                </div>
+              </button>
+            )}
+
+            {filteredCustomers.length === 0 && searchQuery ? (
               <div className="text-center py-10 px-4 text-slate-400">
                 <User className="w-10 h-10 mx-auto mb-2 text-slate-600" />
                 <p className="text-sm font-semibold text-slate-300">No customer found for "{searchQuery}"</p>
@@ -200,7 +260,7 @@ export const CustomerSearchModal: React.FC<CustomerSearchModalProps> = ({
       <CustomerRegistrationModal
         isOpen={isRegisterModalOpen}
         onClose={() => setIsRegisterModalOpen(false)}
-        currentUser={currentUser}
+        currentUser={safeUser}
         onCustomerCreated={handleCustomerCreated}
       />
     </>

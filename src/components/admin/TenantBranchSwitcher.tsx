@@ -27,12 +27,14 @@ interface TenantBranchSwitcherProps {
   currentUser?: Salesperson | null;
   onOpenPermissions?: () => void;
   onOpenSuperAdmin?: () => void;
+  onBranchChange?: (branchId: string, branchName: string) => void;
 }
 
 export const TenantBranchSwitcher: React.FC<TenantBranchSwitcherProps> = ({
   currentUser,
   onOpenPermissions,
   onOpenSuperAdmin,
+  onBranchChange,
 }) => {
   const [company, setCompany] = useState(() => getCurrentCompany());
   const [branch, setBranch] = useState(() => getCurrentBranch());
@@ -74,18 +76,20 @@ export const TenantBranchSwitcher: React.FC<TenantBranchSwitcherProps> = ({
     setCurrentBranchId(branchId);
     
     // Ensure currentUser session branch is synchronized so any new POS sale is attributed to this branch
+    const targetBranch = allBranches.find((b) => (b.branchId || b.id || (b as any).branch_id) === branchId);
+    const branchName = targetBranch?.name || branch.name;
     if (currentUser) {
-      const targetBranch = allBranches.find((b) => (b.branchId || b.id) === branchId);
       const updatedUser: Salesperson = {
         ...currentUser,
         branchId,
         branch_id: branchId,
-        branchName: targetBranch?.name || currentUser.branchName,
+        branchName,
       };
       setSessionUser(updatedUser);
       saveSalesperson(updatedUser);
     }
     
+    onBranchChange?.(branchId, branchName);
     setIsOpen(false);
   };
 

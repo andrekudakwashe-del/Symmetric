@@ -22,6 +22,7 @@ import {
   Users,
   LogOut,
   Wifi,
+  Coins,
 } from 'lucide-react';
 import { POSExpenseModal } from './POSExpenseModal';
 import { meshSyncService } from '../../services/meshSyncService';
@@ -32,8 +33,11 @@ interface POSHomeViewProps {
   onStartNewSale: () => void;
   onRestoreParkedSale?: (parked: ParkedSale) => void;
   onOpenCustomerModal?: () => void;
+  onOpenCurrencySelector?: () => void;
   onOpenMoreMenu?: () => void;
+  onOpenReceiptsModal?: () => void;
   onLogout?: () => void;
+  selectedCurrency?: string;
 }
 
 export const POSHomeView: React.FC<POSHomeViewProps> = ({
@@ -42,8 +46,11 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
   onStartNewSale,
   onRestoreParkedSale,
   onOpenCustomerModal,
+  onOpenCurrencySelector,
   onOpenMoreMenu,
+  onOpenReceiptsModal,
   onLogout,
+  selectedCurrency = 'USD',
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [showExpenseModal, setShowExpenseModal] = useState(false);
@@ -82,14 +89,16 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
       {/* 1. Header Bar matching Screenshot 3 with SAIMETRIC theme */}
       <div className="bg-gradient-to-r from-[#6A4DFF] via-[#7B5BFF] to-[#FF8A00] text-white rounded-3xl p-3.5 sm:p-4 shadow-xl">
         <div className="flex items-center justify-between">
-          {/* Left: Menu Icon */}
+          {/* Left: Currency Selection & Exchange Rates Option */}
           <button
             type="button"
-            onClick={onOpenMoreMenu}
-            title="Open Menu"
-            className="w-10 h-10 rounded-2xl bg-white/15 hover:bg-white/25 flex items-center justify-center transition active:scale-95 text-white"
+            id="btn-pos-home-currency"
+            onClick={onOpenCurrencySelector || onOpenMoreMenu}
+            title="Select Currency & Exchange Rates"
+            className="h-10 px-3 rounded-2xl bg-white/20 hover:bg-white/30 flex items-center space-x-1.5 transition active:scale-95 text-white font-bold text-xs border border-white/30 shadow-sm"
           >
-            <Menu className="w-5 h-5" />
+            <Coins className="w-4 h-4 text-amber-300" />
+            <span className="font-mono">{selectedCurrency}</span>
           </button>
 
           {/* Center: Title Dropdown */}
@@ -345,26 +354,31 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
         )}
       </div>
 
-      {/* Quick Summary Grid */}
+      {/* Operational Quick Action Grid (No revenue or drawer balances exposed to cashiers) */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
         <div
-          onClick={() => onNavigateTab('today')}
+          id="btn-pos-open-receipts"
+          onClick={() => {
+            if (onOpenReceiptsModal) {
+              onOpenReceiptsModal();
+            } else {
+              onNavigateTab('today');
+            }
+          }}
           className="bg-slate-900/60 border border-slate-800 rounded-2xl p-3 cursor-pointer hover:border-slate-700 transition"
         >
-          <div className="text-[10px] text-slate-400 font-bold uppercase">Today's Sales</div>
-          <div className="text-base font-black text-white font-mono-num mt-0.5">${todayRevenue.toFixed(2)}</div>
-          <div className="text-[10px] text-emerald-400 font-medium">{todaySales.length} Invoices</div>
+          <div className="text-[10px] text-blue-400 font-bold uppercase">Receipts</div>
+          <div className="text-sm sm:text-base font-black text-white mt-0.5">Invoices &amp; Log</div>
+          <div className="text-[10px] text-slate-400 font-medium">Lookup &amp; Reprint</div>
         </div>
 
         <div
           onClick={() => onNavigateTab('cash_balancing')}
           className="bg-slate-900/60 border border-slate-800 rounded-2xl p-3 cursor-pointer hover:border-slate-700 transition"
         >
-          <div className="text-[10px] text-slate-400 font-bold uppercase">Drawer Net</div>
-          <div className="text-base font-black text-white font-mono-num mt-0.5">
-            ${cashLogs.reduce((acc, l) => acc + (l.in || 0) - (l.out || 0), 0).toFixed(2)}
-          </div>
-          <div className="text-[10px] text-purple-400 font-medium">Forms 1–4 Live</div>
+          <div className="text-[10px] text-slate-400 font-bold uppercase">Shift Close</div>
+          <div className="text-sm sm:text-base font-black text-white mt-0.5">Forms 1 &amp; 2</div>
+          <div className="text-[10px] text-purple-400 font-medium">Daily Cash Balancing</div>
         </div>
 
         <div
@@ -372,17 +386,17 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
           className="bg-slate-900/60 border border-slate-800 rounded-2xl p-3 cursor-pointer hover:border-slate-700 transition"
         >
           <div className="text-[10px] text-slate-400 font-bold uppercase">Customers</div>
-          <div className="text-base font-black text-white font-mono-num mt-0.5">Merged DB</div>
-          <div className="text-[10px] text-amber-400 font-medium">Debtors & Change</div>
+          <div className="text-sm sm:text-base font-black text-white mt-0.5">Directory</div>
+          <div className="text-[10px] text-amber-400 font-medium">Accounts &amp; Change</div>
         </div>
 
         <div
-          onClick={() => onNavigateTab('reports')}
+          onClick={() => onNavigateTab('today')}
           className="bg-slate-900/60 border border-slate-800 rounded-2xl p-3 cursor-pointer hover:border-slate-700 transition"
         >
-          <div className="text-[10px] text-slate-400 font-bold uppercase">Audits</div>
-          <div className="text-base font-black text-white font-mono-num mt-0.5">Reconciliation</div>
-          <div className="text-[10px] text-blue-400 font-medium">Variance Check</div>
+          <div className="text-[10px] text-slate-400 font-bold uppercase">Today's Shift</div>
+          <div className="text-sm sm:text-base font-black text-white mt-0.5">Orders List</div>
+          <div className="text-[10px] text-blue-400 font-medium">{todaySales.length} Processed</div>
         </div>
       </div>
 

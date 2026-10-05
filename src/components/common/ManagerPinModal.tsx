@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Salesperson } from '../../types';
-import { getSalespeople } from '../../db/roomDatabase';
+import { getSalespeople, getAllSalespeople, isSupervisorOrAbove } from '../../db/roomDatabase';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -19,7 +19,7 @@ interface ManagerPinModalProps {
   onClose: () => void;
   title: string;
   subtitle?: string;
-  actionType: 'REFUND' | 'VOID' | 'DISCOUNT';
+  actionType: 'REFUND' | 'VOID' | 'DISCOUNT' | 'APPROVAL';
   actionDescription: string;
   amount?: number;
   reasonRequired?: boolean;
@@ -28,7 +28,7 @@ interface ManagerPinModalProps {
   onAuthorize: (manager: Salesperson, reason: string) => void;
 }
 
-const DEFAULT_REASONS_MAP: Record<'REFUND' | 'VOID' | 'DISCOUNT', string[]> = {
+const DEFAULT_REASONS_MAP: Record<'REFUND' | 'VOID' | 'DISCOUNT' | 'APPROVAL', string[]> = {
   REFUND: [
     'Customer Return / Defective',
     'Customer Dissatisfied',
@@ -49,6 +49,12 @@ const DEFAULT_REASONS_MAP: Record<'REFUND' | 'VOID' | 'DISCOUNT', string[]> = {
     'Bulk Purchase Incentive',
     'Damaged Packaging / Minor Flaw',
     'Manager Goodwill Discretion',
+  ],
+  APPROVAL: [
+    'Credit Terms Authorization',
+    'Customer Limit Adjustment',
+    'Special Account Approval',
+    'Owner Discretion',
   ],
 };
 
@@ -150,8 +156,13 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
 
     setIsVerifying(true);
     setTimeout(() => {
-      const allStaff = getSalespeople().filter((s) => s.active === 'Y');
-      const matched = allStaff.find((s) => s.pin === pinToTest);
+      const cleanPin = pinToTest.trim();
+      const scopedStaff = getSalespeople().filter((s) => s.active === 'Y');
+      const allActiveStaff = getAllSalespeople().filter((s) => s.active === 'Y');
+      
+      // Match within current branch/company first, then fallback across active tenant staff
+      const matched = scopedStaff.find((s) => String(s.pin || '').trim() === cleanPin) ||
+                      allActiveStaff.find((s) => String(s.pin || '').trim() === cleanPin);
 
       if (!matched) {
         setError('Invalid 4-digit PIN. Please try again.');
@@ -160,11 +171,11 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
         return;
       }
 
-      const isManagerOrAdmin = matched.role === 'Manager' || matched.role === 'Admin';
+      const isAuthorized = isSupervisorOrAbove(matched.role) || Boolean(matched.permissions?.canPinOverride);
 
-      if (!isManagerOrAdmin) {
+      if (!isAuthorized) {
         setError(
-          `Entered PIN belongs to ${matched.name} (Cashier). Authorization requires a Manager or Administrator PIN.`
+          `Entered PIN belongs to ${matched.name} (${matched.role}). Authorization requires a Supervisor, Manager, or Administrator PIN.`
         );
         setPin('');
         setIsVerifying(false);
@@ -189,10 +200,10 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
     }, 180);
   };
 
-  const allStaff = getSalespeople().filter((s) => s.active === 'Y');
-  const authorizedManagers = allStaff.filter(
-    (s) => s.role === 'Manager' || s.role === 'Admin'
-  );
+  const staffPool = getSalespeople().length > 0 ? getSalespeople() : getAllSalespeople();
+  const authorizedManagers = staffPool
+    .filter((s) => s.active === 'Y')
+    .filter((s) => isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride));
 
   return (
     <div

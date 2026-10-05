@@ -923,7 +923,7 @@ export const UniversalReportBuilder: React.FC<UniversalReportBuilderProps> = ({
                         type="text"
                         placeholder="Value 2..."
                         value={f.value2 || ''}
-                        onChange={(e) => updateFilter(f.id, { value2: e.target.value2 })}
+                        onChange={(e) => updateFilter(f.id, { value2: e.target.value })}
                         className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-[#6A4DFF] flex-1 min-w-[120px]"
                       />
                     )}

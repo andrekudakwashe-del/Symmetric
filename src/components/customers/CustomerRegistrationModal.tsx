@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Customer, Salesperson } from '../../types';
-import { getNextCustomerId, addCustomer } from '../../db/roomDatabase';
-import { X, UserPlus, Phone, MapPin, User, Check, Sparkles, Hash } from 'lucide-react';
+import { getNextCustomerId, addCustomer, isSupervisorOrAbove } from '../../db/roomDatabase';
+import { X, UserPlus, Phone, MapPin, User, Check, Sparkles, Hash, Lock, ShieldCheck } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
 interface CustomerRegistrationModalProps {
@@ -18,9 +18,14 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
   onCustomerCreated,
 }) => {
   const nextId = getNextCustomerId();
+  const isAuthorizedToSetCredit = isSupervisorOrAbove(currentUser.role) || Boolean(currentUser.permissions?.canGrantCredit);
+
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [address, setAddress] = useState('');
+  const [creditAllowed, setCreditAllowed] = useState(isAuthorizedToSetCredit);
+  const [creditLimit, setCreditLimit] = useState(isAuthorizedToSetCredit ? '100.00' : '0.00');
+  const [maxCreditReceiptCount, setMaxCreditReceiptCount] = useState('2');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -42,6 +47,11 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
         phone: phone.trim(),
         address: address.trim(),
         createdBy: currentUser.id,
+        creditAllowed,
+        creditLimit: Math.max(0, parseFloat(creditLimit) || 0),
+        maxCreditReceiptCount: Math.max(1, parseInt(maxCreditReceiptCount, 10) || 1),
+        creditApprovedBy: currentUser.name,
+        creditApprovalDate: new Date().toISOString(),
       });
 
       confetti({
@@ -169,6 +179,86 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
                 className="w-full pl-10 pr-3.5 py-2.5 bg-slate-950/80 border border-slate-700/80 focus:border-[#6A4DFF] focus:ring-2 focus:ring-[#6A4DFF]/30 rounded-2xl text-sm text-white placeholder-slate-500 transition outline-none"
               />
             </div>
+          </div>
+
+          {/* Credit Account Settings (Mode C: Authorized limits) */}
+          <div className="p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="flex items-center space-x-1.5">
+                  <span className="text-xs font-bold text-slate-200">Credit Account Terms</span>
+                  {isAuthorizedToSetCredit ? (
+                    <span className="text-[9px] bg-emerald-500/20 text-emerald-300 font-bold px-1.5 py-0.5 rounded border border-emerald-500/30">
+                      Authorized Staff
+                    </span>
+                  ) : (
+                    <span className="text-[9px] bg-amber-500/20 text-amber-300 font-bold px-1.5 py-0.5 rounded border border-amber-500/30 flex items-center space-x-0.5">
+                      <Lock className="w-2.5 h-2.5" />
+                      <span>Express Auth Required</span>
+                    </span>
+                  )}
+                </div>
+                <p className="text-[10px] text-slate-400">Allow this customer to purchase on credit within limits</p>
+              </div>
+              {isAuthorizedToSetCredit ? (
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={creditAllowed}
+                    onChange={(e) => setCreditAllowed(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-10 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600"></div>
+                </label>
+              ) : (
+                <div className="text-[10px] font-bold text-slate-500 bg-slate-900 px-2 py-1 rounded-lg border border-slate-800">
+                  Cash Only
+                </div>
+              )}
+            </div>
+
+            {isAuthorizedToSetCredit ? (
+              creditAllowed && (
+                <div className="grid grid-cols-2 gap-3 pt-1 border-t border-slate-800/80">
+                  <div>
+                    <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
+                      Credit Limit ($)
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="5"
+                      value={creditLimit}
+                      onChange={(e) => setCreditLimit(e.target.value)}
+                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono font-bold text-white focus:outline-none focus:border-purple-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
+                      Max Unpaid Receipts
+                    </label>
+                    <input
+                      type="number"
+                      min="1"
+                      max="10"
+                      value={maxCreditReceiptCount}
+                      onChange={(e) => setMaxCreditReceiptCount(e.target.value)}
+                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono font-bold text-white focus:outline-none focus:border-purple-500"
+                    />
+                  </div>
+                </div>
+              )
+            ) : (
+              <div className="p-2.5 rounded-xl bg-amber-950/30 border border-amber-500/20 text-[11px] text-amber-300/90 space-y-1">
+                <div className="font-bold flex items-center space-x-1">
+                  <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Cashiers can register customers freely</span>
+                </div>
+                <p className="text-[10px] text-slate-400 leading-relaxed">
+                  To protect business exposure, credit limits are locked during cashier registration. An authorized Supervisor or Manager can grant credit limits anytime from the Customer Directory.
+                </p>
+              </div>
+            )}
           </div>
 
           {error && (

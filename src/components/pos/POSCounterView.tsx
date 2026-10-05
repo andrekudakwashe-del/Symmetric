@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef } from 'react'; // ADDED useRef
 import { Product, CartItem, Customer, Salesperson, ActiveTab } from '../../types';
-import { getSalespeople, logManagerOverride } from '../../db/roomDatabase';
+import { getSalespeople, getAllSalespeople, isSupervisorOrAbove, logManagerOverride, getMultiCurrencyConfig } from '../../db/roomDatabase';
 import { FractionalWeightModal } from './FractionalWeightModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { CartItemGestureRow } from './CartItemGestureRow';
@@ -29,6 +29,9 @@ import {
   AlertCircle,
   FileText,
   Scale,
+  Search,
+  Coins,
+  Banknote,
 } from 'lucide-react';
 
 interface POSCounterViewProps {
@@ -36,6 +39,8 @@ interface POSCounterViewProps {
   customers: Customer[];
   selectedCustomer: Customer | null;
   currentUser?: Salesperson | null;
+  products?: Product[];
+  onAddToCart?: (product: Product, quantity?: number, customPrice?: number) => void;
   onSelectCustomer: (cust: Customer | null) => void;
   onUpdateQuantity: (productId: string, delta: number) => void;
   onSetQuantity: (productId: string, quantity: number) => void;
@@ -46,6 +51,7 @@ interface POSCounterViewProps {
   onOpenItems: () => void;
   onCharge: () => void;
   onOpenMoreMenu?: () => void;
+  onOpenCurrencySelector?: () => void;
   onOpenCustomerModal?: () => void;
   onQuickAddProduct?: (product: Product) => void;
   discountAmount: number;
@@ -56,6 +62,9 @@ interface POSCounterViewProps {
   onApplyTax?: (tax: number) => void;
   otherCharges?: number;
   onApplyOtherCharges?: (charges: number) => void;
+  onOpenExchangeRates?: () => void;
+  onSelectCurrencyAndCheckout?: (currency: 'USD' | 'ZiG' | 'EcoCash', withCashOut?: boolean) => void;
+  selectedCurrency?: string;
 }
 
 export const POSCounterView: React.FC<POSCounterViewProps> = ({
@@ -63,6 +72,8 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   customers,
   selectedCustomer,
   currentUser,
+  products = [],
+  onAddToCart,
   onSelectCustomer,
   onUpdateQuantity,
   onSetQuantity,
@@ -73,6 +84,7 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   onOpenItems,
   onCharge,
   onOpenMoreMenu,
+  onOpenCurrencySelector,
   onOpenCustomerModal,
   onQuickAddProduct,
   discountAmount,
@@ -83,12 +95,52 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   onApplyTax,
   otherCharges = 0,
   onApplyOtherCharges,
+  onOpenExchangeRates,
+  onSelectCurrencyAndCheckout,
+  selectedCurrency = 'USD',
 }) => {
   const [editingItem, setEditingItem] = useState<CartItem | null>(null);
   const [editQtyInput, setEditQtyInput] = useState<string>('1');
   const [editPriceInput, setEditPriceInput] = useState<string>('0');
   const [editDiscountInput, setEditDiscountInput] = useState<string>('0');
   const [editNotesInput, setEditNotesInput] = useState<string>('');
+
+  // Top Search Panel in Sales Cart
+  const [productSearchQuery, setProductSearchQuery] = useState('');
+  const [isSearchFocused, setIsSearchFocused] = useState(false);
+
+  // Cart lookup map
+  const cartMap = useMemo(() => {
+    const map = new Map<string, number>();
+    cart.forEach((item) => {
+      map.set(item.product.id, item.quantity);
+    });
+    return map;
+  }, [cart]);
+
+  // Search Results for Sales Cart
+  const searchResults = useMemo(() => {
+    if (!productSearchQuery.trim() || !products || products.length === 0) return [];
+    const q = productSearchQuery.toLowerCase().trim();
+    return products
+      .filter((p) => {
+        return (
+          (p.name && p.name.toLowerCase().includes(q)) ||
+          (p.sku && p.sku.toLowerCase().includes(q)) ||
+          (p.category && p.category.toLowerCase().includes(q)) ||
+          (p.barcode && String(p.barcode).toLowerCase().includes(q))
+        );
+      })
+      .slice(0, 8);
+  }, [productSearchQuery, products]);
+
+  const handleQuickAddSearchResult = (p: Product) => {
+    if (onAddToCart) {
+      onAddToCart(p, 1);
+    }
+    setProductSearchQuery('');
+    setIsSearchFocused(false);
+  };
 
   // Gesture Controls & Quick Add Modals
   const [showQuickAddModal, setShowQuickAddModal] = useState<boolean>(false);
@@ -115,11 +167,11 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   const [fractionalModalItem, setFractionalModalItem] = useState<CartItem | null>(null);
 
   // Permission Check
-  const isAdmin = currentUser?.role === 'Admin';
-  const isManager = currentUser?.role === 'Manager';
-  const hasEditPricePermission = isAdmin || Boolean(currentUser?.permissions?.canEditCartPrice) || isAdminUnlocked;
-  const hasDiscountPermission = isAdmin || isManager || Boolean(currentUser?.permissions?.canApplyCartDiscount) || isAdminUnlocked;
-  const hasClearCartPermission = isAdmin || isManager || currentUser?.permissions?.canClearCart !== false;
+  const isSupervisorOrManager = isSupervisorOrAbove(currentUser?.role);
+  const isAdmin = currentUser?.role === 'Admin' || currentUser?.role === 'ADMIN' || currentUser?.role === 'OWNER' || currentUser?.role === 'SUPER_ADMIN';
+  const hasEditPricePermission = isSupervisorOrManager || Boolean(currentUser?.permissions?.canEditCartPrice) || isAdminUnlocked;
+  const hasDiscountPermission = isSupervisorOrManager || Boolean(currentUser?.permissions?.canApplyCartDiscount) || isAdminUnlocked;
+  const hasClearCartPermission = isSupervisorOrManager || currentUser?.permissions?.canClearCart !== false;
 
   // Manager PIN Security Modal Configuration
   const [managerPinModalConfig, setManagerPinModalConfig] = useState<{
@@ -162,6 +214,32 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   const rawGrandTotal = Math.max(0, subtotal - calculatedDiscount + currentTax + currentOtherCharges);
   const grandTotal = roundOffEnabled ? Math.round(rawGrandTotal * 10) / 10 : rawGrandTotal;
 
+  // Multi-Currency & Withdrawal calculations
+  const multiConfig = useMemo(() => getMultiCurrencyConfig(), []);
+  const currentRate = useMemo(() => {
+    if (!selectedCurrency || selectedCurrency === 'USD') return 1;
+    const ratesObj = multiConfig.rates || {};
+    const match =
+      ratesObj[selectedCurrency] ||
+      Object.values(ratesObj).find(
+        (c: any) =>
+          (c.code || '').toUpperCase() === selectedCurrency.toUpperCase() ||
+          (c.currency || '').toUpperCase() === selectedCurrency.toUpperCase()
+      );
+    const r = Number((match as any)?.rateToBase !== undefined ? (match as any)?.rateToBase : (match as any)?.rateToUsd || 0);
+    return r > 0 ? r : 1;
+  }, [selectedCurrency, multiConfig]);
+
+  const convertedGrandTotal = grandTotal * currentRate;
+  const zigRate = multiConfig.rates.ZiG?.rateToUsd || 26.5;
+  const ecoRate = multiConfig.rates.EcoCash?.rateToUsd || 27.0;
+  const grandTotalZig = grandTotal * zigRate;
+  const grandTotalEco = grandTotal * ecoRate;
+  const maxWithdrawalUsd =
+    multiConfig.cashWithdrawalPolicy.maxWithdrawalRule === 'CUSTOM_PERCENT'
+      ? (grandTotal * (multiConfig.cashWithdrawalPolicy.customPercent || 100)) / 100
+      : grandTotal;
+
   // Open item edit drawer or fractional modal
   const handleStartEdit = (item: CartItem) => {
     if (item.isFractional || item.product.sellByFraction) {
@@ -199,22 +277,35 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
 
   const handleVerifyAdminPin = (e: React.FormEvent) => {
     e.preventDefault();
-    const salespeople = getSalespeople();
-    const adminMatch = salespeople.find((s) => (s.role === 'Admin' || s.role === 'Manager') && s.pin === adminPinInput && s.active === 'Y');
+    const cleanPin = adminPinInput.trim();
+    const scopedSalespeople = getSalespeople();
+    const allStaff = getAllSalespeople();
+    const candidatePool = scopedSalespeople.length > 0 ? scopedSalespeople : allStaff;
+    
+    const adminMatch = candidatePool.find(
+      (s) => (isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride)) &&
+             String(s.pin || '').trim() === cleanPin &&
+             s.active === 'Y'
+    ) || allStaff.find(
+      (s) => (isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride)) &&
+             String(s.pin || '').trim() === cleanPin &&
+             s.active === 'Y'
+    );
+
     if (adminMatch) {
       setIsAdminUnlocked(true);
       setAdminPinPromptOpen(false);
       setAdminPinInput('');
       setAdminPinError(null);
     } else {
-      setAdminPinError('Invalid Manager/Admin PIN. Please enter a valid 4-digit PIN.');
+      setAdminPinError('Invalid Supervisor/Manager PIN. Please enter a valid 4-digit PIN.');
     }
   };
 
   // Void Cart Security Handler
   const handleClearCartWithSecurity = () => {
     if (cart.length === 0) return;
-    const isManagerOrAdmin = currentUser?.role === 'Manager' || currentUser?.role === 'Admin' || isAdminUnlocked;
+    const isManagerOrAdmin = isSupervisorOrAbove(currentUser?.role) || isAdminUnlocked;
 
     if (isManagerOrAdmin) {
       if (window.confirm(`Void and clear active counter (${cart.length} items, total: $${subtotal.toFixed(2)})?`)) {
@@ -263,7 +354,7 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
     const dollarAmt = isPercent ? (subtotal * pct) / 100 : val;
 
     if (pct > 5) {
-      const isManagerOrAdmin = currentUser?.role === 'Manager' || currentUser?.role === 'Admin' || isAdminUnlocked;
+      const isManagerOrAdmin = isSupervisorOrAbove(currentUser?.role) || isAdminUnlocked;
       if (isManagerOrAdmin) {
         if (currentUser) {
           logManagerOverride({
@@ -310,32 +401,47 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
 
   return (
     <div className="space-y-3 pb-28 select-none animate-fadeIn">
-      {/* 1. Top Header Bar (Matching Desired 2) */}
-      <div className="bg-gradient-to-r from-[#6A4DFF] via-[#7B5BFF] to-[#FF8A00] text-white rounded-3xl p-3.5 sm:p-4 shadow-xl">
-        <div className="flex items-center justify-between">
-          {/* Left: Menu */}
+      {/* 1. Top Header Bar (Frozen Sticky Search & Controls) */}
+      <div className="sticky top-0 z-30 bg-gradient-to-r from-[#6A4DFF] via-[#7B5BFF] to-[#FF8A00] text-white rounded-3xl p-3.5 sm:p-4 shadow-xl backdrop-blur-md">
+        <div className="flex items-center justify-between gap-2">
+          {/* Left: Currency Selection & Exchange Rates Option */}
           <button
             type="button"
-            onClick={onOpenMoreMenu}
-            className="w-10 h-10 rounded-2xl bg-white/15 hover:bg-white/25 flex items-center justify-center transition active:scale-95 text-white"
+            id="btn-pos-counter-currency"
+            onClick={onOpenCurrencySelector || onOpenExchangeRates}
+            title="Select Currency & Exchange Rates"
+            className="h-10 px-3 rounded-2xl bg-white/20 hover:bg-white/30 flex items-center space-x-1.5 transition active:scale-95 text-white font-bold text-xs border border-white/30 shadow-sm shrink-0"
           >
-            <Menu className="w-5 h-5" />
+            <Coins className="w-4 h-4 text-amber-300" />
+            <span className="font-mono">{selectedCurrency}</span>
           </button>
 
-          {/* Center: Title */}
-          <div className="flex items-center space-x-2">
+          {/* Center: Title + Badges */}
+          <div className="flex items-center space-x-2 shrink-0">
             <h2 className="text-lg sm:text-xl font-black tracking-wider text-white">
               Counter
             </h2>
+            <span className="bg-white/20 text-white text-[11px] font-bold px-2 py-0.5 rounded-full border border-white/30">
+              {totalUnitsCount} {totalUnitsCount === 1 ? 'item' : 'items'}
+            </span>
             {selectedCustomer && (
-              <span className="bg-white/20 text-white text-[11px] font-bold px-2 py-0.5 rounded-full border border-white/30 truncate max-w-[140px]">
+              <span className="hidden sm:inline-block bg-white/20 text-white text-[11px] font-bold px-2 py-0.5 rounded-full border border-white/30 truncate max-w-[140px]">
                 {selectedCustomer.name}
               </span>
             )}
           </div>
 
-          {/* Right: Add Customer, Call */}
-          <div className="flex items-center space-x-2">
+          {/* Right: Browse Catalog, Customer, Call */}
+          <div className="flex items-center space-x-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={onOpenItems}
+              className="h-10 px-3 rounded-2xl bg-white/20 hover:bg-white/30 text-white text-xs font-bold flex items-center gap-1.5 shadow transition active:scale-95 border border-white/30"
+              title="Open full catalog items grid"
+            >
+              <ShoppingBag className="w-4 h-4" />
+              <span className="hidden sm:inline">Catalog</span>
+            </button>
             <button
               type="button"
               onClick={onOpenCustomerModal}
@@ -356,6 +462,95 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
               <PhoneCall className="w-4 h-4" />
             </a>
           </div>
+        </div>
+
+        {/* FROZEN SEARCH PANEL IN SALES CART */}
+        <div className="mt-3 relative">
+          <div className="relative flex items-center">
+            <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+            <input
+              type="text"
+              value={productSearchQuery}
+              onChange={(e) => setProductSearchQuery(e.target.value)}
+              onFocus={() => setIsSearchFocused(true)}
+              placeholder="Search products by name, SKU, barcode to add to counter..."
+              className="w-full bg-white text-slate-900 rounded-2xl pl-10 pr-9 py-2 text-xs sm:text-sm font-semibold placeholder:text-slate-400 focus:outline-none shadow-md"
+            />
+            {productSearchQuery && (
+              <button
+                type="button"
+                onClick={() => setProductSearchQuery('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs font-bold p-1 rounded-full hover:bg-slate-100"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+
+          {/* Quick Product Search Dropdown Overlay */}
+          {isSearchFocused && searchResults.length > 0 && (
+            <>
+              <div
+                className="fixed inset-0 z-40"
+                onClick={() => setIsSearchFocused(false)}
+              />
+              <div className="absolute left-0 right-0 top-full mt-2 bg-slate-900 border border-purple-500/40 rounded-2xl shadow-2xl z-50 overflow-hidden divide-y divide-slate-800 backdrop-blur-xl animate-fadeIn max-h-80 overflow-y-auto">
+                <div className="p-2 bg-slate-950/90 px-3 text-[10px] uppercase font-bold text-slate-400 flex items-center justify-between">
+                  <span>Matching Catalog Products ({searchResults.length})</span>
+                  <span className="text-amber-400">Tap to add to counter</span>
+                </div>
+                {searchResults.map((p) => {
+                  const inCartQty = cartMap.get(p.id) || 0;
+                  return (
+                    <div
+                      key={p.id}
+                      onClick={() => handleQuickAddSearchResult(p)}
+                      className="p-2.5 sm:p-3 hover:bg-purple-950/50 transition flex items-center justify-between cursor-pointer group text-left"
+                    >
+                      <div className="flex-1 pr-2 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs sm:text-sm font-bold text-white group-hover:text-amber-300 transition truncate">
+                            {p.name}
+                          </span>
+                          {inCartQty > 0 && (
+                            <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-purple-500/30 text-purple-300 border border-purple-400/40 shrink-0">
+                              {inCartQty} in cart
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-400 flex items-center gap-2 mt-0.5 font-mono">
+                          <span>{p.sku || p.id}</span>
+                          <span>•</span>
+                          <span>{p.category}</span>
+                          <span>•</span>
+                          <span className={(p.stockQuantity ?? 0) <= 5 ? 'text-amber-400 font-bold' : 'text-slate-400'}>
+                            Stock: {p.stockQuantity ?? 0} {p.unit || 'ea'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="font-mono font-black text-sm text-emerald-400">
+                          ${p.price.toFixed(2)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleQuickAddSearchResult(p);
+                          }}
+                          className="px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white text-xs font-bold shadow hover:brightness-110 active:scale-95 flex items-center gap-1"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>Add</span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -442,9 +637,9 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
             </div>
 
             <div className="divide-y divide-slate-100">
-              {cart.map((item) => (
+              {cart.map((item, idx) => (
                 <CartItemGestureRow
-                  key={item.product.id}
+                  key={`${item.product.id}-${idx}`}
                   item={item}
                   onUpdateQuantity={onUpdateQuantity}
                   onRemoveItem={onRemoveItem}
@@ -498,12 +693,32 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
         {/* Separator */}
         <div className="border-t border-slate-100" />
 
-        {/* Grand Total (Vibrant Blue font from Screenshot Desired 2) */}
+        {/* Grand Total */}
         <div className="flex items-center justify-between">
-          <span className="text-sm sm:text-base font-bold text-slate-700">Grand Total</span>
-          <span className="font-mono-num text-lg sm:text-xl font-black text-[#1E40AF]">
-            ${grandTotal % 1 === 0 ? grandTotal : grandTotal.toFixed(2)}
-          </span>
+          <div className="flex flex-col">
+            <span className="text-sm sm:text-base font-bold text-slate-700">Grand Total</span>
+            {selectedCurrency !== 'USD' && (
+              <span className="text-[11px] font-semibold text-slate-500">
+                Base USD: ${grandTotal.toFixed(2)} @ 1 USD = {currentRate.toFixed(2)} {selectedCurrency}
+              </span>
+            )}
+          </div>
+          <div className="text-right">
+            {selectedCurrency !== 'USD' ? (
+              <div>
+                <span className="font-mono-num text-xl sm:text-2xl font-black text-amber-600 block">
+                  {convertedGrandTotal.toFixed(2)} {selectedCurrency}
+                </span>
+                <span className="font-mono-num text-xs text-slate-500 font-bold block">
+                  (${grandTotal.toFixed(2)} USD)
+                </span>
+              </div>
+            ) : (
+              <span className="font-mono-num text-lg sm:text-xl font-black text-[#1E40AF]">
+                ${grandTotal % 1 === 0 ? grandTotal : grandTotal.toFixed(2)}
+              </span>
+            )}
+          </div>
         </div>
 
         {/* Two-Column Adjustments Section (Desired 2) */}
@@ -585,7 +800,27 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
         </button>
       </div>
 
-      {/* 6. Sticky Bottom Green "Charge: $X.XX" Button (Desired 2) */}
+      {/* Quick Cash-Out / Withdrawal trigger on counter */}
+      {selectedCurrency !== 'USD' && multiConfig.cashWithdrawalPolicy.enabled && (
+        <button
+          type="button"
+          id="btn-pos-counter-cashout"
+          onClick={() => {
+            if (onSelectCurrencyAndCheckout) {
+              onSelectCurrencyAndCheckout(selectedCurrency as any, true);
+            } else {
+              onCharge();
+            }
+          }}
+          disabled={cart.length === 0}
+          className="w-full py-2 px-3 rounded-2xl bg-emerald-50 hover:bg-emerald-100 border border-emerald-300 text-emerald-800 text-xs font-bold flex items-center justify-center gap-1.5 transition shadow-sm cursor-pointer"
+        >
+          <Banknote className="w-4 h-4 text-emerald-600" />
+          <span>💵 Cash Withdrawal / Cash-Out Available with this {selectedCurrency} Sale</span>
+        </button>
+      )}
+
+      {/* 6. Sticky Bottom Green / Amber "Charge: $X.XX" Button (Desired 2) */}
       <div className="fixed bottom-14 left-0 right-0 z-20 px-3 sm:px-4 pointer-events-auto">
         <div className="max-w-4xl mx-auto">
           <button
@@ -593,9 +828,25 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
             type="button"
             onClick={onCharge}
             disabled={cart.length === 0}
-            className="w-full py-3.5 px-6 rounded-2xl bg-[#4CAF50] hover:bg-[#43A047] active:bg-[#388E3C] disabled:opacity-50 text-white font-black text-base sm:text-lg tracking-wide shadow-xl flex items-center justify-center space-x-2 transition transform active:scale-[0.99]"
+            className={`w-full py-3.5 px-6 rounded-2xl ${
+              selectedCurrency !== 'USD'
+                ? 'bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-700 hover:to-amber-600 text-white shadow-amber-500/20'
+                : 'bg-[#4CAF50] hover:bg-[#43A047]'
+            } active:scale-[0.99] disabled:opacity-50 font-black text-base sm:text-lg tracking-wide shadow-xl flex items-center justify-between transition transform`}
           >
-            <span>Charge: ${grandTotal % 1 === 0 ? grandTotal : grandTotal.toFixed(2)}</span>
+            <div className="flex items-center space-x-2">
+              <Coins className="w-5 h-5 text-amber-200" />
+              <span>
+                {selectedCurrency !== 'USD'
+                  ? `Charge: ${convertedGrandTotal.toFixed(2)} ${selectedCurrency}`
+                  : `Charge: $${grandTotal % 1 === 0 ? grandTotal : grandTotal.toFixed(2)}`}
+              </span>
+            </div>
+            {selectedCurrency !== 'USD' && (
+              <span className="text-xs bg-black/20 px-2 py-0.5 rounded-lg text-white font-mono">
+                ${grandTotal.toFixed(2)} USD
+              </span>
+            )}
           </button>
         </div>
       </div>
@@ -627,7 +878,12 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
                 {editingItem.product.name}
               </div>
               <div className="text-xs text-slate-500 mt-0.5">
-                Standard Price: ${editingItem.product.price.toFixed(2)} | In Stock: {editingItem.product.stockQuantity}
+                Standard Price: ${editingItem.product.price.toFixed(2)}
+                {isSupervisorOrAbove(currentUser?.role) || Boolean(currentUser?.permissions?.canManageInventory) ? (
+                  <> | In Stock: {editingItem.product.stockQuantity}</>
+                ) : (
+                  <> | Status: {editingItem.product.stockQuantity === 0 ? 'Out of Stock' : (editingItem.product.stockQuantity <= (editingItem.product.reorderLevelUnits || 5) ? 'Low Stock' : 'In Stock')}</>
+                )}
               </div>
             </div>
 

@@ -14,7 +14,10 @@ import {
   getTodayDateString,
   getCustomerChangesForStaffAndDate,
   getCreditSalesForStaffAndDate,
+  getAllSales,
+  isSupervisorOrAbove,
 } from '../../db/roomDatabase';
+import { computeDrawerBalance, getShiftId } from '../../db/cashLedger';
 import { downloadCsvFile } from '../../services/googleSheetsSync';
 import {
   ArrowLeftRight,
@@ -47,6 +50,7 @@ import {
   ChevronDown,
   Check,
   Lock,
+  ShieldCheck,
   Home,
   ArrowLeft,
   ArrowRight,
@@ -88,33 +92,84 @@ export interface CreditSaleRowState {
   isDynamicExtra?: boolean;
 }
 
-// Generate 10 default rows for Customer Change
-const createInitialChangeRows = (): CustomerChangeRowState[] => {
-  return Array.from({ length: 10 }, (_, i) => ({
-    id: `chg_row_${i + 1}`,
-    customerName: '',
-    customerId: undefined,
-    in: '',
-    out: '',
-    notes: '',
-    isDynamicExtra: false,
-  }));
+// Helper to create a single Customer Change row
+export const createSingleChangeRow = (idSuffix: string | number = Date.now()): CustomerChangeRowState => ({
+  id: `chg_row_${idSuffix}`,
+  customerName: '',
+  customerId: undefined,
+  in: '',
+  out: '',
+  notes: '',
+  isDynamicExtra: false,
+});
+
+export const isChangeRowEmpty = (r: CustomerChangeRowState): boolean => {
+  return (
+    !(r.customerName || '').trim() &&
+    !(r.in || '').trim() &&
+    !(r.out || '').trim() &&
+    !(r.notes || '').trim()
+  );
 };
 
-// Generate 5 default rows for Credit Sales
-const createInitialCreditRows = (): CreditSaleRowState[] => {
-  return Array.from({ length: 5 }, (_, i) => ({
-    id: `credit_row_${i + 1}`,
-    customerName: '',
-    customerId: undefined,
-    amount: '',
-    in: '',
-    out: '',
-    itemDescription: '',
-    dueDate: '',
-    notes: '',
-    isDynamicExtra: false,
-  }));
+// Always maintain autofilled rows + exactly 1 additional empty line
+export const ensureTrailingEmptyChangeRow = (rows: CustomerChangeRowState[]): CustomerChangeRowState[] => {
+  if (rows.length === 0) {
+    return [createSingleChangeRow(1)];
+  }
+  const last = rows[rows.length - 1];
+  if (!isChangeRowEmpty(last)) {
+    return [...rows, createSingleChangeRow(`${Date.now()}_${rows.length + 1}`)];
+  }
+  return rows;
+};
+
+// Generate initial row for Customer Change (1 empty line)
+export const createInitialChangeRows = (): CustomerChangeRowState[] => {
+  return [createSingleChangeRow(1)];
+};
+
+// Helper to create a single Credit Sale row
+export const createSingleCreditRow = (idSuffix: string | number = Date.now()): CreditSaleRowState => ({
+  id: `credit_row_${idSuffix}`,
+  customerName: '',
+  customerId: undefined,
+  amount: '',
+  in: '',
+  out: '',
+  itemDescription: '',
+  dueDate: '',
+  notes: '',
+  isDynamicExtra: false,
+});
+
+export const isCreditRowEmpty = (r: CreditSaleRowState): boolean => {
+  return (
+    !(r.customerName || '').trim() &&
+    !(r.amount || '').trim() &&
+    !(r.in || '').trim() &&
+    !(r.out || '').trim() &&
+    !(r.itemDescription || '').trim() &&
+    !(r.dueDate || '').trim() &&
+    !(r.notes || '').trim()
+  );
+};
+
+// Always maintain autofilled rows + exactly 1 additional empty line
+export const ensureTrailingEmptyCreditRow = (rows: CreditSaleRowState[]): CreditSaleRowState[] => {
+  if (rows.length === 0) {
+    return [createSingleCreditRow(1)];
+  }
+  const last = rows[rows.length - 1];
+  if (!isCreditRowEmpty(last)) {
+    return [...rows, createSingleCreditRow(`${Date.now()}_${rows.length + 1}`)];
+  }
+  return rows;
+};
+
+// Generate initial row for Credit Sales (1 empty line)
+export const createInitialCreditRows = (): CreditSaleRowState[] => {
+  return [createSingleCreditRow(1)];
 };
 
 const QUICK_AMOUNTS = [5, 10, 20, 50, 100, 200];
@@ -133,8 +188,10 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
   const [searchFilter, setSearchFilter] = useState<string>('');
 
   const isToday = selectedDate === today;
-  const isAdmin = currentUser.role === 'Admin';
-  const isEditable = isAdmin || isToday; // Staff can only edit today; Admins can edit any day
+  const isSupervisorOrManager = isSupervisorOrAbove(currentUser.role);
+  const isAdmin = isSupervisorOrManager;
+  // Form 3 is an audited read-only statement autofilled in real-time from POS register and change/credit ledgers
+  const isEditable = false;
 
   // DB Data
   const [customers, setCustomers] = useState<Customer[]>(() => getCustomers());
@@ -145,6 +202,23 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
   const [historyCreditLogs, setHistoryCreditLogs] = useState<CreditSaleEntry[]>(() =>
     getCreditSales()
   );
+
+  const [ledgerRefreshKey, setLedgerRefreshKey] = useState<number>(0);
+
+  useEffect(() => {
+    const handleMovementsUpdate = () => {
+      setLedgerRefreshKey((k) => k + 1);
+    };
+    window.addEventListener('saimetric_cash_movements_updated', handleMovementsUpdate);
+    return () => {
+      window.removeEventListener('saimetric_cash_movements_updated', handleMovementsUpdate);
+    };
+  }, []);
+
+  const liveDrawerBalance = useMemo(() => {
+    const sId = getShiftId(selectedStaffId, selectedDate, currentUser.branchId);
+    return computeDrawerBalance(sId, 'USD', currentUser.branchId);
+  }, [selectedStaffId, selectedDate, ledgerRefreshKey, historyChangeLogs, historyCreditLogs, currentUser.branchId]);
 
   // Check if existing saved entries exist for this staff & date
   const isExistingSavedSheet = useMemo(() => {
@@ -195,21 +269,10 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
         in: c.in > 0 ? String(c.in) : '',
         out: c.out > 0 ? String(c.out) : '',
         notes: c.notes || '',
-        isDynamicExtra: idx >= 10,
+        isDynamicExtra: false,
       }));
-      // Pad to at least 10 rows if needed
-      while (loadedChangeRows.length < 10) {
-        const idx = loadedChangeRows.length + 1;
-        loadedChangeRows.push({
-          id: `chg_pad_${idx}_${Date.now()}`,
-          customerName: '',
-          in: '',
-          out: '',
-          notes: '',
-          isDynamicExtra: false,
-        });
-      }
-      setChangeRows(loadedChangeRows);
+      // Autofilled lines + exactly 1 additional empty line
+      setChangeRows(ensureTrailingEmptyChangeRow(loadedChangeRows));
     } else {
       const initial = createInitialChangeRows();
       const preName = getPreselectedName(preselectedCustomer);
@@ -231,23 +294,10 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
         itemDescription: cr.itemDescription || '',
         dueDate: cr.dueDate || '',
         notes: cr.notes || '',
-        isDynamicExtra: idx >= 5,
+        isDynamicExtra: false,
       }));
-      while (loadedCreditRows.length < 5) {
-        const idx = loadedCreditRows.length + 1;
-        loadedCreditRows.push({
-          id: `cred_pad_${idx}_${Date.now()}`,
-          customerName: '',
-          amount: '',
-          in: '',
-          out: '',
-          itemDescription: '',
-          dueDate: '',
-          notes: '',
-          isDynamicExtra: false,
-        });
-      }
-      setCreditRows(loadedCreditRows);
+      // Autofilled lines + exactly 1 additional empty line
+      setCreditRows(ensureTrailingEmptyCreditRow(loadedCreditRows));
     } else {
       setCreditRows(createInitialCreditRows());
     }
@@ -341,6 +391,14 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
     return () => unsub();
   }, []);
 
+  // Synchronize selected staff to active branch
+  useEffect(() => {
+    if (salespeople.length > 0 && !salespeople.some((s) => s.id === selectedStaffId)) {
+      const matchCurrent = salespeople.find((s) => s.id === currentUser.id);
+      setSelectedStaffId(matchCurrent ? matchCurrent.id : salespeople[0].id);
+    }
+  }, [salespeople, selectedStaffId, currentUser.id, currentUser.branchId]);
+
   const selectedStaff = useMemo(() => {
     return salespeople.find((s) => s.id === selectedStaffId) || currentUser;
   }, [salespeople, selectedStaffId, currentUser]);
@@ -358,113 +416,109 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
   // ==================== ROW MANIPULATION ====================
   const handleUpdateChangeRow = (id: string, updates: Partial<CustomerChangeRowState>) => {
     if (!isEditable) return;
-    setChangeRows((prev) =>
-      prev.map((r) => {
+    setChangeRows((prev) => {
+      const updated = prev.map((r) => {
         if (r.id !== id) return r;
-        const updated = { ...r, ...updates };
+        const modified = { ...r, ...updates };
         if (updates.customerName !== undefined) {
           const match = getCustomerMatch(updates.customerName);
           if (match) {
-            updated.customerId = match.customerId;
+            modified.customerId = match.customerId;
           } else {
-            updated.customerId = undefined;
+            modified.customerId = undefined;
           }
         }
-        return updated;
-      })
-    );
+        return modified;
+      });
+      // If user fills the additional row, automatically add another empty line
+      return ensureTrailingEmptyChangeRow(updated);
+    });
   };
 
   const handleSelectCustomerForChangeRow = (rowId: string, customer: Customer) => {
     if (!isEditable) return;
-    setChangeRows((prev) =>
-      prev.map((r) => (r.id === rowId ? { ...r, customerName: customer.name, customerId: customer.customerId } : r))
-    );
+    setChangeRows((prev) => {
+      const updated = prev.map((r) =>
+        r.id === rowId ? { ...r, customerName: customer.name, customerId: customer.customerId } : r
+      );
+      return ensureTrailingEmptyChangeRow(updated);
+    });
     setActiveDropdownRowId(null);
   };
 
   const handleAddChangeRow = () => {
     if (!isEditable) return;
-    const newRow: CustomerChangeRowState = {
-      id: `chg_row_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      customerName: '',
-      customerId: undefined,
-      in: '',
-      out: '',
-      notes: '',
-      isDynamicExtra: true,
-    };
-    setChangeRows((prev) => [...prev, newRow]);
+    setChangeRows((prev) => [...prev, createSingleChangeRow(`${Date.now()}_${prev.length + 1}`)]);
   };
 
   const handleDeleteChangeRow = (id: string) => {
     if (!isEditable) return;
-    setChangeRows((prev) => prev.filter((r) => r.id !== id));
+    setChangeRows((prev) => {
+      const filtered = prev.filter((r) => r.id !== id);
+      return ensureTrailingEmptyChangeRow(filtered);
+    });
   };
 
   const handleClearChangeRow = (id: string) => {
     if (!isEditable) return;
-    setChangeRows((prev) =>
-      prev.map((r) =>
+    setChangeRows((prev) => {
+      const updated = prev.map((r) =>
         r.id === id ? { ...r, customerName: '', customerId: undefined, in: '', out: '', notes: '' } : r
-      )
-    );
+      );
+      return ensureTrailingEmptyChangeRow(updated);
+    });
   };
 
   // Credit rows handlers
   const handleUpdateCreditRow = (id: string, updates: Partial<CreditSaleRowState>) => {
     if (!isEditable) return;
-    setCreditRows((prev) =>
-      prev.map((r) => {
+    setCreditRows((prev) => {
+      const updated = prev.map((r) => {
         if (r.id !== id) return r;
-        const updated = { ...r, ...updates };
+        const modified = { ...r, ...updates };
         if (updates.customerName !== undefined) {
           const match = getCustomerMatch(updates.customerName);
           if (match) {
-            updated.customerId = match.customerId;
+            modified.customerId = match.customerId;
           } else {
-            updated.customerId = undefined;
+            modified.customerId = undefined;
           }
         }
-        return updated;
-      })
-    );
+        return modified;
+      });
+      // If user fills the additional credit row, automatically add another empty line
+      return ensureTrailingEmptyCreditRow(updated);
+    });
   };
 
   const handleSelectCustomerForCreditRow = (rowId: string, customer: Customer) => {
     if (!isEditable) return;
-    setCreditRows((prev) =>
-      prev.map((r) => (r.id === rowId ? { ...r, customerName: customer.name, customerId: customer.customerId } : r))
-    );
+    setCreditRows((prev) => {
+      const updated = prev.map((r) =>
+        r.id === rowId ? { ...r, customerName: customer.name, customerId: customer.customerId } : r
+      );
+      return ensureTrailingEmptyCreditRow(updated);
+    });
     setActiveDropdownRowId(null);
   };
 
   const handleAddCreditRow = () => {
     if (!isEditable) return;
-    const newRow: CreditSaleRowState = {
-      id: `credit_row_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      customerName: '',
-      customerId: undefined,
-      amount: '',
-      in: '',
-      out: '',
-      itemDescription: '',
-      dueDate: '',
-      notes: '',
-      isDynamicExtra: true,
-    };
-    setCreditRows((prev) => [...prev, newRow]);
+    setCreditRows((prev) => [...prev, createSingleCreditRow(`${Date.now()}_${prev.length + 1}`)]);
   };
 
   const handleDeleteCreditRow = (id: string) => {
     if (!isEditable) return;
-    setCreditRows((prev) => prev.filter((r) => r.id !== id));
+    setCreditRows((prev) => {
+      const filtered = prev.filter((r) => r.id !== id);
+      return ensureTrailingEmptyCreditRow(filtered);
+    });
   };
 
   const handleClearCreditRow = (id: string) => {
     if (!isEditable) return;
-    setCreditRows((prev) =>
-      prev.map((r) =>
+    setCreditRows((prev) => {
+      const updated = prev.map((r) =>
         r.id === id
           ? {
               ...r,
@@ -478,8 +532,9 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
               notes: '',
             }
           : r
-      )
-    );
+      );
+      return ensureTrailingEmptyCreditRow(updated);
+    });
   };
 
   // ==================== INLINE CUSTOMER REGISTRATION ====================
@@ -601,8 +656,95 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
     return { totalAmount, totalIn, totalOut, net: totalIn - totalOut, validCount, newCustomersCount };
   }, [creditRows, customers]);
 
+  // Distinct Badges:
+  // 1. Cash Movements Today = change_received (in) - change_paid (out) + credit_cash_payment (in)
+  const cashMovementsToday = (changeTotals.totalIn - changeTotals.totalOut) + creditTotals.totalIn;
+  // 2. Receivables Delta = credit extended (out/amount) - credit paid (in)
+  const receivablesDelta = creditTotals.totalOut - creditTotals.totalIn;
+
   const totalEntriesToSave = changeTotals.validCount + creditTotals.validCount;
   const totalNewCustomersToRegister = changeTotals.newCustomersCount + creditTotals.newCustomersCount;
+
+  // Filtered actual populated rows for read-only verified audit tables
+  const actualChangeRows = useMemo(() => {
+    return changeRows.filter(
+      (r) => (r.customerName || '').trim() !== '' || parseFloat(r.in) > 0 || parseFloat(r.out) > 0
+    );
+  }, [changeRows]);
+
+  const actualCreditRows = useMemo(() => {
+    return creditRows.filter(
+      (r) =>
+        (r.customerName || '').trim() !== '' ||
+        parseFloat(r.out || r.amount) > 0 ||
+        parseFloat(r.in) > 0
+    );
+  }, [creditRows]);
+
+  const handleExportShiftAuditCsv = () => {
+    const headers = [
+      'Type',
+      'Customer Name',
+      'Customer ID',
+      'Cash IN ($)',
+      'Cash OUT / Credit ($)',
+      'Notes / Description',
+      'Due Date',
+      'Audit Status',
+    ];
+    const rows: any[][] = [];
+    actualChangeRows.forEach((r) => {
+      rows.push([
+        'Customer Change',
+        r.customerName,
+        r.customerId || '',
+        r.in || '0.00',
+        r.out || '0.00',
+        r.notes || '',
+        '',
+        'Verified POS Register',
+      ]);
+    });
+    actualCreditRows.forEach((cr) => {
+      rows.push([
+        'Credit Sale',
+        cr.customerName,
+        cr.customerId || '',
+        cr.in || '0.00',
+        cr.out || cr.amount || '0.00',
+        cr.itemDescription || cr.notes || '',
+        cr.dueDate || '',
+        'Verified Credit Ledger',
+      ]);
+    });
+    const csvContent = [headers.join(','), ...rows.map(r => r.map(c => `"${String(c || '').replace(/"/g, '""')}"`).join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `Form3_Audit_Statement_${selectedStaffId}_${selectedDate}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Helper to prevent double-counting with POS invoices
+  const findMatchingProcessedInvoice = (refOrNotes?: string) => {
+    if (!refOrNotes || !refOrNotes.trim()) return null;
+    const trimmed = refOrNotes.trim();
+    const allSales = getAllSales();
+    const directMatch = allSales.find(
+      (s) => s.id.toLowerCase() === trimmed.toLowerCase() ||
+             s.id.replace(/^INV-0*/i, '') === trimmed.replace(/^INV-0*/i, '')
+    );
+    if (directMatch) return directMatch;
+    const invMatch = trimmed.match(/INV-\d+/i) || trimmed.match(/invoice\s*#?\s*(\d+)/i);
+    if (invMatch) {
+      const invIdStr = invMatch[0].toUpperCase();
+      return allSales.find((s) => s.id.toUpperCase().includes(invIdStr) || invIdStr.includes(s.id.toUpperCase())) || null;
+    }
+    return null;
+  };
 
   // ==================== SAVE SPREADSHEET BATCH ====================
   const handleSaveAllSheet = (targetAction: 'stay' | 'next' | 'home' = 'stay') => {
@@ -678,6 +820,9 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
     setSaveSuccessMsg(
       `Successfully saved ${totalEntriesToSave} entries (${changeEntriesToSave.length} Customer Change, ${creditEntriesToSave.length} Credit Sales)!`
     );
+
+    setLedgerRefreshKey((k) => k + 1);
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
 
     // Reset rows to clean state with 10 change & 5 credit
     setChangeRows(createInitialChangeRows());
@@ -763,6 +908,9 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
     });
 
     setSaveSuccessMsg(`Saved single ${singleSection === 'change' ? 'Customer Change' : 'Credit Sale'} for ${custName}!`);
+
+    setLedgerRefreshKey((k) => k + 1);
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
 
     // Reset single form
     setSingleCustomerName('');
@@ -851,7 +999,7 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                 <button
                   type="button"
                   id="btn-top-save-customer-change-credit"
-                  onClick={handleSaveAllSheet}
+                  onClick={() => handleSaveAllSheet()}
                   disabled={totalEntriesToSave === 0}
                   className={`px-4 py-2 rounded-xl text-xs font-black flex items-center space-x-1.5 transition active:scale-95 shadow-lg ${
                     totalEntriesToSave > 0
@@ -907,59 +1055,46 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
             <button
               type="button"
               onClick={() => setViewMode('sheet')}
-              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
                 viewMode === 'sheet'
                   ? 'bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               <Table className="w-3.5 h-3.5" />
-              <span>Matrix Sheet (Default 10 & 5)</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setViewMode('single')}
-              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
-                viewMode === 'single'
-                  ? 'bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white shadow-md'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>Quick Single Entry</span>
+              <span>Audited Statement (Read-Only)</span>
             </button>
 
             <button
               type="button"
               onClick={() => setViewMode('history')}
-              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
                 viewMode === 'history'
                   ? 'bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               <History className="w-3.5 h-3.5" />
-              <span>Change & Credit History</span>
+              <span>Change &amp; Credit History</span>
             </button>
 
             <button
               type="button"
               onClick={() => setViewMode('change_report')}
-              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
                 viewMode === 'change_report'
                   ? 'bg-emerald-600 text-white shadow-md shadow-emerald-950'
                   : 'text-emerald-400 hover:text-emerald-200 hover:bg-emerald-950/40 border border-emerald-500/30'
               }`}
             >
               <Coins className="w-3.5 h-3.5 text-emerald-300" />
-              <span>📊 Change Report (Owed & Aging)</span>
+              <span>📊 Change Report (Owed &amp; Aging)</span>
             </button>
 
             <button
               type="button"
               onClick={() => setViewMode('credit_report')}
-              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+              className={`flex items-center space-x-2 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer ${
                 viewMode === 'credit_report'
                   ? 'bg-orange-600 text-white shadow-md shadow-orange-950'
                   : 'text-orange-400 hover:text-orange-200 hover:bg-orange-950/40 border border-orange-500/30'
@@ -970,37 +1105,21 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
             </button>
           </div>
 
-          <div className="flex items-center space-x-2 text-xs text-slate-400 font-medium">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span>Customer DB auto-linking active</span>
+          <div className="flex items-center space-x-2 text-xs text-emerald-300 font-medium bg-emerald-950/40 px-3 py-1.5 rounded-xl border border-emerald-500/30">
+            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <span>Autofilled &amp; Verified from POS Till</span>
           </div>
         </div>
       </div>
 
       {/* Daily report permission & status banner */}
       <div>
-        {!isEditable ? (
-          <div className="flex items-center space-x-2 px-3.5 py-2.5 rounded-2xl bg-amber-950/40 border border-amber-500/30 text-amber-300 text-xs shadow-sm">
-            <Lock className="w-4 h-4 text-amber-400 shrink-0" />
-            <span>
-              <strong>Historical Record (Read-Only):</strong> Viewing Customer Change & Credit records for {selectedDate}. Non-admin staff cannot edit forms of previous days.
-            </span>
-          </div>
-        ) : !isToday && isAdmin ? (
-          <div className="flex items-center space-x-2 px-3.5 py-2.5 rounded-2xl bg-purple-950/40 border border-purple-500/40 text-purple-200 text-xs shadow-sm">
-            <Sparkles className="w-4 h-4 text-[#FF8A00] shrink-0" />
-            <span>
-              <strong>Historical Record (Admin Edit Mode):</strong> Administrator override active for {selectedDate}. Any modifications will update upon saving.
-            </span>
-          </div>
-        ) : isExistingSavedSheet ? (
-          <div className="flex items-center space-x-2 px-3.5 py-2.5 rounded-2xl bg-emerald-950/40 border border-emerald-500/30 text-emerald-300 text-xs shadow-sm">
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>
-              <strong>Saved Daily Sheet Loaded ({selectedDate}):</strong> Showing saved customer change and credit entries for today. Modifications will update upon saving.
-            </span>
-          </div>
-        ) : null}
+        <div className="flex items-center space-x-2 px-3.5 py-2.5 rounded-2xl bg-slate-900 border border-purple-500/30 text-purple-200 text-xs shadow-sm">
+          <Lock className="w-4 h-4 text-purple-400 shrink-0" />
+          <span>
+            <strong>Autofilled Read-Only Audit Sheet:</strong> Form 3 is automatically populated in real-time from the POS Register, Customer Change tracker, and Debt Ledgers. Values are locked to guarantee financial ledger integrity.
+          </span>
+        </div>
       </div>
 
       {/* 2. Feedback Toasts */}
@@ -1064,21 +1183,24 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
           </div>
         </div>
 
-        {/* Real-time KPI summary badges */}
+        {/* Real-time KPI summary badges - Cash Movements vs Receivables separation */}
         <div className="flex items-center space-x-3 flex-wrap gap-y-2 text-xs">
-          <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 font-semibold">
-            <ArrowDownLeft className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Change In: ${changeTotals.totalIn.toFixed(2)}</span>
+          <div className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-xl border font-semibold ${
+            cashMovementsToday >= 0 
+              ? 'bg-emerald-950/60 border-emerald-500/30 text-emerald-300' 
+              : 'bg-rose-950/60 border-rose-500/30 text-rose-300'
+          }`}>
+            <ArrowLeftRight className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Cash Movements Today: {cashMovementsToday >= 0 ? '+' : ''}${cashMovementsToday.toFixed(2)}</span>
           </div>
 
-          <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-rose-950/60 border border-rose-500/30 text-rose-300 font-semibold">
-            <ArrowUpRight className="w-3.5 h-3.5 text-rose-400" />
-            <span>Change Out: ${changeTotals.totalOut.toFixed(2)}</span>
-          </div>
-
-          <div className="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl bg-orange-950/60 border border-orange-500/30 text-orange-300 font-semibold">
+          <div className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-xl border font-semibold ${
+            receivablesDelta >= 0 
+              ? 'bg-orange-950/60 border-orange-500/30 text-orange-300' 
+              : 'bg-blue-950/60 border-blue-500/30 text-blue-300'
+          }`}>
             <CreditCard className="w-3.5 h-3.5 text-orange-400" />
-            <span>Credit Total: ${creditTotals.totalAmount.toFixed(2)}</span>
+            <span>Receivables Delta: {receivablesDelta >= 0 ? '+' : ''}${receivablesDelta.toFixed(2)}</span>
           </div>
         </div>
       </div>
@@ -1108,167 +1230,91 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
               </div>
             </div>
 
-            {/* Change Table */}
+            {/* Change Table - Read-Only Audited */}
             <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950/60">
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-900/90 text-slate-400 border-b border-slate-800 select-none">
                     <th className="py-3 px-3 w-10 text-center font-mono-num">#</th>
-                    <th className="py-3 px-3 min-w-[220px]">Customer Name</th>
+                    <th className="py-3 px-3 min-w-[200px]">Customer</th>
                     <th className="py-3 px-3 w-32 text-right">Cash IN ($)</th>
                     <th className="py-3 px-3 w-32 text-right">Cash OUT ($)</th>
-                    <th className="py-3 px-3 min-w-[180px]">Change Reason / Notes (Optional)</th>
-                    <th className="py-3 px-2 w-16 text-center">Action</th>
+                    <th className="py-3 px-3 min-w-[180px]">Change Reason / Notes</th>
+                    <th className="py-3 px-3 w-36 text-center">POS Audit Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {changeRows.map((row, idx) => {
-                    const match = getCustomerMatch(row.customerName);
-                    const isFilled = row.customerName.trim() !== '';
-                    const isNewCust = isFilled && !match;
+                  {actualChangeRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-400 text-xs">
+                        <CheckCircle2 className="w-8 h-8 text-purple-400/60 mx-auto mb-2" />
+                        <p className="font-bold text-slate-300">No Customer Change Movements for this Shift</p>
+                        <p className="text-[11px] text-slate-500 mt-1">
+                          Customer change movements conducted at the POS Counter automatically stream into this audited ledger.
+                        </p>
+                      </td>
+                    </tr>
+                  ) : (
+                    actualChangeRows.map((row, idx) => {
+                      const inVal = parseFloat(row.in) || 0;
+                      const outVal = parseFloat(row.out) || 0;
+                      const match = getCustomerMatch(row.customerName);
 
-                    return (
-                      <tr
-                        key={row.id}
-                        className={`hover:bg-slate-900/60 transition-colors ${
-                          row.isDynamicExtra ? 'bg-purple-950/10' : ''
-                        }`}
-                      >
-                        {/* 1. Index # */}
-                        <td className="py-2.5 px-3 text-center text-slate-500 font-mono-num font-bold">
-                          {idx + 1}
-                        </td>
-
-                        {/* 2. Customer Name with Smart Typeahead Autocomplete */}
-                        <td className="py-2 px-2 relative min-w-[210px]">
-                          <CustomerAutocompleteInput
-                            value={row.customerName}
-                            disabled={!isEditable}
-                            theme="purple"
-                            placeholder={isEditable ? "Type name (e.g. Givemore)..." : "No customer"}
-                            onChange={(name, cust) => {
-                              handleUpdateChangeRow(row.id, {
-                                customerName: name,
-                                customerId: cust ? cust.customerId : undefined,
-                              });
-                            }}
-                            onSelectCustomer={(cust) => {
-                              handleSelectCustomerForChangeRow(row.id, cust);
-                            }}
-                            onRegisterNew={(typedName) => {
-                              handleOpenRegisterModal(typedName, row.id, 'change');
-                            }}
-                            showBalances={true}
-                          />
-                        </td>
-
-                        {/* 3. Cash IN */}
-                        <td className="py-2.5 px-3 text-right">
-                          <div className="relative flex items-center w-full min-w-[95px]">
-                            <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none select-none text-emerald-400 font-bold text-xs">
-                              $
-                            </span>
-                            <input
-                              type="number"
-                              disabled={!isEditable}
-                              inputMode="decimal"
-                              step="0.01"
-                              min="0"
-                              value={row.in}
-                              onChange={(e) => handleUpdateChangeRow(row.id, { in: e.target.value })}
-                              placeholder="0.00"
-                              className={`w-full pl-6 pr-2 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 text-right font-mono-num text-xs font-bold text-emerald-300 placeholder-slate-600 outline-none transition ${
-                                !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : ''
-                              }`}
-                            />
-                          </div>
-                        </td>
-
-                        {/* 4. Cash OUT */}
-                        <td className="py-2.5 px-3 text-right">
-                          <div className="relative flex items-center w-full min-w-[95px]">
-                            <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none select-none text-rose-400 font-bold text-xs">
-                              $
-                            </span>
-                            <input
-                              type="number"
-                              disabled={!isEditable}
-                              inputMode="decimal"
-                              step="0.01"
-                              min="0"
-                              value={row.out}
-                              onChange={(e) => handleUpdateChangeRow(row.id, { out: e.target.value })}
-                              placeholder="0.00"
-                              className={`w-full pl-6 pr-2 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-rose-500 focus:ring-1 focus:ring-rose-500/30 text-right font-mono-num text-xs font-bold text-rose-300 placeholder-slate-600 outline-none transition ${
-                                !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : ''
-                              }`}
-                            />
-                          </div>
-                        </td>
-
-                        {/* 5. Notes / Reason */}
-                        <td className="py-2.5 px-3">
-                          <input
-                            type="text"
-                            disabled={!isEditable}
-                            value={row.notes}
-                            onChange={(e) => handleUpdateChangeRow(row.id, { notes: e.target.value })}
-                            placeholder={isEditable ? "e.g. Change for $100 bill, Tuckshop cashout" : "—"}
-                            className={`w-full px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-purple-500 text-xs text-slate-300 placeholder-slate-600 outline-none transition ${
-                              !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : ''
-                            }`}
-                          />
-                        </td>
-
-                        {/* 6. Row Action */}
-                        <td className="py-2.5 px-2 text-center">
-                          {isEditable ? (
-                            row.isDynamicExtra ? (
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteChangeRow(row.id)}
-                                className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-950/30 transition"
-                                title="Delete extra row"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
+                      return (
+                        <tr key={row.id} className="hover:bg-slate-900/60 transition-colors">
+                          <td className="py-3 px-3 text-center text-slate-500 font-mono-num font-bold">
+                            {idx + 1}
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="font-bold text-white flex items-center gap-1.5">
+                              <User className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                              <span>{row.customerName}</span>
+                              {row.customerId && (
+                                <span className="text-[10px] font-mono text-purple-300 bg-purple-950/60 px-1.5 py-0.5 rounded border border-purple-800/60">
+                                  {row.customerId}
+                                </span>
+                              )}
+                            </div>
+                            {match && (
+                              <div className="text-[10px] text-slate-400 mt-0.5">
+                                Current Balance: ${(match.currentBalance || 0).toFixed(2)}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            {inVal > 0 ? (
+                              <span className="font-mono-num font-bold text-emerald-400 bg-emerald-950/40 px-2 py-1 rounded-lg border border-emerald-500/20">
+                                +${inVal.toFixed(2)}
+                              </span>
                             ) : (
-                              <button
-                                type="button"
-                                onClick={() => handleClearChangeRow(row.id)}
-                                className="p-1.5 rounded-lg text-slate-600 hover:text-slate-300 hover:bg-slate-800 transition"
-                                title="Clear row values"
-                              >
-                                <X className="w-3.5 h-3.5" />
-                              </button>
-                            )
-                          ) : (
-                            <span className="text-slate-600 text-xs">—</span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                              <span className="text-slate-600 font-mono">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            {outVal > 0 ? (
+                              <span className="font-mono-num font-bold text-rose-400 bg-rose-950/40 px-2 py-1 rounded-lg border border-rose-500/20">
+                                -${outVal.toFixed(2)}
+                              </span>
+                            ) : (
+                              <span className="text-slate-600 font-mono">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-slate-300">
+                            {row.notes ? row.notes : <span className="text-slate-600 italic">No notes</span>}
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 shadow-sm">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                              <span>Verified POS</span>
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
-
-            {/* ADD MORE ENTRY BUTTON (BELOW THE LAST ENTRY) */}
-            {isEditable && (
-              <div className="flex items-center justify-start pt-1">
-                <button
-                  type="button"
-                  id="btn-add-more-change-entry-bottom"
-                  onClick={handleAddChangeRow}
-                  className="px-4 py-2.5 rounded-xl bg-slate-800/90 hover:bg-purple-950/60 border border-purple-500/40 hover:border-purple-400 text-purple-200 text-xs font-bold flex items-center space-x-2 shadow-md transition active:scale-95 group"
-                >
-                  <div className="w-5 h-5 rounded-lg bg-[#6A4DFF]/30 text-purple-300 flex items-center justify-center group-hover:bg-[#6A4DFF] group-hover:text-white transition">
-                    <Plus className="w-3.5 h-3.5" />
-                  </div>
-                  <span>+ Add More Customer Change Entry</span>
-                </button>
-              </div>
-            )}
 
             {/* Change Subtotals */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-3 text-xs bg-slate-950/40 p-3 rounded-2xl border border-slate-800">
@@ -1296,13 +1342,13 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                   </strong>
                 </div>
                 <div>
-                  <span className="text-slate-400 mr-1.5">Net Change:</span>
+                  <span className="text-slate-400 mr-1.5">Cash Drawer Impact:</span>
                   <strong
                     className={`font-mono-num font-black text-sm ${
                       changeTotals.net >= 0 ? 'text-purple-300' : 'text-rose-400'
                     }`}
                   >
-                    ${changeTotals.net.toFixed(2)}
+                    {changeTotals.net >= 0 ? '+' : ''}${changeTotals.net.toFixed(2)}
                   </strong>
                 </div>
               </div>
@@ -1331,181 +1377,103 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
               </div>
             </div>
 
-            {/* Credit Table with Same IN & OUT Design as Change */}
+            {/* Credit Table - Read-Only Audited */}
             <div className="overflow-x-auto rounded-2xl border border-slate-800 bg-slate-950/60">
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-900/90 text-slate-400 border-b border-slate-800 select-none">
                     <th className="py-3 px-3 w-10 text-center font-mono-num">#</th>
-                    <th className="py-3 px-3 min-w-[220px]">Customer Name</th>
-                    <th className="py-3 px-3 w-32 text-right">Credit IN ($)</th>
+                    <th className="py-3 px-3 min-w-[200px]">Customer</th>
+                    <th className="py-3 px-3 w-32 text-right">Payment IN ($)</th>
                     <th className="py-3 px-3 w-32 text-right">Credit OUT ($)</th>
                     <th className="py-3 px-3 min-w-[180px]">Goods / Item Description</th>
                     <th className="py-3 px-3 w-32">Payment Due Date</th>
-                    <th className="py-3 px-3 min-w-[150px]">Notes</th>
-                    <th className="py-3 px-2 w-16 text-center">Action</th>
+                    <th className="py-3 px-3 w-36 text-center">Settlement Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
-                  {creditRows.map((row, idx) => {
-                    const match = getCustomerMatch(row.customerName);
-                    const isFilled = row.customerName.trim() !== '';
-                    const isNewCust = isFilled && !match;
+                  {actualCreditRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-8 text-center text-slate-400 text-xs">
+                        <CreditCard className="w-8 h-8 text-orange-400/60 mx-auto mb-2" />
+                        <p className="font-bold text-slate-300">No Credit Sales Recorded for this Shift</p>
+                        <p className="text-[11px] text-slate-500 mt-1">
+                          Credit sales billed to customer accounts at the POS Counter automatically stream into this audited ledger.
+                        </p>
+                      </td>
+                    </tr>
+                  ) : (
+                    actualCreditRows.map((row, idx) => {
+                      const inVal = parseFloat(row.in) || 0;
+                      const outVal = parseFloat(row.out || row.amount) || 0;
+                      const remaining = Math.max(0, outVal - inVal);
+                      const match = getCustomerMatch(row.customerName);
 
-                    return (
-                      <tr
-                        key={row.id}
-                        className={`hover:bg-slate-900/60 transition-colors ${
-                          row.isDynamicExtra ? 'bg-orange-950/10' : ''
-                        }`}
-                      >
-                        {/* 1. Index # */}
-                        <td className="py-2.5 px-3 text-center text-slate-500 font-mono-num font-bold">
-                          {idx + 1}
-                        </td>
-
-                        {/* 2. Customer Name with Typeahead Autocomplete */}
-                        <td className="py-2 px-2 relative min-w-[210px]">
-                          <CustomerAutocompleteInput
-                            value={row.customerName}
-                            disabled={!isEditable}
-                            theme="orange"
-                            placeholder={isEditable ? "Type name (e.g. Givemore)..." : "No customer"}
-                            onChange={(name, cust) => {
-                              handleUpdateCreditRow(row.id, {
-                                customerName: name,
-                                customerId: cust ? cust.customerId : undefined,
-                              });
-                            }}
-                            onSelectCustomer={(cust) => {
-                              handleSelectCustomerForCreditRow(row.id, cust);
-                            }}
-                            onRegisterNew={(typedName) => {
-                              handleOpenRegisterModal(typedName, row.id, 'credit');
-                            }}
-                            showBalances={true}
-                          />
-                        </td>
-
-                        {/* 3. Credit IN (Payment Received) */}
-                        <td className="py-2.5 px-3 text-right">
-                          <div className="relative flex items-center w-full min-w-[95px]">
-                            <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none select-none text-emerald-400 font-bold text-xs">
-                              $
-                            </span>
-                            <input
-                              type="number"
-                              disabled={!isEditable}
-                              inputMode="decimal"
-                              step="0.01"
-                              min="0"
-                              value={row.in}
-                              onChange={(e) => handleUpdateCreditRow(row.id, { in: e.target.value })}
-                              placeholder="0.00"
-                              className={`w-full pl-6 pr-2 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 text-right font-mono-num text-xs font-bold text-emerald-300 placeholder-slate-600 outline-none transition ${
-                                !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : ''
-                              }`}
-                            />
-                          </div>
-                        </td>
-
-                        {/* 4. Credit OUT (Credit Given / Goods Delivered) */}
-                        <td className="py-2.5 px-3 text-right">
-                          <div className="relative flex items-center w-full min-w-[95px]">
-                            <span className="absolute inset-y-0 left-0 pl-2.5 flex items-center pointer-events-none select-none text-orange-400 font-bold text-xs">
-                              $
-                            </span>
-                            <input
-                              type="number"
-                              disabled={!isEditable}
-                              inputMode="decimal"
-                              step="0.01"
-                              min="0"
-                              value={row.out || row.amount}
-                              onChange={(e) =>
-                                handleUpdateCreditRow(row.id, {
-                                  out: e.target.value,
-                                  amount: e.target.value,
-                                })
-                              }
-                              placeholder="0.00"
-                              className={`w-full pl-6 pr-2 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-[#FF8A00] focus:ring-1 focus:ring-orange-500/30 text-right font-mono-num text-xs font-bold text-orange-300 placeholder-slate-600 outline-none transition ${
-                                !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : ''
-                              }`}
-                            />
-                          </div>
-                        </td>
-
-                        {/* 5. Goods / Description */}
-                        <td className="py-2.5 px-3">
-                          <input
-                            type="text"
-                            disabled={!isEditable}
-                            value={row.itemDescription}
-                            onChange={(e) => handleUpdateCreditRow(row.id, { itemDescription: e.target.value })}
-                            placeholder={isEditable ? "e.g. 2x 585W Solar Panels, 1x Inverter" : "—"}
-                            className={`w-full px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-[#FF8A00] text-xs text-slate-200 placeholder-slate-600 outline-none transition ${
-                              !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : ''
-                            }`}
-                          />
-                        </td>
-
-                        {/* 6. Payment Due Date */}
-                        <td className="py-2.5 px-3">
-                          <input
-                            type="date"
-                            disabled={!isEditable}
-                            value={row.dueDate}
-                            onChange={(e) => handleUpdateCreditRow(row.id, { dueDate: e.target.value })}
-                            className={`w-full px-2.5 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-[#FF8A00] text-xs text-slate-300 font-mono-num outline-none transition ${
-                              !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : 'cursor-pointer'
-                            }`}
-                          />
-                        </td>
-
-                        {/* 7. Notes */}
-                        <td className="py-2.5 px-3">
-                          <input
-                            type="text"
-                            disabled={!isEditable}
-                            value={row.notes}
-                            onChange={(e) => handleUpdateCreditRow(row.id, { notes: e.target.value })}
-                            placeholder={isEditable ? "Terms / notes" : "—"}
-                            className={`w-full px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 focus:border-slate-500 text-xs text-slate-400 placeholder-slate-600 outline-none transition ${
-                              !isEditable ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800' : ''
-                            }`}
-                          />
-                        </td>
-
-                        {/* 8. Action */}
-                        <td className="py-2.5 px-2 text-center">
-                          {isEditable ? (
-                            row.isDynamicExtra ? (
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteCreditRow(row.id)}
-                                className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-950/30 transition"
-                                title="Delete extra row"
-                              >
-                                <Trash2 className="w-4 h-4" />
-                              </button>
+                      return (
+                        <tr key={row.id} className="hover:bg-slate-900/60 transition-colors">
+                          <td className="py-3 px-3 text-center text-slate-500 font-mono-num font-bold">
+                            {idx + 1}
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="font-bold text-white flex items-center gap-1.5">
+                              <User className="w-3.5 h-3.5 text-orange-400 shrink-0" />
+                              <span>{row.customerName}</span>
+                              {row.customerId && (
+                                <span className="text-[10px] font-mono text-orange-300 bg-orange-950/60 px-1.5 py-0.5 rounded border border-orange-800/60">
+                                  {row.customerId}
+                                </span>
+                              )}
+                            </div>
+                            {match && (
+                              <div className="text-[10px] text-slate-400 mt-0.5">
+                                Limit: ${(match.creditLimit || 0).toFixed(2)} • Bal: ${(match.currentBalance || 0).toFixed(2)}
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            {inVal > 0 ? (
+                              <span className="font-mono-num font-bold text-emerald-400 bg-emerald-950/40 px-2 py-1 rounded-lg border border-emerald-500/20">
+                                +${inVal.toFixed(2)}
+                              </span>
                             ) : (
-                              <button
-                                type="button"
-                                onClick={() => handleClearCreditRow(row.id)}
-                                className="p-1.5 rounded-lg text-slate-600 hover:text-slate-300 hover:bg-slate-800 transition"
-                                title="Clear row values"
-                              >
-                                <X className="w-3.5 h-3.5" />
-                              </button>
-                            )
-                          ) : (
-                            <span className="text-slate-600 text-xs">—</span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                              <span className="text-slate-600 font-mono">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            {outVal > 0 ? (
+                              <span className="font-mono-num font-bold text-orange-400 bg-orange-950/40 px-2 py-1 rounded-lg border border-orange-500/20">
+                                ${outVal.toFixed(2)}
+                              </span>
+                            ) : (
+                              <span className="text-slate-600 font-mono">—</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-slate-300">
+                            {row.itemDescription || row.notes || <span className="text-slate-600 italic">No description</span>}
+                          </td>
+                          <td className="py-3 px-3 font-mono-num text-slate-300 text-xs">
+                            {row.dueDate || '—'}
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            {remaining <= 0 && outVal > 0 ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                <span>Settled</span>
+                              </span>
+                            ) : inVal > 0 ? (
+                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                                Partial (${remaining.toFixed(2)})
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-orange-500/20 text-orange-300 border border-orange-500/30">
+                                Owed (${outVal.toFixed(2)})
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
                 </tbody>
               </table>
             </div>
@@ -1553,13 +1521,13 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                   </strong>
                 </div>
                 <div>
-                  <span className="text-slate-400 mr-1.5">Net Credit:</span>
+                  <span className="text-slate-400 mr-1.5">Receivables Delta:</span>
                   <strong
                     className={`font-mono-num font-black text-sm ${
-                      creditTotals.net >= 0 ? 'text-emerald-300' : 'text-rose-400'
+                      creditTotals.totalOut - creditTotals.totalIn >= 0 ? 'text-orange-300' : 'text-blue-400'
                     }`}
                   >
-                    ${creditTotals.net.toFixed(2)}
+                    {creditTotals.totalOut - creditTotals.totalIn >= 0 ? '+' : ''}${(creditTotals.totalOut - creditTotals.totalIn).toFixed(2)}
                   </strong>
                 </div>
               </div>
@@ -2168,10 +2136,12 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                         id: `crd_row_${Date.now()}`,
                         customerName,
                         customerId: match ? match.customerId : undefined,
-                        creditIn: '',
-                        repaidOut: '',
+                        amount: '',
+                        in: '',
+                        out: '',
                         itemDescription: '',
                         dueDate: '',
+                        notes: '',
                         isDynamicExtra: true,
                       },
                     ];

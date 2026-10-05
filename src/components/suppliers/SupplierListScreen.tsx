@@ -39,6 +39,7 @@ interface SupplierListScreenProps {
   currentUser: Salesperson | null;
   onNavigateToGRN: (supplierName?: string) => void;
   onViewVoucher?: (voucher: SupplierInvoiceVoucher) => void;
+  onNavigateHome?: () => void;
 }
 
 export const SupplierListScreen: React.FC<SupplierListScreenProps> = ({

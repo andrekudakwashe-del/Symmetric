@@ -1298,6 +1298,7 @@ export const INITIAL_STOCKTAKE_SESSIONS: StocktakeSession[] = [
     sessionId: 'STK-20260828-001',
     title: 'Mid-Year Store Floor Double-Count Audit',
     date: '2026-08-28',
+    countType: 'FULL_LOCKDOWN',
     status: 'RECOUNTING',
     branchId: 'BR-MAIN',
     branchName: 'Main Central Distribution & Warehouse',

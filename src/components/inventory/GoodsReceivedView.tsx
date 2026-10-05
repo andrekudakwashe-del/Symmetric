@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   Boxes,
   Package,
@@ -40,6 +40,8 @@ import {
   Supplier,
   Branch,
   Salesperson,
+  LandedCostItem,
+  GrnLineItem,
 } from '../../types';
 import {
   getInventoryItems,
@@ -53,10 +55,14 @@ import {
   recalculateItemPackagingRatio,
   subscribeRoomDatabase,
 } from '../../db/roomDatabase';
+import { landedCostService } from '../../services/landedCostService';
+import { getAllGoodsReceivedNotes } from '../../db/goodsReceivedNotes';
 import { SupplierRegistrationModal } from '../suppliers/SupplierRegistrationModal';
 import { PackagingRatioModal } from './PackagingRatioModal';
 import { ProductAddEditModal } from './ProductAddEditModal';
 import { DailyGoodsReceivedReport } from './DailyGoodsReceivedReport';
+import { LandedCostReport } from './LandedCostReport';
+import { ProcurementTripManifestView } from './ProcurementTripManifestView';
 
 interface GoodsReceivedViewProps {
   currentUser: Salesperson | null;
@@ -88,7 +94,283 @@ interface ExcelVoucherRow {
   packagingVariants?: PackagingVariant[];
   expiryDate?: string;
   batchNumber?: string;
+  weight?: number; // item weight in kg for by_weight landed cost allocation
 }
+
+// Stage 3: Margin Capacity Allocation preview and management override panel
+const LandedCostMarginPreview: React.FC<{
+  lc: LandedCostItem;
+  lcIndex: number;
+  rows: ExcelVoucherRow[];
+  getRowCalculations: (row: ExcelVoucherRow) => any;
+  updateLandedCost: (index: number, patch: Partial<LandedCostItem>) => void;
+}> = ({ lc, lcIndex, rows, getRowCalculations, updateLandedCost }) => {
+  const validRows = rows.filter((r) => r.itemId);
+
+  const previewGrnLineItems: GrnLineItem[] = validRows.map((r) => {
+    const calc = getRowCalculations(r);
+    const unitsPerCase = Number(r.qtyPerCaseDefault) || 1;
+    const unitsPerPack = Number(r.unitsPerPack) || 1;
+    const qty =
+      r.receiveAs === 'Cases'
+        ? (Number(r.quantityCases) || 0) * unitsPerCase
+        : r.receiveAs === 'Variant'
+        ? (Number(r.quantityPacks) || 0) * unitsPerPack
+        : Number(r.quantitySingles) || 0;
+
+    return {
+      itemId: r.id,
+      itemName: r.itemName || r.itemId,
+      quantity: Math.max(1, qty),
+      unitCost: calc.unitCost,
+      subtotal: calc.lineTotal,
+      sellingPrice: r.sellingPrice,
+      weight: r.weight || 0,
+    };
+  });
+
+  // Calculate suggested allocation via allocateByMargin (ignoring manual overrides for suggested column)
+  const suggestedMap = useMemo(() => {
+    const tempLc: LandedCostItem = {
+      ...lc,
+      manualOverrides: undefined,
+    };
+    return landedCostService.allocateByMargin(tempLc, previewGrnLineItems);
+  }, [lc.amount, lc.marginBasis, lc.marginFloorPercent, lc.marginFloorAbsolute, previewGrnLineItems]);
+
+  // Compute row allocations
+  const rowAllocations = validRows.map((r, idx) => {
+    const calc = getRowCalculations(r);
+    const cost = calc.unitCost;
+    const sell = r.sellingPrice || 0;
+    const profit = sell - cost;
+    const marginPct = sell > 0 ? (profit / sell) * 100 : 0;
+    const isExcluded = profit <= 0 || sell <= 0;
+
+    const suggestedCents = suggestedMap.get(idx) || 0;
+    const suggestedDollars = suggestedCents / 100;
+
+    const hasOverride = lc.manualOverrides && lc.manualOverrides[r.id] !== undefined;
+    const overrideVal = hasOverride ? lc.manualOverrides![r.id] : null;
+    const actualDollars = hasOverride ? Number(overrideVal) || 0 : suggestedDollars;
+
+    return {
+      row: r,
+      idx,
+      cost,
+      sell,
+      profit,
+      marginPct,
+      isExcluded,
+      suggestedDollars,
+      overrideVal,
+      actualDollars,
+    };
+  });
+
+  const totalAllocated = Number(rowAllocations.reduce((sum, item) => sum + item.actualDollars, 0).toFixed(2));
+  const targetAmount = Number(lc.amount) || 0;
+  const isMatch = Math.abs(totalAllocated - targetAmount) < 0.01;
+
+  const handleOverrideChange = (rowId: string, valStr: string) => {
+    const copy = { ...(lc.manualOverrides || {}) };
+    if (valStr.trim() === '') {
+      delete copy[rowId];
+    } else {
+      copy[rowId] = parseFloat(valStr) || 0;
+    }
+    updateLandedCost(lcIndex, { manualOverrides: copy });
+  };
+
+  const resetOverrides = () => {
+    updateLandedCost(lcIndex, { manualOverrides: {} });
+  };
+
+  return (
+    <div className="mt-3 pt-3 border-t border-slate-800 space-y-3">
+      {/* Margin Capacity Controls Row */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 bg-slate-950/70 p-3 rounded-xl border border-slate-800">
+        <div>
+          <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">
+            Margin Basis
+          </label>
+          <select
+            value={lc.marginBasis || 'absolute_profit'}
+            onChange={(e) => updateLandedCost(lcIndex, { marginBasis: e.target.value as any })}
+            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-amber-300 font-semibold focus:outline-none focus:border-amber-500"
+          >
+            <option value="absolute_profit">Absolute Profit ($)</option>
+            <option value="margin_percent">Margin % (Margin % × Unit Cost)</option>
+          </select>
+        </div>
+        <div>
+          <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">
+            Margin Floor % (Optional Cap)
+          </label>
+          <input
+            type="number"
+            step="0.1"
+            min="0"
+            max="100"
+            value={lc.marginFloorPercent !== null && lc.marginFloorPercent !== undefined ? lc.marginFloorPercent : ''}
+            onChange={(e) =>
+              updateLandedCost(lcIndex, {
+                marginFloorPercent: e.target.value !== '' ? parseFloat(e.target.value) : null,
+              })
+            }
+            placeholder="e.g. 5 for 5%"
+            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-amber-500"
+          />
+        </div>
+        <div>
+          <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">
+            Margin Floor $ (Optional Cap)
+          </label>
+          <input
+            type="number"
+            step="0.01"
+            min="0"
+            value={lc.marginFloorAbsolute !== null && lc.marginFloorAbsolute !== undefined ? lc.marginFloorAbsolute : ''}
+            onChange={(e) =>
+              updateLandedCost(lcIndex, {
+                marginFloorAbsolute: e.target.value !== '' ? parseFloat(e.target.value) : null,
+              })
+            }
+            placeholder="e.g. 2.50"
+            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-amber-500"
+          />
+        </div>
+        <div>
+          <div className="flex items-center justify-between mb-1">
+            <label className="text-[10px] font-semibold text-slate-400 uppercase block">
+              Allocation Reason <span className="text-amber-400">*</span>
+            </label>
+            <span
+              className={`text-[9px] font-semibold ${
+                (lc.allocationReason || '').trim().length >= 5 ? 'text-emerald-400' : 'text-amber-400'
+              }`}
+            >
+              {(lc.allocationReason || '').trim().length >= 5
+                ? 'Valid'
+                : `${(lc.allocationReason || '').trim().length}/5 chars min`}
+            </span>
+          </div>
+          <input
+            type="text"
+            value={lc.allocationReason || ''}
+            onChange={(e) => updateLandedCost(lcIndex, { allocationReason: e.target.value })}
+            placeholder="Required reason for managerial override (min 5 chars)..."
+            className={`w-full bg-slate-900 border rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none ${
+              (lc.allocationReason || '').trim().length >= 5
+                ? 'border-emerald-600/70 focus:border-emerald-500'
+                : 'border-amber-500/80 focus:border-amber-500'
+            }`}
+          />
+        </div>
+      </div>
+
+      {/* Preview Table */}
+      <div className="overflow-x-auto rounded-xl border border-slate-800 bg-slate-950">
+        <table className="w-full text-left text-xs border-collapse">
+          <thead>
+            <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px]">
+              <th className="py-2 px-3">Item</th>
+              <th className="py-2 px-2 text-right">Cost</th>
+              <th className="py-2 px-2 text-right">Sell</th>
+              <th className="py-2 px-2 text-right">Profit</th>
+              <th className="py-2 px-2 text-center">Margin %</th>
+              <th className="py-2 px-3 text-right text-amber-300">Suggested Alloc</th>
+              <th className="py-2 px-3 text-right">Override ($)</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-850 font-mono text-[11px]">
+            {rowAllocations.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="py-4 text-center text-slate-500 font-sans">
+                  No line items on voucher. Add products to Excel grid to allocate landed costs.
+                </td>
+              </tr>
+            ) : (
+              rowAllocations.map((item) => (
+                <tr key={item.row.id} className="hover:bg-slate-900/50">
+                  <td className="py-1.5 px-3 font-sans font-medium text-slate-200">
+                    {item.row.itemName || item.row.itemId}
+                    <span className="text-[10px] text-slate-500 font-mono ml-1">({item.row.itemId})</span>
+                  </td>
+                  <td className="py-1.5 px-2 text-right text-slate-300">${item.cost.toFixed(2)}</td>
+                  <td className="py-1.5 px-2 text-right text-slate-300">
+                    {item.sell > 0 ? `$${item.sell.toFixed(2)}` : '-'}
+                  </td>
+                  <td className="py-1.5 px-2 text-right">
+                    {item.isExcluded ? (
+                      <span className="text-rose-400">${item.profit.toFixed(2)}</span>
+                    ) : (
+                      <span className="text-emerald-400 font-semibold">+${item.profit.toFixed(2)}</span>
+                    )}
+                  </td>
+                  <td className="py-1.5 px-2 text-center">
+                    {item.isExcluded ? (
+                      <span className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-rose-950 text-rose-300 border border-rose-800">
+                        Excluded (no profit)
+                      </span>
+                    ) : (
+                      <span className="text-slate-300 font-semibold">{item.marginPct.toFixed(1)}%</span>
+                    )}
+                  </td>
+                  <td className="py-1.5 px-3 text-right font-bold text-amber-300">
+                    {item.isExcluded ? '$0.00' : `$${item.suggestedDollars.toFixed(2)}`}
+                  </td>
+                  <td className="py-1.5 px-3 text-right">
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={item.overrideVal !== null ? item.overrideVal : ''}
+                      placeholder={item.suggestedDollars.toFixed(2)}
+                      onChange={(e) => handleOverrideChange(item.row.id, e.target.value)}
+                      className="w-24 bg-slate-900 border border-slate-700 rounded px-2 py-0.5 text-xs text-white text-right focus:outline-none focus:border-amber-500 font-mono"
+                    />
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Live Allocation Validation Banner */}
+      <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl border text-xs bg-slate-950/90 border-slate-800">
+        <div className="flex items-center gap-2">
+          {isMatch ? (
+            <div className="flex items-center gap-1.5 text-emerald-400 font-semibold">
+              <CheckCircle2 className="w-4 h-4" />
+              <span>
+                Total Allocated: <strong>${totalAllocated.toFixed(2)}</strong> equals Landed Cost: <strong>${targetAmount.toFixed(2)}</strong> exactly ✅
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-1.5 text-rose-400 font-semibold">
+              <AlertTriangle className="w-4 h-4" />
+              <span>
+                Total Allocated: <strong>${totalAllocated.toFixed(2)}</strong> does not equal Landed Cost: <strong>${targetAmount.toFixed(2)}</strong> (Difference: ${Math.abs(totalAllocated - targetAmount).toFixed(2)}) ❌ Block Save
+              </span>
+            </div>
+          )}
+        </div>
+
+        {lc.manualOverrides && Object.keys(lc.manualOverrides).length > 0 && (
+          <button
+            type="button"
+            onClick={resetOverrides}
+            className="text-[11px] text-amber-400 hover:text-amber-300 underline font-semibold"
+          >
+            Reset Overrides to Suggested
+          </button>
+        )}
+      </div>
+    </div>
+  );
+};
 
 export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   currentUser,
@@ -103,7 +385,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   const [suppliers, setSuppliers] = useState<Supplier[]>(() => getSuppliers());
   const [branches, setBranches] = useState<Branch[]>(() => getBranches());
 
-  const [activeTab, setActiveTab] = useState<'create_invoice' | 'invoice_history' | 'daily_report' | 'audit_log'>('create_invoice');
+  const [activeTab, setActiveTab] = useState<'create_invoice' | 'invoice_history' | 'trip_manifest' | 'daily_report' | 'landed_cost_report' | 'audit_log'>('create_invoice');
 
   // Supplier Invoice Header State
   const [selectedBranchId, setSelectedBranchId] = useState<string>('BR001');
@@ -124,8 +406,58 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   const [paymentTerms, setPaymentTerms] = useState<string>('30-Day Account Credit');
   const [invoiceNotes, setInvoiceNotes] = useState<string>('');
 
-  // Interactive Excel Spreadsheet Rows - Starts completely blank for a new receiving voucher
-  const [rows, setRows] = useState<ExcelVoucherRow[]>(() => []);
+  const createBlankVoucherRow = (): ExcelVoucherRow => ({
+    id: `row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+    itemId: '',
+    itemName: '',
+    receiveAs: 'Cases',
+    qtyPerCaseDefault: 12,
+    originalUnitsPerCase: 12,
+    quantityCases: 1,
+    quantitySingles: 0,
+    quantityPacks: 0,
+    lastCost: 0,
+    pricePerCase: 0,
+    sellingPrice: 0,
+    canSellAsCase: true,
+    category: 'General',
+    packagingVariants: [],
+  });
+
+  // Interactive Excel Spreadsheet Rows - Starts with 1 blank row ready for input
+  const [rows, setRows] = useState<ExcelVoucherRow[]>(() => [createBlankVoucherRow()]);
+
+  // Dynamic Landed Costs (Freight, Duty, Brokerage, Insurance)
+  const [landedCosts, setLandedCosts] = useState<LandedCostItem[]>([]);
+
+  const addLandedCost = () => {
+    setLandedCosts((prev) => [
+      ...prev,
+      {
+        id: `lc_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        description: 'Cross-border Freight / Transport',
+        amount: 0,
+        allocationMethod: 'by_value',
+        marginBasis: 'absolute_profit',
+        marginFloorPercent: null,
+        marginFloorAbsolute: null,
+        allocationReason: '',
+        manualOverrides: {},
+      },
+    ]);
+  };
+
+  const updateLandedCost = (index: number, patch: Partial<LandedCostItem>) => {
+    setLandedCosts((prev) => {
+      const copy = [...prev];
+      copy[index] = { ...copy[index], ...patch };
+      return copy;
+    });
+  };
+
+  const removeLandedCost = (index: number) => {
+    setLandedCosts((prev) => prev.filter((_, i) => i !== index));
+  };
 
   // Active search row state for item combobox
   const [activeSearchRowId, setActiveSearchRowId] = useState<string | null>(null);
@@ -257,8 +589,9 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   };
 
   const selectProductForRow = (rowId: string, item: InventoryItem) => {
-    setRows((prev) =>
-      prev.map((row) => {
+    setRows((prev) => {
+      const isLast = prev.length > 0 && prev[prev.length - 1].id === rowId;
+      const updated = prev.map((row) => {
         if (row.id === rowId) {
           const variants = item.packagingVariants || [];
           return {
@@ -279,8 +612,30 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
           };
         }
         return row;
-      })
-    );
+      });
+
+      if (isLast) {
+        updated.push({
+          id: `row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+          itemId: '',
+          itemName: '',
+          receiveAs: 'Cases',
+          qtyPerCaseDefault: 12,
+          originalUnitsPerCase: 12,
+          quantityCases: 1,
+          quantitySingles: 0,
+          quantityPacks: 0,
+          lastCost: 0,
+          pricePerCase: 0,
+          sellingPrice: 0,
+          canSellAsCase: true,
+          category: 'General',
+          packagingVariants: [],
+        });
+      }
+
+      return updated;
+    });
     setActiveSearchRowId(null);
     setProductSearchTerm('');
   };
@@ -478,6 +833,57 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     return acc + qtyCases * ratio + qtySingles + qtyPacks * packUnits;
   }, 0);
 
+  // Landed Cost Allocations across Excel rows
+  const allocatedLandedCostMap = useMemo(() => {
+    const validLandedCosts = landedCosts.filter((lc) => Number(lc.amount) > 0);
+    if (validLandedCosts.length === 0 || rows.length === 0) {
+      return new Map<string, { landedCostAllocated: number; totalUnitCost: number }>();
+    }
+
+    const tempGrn: any = {
+      lineItems: rows.map((r) => {
+        const calc = getRowCalculations(r);
+        const unitsPerCase = Number(r.qtyPerCaseDefault) || 1;
+        const unitsPerPack = Number(r.unitsPerPack) || 1;
+        const totalUnits =
+          r.receiveAs === 'Cases'
+            ? (Number(r.quantityCases) || 0) * unitsPerCase
+            : r.receiveAs === 'Variant'
+            ? (Number(r.quantityPacks) || 0) * unitsPerPack
+            : Number(r.quantitySingles) || 0;
+
+        return {
+          itemId: r.id, // using unique row.id for exact mapping
+          itemName: r.itemName || r.itemId,
+          quantity: totalUnits,
+          unitCost: calc.unitCost,
+          subtotal: calc.lineTotal,
+          sellingPrice: r.sellingPrice,
+          weight: r.weight || 0,
+        };
+      }),
+      landedCosts: validLandedCosts,
+    };
+
+    landedCostService.allocateLandedCosts(tempGrn);
+
+    const map = new Map<string, { landedCostAllocated: number; totalUnitCost: number }>();
+    tempGrn.lineItems.forEach((li: any) => {
+      map.set(li.itemId, {
+        landedCostAllocated: li.landedCostAllocated || 0,
+        totalUnitCost: li.totalUnitCost || li.unitCost,
+      });
+    });
+    return map;
+  }, [rows, landedCosts]);
+
+  const totalLandedCosts = useMemo(() => {
+    return landedCosts.reduce((sum, lc) => sum + (Number(lc.amount) || 0), 0);
+  }, [landedCosts]);
+
+  const totalInventoryValue = voucherGrandTotal + totalLandedCosts;
+  const hasByWeightAllocation = landedCosts.some((lc) => lc.allocationMethod === 'by_weight');
+
   // Submit and Post Supplier Invoice
   const handlePostGoodsReceivedVoucher = () => {
     if (!supplierInvoiceNo.trim()) {
@@ -490,6 +896,36 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     }
 
     const selectedBranch = branches.find((b) => b.branchId === selectedBranchId);
+
+    // Validate landed costs for by_margin requirements
+    for (let i = 0; i < landedCosts.length; i++) {
+      const lc = landedCosts[i];
+      if (Number(lc.amount) > 0 && lc.allocationMethod === 'by_margin') {
+        const reason = (lc.allocationReason || '').trim();
+        if (reason.length < 5) {
+          showToast(
+            'error',
+            `Landed Cost #${i + 1} (${lc.description}) using "By Margin Capacity" requires an allocation reason (minimum 5 characters).`
+          );
+          return;
+        }
+
+        // Validate that total allocated matches landed cost amount exactly
+        if (lc.manualOverrides && Object.keys(lc.manualOverrides).length > 0) {
+          let overrideSum = 0;
+          for (const k of Object.keys(lc.manualOverrides)) {
+            overrideSum += Number(lc.manualOverrides[k]) || 0;
+          }
+          if (Math.abs(overrideSum - Number(lc.amount)) > 0.009) {
+            showToast(
+              'error',
+              `Landed Cost #${i + 1} override sum ($${overrideSum.toFixed(2)}) must match the Landed Cost amount ($${Number(lc.amount).toFixed(2)}) exactly. Block save.`
+            );
+            return;
+          }
+        }
+      }
+    }
 
     // Filter valid rows with quantity > 0
     const validItemsToReceive = rows
@@ -519,6 +955,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
           marginPercent: calc.marginPercent,
           expiryDate: r.expiryDate || undefined,
           batchNumber: r.batchNumber || undefined,
+          weight: r.weight || 0,
         };
       });
 
@@ -544,6 +981,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       staffName: currentUser?.name || 'Administrator',
       notes: invoiceNotes,
       items: validItemsToReceive,
+      landedCosts: landedCosts.filter((lc) => Number(lc.amount) > 0),
     });
 
     if (result.success && result.voucher) {
@@ -561,6 +999,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       setInvoiceNotes('');
       setSupplierName('');
       setRows([]); // New voucher is blank!
+      setLandedCosts([]);
     } else {
       showToast('error', result.message || 'Failed to post voucher.');
     }
@@ -575,6 +1014,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     setPurchaseOrderNo(`PO-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`);
     setInvoiceNotes('');
     setRows([]); // Blank, ready for new products!
+    setLandedCosts([]);
   };
 
   // Filtered suppliers for combobox
@@ -694,6 +1134,18 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                 Vouchers History ({invoicesList.length})
               </button>
               <button
+                id="btn-tab-trip-manifest"
+                onClick={() => setActiveTab('trip_manifest')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-all whitespace-nowrap ${
+                  activeTab === 'trip_manifest'
+                    ? 'bg-indigo-600 text-white shadow-md'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Truck className="w-3.5 h-3.5 text-indigo-300" />
+                Procurement Trips (Town Run)
+              </button>
+              <button
                 id="btn-tab-daily-report"
                 onClick={() => setActiveTab('daily_report')}
                 className={`px-3 py-1.5 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-all whitespace-nowrap ${
@@ -704,6 +1156,18 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
               >
                 <FileSpreadsheet className="w-3.5 h-3.5 text-teal-300" />
                 Daily Admin Report
+              </button>
+              <button
+                id="btn-tab-landed-cost-report"
+                onClick={() => setActiveTab('landed_cost_report')}
+                className={`px-3 py-1.5 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition-all whitespace-nowrap ${
+                  activeTab === 'landed_cost_report'
+                    ? 'bg-amber-600 text-white shadow-md'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Truck className="w-3.5 h-3.5 text-amber-300" />
+                Landed Cost Report
               </button>
               <button
                 id="btn-tab-audit-log"
@@ -742,6 +1206,15 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('trip_manifest')}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-600/30 transition-all flex items-center gap-1.5"
+                    title="Combine multiple supplier invoices with shared transport hire"
+                  >
+                    <Truck className="w-3.5 h-3.5 text-indigo-400" />
+                    Town Run Manifest
+                  </button>
                   <button
                     type="button"
                     onClick={handleStartNewInvoice}
@@ -914,6 +1387,141 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
               </div>
             </div>
 
+            {/* Dynamic Landed Costs (Freight, Duty, Brokerage, Insurance) */}
+            <div className="bg-slate-850 border border-slate-700/80 rounded-2xl p-4 shadow-xl space-y-3">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-amber-500/10 border border-amber-500/25 flex items-center justify-center text-amber-400">
+                    <Truck className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+                        Landed Costs & Freight Allocation
+                      </h3>
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                        Additive to Unit Cost Only
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Distribute freight, customs duty, port clearance, and transit insurance into inventory item cost (no cash impact)
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  {totalLandedCosts > 0 && (
+                    <div className="text-right px-3 py-1 bg-amber-500/10 border border-amber-500/30 rounded-xl">
+                      <span className="text-[10px] text-amber-400 block uppercase font-semibold">Total Landed</span>
+                      <span className="text-sm font-bold font-mono text-amber-300">${totalLandedCosts.toFixed(2)}</span>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={addLandedCost}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-600/20 text-amber-300 border border-amber-500/40 hover:bg-amber-600/30 transition-all flex items-center gap-1.5"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    + Add Landed Cost Line
+                  </button>
+                </div>
+              </div>
+
+              {landedCosts.length === 0 ? (
+                <div className="text-xs text-slate-400 bg-slate-900/60 rounded-xl p-3 border border-slate-800 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Info className="w-4 h-4 text-slate-500 shrink-0" />
+                    <span>No landed costs attached to this invoice. Line items will record inventory receipt at invoice price.</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={addLandedCost}
+                    className="text-amber-400 hover:text-amber-300 font-semibold underline text-xs ml-2"
+                  >
+                    Add freight/duty line
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {landedCosts.map((lc, index) => (
+                    <div
+                      key={lc.id || index}
+                      className="bg-slate-900 border border-slate-700/80 rounded-xl p-3"
+                    >
+                      <div className="flex flex-col md:flex-row md:items-center gap-3">
+                        <div className="flex-1">
+                          <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">
+                            Cost Description
+                          </label>
+                          <input
+                            type="text"
+                            value={lc.description}
+                            onChange={(e) => updateLandedCost(index, { description: e.target.value })}
+                            placeholder="e.g. Cross-border Freight, Customs Duty..."
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-amber-500"
+                          />
+                        </div>
+                        <div className="w-full md:w-36">
+                          <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">
+                            Amount ($)
+                          </label>
+                          <div className="relative">
+                            <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500 text-xs">$</span>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min={0}
+                              value={lc.amount || ''}
+                              onChange={(e) =>
+                                updateLandedCost(index, { amount: Math.max(0, parseFloat(e.target.value) || 0) })
+                              }
+                              placeholder="0.00"
+                              className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-6 pr-2 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-amber-500 text-right"
+                            />
+                          </div>
+                        </div>
+                        <div className="w-full md:w-64">
+                          <label className="text-[10px] font-semibold text-slate-400 uppercase block mb-1">
+                            Allocation Method
+                          </label>
+                          <select
+                            value={lc.allocationMethod}
+                            onChange={(e) => updateLandedCost(index, { allocationMethod: e.target.value as any })}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-amber-300 font-semibold focus:outline-none focus:border-amber-500"
+                          >
+                            <option value="by_value">By Value (Proportional to Subtotal)</option>
+                            <option value="by_quantity">By Quantity (Proportional to Units)</option>
+                            <option value="by_weight">By Weight (Proportional to kg)</option>
+                            <option value="by_margin">By Margin Capacity (Management Override)</option>
+                          </select>
+                        </div>
+                        <div className="shrink-0 pt-2 md:pt-4">
+                          <button
+                            type="button"
+                            onClick={() => removeLandedCost(index)}
+                            className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-slate-800 rounded-lg transition-colors"
+                            title="Remove landed cost line"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Stage 3: Margin Capacity Management Override Panel */}
+                      {lc.allocationMethod === 'by_margin' && (
+                        <LandedCostMarginPreview
+                          lc={lc}
+                          lcIndex={index}
+                          rows={rows}
+                          getRowCalculations={getRowCalculations}
+                          updateLandedCost={updateLandedCost}
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {/* Interactive Excel Spreadsheet Grid */}
             <div className="bg-slate-850 border border-slate-700/80 rounded-2xl shadow-xl overflow-hidden">
               <div className="p-4 bg-slate-800 border-b border-slate-700/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -965,6 +1573,12 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                         Quantity Inward <br />
                         <span className="text-[10px] font-normal text-slate-400">(Cases / Singles / Prepacks)</span>
                       </th>
+                      {hasByWeightAllocation && (
+                        <th className="py-3 px-2 min-w-[85px] text-center text-amber-300 bg-slate-900 font-semibold">
+                          Weight <br />
+                          <span className="text-[10px] font-normal text-slate-400">(kg/unit)</span>
+                        </th>
+                      )}
                       <th className="py-3 px-2 min-w-[85px] text-right">last cost</th>
                       <th className="py-3 px-2 min-w-[120px] text-right">
                         Price / Case or Unit <br />
@@ -974,6 +1588,14 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                         Line Total ($)
                       </th>
                       <th className="py-3 px-2 min-w-[80px] text-right text-slate-300">unit cost</th>
+                      <th className="py-3 px-2 min-w-[105px] text-right text-amber-400 bg-slate-900 font-semibold">
+                        Landed Alloc <br />
+                        <span className="text-[10px] font-normal text-slate-400">($ allocated)</span>
+                      </th>
+                      <th className="py-3 px-2 min-w-[105px] text-right text-emerald-400 bg-slate-900 font-bold">
+                        Total Unit Cost <br />
+                        <span className="text-[10px] font-normal text-slate-400">(with Landed)</span>
+                      </th>
                       <th className="py-3 px-2 min-w-[90px] text-right">Selling price</th>
                       <th className="py-3 px-2 min-w-[80px] text-center">Margin</th>
                       <th className="py-3 px-2 w-[48px] text-center"></th>
@@ -1104,9 +1726,9 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
 
                                     {/* Product List */}
                                     <div className="max-h-60 overflow-y-auto divide-y divide-slate-800">
-                                      {filteredAvailableProducts.map((p) => (
+                                      {filteredAvailableProducts.map((p, pIdx) => (
                                         <button
-                                          key={p.itemId}
+                                          key={`${p.itemId}-${pIdx}`}
                                           type="button"
                                           onClick={() => selectProductForRow(row.id, p)}
                                           className={`w-full text-left p-2.5 hover:bg-slate-800 transition-colors flex items-center justify-between ${
@@ -1229,8 +1851,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                       const packPrice = Number((currentUnitCost * packUnits).toFixed(2));
                                       updateRow(row.id, {
                                         receiveAs: 'Variant',
-                                        selectedVariantId: defaultVariant ? defaultVariant.variantId : 'custom-variant',
-                                        selectedVariantName: defaultVariant ? defaultVariant.variantName : `Pack of ${packUnits}`,
+                                        selectedVariantId: defaultVariant ? (defaultVariant.variantId || defaultVariant.id) : 'custom-variant',
+                                        selectedVariantName: defaultVariant ? (defaultVariant.variantName || defaultVariant.name) : `Pack of ${packUnits}`,
                                         unitsPerPack: packUnits,
                                         pricePerCase: packPrice || defaultVariant?.costPrice || row.pricePerCase,
                                         quantityPacks: row.quantityPacks || 1,
@@ -1442,6 +2064,24 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                               )}
                             </td>
 
+                            {hasByWeightAllocation && (
+                              <td className="py-2.5 px-2 text-center">
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min={0}
+                                  value={row.weight || ''}
+                                  onChange={(e) =>
+                                    updateRow(row.id, {
+                                      weight: Math.max(0, parseFloat(e.target.value) || 0),
+                                    })
+                                  }
+                                  placeholder="0 kg"
+                                  className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-mono focus:outline-none focus:border-amber-500"
+                                />
+                              </td>
+                            )}
+
                             {/* 5. last cost */}
                             <td className="py-2.5 px-2 text-right font-mono text-slate-400">
                               ${(row.lastCost || 0).toFixed(2)}
@@ -1506,6 +2146,18 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                             {/* 8. unit cost */}
                             <td className="py-2.5 px-2 text-right font-mono text-slate-300">
                               ${calc.unitCost.toFixed(2)}
+                            </td>
+
+                            {/* 8b. Landed Cost Allocated (auto-computed) */}
+                            <td className="py-2.5 px-2 text-right font-mono text-xs text-amber-400 bg-slate-900/40">
+                              {(allocatedLandedCostMap.get(row.id)?.landedCostAllocated || 0) > 0
+                                ? `+$${(allocatedLandedCostMap.get(row.id)?.landedCostAllocated || 0).toFixed(2)}`
+                                : '$0.00'}
+                            </td>
+
+                            {/* 8c. Total Unit Cost (auto-computed) */}
+                            <td className="py-2.5 px-2 text-right font-mono font-bold text-xs text-emerald-400 bg-slate-900/60">
+                              ${(allocatedLandedCostMap.get(row.id)?.totalUnitCost || calc.unitCost).toFixed(2)}
                             </td>
 
                             {/* 9. Selling price (unit) */}
@@ -1579,14 +2231,33 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                           {voucherTotalPacks > 0 && ` + ${voucherTotalPacks} pk`}
                           {voucherTotalSingles > 0 && ` + ${voucherTotalSingles} un`}
                         </td>
+                        {hasByWeightAllocation && (
+                          <td className="py-3 px-2 text-center text-xs text-slate-400 font-mono">
+                            -
+                          </td>
+                        )}
                         <td colSpan={2} className="py-3 px-2 text-right uppercase text-xs text-slate-400">
-                          Total Invoice Value:
+                          Subtotal:
                         </td>
-                        <td className="py-3 px-3 text-right font-mono font-extrabold text-base text-emerald-400 bg-slate-950">
+                        <td className="py-3 px-3 text-right font-mono font-extrabold text-sm text-slate-200 bg-slate-950">
                           ${voucherGrandTotal.toFixed(2)}
                         </td>
-                        <td colSpan={4} className="py-3 px-3 text-slate-400 text-xs font-normal">
+                        <td className="py-3 px-2 text-right text-xs uppercase text-slate-400">
+                          Landed:
+                        </td>
+                        <td className="py-3 px-2 text-right font-mono text-xs font-bold text-amber-400 bg-slate-950">
+                          +${totalLandedCosts.toFixed(2)}
+                        </td>
+                        <td className="py-3 px-2 text-right font-mono font-extrabold text-sm text-emerald-400 bg-slate-950">
+                          ${totalInventoryValue.toFixed(2)}
+                        </td>
+                        <td colSpan={3} className="py-3 px-3 text-slate-400 text-xs font-normal">
                           Total Inward Units: <span className="font-mono font-bold text-white">{voucherTotalUnits} units</span>
+                          {totalLandedCosts > 0 && (
+                            <span className="ml-2 text-amber-300 font-bold font-mono">
+                              (Inventory Value: ${totalInventoryValue.toFixed(2)})
+                            </span>
+                          )}
                         </td>
                       </tr>
                     </tfoot>
@@ -1733,11 +2404,46 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
         )}
 
         {/* ========================================================================= */}
+        {/* TAB: PROCUREMENT TRIPS & FREIGHT MANIFESTS (MULTI-SUPPLIER TOWN RUN) */}
+        {/* ========================================================================= */}
+        {activeTab === 'trip_manifest' && (
+          <ProcurementTripManifestView
+            currentUser={currentUser}
+            onGoToGrnCreate={() => setActiveTab('create_invoice')}
+            onViewGrnDetail={(grnId) => {
+              const found = invoicesList.find(
+                (inv) => inv.voucherId === grnId || inv.invoiceNo === grnId
+              );
+              if (found) {
+                setViewingVoucher(found);
+              }
+            }}
+          />
+        )}
+
+        {/* ========================================================================= */}
         {/* TAB 3: DAILY GOODS RECEIVED ADMIN REPORT */}
         {/* ========================================================================= */}
         {activeTab === 'daily_report' && (
           <DailyGoodsReceivedReport
             onViewVoucher={setViewingVoucher}
+            onGoToGRN={() => setActiveTab('create_invoice')}
+          />
+        )}
+
+        {/* ========================================================================= */}
+        {/* TAB: LANDED COST ALLOCATION & AUDIT REPORT */}
+        {/* ========================================================================= */}
+        {activeTab === 'landed_cost_report' && (
+          <LandedCostReport
+            onViewVoucher={(voucherIdOrNo) => {
+              const found = invoicesList.find(
+                (inv) => inv.voucherId === voucherIdOrNo || inv.invoiceNo === voucherIdOrNo
+              );
+              if (found) {
+                setViewingVoucher(found);
+              }
+            }}
             onGoToGRN={() => setActiveTab('create_invoice')}
           />
         )}
@@ -1777,7 +2483,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                 </thead>
                 <tbody className="divide-y divide-slate-800">
                   {filteredLogs.map((log) => (
-                    <tr key={log.id} className="hover:bg-slate-800/50">
+                    <tr key={log.grnId || log.id || Math.random()} className="hover:bg-slate-800/50">
                       <td className="py-2.5 px-3 font-mono text-slate-400 text-[11px]">
                         {log.timestamp.slice(0, 16).replace('T', ' ')}
                       </td>
@@ -2070,6 +2776,108 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   </tbody>
                 </table>
               </div>
+
+              {/* Stage 3: Audit display on GRN detail for Landed Costs (Task 5) */}
+              {(() => {
+                const linkedGrn = getAllGoodsReceivedNotes().find(
+                  (g) =>
+                    g.id === viewingVoucher.voucherId ||
+                    g.grnNumber === viewingVoucher.invoiceNo ||
+                    g.payableId === viewingVoucher.invoiceNo
+                );
+
+                if (!linkedGrn || !linkedGrn.landedCosts || linkedGrn.landedCosts.length === 0) {
+                  return null;
+                }
+
+                const marginLandedCosts = linkedGrn.landedCosts.filter(
+                  (lc) => lc.allocationMethod === 'by_margin'
+                );
+
+                if (marginLandedCosts.length === 0) {
+                  return null;
+                }
+
+                return (
+                  <div className="space-y-4 pt-2">
+                    {marginLandedCosts.map((lc, lcIdx) => (
+                      <div
+                        key={lcIdx}
+                        className="p-4 rounded-xl bg-amber-50 border-2 border-amber-300 text-slate-800 shadow-sm print:bg-white print:border-slate-400"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2 mb-2 pb-2 border-b border-amber-200">
+                          <div className="flex items-center gap-2">
+                            <Sparkles className="w-4 h-4 text-amber-700" />
+                            <span className="font-bold text-sm text-amber-950">
+                              Allocation: By Margin Capacity (management override)
+                            </span>
+                          </div>
+                          <span className="text-xs font-mono font-bold text-amber-900 bg-amber-100 px-2.5 py-0.5 rounded border border-amber-300">
+                            ${Number(lc.amount).toFixed(2)} Freight / Landed Cost
+                          </span>
+                        </div>
+
+                        <div className="text-xs text-amber-950 mb-3 bg-white p-2.5 rounded-lg border border-amber-200">
+                          <span className="font-bold text-amber-900">Reason: </span>
+                          <span>{lc.allocationReason || 'Managerial margin override'}</span>
+                        </div>
+
+                        <div className="overflow-x-auto rounded-lg border border-amber-200 bg-white">
+                          <table className="w-full text-xs text-left border-collapse">
+                            <thead>
+                              <tr className="border-b border-amber-200 text-amber-950 font-bold bg-amber-100/70 text-[11px]">
+                                <th className="py-2 px-3">Item</th>
+                                <th className="py-2 px-3 text-right">Standard (By Value)</th>
+                                <th className="py-2 px-3 text-right">As Allocated</th>
+                                <th className="py-2 px-3 text-right">Difference</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-amber-100 font-mono text-[11px]">
+                              {linkedGrn.lineItems.map((li, liIdx) => {
+                                const std = lc.standardAllocation?.[li.itemId] ?? 0;
+                                const act = lc.allocatedAmount?.[li.itemId] ?? (li.landedCostAllocated ?? 0);
+                                const diff = Number((act - std).toFixed(2));
+
+                                return (
+                                  <tr key={liIdx} className="hover:bg-amber-50/50">
+                                    <td className="py-1.5 px-3 font-sans font-semibold text-slate-900">
+                                      {li.itemName}{' '}
+                                      <span className="text-[10px] text-slate-500 font-mono ml-1">
+                                        ({li.itemId})
+                                      </span>
+                                    </td>
+                                    <td className="py-1.5 px-3 text-right text-slate-700">
+                                      ${std.toFixed(2)}
+                                    </td>
+                                    <td className="py-1.5 px-3 text-right font-bold text-amber-950">
+                                      ${act.toFixed(2)}
+                                    </td>
+                                    <td
+                                      className={`py-1.5 px-3 text-right font-bold ${
+                                        diff > 0
+                                          ? 'text-rose-700'
+                                          : diff < 0
+                                          ? 'text-emerald-700'
+                                          : 'text-slate-500'
+                                      }`}
+                                    >
+                                      {diff > 0
+                                        ? `+$${diff.toFixed(2)}`
+                                        : diff < 0
+                                        ? `-$${Math.abs(diff).toFixed(2)}`
+                                        : '$0.00'}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
 
               {/* Signatures & Notes Block */}
               <div className="grid grid-cols-2 gap-8 pt-4 border-t border-slate-300 text-xs">
