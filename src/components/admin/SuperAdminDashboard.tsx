@@ -37,8 +37,10 @@ import {
   Link2,
   Eye,
   Package,
+  Server,
 } from 'lucide-react';
 import { PackageSetupView } from './PackageSetupView';
+import { BackendAdapterHub } from './BackendAdapterHub';
 import {
   getCompanies,
   saveCompany,
@@ -76,7 +78,7 @@ interface SuperAdminDashboardProps {
   currentUser?: Salesperson | null;
   onOpenSheetSetup?: () => void;
   onOpenReportBuilder?: () => void;
-  initialTab?: 'tenants' | 'packages' | 'sheets' | 'reports';
+  initialTab?: 'tenants' | 'packages' | 'sheets' | 'reports' | 'backends';
 }
 
 export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
@@ -91,7 +93,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
     currentUser?.role === 'SUPER_ADMIN' ||
     currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
 
-  const [adminTab, setAdminTab] = useState<'tenants' | 'packages' | 'sheets' | 'reports'>(initialTab);
+  const [adminTab, setAdminTab] = useState<'tenants' | 'packages' | 'sheets' | 'reports' | 'backends'>(initialTab);
   const [companies, setCompanies] = useState<Company[]>(() => getCompanies());
   const [branches, setBranches] = useState(() => getBranches());
   const [searchTerm, setSearchTerm] = useState('');
@@ -280,7 +282,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
           }
           if (sData && Array.isArray(sData.branches)) {
             sData.branches.forEach((sb: any) => {
-              if (sb && sb.branch_id) saveBranch(sb);
+              if (sb && (sb.branch_id || sb.branchId || sb.id)) saveBranch(sb, { fromSync: true });
             });
           }
         }
@@ -728,6 +730,24 @@ function setupMasterSheets() {
 
           <button
             type="button"
+            onClick={() => setAdminTab('backends')}
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer whitespace-nowrap ${
+              adminTab === 'backends'
+                ? 'bg-amber-500 text-slate-950 shadow-md shadow-amber-500/20'
+                : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Server className="w-3.5 h-3.5" />
+            <span>Backend Adapters &amp; Tiers</span>
+            <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-mono font-bold ${
+              adminTab === 'backends' ? 'bg-slate-950/30 text-slate-950' : 'bg-amber-500/20 text-amber-300'
+            }`}>
+              Phase A-D Enterprise
+            </span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => {
               if (onOpenReportBuilder) {
                 onClose();
@@ -986,6 +1006,13 @@ function setupMasterSheets() {
                   <span>Configure Report Access in Packages</span>
                 </button>
               </div>
+            </div>
+          )}
+
+          {/* BACKEND ADAPTERS & TIERS TAB */}
+          {adminTab === 'backends' && (
+            <div className="animate-fadeIn">
+              <BackendAdapterHub onShowToast={showToast} />
             </div>
           )}
 

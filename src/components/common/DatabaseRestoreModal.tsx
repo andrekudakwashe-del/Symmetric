@@ -260,8 +260,15 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
               <div className="p-4 bg-amber-950/40 border border-amber-500/50 rounded-2xl space-y-2">
                 <div className="flex items-center gap-2 text-amber-300 font-bold text-xs">
                   <ShieldCheck className="w-5 h-5 text-amber-400 shrink-0" />
-                  <span>Owner Master Data Update (Protected Mode)</span>
+                  <span>
+                    Owner Master Update (Clearance Level {manifest.clearanceLevel || 5}: {manifest.clearanceRole || 'OWNER'})
+                  </span>
                 </div>
+                {manifest.exportedBy && (
+                  <div className="text-[11px] text-amber-300 font-mono">
+                    Authorized Signer: <strong>{manifest.exportedBy}</strong>
+                  </div>
+                )}
                 <p className="text-xs text-amber-200/90 leading-relaxed">
                   🛡️ <strong>Safety Protection Active:</strong> This file contains master catalog items, retail prices, packaging variants, exchange rates, and permissions configured by the owner.
                 </p>

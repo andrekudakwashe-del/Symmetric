@@ -27,10 +27,14 @@ import {
   getCustomerCreditSummary,
   isSupervisorOrAbove,
   isBranchInLockdown,
+  getCurrentCompanyId,
   getCurrentBranchId,
   getCurrentBranch,
+  getTodayDateString,
 } from '../../db/roomDatabase';
+import { syncService } from '../../services/syncService';
 import { ManagerPinModal } from '../common/ManagerPinModal';
+import { loadPOSCartDraft, savePOSCartDraft, clearPOSCartDraft } from '../../utils/posCartStorage';
 import {
   ShoppingCart,
   Search,
@@ -90,24 +94,47 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
   activeGlobalTab,
   onLogout,
 }) => {
+  // Recover till cart draft immediately from multi-tier storage
+  const initialDraft = useMemo(() => loadPOSCartDraft(), []);
+
   // Navigation internal sub-view: 'home' | 'items' | 'counter' | 'more'
+  // If active products were in cart and cashier closed register by mistake or app rebooted, resume right where they left off!
   const [currentView, setCurrentView] = useState<'home' | 'items' | 'counter' | 'more'>(() => {
     if (activeGlobalTab === 'items') return 'items';
     if (activeGlobalTab === 'counter') return 'counter';
     if (activeGlobalTab === 'more') return 'more';
+    if (initialDraft && initialDraft.cart && initialDraft.cart.length > 0) {
+      return initialDraft.lastView === 'items' ? 'items' : 'counter';
+    }
     return initialView;
   });
 
   const [products, setProducts] = useState<Product[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
-  const [cart, setCart] = useState<CartItem[]>([]);
-  const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
+
+  // Recover till cart draft if app crashed or refreshed
+  const [cart, setCart] = useState<CartItem[]>(() => {
+    return initialDraft?.cart || [];
+  });
+  const [selectedCustomerId, setSelectedCustomerId] = useState<string>(() => {
+    return initialDraft?.selectedCustomerId || '';
+  });
   const [discountAmount, setDiscountAmount] = useState<number>(0);
-  const [discountType, setDiscountType] = useState<'fixed' | 'percent'>('fixed');
-  const [discountInput, setDiscountInput] = useState<string>('0');
-  const [taxAmount, setTaxAmount] = useState<number>(0);
-  const [otherCharges, setOtherCharges] = useState<number>(0);
-  const [saleNotes, setSaleNotes] = useState<string>('');
+  const [discountType, setDiscountType] = useState<'fixed' | 'percent'>(() => {
+    return initialDraft?.discountType || 'fixed';
+  });
+  const [discountInput, setDiscountInput] = useState<string>(() => {
+    return initialDraft?.discountInput || '0';
+  });
+  const [taxAmount, setTaxAmount] = useState<number>(() => {
+    return initialDraft?.taxAmount || 0;
+  });
+  const [otherCharges, setOtherCharges] = useState<number>(() => {
+    return initialDraft?.otherCharges || 0;
+  });
+  const [saleNotes, setSaleNotes] = useState<string>(() => {
+    return initialDraft?.saleNotes || '';
+  });
   const [statusToast, setStatusToast] = useState<string | null>(null);
 
   // Checkout modal states
@@ -170,15 +197,65 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     };
   }, []);
 
+  // Auto-save cart draft across multi-tier storage whenever cart or fields change
+  useEffect(() => {
+    if (cart.length > 0) {
+      savePOSCartDraft({
+        cart,
+        selectedCustomerId,
+        discountInput,
+        discountType,
+        taxAmount,
+        otherCharges,
+        saleNotes,
+        selectedCurrency,
+        lastView: currentView === 'items' ? 'items' : 'counter',
+      });
+    }
+  }, [cart, selectedCustomerId, discountInput, discountType, taxAmount, otherCharges, saleNotes, selectedCurrency, currentView]);
+
+  // Unload / Pagehide / Visibilitychange listeners to flush draft on sudden exit, app switch, or crash
+  useEffect(() => {
+    const handleFlushDraft = () => {
+      if (cart.length > 0) {
+        savePOSCartDraft({
+          cart,
+          selectedCustomerId,
+          discountInput,
+          discountType,
+          taxAmount,
+          otherCharges,
+          saleNotes,
+          selectedCurrency,
+          lastView: currentView === 'items' ? 'items' : 'counter',
+        });
+      }
+    };
+
+    window.addEventListener('beforeunload', handleFlushDraft);
+    window.addEventListener('pagehide', handleFlushDraft);
+    document.addEventListener('visibilitychange', handleFlushDraft);
+
+    return () => {
+      window.removeEventListener('beforeunload', handleFlushDraft);
+      window.removeEventListener('pagehide', handleFlushDraft);
+      document.removeEventListener('visibilitychange', handleFlushDraft);
+    };
+  }, [cart, selectedCustomerId, discountInput, discountType, taxAmount, otherCharges, saleNotes, selectedCurrency, currentView]);
+
   // Sync with external global activeTab changes
   useEffect(() => {
     if (activeGlobalTab === 'items') setCurrentView('items');
     else if (activeGlobalTab === 'counter') setCurrentView('counter');
     else if (activeGlobalTab === 'more') setCurrentView('more');
-    else if (activeGlobalTab === 'home' || activeGlobalTab === 'pos') {
-      // Keep existing sub-view or stay on home if cart is empty
+    else if (activeGlobalTab === 'pos' || activeGlobalTab === 'home') {
+      // If cashier returns to POS and has in-progress products, restore to their active view!
+      if (cart.length > 0) {
+        const draft = loadPOSCartDraft();
+        setCurrentView(draft?.lastView === 'items' ? 'items' : 'counter');
+      }
     }
-  }, [activeGlobalTab]);
+  }, [activeGlobalTab, cart.length]);
 
   // Pre-select customer if provided
   useEffect(() => {
@@ -414,6 +491,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     setSaleNotes('');
     setCashTendered('');
     setCreditDepositInput('0');
+    clearPOSCartDraft();
     showToast('Counter cleared');
   };
 
@@ -429,6 +507,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       notes: saleNotes,
     });
     setCart([]);
+    clearPOSCartDraft();
     showToast('Sale parked in Pending Sales');
     setCurrentView('home');
   };
@@ -456,10 +535,12 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     setShowCustomerPickerInCheckout(false);
 
     setSelectedCurrency(curr);
-    if (curr === 'ZiG') {
+    if (curr === 'ZiG' || curr === 'ZIG') {
       setPaymentMethod('ZiG');
-    } else if (curr === 'EcoCash') {
+      setSelectedCurrency('ZiG');
+    } else if (curr === 'EcoCash' || curr === 'ECO' || curr === 'ECOCASH') {
       setPaymentMethod('EcoCash');
+      setSelectedCurrency('EcoCash');
     } else if (curr === 'USD') {
       setPaymentMethod('Cash');
     } else {
@@ -655,6 +736,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     const saleItems: SaleItem[] = cart.map((item) => {
       const unitPrice =
         item.customPrice !== undefined ? item.customPrice : item.product.price;
+      const prodCost = item.product.costPrice !== undefined ? item.product.costPrice : undefined;
       return {
         id: item.product.id,
         name: item.product.name,
@@ -663,6 +745,12 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
         quantity: item.quantity,
         unitPrice,
         total: unitPrice * item.quantity,
+        costPrice: prodCost,
+        costPerUnitAverage: prodCost,
+        costPerUnitLatest: prodCost,
+        unitsPerPack: item.product.unitsPerPack,
+        unitsPerCase: item.product.unitsPerCase,
+        variantId: item.product.variantId,
       };
     });
 
@@ -675,7 +763,24 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
 
     const customerName = activeCustomer ? activeCustomer.name : 'Walk-in Customer';
     const customerId = activeCustomer ? activeCustomer.customerId : 'C_WALKIN';
-    const today = new Date().toISOString().split('T')[0];
+    const today = getTodayDateString();
+
+    const isEco = paymentMethod === 'EcoCash' || paymentMethod === 'EcoCash/Mobile' || selectedCurrency === 'EcoCash';
+    const isZig = paymentMethod === 'ZiG' || selectedCurrency === 'ZiG';
+    const effectiveCur = isEco ? 'EcoCash' : isZig ? 'ZiG' : (selectedCurrency !== 'USD' ? selectedCurrency : undefined);
+    const multiRates = multiConfig.rates || {};
+    const effectiveRate =
+      currentRate > 0 && selectedCurrency !== 'USD'
+        ? currentRate
+        : isEco
+        ? (multiRates['EcoCash']?.rateToUsd || multiRates['EcoCash']?.rateToBase || 1.05)
+        : isZig
+        ? (multiRates['ZiG']?.rateToUsd || multiRates['ZiG']?.rateToBase || 26.5)
+        : (currentRate || 1);
+
+    const effectiveTotalInCur = effectiveCur ? cartTotal * effectiveRate : undefined;
+    const effectiveWithdrawalInCur = effectiveCur && parsedCashWithdrawal > 0 ? parsedCashWithdrawal * effectiveRate : undefined;
+    const effectiveTotalChargedInCur = effectiveCur ? (cartTotal + parsedCashWithdrawal) * effectiveRate : undefined;
 
     const newSale = addSale({
       timestamp: new Date().toISOString(),
@@ -688,21 +793,12 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       discount: calculatedDiscount,
       tax: taxAmount,
       total: cartTotal,
-      currency: selectedCurrency !== 'USD' ? selectedCurrency : undefined,
-      exchangeRate: selectedCurrency !== 'USD' ? currentRate : undefined,
-      totalInCurrency: selectedCurrency !== 'USD' ? cartTotal * currentRate : undefined,
-      cashWithdrawalAmount:
-        selectedCurrency !== 'USD' && parsedCashWithdrawal > 0
-          ? parsedCashWithdrawal
-          : undefined,
-      cashWithdrawalInCurrency:
-        selectedCurrency !== 'USD' && parsedCashWithdrawal > 0
-          ? parsedCashWithdrawal * currentRate
-          : undefined,
-      totalChargedInCurrency:
-        selectedCurrency !== 'USD'
-          ? (cartTotal + parsedCashWithdrawal) * currentRate
-          : undefined,
+      currency: effectiveCur,
+      exchangeRate: effectiveCur ? effectiveRate : undefined,
+      totalInCurrency: effectiveTotalInCur,
+      cashWithdrawalAmount: parsedCashWithdrawal > 0 ? parsedCashWithdrawal : undefined,
+      cashWithdrawalInCurrency: effectiveWithdrawalInCur,
+      totalChargedInCurrency: effectiveTotalChargedInCur,
       grossTenderUsd:
         parsedCashWithdrawal > 0
           ? cartTotal + parsedCashWithdrawal
@@ -734,9 +830,11 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       creditBalanceOwed: paymentMethod === 'Credit' ? creditBalanceOwed : undefined,
       staffId: currentUser?.id || '001',
       staffName: currentUser?.name || 'Cashier',
-      branchId: currentUser?.branchId || currentUser?.branch_id || getCurrentBranchId(),
-      branch_id: currentUser?.branchId || currentUser?.branch_id || getCurrentBranchId(),
-      branchName: currentUser?.branchName || getCurrentBranch().name,
+      companyId: getCurrentCompanyId() || currentUser?.companyId || currentUser?.company_id || 'COMP-001',
+      company_id: getCurrentCompanyId() || currentUser?.companyId || currentUser?.company_id || 'COMP-001',
+      branchId: getCurrentBranchId() || currentUser?.branchId || currentUser?.branch_id || 'BR-MAIN',
+      branch_id: getCurrentBranchId() || currentUser?.branchId || currentUser?.branch_id || 'BR-MAIN',
+      branchName: getCurrentBranch()?.name || currentUser?.branchName || 'Main Branch',
       notes: saleNotes,
       status: 'Completed',
     });
@@ -748,12 +846,16 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     setOpenCashWithdrawal(false);
     setCompletedInvoice(newSale);
     setCart([]);
+    clearPOSCartDraft();
     setDiscountInput('0');
     setTaxAmount(0);
     setOtherCharges(0);
     setSaleNotes('');
     setLockdownAuthorizedBy(null);
     loadData();
+
+    // Dispatch via offline local mesh to Host Till immediately
+    syncService.dispatchSale(newSale).catch(() => {});
   };
 
   return (
@@ -788,7 +890,14 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
         <POSHomeView
           currentUser={currentUser}
           onNavigateTab={onNavigate}
-          onStartNewSale={() => setCurrentView('items')}
+          onStartNewSale={() => {
+            if (cart.length > 0) setCurrentView('counter');
+            else setCurrentView('items');
+          }}
+          onResumeSale={() => setCurrentView('counter')}
+          cartItemCount={cart.reduce((sum, it) => sum + (Number(it.quantity) || 1), 0)}
+          cartTotal={cartTotal}
+          onClearCart={clearCart}
           onRestoreParkedSale={handleRestoreParkedSale}
           onOpenCustomerModal={() => setShowSearchCustomerModal(true)}
           onOpenCurrencySelector={() => setShowCurrencyPickerModal(true)}
@@ -1018,8 +1127,12 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
                         key={curr.code}
                         type="button"
                         onClick={() => {
-                          setPaymentMethod(curr.code as PaymentMethod);
-                          setSelectedCurrency(curr.code as AppCurrency);
+                          const isEco = curr.currency === 'EcoCash' || curr.code === 'ECO' || curr.code === 'ECOCASH';
+                          const isZig = curr.currency === 'ZiG' || curr.code === 'ZIG' || curr.code === 'ZiG';
+                          const method = isEco ? 'EcoCash' : isZig ? 'ZiG' : (curr.code as PaymentMethod);
+                          const selCurr = isEco ? 'EcoCash' : isZig ? 'ZiG' : (curr.code as AppCurrency);
+                          setPaymentMethod(method);
+                          setSelectedCurrency(selCurr);
                         }}
                         className={`flex-1 min-w-[75px] p-2.5 rounded-xl border text-center transition flex flex-col items-center justify-center space-y-1 ${
                           isSelected

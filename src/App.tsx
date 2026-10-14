@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Suspense, lazy } from 'react';
 import { Salesperson, ActiveTab, Customer } from './types';
 import {
   getCurrentUser,
@@ -32,32 +32,14 @@ import { CustomerListScreen } from './components/customers/CustomerListScreen';
 import { CustomerChangeReport } from './components/reports/CustomerChangeReport';
 import { CustomerCreditReport } from './components/reports/CustomerCreditReport';
 import { SalesReport } from './components/reports/SalesReport';
-import { AuditLogView } from './components/admin/AuditLogView';
-import { GoogleSheetsSyncModal } from './components/sheets/GoogleSheetsSyncModal';
-import { SalespersonManagementModal } from './components/admin/SalespersonManagementModal';
 import { StaffAccessManagementScreen } from './components/admin/StaffAccessManagementScreen';
 import { DirectGoodsReceivedView } from './components/inventory/DirectGoodsReceivedView';
 import { InventoryMasterView } from './components/inventory/InventoryMasterView';
-import { GoodsReceivedView } from './components/inventory/GoodsReceivedView';
-import { StockMovementView } from './components/inventory/StockMovementView';
-import { BatchTrackingView } from './components/inventory/BatchTrackingView';
-import { InventorySetupView } from './components/inventory/InventorySetupView';
-import { StocktakeHubScreen } from './components/stocktake/StocktakeHubScreen';
+import { BluetoothPrinterModal } from './components/common/BluetoothPrinterModal';
+import { getActiveCartItemCount, subscribeToPOSCart } from './utils/posCartStorage';
 import { historyNavigationService } from './services/historyNavigationService';
-import { SupplierListScreen } from './components/suppliers/SupplierListScreen';
-import { DailyGoodsReceivedReport } from './components/inventory/DailyGoodsReceivedReport';
-import { DataManagementHub } from './components/admin/DataManagementHub';
 import { OfflineIndicator } from './components/pwa/OfflineIndicator';
 import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
-import { UniversalReportBuilder } from './components/reports/UniversalReportBuilder';
-import { CustomReportsListView } from './components/reports/CustomReportsListView';
-import { P2PMeshSyncHub } from './components/sync/P2PMeshSyncHub';
-import { PermissionsMatrixModal } from './components/admin/PermissionsMatrixModal';
-import { SuperAdminDashboard } from './components/admin/SuperAdminDashboard';
-import { TenantDiagnosticsModal } from './components/admin/TenantDiagnosticsModal';
-import { BranchSetupScreen } from './components/admin/BranchSetupScreen';
-import { SyncDiagnosticsModal } from './components/sync/SyncDiagnosticsModal';
-import { BluetoothPrinterModal } from './components/common/BluetoothPrinterModal';
 import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield } from 'lucide-react';
 import { initializeSystemConfigAndSync } from './services/systemConfig';
 import { persistentSyncEngine } from './services/persistentSyncEngine';
@@ -67,16 +49,52 @@ import {
   isModuleAllowedForUser,
   getUserPrimaryModules,
 } from './services/roleNavigationService';
+import { prefetchAppModules } from './services/modulePrefetcher';
+
+// Lazy-loaded secondary admin & heavy setup modules (prefetched automatically in background)
+const AuditLogView = lazy(() => import('./components/admin/AuditLogView').then(m => ({ default: m.AuditLogView })));
+const GoogleSheetsSyncModal = lazy(() => import('./components/sheets/GoogleSheetsSyncModal').then(m => ({ default: m.GoogleSheetsSyncModal })));
+const SalespersonManagementModal = lazy(() => import('./components/admin/SalespersonManagementModal').then(m => ({ default: m.SalespersonManagementModal })));
+const GoodsReceivedView = lazy(() => import('./components/inventory/GoodsReceivedView').then(m => ({ default: m.GoodsReceivedView })));
+const StockMovementView = lazy(() => import('./components/inventory/StockMovementView').then(m => ({ default: m.StockMovementView })));
+const BatchTrackingView = lazy(() => import('./components/inventory/BatchTrackingView').then(m => ({ default: m.BatchTrackingView })));
+const ProcurementReorderHub = lazy(() => import('./components/inventory/ProcurementReorderHub').then(m => ({ default: m.ProcurementReorderHub })));
+const InventorySetupView = lazy(() => import('./components/inventory/InventorySetupView').then(m => ({ default: m.InventorySetupView })));
+const StocktakeHubScreen = lazy(() => import('./components/stocktake/StocktakeHubScreen').then(m => ({ default: m.StocktakeHubScreen })));
+const SupplierListScreen = lazy(() => import('./components/suppliers/SupplierListScreen').then(m => ({ default: m.SupplierListScreen })));
+const DailyGoodsReceivedReport = lazy(() => import('./components/inventory/DailyGoodsReceivedReport').then(m => ({ default: m.DailyGoodsReceivedReport })));
+const DataManagementHub = lazy(() => import('./components/admin/DataManagementHub').then(m => ({ default: m.DataManagementHub })));
+const UniversalReportBuilder = lazy(() => import('./components/reports/UniversalReportBuilder').then(m => ({ default: m.UniversalReportBuilder })));
+const CustomReportsListView = lazy(() => import('./components/reports/CustomReportsListView').then(m => ({ default: m.CustomReportsListView })));
+const P2PMeshSyncHub = lazy(() => import('./components/sync/P2PMeshSyncHub').then(m => ({ default: m.P2PMeshSyncHub })));
+const PermissionsMatrixModal = lazy(() => import('./components/admin/PermissionsMatrixModal').then(m => ({ default: m.PermissionsMatrixModal })));
+const SuperAdminDashboard = lazy(() => import('./components/admin/SuperAdminDashboard').then(m => ({ default: m.SuperAdminDashboard })));
+const TenantDiagnosticsModal = lazy(() => import('./components/admin/TenantDiagnosticsModal').then(m => ({ default: m.TenantDiagnosticsModal })));
+const BranchSetupScreen = lazy(() => import('./components/admin/BranchSetupScreen').then(m => ({ default: m.BranchSetupScreen })));
+const SyncDiagnosticsModal = lazy(() => import('./components/sync/SyncDiagnosticsModal').then(m => ({ default: m.SyncDiagnosticsModal })));
+const IncomeStatement = lazy(() => import('./reports/IncomeStatement').then(m => ({ default: m.IncomeStatement })));
+const FixedCosts = lazy(() => import('./pages/Settings/FixedCosts').then(m => ({ default: m.FixedCosts })));
+
+const ViewLoadingFallback = () => (
+  <div className="flex flex-col items-center justify-center p-8 min-h-[220px] space-y-2.5">
+    <div className="w-7 h-7 border-2 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin" />
+    <span className="text-[11px] font-bold text-slate-400">Opening view...</span>
+  </div>
+);
 
 const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes inactivity timeout
 
 export default function App() {
-  // Login: Required on app open
+  // Session User restored on boot so browser refresh never logs the user out or drops state
   const [currentUser, setLoggedInUser] = useState<Salesperson | null>(() => {
     initializeRoomDatabase();
-    return null;
+    return getSessionUser();
   });
-  const [activeTab, setActiveTab] = useState<ActiveTab>('home');
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() => {
+    const saved = getSessionUser();
+    if (saved) return getLandingTabForUser(saved);
+    return 'home';
+  });
   const [dbVersion, setDbVersion] = useState(0);
   const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
   const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
@@ -98,6 +116,15 @@ export default function App() {
   // Cross-form navigation state (e.g. from Customer directory -> create sale for customer)
   const [salePreselectedCustomer, setSalePreselectedCustomer] = useState<Customer | string | null>(null);
   const [targetDirectGrvId, setTargetDirectGrvId] = useState<string | null>(null);
+
+  // Active in-progress POS register draft items count
+  const [cartCount, setCartCount] = useState<number>(() => getActiveCartItemCount());
+
+  useEffect(() => {
+    return subscribeToPOSCart((count) => {
+      setCartCount(count);
+    });
+  }, []);
 
   // Navigation & Android Phone Hardware Back Button Handler
   const [toastNotification, setToastNotification] = useState<string | null>(null);
@@ -223,9 +250,14 @@ export default function App() {
 
     lastActivityRef.current = Date.now();
 
+    let lastThrottledTime = 0;
     const handleUserActivity = () => {
-      lastActivityRef.current = Date.now();
-      setWarningSeconds(null);
+      const now = Date.now();
+      lastActivityRef.current = now;
+      if (now - lastThrottledTime > 1000) {
+        lastThrottledTime = now;
+        setWarningSeconds((prev) => (prev !== null ? null : prev));
+      }
     };
 
     const events = ['mousemove', 'mousedown', 'keydown', 'touchstart', 'scroll', 'click'];
@@ -283,6 +315,7 @@ export default function App() {
 
   // Sync global system config, tenants, and persistent sync engine on boot
   useEffect(() => {
+    prefetchAppModules();
     initializeSystemConfigAndSync().catch(() => {});
     persistentSyncEngine.initialize().catch((err) => console.warn('[App] Sync engine init error:', err));
 
@@ -517,7 +550,7 @@ export default function App() {
             </button>
           </div>
         ) : (
-          <>
+          <Suspense fallback={<ViewLoadingFallback />}>
             {/* POS REGISTER WORKFLOW (Screens 1, 2, 3) */}
         {(activeTab === 'home' ||
           activeTab === 'pos' ||
@@ -632,6 +665,31 @@ export default function App() {
                 </div>
                 <p className="text-xs text-slate-300">
                   Inspect active peer connections, NSD auto-discovery, epidemic broadcast hops, packet delivery acknowledgments, and opportunistic Google Sheets cloud sync.
+                </p>
+              </div>
+
+              {/* Income Statement / True Profit & Loss Card */}
+              <div
+                id="card-reports-income-statement"
+                onClick={() => setActiveTab('income_statement')}
+                className="bg-gradient-to-br from-emerald-950/80 via-slate-900 to-slate-900 border-2 border-emerald-500/60 hover:border-emerald-400 rounded-3xl p-5 cursor-pointer transition active:scale-[0.99] space-y-2 group shadow-xl md:col-span-2 relative overflow-hidden"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-base font-black text-white group-hover:text-emerald-300 flex items-center gap-2">
+                    <span className="text-emerald-400 text-lg">📊</span>
+                    <span>Income Statement / True Profit &amp; Loss (P&amp;L)</span>
+                  </span>
+                  <div className="flex items-center space-x-2">
+                    <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-bold font-mono border border-emerald-500/30">
+                      Prorated Fixed Costs
+                    </span>
+                    <span className="px-2.5 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-xs font-bold font-mono">
+                      Accrual &amp; Cash
+                    </span>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-300">
+                  Calculates true net profit after Revenue, COGS, variable expenses, internal consumption, and monthly fixed overheads (Rent, Salaries, Internet) prorated to daily rates.
                 </p>
               </div>
 
@@ -803,6 +861,24 @@ export default function App() {
           />
         )}
 
+        {/* INCOME STATEMENT / TRUE PROFIT REPORT (WITH PRORATED FIXED COSTS) */}
+        {activeTab === 'income_statement' && (
+          <IncomeStatement
+            currentUser={currentUser}
+            onNavigateToFixedCosts={() => setActiveTab('fixed_costs')}
+            onNavigateToWhereIsMyMoney={() => setActiveTab('cash_balancing')}
+          />
+        )}
+
+        {/* MONTHLY FIXED COSTS (RENT, SALARIES, TELONE/INTERNET) SETTINGS */}
+        {activeTab === 'fixed_costs' && (
+          <FixedCosts
+            currentUser={currentUser}
+            onBack={() => setActiveTab('reports')}
+            onNavigateToIncomeStatement={() => setActiveTab('income_statement')}
+          />
+        )}
+
         {activeTab === 'reconciliation' && (
           <CashBalancingModule
             currentUser={currentUser}
@@ -902,6 +978,9 @@ export default function App() {
             </div>
             <DirectGoodsReceivedView
               currentUser={currentUser}
+              onGoToMaster={() => handleNavigateTab('inventory')}
+              onGoToHome={() => handleNavigateTab('home')}
+              onOpenReorderHub={() => handleNavigateTab('procurement_reorder')}
               preselectedGrvId={targetDirectGrvId}
               onClearPreselectedGrv={() => setTargetDirectGrvId(null)}
             />
@@ -914,7 +993,19 @@ export default function App() {
             currentUser={currentUser}
             onTriggerGRN={() => handleNavigateTab('goods_received')}
             onOpenGRN={() => handleNavigateTab('goods_received')}
+            onOpenReorderHub={() => handleNavigateTab('procurement_reorder')}
           />
+        )}
+
+        {/* PROCUREMENT & REORDER PLANNING HUB */}
+        {(activeTab === 'procurement_reorder' || activeTab === 'reorder_hub') && (
+          <Suspense fallback={<ViewLoadingFallback />}>
+            <ProcurementReorderHub
+              currentUser={currentUser}
+              onNavigateToDirectGrv={() => handleNavigateTab('direct_grv')}
+              onGoToMaster={() => handleNavigateTab('inventory')}
+            />
+          </Suspense>
         )}
 
         {/* GOODS RECEIVED NOTES (GRN) - Standalone module guarded by role */}
@@ -948,6 +1039,7 @@ export default function App() {
           <BatchTrackingView
             currentUser={currentUser}
             onOpenGRN={() => handleNavigateTab('goods_received')}
+            onOpenReorderHub={() => handleNavigateTab('procurement_reorder')}
           />
         )}
 
@@ -1140,7 +1232,7 @@ export default function App() {
         {(activeTab === 'p2p_mesh' || activeTab === 'connectivity') && (
           <P2PMeshSyncHub onBack={() => setActiveTab('home')} />
         )}
-          </>
+          </Suspense>
         )}
       </main>
 
@@ -1149,6 +1241,7 @@ export default function App() {
         activeTab={activeTab}
         currentUser={currentUser}
         pendingSyncCount={pendingCount}
+        cartCount={cartCount}
         onOpenMenu={() => setIsHamburgerOpen(true)}
         onTabChange={(tab) => {
           if (tab !== 'pos' && tab !== 'items' && tab !== 'counter' && tab !== 'sales') {
@@ -1175,68 +1268,71 @@ export default function App() {
         onOpenSuperAdmin={isSuperAdmin ? () => setIsSuperAdminModalOpen(true) : undefined}
       />
 
-      {/* 4. Google Sheets Sync Modal */}
-      {isSyncModalOpen && (
-        <GoogleSheetsSyncModal
-          isOpen={isSyncModalOpen}
-          onClose={() => setIsSyncModalOpen(false)}
-          onSyncCompleted={() => setDbVersion((v) => v + 1)}
-        />
-      )}
+      {/* Lazy-loaded Admin and Auxiliary Modals */}
+      <Suspense fallback={null}>
+        {/* 4. Google Sheets Sync Modal */}
+        {isSyncModalOpen && (
+          <GoogleSheetsSyncModal
+            isOpen={isSyncModalOpen}
+            onClose={() => setIsSyncModalOpen(false)}
+            onSyncCompleted={() => setDbVersion((v) => v + 1)}
+          />
+        )}
 
-      {/* 5. Admin Salesperson Management Modal */}
-      {isAdminModalOpen && (
-        <SalespersonManagementModal
-          isOpen={isAdminModalOpen}
-          onClose={() => setIsAdminModalOpen(false)}
-          currentUser={currentUser}
-        />
-      )}
+        {/* 5. Admin Salesperson Management Modal */}
+        {isAdminModalOpen && (
+          <SalespersonManagementModal
+            isOpen={isAdminModalOpen}
+            onClose={() => setIsAdminModalOpen(false)}
+            currentUser={currentUser}
+          />
+        )}
 
-      {/* 6. 52 Granular Permissions Matrix Modal (RBAC) */}
-      {isPermissionsModalOpen && (
-        <PermissionsMatrixModal
-          isOpen={isPermissionsModalOpen}
-          onClose={() => setIsPermissionsModalOpen(false)}
-        />
-      )}
+        {/* 6. 52 Granular Permissions Matrix Modal (RBAC) */}
+        {isPermissionsModalOpen && (
+          <PermissionsMatrixModal
+            isOpen={isPermissionsModalOpen}
+            onClose={() => setIsPermissionsModalOpen(false)}
+          />
+        )}
 
-      {/* 7. SaaS Multi-Tenant Management Dashboard */}
-      {isSuperAdmin && isSuperAdminModalOpen && (
-        <SuperAdminDashboard
-          isOpen={isSuperAdminModalOpen}
-          currentUser={currentUser}
-          onClose={() => setIsSuperAdminModalOpen(false)}
-          onOpenSheetSetup={() => setIsSyncModalOpen(true)}
-          onOpenReportBuilder={() => setActiveTab('custom_reports')}
-        />
-      )}
+        {/* 7. SaaS Multi-Tenant Management Dashboard */}
+        {isSuperAdmin && isSuperAdminModalOpen && (
+          <SuperAdminDashboard
+            isOpen={isSuperAdminModalOpen}
+            currentUser={currentUser}
+            onClose={() => setIsSuperAdminModalOpen(false)}
+            onOpenSheetSetup={() => setIsSyncModalOpen(true)}
+            onOpenReportBuilder={() => setActiveTab('custom_reports')}
+          />
+        )}
 
-      {/* 8. Stage 2 Persistent Sync Engine Diagnostics & Queue Modal */}
-      {isDiagnosticsModalOpen && (
-        <SyncDiagnosticsModal
-          isOpen={isDiagnosticsModalOpen}
-          onClose={() => setIsDiagnosticsModalOpen(false)}
-          currentUser={currentUser}
-        />
-      )}
+        {/* 8. Stage 2 Persistent Sync Engine Diagnostics & Queue Modal */}
+        {isDiagnosticsModalOpen && (
+          <SyncDiagnosticsModal
+            isOpen={isDiagnosticsModalOpen}
+            onClose={() => setIsDiagnosticsModalOpen(false)}
+            currentUser={currentUser}
+          />
+        )}
 
-      {/* 9. Stage 3 Tenant Diagnostics & Health Modal */}
-      {isTenantDiagnosticsModalOpen && (
-        <TenantDiagnosticsModal
-          isOpen={isTenantDiagnosticsModalOpen}
-          onClose={() => setIsTenantDiagnosticsModalOpen(false)}
-          onShowToast={(msg) => setTenantAlert({ type: 'info', message: msg })}
-        />
-      )}
+        {/* 9. Stage 3 Tenant Diagnostics & Health Modal */}
+        {isTenantDiagnosticsModalOpen && (
+          <TenantDiagnosticsModal
+            isOpen={isTenantDiagnosticsModalOpen}
+            onClose={() => setIsTenantDiagnosticsModalOpen(false)}
+            onShowToast={(msg) => setTenantAlert({ type: 'info', message: msg })}
+          />
+        )}
 
-      {/* 10. Thermal Receipt Printer Setup Modal */}
-      {isPrinterModalOpen && (
-        <BluetoothPrinterModal
-          isOpen={isPrinterModalOpen}
-          onClose={() => setIsPrinterModalOpen(false)}
-        />
-      )}
+        {/* 10. Thermal Receipt Printer Setup Modal */}
+        {isPrinterModalOpen && (
+          <BluetoothPrinterModal
+            isOpen={isPrinterModalOpen}
+            onClose={() => setIsPrinterModalOpen(false)}
+          />
+        )}
+      </Suspense>
 
       {/* 11. PWA Offline Status Banner */}
       <OfflineIndicator isSimulatedOffline={isOfflineMode} />

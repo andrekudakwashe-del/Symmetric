@@ -1,0 +1,14 @@
+export * from './types';
+export * from './adapterRegistry';
+export * from './migrationFoundation';
+export * from './migrationEngine';
+export * from './retentionService';
+export * from './runtimeSyncDispatcher';
+export * from './backendAuthService';
+export * from './circuitBreakerFailover';
+export * from './driftDetectionService';
+export * from './disasterRecoveryService';
+export { roomBackendAdapter } from './adapters/RoomAdapter';
+export { sheetsAppScriptAdapter } from './adapters/SheetsAppScriptAdapter';
+export { firebaseBackendAdapter } from './adapters/FirebaseAdapter';
+export { supabaseBackendAdapter } from './adapters/SupabaseAdapter';

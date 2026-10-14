@@ -23,7 +23,10 @@ import {
   getStaffBranchAssignments,
   isStaffAssignedToBranch,
   getStaffRoleInBranch,
+  getCurrentCompany,
 } from '../../db/roomDatabase';
+import { checkStaffLimit } from '../../services/packageService';
+import { PackageLimitModal } from '../common/PackageLimitModal';
 import {
   Users,
   UserPlus,
@@ -245,6 +248,19 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
   const [activeEditorTab, setActiveEditorTab] = useState<'profile' | 'permissions'>('profile');
   const [isRefreshing, setIsRefreshing] = useState(false);
 
+  // Package Limit Modal state
+  const [limitModalState, setLimitModalState] = useState<{
+    isOpen: boolean;
+    currentCount: number;
+    maxLimit: number;
+    packageName: string;
+  }>({
+    isOpen: false,
+    currentCount: 0,
+    maxLimit: 2,
+    packageName: 'Starter POS',
+  });
+
   // Form State
   const [formName, setFormName] = useState('');
   const [formEmail, setFormEmail] = useState('');
@@ -290,6 +306,17 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
   });
 
   const handleOpenAdd = () => {
+    const check = checkStaffLimit(getCurrentCompanyId());
+    if (!check.allowed) {
+      setLimitModalState({
+        isOpen: true,
+        currentCount: check.currentStaff,
+        maxLimit: check.maxStaff,
+        packageName: check.packageName,
+      });
+      return;
+    }
+
     setEditingStaff(null);
     setFormName('');
     setFormEmail('');
@@ -368,8 +395,8 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
       setFormError('Please provide the staff member full name.');
       return;
     }
-    if (!/^\d{4}$/.test(formPin)) {
-      setFormError('PIN must be exactly 4 numeric digits (e.g. 1234).');
+    if (!/^\d{6}$/.test(formPin) && !/^\d{4}$/.test(formPin)) {
+      setFormError('PIN must be 6 numeric digits (e.g. 123456).');
       return;
     }
 
@@ -442,6 +469,18 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           setEditingStaff(null);
         }, 800);
       } else {
+        const check = checkStaffLimit(getCurrentCompanyId());
+        if (!check.allowed) {
+          setLimitModalState({
+            isOpen: true,
+            currentCount: check.currentStaff,
+            maxLimit: check.maxStaff,
+            packageName: check.packageName,
+          });
+          setFormError(`Package limit reached: Your ${check.packageName} plan allows max ${check.maxStaff} staff member(s).`);
+          return;
+        }
+
         const newId = getNextSalespersonId();
         addSalesperson({
           id: newId,
@@ -714,7 +753,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
                 </span>
               </div>
               <p className="text-xs text-purple-100/80">
-                Staff directory, 4-digit PINs, roles & granular multi-tenant access governance
+                Staff directory, 6-digit PINs, roles & granular multi-tenant access governance
               </p>
             </div>
           </div>
@@ -855,7 +894,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
                       )}
                     </div>
                     <div className="flex items-center space-x-2 mt-0.5 text-xs text-slate-500 font-medium">
-                      <span>PIN: •••• ({staff.pin})</span>
+                      <span>PIN: •••••• ({staff.pin})</span>
                       {staff.phone && <span>• {staff.phone}</span>}
                     </div>
 
@@ -1098,15 +1137,15 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
 
                   <div>
                     <label className="block text-xs font-bold text-slate-700 mb-1">
-                      4-Digit PIN <span className="text-rose-500">*</span>
+                      6-Digit PIN <span className="text-rose-500">*</span>
                     </label>
                     <input
                       type="password"
-                      maxLength={4}
+                      maxLength={6}
                       required
                       value={formPin}
-                      onChange={(e) => setFormPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                      placeholder="e.g. 1234"
+                      onChange={(e) => setFormPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      placeholder="e.g. 123456"
                       className="w-full bg-slate-50 border border-slate-300 rounded-xl py-2.5 px-3 text-center text-base font-mono-num font-black text-slate-950 focus:outline-none focus:border-blue-600 focus:bg-white"
                     />
                   </div>
@@ -1444,6 +1483,23 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           </div>
         </div>
       )}
+
+      {/* Package Limit Enforcement Modal */}
+      <PackageLimitModal
+        isOpen={limitModalState.isOpen}
+        onClose={() => setLimitModalState((prev) => ({ ...prev, isOpen: false }))}
+        type="STAFF"
+        currentCount={limitModalState.currentCount}
+        maxLimit={limitModalState.maxLimit}
+        packageName={limitModalState.packageName}
+        companyName={getCurrentCompany()?.company_name}
+        onUpgrade={() => {
+          setLimitModalState((prev) => ({ ...prev, isOpen: false }));
+          if (onNavigateTab) {
+            onNavigateTab('SuperAdminDashboard');
+          }
+        }}
+      />
     </div>
   );
 };

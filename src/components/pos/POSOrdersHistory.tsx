@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { SaleInvoice, ActiveTab, PaymentMethod, Salesperson } from '../../types';
-import { getSales, refundSaleInvoice, voidSaleInvoice } from '../../db/roomDatabase';
+import { getSales, getAllSales, getAllBranchesSales, refundSaleInvoice, voidSaleInvoice, editSaleInvoice, isSupervisorOrAbove, subscribeToDatabase, getTodayDateString, getCurrentBranch } from '../../db/roomDatabase';
 import {
   Receipt,
   Search,
@@ -23,9 +23,13 @@ import {
   Clock,
   ArrowDown,
   X,
+  Pencil,
+  Building2,
+  Layers,
 } from 'lucide-react';
 import { ReceiptModal } from '../common/ReceiptModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
+import { EditReceiptModal } from './EditReceiptModal';
 
 interface POSOrdersHistoryProps {
   currentUser?: Salesperson | null;
@@ -46,6 +50,8 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
   const [statusFilter, setStatusFilter] = useState<string>('All');
   const [selectedInvoice, setSelectedInvoice] = useState<SaleInvoice | null>(null);
   const [actionNotice, setActionNotice] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [editingInvoice, setEditingInvoice] = useState<SaleInvoice | null>(null);
+  const [authorizedEditor, setAuthorizedEditor] = useState<Salesperson | null>(null);
 
   // Pagination: number of receipts visible on page
   const PAGE_SIZE = 10;
@@ -75,91 +81,84 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
   const [startDateInput, setStartDateInput] = useState<string>(defaultOlder.start);
   const [endDateInput, setEndDateInput] = useState<string>(defaultOlder.end);
 
-  // Security Manager PIN modal state for Refund / Void
+  // Security Manager PIN modal state for Refund / Void / Edit Approval
   const [managerModalConfig, setManagerModalConfig] = useState<{
     isOpen: boolean;
     title: string;
     subtitle: string;
-    actionType: 'REFUND' | 'VOID';
+    actionType: 'REFUND' | 'VOID' | 'APPROVAL';
     actionDescription: string;
     amount: number;
-    invoice: SaleInvoice;
+    invoice?: SaleInvoice;
+    onAuthorize?: (manager: Salesperson, reason: string) => void;
   } | null>(null);
 
+  const isPrivileged =
+    currentUser?.role === 'Manager' ||
+    currentUser?.role === 'Admin' ||
+    currentUser?.role === 'OWNER' ||
+    currentUser?.role === 'SUPER_ADMIN';
+
+  // Branch Scope: Defaults strictly to current branch with zero cross-branch leakage
+  const [scopeFilter, setScopeFilter] = useState<'branch' | 'all'>('branch');
+  const activeBranch = useMemo(() => getCurrentBranch(), []);
+
   const loadData = () => {
-    setSales(getSales());
+    if (scopeFilter === 'all' && isPrivileged) {
+      setSales(getAllBranchesSales());
+    } else {
+      setSales(getSales());
+    }
   };
 
   useEffect(() => {
     loadData();
+  }, [scopeFilter]);
+
+  useEffect(() => {
+    loadData();
+    const handleUpdate = () => loadData();
+    const unsub = subscribeToDatabase(handleUpdate);
+    window.addEventListener('saimetric_sales_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_movements_updated', handleUpdate);
+    window.addEventListener('mesh-catchup-completed', handleUpdate);
+    window.addEventListener('storage', handleUpdate);
+
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_sales_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_movements_updated', handleUpdate);
+      window.removeEventListener('mesh-catchup-completed', handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
+    };
   }, []);
 
   const handleTriggerRefund = (invoice: SaleInvoice) => {
     if (invoice.status === 'Refunded' || invoice.status === 'Voided') return;
-    const isManagerOrAdmin = currentUser?.role === 'Manager' || currentUser?.role === 'Admin';
-
-    if (isManagerOrAdmin && currentUser) {
-      const reason = window.prompt(`Enter reason for refunding Invoice #${invoice.id} ($${invoice.total.toFixed(2)}):`, 'Customer Return / Defective');
-      if (reason && reason.trim()) {
-        const res = refundSaleInvoice({
-          invoiceId: invoice.id,
-          manager: currentUser,
-          cashier: currentUser,
-          reason: reason.trim(),
-        });
-        if (res.success) {
-          setActionNotice({ text: res.message, type: 'success' });
-          loadData();
-        } else {
-          setActionNotice({ text: res.message, type: 'error' });
-        }
-      }
-    } else {
-      // Cashier requires Manager PIN
-      setManagerModalConfig({
-        isOpen: true,
-        title: 'Manager PIN Required: Invoice Refund',
-        subtitle: `Refunding #${invoice.id} ($${invoice.total.toFixed(2)}) requires Manager or Admin authorization`,
-        actionType: 'REFUND',
-        actionDescription: `Full refund for Invoice #${invoice.id} to ${invoice.customerName}`,
-        amount: invoice.total,
-        invoice,
-      });
-    }
+    setManagerModalConfig({
+      isOpen: true,
+      title: 'Manager Authorization: Invoice Refund',
+      subtitle: `Refunding #${invoice.id} ($${invoice.total.toFixed(2)}) requires authorization`,
+      actionType: 'REFUND',
+      actionDescription: `Full refund for Invoice #${invoice.id} to ${invoice.customerName}`,
+      amount: invoice.total,
+      invoice,
+    });
   };
 
   const handleTriggerVoid = (invoice: SaleInvoice) => {
     if (invoice.status === 'Refunded' || invoice.status === 'Voided') return;
-    const isManagerOrAdmin = currentUser?.role === 'Manager' || currentUser?.role === 'Admin';
-
-    if (isManagerOrAdmin && currentUser) {
-      const reason = window.prompt(`Enter reason for voiding Invoice #${invoice.id} ($${invoice.total.toFixed(2)}):`, 'Duplicate / Mistake Entry');
-      if (reason && reason.trim()) {
-        const res = voidSaleInvoice({
-          invoiceId: invoice.id,
-          manager: currentUser,
-          cashier: currentUser,
-          reason: reason.trim(),
-        });
-        if (res.success) {
-          setActionNotice({ text: res.message, type: 'success' });
-          loadData();
-        } else {
-          setActionNotice({ text: res.message, type: 'error' });
-        }
-      }
-    } else {
-      // Cashier requires Manager PIN
-      setManagerModalConfig({
-        isOpen: true,
-        title: 'Manager PIN Required: Void Invoice',
-        subtitle: `Voiding #${invoice.id} ($${invoice.total.toFixed(2)}) requires Manager or Admin authorization`,
-        actionType: 'VOID',
-        actionDescription: `Void transaction #${invoice.id} and reverse inventory & cash entries`,
-        amount: invoice.total,
-        invoice,
-      });
-    }
+    setManagerModalConfig({
+      isOpen: true,
+      title: 'Manager Authorization: Void Invoice',
+      subtitle: `Voiding #${invoice.id} ($${invoice.total.toFixed(2)}) requires authorization`,
+      actionType: 'VOID',
+      actionDescription: `Void transaction #${invoice.id} and reverse inventory & cash entries`,
+      amount: invoice.total,
+      invoice,
+    });
   };
 
   const handleAuthorizeManagerAction = (manager: Salesperson, reason: string) => {
@@ -199,13 +198,29 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
 
   // Date period filtering
   const periodFilteredSales = useMemo(() => {
-    const todayStr = new Date().toISOString().split('T')[0];
+    // When user types a search query (invoice #, customer, staff, product), search across all receipts so invoices are never hidden
+    if (searchQuery && searchQuery.trim().length > 0) {
+      return sales;
+    }
+
+    const todayUtc = new Date().toISOString().split('T')[0];
+    const todayLocal = getTodayDateString();
 
     return sales.filter((sale) => {
-      const saleDate = sale.date || (sale.timestamp ? new Date(sale.timestamp).toISOString().split('T')[0] : '');
+      const saleDate = sale.date || (sale.timestamp ? sale.timestamp.slice(0, 10) : '');
 
       if (activePeriodType === 'today') {
-        return saleDate === todayStr;
+        let isToday = saleDate === todayLocal || saleDate === todayUtc;
+        if (!isToday && sale.timestamp) {
+          try {
+            const localD = new Date(sale.timestamp);
+            const y = localD.getFullYear();
+            const m = String(localD.getMonth() + 1).padStart(2, '0');
+            const d = String(localD.getDate()).padStart(2, '0');
+            isToday = `${y}-${m}-${d}` === todayLocal || `${y}-${m}-${d}` === todayUtc;
+          } catch {}
+        }
+        return isToday;
       }
 
       if (activePeriodType === 'past3days') {
@@ -217,14 +232,14 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         const d = new Date();
         d.setDate(d.getDate() - 7);
         const limitStr = d.toISOString().split('T')[0];
-        return saleDate >= limitStr && saleDate <= todayStr;
+        return saleDate >= limitStr && (saleDate <= todayLocal || saleDate <= todayUtc);
       }
 
       if (activePeriodType === 'last30days') {
         const d = new Date();
         d.setDate(d.getDate() - 30);
         const limitStr = d.toISOString().split('T')[0];
-        return saleDate >= limitStr && saleDate <= todayStr;
+        return saleDate >= limitStr && (saleDate <= todayLocal || saleDate <= todayUtc);
       }
 
       if (activePeriodType === 'custom') {
@@ -240,7 +255,18 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
   const filteredSales = useMemo(() => {
     return periodFilteredSales.filter((sale) => {
       const matchesPayment =
-        paymentFilter === 'All' || sale.paymentMethod === paymentFilter;
+        paymentFilter === 'All' ||
+        sale.paymentMethod === paymentFilter ||
+        sale.currency === paymentFilter ||
+        (paymentFilter === 'EcoCash' &&
+          (sale.paymentMethod === 'EcoCash' ||
+            sale.paymentMethod === 'EcoCash/Mobile' ||
+            sale.currency === 'EcoCash' ||
+            sale.currency === 'ECO')) ||
+        (paymentFilter === 'ZiG' &&
+          (sale.paymentMethod === 'ZiG' ||
+            sale.currency === 'ZiG' ||
+            sale.currency === 'ZIG'));
       const matchesStatus =
         statusFilter === 'All' ||
         (statusFilter === 'Paid' && sale.status !== 'Refunded' && sale.status !== 'Voided') ||
@@ -262,14 +288,6 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     return filteredSales.slice(0, visibleCount);
   }, [filteredSales, visibleCount]);
 
-  const totalReceiptsValue = useMemo(() => {
-    return filteredSales.reduce((acc, s) => acc + (s.total || 0), 0);
-  }, [filteredSales]);
-
-  const paidCount = useMemo(() => {
-    return filteredSales.filter((s) => s.status !== 'Refunded' && s.status !== 'Voided').length;
-  }, [filteredSales]);
-
   const refundedCount = useMemo(() => {
     return filteredSales.filter((s) => s.status === 'Refunded').length;
   }, [filteredSales]);
@@ -277,6 +295,56 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
   const voidedCount = useMemo(() => {
     return filteredSales.filter((s) => s.status === 'Voided').length;
   }, [filteredSales]);
+
+  // Edit Receipt for Authorized Staff with Audit Trail Logging
+  const handleTriggerEdit = (sale: SaleInvoice) => {
+    if (isSupervisorOrAbove(currentUser?.role)) {
+      setAuthorizedEditor(currentUser || null);
+      setEditingInvoice(sale);
+    } else {
+      setManagerModalConfig({
+        isOpen: true,
+        title: 'Manager PIN Required: Edit Receipt',
+        subtitle: `Modifying Receipt #${sale.id} requires Supervisor or Manager authorization`,
+        actionType: 'APPROVAL',
+        actionDescription: `Edit details for Receipt #${sale.id} ($${sale.total.toFixed(2)})`,
+        amount: sale.total,
+        invoice: sale,
+        onAuthorize: (manager, _reason) => {
+          setAuthorizedEditor(manager);
+          setEditingInvoice(sale);
+          setManagerModalConfig(null);
+        },
+      });
+    }
+  };
+
+  const handleSaveReceiptEdit = (updates: any, reason: string) => {
+    if (!editingInvoice) return;
+    const staff = currentUser || authorizedEditor || { id: 'staff', name: 'Authorized Staff', role: 'Staff' };
+    const result = editSaleInvoice({
+      invoiceId: editingInvoice.id,
+      staff,
+      authorizedBy: authorizedEditor || undefined,
+      reason,
+      updates,
+    });
+
+    if (result.success) {
+      setSales(getSales());
+      setActionNotice({
+        text: `Receipt #${editingInvoice.id} successfully updated and recorded in Audit Trail.`,
+        type: 'success',
+      });
+      setEditingInvoice(null);
+      setAuthorizedEditor(null);
+    } else {
+      setActionNotice({
+        text: result.message || 'Failed to update receipt.',
+        type: 'error',
+      });
+    }
+  };
 
   const handleApplyOlderPeriod = (period: 'past3days' | 'last7days' | 'last30days' | 'custom' | 'all') => {
     setActivePeriodType(period);
@@ -325,6 +393,38 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         </div>
 
         <div className="flex items-center space-x-2 flex-wrap gap-y-2">
+          {/* Explicit Branch vs All Branches Scope Toggle */}
+          {isPrivileged && (
+            <div className="flex items-center p-0.5 rounded-2xl bg-slate-950/80 border border-slate-700/80 shadow-inner">
+              <button
+                type="button"
+                onClick={() => setScopeFilter('branch')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                  scopeFilter === 'branch'
+                    ? 'bg-blue-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title={`Strictly isolated to current branch: ${activeBranch.name} (${activeBranch.code || 'HQ-01'})`}
+              >
+                <Building2 className="w-3.5 h-3.5" />
+                <span className="max-w-[120px] truncate">{activeBranch.name || 'This Branch'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setScopeFilter('all')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                  scopeFilter === 'all'
+                    ? 'bg-amber-600 text-white shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+                title="Consolidated view: View all branches in active company"
+              >
+                <Layers className="w-3.5 h-3.5" />
+                <span>All Branches</span>
+              </button>
+            </div>
+          )}
+
           {/* Get Older Receipts Button */}
           <button
             type="button"
@@ -374,29 +474,13 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         </div>
       </div>
 
-      {/* Receipts Summary Badges (Focused purely on receipts, not drawer balances) */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+      {/* Receipts Summary Badges */}
+      <div className="grid grid-cols-2 gap-2.5">
         <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3">
           <span className="text-[10px] text-slate-400 block font-semibold uppercase">Total Receipts</span>
           <div className="flex items-baseline justify-between mt-0.5">
             <span className="text-lg font-black font-mono text-white">{filteredSales.length}</span>
             <span className="text-[10px] text-slate-500">Invoices</span>
-          </div>
-        </div>
-
-        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3">
-          <span className="text-[10px] text-slate-400 block font-semibold uppercase">Total Value</span>
-          <div className="flex items-baseline justify-between mt-0.5">
-            <span className="text-lg font-black font-mono text-emerald-400">${totalReceiptsValue.toFixed(2)}</span>
-            <span className="text-[10px] text-emerald-400/70">Sum</span>
-          </div>
-        </div>
-
-        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3">
-          <span className="text-[10px] text-slate-400 block font-semibold uppercase">Paid Invoices</span>
-          <div className="flex items-baseline justify-between mt-0.5">
-            <span className="text-lg font-black font-mono text-cyan-300">{paidCount}</span>
-            <span className="text-[10px] text-cyan-400/70">Settled</span>
           </div>
         </div>
 
@@ -437,10 +521,11 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
               className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-2.5 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
             >
               <option value="All">All Payment Methods</option>
-              <option value="Cash">Cash</option>
-              <option value="Credit">Credit</option>
-              <option value="Card">Card</option>
-              <option value="EcoCash/Mobile">EcoCash</option>
+              <option value="Cash">Cash (USD)</option>
+              <option value="ZiG">ZiG (Zimbabwe Gold)</option>
+              <option value="EcoCash">EcoCash Mobile Money</option>
+              <option value="Credit">Form 3 Credit</option>
+              <option value="Card">Bank Card / POS</option>
               <option value="Bank Transfer">Bank Transfer</option>
             </select>
           </div>
@@ -542,6 +627,11 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
                       <span className="text-[10px] text-slate-500 block">
                         by {sale.staffName}
                       </span>
+                      {sale.lastEditedBy && (
+                        <span className="text-[9px] text-amber-400 block font-semibold" title={`Edited: ${sale.editReason || 'Details modified'}`}>
+                          ✏️ Edited by {sale.lastEditedBy}
+                        </span>
+                      )}
                     </td>
                     <td className="py-3 px-4 font-bold text-slate-200">
                       <div>{sale.customerName}</div>
@@ -602,6 +692,16 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
                         >
                           <Printer className="w-3 h-3" />
                           <span>Receipt</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleTriggerEdit(sale)}
+                          className="px-2.5 py-1 rounded-xl bg-amber-600/30 hover:bg-amber-600 text-amber-200 hover:text-white text-xs font-bold border border-amber-500/40 transition-colors flex items-center space-x-1"
+                          title="Edit Receipt Details (Requires Authorization & Logged in Audit Trail)"
+                        >
+                          <Pencil className="w-3 h-3" />
+                          <span>Edit</span>
                         </button>
 
                         {isCompleted && (
@@ -815,6 +915,21 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         />
       )}
 
+      {/* EDIT RECEIPT MODAL (Staff with Access / Authorized) */}
+      {editingInvoice && (
+        <EditReceiptModal
+          isOpen={!!editingInvoice}
+          invoice={editingInvoice}
+          currentUser={currentUser || null}
+          authorizedBy={authorizedEditor}
+          onClose={() => {
+            setEditingInvoice(null);
+            setAuthorizedEditor(null);
+          }}
+          onSave={handleSaveReceiptEdit}
+        />
+      )}
+
       {/* MANAGER PIN AUTHORIZATION MODAL FOR REFUND / VOID */}
       {managerModalConfig && (
         <ManagerPinModal
@@ -827,7 +942,13 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
           amount={managerModalConfig.amount}
           currentStaff={currentUser}
           reasonRequired={true}
-          onAuthorize={handleAuthorizeManagerAction}
+          onAuthorize={(manager, reason) => {
+            if (managerModalConfig.onAuthorize) {
+              managerModalConfig.onAuthorize(manager, reason);
+            } else {
+              handleAuthorizeManagerAction(manager, reason);
+            }
+          }}
         />
       )}
     </div>

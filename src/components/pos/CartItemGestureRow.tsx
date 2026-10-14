@@ -177,7 +177,7 @@ export const CartItemGestureRow: React.FC<CartItemGestureRowProps> = ({
       onPointerUp={handlePointerUp}
       onPointerLeave={handlePointerLeave}
       onPointerCancel={handlePointerCancel}
-      className={`relative p-3 sm:p-3.5 transition select-none cursor-pointer flex flex-col justify-between ${
+      className={`relative p-2.5 sm:p-3 transition select-none cursor-pointer flex flex-col justify-between ${
         isHolding
           ? 'bg-purple-50/70 ring-1 ring-purple-300'
           : 'hover:bg-slate-50/80 bg-white'

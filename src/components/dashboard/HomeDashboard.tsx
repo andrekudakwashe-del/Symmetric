@@ -12,7 +12,9 @@ import {
   getCustomerChangeReport,
   getCustomerCreditReport,
   getInventoryItems,
+  getProducts,
 } from '../../db/roomDatabase';
+import { resolveItemCost } from '../../utils/costResolver';
 import {
   Coins,
   ReceiptText,
@@ -72,16 +74,6 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
     return todaySales.reduce((acc, s) => acc + s.total, 0);
   }, [todaySales]);
 
-  const drawerNetCash = useMemo(() => {
-    let inTotal = 0;
-    let outTotal = 0;
-    cashLogs.forEach((l) => {
-      inTotal += l.in || 0;
-      outTotal += l.out || 0;
-    });
-    return inTotal - outTotal;
-  }, [cashLogs]);
-
   const todayCashCount = useMemo(() => {
     return cashCounts.find((c) => c.date === todayStr && c.staffId === currentUser.id);
   }, [cashCounts, todayStr, currentUser]);
@@ -109,16 +101,8 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
 
   // Real-time sales, profit & velocity analytics for Dashboard
   const inventoryItems = getInventoryItems();
+  const products = getProducts();
   const { todayGrossProfit, fastestProduct, topProfitProduct } = useMemo(() => {
-    const costMap = new Map<string, number>();
-    inventoryItems.forEach((inv) => {
-      const idKey = (inv.itemId || '').trim().toUpperCase();
-      const nameKey = (inv.itemName || '').trim().toLowerCase();
-      const cost = inv.averageCostPerUnit || inv.costPerUnit || 0;
-      if (idKey) costMap.set(idKey, cost);
-      if (nameKey) costMap.set(nameKey, cost);
-    });
-
     let totalProfit = 0;
     const qtyByProduct = new Map<string, { name: string; qty: number }>();
     const profitByProduct = new Map<string, { name: string; profit: number }>();
@@ -126,18 +110,14 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
     todaySales.forEach((sale) => {
       if (sale.status === 'Refunded' || sale.status === 'Voided') return;
       (sale.items || []).forEach((item) => {
-        const idUpper = (item.id || '').trim().toUpperCase();
-        const nameLower = (item.name || '').trim().toLowerCase();
-        const itemCost =
-          item.costPerUnitAverage !== undefined && item.costPerUnitAverage >= 0
-            ? item.costPerUnitAverage
-            : costMap.get(idUpper) ?? (nameLower ? costMap.get(nameLower) : undefined) ?? (item.unitPrice * 0.7);
+        const resolved = resolveItemCost(item, inventoryItems, products);
         const qty = Number(item.quantity) || 0;
-        const lineRev = Number(item.total) || (qty * item.unitPrice);
-        const lineProfit = lineRev - (qty * itemCost);
+        const lineRev = Number(item.total) || (qty * Number(item.unitPrice || 0));
+        const lineCost = qty * resolved.avgCost;
+        const lineProfit = lineRev - lineCost;
         totalProfit += lineProfit;
 
-        const pName = item.name || 'Unknown Item';
+        const pName = resolved.displayName || item.name || 'Unknown Item';
         const curQty = qtyByProduct.get(pName) || { name: pName, qty: 0 };
         curQty.qty += qty;
         qtyByProduct.set(pName, curQty);
@@ -199,7 +179,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
       title: 'Cash Balancing Module',
       subtitle: 'Unified Forms 1, 2, 3 & 4 (Reconciliation)',
       icon: Banknote,
-      badge: `$${(Number(drawerNetCash) || 0).toFixed(2)} Net Cash`,
+      badge: 'Forms 1 - 4 Ready',
       badgeColor: 'bg-purple-500/20 text-purple-300',
       gradient: 'from-purple-900/60 to-slate-900',
       borderColor: 'border-purple-500/40',
@@ -319,8 +299,8 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
           </div>
         </div>
 
-        {/* 4 Quick Stat Metric Tiles */}
-        <div className="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3 pt-4 border-t border-slate-800/80">
+        {/* Quick Stat Metric Tiles */}
+        <div className="mt-5 grid grid-cols-1 sm:grid-cols-3 gap-3 pt-4 border-t border-slate-800/80">
           {/* Revenue */}
           <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800">
             <span className="text-[10px] uppercase font-bold text-slate-400 block">Today's Revenue</span>
@@ -328,15 +308,6 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
               ${(Number(todayRevenue) || 0).toFixed(2)}
             </div>
             <span className="text-[10px] text-slate-500 font-medium font-mono-num">{todaySales.length} invoices</span>
-          </div>
-
-          {/* Net Cash Drawer */}
-          <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800">
-            <span className="text-[10px] uppercase font-bold text-slate-400 block">Drawer Cash In Hand</span>
-            <div className="text-lg font-black font-mono-num text-white mt-0.5">
-              ${(Number(drawerNetCash) || 0).toFixed(2)}
-            </div>
-            <span className="text-[10px] text-purple-300 font-medium">Net calculated</span>
           </div>
 
           {/* Customers */}

@@ -183,14 +183,21 @@ class MeshSyncManager {
   private localGatewayPollTimer: number | null = null;
   private lastMeshPollTimestamp: number = Date.now();
   private lastNotifiedPeerSignature: string = '';
+  private lastCatchUpRequestTime: Map<string, number> = new Map();
 
   constructor() {
     this.config = this.loadConfig();
     this.initServerStream();
-    this.initMqttRelay();
     this.initBroadcastChannel();
     this.initVirtualMeshDefault();
     this.startOpportunisticCloudSyncTimer();
+
+    // Defer external MQTT relay connection until after critical UI boots
+    if (typeof window !== 'undefined') {
+      setTimeout(() => {
+        this.initMqttRelay();
+      }, 5000);
+    }
 
     // Local Gateway IP if configured
     try {
@@ -258,11 +265,11 @@ class MeshSyncManager {
     this.startHeartbeatLoop();
     this.startPruneLoop();
 
-    // Periodic pull from server
+    // Periodic pull from server - gentle background interval to prevent UI freezes
     if (typeof window !== 'undefined') {
       window.setInterval(() => {
         pullTenantInventory().catch(() => {});
-      }, 25000);
+      }, 180000);
     }
   }
 
@@ -397,7 +404,7 @@ class MeshSyncManager {
       if (this.config.autoDetectTenantBranch !== false) {
         this.syncContextWithActiveSession();
       }
-    }, 3500);
+    }, 15000);
   }
 
   public syncContextWithActiveSession(force: boolean = false) {
@@ -601,38 +608,40 @@ class MeshSyncManager {
   public onScanSuccess(decodedText: string): void {
     let targetWsUrl = '';
     const trimmed = (decodedText || '').trim();
+    const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
 
-    if (trimmed.startsWith('ws://')) {
+    if (trimmed.startsWith('wss://')) {
       targetWsUrl = trimmed;
-    } else if (trimmed.startsWith('wss://')) {
-      targetWsUrl = 'ws://' + trimmed.slice('wss://'.length);
-    } else if (trimmed.startsWith('http://')) {
-      targetWsUrl = 'ws://' + trimmed.slice('http://'.length);
+    } else if (trimmed.startsWith('ws://')) {
+      targetWsUrl = isHttps ? 'wss://' + trimmed.slice('ws://'.length) : trimmed;
     } else if (trimmed.startsWith('https://')) {
-      targetWsUrl = 'ws://' + trimmed.slice('https://'.length);
+      targetWsUrl = 'wss://' + trimmed.slice('https://'.length);
+    } else if (trimmed.startsWith('http://')) {
+      targetWsUrl = isHttps ? 'wss://' + trimmed.slice('http://'.length) : 'ws://' + trimmed.slice('http://'.length);
     } else {
       try {
         const parsed = JSON.parse(trimmed);
         if (parsed.wsUrl) {
           targetWsUrl = parsed.wsUrl;
         } else if (parsed.url) {
-          targetWsUrl = parsed.url.replace(/^https?:\/\//i, 'ws://').replace(/^wss:\/\//i, 'ws://');
+          targetWsUrl = isHttps
+            ? parsed.url.replace(/^https?:\/\//i, 'wss://').replace(/^ws:\/\//i, 'wss://')
+            : parsed.url.replace(/^https?:\/\//i, 'ws://').replace(/^wss:\/\//i, 'ws://');
         } else if (parsed.host || parsed.ip) {
           const port = parsed.port || 3000;
-          targetWsUrl = `ws://${parsed.host || parsed.ip}:${port}`;
+          const proto = isHttps ? 'wss://' : 'ws://';
+          targetWsUrl = `${proto}${parsed.host || parsed.ip}:${port}`;
         }
       } catch (e) {
         const ipMatch = trimmed.match(/(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?::\d+)?/);
         if (ipMatch) {
-          targetWsUrl = `ws://${ipMatch[0]}`;
+          const proto = isHttps ? 'wss://' : 'ws://';
+          targetWsUrl = `${proto}${ipMatch[0]}`;
         }
       }
     }
 
     if (targetWsUrl) {
-      if (!targetWsUrl.startsWith('ws://')) {
-        targetWsUrl = 'ws://' + targetWsUrl.replace(/^[a-zA-Z]+:\/\//, '');
-      }
       this.connectToWsUrl(targetWsUrl);
     }
 
@@ -643,8 +652,24 @@ class MeshSyncManager {
 
   public connectToWsUrl(wsUrl: string) {
     let cleanWs = wsUrl.trim();
-    if (!cleanWs.startsWith('ws://')) {
-      cleanWs = 'ws://' + cleanWs.replace(/^[a-zA-Z]+:\/\//, '');
+    const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+
+    if (isHttps) {
+      if (cleanWs.startsWith('ws://')) {
+        cleanWs = 'wss://' + cleanWs.slice('ws://'.length);
+      } else if (!cleanWs.startsWith('wss://')) {
+        cleanWs = 'wss://' + cleanWs.replace(/^[a-zA-Z]+:\/\//, '');
+      }
+      // On HTTPS, if targeting a raw LAN IP over WebSocket, skip direct socket to prevent browser mixed content warnings
+      if (/^wss?:\/\/(?:192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)/.test(cleanWs)) {
+        console.info('[MeshSync] Raw LAN IP WebSocket skipped on HTTPS to avoid Mixed Content security warning. Retaining WebRTC DataChannel.');
+        this.addLog('DISCOVERY', `Secure HTTPS environment: LAN raw IP socket avoided to prevent mixed content warnings.`, this.config.deviceName);
+        return;
+      }
+    } else {
+      if (!cleanWs.startsWith('ws://') && !cleanWs.startsWith('wss://')) {
+        cleanWs = 'ws://' + cleanWs.replace(/^[a-zA-Z]+:\/\//, '');
+      }
     }
 
     this.localGatewayUrl = cleanWs;
@@ -1044,7 +1069,7 @@ class MeshSyncManager {
         clientId,
         clean: true,
         connectTimeout: 5000,
-        reconnectPeriod: 3000,
+        reconnectPeriod: 30000,
         keepalive: 30,
       });
 
@@ -1121,7 +1146,7 @@ class MeshSyncManager {
     this.sendHeartbeat();
     this.heartbeatInterval = window.setInterval(() => {
       this.sendHeartbeat();
-    }, 3500);
+    }, 18000);
   }
 
   private startPruneLoop() {
@@ -1130,7 +1155,7 @@ class MeshSyncManager {
       const now = Date.now();
       let changed = false;
       for (const [id, peer] of this.discoveredPeers.entries()) {
-        if (now - peer.lastSeen > 30000) {
+        if (now - peer.lastSeen > 45000) {
           this.discoveredPeers.delete(id);
           changed = true;
           this.addLog('DISCOVERY', `Peer disconnected: ${peer.name} (${id})`, this.config.deviceName);
@@ -1139,7 +1164,7 @@ class MeshSyncManager {
       if (changed && !this.isSimulationMode) {
         this.notifyPeerSubscribers();
       }
-    }, 5000);
+    }, 15000);
   }
 
   private sendHeartbeat() {
@@ -1690,6 +1715,14 @@ class MeshSyncManager {
     customSinceIso?: string,
     isReciprocal?: boolean
   ): Promise<{ success: boolean; message: string; sinceTimestamp: string }> {
+    const peerKey = targetPeerId || 'ALL';
+    const now = Date.now();
+    const lastReq = this.lastCatchUpRequestTime.get(peerKey) || 0;
+    if (!customSinceIso && now - lastReq < 45000) {
+      return { success: false, message: 'Catch-up recently requested (throttled)', sinceTimestamp: '' };
+    }
+    this.lastCatchUpRequestTime.set(peerKey, now);
+
     const sinceTimestamp = customSinceIso || this.getLastMeshSyncTimestamp();
     const packetId = `CRQ-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
@@ -1797,11 +1830,6 @@ class MeshSyncManager {
     };
 
     this.sendPacketToAllTransports('catchup_response', responsePacket);
-
-    // If request wasn't already reciprocal, request returning peer's delta records since this terminal's last sync
-    if (!packet.isReciprocal) {
-      this.requestCatchUpSync(packet.originDeviceId, undefined, true).catch(() => {});
-    }
 
     this.addLog(
       'EPIDEMIC_HOP',

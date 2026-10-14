@@ -27,6 +27,8 @@ import {
   Share2,
 } from 'lucide-react';
 import { persistentSyncEngine } from '../../services/persistentSyncEngine';
+import { checkBranchLimit } from '../../services/packageService';
+import { PackageLimitModal } from '../common/PackageLimitModal';
 import {
   getBranches,
   saveBranch,
@@ -62,6 +64,19 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // Package Limit Modal state
+  const [limitModalState, setLimitModalState] = useState<{
+    isOpen: boolean;
+    currentCount: number;
+    maxLimit: number;
+    packageName: string;
+  }>({
+    isOpen: false,
+    currentCount: 0,
+    maxLimit: 1,
+    packageName: 'Starter POS',
+  });
 
   // Dedicated Team Setup Modal states
   const [selectedBranchForTeam, setSelectedBranchForTeam] = useState<Branch | null>(null);
@@ -140,6 +155,18 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
       showToast('Permission Denied: Only Business Owners or Super Admins can add new branches.');
       return;
     }
+
+    const check = checkBranchLimit(company.company_id);
+    if (!check.allowed) {
+      setLimitModalState({
+        isOpen: true,
+        currentCount: check.currentBranches,
+        maxLimit: check.maxBranches,
+        packageName: check.packageName,
+      });
+      return;
+    }
+
     setEditingBranch(null);
     setFormName('');
     const count = branches.length + 1;
@@ -298,6 +325,21 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
       return;
     }
 
+    // Enforce Tenant Package Branch Limit on new creations
+    if (!editingBranch) {
+      const check = checkBranchLimit(company.company_id);
+      if (!check.allowed) {
+        setLimitModalState({
+          isOpen: true,
+          currentCount: check.currentBranches,
+          maxLimit: check.maxBranches,
+          packageName: check.packageName,
+        });
+        setFormError(`Package limit reached: Your ${check.packageName} plan allows max ${check.maxBranches} branch(es).`);
+        return;
+      }
+    }
+
     const assignedManager = staffList.find((s) => s.id === formManagerId);
     const branchId = editingBranch
       ? editingBranch.branchId || editingBranch.id || `BR-${Date.now()}`
@@ -306,7 +348,9 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
     const newBranch: Branch = {
       branchId,
       id: branchId,
-      company_id: company.company_id || '1',
+      branch_id: branchId,
+      company_id: company.company_id || 'COMP-001',
+      companyId: company.company_id || 'COMP-001',
       name: formName.trim(),
       code: formCode.trim().toUpperCase(),
       location: formAddress.trim(),
@@ -319,6 +363,7 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
     };
 
     saveBranch(newBranch);
+    setBranches(getBranches());
 
     // Save any configured team member assignments for this branch
     staffList.forEach((staff) => {
@@ -363,14 +408,15 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
       showToast('Permission Denied: Only Business Owners or Super Admins can delete branches.');
       return;
     }
-    if (branchId === '1' || branchId === 'BR-MAIN') {
-      alert('Cannot delete the primary Head Office branch.');
+    const b = branches.find((item) => item.branchId === branchId || item.id === branchId || (item as any).branch_id === branchId);
+    if (b?.isMain || branchId === '1' || branchId === 'BR-MAIN' || b?.code === 'HQ-01' || b?.code === 'SAI-01') {
+      alert('Cannot delete the primary Head Office / HQ branch.');
       return;
     }
 
-    const b = branches.find((item) => item.branchId === branchId || item.id === branchId);
     const success = deleteBranch(branchId);
     if (success) {
+      setBranches(getBranches());
       addAuditLog({
         action: 'SYSTEM_SETTINGS_UPDATE',
         severity: 'WARNING',
@@ -381,7 +427,7 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
         branch_id: branchId,
         details: `Deleted branch '${b?.name || branchId}' (${b?.code || ''})`,
       });
-      showToast('Branch deleted.');
+      showToast('Branch deleted and recorded in deletion registry.');
     }
     setConfirmDeleteId(null);
   };
@@ -1290,6 +1336,23 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
           </div>
         </div>
       )}
+
+      {/* Package Limit Enforcement Modal */}
+      <PackageLimitModal
+        isOpen={limitModalState.isOpen}
+        onClose={() => setLimitModalState((prev) => ({ ...prev, isOpen: false }))}
+        type="BRANCHES"
+        currentCount={limitModalState.currentCount}
+        maxLimit={limitModalState.maxLimit}
+        packageName={limitModalState.packageName}
+        companyName={company.company_name}
+        onUpgrade={() => {
+          setLimitModalState((prev) => ({ ...prev, isOpen: false }));
+          if (onNavigateTab) {
+            onNavigateTab('SuperAdminDashboard');
+          }
+        }}
+      />
     </div>
   );
 };

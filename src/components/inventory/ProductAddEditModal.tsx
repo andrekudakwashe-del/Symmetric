@@ -16,10 +16,14 @@ import {
   Tag,
   Scale,
   Lock,
+  Calendar,
+  Clock,
+  Truck,
 } from 'lucide-react';
-import { InventoryItem, PackagingVariant, Salesperson } from '../../types';
+import { InventoryItem, PackagingVariant, Salesperson, Supplier } from '../../types';
 import {
   getInventoryItems,
+  getSuppliers,
   getSessionUser,
   saveInventoryItem,
   createPackagingVariant,
@@ -27,6 +31,7 @@ import {
   recordPriceCostChangeAudit,
 } from '../../db/roomDatabase';
 import { PackagingRatioModal } from './PackagingRatioModal';
+import { cleanNumberInput } from './GoodsReceivedView';
 
 export interface ProductAddEditModalProps {
   isOpen: boolean;
@@ -103,6 +108,8 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
   const [packagingVariants, setPackagingVariants] = useState<PackagingVariant[]>([]);
   const [sellByFraction, setSellByFraction] = useState(false);
   const [fractionUnit, setFractionUnit] = useState('kg');
+  const [trackExpiry, setTrackExpiry] = useState(false);
+  const [shelfLifeDays, setShelfLifeDays] = useState<string | number>('');
   const [error, setError] = useState('');
 
   // Helper for case package name pluralization
@@ -137,6 +144,10 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
   const [categoryDropdownOpen, setCategoryDropdownOpen] = useState(false);
   const [categorySearchTerm, setCategorySearchTerm] = useState('');
 
+  // Supplier selection state
+  const [supplierId, setSupplierId] = useState('');
+  const [suppliersList, setSuppliersList] = useState<Supplier[]>([]);
+
   // Packaging Ratio Modal trigger state
   const [showPackagingModal, setShowPackagingModal] = useState(false);
   const [pendingSaveItem, setPendingSaveItem] = useState<InventoryItem | null>(null);
@@ -145,10 +156,13 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
 
+    setSuppliersList(getSuppliers());
+
     if (initialItem) {
       setItemId(initialItem.itemId);
       setItemName(initialItem.itemName);
       setCategory(initialItem.category || 'Groceries');
+      setSupplierId(initialItem.supplierId || (initialItem as any).preferredSupplierId || '');
       setCasePackageName(initialItem.casePackageName || 'Case');
       setUnitsPerCase(initialItem.unitsPerCase ?? 24);
       setCanSellAsCase(Boolean(initialItem.canSellAsCase));
@@ -163,6 +177,8 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       setPackagingVariants(initialItem.packagingVariants || []);
       setSellByFraction(Boolean(initialItem.sellByFraction));
       setFractionUnit(initialItem.fractionUnit || 'kg');
+      setTrackExpiry(Boolean(initialItem.trackExpiry));
+      setShelfLifeDays(initialItem.shelfLifeDays !== undefined ? initialItem.shelfLifeDays : '');
       setError('');
     } else {
       // Auto-generate a sequential item ID
@@ -315,9 +331,14 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       itemId: itemId.trim().toUpperCase(),
       itemName: itemName.trim(),
       category: category.trim() || 'General',
+      supplierId: supplierId || undefined,
+      supplierName: suppliersList.find((s) => s.supplierId === supplierId)?.name || undefined,
+      preferredSupplierId: supplierId || undefined,
       casePackageName: casePackageName.trim() || 'Case',
       sellByFraction,
       fractionUnit: sellByFraction ? (fractionUnit.trim() || 'kg') : undefined,
+      trackExpiry,
+      shelfLifeDays: trackExpiry && shelfLifeDays !== '' && !isNaN(Number(shelfLifeDays)) ? Math.max(1, Number(shelfLifeDays)) : undefined,
       unitsPerCase: safeUnitsPerCase,
       canSellAsCase,
       caseReserveThreshold: Math.max(0, Number(caseReserveThreshold) || 0),
@@ -483,10 +504,8 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                   <button
                     type="button"
                     onClick={() => {
-                      const newCatName = window.prompt('Enter new category name:');
-                      if (newCatName && newCatName.trim()) {
-                        setCategory(newCatName.trim());
-                      }
+                      setCategoryDropdownOpen(true);
+                      setCategorySearchTerm('');
                     }}
                     className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-0.5 cursor-pointer"
                   >
@@ -562,6 +581,29 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                     </div>
                   )}
                 </div>
+
+                {/* Primary / Preferred Supplier Selector */}
+                <div className="mt-3 p-2.5 bg-slate-50 rounded-xl border border-slate-200">
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs font-black text-slate-900 flex items-center gap-1">
+                      <Truck className="w-3.5 h-3.5 text-indigo-600" />
+                      <span>Primary Supplier</span>
+                    </label>
+                    <span className="text-[10px] text-slate-500 font-medium">Auto-reorders &amp; POs</span>
+                  </div>
+                  <select
+                    value={supplierId}
+                    onChange={(e) => setSupplierId(e.target.value)}
+                    className="w-full py-1.5 px-2 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600 cursor-pointer shadow-sm"
+                  >
+                    <option value="">-- No Supplier Assigned (Unassigned) --</option>
+                    {suppliersList.map((sup) => (
+                      <option key={sup.supplierId} value={sup.supplierId}>
+                        {sup.name} ({sup.category || 'General'} &bull; {sup.paymentTerms || 'Credit'})
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               {/* Master Outer Case Units & Packaging Type */}
@@ -620,12 +662,23 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                   <div className="relative">
                     <Boxes className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                     <input
-                      type="number"
-                      min={1}
+                      type="text"
+                      inputMode="numeric"
                       required
-                      value={unitsPerCase}
-                      onFocus={(e) => e.target.select()}
-                      onChange={(e) => setUnitsPerCase(e.target.value)}
+                      value={unitsPerCase === 0 || unitsPerCase === '0' || unitsPerCase === '' ? '' : unitsPerCase}
+                      onFocus={(e) => {
+                        if (unitsPerCase === 0 || unitsPerCase === '0') {
+                          setUnitsPerCase('');
+                        } else {
+                          e.target.select();
+                        }
+                      }}
+                      onClick={(e) => (e.target as HTMLInputElement).select()}
+                      onChange={(e) => setUnitsPerCase(cleanNumberInput(e.target.value, false))}
+                      onBlur={(e) => {
+                        const num = parseInt(e.target.value, 10);
+                        if (!num || num < 1) setUnitsPerCase(1);
+                      }}
                       placeholder="e.g. 40 (Noodles), 100 (Pampers), 24"
                       className="w-full py-2.5 pl-9 pr-3.5 bg-white border-2 border-slate-300 rounded-xl text-sm font-mono font-black text-slate-950 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-600 focus:border-indigo-600 shadow-sm"
                     />
@@ -713,12 +766,18 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                     Cost / {casePackageName || 'Case'} ($)
                   </label>
                   <input
-                    type="number"
-                    step="0.01"
-                    min={0}
-                    value={costPerCase}
-                    onFocus={(e) => e.target.select()}
-                    onChange={(e) => setCostPerCase(e.target.value)}
+                    type="text"
+                    inputMode="decimal"
+                    value={costPerCase === 0 || costPerCase === '0' || costPerCase === '' ? '' : costPerCase}
+                    onFocus={(e) => {
+                      if (costPerCase === 0 || costPerCase === '0') {
+                        setCostPerCase('');
+                      } else {
+                        e.target.select();
+                      }
+                    }}
+                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                    onChange={(e) => setCostPerCase(cleanNumberInput(e.target.value, true))}
                     placeholder="0.00"
                     className="w-full py-2 px-3 bg-white border border-slate-300 rounded-xl text-sm font-mono font-bold text-slate-950 focus:outline-none focus:ring-2 focus:ring-indigo-600"
                   />
@@ -740,13 +799,19 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                     Single Sell ($) *
                   </label>
                   <input
-                    type="number"
-                    step="0.01"
-                    min={0}
+                    type="text"
+                    inputMode="decimal"
                     required
-                    value={sellPriceUnit}
-                    onFocus={(e) => e.target.select()}
-                    onChange={(e) => setSellPriceUnit(e.target.value)}
+                    value={sellPriceUnit === 0 || sellPriceUnit === '0' || sellPriceUnit === '' ? '' : sellPriceUnit}
+                    onFocus={(e) => {
+                      if (sellPriceUnit === 0 || sellPriceUnit === '0') {
+                        setSellPriceUnit('');
+                      } else {
+                        e.target.select();
+                      }
+                    }}
+                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                    onChange={(e) => setSellPriceUnit(cleanNumberInput(e.target.value, true))}
                     placeholder="0.00"
                     className="w-full py-2 px-3 bg-white border border-slate-300 rounded-xl text-sm font-mono font-bold text-emerald-700 focus:outline-none focus:ring-2 focus:ring-indigo-600"
                   />
@@ -758,13 +823,23 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                     {casePackageName || 'Case'} Sell ($)
                   </label>
                   <input
-                    type="number"
-                    step="0.01"
-                    min={0}
+                    type="text"
+                    inputMode="decimal"
                     disabled={!canSellAsCase}
-                    value={canSellAsCase ? sellPriceCase : (safeSellPriceUnit * safeUnitsPerCase > 0 ? (safeSellPriceUnit * safeUnitsPerCase).toFixed(2) : '')}
-                    onFocus={(e) => e.target.select()}
-                    onChange={(e) => setSellPriceCase(e.target.value)}
+                    value={
+                      canSellAsCase
+                        ? (sellPriceCase === 0 || sellPriceCase === '0' || sellPriceCase === '' ? '' : sellPriceCase)
+                        : (safeSellPriceUnit * safeUnitsPerCase > 0 ? (safeSellPriceUnit * safeUnitsPerCase).toFixed(2) : '')
+                    }
+                    onFocus={(e) => {
+                      if (sellPriceCase === 0 || sellPriceCase === '0') {
+                        setSellPriceCase('');
+                      } else {
+                        e.target.select();
+                      }
+                    }}
+                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                    onChange={(e) => setSellPriceCase(cleanNumberInput(e.target.value, true))}
                     placeholder="0.00"
                     className="w-full py-2 px-3 bg-white border border-slate-300 rounded-xl text-sm font-mono font-bold text-indigo-900 focus:outline-none focus:ring-2 focus:ring-indigo-600 disabled:bg-slate-100 disabled:text-slate-400"
                   />
@@ -1097,6 +1172,92 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                       </button>
                     ))}
                   </div>
+                </div>
+              )}
+            </div>
+
+            {/* ========================================================================= */}
+            {/* EXPIRY DATE & SHELF LIFE TRACKING SECTION */}
+            {/* ========================================================================= */}
+            <div className="p-4 bg-amber-50/70 rounded-2xl border-2 border-amber-200/80 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Calendar className="w-4 h-4 text-amber-700" />
+                  <span className="text-xs font-black text-amber-950 uppercase tracking-wider">
+                    Expiry & Batch Tracking
+                  </span>
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                    trackExpiry ? 'bg-amber-200 text-amber-900' : 'bg-slate-200 text-slate-700'
+                  }`}>
+                    {trackExpiry ? 'Enabled' : 'Disabled (Default)'}
+                  </span>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={trackExpiry}
+                    onChange={(e) => setTrackExpiry(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-600"></div>
+                </label>
+              </div>
+
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Automatically disabled by default for non-perishable goods (hardware, stationery, plastics). When enabled, Batch # and Expiry Date inputs appear during GRV receiving and are tracked in the Batch Tracking Ledger.
+              </p>
+
+              {trackExpiry && (
+                <div className="space-y-3 pt-2 border-t border-amber-200/80">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-800 mb-1 flex items-center gap-1">
+                        <Clock className="w-3.5 h-3.5 text-amber-700" />
+                        <span>Shelf Life (Days)</span>
+                        <span className="text-[10px] font-normal text-slate-500">(Optional fallback)</span>
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={shelfLifeDays}
+                        onFocus={(e) => e.target.select()}
+                        onChange={(e) => setShelfLifeDays(e.target.value)}
+                        placeholder="e.g. 3 (Tomatoes), 7 (Bread), 30 (Dairy)"
+                        className="w-full py-2 px-3 bg-white border border-amber-300 rounded-xl text-sm font-mono font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-amber-600"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-800 mb-1">
+                        Quick Presets
+                      </label>
+                      <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                        {[
+                          { label: '3d (Produce)', days: 3 },
+                          { label: '7d (Bakery)', days: 7 },
+                          { label: '14d (Dairy)', days: 14 },
+                          { label: '30d (Fresh)', days: 30 },
+                          { label: '90d', days: 90 },
+                          { label: '365d (1 Yr)', days: 365 },
+                        ].map((preset) => (
+                          <button
+                            key={preset.days}
+                            type="button"
+                            onClick={() => setShelfLifeDays(preset.days)}
+                            className={`text-[11px] font-bold px-2 py-1 rounded-lg border transition ${
+                              Number(shelfLifeDays) === preset.days
+                                ? 'bg-amber-600 text-white border-amber-600'
+                                : 'bg-white border-amber-200 text-amber-800 hover:bg-amber-100'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-amber-900 bg-amber-100/70 p-2 rounded-lg border border-amber-200">
+                    💡 If received without an explicit manufacturer expiry date, the GRV will automatically compute the expiry date using this product shelf life (Received Date + {shelfLifeDays || 'N'} days).
+                  </p>
                 </div>
               )}
             </div>

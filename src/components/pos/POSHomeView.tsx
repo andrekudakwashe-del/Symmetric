@@ -25,7 +25,9 @@ import {
   Coins,
 } from 'lucide-react';
 import { POSExpenseModal } from './POSExpenseModal';
+import { ShopUseModal } from './ShopUseModal';
 import { meshSyncService } from '../../services/meshSyncService';
+import { Utensils } from 'lucide-react';
 
 interface POSHomeViewProps {
   currentUser: Salesperson | null;
@@ -38,6 +40,10 @@ interface POSHomeViewProps {
   onOpenReceiptsModal?: () => void;
   onLogout?: () => void;
   selectedCurrency?: string;
+  cartItemCount?: number;
+  cartTotal?: number;
+  onResumeSale?: () => void;
+  onClearCart?: () => void;
 }
 
 export const POSHomeView: React.FC<POSHomeViewProps> = ({
@@ -51,9 +57,14 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
   onOpenReceiptsModal,
   onLogout,
   selectedCurrency = 'USD',
+  cartItemCount = 0,
+  cartTotal = 0,
+  onResumeSale,
+  onClearCart,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [showExpenseModal, setShowExpenseModal] = useState(false);
+  const [showShopUseModal, setShowShopUseModal] = useState(false);
   const [showParkedModal, setShowParkedModal] = useState(false);
   const [showStoreDropdown, setShowStoreDropdown] = useState(false);
   const [peerCount, setPeerCount] = useState(0);
@@ -204,35 +215,86 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
         </form>
       </div>
 
+      {/* In-Progress Active Sale Continuity Banner (when cashier has uncompleted items in till) */}
+      {cartItemCount > 0 && (
+        <div className="bg-gradient-to-r from-amber-500 via-orange-500 to-amber-600 text-white rounded-3xl p-4 shadow-xl border border-amber-300/40 space-y-3 animate-fadeIn">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center space-x-3">
+              <div className="w-12 h-12 rounded-2xl bg-white/20 border border-white/30 flex items-center justify-center shrink-0">
+                <ShoppingBag className="w-6 h-6 text-white" />
+              </div>
+              <div>
+                <div className="flex items-center space-x-2">
+                  <span className="text-sm font-black uppercase tracking-wider">
+                    In-Progress Sale Active
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full bg-white text-slate-900 font-black text-xs">
+                    {cartItemCount} {cartItemCount === 1 ? 'item' : 'items'}
+                  </span>
+                </div>
+                <p className="text-xs text-white/90 font-semibold mt-0.5">
+                  Selected products preserved. Total: ${(Number(cartTotal) || 0).toFixed(2)}. Continue where you left off.
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              id="btn-pos-home-resume-sale"
+              onClick={onResumeSale || onStartNewSale}
+              className="py-2.5 px-4 rounded-2xl bg-white text-orange-600 hover:bg-orange-50 font-black text-xs shadow-md transition transform active:scale-95 flex items-center space-x-1.5 shrink-0 cursor-pointer"
+            >
+              <span>Resume Sale</span>
+              <ArrowRight className="w-4 h-4 stroke-[3]" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 2. Big "+ NEW SALE" Card (Exact design from Screenshot 3) */}
       <div
         id="btn-pos-new-sale-card"
-        onClick={onStartNewSale}
+        onClick={cartItemCount > 0 ? (onResumeSale || onStartNewSale) : onStartNewSale}
         className="bg-white hover:bg-slate-50 border border-slate-200 rounded-3xl p-7 shadow-lg flex flex-col items-center justify-center cursor-pointer transition transform active:scale-[0.98] group"
       >
-        <div className="w-14 h-14 rounded-full bg-emerald-500 flex items-center justify-center text-white shadow-lg group-hover:scale-110 transition duration-200">
-          <Plus className="w-8 h-8 stroke-[3]" />
+        <div className={`w-14 h-14 rounded-full ${cartItemCount > 0 ? 'bg-amber-500' : 'bg-emerald-500'} flex items-center justify-center text-white shadow-lg group-hover:scale-110 transition duration-200`}>
+          {cartItemCount > 0 ? <ShoppingBag className="w-7 h-7" /> : <Plus className="w-8 h-8 stroke-[3]" />}
         </div>
         <span className="mt-3.5 text-lg font-black text-slate-800 tracking-wider">
-          NEW SALE
+          {cartItemCount > 0 ? `CONTINUE SALE (${cartItemCount} ITEMS)` : 'NEW SALE'}
         </span>
         <span className="text-xs text-slate-400 font-medium mt-0.5">
-          Tap to browse product catalog & add to counter
+          {cartItemCount > 0 ? 'Tap to view counter with your selected items' : 'Tap to browse product catalog & add to counter'}
         </span>
       </div>
 
-      {/* 3. "ADD NEW EXPENSE" Card (Exact design from Screenshot 3) */}
-      <div
-        id="btn-pos-add-expense-card"
-        onClick={() => setShowExpenseModal(true)}
-        className="bg-white hover:bg-slate-50 border border-slate-200 rounded-3xl py-4 px-6 shadow-md flex items-center justify-center space-x-3 cursor-pointer transition transform active:scale-[0.98]"
-      >
-        <div className="w-7 h-7 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 font-bold text-sm">
-          🍃
+      {/* 3. Action Cards Grid: Expense & Shop Use */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div
+          id="btn-pos-add-expense-card"
+          onClick={() => setShowExpenseModal(true)}
+          className="bg-white hover:bg-slate-50 border border-slate-200 rounded-3xl py-4 px-6 shadow-md flex items-center justify-center space-x-3 cursor-pointer transition transform active:scale-[0.98]"
+        >
+          <div className="w-7 h-7 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 font-bold text-sm">
+            🍃
+          </div>
+          <span className="text-sm font-black text-slate-700 tracking-wide uppercase">
+            ADD NEW EXPENSE
+          </span>
         </div>
-        <span className="text-sm font-black text-slate-700 tracking-wide uppercase">
-          ADD NEW EXPENSE
-        </span>
+
+        <div
+          id="btn-pos-shop-use-card"
+          onClick={() => setShowShopUseModal(true)}
+          className="bg-white hover:bg-slate-50 border border-slate-200 rounded-3xl py-4 px-6 shadow-md flex items-center justify-center space-x-3 cursor-pointer transition transform active:scale-[0.98]"
+        >
+          <div className="w-7 h-7 rounded-full bg-orange-100 flex items-center justify-center text-orange-600 font-bold text-sm">
+            <Utensils className="w-4 h-4" />
+          </div>
+          <span className="text-sm font-black text-slate-700 tracking-wide uppercase">
+            SHOP USE / STAFF FOOD
+          </span>
+        </div>
       </div>
 
       {/* 3b. Local P2P WiFi Mesh Connectivity & Device Status Card */}
@@ -406,6 +468,15 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
         onClose={() => setShowExpenseModal(false)}
         currentUser={currentUser}
       />
+
+      {/* Shop Use / Staff Food Modal */}
+      {currentUser && (
+        <ShopUseModal
+          isOpen={showShopUseModal}
+          onClose={() => setShowShopUseModal(false)}
+          currentUser={currentUser}
+        />
+      )}
     </div>
   );
 };

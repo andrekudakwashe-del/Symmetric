@@ -86,8 +86,8 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
       setError('Salesperson name is required.');
       return;
     }
-    if (!/^\d{4}$/.test(pin)) {
-      setError('PIN must be exactly 4 numeric digits (e.g. 1234).');
+    if (!/^\d{6}$/.test(pin) && !/^\d{4}$/.test(pin)) {
+      setError('PIN must be 6 numeric digits (e.g. 123456).');
       return;
     }
 
@@ -210,15 +210,15 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
                   />
                 </div>
 
-                {/* 4-digit PIN */}
+                {/* 6-digit PIN */}
                 <div>
-                  <label className="block text-xs font-bold text-slate-300 mb-1">4-Digit Security PIN *</label>
+                  <label className="block text-xs font-bold text-slate-300 mb-1">6-Digit Security PIN *</label>
                   <input
                     type="password"
-                    maxLength={4}
+                    maxLength={6}
                     value={pin}
-                    onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
-                    placeholder="e.g. 5678"
+                    onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    placeholder="e.g. 123456"
                     className="w-full py-2 px-3 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white font-mono-num outline-none focus:border-[#6A4DFF]"
                     required
                   />

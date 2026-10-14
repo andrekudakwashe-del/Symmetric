@@ -7,6 +7,7 @@ import {
   subscribeToDatabase,
 } from '../../db/roomDatabase';
 import { useScrollDirection } from '../../hooks/useScrollDirection';
+import { resolveItemCost } from '../../utils/costResolver';
 import {
   TrendingUp,
   DollarSign,
@@ -197,84 +198,26 @@ export const SalesReport: React.FC<SalesReportProps> = ({
     totalUnitsSold,
     categories,
   } = useMemo(() => {
-    const avgCostMap = new Map<string, number>();
-    const latestCostMap = new Map<string, number>();
-    const stockMap = new Map<string, { stock: number; reorder: number; sku: string; category: string }>();
-
-    // 1. Build lookup maps from live inventory items
-    inventoryItems.forEach((inv) => {
-      const idKey = (inv.itemId || '').trim().toUpperCase();
-      const nameKey = (inv.itemName || '').trim().toLowerCase();
-      const avgCost = inv.averageCostPerUnit !== undefined && inv.averageCostPerUnit > 0
-        ? inv.averageCostPerUnit
-        : (inv.costPerUnit || 0);
-      const latestCost = inv.latestCostPerUnit !== undefined && inv.latestCostPerUnit > 0
-        ? inv.latestCostPerUnit
-        : (inv.costPerUnit || 0);
-
-      if (idKey) {
-        avgCostMap.set(idKey, avgCost);
-        latestCostMap.set(idKey, latestCost);
-      }
-      if (nameKey) {
-        avgCostMap.set(nameKey, avgCost);
-        latestCostMap.set(nameKey, latestCost);
-      }
-      stockMap.set(idKey, {
-        stock: inv.totalUnits ?? 0,
-        reorder: inv.reorderLevelUnits ?? 5,
-        sku: inv.sku || inv.itemId,
-        category: inv.category || 'General',
-      });
-    });
-
-    // Also index products
-    products.forEach((p) => {
-      const pId = (p.id || '').trim().toUpperCase();
-      const pName = (p.name || '').trim().toLowerCase();
-      const cost = p.costPrice || p.costPerUnit || 0;
-      if (pId && !avgCostMap.has(pId)) {
-        avgCostMap.set(pId, p.averageCostPerUnit ?? cost);
-        latestCostMap.set(pId, p.latestCostPerUnit ?? cost);
-      }
-      if (pName && !avgCostMap.has(pName)) {
-        avgCostMap.set(pName, p.averageCostPerUnit ?? cost);
-        latestCostMap.set(pName, p.latestCostPerUnit ?? cost);
-      }
-    });
-
     const statMap = new Map<string, ProductSalesStat>();
     const categorySet = new Set<string>();
 
     filteredSales.forEach((sale) => {
       if (sale.items && Array.isArray(sale.items)) {
         sale.items.forEach((item) => {
-          const key = (item.id || item.name || 'Unknown').trim();
-          const idUpper = (item.id || '').trim().toUpperCase();
-          const nameLower = (item.name || '').trim().toLowerCase();
+          // Resolve accurate cost & stock from Inventory Master catalog
+          const resolved = resolveItemCost(item, inventoryItems, products);
+          const key = resolved.canonicalKey;
 
-          // Cost Resolution: Check sale snapshot first -> inventory map -> fallback unitPrice * 0.7
-          const matchedAvgCost =
-            item.costPerUnitAverage !== undefined && item.costPerUnitAverage >= 0
-              ? item.costPerUnitAverage
-              : avgCostMap.get(idUpper) ?? (nameLower ? avgCostMap.get(nameLower) : undefined) ?? (item.unitPrice * 0.7);
-
-          const matchedLatestCost =
-            item.costPerUnitLatest !== undefined && item.costPerUnitLatest >= 0
-              ? item.costPerUnitLatest
-              : latestCostMap.get(idUpper) ?? (nameLower ? latestCostMap.get(nameLower) : undefined) ?? (item.unitPrice * 0.7);
-
-          const stockInfo = stockMap.get(idUpper);
-          const itemCat = item.category || stockInfo?.category || 'General';
-          categorySet.add(itemCat);
+          categorySet.add(resolved.category);
 
           const itemQty = Number(item.quantity) || 0;
-          const itemRevenue = Number(item.total) || (itemQty * item.unitPrice);
+          const itemUnitPrice = Number(item.unitPrice) || 0;
+          const itemRevenue = Number(item.total) || (itemQty * itemUnitPrice);
 
-          const itemCostAvg = itemQty * matchedAvgCost;
+          const itemCostAvg = itemQty * resolved.avgCost;
           const itemProfitAvg = itemRevenue - itemCostAvg;
 
-          const itemCostLatest = itemQty * matchedLatestCost;
+          const itemCostLatest = itemQty * resolved.latestCost;
           const itemProfitLatest = itemRevenue - itemCostLatest;
 
           const existing = statMap.get(key);
@@ -297,21 +240,21 @@ export const SalesReport: React.FC<SalesReportProps> = ({
             existing.totalCost = existing.totalCostAvg;
             existing.grossProfit = existing.grossProfitAvg;
             existing.profitMarginPercent = existing.profitMarginPercentAvg;
-          } else {
-            const currentStock = stockInfo?.stock ?? 0;
-            const reorder = stockInfo?.reorder ?? 5;
-            let stockStatus: 'Out of Stock' | 'Low Stock' | 'In Stock' = 'In Stock';
-            if (currentStock <= 0) stockStatus = 'Out of Stock';
-            else if (currentStock <= reorder) stockStatus = 'Low Stock';
 
+            // Keep fresh stock from Inventory Master
+            if (resolved.currentStock !== undefined) {
+              existing.currentStock = resolved.currentStock;
+              existing.stockStatus = resolved.stockStatus;
+            }
+          } else {
             const profitMarginAvg = itemRevenue > 0 ? (itemProfitAvg / itemRevenue) * 100 : 0;
             const profitMarginLatest = itemRevenue > 0 ? (itemProfitLatest / itemRevenue) * 100 : 0;
 
             statMap.set(key, {
-              id: item.id || key,
-              name: item.name || 'Unknown Item',
-              sku: stockInfo?.sku || item.sku || (item.id ? String(item.id).substring(0, 8) : 'N/A'),
-              category: itemCat,
+              id: resolved.matchedItemId || key,
+              name: resolved.displayName,
+              sku: resolved.matchedSku || 'N/A',
+              category: resolved.category,
               unitsSold: itemQty,
               totalRevenue: itemRevenue,
 
@@ -327,8 +270,8 @@ export const SalesReport: React.FC<SalesReportProps> = ({
               grossProfit: itemProfitAvg,
               profitMarginPercent: profitMarginAvg,
 
-              currentStock,
-              stockStatus,
+              currentStock: resolved.currentStock,
+              stockStatus: resolved.stockStatus,
             });
           }
         });
@@ -495,6 +438,17 @@ export const SalesReport: React.FC<SalesReportProps> = ({
           </div>
 
           <div className="flex items-center space-x-2">
+            {onNavigateToInventory && (
+              <button
+                type="button"
+                onClick={onNavigateToInventory}
+                className="px-3.5 py-2 bg-indigo-900/60 hover:bg-indigo-800 text-indigo-200 border border-indigo-700/50 rounded-2xl text-xs font-bold shadow transition flex items-center gap-1.5 active:scale-95"
+                title="Go to Inventory Master Catalog"
+              >
+                <Package className="w-3.5 h-3.5" />
+                <span>Inventory Master</span>
+              </button>
+            )}
             {onNavigateToPOS && (
               <button
                 type="button"

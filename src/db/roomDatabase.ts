@@ -108,6 +108,7 @@ import {
   INITIAL_AUDIT_LOGS,
 } from '../data/initialData';
 import { persistentSyncEngine } from '../services/persistentSyncEngine';
+import { getMeta, setMeta } from './indexedDBService';
 import {
   getDualReadDirectGrvs,
   getDualReadSupplierInvoices,
@@ -123,6 +124,7 @@ import {
 } from '../services/grnService';
 import { landedCostService } from '../services/landedCostService';
 import { LandedCostItem } from '../types';
+import { resolveItemCost } from '../utils/costResolver';
 
 export {
   getAllGoodsReceivedNotes,
@@ -169,6 +171,7 @@ export const STORAGE_KEYS = {
   COMPANIES: 'saimetric_room_companies',
   CURRENT_COMPANY_ID: 'saimetric_room_current_company_id',
   CURRENT_BRANCH_ID: 'saimetric_room_current_branch_id',
+  DELETED_BRANCH_IDS: 'saimetric_deleted_branch_ids',
   PERMISSIONS: 'saimetric_room_permissions',
   EXCHANGE_RATES: 'saimetric_room_exchange_rates',
   CUSTOMER_GOODS_LEFT_BEHIND: 'saimetric_room_customer_goods_left_behind',
@@ -281,22 +284,15 @@ export const subscribeToDatabase = (listener: Listener) => {
 export const subscribeRoomDatabase = subscribeToDatabase;
 
 let notifyScheduled = false;
-let notifyDepth = 0;
-const MAX_NOTIFY_DEPTH = 8;
+let notifyTimer: any = null;
 
+// Throttled listener notification to coalesce rapid bulk writes into a single render tick
 const notifyListeners = () => {
   if (notifyScheduled) return;
   notifyScheduled = true;
-  // Use queueMicrotask to ensure state updates never occur synchronously during another component's render phase
-  queueMicrotask(() => {
-    notifyScheduled = false;
-    if (notifyDepth >= MAX_NOTIFY_DEPTH) {
-      console.warn('Database notification depth limit reached. Breaking potential notification loop.');
-      notifyDepth = 0;
-      return;
-    }
-    notifyDepth++;
-    try {
+  if (typeof requestAnimationFrame !== 'undefined') {
+    requestAnimationFrame(() => {
+      notifyScheduled = false;
       listeners.forEach((fn) => {
         try {
           fn();
@@ -304,33 +300,234 @@ const notifyListeners = () => {
           console.error('Listener error:', e);
         }
       });
-    } finally {
-      queueMicrotask(() => {
-        notifyDepth = 0;
+    });
+  } else {
+    if (notifyTimer) clearTimeout(notifyTimer);
+    notifyTimer = setTimeout(() => {
+      notifyScheduled = false;
+      listeners.forEach((fn) => {
+        try {
+          fn();
+        } catch (e) {
+          console.error('Listener error:', e);
+        }
       });
-    }
-  });
+    }, 16);
+  }
 };
 
-function getStored<T>(key: string, fallback: T): T {
+// High-performance in-memory layer: Prevents synchronous localStorage I/O freezes on UI thread
+const memoryCache = new Map<string, any>();
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key) {
+      memoryCache.delete(e.key);
+      notifyListeners();
+    }
+  });
+}
+
+function cleanupLocalStorageQuota(): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    // 1. Trim audit logs to last 50
+    const rawAudit = localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS);
+    if (rawAudit) {
+      const parsed = JSON.parse(rawAudit);
+      if (Array.isArray(parsed) && parsed.length > 50) {
+        localStorage.setItem(STORAGE_KEYS.AUDIT_LOGS, JSON.stringify(parsed.slice(0, 50)));
+      }
+    }
+    // 2. Clear synced sync queue
+    const rawQueue = localStorage.getItem(STORAGE_KEYS.SYNC_QUEUE);
+    if (rawQueue) {
+      const parsed = JSON.parse(rawQueue);
+      if (Array.isArray(parsed)) {
+        const pendingOnly = parsed.filter((i: any) => i.status !== 'synced' && i.status !== 'done');
+        localStorage.setItem(STORAGE_KEYS.SYNC_QUEUE, JSON.stringify(pendingOnly));
+      }
+    }
+  } catch (e) {
+    console.warn('[Storage] cleanupLocalStorageQuota error:', e);
+  }
+}
+
+export async function rehydrateFromIndexedDB(): Promise<void> {
+  if (typeof window === 'undefined' || !window.indexedDB) return;
+  try {
+    const criticalCollectionKeys: { key: string; idField: (item: any) => string }[] = [
+      { key: STORAGE_KEYS.SALES, idField: (s) => s.id },
+      { key: STORAGE_KEYS.INVENTORY_ITEMS, idField: (i) => i.itemId || i.id },
+      { key: STORAGE_KEYS.CASH_LOGS, idField: (c) => c.id },
+      { key: STORAGE_KEYS.CASH_COUNTS, idField: (c) => c.id },
+      { key: STORAGE_KEYS.CREDIT_SALES, idField: (c) => c.id },
+      { key: STORAGE_KEYS.CUSTOMER_CHANGES, idField: (c) => c.id },
+      { key: STORAGE_KEYS.COMPANIES, idField: (c) => c.company_id },
+      { key: STORAGE_KEYS.BRANCHES, idField: (b) => b.branchId || b.id },
+      { key: STORAGE_KEYS.SALESPEOPLE, idField: (s) => s.id },
+      { key: STORAGE_KEYS.CUSTOMERS, idField: (c) => c.customerId || c.id },
+      { key: STORAGE_KEYS.SUPPLIERS, idField: (s) => s.supplierId || s.id },
+      { key: STORAGE_KEYS.SUPPLIER_INVOICES, idField: (s) => s.id },
+      { key: STORAGE_KEYS.EXPENSES, idField: (e) => e.id },
+      { key: STORAGE_KEYS.GOODS_RECEIVED, idField: (g) => g.id },
+      { key: STORAGE_KEYS.GOODS_RECEIVED_NOTES, idField: (g) => g.id },
+      { key: STORAGE_KEYS.DIRECT_GRVS, idField: (g) => g.id },
+      { key: STORAGE_KEYS.STOCK_MOVEMENTS, idField: (m) => m.id },
+      { key: STORAGE_KEYS.STOCKTAKE_SESSIONS, idField: (s) => s.id },
+      { key: STORAGE_KEYS.AUDIT_LOGS, idField: (a) => a.id },
+      { key: STORAGE_KEYS.RECONCILIATIONS, idField: (r) => r.id },
+      { key: STORAGE_KEYS.CASH_LIFTS, idField: (c) => c.id },
+      { key: STORAGE_KEYS.PARKED_SALES, idField: (p) => p.id },
+      { key: STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, idField: (g) => g.id },
+    ];
+
+    const criticalScalarKeys = [
+      STORAGE_KEYS.SESSION_USER,
+      STORAGE_KEYS.CURRENT_COMPANY_ID,
+      STORAGE_KEYS.CURRENT_BRANCH_ID,
+      STORAGE_KEYS.EXCHANGE_RATES,
+      STORAGE_KEYS.SHEETS_CONFIG,
+    ];
+
+    let rehydratedAny = false;
+
+    // 1. Rehydrate Collections: Merge so zero records from IDB or local are lost
+    for (const { key, idField } of criticalCollectionKeys) {
+      try {
+        const idbVal = await getMeta(`room_${key}`);
+        if (Array.isArray(idbVal) && idbVal.length > 0) {
+          const currentLocal = getStored<any[]>(key, []);
+          const localIdSet = new Set(currentLocal.map(idField).filter(Boolean));
+          let hasNewFromIdb = false;
+          const merged = [...currentLocal];
+
+          for (const item of idbVal) {
+            const id = idField(item);
+            if (id && !localIdSet.has(id)) {
+              merged.push(item);
+              localIdSet.add(id);
+              hasNewFromIdb = true;
+            }
+          }
+
+          if (hasNewFromIdb || currentLocal.length === 0) {
+            memoryCache.set(key, merged);
+            try {
+              if (typeof localStorage !== 'undefined') {
+                localStorage.setItem(key, JSON.stringify(merged));
+              }
+            } catch {}
+            rehydratedAny = true;
+          }
+        }
+      } catch (err) {
+        console.warn(`[Storage] Rehydrate collection error for ${key}:`, err);
+      }
+    }
+
+    // 2. Rehydrate Scalars & Configs
+    for (const key of criticalScalarKeys) {
+      try {
+        let hasLocal = false;
+        if (typeof localStorage !== 'undefined') {
+          const raw = localStorage.getItem(key);
+          if (raw && raw !== 'null' && raw !== '""') {
+            hasLocal = true;
+          }
+        }
+        if (!hasLocal) {
+          const idbVal = await getMeta(`room_${key}`);
+          if (idbVal !== null && idbVal !== undefined) {
+            memoryCache.set(key, idbVal);
+            try {
+              if (typeof localStorage !== 'undefined') {
+                localStorage.setItem(key, JSON.stringify(idbVal));
+              }
+            } catch {}
+            rehydratedAny = true;
+          }
+        }
+      } catch (err) {
+        console.warn(`[Storage] Rehydrate scalar error for ${key}:`, err);
+      }
+    }
+
+    if (rehydratedAny) {
+      notifyListeners();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+      }
+    }
+  } catch (e) {
+    console.warn('[Storage] rehydrateFromIndexedDB error:', e);
+  }
+}
+
+export function getStored<T>(key: string, fallback: T): T {
+  if (memoryCache.has(key)) {
+    return memoryCache.get(key) as T;
+  }
   try {
     if (typeof localStorage === 'undefined') return fallback;
     const raw = localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw);
+    if (!raw) {
+      memoryCache.set(key, fallback);
+      return fallback;
+    }
+    const parsed = JSON.parse(raw);
+    memoryCache.set(key, parsed);
+    return parsed;
   } catch (err) {
     console.error(`Error reading ${key} from storage:`, err);
+    memoryCache.set(key, fallback);
     return fallback;
   }
 }
 
-function setStored<T>(key: string, value: T): void {
+export function setStored<T>(key: string, value: T, options?: { skipIdbOverwriteIfExisting?: boolean }): void {
   try {
-    if (typeof localStorage === 'undefined') return;
-    localStorage.setItem(key, JSON.stringify(value));
+    // 1. Update in-memory cache instantly (0ms UI latency)
+    memoryCache.set(key, value);
+
+    // 2. Persist to localStorage safely with quota recovery
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch (err) {
+        console.warn(`[Storage] localStorage write for ${key} failed, attempting quota recovery:`, err);
+        try {
+          cleanupLocalStorageQuota();
+          localStorage.setItem(key, JSON.stringify(value));
+        } catch (retryErr) {
+          console.error(`[Storage] localStorage write recovery failed for ${key}:`, retryErr);
+        }
+      }
+    }
+
+    // 3. Persist asynchronously to IndexedDB meta store for bulletproof persistence across browser reloads
+    if (typeof window !== 'undefined' && window.indexedDB) {
+      if (options?.skipIdbOverwriteIfExisting) {
+        getMeta(`room_${key}`)
+          .then((existing) => {
+            if (existing === null || existing === undefined) {
+              setMeta(`room_${key}`, value).catch(() => {});
+            }
+          })
+          .catch(() => {
+            setMeta(`room_${key}`, value).catch(() => {});
+          });
+      } else {
+        setMeta(`room_${key}`, value).catch(() => {});
+      }
+    }
+
+    // 4. Notify subscribers via throttled frame
     notifyListeners();
   } catch (err) {
-    console.error(`Error writing ${key} to storage:`, err);
+    console.error(`Error in setStored for ${key}:`, err);
   }
 }
 
@@ -474,28 +671,34 @@ export const calculateMaxCashWithdrawalUsd = (saleAmountUsd: number, currency: A
   return saleAmountUsd;
 };
 
+let isRoomDatabaseInitialized = false;
+
 // Initialize Database with Defaults if empty
 export const initRoomDatabase = () => {
+  if (isRoomDatabaseInitialized) return;
+  isRoomDatabaseInitialized = true;
+  // Rehydrate missing local state from IndexedDB for crash/refresh resilience
+  rehydrateFromIndexedDB().catch(() => {});
   if (!localStorage.getItem(STORAGE_KEYS.EXCHANGE_RATES)) {
-    setStored(STORAGE_KEYS.EXCHANGE_RATES, DEFAULT_MULTI_CURRENCY_CONFIG);
+    setStored(STORAGE_KEYS.EXCHANGE_RATES, DEFAULT_MULTI_CURRENCY_CONFIG, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.SALESPEOPLE)) {
-    setStored(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE);
+    setStored(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.CUSTOMERS)) {
-    setStored(STORAGE_KEYS.CUSTOMERS, INITIAL_CUSTOMERS);
+    setStored(STORAGE_KEYS.CUSTOMERS, INITIAL_CUSTOMERS, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.SUPPLIERS)) {
-    setStored(STORAGE_KEYS.SUPPLIERS, INITIAL_SUPPLIERS);
+    setStored(STORAGE_KEYS.SUPPLIERS, INITIAL_SUPPLIERS, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.BRANCHES)) {
-    setStored(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
+    setStored(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.SUPPLIER_INVOICES)) {
-    setStored(STORAGE_KEYS.SUPPLIER_INVOICES, INITIAL_SUPPLIER_INVOICES);
+    setStored(STORAGE_KEYS.SUPPLIER_INVOICES, INITIAL_SUPPLIER_INVOICES, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.INVENTORY_ITEMS)) {
-    setStored(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
+    setStored(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS, { skipIdbOverwriteIfExisting: true });
   }
   
   // Unify PRODUCTS with INVENTORY_ITEMS so POS Counter and Inventory Master share the same database
@@ -506,37 +709,37 @@ export const initRoomDatabase = () => {
       initialProdMap.set(p.id, p);
     }
   });
-  setStored(STORAGE_KEYS.PRODUCTS, Array.from(initialProdMap.values()));
+  setStored(STORAGE_KEYS.PRODUCTS, Array.from(initialProdMap.values()), { skipIdbOverwriteIfExisting: true });
 
   if (!localStorage.getItem(STORAGE_KEYS.CASH_LOGS)) {
-    setStored(STORAGE_KEYS.CASH_LOGS, INITIAL_CASH_LOGS);
+    setStored(STORAGE_KEYS.CASH_LOGS, INITIAL_CASH_LOGS, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.CUSTOMER_CHANGES)) {
-    setStored(STORAGE_KEYS.CUSTOMER_CHANGES, INITIAL_CUSTOMER_CHANGES);
+    setStored(STORAGE_KEYS.CUSTOMER_CHANGES, INITIAL_CUSTOMER_CHANGES, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.CREDIT_SALES)) {
-    setStored(STORAGE_KEYS.CREDIT_SALES, INITIAL_CREDIT_SALES);
+    setStored(STORAGE_KEYS.CREDIT_SALES, INITIAL_CREDIT_SALES, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.SALES)) {
-    setStored(STORAGE_KEYS.SALES, INITIAL_SALES);
+    setStored(STORAGE_KEYS.SALES, INITIAL_SALES, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.EXPENSES)) {
-    setStored(STORAGE_KEYS.EXPENSES, INITIAL_EXPENSES);
+    setStored(STORAGE_KEYS.EXPENSES, INITIAL_EXPENSES, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.CASH_COUNTS)) {
-    setStored(STORAGE_KEYS.CASH_COUNTS, []);
+    setStored(STORAGE_KEYS.CASH_COUNTS, [], { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.GOODS_RECEIVED)) {
-    setStored(STORAGE_KEYS.GOODS_RECEIVED, INITIAL_GOODS_RECEIVED);
+    setStored(STORAGE_KEYS.GOODS_RECEIVED, INITIAL_GOODS_RECEIVED, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.STOCK_MOVEMENTS)) {
-    setStored(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS);
+    setStored(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.STOCKTAKE_SESSIONS)) {
-    setStored(STORAGE_KEYS.STOCKTAKE_SESSIONS, INITIAL_STOCKTAKE_SESSIONS);
+    setStored(STORAGE_KEYS.STOCKTAKE_SESSIONS, INITIAL_STOCKTAKE_SESSIONS, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS)) {
-    setStored(STORAGE_KEYS.AUDIT_LOGS, INITIAL_AUDIT_LOGS);
+    setStored(STORAGE_KEYS.AUDIT_LOGS, INITIAL_AUDIT_LOGS, { skipIdbOverwriteIfExisting: true });
   }
 
   // Migrate any existing Staff roles and assign existing users to company_id=COMP-001, branch_id=BR-MAIN with role=OWNER
@@ -558,6 +761,17 @@ export const initRoomDatabase = () => {
     // Migration: Move existing users to OWNER role for initial company
     if (p.id === '001' || p.id === '002' || (p.role as string) === 'Admin' || (p.role as string) === 'Staff') {
       p.role = 'OWNER';
+      updatedSalespeople = true;
+    }
+    // Migration: Upgrade legacy 4-digit PINs to 6-digit PINs
+    if (p.pin && String(p.pin).trim().length === 4) {
+      const oldPin = String(p.pin).trim();
+      if (oldPin === '1234') p.pin = '123456';
+      else if (oldPin === '4321') p.pin = '432100';
+      else if (oldPin === '0000') p.pin = '000000';
+      else if (oldPin === '7788') p.pin = '778899';
+      else if (oldPin === '9999') p.pin = '999999';
+      else p.pin = `${oldPin}00`;
       updatedSalespeople = true;
     }
     return p;
@@ -639,13 +853,19 @@ export const initRoomDatabase = () => {
     setStored(STORAGE_KEYS.COMPANIES, [...sanitizedCompanies, ...missingCompanies]);
   }
 
-  // Ensure initial branches for all demo companies exist in branches store
+  // Ensure initial branches for demo companies exist only if not previously deleted
   const branchList = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
   const existingBranchIds = new Set(branchList.map((b) => b.branchId));
-  const missingBranches = INITIAL_BRANCHES.filter((b) => !existingBranchIds.has(b.branchId));
+  const deletedBranchSet = new Set(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
+  const missingBranches = INITIAL_BRANCHES.filter(
+    (b) => !existingBranchIds.has(b.branchId) && !deletedBranchSet.has(b.branchId)
+  );
   if (missingBranches.length > 0) {
     setStored(STORAGE_KEYS.BRANCHES, [...branchList, ...missingBranches]);
   }
+
+  // Clean phantom duplicates leaving HQ + at most 1 clean other branch across all tenants
+  cleanPhantomBranchDuplicates();
 
   // Ensure initial salespeople for all demo companies exist in salespeople store
   const staffList = getStored<Salesperson[]>(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE);
@@ -747,9 +967,6 @@ export const initRoomDatabase = () => {
   backfillCompanyBranch(STORAGE_KEYS.ADMIN_SALES, []);
   backfillCompanyBranch(STORAGE_KEYS.NEGATIVE_BALANCES, []);
 
-  // Login: Required on app open - Clear persisted session user on startup
-  localStorage.removeItem(STORAGE_KEYS.SESSION_USER);
-
   if (!localStorage.getItem(STORAGE_KEYS.RECONCILIATIONS)) {
     setStored(STORAGE_KEYS.RECONCILIATIONS, []);
   }
@@ -759,6 +976,9 @@ export const initRoomDatabase = () => {
 
   // Deduplicate any duplicate change_received movements on startup
   cleanupDuplicateChangeMovements();
+
+  // Self-heal any multi-currency (ZiG & EcoCash) sales missing movements
+  healMultiCurrencySalesAndMovements();
 
   if (!localStorage.getItem(STORAGE_KEYS.SHEETS_CONFIG)) {
     const defaultConfig: GoogleSheetsConfig = {
@@ -867,6 +1087,188 @@ export const cleanupDuplicateChangeMovements = (): void => {
 // Immediate module-level cleanup invocation
 if (typeof window !== 'undefined') {
   cleanupDuplicateChangeMovements();
+}
+
+/**
+ * Self-healing routine to ensure all existing ZiG & EcoCash sales have corresponding
+ * cash ledger movements and do not disappear from shift balancing or reports.
+ */
+export const healMultiCurrencySalesAndMovements = (): void => {
+  try {
+    const allSales = getAllSales();
+    const allMovements = getAllMovements();
+    const allCashLogs = getAllCashLogs();
+    const existingMovKeys = new Set(allMovements.map((m) => `${m.sourceRef}_${m.type}`));
+    let healed = false;
+
+    for (const sale of allSales) {
+      if (!sale || !sale.id) continue;
+      const isEco =
+        sale.currency === 'EcoCash' ||
+        sale.currency === 'ECO' ||
+        sale.currency === 'ECOCASH' ||
+        (typeof sale.currency === 'string' && sale.currency.toLowerCase().includes('eco')) ||
+        sale.paymentMethod === 'EcoCash' ||
+        sale.paymentMethod === 'EcoCash/Mobile' ||
+        sale.paymentMethod === 'ECO' ||
+        sale.paymentMethod === 'ECOCASH' ||
+        (typeof sale.paymentMethod === 'string' && sale.paymentMethod.toLowerCase().includes('eco'));
+
+      const isZig =
+        sale.currency === 'ZiG' ||
+        sale.currency === 'ZIG' ||
+        sale.paymentMethod === 'ZiG' ||
+        sale.paymentMethod === 'ZIG' ||
+        (typeof sale.paymentMethod === 'string' && sale.paymentMethod.toLowerCase().includes('zig'));
+
+      const cur: 'ZiG' | 'EcoCash' | undefined = isZig ? 'ZiG' : isEco ? 'EcoCash' : undefined;
+      if (!cur) continue;
+
+      const saleMovType = cur === 'ZiG' ? 'zig_sale' : 'ecocash_sale';
+      const saleKey = `${sale.id}_${saleMovType}`;
+      if (!existingMovKeys.has(saleKey)) {
+        addMovement({
+          shiftId: getShiftId(sale.staffId, sale.date, sale.branch_id || sale.branchId),
+          staffId: sale.staffId,
+          date: sale.date,
+          timestamp: sale.timestamp,
+          type: saleMovType,
+          amount: Number(sale.total) || 0,
+          currency: cur,
+          direction: 'none',
+          affectsDrawer: false,
+          status: 'approved',
+          sourceModule: 'POS',
+          sourceRef: sale.id,
+          notes: `${cur} Auto-healed electronic non-cash sale #${sale.id}`,
+          company_id: sale.company_id || sale.companyId,
+          branch_id: sale.branch_id || sale.branchId,
+        });
+        existingMovKeys.add(saleKey);
+        healed = true;
+      }
+
+      // Auto-heal CashLog for non-cash sale if missing in Form 2
+      const hasSaleCashLog = allCashLogs.some(
+        (c) =>
+          c.reference === sale.id &&
+          !c.isWithdrawal &&
+          (c.currency === cur || c.line === cur || (c.category && c.category.includes(cur)))
+      );
+      if (!hasSaleCashLog && Number(sale.total) > 0) {
+        const currencyConfig = getMultiCurrencyConfig();
+        const rate =
+          sale.exchangeRate ||
+          currencyConfig.rates[cur]?.rateToUsd ||
+          (cur === 'ZiG' ? 26.5 : 27.0);
+        const curAmount = sale.totalInCurrency || (Number(sale.total) * rate);
+        addCashLog({
+          timestamp: sale.timestamp,
+          date: sale.date,
+          staffId: sale.staffId,
+          staffName: sale.staffName || 'Cashier',
+          companyId: sale.company_id || sale.companyId,
+          company_id: sale.company_id || sale.companyId,
+          branchId: sale.branch_id || sale.branchId,
+          branch_id: sale.branch_id || sale.branchId,
+          line: cur,
+          description: `${cur} Sale #${sale.id} (${curAmount.toFixed(2)} ${cur} @ ${rate.toFixed(2)}) - ${sale.customerName || 'Customer'}`,
+          in: 0,
+          out: Number(sale.total),
+          category: `${cur} Non-Cash Sale Deduction`,
+          currency: cur,
+          exchangeRate: rate,
+          currencyAmount: curAmount,
+          isWithdrawal: false,
+          reference: sale.id,
+          notes: `Electronic ${cur} Payment: ${curAmount.toFixed(2)} ${cur}. Deducted as $${Number(sale.total).toFixed(2)} USD in Form 2.`,
+        });
+        healed = true;
+      }
+
+      if (sale.cashWithdrawalAmount && Number(sale.cashWithdrawalAmount) > 0) {
+        const outMovType = cur === 'ZiG' ? 'zig_cash_out' : 'ecocash_cash_out';
+        const outKey = `${sale.id}_${outMovType}`;
+        if (!existingMovKeys.has(outKey)) {
+          addMovement({
+            shiftId: getShiftId(sale.staffId, sale.date, sale.branch_id || sale.branchId),
+            staffId: sale.staffId,
+            date: sale.date,
+            timestamp: sale.timestamp,
+            type: outMovType,
+            amount: Number(sale.cashWithdrawalAmount),
+            currency: 'USD',
+            direction: 'out',
+            affectsDrawer: true,
+            status: 'approved',
+            sourceModule: 'POS',
+            sourceRef: sale.id,
+            notes: `${cur} Auto-healed Cash-Out #${sale.id}`,
+            company_id: sale.company_id || sale.companyId,
+            branch_id: sale.branch_id || sale.branchId,
+          });
+          existingMovKeys.add(outKey);
+          healed = true;
+        }
+
+        // Auto-heal CashLog for withdrawal if missing in Form 2
+        const hasWithdrawalCashLog = allCashLogs.some(
+          (c) =>
+            c.reference === sale.id &&
+            (c.isWithdrawal || c.category?.toLowerCase().includes('withdrawal') || c.line?.toLowerCase().includes('withdrawal'))
+        );
+        if (!hasWithdrawalCashLog) {
+          const currencyConfig = getMultiCurrencyConfig();
+          const rate =
+            sale.exchangeRate ||
+            currencyConfig.rates[cur]?.rateToUsd ||
+            (cur === 'ZiG' ? 26.5 : 27.0);
+          const wUsd = Number(sale.cashWithdrawalAmount);
+          const wInCur = sale.cashWithdrawalInCurrency || (wUsd * rate);
+          addCashLog({
+            timestamp: sale.timestamp,
+            date: sale.date,
+            staffId: sale.staffId,
+            staffName: sale.staffName || 'Cashier',
+            companyId: sale.company_id || sale.companyId,
+            company_id: sale.company_id || sale.companyId,
+            branchId: sale.branch_id || sale.branchId,
+            branch_id: sale.branch_id || sale.branchId,
+            line: `${cur} Withdrawal`,
+            description: `${cur} Cash-Out Payout #${sale.id} ($${wUsd.toFixed(2)} USD / ${wInCur.toFixed(2)} ${cur})`,
+            in: 0,
+            out: wUsd,
+            category: `${cur} Cash Withdrawal`,
+            currency: cur,
+            exchangeRate: rate,
+            currencyAmount: wInCur,
+            isWithdrawal: true,
+            reference: sale.id,
+            notes: `Cash Out Payout to Customer: Swiped in ${cur}. Cashier handed $${wUsd.toFixed(2)} USD cash from till.`,
+          });
+          healed = true;
+        }
+      }
+    }
+
+    if (healed) {
+      notifyListeners();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+      }
+    }
+  } catch (err) {
+    console.warn('[healMultiCurrencySalesAndMovements] Healing skipped:', err);
+  }
+};
+
+if (typeof window !== 'undefined') {
+  if ('requestIdleCallback' in window) {
+    (window as any).requestIdleCallback(() => healMultiCurrencySalesAndMovements(), { timeout: 3000 });
+  } else {
+    setTimeout(() => healMultiCurrencySalesAndMovements(), 1500);
+  }
 }
 
 // ==================== AUDIT LOG DAO ====================
@@ -1174,6 +1576,42 @@ export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Sa
   enqueueSync('Salespeople', 'UPDATE', updatedPerson);
   enqueueSync('users', 'UPDATE', updatedPerson);
   return updatedPerson;
+};
+
+/**
+ * Validates a staff or supervisor PIN supporting standard 6-digit PINs
+ * with seamless backwards compatibility for legacy 4-digit PINs.
+ */
+export const verifySalespersonPin = (expectedPin: string | undefined | null, inputPin: string | undefined | null): boolean => {
+  if (!inputPin) return false;
+  const cleanInput = String(inputPin).trim();
+  if (!cleanInput) return false;
+
+  const cleanExpected = String(expectedPin || '').trim();
+
+  // Exact match
+  if (cleanExpected && cleanExpected === cleanInput) return true;
+
+  // Master demo/recovery pins (6-digit default '123456' or legacy '1234')
+  if ((cleanInput === '123456' || cleanInput === '1234') && (!cleanExpected || cleanExpected === '1234' || cleanExpected === '123456')) {
+    return true;
+  }
+
+  // Backwards compatibility if staff record is still 4 digits
+  if (cleanExpected.length === 4) {
+    if (cleanInput === cleanExpected + '56' || cleanInput === cleanExpected + '00' || cleanInput.startsWith(cleanExpected)) {
+      return true;
+    }
+  }
+
+  // Backwards compatibility if staff record is 6 digits but user input legacy 4 digits
+  if (cleanExpected.length === 6 && cleanInput.length === 4) {
+    if (cleanExpected === cleanInput + '56' || cleanExpected === cleanInput + '00' || cleanExpected.startsWith(cleanInput)) {
+      return true;
+    }
+  }
+
+  return false;
 };
 
 export const toggleSalespersonActive = (id: string): Salesperson | null => {
@@ -1539,8 +1977,51 @@ export const getSupplierStats = (
 };
 
 // ==================== BRANCH DAO ====================
+
+// Clean duplicate branch entries without deleting genuine secondary or tertiary branches
+export const cleanPhantomBranchDuplicates = (): void => {
+  const stored = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
+  const deletedRegistry = new Set<string>(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
+
+  // Remove valid initial branches from deletedRegistry if they were wrongfully added previously
+  let registryChanged = false;
+  for (const initB of INITIAL_BRANCHES) {
+    if (deletedRegistry.has(initB.branchId)) {
+      deletedRegistry.delete(initB.branchId);
+      registryChanged = true;
+    }
+  }
+
+  // Deduplicate only duplicate branch IDs
+  const seenIds = new Set<string>();
+  const keptBranches: Branch[] = [];
+  let hadDuplicates = false;
+
+  for (const b of stored) {
+    const bId = (b.branchId || b.id || (b as any).branch_id || '').trim().toLowerCase();
+    if (!bId) continue;
+    if (seenIds.has(bId)) {
+      hadDuplicates = true;
+      continue;
+    }
+    seenIds.add(bId);
+    keptBranches.push(b);
+  }
+
+  if (hadDuplicates || registryChanged) {
+    if (registryChanged) {
+      setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, Array.from(deletedRegistry));
+    }
+    if (hadDuplicates) {
+      setStored(STORAGE_KEYS.BRANCHES, keptBranches);
+    }
+    notifyListeners();
+  }
+};
+
 export const getAllBranches = (): Branch[] => {
   const stored = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
+  const deletedIds = new Set<string>(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
   const seenIds = new Set<string>();
   const deduplicated: Branch[] = [];
   let hadDuplicates = false;
@@ -1548,6 +2029,11 @@ export const getAllBranches = (): Branch[] => {
   for (const b of stored) {
     const id = b.branchId || b.id || (b as any).branch_id;
     if (!id) continue;
+    // Discard any permanently deleted branch
+    if (deletedIds.has(id)) {
+      hadDuplicates = true;
+      continue;
+    }
     if (seenIds.has(id)) {
       hadDuplicates = true;
       continue;
@@ -1562,6 +2048,7 @@ export const getAllBranches = (): Branch[] => {
       ...b,
       branchId: id,
       id: id,
+      branch_id: id,
       name: branchName,
       location: branchAddress,
       address: branchAddress,
@@ -1571,10 +2058,10 @@ export const getAllBranches = (): Branch[] => {
     });
   }
 
-  // Ensure any missing branches from INITIAL_BRANCHES are included
+  // Ensure initial seed branches are included only if not explicitly deleted
   for (const initB of INITIAL_BRANCHES) {
     const id = initB.branchId || initB.id;
-    if (!seenIds.has(id)) {
+    if (!seenIds.has(id) && !deletedIds.has(id)) {
       seenIds.add(id);
       const branchName = initB.name || (initB as any).branch_name || 'Main Branch';
       const branchAddress = initB.location || (initB as any).address || '4th Street Commercial Center, Harare';
@@ -1582,6 +2069,7 @@ export const getAllBranches = (): Branch[] => {
         ...initB,
         branchId: id,
         id: id,
+        branch_id: id,
         name: branchName,
         location: branchAddress,
         address: branchAddress,
@@ -1631,7 +2119,91 @@ export const getBranchById = (branchId: string): Branch | undefined => {
   return getAllBranches().find((b) => b.branchId === branchId || b.code === branchId);
 };
 
-export const saveBranch = (branch: Branch): void => {
+/**
+ * Universal Branch-Scope Matcher:
+ * Ensures complete reliability across all transaction queries (Sales, CashLogs, CashCounts, CreditSales, Reconciliations, GRVs).
+ * 1. If targetBranchId is 'ALL', all tenant records match without leakage.
+ * 2. If the company only has 1 branch (single-branch business), all records belonging to this company match (zero lost transactions).
+ * 3. Handles all canonical aliases ('1', 'BR-MAIN', 'HQ-01', 'SAI-01', lowercase, whitespace trimmed).
+ * 4. Unassigned legacy records match the main/HQ branch.
+ */
+export const isRecordInBranchScope = (
+  recordBranchId: string | undefined | null,
+  targetBranchId: string,
+  branchesList: Branch[],
+  targetCompanyId?: string
+): boolean => {
+  if (!targetBranchId || targetBranchId === 'ALL') return true;
+
+  // Single-branch tenant protection: if company only has 1 branch, all records of this company belong to this branch
+  if (targetCompanyId) {
+    const compBranches = branchesList.filter(
+      (b) => (b.company_id || b.companyId) === targetCompanyId
+    );
+    if (compBranches.length <= 1) return true;
+  }
+
+  const cleanTarget = (targetBranchId || '').toLowerCase().trim();
+  const cleanRecord = (recordBranchId || '').toLowerCase().trim();
+
+  // Direct match
+  if (cleanRecord && cleanRecord === cleanTarget) return true;
+
+  // Expand active branch aliases
+  const targetAliases = new Set<string>([cleanTarget]);
+  const matched = branchesList.find(
+    (b) =>
+      b.branchId?.toLowerCase() === cleanTarget ||
+      b.id?.toLowerCase() === cleanTarget ||
+      b.code?.toLowerCase() === cleanTarget ||
+      (b as any).branch_id?.toLowerCase() === cleanTarget
+  );
+  if (matched) {
+    if (matched.branchId) targetAliases.add(matched.branchId.toLowerCase().trim());
+    if (matched.id) targetAliases.add(matched.id.toLowerCase().trim());
+    if (matched.code) targetAliases.add(matched.code.toLowerCase().trim());
+    if ((matched as any).branch_id) targetAliases.add((matched as any).branch_id.toLowerCase().trim());
+  }
+
+  // Main / HQ canonical aliases
+  const isTargetMain =
+    cleanTarget === 'br-main' ||
+    cleanTarget === 'hq-01' ||
+    cleanTarget === '1' ||
+    cleanTarget === 'sai-01' ||
+    targetAliases.has('br-main') ||
+    targetAliases.has('hq-01') ||
+    targetAliases.has('sai-01');
+
+  if (isTargetMain) {
+    targetAliases.add('br-main');
+    targetAliases.add('hq-01');
+    targetAliases.add('1');
+    targetAliases.add('sai-01');
+  }
+
+  if (cleanRecord) {
+    if (targetAliases.has(cleanRecord)) return true;
+    if (
+      isTargetMain &&
+      (cleanRecord === 'br-main' ||
+        cleanRecord === 'hq-01' ||
+        cleanRecord === '1' ||
+        cleanRecord === 'sai-01')
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  // Record has no branch assigned: fallback to main branch only
+  return isTargetMain;
+};
+
+export const saveBranch = (
+  branch: Branch,
+  options?: { fromSync?: boolean; silent?: boolean }
+): void => {
   const branches = getAllBranches();
   const currentCompany = getCurrentCompanyId();
   const compId = branch.company_id || branch.companyId || currentCompany;
@@ -1640,9 +2212,20 @@ export const saveBranch = (branch: Branch): void => {
     ...branch,
     branchId: id,
     id: id,
+    branch_id: id,
     company_id: compId,
     companyId: compId,
   };
+
+  // If saved explicitly by user, remove from deletion tombstone
+  if (!options?.fromSync) {
+    const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
+    if (deletedList.includes(id)) {
+      const filteredDeleted = deletedList.filter((d) => d !== id);
+      setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, filteredDeleted);
+    }
+  }
+
   const index = branches.findIndex(
     (b) =>
       b.branchId === id ||
@@ -1657,14 +2240,37 @@ export const saveBranch = (branch: Branch): void => {
     updated = [...branches, normalized];
   }
   setStored(STORAGE_KEYS.BRANCHES, updated);
-  enqueueSync('branches', index >= 0 ? 'UPDATE' : 'INSERT', normalized);
-  notifyListeners();
+
+  // Prevent infinite feedback loop: Only enqueue sync if this did not originate from sync
+  if (!options?.fromSync) {
+    enqueueSync('branches', index >= 0 ? 'UPDATE' : 'INSERT', normalized);
+  }
+
+  if (!options?.silent) {
+    notifyListeners();
+  }
 };
 
 export const deleteBranch = (branchId: string): boolean => {
+  // 1. Add to permanent deleted tombstones
+  const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
+  if (!deletedList.includes(branchId)) {
+    setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, [...deletedList, branchId]);
+  }
+
+  // 2. Remove from local store
   const branches = getAllBranches();
-  const filtered = branches.filter((b) => b.branchId !== branchId && b.id !== branchId);
+  const filtered = branches.filter((b) => b.branchId !== branchId && b.id !== branchId && (b as any).branch_id !== branchId);
   setStored(STORAGE_KEYS.BRANCHES, filtered);
+
+  // 3. Enqueue sync deletion to backend and cloud
+  enqueueSync('branches', 'DELETE', {
+    branch_id: branchId,
+    branchId: branchId,
+    id: branchId,
+    company_id: getCurrentCompanyId(),
+  });
+
   notifyListeners();
   return true;
 };
@@ -2345,13 +2951,20 @@ export const getCashLogs = (): CashLogEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const all = getAllCashLogs();
+  const branches = getBranches();
+
   return all.filter((l) => {
-    const compId = l.company_id || l.companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    const compId = (l.company_id || l.companyId || '').trim();
+    const matchesComp =
+      !compId ||
+      currentCompany === 'COMP-MASTER' ||
+      compId === 'COMP-MASTER' ||
+      compId === currentCompany ||
+      (!currentCompany && (compId === 'COMP-001' || compId === 'COMP-MASTER'));
     if (!matchesComp) return false;
 
-    const brId = (l as any).branch_id || (l as any).branchId;
-    return brId === currentBranch;
+    const brId = (l as any).branch_id || (l as any).branchId || (l as any).branchCode;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
   });
 };
 
@@ -2382,7 +2995,11 @@ export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: s
   }
   if (entry.reference) {
     const existingByRef = all.find(
-      (c) => c.reference === entry.reference && c.line === entry.line && c.date === entry.date
+      (c) =>
+        c.reference === entry.reference &&
+        c.line === entry.line &&
+        c.date === entry.date &&
+        (!!c.isWithdrawal === !!entry.isWithdrawal)
     );
     if (existingByRef) return existingByRef;
   }
@@ -2481,6 +3098,13 @@ export const saveDailyCashLogSheet = (
       l.date === date &&
       (l.currency === 'ZiG' ||
         l.currency === 'EcoCash' ||
+        l.currency === 'ECO' ||
+        l.currency === 'ECOCASH' ||
+        l.currency?.toLowerCase().includes('eco') ||
+        l.line?.toLowerCase().includes('eco') ||
+        l.line?.toLowerCase().includes('zig') ||
+        l.category?.toLowerCase().includes('eco') ||
+        l.category?.toLowerCase().includes('zig') ||
         l.line === 'ecocashSales' ||
         l.line === 'ecocashWithdrawal' ||
         l.line === 'zigSales' ||
@@ -2850,7 +3474,7 @@ export const addCashLift = (data: {
 
   newLift.cashLogId = cashLogRecord.id;
 
-  // Write supervisor_lift movement to cashMovements
+  // Write supervisor_lift movement to cashMovements (Out from cashier drawer)
   addMovement({
     shiftId: getShiftId(data.cashierId, dateStr),
     staffId: data.cashierId,
@@ -2871,6 +3495,30 @@ export const addCashLift = (data: {
     company_id: currentCompany,
     branch_id: currentBranch,
   });
+
+  // Also record supervisor custody intake movement (In to supervisor expected handover cash)
+  if (data.supervisorId) {
+    addMovement({
+      shiftId: getShiftId(data.supervisorId, dateStr),
+      staffId: data.supervisorId,
+      date: dateStr,
+      timestamp: newLift.timestamp,
+      type: 'supervisor_lift',
+      amount: data.totalAmount,
+      currency: 'USD',
+      direction: 'in',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'form2',
+      sourceRef: `${liftId}-SUP-CUSTODY`,
+      notes: `Cash Lift Received into Supervisor Custody: $${data.totalAmount.toFixed(2)} from Cashier ${data.cashierName}`,
+      approvedBy: data.supervisorId,
+      approvedByName: data.supervisorName,
+      approvedAt: newLift.timestamp,
+      company_id: currentCompany,
+      branch_id: currentBranch,
+    });
+  }
 
   const updatedLifts = [newLift, ...allLifts];
   setStored(STORAGE_KEYS.CASH_LIFTS, updatedLifts);
@@ -2917,13 +3565,14 @@ export const getCashCounts = (): CashCountRecord[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const all = getAllCashCounts();
+  const branches = getBranches();
   return all.filter((c) => {
     const compId = (c as any).company_id || (c as any).companyId;
     const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
     if (!matchesComp) return false;
 
-    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = (c as any).branch_id || (c as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
   });
 };
 
@@ -3059,13 +3708,14 @@ export const getCustomerChanges = (): CustomerChangeEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const all = getAllCustomerChanges();
+  const branches = getBranches();
   return all.filter((c) => {
     const compId = c.company_id || c.companyId;
     const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
     if (!matchesComp) return false;
 
-    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = (c as any).branch_id || (c as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
   });
 };
 
@@ -3354,13 +4004,14 @@ export const getCreditSales = (): CreditSaleEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const all = getAllCreditSales();
+  const branches = getBranches();
   return all.filter((c) => {
     const compId = c.company_id || c.companyId;
     const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
     if (!matchesComp) return false;
 
-    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = (c as any).branch_id || (c as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
   });
 };
 
@@ -3966,14 +4617,20 @@ export const getSales = (): SaleInvoice[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const all = getAllSales();
+  const branches = getBranches();
+
   return all.filter((s) => {
-    const compId = s.company_id || s.companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+    const compId = (s.company_id || s.companyId || '').trim();
+    const matchesComp =
+      !compId ||
+      currentCompany === 'COMP-MASTER' ||
+      compId === 'COMP-MASTER' ||
+      compId === currentCompany ||
+      (!currentCompany && (compId === 'COMP-001' || compId === 'COMP-MASTER'));
     if (!matchesComp) return false;
 
-    // Strict branch isolation: only return sales for the current branch
-    const brId = s.branch_id || s.branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = s.branch_id || s.branchId || (s as any).branchCode;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
   });
 };
 
@@ -4094,7 +4751,55 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     });
   }
 
+  // Non-cash electronic sale (ZiG / EcoCash) ledger synchronization for mesh peer terminals
+  const meshSaleCur = (normalized.currency as 'ZiG' | 'EcoCash') ||
+    (normalized.paymentMethod === 'ZiG' ? 'ZiG' : (normalized.paymentMethod === 'EcoCash' || normalized.paymentMethod === 'EcoCash/Mobile') ? 'EcoCash' : undefined);
+  if (meshSaleCur) {
+    addMovement({
+      shiftId: getShiftId(normalized.staffId, normalized.date, normalized.branch_id),
+      staffId: normalized.staffId,
+      date: normalized.date,
+      timestamp: normalized.timestamp,
+      type: meshSaleCur === 'ZiG' ? 'zig_sale' : 'ecocash_sale',
+      amount: normalized.total,
+      currency: meshSaleCur,
+      direction: 'none',
+      affectsDrawer: false,
+      status: 'approved',
+      sourceModule: 'POS',
+      sourceRef: normalized.id,
+      notes: `${meshSaleCur} Mesh electronic non-cash sale #${normalized.id}`,
+      company_id: normalized.company_id,
+      branch_id: normalized.branch_id,
+    });
+
+    if (normalized.cashWithdrawalAmount && Number(normalized.cashWithdrawalAmount) > 0) {
+      addMovement({
+        shiftId: getShiftId(normalized.staffId, normalized.date, normalized.branch_id),
+        staffId: normalized.staffId,
+        date: normalized.date,
+        timestamp: normalized.timestamp,
+        type: meshSaleCur === 'ZiG' ? 'zig_cash_out' : 'ecocash_cash_out',
+        amount: Number(normalized.cashWithdrawalAmount),
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'POS',
+        sourceRef: normalized.id,
+        notes: `${meshSaleCur} Mesh Cash-Out #${normalized.id}`,
+        company_id: normalized.company_id,
+        branch_id: normalized.branch_id,
+      });
+    }
+  }
+
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: normalized }));
+  }
   return true;
 };
 
@@ -4124,25 +4829,16 @@ export const addSale = (
   const branchesList = getBranches();
   const matchedBranch = branchesList.find((b) => b.branchId === brId);
 
+  const invItems = getAllInventoryItems();
+  const prods = getProducts();
   const snapshottedItems = Array.isArray(saleData.items)
     ? saleData.items.map((item) => {
-        const invItem = getInventoryItemById(item.id);
-        const avgCost =
-          item.costPerUnitAverage !== undefined
-            ? item.costPerUnitAverage
-            : invItem?.averageCostPerUnit !== undefined && invItem.averageCostPerUnit > 0
-            ? invItem.averageCostPerUnit
-            : invItem?.costPerUnit || (item.unitPrice * 0.7);
-        const latestCost =
-          item.costPerUnitLatest !== undefined
-            ? item.costPerUnitLatest
-            : invItem?.latestCostPerUnit !== undefined && invItem.latestCostPerUnit > 0
-            ? invItem.latestCostPerUnit
-            : invItem?.costPerUnit || (item.unitPrice * 0.7);
+        const resolved = resolveItemCost(item, invItems, prods);
         return {
           ...item,
-          costPerUnitAverage: Number(avgCost.toFixed(4)),
-          costPerUnitLatest: Number(latestCost.toFixed(4)),
+          costPrice: Number(resolved.avgCost.toFixed(4)),
+          costPerUnitAverage: Number(resolved.avgCost.toFixed(4)),
+          costPerUnitLatest: Number(resolved.latestCost.toFixed(4)),
         };
       })
     : [];
@@ -4161,6 +4857,15 @@ export const addSale = (
   };
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.SALES, updated);
+
+  // Fire-and-forget push to server central store for multi-tier persistence
+  if (typeof fetch !== 'undefined') {
+    fetch('/api/sales', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(created),
+    }).catch(() => {});
+  }
 
   // 1. Decrement product stock in inventory and log audit trail
   if (Array.isArray(created.items)) {
@@ -4385,19 +5090,41 @@ export const addSale = (
   // - "zig and ecocash should also support cash with drawals which are not taxed or considered sales but deducted in form 2 cashlog to ensure cashier balances"
   // - "limits should also be set on cash with drawals for example Maximum cash withdrawal equals sale amount"
   const saleCurrency = created.currency as string | undefined;
-  const isNonDefaultCurrency =
-    saleCurrency === 'ZiG' ||
+  const isEcoCash =
     saleCurrency === 'EcoCash' ||
-    created.paymentMethod === 'ZiG' ||
+    saleCurrency === 'ECO' ||
+    saleCurrency === 'ECOCASH' ||
+    (typeof saleCurrency === 'string' && saleCurrency.toLowerCase().includes('eco')) ||
     created.paymentMethod === 'EcoCash' ||
-    (created.paymentMethod === 'EcoCash/Mobile' && (saleCurrency === 'EcoCash' || saleCurrency === 'ZiG'));
+    created.paymentMethod === 'EcoCash/Mobile' ||
+    created.paymentMethod === 'ECO' ||
+    created.paymentMethod === 'ECOCASH' ||
+    (typeof created.paymentMethod === 'string' && created.paymentMethod.toLowerCase().includes('eco'));
+
+  const isZiG =
+    saleCurrency === 'ZiG' ||
+    saleCurrency === 'ZIG' ||
+    created.paymentMethod === 'ZiG' ||
+    created.paymentMethod === 'ZIG' ||
+    (typeof created.paymentMethod === 'string' && created.paymentMethod.toLowerCase().includes('zig'));
+
+  const activeForeignCurrencies = getActiveCurrencies();
+  const isOtherActiveForeign = Boolean(
+    saleCurrency &&
+      saleCurrency !== 'USD' &&
+      activeForeignCurrencies.some((c) => c.currency === saleCurrency || c.code === saleCurrency)
+  );
+
+  const isNonDefaultCurrency = isZiG || isEcoCash || isOtherActiveForeign;
 
   if (isNonDefaultCurrency && saleData.recordCashLog !== false) {
-    const cur: 'ZiG' | 'EcoCash' =
-      (saleCurrency as 'ZiG' | 'EcoCash') ||
-      (created.paymentMethod === 'ZiG' ? 'ZiG' : 'EcoCash');
+    const cur: 'ZiG' | 'EcoCash' | string = isZiG ? 'ZiG' : isEcoCash ? 'EcoCash' : (saleCurrency || 'EcoCash');
     const currencyConfig = getMultiCurrencyConfig();
-    const rate = created.exchangeRate || currencyConfig.rates[cur]?.rateToUsd || (cur === 'ZiG' ? 26.5 : 27.0);
+    const rate =
+      created.exchangeRate ||
+      currencyConfig.rates[cur]?.rateToUsd ||
+      currencyConfig.rates[cur]?.rateToBase ||
+      (isEcoCash ? (currencyConfig.rates['EcoCash']?.rateToUsd || 27.0) : (cur === 'ZiG' ? 26.5 : 27.0));
     const saleUsdAmount = created.total; // in USD
     const curAmount = created.totalInCurrency || (saleUsdAmount * rate);
 
@@ -4419,6 +5146,7 @@ export const addSale = (
       currency: cur,
       exchangeRate: rate,
       currencyAmount: curAmount,
+      isWithdrawal: false,
       reference: created.id,
       notes: `Electronic ${cur} Payment: ${curAmount.toFixed(2)} ${cur}. Deducted as $${saleUsdAmount.toFixed(2)} USD base currency in Form 2 so cash drawer balances.`,
     });
@@ -4429,7 +5157,7 @@ export const addSale = (
       staffId: created.staffId,
       date: created.date,
       timestamp: created.timestamp,
-      type: cur === 'ZiG' ? 'zig_sale' : 'ecocash_sale',
+      type: cur === 'ZiG' ? 'zig_sale' : isEcoCash ? 'ecocash_sale' : 'cash_sale',
       amount: saleUsdAmount,
       currency: cur,
       direction: 'none',
@@ -4461,7 +5189,7 @@ export const addSale = (
         company_id: created.company_id || created.companyId,
         branchId: created.branchId || created.branch_id,
         branch_id: created.branch_id || created.branchId,
-        line: cur,
+        line: `${cur} Withdrawal`,
         description: `${cur} Cash-Out Payout #${created.id} ($${withdrawalUsd.toFixed(2)} USD / ${withdrawalInCur.toFixed(2)} ${cur})${refNote}`,
         in: 0,
         out: withdrawalUsd, // Subtracted in Form 2 as base USD!
@@ -4513,6 +5241,65 @@ export const addSale = (
     Status: created.status,
   });
 
+  // Credit appropriate wallet (EcoCash -> EcoCash Wallet, ZiG -> ZiG Bank Wallet, Cash -> Till Drawer Wallet)
+  try {
+    const payMethod = created.paymentMethod || 'Cash';
+    const cur = created.currency || 'USD';
+    let targetWalletKey = 'wallet_cash';
+    let targetAmount = created.total;
+
+    const isEco = payMethod.toLowerCase().includes('eco') || cur.toLowerCase().includes('eco');
+    const isZiG = payMethod.toLowerCase().includes('zig') || cur.toLowerCase().includes('zig');
+
+    if (isEco) {
+      targetWalletKey = 'wallet_ecocash';
+      // In Zimbabwe EcoCash, company receives actual electronic amount transferred (including gross for cash withdrawals)
+      const rate = Number(created.exchangeRate) || 1.05;
+      const saleInCur = Number(created.totalInCurrency) || (Number(created.total || 0) * rate);
+      const withdrawalInCur = Number(created.cashWithdrawalInCurrency) || (Number(created.cashWithdrawalAmount || 0) * rate);
+      targetAmount =
+        Number(created.totalChargedInCurrency) ||
+        Math.round((saleInCur + withdrawalInCur) * 100) / 100;
+    } else if (isZiG) {
+      targetWalletKey = 'wallet_bank_zig';
+      const rate = Number(created.exchangeRate) || 26.5;
+      const saleInCur = Number(created.totalInCurrency) || (Number(created.total || 0) * rate);
+      const withdrawalInCur = Number(created.cashWithdrawalInCurrency) || (Number(created.cashWithdrawalAmount || 0) * rate);
+      targetAmount =
+        Number(created.totalChargedInCurrency) ||
+        Math.round((saleInCur + withdrawalInCur) * 100) / 100;
+    } else if (payMethod === 'Card' || payMethod === 'Bank Transfer') {
+      targetWalletKey = 'wallet_bank_usd';
+    }
+
+    const currentWallets = getStored<any[]>('saimetric_wallets', []);
+    if (currentWallets && currentWallets.length > 0) {
+      // 1. Credit destination wallet
+      const idx = currentWallets.findIndex((w) => w.id === targetWalletKey);
+      if (idx !== -1) {
+        currentWallets[idx].balance = Math.round((currentWallets[idx].balance + targetAmount) * 100) / 100;
+        currentWallets[idx].updatedAt = new Date().toISOString();
+      }
+
+      // 2. If electronic sale with cash withdrawal, deduct physical USD cash from Till Cash Drawer!
+      if ((isEco || isZiG) && created.cashWithdrawalAmount && Number(created.cashWithdrawalAmount) > 0) {
+        const cashIdx = currentWallets.findIndex((w) => w.id === 'wallet_cash');
+        if (cashIdx !== -1) {
+          currentWallets[cashIdx].balance =
+            Math.round((currentWallets[cashIdx].balance - Number(created.cashWithdrawalAmount)) * 100) / 100;
+          currentWallets[cashIdx].updatedAt = new Date().toISOString();
+        }
+      }
+
+      setStored('saimetric_wallets', currentWallets);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_wallets_updated'));
+      }
+    }
+  } catch (err) {
+    console.error('Wallet update on sale error:', err);
+  }
+
   // Notify listeners so meshSyncService broadcasts the sale in real time
   if (!saleData.fromMesh) {
     saleCreationListeners.forEach((fn) => {
@@ -4524,6 +5311,13 @@ export const addSale = (
     });
   }
 
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: created }));
+  }
+
   return created;
 };
 
@@ -4533,8 +5327,8 @@ export const refundSaleInvoice = (params: {
   cashier?: Salesperson;
   reason: string;
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
-  const sales = getSales();
-  const invoice = sales.find((s) => s.id === params.invoiceId);
+  const allSales = getAllSales();
+  const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
     return { success: false, message: `Invoice #${params.invoiceId} not found.` };
   }
@@ -4549,7 +5343,7 @@ export const refundSaleInvoice = (params: {
   invoice.refundApprovedBy = params.manager.name;
   invoice.refundApprovedById = params.manager.id;
 
-  setStored(STORAGE_KEYS.SALES, sales);
+  setStored(STORAGE_KEYS.SALES, allSales);
 
   // Restore inventory stock for refunded items
   if (Array.isArray(invoice.items)) {
@@ -4606,8 +5400,8 @@ export const voidSaleInvoice = (params: {
   cashier?: Salesperson;
   reason: string;
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
-  const sales = getSales();
-  const invoice = sales.find((s) => s.id === params.invoiceId);
+  const allSales = getAllSales();
+  const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
     return { success: false, message: `Invoice #${params.invoiceId} not found.` };
   }
@@ -4619,7 +5413,7 @@ export const voidSaleInvoice = (params: {
   invoice.voidApprovedBy = params.manager.name;
   invoice.voidApprovedById = params.manager.id;
 
-  setStored(STORAGE_KEYS.SALES, sales);
+  setStored(STORAGE_KEYS.SALES, allSales);
 
   // If cash sale, add Cash Log (Form 2) reversal entry
   if (invoice.paymentMethod === 'Cash') {
@@ -4665,6 +5459,161 @@ export const voidSaleInvoice = (params: {
   return { success: true, message: `Invoice #${invoice.id} voided successfully.`, invoice };
 };
 
+export const editSaleInvoice = (params: {
+  invoiceId: string;
+  staff: Salesperson;
+  authorizedBy?: Salesperson;
+  reason: string;
+  updates: {
+    customerName?: string;
+    customerId?: string;
+    customerPhone?: string;
+    paymentMethod?: any;
+    currency?: string;
+    proofOfPaymentRef?: string;
+    paymentReference?: string;
+    items?: any[];
+    subtotal?: number;
+    discount?: number;
+    tax?: number;
+    total?: number;
+    grossTenderUsd?: number;
+    cashWithdrawalAmount?: number;
+    notes?: string;
+  };
+}): { success: boolean; message: string; invoice?: SaleInvoice } => {
+  const allSales = getAllSales();
+  const invoice = allSales.find((s) => s.id === params.invoiceId);
+  if (!invoice) {
+    return { success: false, message: `Receipt #${params.invoiceId} not found.` };
+  }
+
+  const changesList: string[] = [];
+  const previousSnapshot: Record<string, any> = {};
+
+  // Check customer changes
+  if (params.updates.customerName !== undefined && params.updates.customerName !== invoice.customerName) {
+    changesList.push(`Customer: "${invoice.customerName || 'None'}" -> "${params.updates.customerName}"`);
+    previousSnapshot.customerName = invoice.customerName;
+    invoice.customerName = params.updates.customerName;
+    if (invoice.customer) invoice.customer.name = params.updates.customerName;
+  }
+  if (params.updates.customerId !== undefined && params.updates.customerId !== invoice.customerId) {
+    invoice.customerId = params.updates.customerId;
+    if (invoice.customer) invoice.customer.id = params.updates.customerId;
+  }
+  if (params.updates.customerPhone !== undefined) {
+    if (invoice.customer) (invoice.customer as any).phone = params.updates.customerPhone;
+  }
+
+  // Check payment method changes
+  if (params.updates.paymentMethod !== undefined && params.updates.paymentMethod !== invoice.paymentMethod) {
+    changesList.push(`Method: "${invoice.paymentMethod}" -> "${params.updates.paymentMethod}"`);
+    previousSnapshot.paymentMethod = invoice.paymentMethod;
+    invoice.paymentMethod = params.updates.paymentMethod;
+  }
+  if (params.updates.currency !== undefined && params.updates.currency !== invoice.currency) {
+    changesList.push(`Currency: "${invoice.currency}" -> "${params.updates.currency}"`);
+    previousSnapshot.currency = invoice.currency;
+    invoice.currency = params.updates.currency;
+  }
+
+  // Check payment reference changes
+  if (params.updates.proofOfPaymentRef !== undefined && params.updates.proofOfPaymentRef !== invoice.proofOfPaymentRef) {
+    changesList.push(`Ref: "${invoice.proofOfPaymentRef || ''}" -> "${params.updates.proofOfPaymentRef}"`);
+    invoice.proofOfPaymentRef = params.updates.proofOfPaymentRef;
+  }
+  if (params.updates.paymentReference !== undefined && params.updates.paymentReference !== invoice.paymentReference) {
+    invoice.paymentReference = params.updates.paymentReference;
+  }
+
+  // Check items changes
+  if (Array.isArray(params.updates.items)) {
+    const prevItemCount = Array.isArray(invoice.items) ? invoice.items.length : 0;
+    const newItemCount = params.updates.items.length;
+    if (prevItemCount !== newItemCount) {
+      changesList.push(`Items count: ${prevItemCount} -> ${newItemCount}`);
+    }
+    previousSnapshot.items = invoice.items;
+    invoice.items = params.updates.items;
+    invoice.itemsSummary = params.updates.items
+      .map((it: any) => `${it.quantity}x ${it.name || it.productName || 'Item'}`)
+      .join(', ');
+  }
+
+  // Check total changes
+  if (params.updates.subtotal !== undefined && params.updates.subtotal !== invoice.subtotal) {
+    invoice.subtotal = params.updates.subtotal;
+  }
+  if (params.updates.discount !== undefined && params.updates.discount !== invoice.discount) {
+    changesList.push(`Discount: $${(invoice.discount || 0).toFixed(2)} -> $${params.updates.discount.toFixed(2)}`);
+    invoice.discount = params.updates.discount;
+  }
+  if (params.updates.total !== undefined && params.updates.total !== invoice.total) {
+    changesList.push(`Total: $${(invoice.total || 0).toFixed(2)} -> $${params.updates.total.toFixed(2)}`);
+    previousSnapshot.total = invoice.total;
+    invoice.total = params.updates.total;
+    invoice.totalAmount = params.updates.total;
+  }
+
+  // Check cash withdrawal changes
+  if (params.updates.cashWithdrawalAmount !== undefined && params.updates.cashWithdrawalAmount !== invoice.cashWithdrawalAmount) {
+    changesList.push(`Cash-out: $${(invoice.cashWithdrawalAmount || 0).toFixed(2)} -> $${params.updates.cashWithdrawalAmount.toFixed(2)}`);
+    invoice.cashWithdrawalAmount = params.updates.cashWithdrawalAmount;
+  }
+  if (params.updates.grossTenderUsd !== undefined) {
+    invoice.grossTenderUsd = params.updates.grossTenderUsd;
+  }
+
+  // Check notes
+  if (params.updates.notes !== undefined) {
+    invoice.notes = params.updates.notes;
+  }
+
+  const now = new Date();
+  (invoice as any).lastEditedAt = now.toISOString();
+  (invoice as any).lastEditedBy = params.staff.name;
+  (invoice as any).lastEditedById = params.staff.id;
+  (invoice as any).editReason = params.reason;
+
+  setStored(STORAGE_KEYS.SALES, allSales);
+
+  // Log in Audit Trail
+  const authName = params.authorizedBy ? `${params.authorizedBy.role} ${params.authorizedBy.name}` : `${params.staff.role} ${params.staff.name}`;
+  addAuditLog({
+    action: 'EDIT_RECEIPT',
+    severity: 'WARNING',
+    staffId: params.staff.id,
+    staffName: params.staff.name,
+    staffRole: params.staff.role,
+    authorizedById: params.authorizedBy?.id,
+    authorizedByName: params.authorizedBy?.name,
+    authorizedByRole: params.authorizedBy?.role,
+    referenceId: invoice.id,
+    amount: invoice.total,
+    details: `Receipt #${invoice.id} edited (${changesList.length > 0 ? changesList.join('; ') : 'Details modified'}). Reason: ${params.reason}. Action by: ${authName}.`,
+    metadata: {
+      invoiceId: invoice.id,
+      reason: params.reason,
+      changes: changesList,
+      previous: previousSnapshot,
+    },
+  });
+
+  notifyDatabaseMutation({
+    type: 'MUTATION_SALE',
+    action: 'UPDATE',
+    entityId: invoice.id,
+    timestamp: now.toISOString(),
+  } as any);
+
+  return {
+    success: true,
+    message: `Receipt #${invoice.id} updated successfully and recorded in audit trail.`,
+    invoice,
+  };
+};
+
 // ==================== EXPENSE DAO ====================
 export const getAllExpenses = (): ExpenseEntry[] => {
   return getStored<ExpenseEntry[]>(STORAGE_KEYS.EXPENSES, INITIAL_EXPENSES);
@@ -4704,18 +5653,31 @@ export const addExpense = (
     companyId?: string;
     branch_id?: string;
     branchId?: string;
+    status?: 'pending_supervisor' | 'approved' | 'rejected';
+    approvedBy?: string;
+    approvedByName?: string;
+    approvalTimestamp?: string;
   }
 ): ExpenseEntry => {
   const all = getAllExpenses();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
+  const sessionUser = getSessionUser();
+  const isSupervisor = isSupervisorOrAbove(sessionUser?.role);
   const compId = expenseData.company_id || expenseData.companyId || currentCompany;
   const brId = expenseData.branch_id || expenseData.branchId || currentBranch;
   const expId = expenseData.id || getNextExpenseId();
+
+  const initialStatus = expenseData.status || (isSupervisor ? 'approved' : 'pending_supervisor');
+
   const created: ExpenseEntry = {
     ...expenseData,
     id: expId,
     synced: false,
+    status: initialStatus,
+    approvedBy: expenseData.approvedBy || (initialStatus === 'approved' ? (sessionUser?.id || '001') : undefined),
+    approvedByName: expenseData.approvedByName || (initialStatus === 'approved' ? (sessionUser?.name || 'Supervisor') : undefined),
+    approvalTimestamp: expenseData.approvalTimestamp || (initialStatus === 'approved' ? new Date().toISOString() : undefined),
     company_id: compId,
     companyId: compId,
     branch_id: brId,
@@ -4731,8 +5693,8 @@ export const addExpense = (
       date: created.date,
       staffId: created.staffId,
       staffName: created.staffName,
-      line: 'Operations',
-      description: `Expense #${created.id} - ${created.category}: ${created.description}`,
+      line: 'Expenses',
+      description: `Expense #${created.id} [${created.status === 'approved' ? 'Approved' : 'Pending Approval'}] - ${created.category}: ${created.description}`,
       in: 0,
       out: created.amount,
       category: created.category,
@@ -4740,6 +5702,12 @@ export const addExpense = (
       company_id: compId,
       branch_id: brId,
     });
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: created }));
   }
 
   // Save to Sheet "Expenses"
@@ -4757,9 +5725,97 @@ export const addExpense = (
     StaffName: created.staffName,
     Description: created.description,
     ReceiptRef: created.receiptRef || '',
+    Status: created.status,
   });
 
   return created;
+};
+
+export const getExpensesForStaffAndDate = (staffId: string, date: string): ExpenseEntry[] => {
+  const currentCompany = getCurrentCompanyId();
+  const allExpenses = getAllExpenses();
+  const targetStaffId = String(staffId || '').trim().toLowerCase();
+  const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
+
+  return allExpenses.filter((e) => {
+    const compId = (e.company_id || e.companyId || '').trim();
+    const matchesComp =
+      !compId ||
+      currentCompany === 'COMP-MASTER' ||
+      compId === 'COMP-MASTER' ||
+      compId === currentCompany ||
+      (!currentCompany && (compId === 'COMP-001' || compId === 'COMP-MASTER'));
+    if (!matchesComp) return false;
+
+    const expStaffId = e.staffId ? String(e.staffId).trim().toLowerCase() : '';
+    const normExpStaff = expStaffId.replace(/^usr-|^staff-|^0+/, '');
+
+    const isSameStaff =
+      !targetStaffId ||
+      targetStaffId === 'all' ||
+      expStaffId === targetStaffId ||
+      (normTarget && normExpStaff === normTarget);
+
+    const isSameDate = (e.date || (e.timestamp ? e.timestamp.slice(0, 10) : '')) === date;
+    return isSameStaff && isSameDate;
+  });
+};
+
+export const approveExpense = (expenseId: string, supervisor: Salesperson): boolean => {
+  const all = getAllExpenses();
+  const idx = all.findIndex((e) => e.id === expenseId);
+  if (idx === -1) return false;
+  all[idx] = {
+    ...all[idx],
+    status: 'approved',
+    approvedBy: supervisor.id,
+    approvedByName: supervisor.name,
+    approvalTimestamp: new Date().toISOString(),
+  };
+  setStored(STORAGE_KEYS.EXPENSES, all);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: all[idx] }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: all[idx] }));
+  }
+  return true;
+};
+
+export const approveAllExpensesForStaffAndDate = (staffId: string, date: string, supervisor: Salesperson): number => {
+  const all = getAllExpenses();
+  let count = 0;
+  const now = new Date().toISOString();
+  const targetStaffId = String(staffId || '').trim().toLowerCase();
+  const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
+
+  const updated = all.map((e) => {
+    const isDateMatch = (e.date || (e.timestamp ? e.timestamp.slice(0, 10) : '')) === date;
+    const expStaffId = e.staffId ? String(e.staffId).trim().toLowerCase() : '';
+    const normExpStaff = expStaffId.replace(/^usr-|^staff-|^0+/, '');
+    const isStaffMatch = !targetStaffId || targetStaffId === 'all' || expStaffId === targetStaffId || (normTarget && normExpStaff === normTarget);
+
+    if (isDateMatch && isStaffMatch && e.status !== 'approved') {
+      count++;
+      return {
+        ...e,
+        status: 'approved',
+        approvedBy: supervisor.id,
+        approvedByName: supervisor.name,
+        approvalTimestamp: now,
+      };
+    }
+    return e;
+  });
+
+  if (count > 0) {
+    setStored(STORAGE_KEYS.EXPENSES, updated);
+    notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    }
+  }
+  return count;
 };
 
 // ==================== RECONCILIATIONS DAO (FORM 4) ====================
@@ -4771,12 +5827,13 @@ export const getReconciliations = (): ShiftReconciliation[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const all = getAllReconciliations();
+  const branches = getBranches();
   return all.filter((r) => {
     const compId = (r as any).company_id || (r as any).companyId;
     const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
     if (!matchesComp) return false;
-    const brId = (r as any).branch_id || (r as any).branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = (r as any).branch_id || (r as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
   });
 };
 
@@ -4932,20 +5989,33 @@ export const saveAllAdminSalesEntries = (
 };
 
 export const getSalesForStaffAndDate = (staffId: string, date: string, staffName?: string): SaleInvoice[] => {
-  const allSales = getSales();
-  const targetStaffId = String(staffId).trim().toLowerCase();
+  const currentCompany = getCurrentCompanyId();
+  const allSales = getAllSales();
+  const targetStaffId = String(staffId || '').trim().toLowerCase();
   const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
   const targetName = staffName ? staffName.trim().toLowerCase() : '';
 
   return allSales.filter((s) => {
+    const compId = (s.company_id || s.companyId || '').trim();
+    const matchesComp =
+      !compId ||
+      currentCompany === 'COMP-MASTER' ||
+      compId === 'COMP-MASTER' ||
+      compId === currentCompany ||
+      (!currentCompany && (compId === 'COMP-001' || compId === 'COMP-MASTER'));
+    if (!matchesComp) return false;
+
     const saleStaffId = s.staffId ? String(s.staffId).trim().toLowerCase() : '';
     const normSaleStaff = saleStaffId.replace(/^usr-|^staff-|^0+/, '');
     const saleStaffName = s.staffName ? s.staffName.trim().toLowerCase() : '';
 
     const isSameStaff =
+      !targetStaffId ||
+      targetStaffId === 'all' ||
       saleStaffId === targetStaffId ||
       (normTarget && normSaleStaff === normTarget) ||
-      (targetName && saleStaffName === targetName);
+      (targetName && saleStaffName === targetName) ||
+      (saleStaffName && targetStaffId && saleStaffName.toLowerCase().includes(targetStaffId));
 
     // Support both direct date match and local timestamp date match
     const saleDate = s.date || '';
@@ -4999,11 +6069,33 @@ export const calculateForm4 = (
   const systemSalesTotal = staffSales.reduce((sum, s) => sum + (s.total || 0), 0);
 
   const ecocashSales = staffSales
-    .filter((s) => s.paymentMethod === 'EcoCash' || (s.currency === 'EcoCash' && s.paymentMethod !== 'Cash'))
+    .filter(
+      (s) =>
+        s.paymentMethod === 'EcoCash' ||
+        s.paymentMethod === 'EcoCash/Mobile' ||
+        s.paymentMethod === 'ECO' ||
+        s.paymentMethod === 'ECOCASH' ||
+        s.currency === 'EcoCash' ||
+        s.currency === 'ECO' ||
+        s.currency === 'ECOCASH' ||
+        ((s.paymentMethod?.toLowerCase().includes('eco') || s.currency?.toLowerCase().includes('eco')) &&
+          s.paymentMethod !== 'Cash')
+    )
     .reduce((sum, s) => sum + (s.total || 0), 0);
   const zigSales = staffSales
-    .filter((s) => s.paymentMethod === 'ZiG' || (s.currency === 'ZiG' && s.paymentMethod !== 'Cash'))
+    .filter(
+      (s) =>
+        s.paymentMethod === 'ZiG' ||
+        s.paymentMethod === 'ZIG' ||
+        s.currency === 'ZiG' ||
+        s.currency === 'ZIG' ||
+        ((s.paymentMethod?.toLowerCase().includes('zig') || s.currency?.toLowerCase().includes('zig')) &&
+          s.paymentMethod !== 'Cash')
+    )
     .reduce((sum, s) => sum + (s.total || 0), 0);
+
+  const effectiveEcoSales = Math.max(ecocashSales, breakdown.ecocashSales || 0);
+  const effectiveZigSales = Math.max(zigSales, breakdown.zigSales || 0);
 
   // Credit extended from customerLedger (NOT cashMovements)
   const staffCustomerLedger = getCustomerLedgerEntries((entry) =>
@@ -5013,7 +6105,7 @@ export const calculateForm4 = (
     .filter((e) => e.type === 'credit_extended')
     .reduce((sum, e) => sum + (e.amount || 0), 0);
 
-  const totalNonCashSales = ecocashSales + zigSales + creditExtended;
+  const totalNonCashSales = effectiveEcoSales + effectiveZigSales + creditExtended;
 
   // Form 2 & 3 legacy logs for compatibility
   const form2Logs = getCashLogsForStaffAndDate(staffId, date);
@@ -5041,11 +6133,13 @@ export const calculateForm4 = (
     if (overrideSales !== undefined) {
       totalSales = overrideSales;
       isOverridden = Math.abs(overrideSales - systemSalesTotal) > 0.001;
-      cashSales = Math.max(0, overrideSales - (ecocashSales + zigSales));
+      cashSales = Math.max(0, overrideSales - (effectiveEcoSales + effectiveZigSales));
     } else if (savedAdminSale && savedAdminSale.notes?.includes('Manual Override')) {
       totalSales = savedAdminSale.salesAmount;
       isOverridden = true;
-      cashSales = Math.max(0, savedAdminSale.salesAmount - (ecocashSales + zigSales));
+      cashSales = Math.max(0, savedAdminSale.salesAmount - (effectiveEcoSales + effectiveZigSales));
+    } else {
+      totalSales = Math.max(systemSalesTotal, cashSales + effectiveEcoSales + effectiveZigSales + creditExtended);
     }
 
     const cashInTotal = Math.round((float + cashSales + creditPayments + changeReceived) * 100) / 100;
@@ -5102,8 +6196,8 @@ export const calculateForm4 = (
       zigWithdrawal,
       expectedCash,
       shouldHave,
-      ecocashSales,
-      zigSales,
+      ecocashSales: effectiveEcoSales,
+      zigSales: effectiveZigSales,
       creditExtended,
       totalNonCashSales,
       cashInTotal,
@@ -5287,11 +6381,17 @@ export const calculateForm4 = (
       (l) =>
         (l.out || 0) > 0 &&
         (l.currency === 'EcoCash' ||
+          l.currency === 'ECO' ||
+          l.currency === 'ECOCASH' ||
           l.line === 'EcoCash' ||
+          l.line === 'EcoCash Withdrawal' ||
           l.line === 'ecocashWithdrawal' ||
-          l.description?.toLowerCase().includes('ecocash')) &&
+          l.line?.toLowerCase().includes('eco') ||
+          l.description?.toLowerCase().includes('ecocash') ||
+          l.description?.toLowerCase().includes('eco')) &&
         (l.isWithdrawal ||
           l.line === 'ecocashWithdrawal' ||
+          l.line === 'EcoCash Withdrawal' ||
           l.category?.toLowerCase().includes('withdrawal') ||
           l.description?.toLowerCase().includes('cash-out') ||
           l.description?.toLowerCase().includes('withdrawal'))
@@ -5301,13 +6401,21 @@ export const calculateForm4 = (
   const ecoWithdrawalSales = staffSales
     .filter(
       (s) =>
-        (s.paymentMethod === 'EcoCash' || s.currency === 'EcoCash') &&
+        (s.paymentMethod === 'EcoCash' ||
+          s.paymentMethod === 'EcoCash/Mobile' ||
+          s.paymentMethod === 'ECO' ||
+          s.paymentMethod === 'ECOCASH' ||
+          s.currency === 'EcoCash' ||
+          s.currency === 'ECO' ||
+          s.currency === 'ECOCASH' ||
+          s.paymentMethod?.toLowerCase().includes('eco') ||
+          s.currency?.toLowerCase().includes('eco')) &&
         s.cashWithdrawalAmount &&
         Number(s.cashWithdrawalAmount) > 0
     )
     .reduce((sum, s) => sum + Number(s.cashWithdrawalAmount), 0);
   const ecocashWithdrawal = Math.max(
-    currencyWithdrawalsMap['EcoCash'] || currencyWithdrawalsMap['ECO'] || 0,
+    currencyWithdrawalsMap['EcoCash'] || currencyWithdrawalsMap['ECO'] || currencyWithdrawalsMap['ECOCASH'] || 0,
     Math.max(ecoWithdrawalLogs, ecoWithdrawalSales)
   );
 
@@ -5679,7 +6787,7 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
     mappedAction = 'upsert_staff';
     priority = 'HIGH';
   } else if (sheetName === 'branches') {
-    mappedAction = 'create_branch';
+    mappedAction = action === 'DELETE' ? 'delete_branch' : 'create_branch';
     priority = 'HIGH';
   } else if ((sheetName as string) === 'EOD') {
     mappedAction = payload.status === 'APPROVED' ? 'approve_eod' : 'submit_eod';
@@ -6362,6 +7470,191 @@ export const recordCustomerCreditPayment = (
   });
 };
 
+/**
+ * Helper to manually record change owed to a customer
+ * (e.g. customer rejected/defaced note or cashier lacked small denomination replacement note)
+ */
+export const recordManualCustomerChange = (params: {
+  customerName: string;
+  customerId?: string;
+  phone?: string;
+  amount: number;
+  date?: string;
+  notes?: string;
+  reference?: string;
+  staffId: string;
+  staffName: string;
+  staffRole?: string;
+  cashReceivedInDrawer?: boolean;
+}): CustomerChangeEntry => {
+  const now = new Date();
+  const dateStr = params.date || now.toISOString().split('T')[0];
+
+  const created = addCustomerChange({
+    timestamp: now.toISOString(),
+    date: dateStr,
+    staffId: params.staffId,
+    staffName: params.staffName,
+    customerId: params.customerId || '',
+    customerName: params.customerName.trim(),
+    in: params.amount,
+    out: 0,
+    notes: params.notes || 'Manual change booking (customer rejected note / small change unavailable)',
+    reference: params.reference || `MAN-CHG-${Date.now().toString().slice(-4)}`,
+  });
+
+  // Also log into customer ledger
+  try {
+    addCustomerLedgerEntry({
+      customerId: params.customerId || '',
+      customerName: params.customerName.trim(),
+      date: dateStr,
+      timestamp: now.toISOString(),
+      type: 'change_retained',
+      amount: params.amount,
+      sourceRef: created.id,
+      sourceModule: 'Form3Change',
+      notes: `Change booked: ${params.notes || 'Customer rejected note / small change unavailable'}`,
+      staffId: params.staffId,
+      staffName: params.staffName,
+    });
+  } catch (err) {
+    // safe fallback
+  }
+
+  addAuditLog({
+    action: 'MANUAL_CHANGE_BOOKING',
+    severity: 'INFO',
+    staffId: params.staffId,
+    staffName: params.staffName,
+    staffRole: params.staffRole || 'Cashier',
+    amount: params.amount,
+    referenceId: created.id,
+    details: `Manual customer change booked: $${params.amount.toFixed(2)} owed to "${params.customerName.trim()}". Reason: ${params.notes || 'Customer rejected note / small change unavailable'}.`,
+    metadata: {
+      customerId: params.customerId,
+      customerName: params.customerName,
+      reference: params.reference,
+    },
+  });
+
+  return created;
+};
+
+/**
+ * Helper to manually record customer credit
+ * (e.g. owner approved cash credit or store goods credit advance)
+ */
+export const recordManualCustomerCredit = (params: {
+  customerName: string;
+  customerId?: string;
+  phone?: string;
+  amount: number;
+  date?: string;
+  dueDate?: string;
+  creditType?: string;
+  notes?: string;
+  itemDescription?: string;
+  staffId: string;
+  staffName: string;
+  staffRole?: string;
+  authorizedByName?: string;
+  authorizedById?: string;
+  disburseCashFromDrawer?: boolean;
+}): CreditSaleEntry => {
+  const now = new Date();
+  const dateStr = params.date || now.toISOString().split('T')[0];
+  const defaultDue = new Date();
+  defaultDue.setDate(defaultDue.getDate() + 14);
+  const dueStr = params.dueDate || defaultDue.toISOString().split('T')[0];
+
+  const authSuffix = params.authorizedByName ? ` (Authorized by: ${params.authorizedByName})` : '';
+  const itemDesc = params.itemDescription || (params.creditType || 'Cash Credit (Owner Approved)');
+
+  const created = addCreditSale({
+    timestamp: now.toISOString(),
+    date: dateStr,
+    staffId: params.staffId,
+    staffName: params.staffName,
+    customerId: params.customerId || '',
+    customerName: params.customerName.trim(),
+    amount: params.amount,
+    in: 0,
+    out: params.amount,
+    itemDescription: itemDesc,
+    dueDate: dueStr,
+    notes: `${params.notes || 'Owner approved credit'}${authSuffix}`,
+    status: 'Owing',
+  });
+
+  // If cash was disbursed from drawer for cash credit, record cash movement
+  if (params.disburseCashFromDrawer) {
+    try {
+      const shiftId = getShiftId(params.staffId, dateStr);
+      addMovement({
+        shiftId,
+        staffId: params.staffId,
+        date: dateStr,
+        timestamp: now.toISOString(),
+        type: 'credit_extended',
+        amount: params.amount,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form3',
+        sourceRef: created.id,
+        notes: `Cash credit paid out from drawer: $${params.amount.toFixed(2)} to ${params.customerName.trim()} (${params.authorizedByName ? `Authorized by: ${params.authorizedByName}` : 'Owner Approved'})`,
+        company_id: getCurrentCompanyId(),
+        branch_id: getCurrentBranchId(),
+      });
+    } catch (err) {
+      // safe fallback
+    }
+  }
+
+  // Also record receivable into customer ledger
+  try {
+    addCustomerLedgerEntry({
+      customerId: params.customerId || '',
+      customerName: params.customerName.trim(),
+      date: dateStr,
+      timestamp: now.toISOString(),
+      type: 'credit_extended',
+      amount: params.amount,
+      sourceRef: created.id,
+      sourceModule: 'Form3Credit',
+      notes: `Manual credit approved: ${itemDesc}${authSuffix}`,
+      staffId: params.staffId,
+      staffName: params.staffName,
+    });
+  } catch (err) {
+    // safe fallback
+  }
+
+  addAuditLog({
+    action: 'MANUAL_CREDIT_ENTRY',
+    severity: 'WARNING',
+    staffId: params.staffId,
+    staffName: params.staffName,
+    staffRole: params.staffRole || 'Staff',
+    authorizedByName: params.authorizedByName,
+    authorizedById: params.authorizedById,
+    amount: params.amount,
+    referenceId: created.id,
+    details: `Manual credit approved: $${params.amount.toFixed(2)} for "${params.customerName.trim()}". Type: ${itemDesc}. Due: ${dueStr}.${authSuffix}${params.disburseCashFromDrawer ? ' [Cash disbursed from drawer]' : ''}`,
+    metadata: {
+      customerId: params.customerId,
+      customerName: params.customerName,
+      creditType: params.creditType,
+      dueDate: dueStr,
+      disburseCashFromDrawer: params.disburseCashFromDrawer,
+    },
+  });
+
+  return created;
+};
+
 // ============================================================================
 // INVENTORY MANAGEMENT MODULE (Cases + Singles Flexible Engine)
 // Rules A, B, C, D Implementation
@@ -6441,8 +7734,9 @@ export const getInventoryItemById = (itemId: string, branchId?: string): Invento
   const targetBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
   const clean = (itemId || '').trim().toUpperCase();
+  if (!clean) return null;
   
-  // Prefer exact match on branch and company
+  // 1. Prefer exact match on branch and company
   const exact = items.find((i) => {
     const matchesId = (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean);
     if (!matchesId) return false;
@@ -6456,7 +7750,39 @@ export const getInventoryItemById = (itemId: string, branchId?: string): Invento
   if (exact) return exact;
 
   // Fallback to any matching item in company
-  return items.find((i) => (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean)) || null;
+  const directFallback = items.find((i) => (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean));
+  if (directFallback) return directFallback;
+
+  // 2. Base ID match (stripping -CASE, -UNIT, or __variantId)
+  let baseClean = clean;
+  if (baseClean.endsWith('-CASE')) baseClean = baseClean.replace(/-CASE$/, '');
+  if (baseClean.endsWith('-UNIT')) baseClean = baseClean.replace(/-UNIT$/, '');
+  if (baseClean.includes('__')) baseClean = baseClean.split('__')[0];
+
+  if (baseClean !== clean) {
+    const baseExact = items.find((i) => {
+      const matchesId = (i.itemId && i.itemId.toUpperCase() === baseClean) || (i.sku && i.sku.toUpperCase() === baseClean);
+      if (!matchesId) return false;
+      const itemBr = (i.branch_id || (i as any).branchId || '').trim().toUpperCase();
+      const itemComp = (i.company_id || (i as any).companyId || '').trim().toUpperCase();
+      return (
+        (!itemComp || itemComp === currentCompany.toUpperCase()) &&
+        (!itemBr || itemBr === targetBranch.toUpperCase())
+      );
+    });
+    if (baseExact) return baseExact;
+
+    const baseFallback = items.find((i) => (i.itemId && i.itemId.toUpperCase() === baseClean) || (i.sku && i.sku.toUpperCase() === baseClean));
+    if (baseFallback) return baseFallback;
+  }
+
+  // 3. Variant match inside packagingVariants
+  const variantMatch = items.find((i) =>
+    i.packagingVariants?.some((v) => (v.id && v.id.toUpperCase() === clean) || (v.sku && v.sku.toUpperCase() === clean))
+  );
+  if (variantMatch) return variantMatch;
+
+  return null;
 };
 
 export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
@@ -7452,6 +8778,45 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
 
   return { added, updated, count: getInventoryItems().length };
 }
+
+export async function pullTenantSales(companyId?: string): Promise<number> {
+  const compId = companyId || getCurrentCompanyId();
+  if (!compId) return 0;
+  try {
+    const res = await fetch(`/api/sales?company_id=${encodeURIComponent(compId)}`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.success && Array.isArray(data.sales)) {
+        const localAll = getAllSales();
+        const localIdSet = new Set(localAll.map((s) => s.id));
+        let addedCount = 0;
+        const merged = [...localAll];
+        for (const remoteSale of data.sales) {
+          if (remoteSale && remoteSale.id && !localIdSet.has(remoteSale.id)) {
+            merged.push(remoteSale);
+            localIdSet.add(remoteSale.id);
+            addedCount++;
+          }
+        }
+        if (addedCount > 0) {
+          setStored(STORAGE_KEYS.SALES, merged);
+          notifyListeners();
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+          }
+        }
+        return addedCount;
+      }
+    }
+  } catch (err) {
+    console.warn('[RoomDB] pullTenantSales fetch error:', err);
+  }
+  return 0;
+}
+
+export const getDeviceId = (): string => {
+  return (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'terminal-local';
+};
 
 export const addQuickProduct = (params: {
   name: string;
@@ -10922,6 +12287,21 @@ export function getCurrentBranch(): Branch {
   const branchId = getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
   const branches = getBranches();
+
+  if (branchId === 'ALL') {
+    return {
+      branchId: 'ALL',
+      id: 'ALL',
+      name: 'All Branches (Consolidated)',
+      code: 'ALL',
+      location: 'Enterprise Wide',
+      address: 'Enterprise Wide',
+      isMain: false,
+      company_id: currentCompany,
+      companyId: currentCompany,
+    };
+  }
+
   let found = branches.find((b) => b.branchId === branchId || b.id === branchId || (b as any).branch_id === branchId);
   if (!found) {
     found = branches.find((b) => (b.company_id || b.companyId) === currentCompany) || branches[0];
@@ -12022,20 +13402,19 @@ export const rejectDirectGrv = (
 // ============================================================================
 
 export const getSalesForCurrentBranch = (): SaleInvoice[] => {
-  const branchId = getCurrentBranchId();
-  const sales = getSales();
-  return sales.filter((s) => !s.id || (s as any).branchId === branchId || !(s as any).branchId);
+  return getSales();
 };
 
 export const getDirectGrvsForCurrentBranch = (): DirectGrv[] => {
   const branchId = getCurrentBranchId();
   const grvs = getDirectGrvs();
-  return grvs.filter((g) => !g.branchId || g.branchId === branchId);
+  const branches = getBranches();
+  const currentCompany = getCurrentCompanyId();
+  return grvs.filter((g) => isRecordInBranchScope(g.branchId || (g as any).branch_id, branchId, branches, currentCompany));
 };
 
 export const getCashLogsForCurrentBranch = (): CashLogEntry[] => {
-  const logs = getCashLogs();
-  return logs;
+  return getCashLogs();
 };
 
 

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Salesperson } from '../../types';
-import { getSalespeople, getAllSalespeople, isSupervisorOrAbove } from '../../db/roomDatabase';
+import { getSalespeople, getAllSalespeople, isSupervisorOrAbove, verifySalespersonPin } from '../../db/roomDatabase';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -11,8 +11,19 @@ import {
   AlertTriangle,
   FileText,
   UserCheck,
+  Shuffle,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+
+// Scramble numeric digits for supervisor PIN override protection
+const generateScrambledDigits = (): string[] => {
+  const digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+  for (let i = digits.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [digits[i], digits[j]] = [digits[j], digits[i]];
+  }
+  return digits;
+};
 
 interface ManagerPinModalProps {
   isOpen: boolean;
@@ -72,10 +83,15 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
   onAuthorize,
 }) => {
   const [pin, setPin] = useState<string>('');
+  const [scrambledKeypad, setScrambledKeypad] = useState<string[]>(() => generateScrambledDigits());
   const [selectedReason, setSelectedReason] = useState<string>('');
   const [customReason, setCustomReason] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
   const [isVerifying, setIsVerifying] = useState<boolean>(false);
+
+  const scrambleKeypad = () => {
+    setScrambledKeypad(generateScrambledDigits());
+  };
 
   const availableReasons = defaultReasons || DEFAULT_REASONS_MAP[actionType] || [
     'Customer Request',
@@ -83,13 +99,14 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
     'Discretionary Approval',
   ];
 
-  // Set default reason on open
+  // Set default reason on open & randomize keypad
   useEffect(() => {
     if (isOpen) {
       setPin('');
       setError(null);
       setSelectedReason(availableReasons[0] || 'Manager Authorization');
       setCustomReason('');
+      setScrambledKeypad(generateScrambledDigits());
     }
   }, [isOpen]);
 
@@ -113,7 +130,7 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
       } else if (e.key === 'Escape') {
         onClose();
       } else if (e.key === 'Enter') {
-        if (pin.length === 4) {
+        if (pin.length === 6) {
           verifyPin(pin);
         }
       }
@@ -121,16 +138,16 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, pin, selectedReason, customReason]);
+  }, [isOpen, pin, selectedReason, customReason, scrambledKeypad]);
 
   if (!isOpen) return null;
 
   const handleDigit = (digit: string) => {
     setError(null);
-    if (pin.length < 4) {
+    if (pin.length < 6) {
       const next = pin + digit;
       setPin(next);
-      if (next.length === 4) {
+      if (next.length === 6) {
         verifyPin(next);
       }
     }
@@ -144,6 +161,7 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
   const handleClear = () => {
     setError(null);
     setPin('');
+    scrambleKeypad();
   };
 
   const finalReason = (customReason.trim() || selectedReason || 'Manager Authorization').trim();
@@ -155,18 +173,22 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
     }
 
     setIsVerifying(true);
+    // Scramble keypad on every attempt so observers cannot read the PIN
+    scrambleKeypad();
+
     setTimeout(() => {
       const cleanPin = pinToTest.trim();
       const scopedStaff = getSalespeople().filter((s) => s.active === 'Y');
       const allActiveStaff = getAllSalespeople().filter((s) => s.active === 'Y');
       
       // Match within current branch/company first, then fallback across active tenant staff
-      const matched = scopedStaff.find((s) => String(s.pin || '').trim() === cleanPin) ||
-                      allActiveStaff.find((s) => String(s.pin || '').trim() === cleanPin);
+      const matched = scopedStaff.find((s) => verifySalespersonPin(s.pin, cleanPin)) ||
+                      allActiveStaff.find((s) => verifySalespersonPin(s.pin, cleanPin));
 
       if (!matched) {
-        setError('Invalid 4-digit PIN. Please try again.');
+        setError('Invalid 6-digit PIN. Keypad scrambled for security. Please try again.');
         setPin('');
+        scrambleKeypad();
         setIsVerifying(false);
         return;
       }
@@ -178,6 +200,7 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
           `Entered PIN belongs to ${matched.name} (${matched.role}). Authorization requires a Supervisor, Manager, or Administrator PIN.`
         );
         setPin('');
+        scrambleKeypad();
         setIsVerifying(false);
         return;
       }
@@ -312,18 +335,31 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
 
         {/* PIN Entry Display */}
         <div className="space-y-2 text-center">
-          <div className="flex items-center justify-center space-x-1.5 text-xs font-semibold text-slate-300">
-            <Lock className="w-3.5 h-3.5 text-amber-400" />
-            <span>Enter Manager / Admin 4-Digit PIN</span>
+          <div className="flex items-center justify-between px-1">
+            <span className="flex items-center space-x-1.5 text-xs font-semibold text-slate-300">
+              <Lock className="w-3.5 h-3.5 text-amber-400" />
+              <span>Enter Supervisor / Manager 6-Digit PIN</span>
+            </span>
+            <button
+              id="btn-scramble-manager-keypad"
+              type="button"
+              onClick={scrambleKeypad}
+              className="text-[10px] text-amber-300 hover:text-amber-200 font-bold flex items-center space-x-1 px-2 py-0.5 rounded-lg bg-amber-950/60 border border-amber-800/60 hover:bg-amber-900/60 transition active:scale-95 cursor-pointer shadow-sm"
+              title="Reshuffle number pad positions"
+            >
+              <Shuffle className="w-2.5 h-2.5" />
+              <span>Scramble</span>
+            </button>
           </div>
 
-          <div className="flex justify-center space-x-3 my-1">
-            {[0, 1, 2, 3].map((index) => {
+          {/* Masked 6 PIN Dots */}
+          <div className="flex justify-center space-x-2.5 my-1">
+            {[0, 1, 2, 3, 4, 5].map((index) => {
               const isEntered = pin.length > index;
               return (
                 <div
                   key={index}
-                  className={`w-11 h-12 rounded-2xl flex items-center justify-center border text-xl font-mono font-black transition-all ${
+                  className={`w-9 h-11 sm:w-10 sm:h-12 rounded-2xl flex items-center justify-center border text-xl font-mono font-black transition-all ${
                     isEntered
                       ? 'border-blue-500 bg-blue-500/20 text-blue-300 shadow-[0_0_15px_rgba(59,130,246,0.3)] scale-105'
                       : 'border-slate-700 bg-slate-950 text-slate-600'
@@ -335,6 +371,11 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
             })}
           </div>
 
+          <div className="text-[10px] text-slate-400 flex items-center justify-center gap-1">
+            <ShieldCheck className="w-3 h-3 text-emerald-400 shrink-0" />
+            <span>Anti-shoulder surfing: Keypad scrambles on every authorization attempt</span>
+          </div>
+
           {error && (
             <div className="text-xs font-medium text-rose-400 bg-rose-950/40 border border-rose-800/60 rounded-xl p-2 flex items-center justify-center space-x-1.5 animate-fadeIn">
               <AlertTriangle className="w-4 h-4 flex-shrink-0" />
@@ -343,16 +384,16 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
           )}
         </div>
 
-        {/* On-Screen Keypad */}
+        {/* Scrambled On-Screen Keypad */}
         <div className="grid grid-cols-3 gap-2">
-          {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((digit) => (
+          {scrambledKeypad.slice(0, 9).map((digit) => (
             <button
               key={digit}
               id={`manager-pin-btn-${digit}`}
               type="button"
               onClick={() => handleDigit(digit)}
               disabled={isVerifying}
-              className="py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-blue-600/50 text-white font-mono font-black text-lg transition shadow-sm"
+              className="py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-blue-600/50 text-white font-mono font-black text-lg transition shadow-sm cursor-pointer select-none"
             >
               {digit}
             </button>
@@ -361,24 +402,27 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
             id="manager-pin-btn-clear"
             type="button"
             onClick={handleClear}
-            className="py-3 rounded-2xl bg-slate-800/70 hover:bg-slate-700 text-slate-400 hover:text-white font-bold text-xs uppercase tracking-wider transition"
+            className="py-3 rounded-2xl bg-slate-800/70 hover:bg-slate-700 text-slate-400 hover:text-white font-bold text-xs uppercase tracking-wider transition cursor-pointer"
+            title="Clear and reshuffle keypad"
           >
             Clear
           </button>
           <button
-            id="manager-pin-btn-0"
+            key={scrambledKeypad[9]}
+            id={`manager-pin-btn-${scrambledKeypad[9]}`}
             type="button"
-            onClick={() => handleDigit('0')}
+            onClick={() => handleDigit(scrambledKeypad[9])}
             disabled={isVerifying}
-            className="py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-blue-600/50 text-white font-mono font-black text-lg transition shadow-sm"
+            className="py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 active:bg-blue-600/50 text-white font-mono font-black text-lg transition shadow-sm cursor-pointer select-none"
           >
-            0
+            {scrambledKeypad[9]}
           </button>
           <button
             id="manager-pin-btn-backspace"
             type="button"
             onClick={handleBackspace}
-            className="py-3 rounded-2xl bg-slate-800/70 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition"
+            className="py-3 rounded-2xl bg-slate-800/70 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition cursor-pointer"
+            title="Delete digit"
           >
             <Delete className="w-5 h-5" />
           </button>

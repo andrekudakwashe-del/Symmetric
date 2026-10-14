@@ -42,6 +42,7 @@ import {
 interface BatchTrackingViewProps {
   currentUser: Salesperson | null;
   onOpenGRN?: (itemId?: string) => void;
+  onOpenReorderHub?: () => void;
 }
 
 export type BatchFlag = 'DEAD STOCK' | 'EXPIRY RISK' | 'SLOW MOVING' | 'OK';
@@ -62,6 +63,7 @@ export interface EnrichedBatch extends StockBatch {
 export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
   currentUser,
   onOpenGRN,
+  onOpenReorderHub,
 }) => {
   const [batches, setBatches] = useState<StockBatch[]>(() => getStockBatches());
   const [negativeBalances, setNegativeBalances] = useState<NegativeBalanceEntry[]>(() => getNegativeBalances());
@@ -72,6 +74,8 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedProductFilter, setSelectedProductFilter] = useState('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'DEAD_STOCK' | 'EXPIRY_RISK' | 'SLOW_MOVING' | 'OK' | 'ACTIVE'>('ALL');
+  const [coverWindowDays, setCoverWindowDays] = useState<number>(30); // Configurable sales history window (Default 30 days for small/agile orgs)
+  const [hideNonExpiryBatches, setHideNonExpiryBatches] = useState<boolean>(false); // Filter out products not tracked for expiries
   const [sortField, setSortField] = useState<keyof EnrichedBatch>('daysCovered');
   const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
 
@@ -89,8 +93,8 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
 
   const todayStr = new Date().toISOString().split('T')[0];
   const todayTime = new Date(todayStr).getTime();
-  const ninetyDaysAgoTime = todayTime - 90 * 24 * 60 * 60 * 1000;
-  const ninetyDaysAgoStr = new Date(ninetyDaysAgoTime).toISOString().split('T')[0];
+  const windowDaysAgoTime = todayTime - coverWindowDays * 24 * 60 * 60 * 1000;
+  const windowDaysAgoStr = new Date(windowDaysAgoTime).toISOString().split('T')[0];
 
   // Map inventory items by itemId for quick lookup of unitsPerCase etc.
   const inventoryItemsMap = useMemo(() => {
@@ -99,9 +103,9 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
     return map;
   }, [inventoryItems]);
 
-  // Aggregate 90-day sales and last sale date per product code from Stock Movement
+  // Aggregate sales in the chosen window (e.g. 7, 14, 30, 60, 90 days) per product code from Stock Movement
   const productSalesStats = useMemo(() => {
-    const salesMap = new Map<string, { qtySold90: number; lastSaleDate: string }>();
+    const salesMap = new Map<string, { qtySoldWindow: number; firstSaleDate: string; lastSaleDate: string }>();
 
     stockMovements.forEach((m) => {
       const isSale =
@@ -121,24 +125,50 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
           ? Math.abs(m.singlesChange) + Math.abs(m.casesChange || 0) * unitsPerCase
           : (m.qtyCases || 0) * unitsPerCase + (m.qtySingles || 0);
 
-      const existing = salesMap.get(m.itemId) || { qtySold90: 0, lastSaleDate: '' };
+      const existing = salesMap.get(m.itemId) || { qtySoldWindow: 0, firstSaleDate: '', lastSaleDate: '' };
 
-      // Check if within last 90 days
       const movementDate = m.date || m.timestamp?.split('T')[0] || '';
-      if (movementDate >= ninetyDaysAgoStr) {
-        existing.qtySold90 += unitsOut;
+      if (movementDate >= windowDaysAgoStr) {
+        existing.qtySoldWindow += unitsOut;
       }
 
-      // Track most recent sale date
-      if (movementDate && (!existing.lastSaleDate || movementDate > existing.lastSaleDate)) {
-        existing.lastSaleDate = movementDate;
+      // Track first and most recent sale dates
+      if (movementDate) {
+        if (!existing.firstSaleDate || movementDate < existing.firstSaleDate) {
+          existing.firstSaleDate = movementDate;
+        }
+        if (!existing.lastSaleDate || movementDate > existing.lastSaleDate) {
+          existing.lastSaleDate = movementDate;
+        }
       }
 
       salesMap.set(m.itemId, existing);
     });
 
     return salesMap;
-  }, [stockMovements, inventoryItemsMap, ninetyDaysAgoStr]);
+  }, [stockMovements, inventoryItemsMap, windowDaysAgoStr]);
+
+  // Category average daily sales rate (Used as analog rate for new items < 14 days old)
+  const categoryAvgSalesRates = useMemo(() => {
+    const catTotals = new Map<string, { totalQty: number; count: number }>();
+
+    productSalesStats.forEach((stat, itemId) => {
+      const item = inventoryItemsMap.get(itemId);
+      const cat = item?.category || 'General';
+      const prev = catTotals.get(cat) || { totalQty: 0, count: 0 };
+      catTotals.set(cat, {
+        totalQty: prev.totalQty + stat.qtySoldWindow,
+        count: prev.count + 1,
+      });
+    });
+
+    const rates = new Map<string, number>();
+    catTotals.forEach((val, cat) => {
+      const dailyPerSku = val.count > 0 ? (val.totalQty / coverWindowDays) / val.count : 0;
+      rates.set(cat, Math.max(0.1, dailyPerSku));
+    });
+    return rates;
+  }, [productSalesStats, inventoryItemsMap, coverWindowDays]);
 
   // Calculate Enriched Batches with Days Covered & Flags
   const enrichedBatches: EnrichedBatch[] = useMemo(() => {
@@ -147,26 +177,60 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
       const receivedTime = new Date(receivedDate).getTime();
       const ageInDays = Math.max(0, Math.floor((todayTime - receivedTime) / (1000 * 60 * 60 * 24)));
 
-      const stats = productSalesStats.get(batch.itemId) || { qtySold90: 0, lastSaleDate: '' };
-      const qtySoldLast90Days = stats.qtySold90;
+      const item = inventoryItemsMap.get(batch.itemId);
+      const isProductTracked = Boolean(item?.trackExpiry);
+      const shelfLifeDays = item?.shelfLifeDays;
+
+      const stats = productSalesStats.get(batch.itemId) || { qtySoldWindow: 0, firstSaleDate: '', lastSaleDate: '' };
+      const qtySoldInWindow = stats.qtySoldWindow;
       const lastSaleDate = stats.lastSaleDate;
 
-      // Average Daily Sales = Qty Sold Last 90 Days / 90
-      const avgDailySales = qtySoldLast90Days / 90;
+      // Dynamic daily rate with new product detection & analog fallback
+      const daysSinceFirstSale = stats.firstSaleDate
+        ? Math.max(1, Math.floor((todayTime - new Date(stats.firstSaleDate).getTime()) / (1000 * 60 * 60 * 24)))
+        : ageInDays;
+
+      let avgDailySales = 0;
+      let isAnalogRateUsed = false;
+
+      if (daysSinceFirstSale < 14 && qtySoldInWindow > 0) {
+        // Active new product selling fast: rate calculated over its actual active days
+        avgDailySales = qtySoldInWindow / Math.max(1, Math.min(coverWindowDays, daysSinceFirstSale));
+      } else if (qtySoldInWindow > 0) {
+        // Standard window rate
+        avgDailySales = qtySoldInWindow / coverWindowDays;
+      } else {
+        // Brand new product without history: check category analog benchmark if age < 21 days
+        const cat = item?.category || 'General';
+        const analogRate = categoryAvgSalesRates.get(cat) || 0;
+        if (ageInDays <= 21 && analogRate > 0) {
+          avgDailySales = analogRate;
+          isAnalogRateUsed = true;
+        } else {
+          avgDailySales = 0;
+        }
+      }
 
       // Days Covered = IF(Average Daily Sales = 0, 999, ROUND(Qty On Hand / Average Daily Sales, 0))
-      const daysCovered = avgDailySales === 0 ? 999 : Math.round(batch.qtyOnHand / avgDailySales);
+      const daysCovered = avgDailySales <= 0 ? 999 : Math.round(batch.qtyOnHand / avgDailySales);
 
       const lastCost = batch.costPerUnit || 0;
       const valueStuck = (batch.qtyOnHand || 0) * lastCost;
 
-      // Expiry calculations
+      // Expiry calculations (respecting product master trackExpiry setting)
+      let effectiveExpiryDate = batch.expiryDate;
+      // If no explicit expiry date on batch, but product has shelfLifeDays and is tracked, use receivedDate + shelfLifeDays
+      if (!effectiveExpiryDate && isProductTracked && shelfLifeDays) {
+        effectiveExpiryDate = new Date(receivedTime + shelfLifeDays * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      }
+
       let isExpired = false;
       let daysToExpiry: number | null = null;
       let isExpiryRisk = false;
 
-      if (batch.expiryDate) {
-        const expTime = new Date(batch.expiryDate).getTime();
+      // Only evaluate expiry risks if product has expiry tracking or has a valid expiry date
+      if (effectiveExpiryDate && (isProductTracked || batch.expiryDate)) {
+        const expTime = new Date(effectiveExpiryDate).getTime();
         daysToExpiry = Math.ceil((expTime - todayTime) / (1000 * 60 * 60 * 24));
         if (daysToExpiry < 0) {
           isExpired = true;
@@ -180,18 +244,18 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
       }
 
       // Flag calculation logic:
-      // A. Flag = "DEAD STOCK" if Qty Sold Last 90 Days = 0 AND Age in Days > 90
-      // B. Flag = "EXPIRY RISK" if Expiry Date <= TODAY() + Days Covered
-      // C. Flag = "SLOW MOVING" if Days Covered > 120
-      // D. Flag = "OK" if Days Covered <= 60
+      // A. Flag = "DEAD STOCK" if Qty Sold in window = 0 AND Age in Days > coverWindowDays
+      // B. Flag = "EXPIRY RISK" if Expiry Date <= TODAY() + Days Covered (for tracked products)
+      // C. Flag = "SLOW MOVING" if Days Covered > (coverWindowDays * 1.5)
+      // D. Flag = "OK" if Days Covered <= coverWindowDays
       let flag: BatchFlag = 'OK';
-      if (qtySoldLast90Days === 0 && ageInDays > 90) {
+      if (qtySoldInWindow === 0 && ageInDays > coverWindowDays) {
         flag = 'DEAD STOCK';
       } else if (isExpiryRisk) {
         flag = 'EXPIRY RISK';
-      } else if (daysCovered > 120) {
+      } else if (daysCovered > Math.round(coverWindowDays * 1.5)) {
         flag = 'SLOW MOVING';
-      } else if (daysCovered <= 60) {
+      } else if (daysCovered <= coverWindowDays) {
         flag = 'OK';
       } else {
         flag = 'OK';
@@ -199,8 +263,9 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
 
       return {
         ...batch,
+        expiryDate: effectiveExpiryDate || batch.expiryDate,
         ageInDays,
-        qtySoldLast90Days,
+        qtySoldLast90Days: qtySoldInWindow, // represents qty sold in chosen configurable window
         avgDailySales,
         daysCovered,
         lastCost,
@@ -209,9 +274,11 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
         flag,
         isExpired,
         daysToExpiry,
-      };
+        isProductTracked,
+        isAnalogRateUsed,
+      } as EnrichedBatch & { isProductTracked: boolean; isAnalogRateUsed: boolean };
     });
-  }, [batches, productSalesStats, todayStr, todayTime]);
+  }, [batches, productSalesStats, categoryAvgSalesRates, inventoryItemsMap, coverWindowDays, todayStr, todayTime]);
 
   // Batches filtered & sorted (Default Sort: Days Covered DESC)
   const filteredBatches = useMemo(() => {
@@ -227,7 +294,9 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
 
         const matchProduct = selectedProductFilter === 'ALL' || b.itemId === selectedProductFilter;
 
-        if (!matchSearch || !matchProduct) return false;
+        if (hideNonExpiryBatches && !(b as any).isProductTracked && !b.expiryDate) {
+          return false;
+        }
 
         if (statusFilter === 'DEAD_STOCK') return b.flag === 'DEAD STOCK';
         if (statusFilter === 'EXPIRY_RISK') return b.flag === 'EXPIRY RISK';
@@ -374,6 +443,17 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
               <RefreshCw className="w-4 h-4" />
               <span>Refresh</span>
             </button>
+            {onOpenReorderHub && (
+              <button
+                type="button"
+                onClick={onOpenReorderHub}
+                className="px-3.5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow-lg shadow-indigo-950/40 flex items-center gap-1.5"
+                title="Open Procurement & Reorder Hub"
+              >
+                <TrendingUp className="w-4 h-4" />
+                <span>Reorder Hub</span>
+              </button>
+            )}
             {onOpenGRN && (
               <button
                 type="button"
@@ -594,6 +674,61 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
         )}
       </div>
 
+      {/* CONFIGURABLE HORIZON & EXPIRY TRACKING FILTER BAR */}
+      {activeSubTab === 'batches' && (
+        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+          {/* Configurable Sales History Window */}
+          <div className="flex items-center gap-2">
+            <span className="font-bold text-slate-300 flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-purple-400" />
+              <span>Sales Cover Window:</span>
+            </span>
+            <div className="flex items-center gap-1 bg-slate-850 p-1 rounded-xl border border-slate-700">
+              {[
+                { label: '7 Days', days: 7, desc: 'Fast response / Promo / Trends' },
+                { label: '14 Days', days: 14, desc: 'Agile fast-movers' },
+                { label: '30 Days (Default)', days: 30, desc: 'Small-mid businesses default' },
+                { label: '60 Days', days: 60, desc: 'Balanced medium orgs' },
+                { label: '90 Days', days: 90, desc: 'Large orgs / Smooth seasonals' },
+              ].map((w) => (
+                <button
+                  key={w.days}
+                  type="button"
+                  title={w.desc}
+                  onClick={() => setCoverWindowDays(w.days)}
+                  className={`px-2.5 py-1 rounded-lg font-bold text-xs transition ${
+                    coverWindowDays === w.days
+                      ? 'bg-purple-600 text-white shadow'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {w.label}
+                </button>
+              ))}
+            </div>
+            <span className="text-[11px] text-slate-400 hidden xl:inline">
+              (Calculating velocity based on sales over last <strong className="text-purple-300">{coverWindowDays} days</strong>)
+            </span>
+          </div>
+
+          {/* Expiry Tracking Toggle Filter */}
+          <div className="flex items-center gap-3">
+            <label className="flex items-center gap-2 cursor-pointer bg-slate-850 px-3 py-1.5 rounded-xl border border-slate-700 hover:border-slate-600 transition">
+              <input
+                type="checkbox"
+                checked={hideNonExpiryBatches}
+                onChange={(e) => setHideNonExpiryBatches(e.target.checked)}
+                className="rounded border-slate-700 text-purple-600 focus:ring-purple-500 bg-slate-900"
+              />
+              <span className="font-bold text-slate-300 flex items-center gap-1.5">
+                <Calendar className="w-3.5 h-3.5 text-amber-400" />
+                <span>Show Only Products with Expiry Tracking</span>
+              </span>
+            </label>
+          </div>
+        </div>
+      )}
+
       {/* SUB-TAB 1: Batch Ledger with 14 Mandatory Columns & Days Covered Sort */}
       {activeSubTab === 'batches' && (
         <div className="bg-slate-900 border border-slate-800 rounded-2xl shadow-xl overflow-hidden">
@@ -704,7 +839,7 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
                     onClick={() => handleSort('avgDailySales')}
                   >
                     <div className="flex items-center justify-end gap-1">
-                      <span>Avg Daily Sales</span>
+                      <span>Avg Daily Sales ({coverWindowDays}d)</span>
                       <ArrowUpDown className="w-3 h-3 text-slate-500" />
                     </div>
                   </th>
@@ -881,7 +1016,14 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
 
                         {/* 8. Avg Daily Sales */}
                         <td className="py-2.5 px-2 text-right text-slate-300">
-                          {batch.avgDailySales.toFixed(2)}
+                          <div>
+                            <span className="font-mono">{batch.avgDailySales.toFixed(2)}</span>
+                            {(batch as any).isAnalogRateUsed && (
+                              <span className="block text-[9px] text-amber-400 font-sans font-bold" title="New product: Category analog baseline rate used">
+                                (analog)
+                              </span>
+                            )}
+                          </div>
                         </td>
 
                         {/* 9. Days Covered */}

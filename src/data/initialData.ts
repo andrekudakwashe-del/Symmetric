@@ -255,7 +255,7 @@ export const INITIAL_SALESPEOPLE: Salesperson[] = [
   {
     id: '001',
     name: 'Sarah Chidyamakono',
-    pin: '1234',
+    pin: '123456',
     role: 'OWNER',
     phone: '+263 77 123 4567',
     active: 'Y',
@@ -268,7 +268,7 @@ export const INITIAL_SALESPEOPLE: Salesperson[] = [
   {
     id: '002',
     name: 'Kudakwashe Andre',
-    pin: '4321',
+    pin: '432100',
     role: 'OWNER',
     phone: '+263 71 987 6543',
     active: 'Y',
@@ -281,7 +281,7 @@ export const INITIAL_SALESPEOPLE: Salesperson[] = [
   {
     id: '003',
     name: 'Tariro Moyo',
-    pin: '0000',
+    pin: '000000',
     role: 'Cashier',
     phone: '+263 73 555 1212',
     active: 'Y',
@@ -294,7 +294,7 @@ export const INITIAL_SALESPEOPLE: Salesperson[] = [
   {
     id: '005',
     name: 'Tinashe Mutasa',
-    pin: '1234',
+    pin: '123456',
     role: 'OWNER',
     email: 'tinashe@demo.com',
     phone: '+263 77 412 9901',
@@ -308,7 +308,7 @@ export const INITIAL_SALESPEOPLE: Salesperson[] = [
   {
     id: '006',
     name: 'Takunda Chikwanha',
-    pin: '1234',
+    pin: '123456',
     role: 'Cashier',
     email: 'takunda@demo.com',
     phone: '+263 71 882 1109',
@@ -322,7 +322,7 @@ export const INITIAL_SALESPEOPLE: Salesperson[] = [
   {
     id: '004',
     name: 'David Mutasa',
-    pin: '7788',
+    pin: '778899',
     role: 'Cashier',
     phone: '+263 78 444 3322',
     active: 'N',
@@ -335,7 +335,7 @@ export const INITIAL_SALESPEOPLE: Salesperson[] = [
   {
     id: 'USR-METRO-01',
     name: 'Metro General Manager',
-    pin: '9999',
+    pin: '999999',
     role: 'OWNER',
     phone: '+263 77 999 8888',
     email: 'metro_owner@customer.com',

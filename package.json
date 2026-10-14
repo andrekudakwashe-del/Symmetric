@@ -4,7 +4,7 @@
   "version": "5.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts --port 3000 --host 0.0.0.0",
+    "dev": "tsx server.ts",
     "build": "vite build",
     "lint": "tsc --noEmit",
     "preview": "vite preview"

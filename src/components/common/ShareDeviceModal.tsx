@@ -18,6 +18,7 @@ import {
   Zap,
   Edit2,
   RefreshCw,
+  AlertTriangle,
 } from 'lucide-react';
 import { meshSyncService } from '../../services/meshSyncService';
 import { P2PMeshPeer } from '../../types';
@@ -40,8 +41,13 @@ export const ShareDeviceModal: React.FC<ShareDeviceModalProps> = ({
   const [peerCount, setPeerCount] = useState(0);
   const [otherPeers, setOtherPeers] = useState<P2PMeshPeer[]>([]);
 
-  // Connection mode tab: 'local_wifi' (default for 0% internet) or 'cloud_relay' (when internet available)
-  const [activeTab, setActiveTab] = useState<'local_wifi' | 'cloud_relay'>('local_wifi');
+  const isBrowser = typeof window !== 'undefined';
+  const isCurrentHttps = isBrowser && window.location.protocol === 'https:';
+
+  // Connection mode tab: Defaults to secure HTTPS cloud relay if on HTTPS to avoid browser HTTP warnings
+  const [activeTab, setActiveTab] = useState<'local_wifi' | 'cloud_relay'>(() =>
+    isCurrentHttps ? 'cloud_relay' : 'local_wifi'
+  );
 
   // Local Wi-Fi configuration
   const [discoveredIps, setDiscoveredIps] = useState<{ name: string; ip: string; isHotspot: boolean }[]>([]);
@@ -49,8 +55,11 @@ export const ShareDeviceModal: React.FC<ShareDeviceModalProps> = ({
   const [isEditingIp, setIsEditingIp] = useState<boolean>(false);
   const [customIpInput, setCustomIpInput] = useState<string>('');
 
-  // Cloud shared base
-  const publicSharedBase = 'https://ais-pre-xnmwjokljamyp3uo6axish-553136009202.europe-west1.run.app';
+  // Cloud shared base (dynamically adopts active HTTPS domain if available)
+  const isPublicDomain = isBrowser && !window.location.hostname.match(/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/) && window.location.hostname !== 'localhost';
+  const publicSharedBase = (isCurrentHttps && isPublicDomain)
+    ? window.location.origin
+    : 'https://ais-pre-xnmwjokljamyp3uo6axish-553136009202.europe-west1.run.app';
 
   useEffect(() => {
     if (!isOpen) return;
@@ -232,6 +241,19 @@ export const ShareDeviceModal: React.FC<ShareDeviceModalProps> = ({
         {/* Network Mode Tabs */}
         <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1.5 rounded-2xl border border-slate-800">
           <button
+            id="tab-cloud-relay-mode"
+            type="button"
+            onClick={() => setActiveTab('cloud_relay')}
+            className={`py-2 px-3 rounded-xl text-xs font-bold transition flex items-center justify-center space-x-2 cursor-pointer ${
+              activeTab === 'cloud_relay'
+                ? 'bg-indigo-600 text-white shadow-md'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <span>Secure HTTPS Link (Padlock)</span>
+          </button>
+          <button
             id="tab-local-wifi-mode"
             type="button"
             onClick={() => setActiveTab('local_wifi')}
@@ -242,20 +264,7 @@ export const ShareDeviceModal: React.FC<ShareDeviceModalProps> = ({
             }`}
           >
             <Wifi className="w-4 h-4" />
-            <span>Same Wi-Fi (0% Internet)</span>
-          </button>
-          <button
-            id="tab-cloud-relay-mode"
-            type="button"
-            onClick={() => setActiveTab('cloud_relay')}
-            className={`py-2 px-3 rounded-xl text-xs font-bold transition flex items-center justify-center space-x-2 cursor-pointer ${
-              activeTab === 'cloud_relay'
-                ? 'bg-indigo-600 text-white shadow-md'
-                : 'text-slate-400 hover:text-white'
-            }`}
-          >
-            <Server className="w-4 h-4" />
-            <span>Online Cloud Relay</span>
+            <span>Local Wi-Fi Hotspot (0% Data)</span>
           </button>
         </div>
 
@@ -397,6 +406,14 @@ export const ShareDeviceModal: React.FC<ShareDeviceModalProps> = ({
                 </button>
               </div>
             </div>
+
+            {/* Insecure HTTP Warning Note for Local Hotspot IPs */}
+            <div className="bg-slate-950/80 border border-amber-500/30 rounded-xl p-2.5 text-[11px] text-amber-200/90 flex items-start space-x-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <strong className="text-amber-300">Why Chrome shows a red icon on local Wi-Fi:</strong> Modern browsers show a red icon or "Not secure" on raw IP addresses (e.g. <code>http://192.168.x.x</code>) because private subnets do not carry SSL certificates. To keep the secure green padlock in the address bar, use the <strong>Secure HTTPS Link</strong> tab above.
+              </div>
+            </div>
           </div>
         )}
 
@@ -404,10 +421,10 @@ export const ShareDeviceModal: React.FC<ShareDeviceModalProps> = ({
         {activeTab === 'cloud_relay' && (
           <div className="space-y-4 animate-fadeIn">
             <div className="bg-indigo-950/40 border border-indigo-500/30 rounded-2xl p-3 flex items-start space-x-3 text-xs text-indigo-200">
-              <Server className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
+              <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
               <div>
-                <strong className="text-white block font-bold">Cloud Sync Relay Mode:</strong>
-                Use this link when both devices have active internet access across different locations, mobile data networks, or separate Wi-Fi connections.
+                <strong className="text-white block font-bold">100% Secure HTTPS Connection (Green Padlock):</strong>
+                This link uses end-to-end SSL encryption. Browsers display a secure green padlock with zero security warnings, allowing full camera barcode scanning and WebAPK install.
               </div>
             </div>
 

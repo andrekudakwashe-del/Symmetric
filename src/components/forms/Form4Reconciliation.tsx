@@ -75,6 +75,7 @@ import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
 import { DatabaseBackupModal } from '../common/DatabaseBackupModal';
 import { DatabaseRestoreModal } from '../common/DatabaseRestoreModal';
+import { calculateSupervisorExpectedCash } from '../../services/walletService';
 
 interface Form4ReconciliationProps {
   currentUser: Salesperson;
@@ -132,7 +133,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   const [newPasswordInput, setNewPasswordInput] = useState(configuredPassword);
 
   // Active view tab
-  const [activeTab, setActiveTab] = useState<'balancing' | 'expenses' | 'history'>('balancing');
+  const [activeTab, setActiveTab] = useState<'balancing' | 'supervisor_handover' | 'expenses' | 'history'>('balancing');
   const [date, setDate] = useState<string>(() => getTodayDateString());
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState<'ALL' | 'BALANCED' | 'DISCREPANCY' | 'ACTIVE'>('ALL');
@@ -179,14 +180,27 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   const [expenses, setExpenses] = useState<ExpenseEntry[]>(() => getExpenses());
   const [salesList, setSalesList] = useState<SaleInvoice[]>(() => getSales());
 
-  // Subscribe to DB changes
+  // Subscribe to DB changes and window events
   useEffect(() => {
-    const unsub = subscribeToDatabase(() => {
+    const handleUpdate = () => {
       setSalespeople(getSalespeople());
       setExpenses(getExpenses());
       setSalesList(getSales());
-    });
-    return () => unsub();
+    };
+
+    const unsub = subscribeToDatabase(handleUpdate);
+    window.addEventListener('saimetric_sales_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_movements_updated', handleUpdate);
+    window.addEventListener('mesh-catchup-completed', handleUpdate);
+
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_sales_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_movements_updated', handleUpdate);
+      window.removeEventListener('mesh-catchup-completed', handleUpdate);
+    };
   }, []);
 
   // Initialize or update sales overrides whenever date changes
@@ -704,6 +718,20 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
             >
               <Scale className="w-3.5 h-3.5" />
               <span>Cash Balancing</span>
+            </button>
+
+            <button
+              id="tab-btn-supervisor-handover"
+              type="button"
+              onClick={() => setActiveTab('supervisor_handover')}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold transition flex items-center space-x-1.5 ${
+                activeTab === 'supervisor_handover'
+                  ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              <User className="w-3.5 h-3.5" />
+              <span>Supervisor Handover</span>
             </button>
 
             <button
@@ -1345,6 +1373,95 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                   </button>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* TAB 1b: SUPERVISOR EXPECTED CASH HANDOVER */}
+      {/* ========================================================================= */}
+      {activeTab === 'supervisor_handover' && (
+        <div className="space-y-4 animate-fadeIn">
+          <div className="bg-gradient-to-r from-amber-950/80 via-slate-900 to-slate-900 border border-amber-500/40 rounded-3xl p-5 shadow-xl space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base font-black text-white flex items-center gap-2">
+                  <User className="w-5 h-5 text-amber-400" />
+                  <span>Supervisor &amp; Owner Cash Custody Handover</span>
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Formula: Expected Cash = Opening Float + Own Cash Sales + Till Lifts Collected - Expenses Paid From Cash - GRVs Paid From Cash - Owner Drawings
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {salespeople
+                .filter(
+                  (s) =>
+                    s.role === 'Supervisor' ||
+                    s.role === 'Admin' ||
+                    s.role === 'OWNER' ||
+                    s.role === 'SUPER_ADMIN' ||
+                    isSupervisorOrAbove(s.role)
+                )
+                .map((sup) => {
+                  const summary = calculateSupervisorExpectedCash(sup.id, date);
+                  return (
+                    <div
+                      key={sup.id}
+                      className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-3 shadow-md"
+                    >
+                      <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                        <div>
+                          <span className="font-black text-white text-sm block">{sup.name}</span>
+                          <span className="text-[10px] text-amber-400 font-bold uppercase">{sup.role}</span>
+                        </div>
+                        <div className="text-right">
+                          <span className="text-[10px] text-slate-400 block">Expected Handover</span>
+                          <span className="text-base font-black text-amber-400 font-mono">
+                            ${summary.expectedHandoverCash.toFixed(2)}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5 text-xs">
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">+ Own Cash Sales:</span>
+                          <span className="font-mono text-emerald-400 font-bold">+${summary.ownCashSales.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">+ Till Lifts Collected:</span>
+                          <span className="font-mono text-blue-400 font-bold">+${summary.tillLiftsCollected.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">- Expenses Paid from Cash:</span>
+                          <span className="font-mono text-rose-400 font-bold">-${summary.expensesPaidFromCash.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">- GRV Payments Paid from Cash:</span>
+                          <span className="font-mono text-rose-400 font-bold">-${summary.grvPaymentsPaidFromCash.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">- Owner Drawings / Safe:</span>
+                          <span className="font-mono text-purple-400 font-bold">-${summary.ownerDrawingsTaken.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-400">Shop Use (Non-Cash Meals):</span>
+                          <span className="font-mono text-slate-500 font-bold">$0.00 (Non-Cash)</span>
+                        </div>
+                      </div>
+
+                      <div className="pt-2 border-t border-slate-800 flex items-center justify-between">
+                        <span className="text-[10px] text-slate-500">Date: {date}</span>
+                        <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono text-[10px] font-bold">
+                          Live Audit Ready
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
             </div>
           </div>
         </div>

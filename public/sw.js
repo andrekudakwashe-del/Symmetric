@@ -3,7 +3,7 @@
  * Provides 100% offline app loading, asset precaching, and network fallback.
  */
 
-const CACHE_NAME = 'saimetric-v5-cache-v1';
+const CACHE_NAME = 'saimetric-v5-cache-v2';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',
@@ -47,31 +47,48 @@ self.addEventListener('fetch', (event) => {
   // Handle SPA Navigation requests (HTML)
   if (event.request.mode === 'navigate') {
     event.respondWith(
-      fetch(event.request).catch(() => {
-        return caches.match('/index.html') || caches.match('/');
-      })
+      fetch(event.request)
+        .then((networkResponse) => {
+          if (networkResponse && networkResponse.status === 200) {
+            const copy = networkResponse.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          }
+          return networkResponse;
+        })
+        .catch(() => {
+          return caches.match('/index.html') || caches.match('/');
+        })
     );
     return;
   }
 
-  // Handle static assets (JS, CSS, images, fonts)
-  // Stale-While-Revalidate strategy
+  // Handle static assets (JS chunks, CSS, images, fonts)
+  // Cache-First with background revalidation: returns cached module in 0ms instantly
   event.respondWith(
     caches.match(event.request).then((cachedResponse) => {
-      const fetchPromise = fetch(event.request).then((networkResponse) => {
-        if (networkResponse && networkResponse.status === 200 && networkResponse.type === 'basic') {
+      if (cachedResponse) {
+        // Asynchronously update cache in background if network is active
+        fetch(event.request)
+          .then((networkResponse) => {
+            if (networkResponse && networkResponse.status === 200) {
+              const copy = networkResponse.clone();
+              caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+            }
+          })
+          .catch(() => {});
+        return cachedResponse;
+      }
+
+      // Not yet in cache: fetch from network and store in cache immediately
+      return fetch(event.request).then((networkResponse) => {
+        if (networkResponse && networkResponse.status === 200) {
           const responseToCache = networkResponse.clone();
           caches.open(CACHE_NAME).then((cache) => {
             cache.put(event.request, responseToCache);
           });
         }
         return networkResponse;
-      }).catch(() => {
-        // Network failure, return cached or empty
-        return cachedResponse;
       });
-
-      return cachedResponse || fetchPromise;
     })
   );
 });

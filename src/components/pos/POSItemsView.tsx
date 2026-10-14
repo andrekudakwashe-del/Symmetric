@@ -74,10 +74,22 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
   const [searchQuery, setSearchQuery] = useState(initialSearch);
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
   const [isListView, setIsListView] = useState<boolean>(false);
+  const [gridDensity, setGridDensity] = useState<'compact' | 'dense' | 'standard'>(() => {
+    const saved = localStorage.getItem('pos_tile_density');
+    if (saved === 'dense' || saved === 'standard' || saved === 'compact') return saved;
+    return 'compact'; // Default 3x4 as requested
+  });
   const [quickScanOpen, setQuickScanOpen] = useState<boolean>(false);
   const [fractionalModalProduct, setFractionalModalProduct] = useState<Product | null>(null);
   const [isQuickAddOpen, setIsQuickAddOpen] = useState<boolean>(false);
   const [removeConfirmProduct, setRemoveConfirmProduct] = useState<Product | null>(null);
+
+  const handleSetDensity = (mode: 'compact' | 'dense' | 'standard') => {
+    setGridDensity(mode);
+    try {
+      localStorage.setItem('pos_tile_density', mode);
+    } catch (_) {}
+  };
 
   const handleProductTap = (product: Product) => {
     if (product.sellByFraction) {
@@ -189,8 +201,48 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
             </span>
           </div>
 
-          {/* Right: Layout Toggle + Call */}
-          <div className="flex items-center space-x-2">
+          {/* Right: Tile Density Selector + Layout Toggle + Call */}
+          <div className="flex items-center space-x-1.5 sm:space-x-2">
+            {!isListView && (
+              <div className="flex items-center bg-white/15 rounded-2xl p-0.5 border border-white/20">
+                <button
+                  type="button"
+                  onClick={() => handleSetDensity('standard')}
+                  title="2 Columns (2 × 3 Large Tiles)"
+                  className={`px-2 py-1 rounded-xl text-[10px] font-black transition ${
+                    gridDensity === 'standard'
+                      ? 'bg-white text-[#6A4DFF] shadow-xs'
+                      : 'text-white/80 hover:text-white'
+                  }`}
+                >
+                  2×3
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSetDensity('compact')}
+                  title="3 Columns (3 × 4 Compact - Default, Fits 12 Products)"
+                  className={`px-2 py-1 rounded-xl text-[10px] font-black transition ${
+                    gridDensity === 'compact'
+                      ? 'bg-white text-[#6A4DFF] shadow-xs'
+                      : 'text-white/80 hover:text-white'
+                  }`}
+                >
+                  3×4
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSetDensity('dense')}
+                  title="4 Columns (4 × 5 Dense - Maximum Products)"
+                  className={`px-2 py-1 rounded-xl text-[10px] font-black transition ${
+                    gridDensity === 'dense'
+                      ? 'bg-white text-[#6A4DFF] shadow-xs'
+                      : 'text-white/80 hover:text-white'
+                  }`}
+                >
+                  4×5
+                </button>
+              </div>
+            )}
             <button
               type="button"
               onClick={() => setIsListView(!isListView)}
@@ -371,8 +423,16 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
           })}
         </div>
       ) : (
-        /* Grid View Mode matching Screenshot with Full Gesture Support */
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5 sm:gap-3">
+        /* Grid View Mode matching Screenshot with Adjustable Density (3x4 Compact default) */
+        <div
+          className={
+            gridDensity === 'dense'
+              ? 'grid grid-cols-4 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-1.5 sm:gap-2'
+              : gridDensity === 'standard'
+              ? 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5 sm:gap-3'
+              : 'grid grid-cols-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 sm:gap-2.5'
+          }
+        >
           {filteredProducts.map((product, idx) => {
             const qty = cartMap.get(product.id) || 0;
             const avatarBg = AVATAR_COLORS[idx % AVATAR_COLORS.length];
@@ -383,6 +443,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
                 product={product}
                 quantityInCart={qty}
                 avatarBg={avatarBg}
+                density={gridDensity}
                 onTap={handleProductTap}
                 onDecrement={handleProductDecrement}
                 onRequestRemove={handleRequestRemove}

@@ -4,6 +4,7 @@ import { Form1CashCount } from './Form1CashCount';
 import { Form2CashLog } from './Form2CashLog';
 import { Form3SalesEntry } from './Form3SalesEntry';
 import { Form4Reconciliation } from './Form4Reconciliation';
+import { WhereIsMyMoneyView } from './WhereIsMyMoneyView';
 import { isSupervisorOrAbove } from '../../db/roomDatabase';
 import {
   Coins,
@@ -15,11 +16,12 @@ import {
   CreditCard,
   ShoppingCart,
   ShieldCheck,
+  Landmark,
 } from 'lucide-react';
 
 interface CashBalancingModuleProps {
   currentUser: Salesperson;
-  initialSubTab?: 'form1' | 'form2' | 'form3' | 'form4';
+  initialSubTab?: 'form1' | 'form2' | 'form3' | 'form4' | 'where_is_my_money';
   preselectedCustomer?: string | null;
   onNavigateHome: () => void;
   onNavigateToPOS: () => void;
@@ -36,7 +38,7 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
   onNavigateToCreditReport,
   onNavigateToDirectGrv,
 }) => {
-  const [subTab, setSubTab] = useState<'form1' | 'form2' | 'form3' | 'form4'>(
+  const [subTab, setSubTab] = useState<'form1' | 'form2' | 'form3' | 'form4' | 'where_is_my_money'>(
     initialSubTab
   );
 
@@ -81,7 +83,7 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
         </div>
 
         {/* Form Selector Tabs (Material 3 style) */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
           <button
             type="button"
             id="subtab-form1"
@@ -154,6 +156,23 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
               <span>Balancing & EOD</span>
             </div>
           </button>
+
+          <button
+            type="button"
+            id="subtab-where-is-my-money"
+            onClick={() => setSubTab('where_is_my_money')}
+            className={`flex items-center space-x-2 p-2.5 rounded-2xl border transition-all text-xs font-bold ${
+              subTab === 'where_is_my_money'
+                ? 'bg-indigo-950/80 border-indigo-500 text-indigo-200 ring-1 ring-indigo-500/50 shadow-md'
+                : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Landmark className={`w-4 h-4 ${subTab === 'where_is_my_money' ? 'text-indigo-400' : 'text-slate-400'}`} />
+            <div className="text-left">
+              <span className="block text-[10px] text-amber-400 font-medium">Live Wallets</span>
+              <span>Where is My Money?</span>
+            </div>
+          </button>
         </div>
       </div>
 
@@ -208,6 +227,10 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
               </p>
             </div>
           )
+        )}
+
+        {subTab === 'where_is_my_money' && (
+          <WhereIsMyMoneyView currentUser={currentUser} />
         )}
       </div>
     </div>

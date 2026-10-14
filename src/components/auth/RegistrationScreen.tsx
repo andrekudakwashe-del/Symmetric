@@ -189,8 +189,8 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
       setError('Please enter a valid owner email address.');
       return;
     }
-    if (!ownerPin || ownerPin.length !== 4 || !/^\d{4}$/.test(ownerPin)) {
-      setError('Please choose a 4-digit numeric PIN for terminal access.');
+    if (!ownerPin || !/^\d{6}$/.test(ownerPin)) {
+      setError('Please choose a 6-digit numeric PIN for terminal access (e.g. 123456).');
       return;
     }
     if (ownerPin !== confirmPin) {
@@ -408,42 +408,42 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
             </div>
           </div>
 
-          {/* Section 4: 4-Digit Security PIN */}
+          {/* Section 4: 6-Digit Security PIN */}
           <div className="space-y-4 pt-1">
             <div className="flex items-center gap-2 pb-2 border-b border-slate-800">
               <Lock className="w-4 h-4 text-purple-400" />
               <h3 className="text-sm font-bold text-white uppercase tracking-wider">
-                4. Owner 4-Digit POS Login PIN
+                4. Owner 6-Digit POS Login PIN
               </h3>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
               <div className="space-y-1">
                 <label className="text-xs font-semibold text-slate-300">
-                  Choose 4-Digit PIN <span className="text-rose-400">*</span>
+                  Choose 6-Digit PIN <span className="text-rose-400">*</span>
                 </label>
                 <input
                   type="password"
-                  maxLength={4}
+                  maxLength={6}
                   required
                   value={ownerPin}
-                  onChange={(e) => setOwnerPin(e.target.value.replace(/\D/g, ''))}
-                  placeholder="••••"
+                  onChange={(e) => setOwnerPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="••••••"
                   className="w-full bg-slate-950 border border-slate-700 text-white text-center font-mono font-black tracking-widest text-lg rounded-xl py-2 focus:outline-none focus:border-amber-500"
                 />
               </div>
 
               <div className="space-y-1">
                 <label className="text-xs font-semibold text-slate-300">
-                  Confirm 4-Digit PIN <span className="text-rose-400">*</span>
+                  Confirm 6-Digit PIN <span className="text-rose-400">*</span>
                 </label>
                 <input
                   type="password"
-                  maxLength={4}
+                  maxLength={6}
                   required
                   value={confirmPin}
-                  onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, ''))}
-                  placeholder="••••"
+                  onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="••••••"
                   className="w-full bg-slate-950 border border-slate-700 text-white text-center font-mono font-black tracking-widest text-lg rounded-xl py-2 focus:outline-none focus:border-amber-500"
                 />
               </div>

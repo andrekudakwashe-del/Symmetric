@@ -34,6 +34,8 @@ import {
   QrCode,
   Share2,
   Crown,
+  Landmark,
+  Utensils,
 } from 'lucide-react';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import { BluetoothPrinterModal } from '../common/BluetoothPrinterModal';
@@ -213,6 +215,14 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
                 description: 'Calculate variances vs external cash registers',
                 icon: ShieldCheck,
                 color: 'from-indigo-600 to-purple-800',
+              },
+              {
+                tab: 'cash_balancing' as ActiveTab,
+                label: 'Where is My Money? (Multi-Wallet)',
+                description: 'Reconcile Till Cash, EcoCash, ZiG Bank, USD Bank & Home Safe balances',
+                icon: Landmark,
+                color: 'from-amber-500 to-indigo-600',
+                badge: 'Live Wallets',
               },
             ]
           : []),

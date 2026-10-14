@@ -49,8 +49,10 @@ import {
   getSalespeople,
   getBranches,
   pullTenantInventory,
+  pullTenantSales,
   clearAllSyncQueueItems,
 } from '../db/roomDatabase';
+import { retentionLifecycleService } from './backendAdapter/retentionService';
 import { Company, SaaSBranch } from '../data/saasData';
 import { Salesperson, Branch } from '../types';
 
@@ -159,6 +161,11 @@ class PersistentSyncEngine {
       console.warn('[SyncEngine] Initial queue compaction/cleanup error:', e);
     }
 
+    // 2b. Run automated 3-month retention check for all tenants
+    retentionLifecycleService.checkAndRunScheduledPrune().catch((e) => {
+      console.warn('[SyncEngine] Scheduled retention prune check error:', e);
+    });
+
     // 3. Register Background Sync API if supported
     this.registerBackgroundSync();
 
@@ -169,6 +176,7 @@ class PersistentSyncEngine {
     this.performDeltaSync().catch((err) => console.warn('[SyncEngine] Initial delta sync error:', err));
     this.refreshTenantContext().catch((err) => console.warn('[SyncEngine] Initial tenant context error:', err));
     pullTenantInventory().catch(() => {});
+    pullTenantSales().catch(() => {});
 
     // 6. Start Background Workers
     // - Queue worker: every 30 seconds
@@ -521,7 +529,7 @@ class PersistentSyncEngine {
         // Trigger immediate entity refresh if staff or branch was modified
         if (item.action === 'upsert_staff' || item.sheetName === 'users') {
           this.forceRefreshStaff().catch(() => {});
-        } else if (item.action === 'create_branch' || item.sheetName === 'branches') {
+        } else if (item.action === 'create_branch' || (item.sheetName === 'branches' && item.action !== 'delete_branch')) {
           this.forceRefreshBranches().catch(() => {});
         }
 
@@ -710,15 +718,16 @@ class PersistentSyncEngine {
             companyId: b.company_id || companyId,
             is_active: b.is_active !== false,
           };
-          saveBranch(branchObj);
+          saveBranch(branchObj, { fromSync: true });
           branchesCount++;
         }
         const serverTime = branchesRes.server_time || new Date().toISOString();
         await setSyncMeta('branches', serverTime, serverTime);
       }
 
-      // 3. Delta Refresh Tenant Inventory across all devices
+      // 3. Delta Refresh Tenant Inventory and Sales across all devices
       await pullTenantInventory(companyId).catch(() => {});
+      await pullTenantSales(companyId).catch(() => {});
     } catch (err) {
       console.warn('[SyncEngine] Delta sync non-fatal error:', err);
     }
@@ -763,17 +772,20 @@ class PersistentSyncEngine {
     if (res && res.success && Array.isArray(res.branches)) {
       for (const b of res.branches) {
         const brId = b.branch_id || b.branchId || 'BR-MAIN';
-        saveBranch({
-          id: brId,
-          branchId: brId,
-          name: b.name || b.branch_name || 'Branch',
-          code: b.code || b.branch_code || brId,
-          location: b.location || b.address || '',
-          address: b.location || b.address || '',
-          company_id: b.company_id || currentCompany.company_id,
-          companyId: b.company_id || currentCompany.company_id,
-          is_active: b.is_active !== false,
-        });
+        saveBranch(
+          {
+            id: brId,
+            branchId: brId,
+            name: b.name || b.branch_name || 'Branch',
+            code: b.code || b.branch_code || brId,
+            location: b.location || b.address || '',
+            address: b.location || b.address || '',
+            company_id: b.company_id || currentCompany.company_id,
+            companyId: b.company_id || currentCompany.company_id,
+            is_active: b.is_active !== false,
+          },
+          { fromSync: true }
+        );
         count++;
       }
       const serverTime = res.server_time || new Date().toISOString();

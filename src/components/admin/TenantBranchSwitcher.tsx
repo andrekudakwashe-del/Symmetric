@@ -73,6 +73,23 @@ export const TenantBranchSwitcher: React.FC<TenantBranchSwitcherProps> = ({
 
   const handleSelectBranch = (branchId: string) => {
     if (!canSwitchBranch) return;
+    
+    if (branchId === 'ALL') {
+      setCurrentBranchId('ALL');
+      if (currentUser) {
+        const updatedUser: Salesperson = {
+          ...currentUser,
+          branchId: 'ALL',
+          branch_id: 'ALL',
+          branchName: 'All Branches (Consolidated)',
+        };
+        setSessionUser(updatedUser);
+      }
+      onBranchChange?.('ALL', 'All Branches (Consolidated)');
+      setIsOpen(false);
+      return;
+    }
+
     setCurrentBranchId(branchId);
     
     // Ensure currentUser session branch is synchronized so any new POS sale is attributed to this branch
@@ -182,6 +199,23 @@ export const TenantBranchSwitcher: React.FC<TenantBranchSwitcherProps> = ({
           </div>
 
           <div className="space-y-1 max-h-48 overflow-y-auto">
+            {/* Explicit All Branches Option for Consolidated Overview */}
+            <button
+              type="button"
+              onClick={() => handleSelectBranch('ALL')}
+              className={`w-full text-left px-3 py-2 rounded-xl text-xs flex items-center justify-between transition-all ${
+                branch.branchId === 'ALL'
+                  ? 'bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30'
+                  : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <Layers className="w-3.5 h-3.5 text-amber-400" />
+                <span className="font-semibold">All Branches (Consolidated)</span>
+              </div>
+              <span className="font-mono text-[10px] text-amber-400 font-bold">ALL</span>
+            </button>
+
             {allBranches.map((b, bIdx) => {
               const bId = b.branchId || b.id || (b as any).branch_id || `br-${bIdx}`;
               const isSelected = bId === branch.branchId;

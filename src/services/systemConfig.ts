@@ -151,7 +151,7 @@ export async function pushAllLocalTenantsToCloud(
       }
       if (data && Array.isArray(data.branches)) {
         data.branches.forEach((sb: any) => {
-          if (sb && sb.branch_id) saveBranch(sb);
+          if (sb && (sb.branch_id || sb.branchId || sb.id)) saveBranch(sb, { fromSync: true });
         });
       }
       if (data && Array.isArray(data.users)) {
@@ -242,8 +242,8 @@ export async function initializeSystemConfigAndSync(): Promise<{
         }
         if (serverData && Array.isArray(serverData.branches)) {
           serverData.branches.forEach((sb: any) => {
-            if (sb && sb.branch_id) {
-              saveBranch(sb);
+            if (sb && (sb.branch_id || sb.branchId || sb.id)) {
+              saveBranch(sb, { fromSync: true });
             }
           });
         }

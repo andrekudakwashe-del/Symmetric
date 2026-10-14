@@ -30,6 +30,9 @@ import {
   Home,
   Receipt,
   FileSpreadsheet,
+  Minus,
+  List,
+  LayoutGrid,
 } from 'lucide-react';
 import {
   InventoryItem,
@@ -80,22 +83,50 @@ interface ExcelVoucherRow {
   receiveAs: 'Cases' | 'Singles' | 'Variant'; // Exclusive choice: Cases, Singles, or Prepack Variant
   selectedVariantId?: string;
   selectedVariantName?: string;
-  unitsPerPack?: number;
-  qtyPerCaseDefault: number; // units per case
+  unitsPerPack?: number | string;
+  qtyPerCaseDefault: number | string; // units per case
   originalUnitsPerCase?: number; // Catalog ratio for comparison
-  quantityCases: number;
-  quantitySingles: number;
-  quantityPacks?: number;
+  quantityCases: number | string;
+  quantitySingles: number | string;
+  quantityPacks?: number | string;
   lastCost: number; // historical cost per case
-  pricePerCase: number; // current invoice cost per case/pack/unit
-  sellingPrice: number; // single unit selling price
+  pricePerCase: number | string; // current invoice cost per case/pack/unit
+  sellingPrice: number | string; // single unit selling price
   canSellAsCase: boolean;
   category: string;
   packagingVariants?: PackagingVariant[];
   expiryDate?: string;
   batchNumber?: string;
-  weight?: number; // item weight in kg for by_weight landed cost allocation
+  trackExpiry?: boolean;
+  shelfLifeDays?: number;
+  weight?: number | string; // item weight in kg for by_weight landed cost allocation
 }
+
+/**
+ * Cleans numerical text input for seamless cashier/inventory entry:
+ * - Allows clearing the field completely to blank ("") without snapping back
+ * - Strips leading zero if followed by a non-decimal digit (e.g. "012" -> "12", "01" -> "1")
+ * - Retains valid decimals (e.g. "0.5", "12.50")
+ * - Preserves empty string so the field can be cleared cleanly
+ */
+export const cleanNumberInput = (raw: string, allowDecimals = true): string => {
+  if (raw === '' || raw === null || raw === undefined) return '';
+  let clean = String(raw).replace(/[^\d.]/g, '');
+  if (!allowDecimals) {
+    clean = clean.replace(/\./g, '');
+  } else {
+    const parts = clean.split('.');
+    if (parts.length > 2) {
+      clean = parts[0] + '.' + parts.slice(1).join('');
+    }
+  }
+  // Strip leading zero if followed by other digits (e.g. "012" -> "12"), while allowing "0." or standalone "0"
+  if (/^0[0-9]+/.test(clean)) {
+    clean = clean.replace(/^0+/, '');
+    if (clean === '') clean = '0';
+  }
+  return clean;
+};
 
 // Stage 3: Margin Capacity Allocation preview and management override panel
 const LandedCostMarginPreview: React.FC<{
@@ -142,7 +173,7 @@ const LandedCostMarginPreview: React.FC<{
   const rowAllocations = validRows.map((r, idx) => {
     const calc = getRowCalculations(r);
     const cost = calc.unitCost;
-    const sell = r.sellingPrice || 0;
+    const sell = Number(r.sellingPrice) || 0;
     const profit = sell - cost;
     const marginPct = sell > 0 ? (profit / sell) * 100 : 0;
     const isExcluded = profit <= 0 || sell <= 0;
@@ -396,6 +427,10 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   const [supplierFilterTerm, setSupplierFilterTerm] = useState<string>('');
   const [isRegisterSupplierModalOpen, setIsRegisterSupplierModalOpen] = useState<boolean>(false);
 
+  // GRV Voucher Draft Auto-Save State (for sudden clerk exit / power outage recovery)
+  const [lastGrvDraftSavedAt, setLastGrvDraftSavedAt] = useState<string | null>(null);
+  const [hasRestoredGrvDraft, setHasRestoredGrvDraft] = useState<boolean>(false);
+
   const [supplierInvoiceNo, setSupplierInvoiceNo] = useState<string>(
     () => `INV-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`
   );
@@ -413,12 +448,12 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     receiveAs: 'Cases',
     qtyPerCaseDefault: 12,
     originalUnitsPerCase: 12,
-    quantityCases: 1,
-    quantitySingles: 0,
-    quantityPacks: 0,
+    quantityCases: '',
+    quantitySingles: '',
+    quantityPacks: '',
     lastCost: 0,
-    pricePerCase: 0,
-    sellingPrice: 0,
+    pricePerCase: '',
+    sellingPrice: '',
     canSellAsCase: true,
     category: 'General',
     packagingVariants: [],
@@ -426,9 +461,93 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
 
   // Interactive Excel Spreadsheet Rows - Starts with 1 blank row ready for input
   const [rows, setRows] = useState<ExcelVoucherRow[]>(() => [createBlankVoucherRow()]);
+  const [mobileViewMode, setMobileViewMode] = useState<'CARDS' | 'TABLE'>('CARDS');
 
   // Dynamic Landed Costs (Freight, Duty, Brokerage, Insurance)
   const [landedCosts, setLandedCosts] = useState<LandedCostItem[]>([]);
+
+  // 1. Recover Goods Received Voucher Draft on initial mount
+  useEffect(() => {
+    try {
+      const savedDraft = localStorage.getItem('saimetric_draft_goods_received_voucher');
+      if (savedDraft) {
+        const parsed = JSON.parse(savedDraft);
+        if (
+          parsed &&
+          Array.isArray(parsed.rows) &&
+          parsed.rows.some((r: any) => r.itemId || r.itemName || r.quantityCases || r.pricePerCase)
+        ) {
+          if (parsed.supplierName) setSupplierName(parsed.supplierName);
+          if (parsed.selectedBranchId) setSelectedBranchId(parsed.selectedBranchId);
+          if (parsed.supplierInvoiceNo) setSupplierInvoiceNo(parsed.supplierInvoiceNo);
+          if (parsed.purchaseOrderNo) setPurchaseOrderNo(parsed.purchaseOrderNo);
+          if (parsed.invoiceDate) setInvoiceDate(parsed.invoiceDate);
+          if (parsed.paymentTerms) setPaymentTerms(parsed.paymentTerms);
+          if (parsed.invoiceNotes) setInvoiceNotes(parsed.invoiceNotes);
+          if (Array.isArray(parsed.landedCosts)) setLandedCosts(parsed.landedCosts);
+          setRows(parsed.rows);
+          setLastGrvDraftSavedAt(parsed.savedAt || 'Saved');
+          setHasRestoredGrvDraft(true);
+        }
+      }
+    } catch (e) {
+      console.error('[GoodsReceivedView] Failed to restore GRV draft:', e);
+    }
+  }, []);
+
+  // 2. Auto-save Goods Received Voucher Draft on any keystroke or line modification
+  useEffect(() => {
+    const hasMeaningfulData =
+      rows.some((r) => r.itemId || r.itemName || r.quantityCases || r.quantitySingles || r.pricePerCase) ||
+      supplierName.trim() !== '';
+
+    if (hasMeaningfulData) {
+      try {
+        const timeNow = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const draftData = {
+          supplierName,
+          selectedBranchId,
+          supplierInvoiceNo,
+          purchaseOrderNo,
+          invoiceDate,
+          paymentTerms,
+          invoiceNotes,
+          rows,
+          landedCosts,
+          savedAt: timeNow,
+        };
+        localStorage.setItem('saimetric_draft_goods_received_voucher', JSON.stringify(draftData));
+        setLastGrvDraftSavedAt(timeNow);
+      } catch (e) {
+        console.error('[GoodsReceivedView] Failed to auto-save GRV draft:', e);
+      }
+    }
+  }, [
+    rows,
+    supplierName,
+    selectedBranchId,
+    supplierInvoiceNo,
+    purchaseOrderNo,
+    invoiceDate,
+    paymentTerms,
+    invoiceNotes,
+    landedCosts,
+  ]);
+
+  const handleDiscardGrvDraft = () => {
+    try {
+      localStorage.removeItem('saimetric_draft_goods_received_voucher');
+    } catch (e) {
+      // ignore
+    }
+    setHasRestoredGrvDraft(false);
+    setLastGrvDraftSavedAt(null);
+    setSupplierName('');
+    setInvoiceNotes('');
+    setRows([createBlankVoucherRow()]);
+    setLandedCosts([]);
+    showToast('success', 'Goods Received Voucher draft discarded.');
+  };
 
   const addLandedCost = () => {
     setLandedCosts((prev) => [
@@ -605,6 +724,11 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
             sellingPrice: item.sellPriceUnit || 0,
             canSellAsCase: Boolean(item.canSellAsCase),
             category: item.category || 'General',
+            trackExpiry: Boolean(item.trackExpiry),
+            shelfLifeDays: item.shelfLifeDays,
+            expiryDate: item.trackExpiry && item.shelfLifeDays && !row.expiryDate
+              ? new Date(Date.now() + item.shelfLifeDays * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+              : row.expiryDate,
             packagingVariants: variants,
             selectedVariantId: variants.length > 0 ? variants[0].id : undefined,
             selectedVariantName: variants.length > 0 ? variants[0].name : undefined,
@@ -614,7 +738,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
         return row;
       });
 
-      if (isLast) {
+        if (isLast) {
         updated.push({
           id: `row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
           itemId: '',
@@ -622,12 +746,12 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
           receiveAs: 'Cases',
           qtyPerCaseDefault: 12,
           originalUnitsPerCase: 12,
-          quantityCases: 1,
-          quantitySingles: 0,
-          quantityPacks: 0,
+          quantityCases: '',
+          quantitySingles: '',
+          quantityPacks: '',
           lastCost: 0,
-          pricePerCase: 0,
-          sellingPrice: 0,
+          pricePerCase: '',
+          sellingPrice: '',
           canSellAsCase: true,
           category: 'General',
           packagingVariants: [],
@@ -651,12 +775,12 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
         receiveAs: 'Cases',
         qtyPerCaseDefault: 12,
         originalUnitsPerCase: 12,
-        quantityCases: 1,
-        quantitySingles: 0,
-        quantityPacks: 0,
+        quantityCases: '',
+        quantitySingles: '',
+        quantityPacks: '',
         lastCost: 0,
-        pricePerCase: 0,
-        sellingPrice: 0,
+        pricePerCase: '',
+        sellingPrice: '',
         canSellAsCase: true,
         category: 'General',
         packagingVariants: [],
@@ -788,6 +912,13 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     const willConvertNoCaseSale =
       row.receiveAs === 'Cases' && qtyCases > 0 && !row.canSellAsCase;
 
+    const totalUnits =
+      row.receiveAs === 'Singles'
+        ? qtySingles
+        : row.receiveAs === 'Variant'
+        ? qtyPacks * unitsPerPack
+        : qtyCases * qtyPerCase;
+
     return {
       qtyCases,
       qtySingles,
@@ -796,6 +927,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       effectiveCaseCost,
       qtyPerCase,
       unitsPerPack,
+      totalUnits,
       unitCost,
       lineTotal,
       sellingPrice,
@@ -932,9 +1064,9 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       .filter(
         (r) =>
           r.itemId &&
-          ((r.receiveAs === 'Cases' && r.quantityCases > 0) ||
-            (r.receiveAs === 'Singles' && r.quantitySingles > 0) ||
-            (r.receiveAs === 'Variant' && (r.quantityPacks || 0) > 0))
+          ((r.receiveAs === 'Cases' && (Number(r.quantityCases) || 0) > 0) ||
+            (r.receiveAs === 'Singles' && (Number(r.quantitySingles) || 0) > 0) ||
+            (r.receiveAs === 'Variant' && (Number(r.quantityPacks) || 0) > 0))
       )
       .map((r) => {
         const calc = getRowCalculations(r);
@@ -943,19 +1075,19 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
           receiveAs: r.receiveAs,
           receiveVariantId: r.selectedVariantId,
           receiveVariantName: r.selectedVariantName,
-          unitsPerReceivePack: r.unitsPerPack || 1,
-          receivedPacks: r.receiveAs === 'Variant' ? r.quantityPacks || 0 : 0,
-          costPerPack: r.receiveAs === 'Variant' ? r.pricePerCase : undefined,
-          receivedCases: r.receiveAs === 'Cases' ? r.quantityCases : 0,
-          receivedSingles: r.receiveAs === 'Singles' ? r.quantitySingles : 0,
+          unitsPerReceivePack: Number(r.unitsPerPack) || 1,
+          receivedPacks: r.receiveAs === 'Variant' ? Number(r.quantityPacks) || 0 : 0,
+          costPerPack: r.receiveAs === 'Variant' ? Number(r.pricePerCase) || 0 : undefined,
+          receivedCases: r.receiveAs === 'Cases' ? Number(r.quantityCases) || 0 : 0,
+          receivedSingles: r.receiveAs === 'Singles' ? Number(r.quantitySingles) || 0 : 0,
           lastCost: r.lastCost,
           costPerCase: calc.effectiveCaseCost,
           costPerUnit: calc.unitCost,
-          sellingPrice: r.sellingPrice,
+          sellingPrice: Number(r.sellingPrice) || 0,
           marginPercent: calc.marginPercent,
           expiryDate: r.expiryDate || undefined,
           batchNumber: r.batchNumber || undefined,
-          weight: r.weight || 0,
+          weight: Number(r.weight) || 0,
         };
       });
 
@@ -994,6 +1126,13 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       );
 
       // Generate new invoice number and reset voucher completely to blank
+      try {
+        localStorage.removeItem('saimetric_draft_goods_received_voucher');
+      } catch (e) {
+        // ignore
+      }
+      setHasRestoredGrvDraft(false);
+      setLastGrvDraftSavedAt(null);
       setSupplierInvoiceNo(`INV-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`);
       setPurchaseOrderNo(`PO-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`);
       setInvoiceNotes('');
@@ -1007,6 +1146,13 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
 
   // Reset form to receive a brand new invoice (completely blank)
   const handleStartNewInvoice = () => {
+    try {
+      localStorage.removeItem('saimetric_draft_goods_received_voucher');
+    } catch (e) {
+      // ignore
+    }
+    setHasRestoredGrvDraft(false);
+    setLastGrvDraftSavedAt(null);
     setViewingVoucher(null);
     setActiveTab('create_invoice');
     setSupplierName('');
@@ -1193,19 +1339,63 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
         {/* ========================================================================= */}
         {activeTab === 'create_invoice' && (
           <div className="space-y-6">
+            {/* RECOVERED GRV DRAFT ALERT BANNER */}
+            {hasRestoredGrvDraft && (
+              <div className="bg-gradient-to-r from-amber-500/15 via-amber-500/10 to-transparent border-2 border-amber-500/40 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-md animate-in fade-in">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 bg-amber-500 text-white rounded-xl shadow-xs shrink-0">
+                    <Clock className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <div className="font-black text-xs text-amber-200 flex items-center gap-2">
+                      <span>Unsaved Goods Received Voucher (GRV) Recovered</span>
+                      <span className="text-[10px] bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full font-bold border border-amber-500/30">
+                        {rows.filter((r) => r.itemId || r.itemName).length} products &bull; Last Saved: {lastGrvDraftSavedAt || 'Recent'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-amber-200/80 mt-0.5">
+                      Power loss, load shedding, or browser closed? Your delivery voucher worksheet was automatically preserved. You can continue receiving where you left off.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setHasRestoredGrvDraft(false)}
+                    className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer"
+                  >
+                    Continue Working
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDiscardGrvDraft}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-rose-300 border border-rose-500/30 rounded-xl text-xs font-bold transition cursor-pointer"
+                  >
+                    Discard Draft
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Header Form Card */}
             <div className="bg-slate-850 border border-slate-700/80 rounded-2xl p-5 shadow-xl space-y-4">
               <div className="flex flex-col md:flex-row md:items-center justify-between pb-4 border-b border-slate-700/70 gap-4">
                 <div>
-                  <h2 className="text-base font-bold text-white flex items-center gap-2">
+                  <h2 className="text-base font-bold text-white flex items-center gap-2 flex-wrap">
                     <Truck className="w-4 h-4 text-emerald-400" />
-                    Supplier Delivery & Invoice Details
+                    <span>Supplier Delivery &amp; Invoice Details</span>
+                    {lastGrvDraftSavedAt && (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                        Auto-Saved ({lastGrvDraftSavedAt})
+                      </span>
+                    )}
                   </h2>
                   <p className="text-xs text-slate-400 mt-0.5">
                     Capture supplier invoice reference, receiving branch, and line items
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <button
                     type="button"
                     onClick={() => setActiveTab('trip_manifest')}
@@ -1467,13 +1657,15 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                           <div className="relative">
                             <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500 text-xs">$</span>
                             <input
-                              type="number"
-                              step="0.01"
-                              min={0}
-                              value={lc.amount || ''}
-                              onChange={(e) =>
-                                updateLandedCost(index, { amount: Math.max(0, parseFloat(e.target.value) || 0) })
-                              }
+                              type="text"
+                              inputMode="decimal"
+                              value={lc.amount ?? ''}
+                              onFocus={(e) => e.target.select()}
+                              onClick={(e) => (e.target as HTMLInputElement).select()}
+                              onChange={(e) => {
+                                const val = cleanNumberInput(e.target.value, true);
+                                updateLandedCost(index, { amount: val as any });
+                              }}
                               placeholder="0.00"
                               className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-6 pr-2 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-amber-500 text-right"
                             />
@@ -1534,18 +1726,48 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                     ({rows.length} product{rows.length === 1 ? '' : 's'} on voucher)
                   </span>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  {/* View Mode Toggle: Cards vs Table for Mobile Ergonomics */}
+                  <div className="flex items-center bg-slate-900/80 p-0.5 rounded-xl border border-slate-700/80">
+                    <button
+                      type="button"
+                      onClick={() => setMobileViewMode('CARDS')}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                        mobileViewMode === 'CARDS'
+                          ? 'bg-emerald-600 text-white shadow-xs'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="Card view: thumb-friendly touch cards with steppers"
+                    >
+                      <LayoutGrid className="w-3.5 h-3.5" />
+                      <span>Cards</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMobileViewMode('TABLE')}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                        mobileViewMode === 'TABLE'
+                          ? 'bg-emerald-600 text-white shadow-xs'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                      title="Table view: spreadsheet layout with sticky product column"
+                    >
+                      <List className="w-3.5 h-3.5" />
+                      <span>Table</span>
+                    </button>
+                  </div>
+
                   <button
                     id="btn-add-excel-row"
                     onClick={addNewRow}
-                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-all shadow-sm flex items-center gap-1.5"
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-all shadow-sm flex items-center gap-1.5 cursor-pointer"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     + Add Product Row
                   </button>
                   <button
                     onClick={() => openNewProductModal()}
-                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-teal-600/30 text-teal-200 border border-teal-500/40 hover:bg-teal-600/40 transition-all flex items-center gap-1.5"
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-teal-600/30 text-teal-200 border border-teal-500/40 hover:bg-teal-600/40 transition-all flex items-center gap-1.5 cursor-pointer"
                   >
                     <Sparkles className="w-3.5 h-3.5 text-teal-300" />
                     + New Master Product
@@ -1553,12 +1775,340 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                 </div>
               </div>
 
-              {/* Table conforming to WPS Office Excel Template with Exclusive "Receive as" */}
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs border-collapse">
-                  <thead>
-                    <tr className="bg-slate-900 text-slate-300 font-semibold border-b border-slate-700 divide-x divide-slate-700/50">
-                      <th className="py-3 px-3 min-w-[220px]">Product *</th>
+              {mobileViewMode === 'CARDS' ? (
+                /* ========================================================================= */
+                /* MOBILE CARDS VIEW: Ergonomic, touch-friendly, high-contrast              */
+                /* ========================================================================= */
+                <div className="p-3 sm:p-4 space-y-4 bg-slate-900/60 rounded-b-2xl">
+                  {rows.length === 0 ? (
+                    <div className="py-12 text-center text-slate-400">
+                      <Package className="w-8 h-8 text-emerald-500 mx-auto mb-2" />
+                      <p className="font-bold text-sm text-white">Voucher Line Items are Blank</p>
+                      <button
+                        type="button"
+                        onClick={addNewRow}
+                        className="mt-3 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold cursor-pointer"
+                      >
+                        + Add First Product
+                      </button>
+                    </div>
+                  ) : (
+                    rows.map((row, index) => {
+                      const calc = getRowCalculations(row);
+                      const isSearchOpen = activeSearchRowId === row.id;
+
+                      const pTerm = (productSearchTerm || '').trim().toLowerCase();
+                      const filteredAvailableProducts = items.filter(
+                        (i) =>
+                          !pTerm ||
+                          (i.itemName && i.itemName.toLowerCase().includes(pTerm)) ||
+                          (i.itemId && i.itemId.toLowerCase().includes(pTerm)) ||
+                          (i.sku && i.sku.toLowerCase().includes(pTerm)) ||
+                          (i.category && i.category.toLowerCase().includes(pTerm))
+                      );
+
+                      return (
+                        <div
+                          key={row.id}
+                          className="rounded-2xl border border-slate-700/80 bg-slate-850 p-4 space-y-3 shadow-md"
+                        >
+                          {/* Top Row: Line #, Product Name / Picker, Delete button */}
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="flex items-start gap-2 flex-1 min-w-0">
+                              <span className="w-6 h-6 rounded-lg bg-slate-800 text-slate-400 font-mono text-xs flex items-center justify-center font-bold shrink-0 mt-0.5">
+                                {index + 1}
+                              </span>
+                              <div className="flex-1 min-w-0">
+                                {/* Searchable Product Button / Trigger */}
+                                <div className="relative">
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      if (isSearchOpen) setActiveSearchRowId(null);
+                                      else {
+                                        setActiveSearchRowId(row.id);
+                                        setProductSearchTerm('');
+                                      }
+                                    }}
+                                    className="w-full text-left bg-slate-900 border border-slate-700 hover:border-emerald-500/70 rounded-xl px-3 py-2 text-xs text-white flex items-center justify-between gap-2 shadow-sm cursor-pointer"
+                                  >
+                                    <div className="truncate">
+                                      <div className="font-bold text-white text-sm truncate">
+                                        {row.itemName || 'Tap to Select Catalog Product...'}
+                                      </div>
+                                      {row.itemId ? (
+                                        <div className="text-[10px] text-emerald-400 font-mono mt-0.5">
+                                          SKU: {row.itemId} &bull; {row.qtyPerCaseDefault || 12} units/cs
+                                        </div>
+                                      ) : (
+                                        <div className="text-[10px] text-slate-400 mt-0.5">
+                                          Choose an item from catalog
+                                        </div>
+                                      )}
+                                    </div>
+                                    <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+                                  </button>
+
+                                  {/* Popover Product List */}
+                                  {isSearchOpen && (
+                                    <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl z-50 overflow-hidden max-h-72 flex flex-col">
+                                      <div className="p-2.5 border-b border-slate-800 flex items-center gap-2 bg-slate-950">
+                                        <Search className="w-4 h-4 text-slate-400 shrink-0" />
+                                        <input
+                                          type="text"
+                                          autoFocus
+                                          value={productSearchTerm}
+                                          onChange={(e) => setProductSearchTerm(e.target.value)}
+                                          placeholder="Search product name, SKU or barcode..."
+                                          className="w-full bg-transparent text-xs text-white focus:outline-none placeholder-slate-500"
+                                        />
+                                        {productSearchTerm && (
+                                          <button
+                                            type="button"
+                                            onClick={() => setProductSearchTerm('')}
+                                            className="text-slate-400 hover:text-slate-200 text-xs px-1 cursor-pointer"
+                                          >
+                                            ✕
+                                          </button>
+                                        )}
+                                      </div>
+                                      <div className="overflow-y-auto divide-y divide-slate-800 flex-1">
+                                        {filteredAvailableProducts.map((p) => (
+                                          <button
+                                            key={p.itemId}
+                                            type="button"
+                                            onClick={() => selectProductForRow(row.id, p)}
+                                            className="w-full text-left p-2.5 hover:bg-slate-800 transition-colors flex items-center justify-between cursor-pointer"
+                                          >
+                                            <div className="min-w-0 pr-2">
+                                              <p className="text-xs font-bold text-slate-200 truncate">{p.itemName}</p>
+                                              <p className="text-[10px] text-slate-400 mt-0.5">
+                                                {p.category} &bull; <span className="font-mono">{p.itemId}</span> &bull; 1 cs = {p.unitsPerCase} un
+                                              </p>
+                                            </div>
+                                            <div className="text-right shrink-0">
+                                              <p className="text-xs font-bold text-emerald-400 font-mono">
+                                                ${(p.costPerCase || 0).toFixed(2)}/cs
+                                              </p>
+                                            </div>
+                                          </button>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Delete button */}
+                            <button
+                              type="button"
+                              onClick={() => removeRow(row.id)}
+                              className="p-2 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-xl transition-colors shrink-0 cursor-pointer"
+                              title="Remove row"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+
+                          {/* "Receive as" Segmented Buttons: Cases vs Singles vs Prepack */}
+                          <div className="space-y-1">
+                            <span className="text-[10px] font-bold uppercase text-slate-400">Receive Package As:</span>
+                            <div className="grid grid-cols-3 gap-1.5 p-1 bg-slate-900 rounded-xl border border-slate-700/80">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (row.receiveAs !== 'Cases') {
+                                    const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
+                                    const currentUnitCost = calc.unitCost;
+                                    const converted = Number((currentUnitCost * ratio).toFixed(2));
+                                    updateRow(row.id, {
+                                      receiveAs: 'Cases',
+                                      pricePerCase: converted || row.pricePerCase,
+                                    });
+                                  }
+                                }}
+                                className={`py-2 px-2 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 min-h-[40px] cursor-pointer ${
+                                  row.receiveAs === 'Cases'
+                                    ? 'bg-blue-600 text-white shadow-sm'
+                                    : 'text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                <Boxes className="w-3.5 h-3.5" />
+                                <span>Cases</span>
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (row.receiveAs !== 'Singles') {
+                                    const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
+                                    const currentCaseCost = Number(row.pricePerCase) || 0;
+                                    const converted = Number((currentCaseCost / ratio).toFixed(2));
+                                    updateRow(row.id, {
+                                      receiveAs: 'Singles',
+                                      pricePerCase: converted || row.pricePerCase,
+                                    });
+                                  }
+                                }}
+                                className={`py-2 px-2 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 min-h-[40px] cursor-pointer ${
+                                  row.receiveAs === 'Singles'
+                                    ? 'bg-amber-600 text-white shadow-sm'
+                                    : 'text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                <Package className="w-3.5 h-3.5" />
+                                <span>Singles</span>
+                              </button>
+
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (row.receiveAs !== 'Variant') {
+                                    updateRow(row.id, {
+                                      receiveAs: 'Variant',
+                                    });
+                                  }
+                                }}
+                                className={`py-2 px-2 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 min-h-[40px] cursor-pointer ${
+                                  row.receiveAs === 'Variant'
+                                    ? 'bg-purple-600 text-white shadow-sm'
+                                    : 'text-slate-400 hover:text-white'
+                                }`}
+                              >
+                                <Layers className="w-3.5 h-3.5" />
+                                <span>Prepack</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Steppers & Quantity Received */}
+                          <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-700/60 items-center">
+                            <div>
+                              <span className="text-[10px] font-bold uppercase text-slate-400 block mb-1">
+                                Qty Received ({row.receiveAs}):
+                              </span>
+                              <div className="flex items-center bg-slate-900 rounded-xl p-1 border border-slate-700">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (row.receiveAs === 'Cases') {
+                                      updateRow(row.id, { quantityCases: Math.max(0, (Number(row.quantityCases) || 0) - 1) });
+                                    } else if (row.receiveAs === 'Variant') {
+                                      updateRow(row.id, { quantityPacks: Math.max(0, (Number(row.quantityPacks) || 0) - 1) });
+                                    } else {
+                                      updateRow(row.id, { quantitySingles: Math.max(0, (Number(row.quantitySingles) || 0) - 1) });
+                                    }
+                                  }}
+                                  className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center text-sm active:scale-95 cursor-pointer"
+                                  aria-label="Decrease quantity"
+                                >
+                                  <Minus className="w-4 h-4" />
+                                </button>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  value={
+                                    row.receiveAs === 'Cases'
+                                      ? row.quantityCases ?? ''
+                                      : row.receiveAs === 'Variant'
+                                      ? row.quantityPacks ?? ''
+                                      : row.quantitySingles ?? ''
+                                  }
+                                  onChange={(e) => {
+                                    const val = Number(e.target.value) || 0;
+                                    if (row.receiveAs === 'Cases') updateRow(row.id, { quantityCases: val });
+                                    else if (row.receiveAs === 'Variant') updateRow(row.id, { quantityPacks: val });
+                                    else updateRow(row.id, { quantitySingles: val });
+                                  }}
+                                  placeholder="0"
+                                  className="w-full text-center font-mono font-black text-white text-base bg-transparent focus:outline-none"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (row.receiveAs === 'Cases') {
+                                      updateRow(row.id, { quantityCases: (Number(row.quantityCases) || 0) + 1 });
+                                    } else if (row.receiveAs === 'Variant') {
+                                      updateRow(row.id, { quantityPacks: (Number(row.quantityPacks) || 0) + 1 });
+                                    } else {
+                                      updateRow(row.id, { quantitySingles: (Number(row.quantitySingles) || 0) + 1 });
+                                    }
+                                  }}
+                                  className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center text-sm active:scale-95 cursor-pointer"
+                                  aria-label="Increase quantity"
+                                >
+                                  <Plus className="w-4 h-4" />
+                                </button>
+                              </div>
+                              <div className="text-[10px] text-slate-400 mt-1 font-mono">
+                                = {calc.totalUnits} total units
+                              </div>
+                            </div>
+
+                            {/* Price / Case or Price / Unit */}
+                            <div>
+                              <span className="text-[10px] font-bold uppercase text-slate-400 block mb-1">
+                                Price / {row.receiveAs === 'Singles' ? 'Unit' : 'Case'} ($):
+                              </span>
+                              <div className="relative">
+                                <span className="absolute left-3 top-2.5 text-xs text-slate-400 font-mono">$</span>
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={row.pricePerCase ?? ''}
+                                  placeholder="0.00"
+                                  onChange={(e) => {
+                                    const val = cleanNumberInput(e.target.value, true);
+                                    updateRow(row.id, { pricePerCase: val });
+                                  }}
+                                  className="w-full bg-slate-900 border border-slate-700 rounded-xl pl-7 pr-3 py-2 text-sm text-white font-mono font-bold focus:outline-none focus:border-emerald-500"
+                                />
+                              </div>
+                              <div className="text-[10px] text-slate-400 mt-1 font-mono">
+                                Unit Cost: ${calc.unitCost.toFixed(2)}
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Line Total & Selling Price Strip */}
+                          <div className="pt-2 border-t border-slate-700/60 flex items-center justify-between text-xs font-mono">
+                            <div>
+                              <span className="text-[10px] text-slate-400 block uppercase font-sans font-bold">Line Total</span>
+                              <span className="text-base font-black text-emerald-400 font-mono">
+                                ${calc.lineTotal.toFixed(2)}
+                              </span>
+                            </div>
+                            <div className="text-right">
+                              <span className="text-[10px] text-slate-400 block uppercase font-sans font-bold">Selling Price</span>
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-white font-bold font-mono">
+                                  ${(Number(row.sellingPrice) || 0).toFixed(2)}
+                                </span>
+                                <span
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                    calc.marginPercent >= 20
+                                      ? 'bg-emerald-950 text-emerald-300'
+                                      : 'bg-amber-950 text-amber-300'
+                                  }`}
+                                >
+                                  {calc.marginPercent.toFixed(0)}%
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              ) : (
+                /* Table conforming to WPS Office Excel Template with Exclusive "Receive as" */
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-slate-900 text-slate-300 font-semibold border-b border-slate-700 divide-x divide-slate-700/50">
+                        <th className="py-3 px-3 min-w-[220px] sticky left-0 bg-slate-900 z-10">Product *</th>
                       <th className="py-3 px-2 min-w-[110px] text-center">Batch #</th>
                       <th className="py-3 px-2 min-w-[125px] text-center">Expiry Date</th>
                       <th className="py-3 px-3 min-w-[160px] text-center bg-slate-850">
@@ -1659,8 +2209,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                               index % 2 === 0 ? 'bg-slate-800/40' : 'bg-slate-800/80'
                             }`}
                           >
-                            {/* 1. Product (Searchable / Dropdown / Add new) */}
-                            <td className="py-2.5 px-3 relative">
+                            {/* 1. Product (Searchable / Dropdown / Add new) - Sticky Left for Mobile Table Scrolling */}
+                            <td className="py-2.5 px-3 relative sticky left-0 bg-slate-850 z-10 shadow-[2px_0_5px_rgba(0,0,0,0.3)]">
                               <div className="relative">
                                 <button
                                   type="button"
@@ -1777,23 +2327,35 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
 
                             {/* Batch # Input */}
                             <td className="py-2.5 px-2 text-center">
-                              <input
-                                type="text"
-                                value={row.batchNumber || ''}
-                                onChange={(e) => updateRow(row.id, { batchNumber: e.target.value })}
-                                placeholder="Auto (BAT-...)"
-                                className="w-24 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-emerald-500"
-                              />
+                              {row.itemId && !row.trackExpiry ? (
+                                <span className="inline-block py-1 px-2 text-[11px] text-slate-500 bg-slate-900/60 rounded-lg border border-slate-800 font-mono">
+                                  N/A
+                                </span>
+                              ) : (
+                                <input
+                                  type="text"
+                                  value={row.batchNumber || ''}
+                                  onChange={(e) => updateRow(row.id, { batchNumber: e.target.value })}
+                                  placeholder="Auto (BAT-...)"
+                                  className="w-24 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-emerald-500"
+                                />
+                              )}
                             </td>
 
                             {/* Expiry Date Input */}
                             <td className="py-2.5 px-2 text-center">
-                              <input
-                                type="date"
-                                value={row.expiryDate || ''}
-                                onChange={(e) => updateRow(row.id, { expiryDate: e.target.value })}
-                                className="w-28 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-emerald-300 font-mono focus:outline-none focus:border-emerald-500"
-                              />
+                              {row.itemId && !row.trackExpiry ? (
+                                <span className="inline-block py-1 px-2 text-[11px] text-slate-500 bg-slate-900/60 rounded-lg border border-slate-800 font-mono">
+                                  Not Tracked
+                                </span>
+                              ) : (
+                                <input
+                                  type="date"
+                                  value={row.expiryDate || ''}
+                                  onChange={(e) => updateRow(row.id, { expiryDate: e.target.value })}
+                                  className="w-28 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-emerald-300 font-mono focus:outline-none focus:border-emerald-500"
+                                />
+                              )}
                             </td>
 
                             {/* 2. Receive as: Exclusive Choice (Cases vs Singles vs Prepack/Variant) */}
@@ -1804,7 +2366,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                     type="button"
                                     onClick={() => {
                                       if (row.receiveAs !== 'Cases') {
-                                        const ratio = Math.max(1, row.qtyPerCaseDefault || 1);
+                                        const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
                                         const currentUnitCost = calc.unitCost;
                                         const converted = Number((currentUnitCost * ratio).toFixed(2));
                                         updateRow(row.id, {
@@ -1900,18 +2462,27 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                     ) : (
                                       <div className="flex items-center gap-1">
                                         <input
-                                          type="number"
-                                          min={1}
-                                          value={row.unitsPerPack || 5}
+                                          type="text"
+                                          inputMode="numeric"
+                                          value={row.unitsPerPack ?? ''}
+                                          onFocus={(e) => e.target.select()}
+                                          onClick={(e) => (e.target as HTMLInputElement).select()}
                                           onChange={(e) => {
-                                            const units = Math.max(1, parseInt(e.target.value, 10) || 1);
+                                            const raw = cleanNumberInput(e.target.value, false);
+                                            updateRow(row.id, {
+                                              unitsPerPack: raw,
+                                              selectedVariantName: raw ? `Pack of ${raw}` : 'Pack',
+                                            });
+                                          }}
+                                          onBlur={(e) => {
+                                            const units = Math.max(1, parseInt(String(row.unitsPerPack), 10) || 5);
                                             updateRow(row.id, {
                                               unitsPerPack: units,
                                               selectedVariantName: `Pack of ${units}`,
                                             });
                                           }}
                                           placeholder="Units/pk"
-                                          className="w-16 bg-slate-900 border border-purple-500/50 rounded-lg px-1.5 py-0.5 text-center text-[11px] text-purple-200"
+                                          className="w-16 bg-slate-900 border border-purple-500/50 rounded-lg px-1.5 py-0.5 text-center text-[11px] text-purple-200 focus:outline-none focus:border-purple-400 font-mono"
                                         />
                                         <span className="text-[10px] text-purple-300 font-mono">un/pack</span>
                                       </div>
@@ -1924,12 +2495,21 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                             {/* 3. qty per case default (packaging ratio) */}
                             <td className="py-2.5 px-2 text-center font-mono">
                               <input
-                                type="number"
-                                min={1}
-                                value={row.qtyPerCaseDefault}
+                                type="text"
+                                inputMode="numeric"
+                                value={row.qtyPerCaseDefault ?? ''}
+                                placeholder="1"
+                                onFocus={(e) => e.target.select()}
+                                onClick={(e) => (e.target as HTMLInputElement).select()}
                                 onChange={(e) => {
-                                  const val = Math.max(1, parseInt(e.target.value, 10) || 1);
-                                  handleRatioChangeAttempt(row.id, val);
+                                  const raw = cleanNumberInput(e.target.value, false);
+                                  updateRow(row.id, { qtyPerCaseDefault: raw });
+                                }}
+                                onBlur={(e) => {
+                                  const num = parseInt(String(row.qtyPerCaseDefault), 10);
+                                  const normalized = (!num || num < 1) ? 1 : num;
+                                  updateRow(row.id, { qtyPerCaseDefault: normalized });
+                                  handleRatioChangeAttempt(row.id, normalized);
                                 }}
                                 title="Click to edit packaging units per case ratio"
                                 className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-xs text-white font-mono focus:outline-none focus:border-emerald-500 cursor-pointer"
@@ -1945,7 +2525,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                       type="button"
                                       onClick={() =>
                                         updateRow(row.id, {
-                                          quantityCases: Math.max(0, (row.quantityCases || 0) - 1),
+                                          quantityCases: Math.max(0, (Number(row.quantityCases) || 0) - 1),
                                         })
                                       }
                                       className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
@@ -1953,21 +2533,23 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                       -
                                     </button>
                                     <input
-                                      type="number"
-                                      min={0}
-                                      value={row.quantityCases}
-                                      onChange={(e) =>
-                                        updateRow(row.id, {
-                                          quantityCases: Math.max(0, parseInt(e.target.value, 10) || 0),
-                                        })
-                                      }
+                                      type="text"
+                                      inputMode="numeric"
+                                      value={row.quantityCases ?? ''}
+                                      placeholder="0"
+                                      onFocus={(e) => e.target.select()}
+                                      onClick={(e) => (e.target as HTMLInputElement).select()}
+                                      onChange={(e) => {
+                                        const val = cleanNumberInput(e.target.value, false);
+                                        updateRow(row.id, { quantityCases: val });
+                                      }}
                                       className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-emerald-300 font-bold font-mono focus:outline-none focus:border-emerald-500"
                                     />
                                     <button
                                       type="button"
                                       onClick={() =>
                                         updateRow(row.id, {
-                                          quantityCases: (row.quantityCases || 0) + 1,
+                                          quantityCases: (Number(row.quantityCases) || 0) + 1,
                                         })
                                       }
                                       className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
@@ -1976,7 +2558,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                     </button>
                                   </div>
                                   <span className="text-[10px] text-slate-400 font-mono block">
-                                    = {(row.quantityCases || 0) * (row.qtyPerCaseDefault || 1)} units
+                                    = {(Number(row.quantityCases) || 0) * (Number(row.qtyPerCaseDefault) || 1)} units
                                   </span>
                                 </div>
                               ) : row.receiveAs === 'Variant' ? (
@@ -1986,7 +2568,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                       type="button"
                                       onClick={() =>
                                         updateRow(row.id, {
-                                          quantityPacks: Math.max(0, (row.quantityPacks || 0) - 1),
+                                          quantityPacks: Math.max(0, (Number(row.quantityPacks) || 0) - 1),
                                         })
                                       }
                                       className="w-6 h-6 rounded bg-purple-900/60 hover:bg-purple-800 text-purple-200 font-bold flex items-center justify-center text-xs"
@@ -1994,21 +2576,23 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                       -
                                     </button>
                                     <input
-                                      type="number"
-                                      min={0}
-                                      value={row.quantityPacks || 0}
-                                      onChange={(e) =>
-                                        updateRow(row.id, {
-                                          quantityPacks: Math.max(0, parseInt(e.target.value, 10) || 0),
-                                        })
-                                      }
+                                      type="text"
+                                      inputMode="numeric"
+                                      value={row.quantityPacks ?? ''}
+                                      placeholder="0"
+                                      onFocus={(e) => e.target.select()}
+                                      onClick={(e) => (e.target as HTMLInputElement).select()}
+                                      onChange={(e) => {
+                                        const val = cleanNumberInput(e.target.value, false);
+                                        updateRow(row.id, { quantityPacks: val });
+                                      }}
                                       className="w-14 bg-slate-900 border border-purple-500/50 rounded-lg px-1.5 py-1 text-center text-xs text-purple-300 font-bold font-mono focus:outline-none focus:border-purple-400"
                                     />
                                     <button
                                       type="button"
                                       onClick={() =>
                                         updateRow(row.id, {
-                                          quantityPacks: (row.quantityPacks || 0) + 1,
+                                          quantityPacks: (Number(row.quantityPacks) || 0) + 1,
                                         })
                                       }
                                       className="w-6 h-6 rounded bg-purple-900/60 hover:bg-purple-800 text-purple-200 font-bold flex items-center justify-center text-xs"
@@ -2017,7 +2601,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                     </button>
                                   </div>
                                   <span className="text-[10px] text-purple-400 font-mono block">
-                                    = {(row.quantityPacks || 0) * (row.unitsPerPack || 1)} units
+                                    = {(Number(row.quantityPacks) || 0) * (Number(row.unitsPerPack) || 1)} units
                                   </span>
                                 </div>
                               ) : (
@@ -2027,7 +2611,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                       type="button"
                                       onClick={() =>
                                         updateRow(row.id, {
-                                          quantitySingles: Math.max(0, (row.quantitySingles || 0) - 1),
+                                          quantitySingles: Math.max(0, (Number(row.quantitySingles) || 0) - 1),
                                         })
                                       }
                                       className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
@@ -2035,21 +2619,23 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                       -
                                     </button>
                                     <input
-                                      type="number"
-                                      min={0}
-                                      value={row.quantitySingles}
-                                      onChange={(e) =>
-                                        updateRow(row.id, {
-                                          quantitySingles: Math.max(0, parseInt(e.target.value, 10) || 0),
-                                        })
-                                      }
+                                      type="text"
+                                      inputMode="numeric"
+                                      value={row.quantitySingles ?? ''}
+                                      placeholder="0"
+                                      onFocus={(e) => e.target.select()}
+                                      onClick={(e) => (e.target as HTMLInputElement).select()}
+                                      onChange={(e) => {
+                                        const val = cleanNumberInput(e.target.value, false);
+                                        updateRow(row.id, { quantitySingles: val });
+                                      }}
                                       className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-bold font-mono focus:outline-none focus:border-amber-500"
                                     />
                                     <button
                                       type="button"
                                       onClick={() =>
                                         updateRow(row.id, {
-                                          quantitySingles: (row.quantitySingles || 0) + 1,
+                                          quantitySingles: (Number(row.quantitySingles) || 0) + 1,
                                         })
                                       }
                                       className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
@@ -2067,15 +2653,15 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                             {hasByWeightAllocation && (
                               <td className="py-2.5 px-2 text-center">
                                 <input
-                                  type="number"
-                                  step="0.01"
-                                  min={0}
-                                  value={row.weight || ''}
-                                  onChange={(e) =>
-                                    updateRow(row.id, {
-                                      weight: Math.max(0, parseFloat(e.target.value) || 0),
-                                    })
-                                  }
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={row.weight ?? ''}
+                                  onChange={(e) => {
+                                    const val = cleanNumberInput(e.target.value, true);
+                                    updateRow(row.id, { weight: val });
+                                  }}
+                                  onFocus={(e) => e.target.select()}
+                                  onClick={(e) => (e.target as HTMLInputElement).select()}
                                   placeholder="0 kg"
                                   className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-mono focus:outline-none focus:border-amber-500"
                                 />
@@ -2106,26 +2692,22 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                                     : 'Price / Case'}
                                 </span>
                                 <div className="relative">
-                                  <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs">
+                                  <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs font-mono">
                                     $
                                   </span>
                                   <input
-                                    type="number"
-                                    step="0.01"
-                                    min={0}
-                                    value={row.pricePerCase}
-                                    onChange={(e) =>
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={row.pricePerCase ?? ''}
+                                    onFocus={(e) => e.target.select()}
+                                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                                    onChange={(e) => {
+                                      const val = cleanNumberInput(e.target.value, true);
                                       updateRow(row.id, {
-                                        pricePerCase: Math.max(0, parseFloat(e.target.value) || 0),
-                                      })
-                                    }
-                                    placeholder={
-                                      row.receiveAs === 'Singles'
-                                        ? 'Unit cost'
-                                        : row.receiveAs === 'Variant'
-                                        ? 'Pack cost'
-                                        : 'Case cost'
-                                    }
+                                        pricePerCase: val,
+                                      });
+                                    }}
+                                    placeholder="0.00"
                                     className={`w-24 bg-slate-900 border rounded-lg pl-5 pr-2 py-1 text-right text-xs text-white font-mono focus:outline-none ${
                                       row.receiveAs === 'Singles'
                                         ? 'border-amber-500/60 focus:border-amber-400 text-amber-300'
@@ -2163,19 +2745,22 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                             {/* 9. Selling price (unit) */}
                             <td className="py-2.5 px-2 text-right">
                               <div className="relative">
-                                <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs">
+                                <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs font-mono">
                                   $
                                 </span>
                                 <input
-                                  type="number"
-                                  step="0.01"
-                                  min={0}
-                                  value={row.sellingPrice}
-                                  onChange={(e) =>
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={row.sellingPrice ?? ''}
+                                  placeholder="0.00"
+                                  onFocus={(e) => e.target.select()}
+                                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                                  onChange={(e) => {
+                                    const val = cleanNumberInput(e.target.value, true);
                                     updateRow(row.id, {
-                                      sellingPrice: Math.max(0, parseFloat(e.target.value) || 0),
-                                    })
-                                  }
+                                      sellingPrice: val,
+                                    });
+                                  }}
                                   className="w-18 bg-slate-900 border border-slate-700 rounded-lg pl-5 pr-2 py-1 text-right text-xs text-slate-200 font-mono focus:outline-none focus:border-emerald-500"
                                 />
                               </div>
@@ -2264,7 +2849,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   )}
                 </table>
               </div>
-            </div>
+            )}
+          </div>
 
             {/* Bottom Actions Bar */}
             <div className="p-4 rounded-2xl bg-slate-850 border border-slate-700/80 flex flex-col sm:flex-row items-center justify-between gap-4">
@@ -2291,11 +2877,44 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   id="btn-post-goods-received"
                   type="button"
                   onClick={handlePostGoodsReceivedVoucher}
-                  className="px-6 py-2.5 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 transition-all shadow-lg shadow-emerald-950/40 flex items-center gap-2"
+                  className="px-6 py-2.5 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 transition-all shadow-lg shadow-emerald-950/40 flex items-center gap-2 cursor-pointer"
                 >
                   <CheckCircle2 className="w-4 h-4" />
                   Post Goods Received Voucher (${voucherGrandTotal.toFixed(2)})
                 </button>
+              </div>
+            </div>
+
+            {/* Mobile Sticky Bottom Action Dock (Handheld bay terminal ergonomics) */}
+            <div className="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-700 p-3 sm:hidden shadow-2xl">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[10px] text-slate-400 uppercase font-bold">Total Payable</div>
+                  <div className="text-lg font-black font-mono text-emerald-400">
+                    ${voucherGrandTotal.toFixed(2)}
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    {rows.filter((r) => r.itemId).length} items &bull; {voucherTotalUnits} un
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={addNewRow}
+                    className="p-2.5 rounded-xl bg-slate-800 text-slate-200 border border-slate-700 font-bold active:scale-95 cursor-pointer"
+                    title="Add Row"
+                  >
+                    <Plus className="w-5 h-5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handlePostGoodsReceivedVoucher}
+                    className="px-4 py-2.5 rounded-xl text-xs font-black text-white bg-gradient-to-r from-emerald-600 to-teal-600 shadow-lg flex items-center gap-1.5 active:scale-95 cursor-pointer"
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>Post GRV</span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>

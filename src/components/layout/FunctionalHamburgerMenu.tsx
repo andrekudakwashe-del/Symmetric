@@ -34,6 +34,7 @@ import {
   Layers,
 } from 'lucide-react';
 import { getCurrentCompany, getCurrentBranchId, getBranches } from '../../db/roomDatabase';
+import { prefetchAppModules } from '../../services/modulePrefetcher';
 
 interface FunctionalHamburgerMenuProps {
   isOpen: boolean;
@@ -112,6 +113,12 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [collapsedCategories, setCollapsedCategories] = useState<Record<string, boolean>>({});
+
+  React.useEffect(() => {
+    if (isOpen) {
+      prefetchAppModules();
+    }
+  }, [isOpen]);
 
   const isSuperAdmin =
     currentUser?.role === 'SUPER_ADMIN' ||

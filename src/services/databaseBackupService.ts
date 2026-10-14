@@ -30,6 +30,8 @@ export interface BackupManifest {
   companyName?: string;
   branchId?: string;
   exportedBy?: string;
+  clearanceLevel?: number;
+  clearanceRole?: string;
   totalRecords: number;
   tablesCount: Record<string, number>;
   handoverSummary?: HandoverSummary;
@@ -208,7 +210,9 @@ function filterRecordsForDelta(records: any[], cutoffIso: string, isMasterData: 
 export function generateDatabasePayload(
   type: BackupType = 'FULL',
   exportedBy?: string,
-  shiftNotes?: string
+  shiftNotes?: string,
+  clearanceLevel?: number,
+  clearanceRole?: string
 ): BackupPayload {
   const now = new Date();
   const nowIso = now.toISOString();
@@ -368,6 +372,8 @@ export function generateDatabasePayload(
     companyName,
     branchId,
     exportedBy,
+    clearanceLevel: clearanceLevel ?? (type === 'ADMIN_MASTER_UPDATE' ? 5 : 3),
+    clearanceRole: clearanceRole ?? (type === 'ADMIN_MASTER_UPDATE' ? 'OWNER' : 'SUPERVISOR'),
     totalRecords,
     tablesCount,
     handoverSummary,
@@ -388,9 +394,11 @@ export async function createEncryptedBackupFile(
   type: BackupType = 'DELTA',
   passphrase: string,
   exportedBy?: string,
-  shiftNotes?: string
+  shiftNotes?: string,
+  clearanceLevel?: number,
+  clearanceRole?: string
 ): Promise<{ fileName: string; encryptedContent: string; manifest: BackupManifest }> {
-  const payload = generateDatabasePayload(type, exportedBy, shiftNotes);
+  const payload = generateDatabasePayload(type, exportedBy, shiftNotes, clearanceLevel, clearanceRole);
   const encryptedContent = await backupCryptoService.encryptBackupPayload(payload, passphrase);
 
   const cleanDate = payload.manifest.timestamp.slice(0, 10);

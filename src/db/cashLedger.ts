@@ -588,10 +588,12 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
 
     if (m.type === 'ecocash_sale') {
       ecocashSales += Number(m.amount) || 0;
+      movementsCount++;
       return;
     }
     if (m.type === 'zig_sale') {
       zigSales += Number(m.amount) || 0;
+      movementsCount++;
       return;
     }
     // Multi-currency isolation:

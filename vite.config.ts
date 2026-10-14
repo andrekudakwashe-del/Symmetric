@@ -19,5 +19,22 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
+    build: {
+      chunkSizeWarningLimit: 1200,
+      rollupOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('node_modules')) {
+              if (id.includes('xlsx')) return 'vendor-xlsx';
+              if (id.includes('recharts')) return 'vendor-charts';
+              if (id.includes('mqtt')) return 'vendor-mqtt';
+              if (id.includes('html5-qrcode') || id.includes('qrcode')) return 'vendor-qr';
+              if (id.includes('lucide-react')) return 'vendor-icons';
+              return 'vendor-core';
+            }
+          },
+        },
+      },
+    },
   };
 });

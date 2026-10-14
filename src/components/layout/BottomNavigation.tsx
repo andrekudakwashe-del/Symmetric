@@ -6,6 +6,7 @@ import {
   getModuleIcon,
   ALL_SYSTEM_MODULES,
 } from '../../services/roleNavigationService';
+import { prefetchAppModules } from '../../services/modulePrefetcher';
 import {
   LayoutGrid,
   Menu,
@@ -115,6 +116,8 @@ export const BottomNavigation: React.FC<BottomNavigationProps> = ({
               key={`${item.id}-${index}`}
               id={`nav-tab-${item.id}`}
               type="button"
+              onMouseEnter={() => prefetchAppModules()}
+              onTouchStart={() => prefetchAppModules()}
               onClick={() => handleItemClick(item.id)}
               className={`relative flex-1 min-h-[48px] flex flex-col items-center justify-center py-1 rounded-2xl transition-all duration-200 tap-target ${
                 item.isActive

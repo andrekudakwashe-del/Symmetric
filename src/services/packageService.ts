@@ -1,5 +1,5 @@
 import { Company } from '../data/saasData';
-import { getCurrentCompany, getCompanies, saveCompany } from '../db/roomDatabase';
+import { getCurrentCompany, getCompanies, saveCompany, getBranchesForCompany, getSalespeopleForCompany } from '../db/roomDatabase';
 
 export type AppFunctionCategory =
   | 'pos'
@@ -776,3 +776,52 @@ export function isAppFunctionEnabled(functionId: string, companyOrId?: Company |
   }
   return true;
 }
+
+// Check if tenant has reached package maxBranches limit
+export function checkBranchLimit(companyOrId?: Company | string | null): {
+  allowed: boolean;
+  maxBranches: number;
+  currentBranches: number;
+  packageName: string;
+} {
+  const pkg = getCompanyPackage(companyOrId);
+  const compId =
+    typeof companyOrId === 'string'
+      ? companyOrId
+      : companyOrId?.company_id || getCurrentCompany().company_id;
+  const branches = getBranchesForCompany(compId);
+  const currentCount = branches.length;
+  const max = pkg?.maxBranches ?? 1;
+
+  return {
+    allowed: max >= 999 ? true : currentCount < max,
+    maxBranches: max,
+    currentBranches: currentCount,
+    packageName: pkg?.name || 'Starter POS',
+  };
+}
+
+// Check if tenant has reached package maxStaff limit
+export function checkStaffLimit(companyOrId?: Company | string | null): {
+  allowed: boolean;
+  maxStaff: number;
+  currentStaff: number;
+  packageName: string;
+} {
+  const pkg = getCompanyPackage(companyOrId);
+  const compId =
+    typeof companyOrId === 'string'
+      ? companyOrId
+      : companyOrId?.company_id || getCurrentCompany().company_id;
+  const staff = getSalespeopleForCompany(compId);
+  const currentCount = staff.length;
+  const max = pkg?.maxStaff ?? 2;
+
+  return {
+    allowed: max >= 999 ? true : currentCount < max,
+    maxStaff: max,
+    currentStaff: currentCount,
+    packageName: pkg?.name || 'Starter POS',
+  };
+}
+

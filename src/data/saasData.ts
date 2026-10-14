@@ -1,4 +1,5 @@
 import { Role } from '../types';
+import type { BackendType, TenantBackendConfig } from '../services/backendAdapter/types';
 
 export interface PermissionRule {
   id: string;
@@ -32,6 +33,8 @@ export interface Company {
   offline_activation_code?: string;
   trial_days_remaining?: number;
   notes?: string;
+  backend_type?: BackendType;
+  backend_config?: TenantBackendConfig;
 }
 
 export interface SaaSBranch {
@@ -160,6 +163,7 @@ export const SEED_COMPANIES: Company[] = [
     subscription_status: 'ACTIVE',
     plan: 'ENTERPRISE',
     next_billing_date: '2027-08-01',
+    backend_type: 'sheets_appscript',
   },
   {
     company_id: 'COMP-002',
@@ -176,6 +180,7 @@ export const SEED_COMPANIES: Company[] = [
     subscription_status: 'ACTIVE',
     plan: 'PROFESSIONAL',
     next_billing_date: '2027-08-15',
+    backend_type: 'room',
   },
 ];
 

@@ -43,6 +43,7 @@ import {
   Laptop,
   Unlink,
   Database,
+  Shuffle,
 } from 'lucide-react';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import { RegistrationScreen } from './RegistrationScreen';
@@ -52,6 +53,18 @@ import {
   authenticateOwnerWithAppsScript,
   authenticateStaffWithAppsScript,
 } from '../../services/googleSheetsSync';
+import { backendAuthService } from '../../services/backendAdapter/backendAuthService';
+import { getTenantBackendConfig, getBackendAdapter } from '../../services/backendAdapter/adapterRegistry';
+
+// Fisher-Yates shuffle algorithm to randomize numeric keypad locations
+const generateScrambledDigits = (): string[] => {
+  const digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+  for (let i = digits.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [digits[i], digits[j]] = [digits[j], digits[i]];
+  }
+  return digits;
+};
 
 interface LoginScreenProps {
   onLoginSuccess: (user: Salesperson) => void;
@@ -247,8 +260,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   }, [companyStaff, selectedStaffId]);
 
   const [pin, setPin] = useState<string>('');
+  const [scrambledKeypad, setScrambledKeypad] = useState<string[]>(() => generateScrambledDigits());
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(false);
+
+  // Re-scramble number positions on demand or after every attempt
+  const scrambleKeypad = () => {
+    setScrambledKeypad(generateScrambledDigits());
+  };
 
   // Authentication Tier:
   // 'owner': Tier 1 (Device Registration: Email + Password via Apps Script)
@@ -333,7 +352,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
     setIsOwnerSubmitting(true);
     try {
-      const response = await authenticateOwnerWithAppsScript(cleanEmail, ownerPassword);
+      const response = await backendAuthService.authenticateOwner(cleanEmail, ownerPassword, selectedCompanyId);
 
       if (response.status === 'success' || response.success === true) {
         const busId = response.businessId || response.company_id || 'COMP-001';
@@ -429,10 +448,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
   const handleKeyPress = (num: string) => {
     setError(null);
-    if (pin.length < 4) {
+    if (pin.length < 6) {
       const nextPin = pin + num;
       setPin(nextPin);
-      if (nextPin.length === 4) {
+      if (nextPin.length === 6) {
         verifyPin(nextPin, selectedStaff);
       }
     }
@@ -446,6 +465,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const handleClear = () => {
     setError(null);
     setPin('');
+    scrambleKeypad();
   };
 
   const verifyPin = async (pinToVerify: string, staff: Salesperson | null) => {
@@ -456,13 +476,16 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
     setIsLoading(true);
     setError(null);
+    // Scramble keypad numbers on every login attempt for security against onlookers
+    scrambleKeypad();
 
     try {
-      const response = await authenticateStaffWithAppsScript(
+      const response = await backendAuthService.authenticateStaff(
         selectedCompanyId,
         staff.id,
         staff.name,
-        pinToVerify
+        pinToVerify,
+        selectedBranchId
       );
 
       if (response.status === 'success' || response.success === true) {
@@ -491,12 +514,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         logLogin(fullStaffUser);
         onLoginSuccess(fullStaffUser);
       } else {
-        setError(response.message || `Incorrect 4-digit PIN for ${staff.name}. Please try again.`);
+        setError(response.message || `Incorrect 6-digit PIN for ${staff.name}. Keypad scrambled for security. Please try again.`);
         setPin('');
+        scrambleKeypad();
       }
     } catch (err: any) {
       setError(err?.message || 'Authentication error verifying PIN with Google Apps Script.');
       setPin('');
+      scrambleKeypad();
     } finally {
       setIsLoading(false);
     }
@@ -506,11 +531,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     setSelectedStaffId(staff.id);
     setPin('');
     setError(null);
+    scrambleKeypad();
   };
 
   const handleDirectQuickLogin = (staff: Salesperson) => {
     setSelectedStaffId(staff.id);
-    verifyPin(staff.pin || '1234', staff);
+    verifyPin(staff.pin || '123456', staff);
   };
 
   const handleManualSubmit = () => {
@@ -518,8 +544,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setError('Please select a staff member first.');
       return;
     }
-    if (pin.length !== 4) {
-      setError('Please enter your complete 4-digit PIN.');
+    if (pin.length !== 6) {
+      setError('Please enter your complete 6-digit PIN.');
       return;
     }
     verifyPin(pin, selectedStaff);
@@ -539,7 +565,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         handleDelete();
       } else if (e.key === 'Enter') {
         if (selectedStaff) {
-          if (pin.length === 4) {
+          if (pin.length === 6) {
             verifyPin(pin, selectedStaff);
           } else if (pin.length === 0) {
             handleDirectQuickLogin(selectedStaff);
@@ -552,7 +578,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [pin, selectedStaff, mode]);
+  }, [pin, selectedStaff, mode, scrambledKeypad]);
 
   // If in Register mode, show Registration Screen
   if (mode === 'register') {
@@ -767,7 +793,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
             </div>
           </form>
         ) : (
-          /* TIER 2: STAFF SELECTION & 4-DIGIT PIN AUTHENTICATION */
+          /* TIER 2: STAFF SELECTION & 6-DIGIT PIN AUTHENTICATION */
           <div className="space-y-4">
             {/* Authenticated Device Banner (Strictly For Registered Company) */}
             <div className="p-3.5 rounded-2xl bg-gradient-to-r from-purple-950/60 to-slate-900 border border-purple-500/30 flex items-center justify-between text-xs">
@@ -904,7 +930,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                               </span>
                             </div>
                             <span className="text-[11px] text-slate-400">
-                              🔒 4-Digit PIN Protected • {staff.phone || 'ID: #' + staff.id}
+                              🔒 6-Digit PIN Protected • {staff.phone || 'ID: #' + staff.id}
                             </span>
                           </div>
                         </div>
@@ -923,21 +949,33 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-semibold text-slate-300 flex items-center gap-1">
                       <Lock className="w-3 h-3 text-amber-400" />
-                      <span>Enter 4-Digit Security PIN</span>
+                      <span>Enter 6-Digit Security PIN</span>
                     </span>
-                    <span className="text-[11px] text-purple-300 font-mono">
-                      Selected: {selectedStaff?.name.split(' ')[0]}
-                    </span>
+                    <div className="flex items-center space-x-2">
+                      <button
+                        id="btn-scramble-keypad"
+                        type="button"
+                        onClick={scrambleKeypad}
+                        className="text-[10px] text-purple-300 hover:text-purple-200 font-bold flex items-center space-x-1 px-2 py-0.5 rounded-lg bg-purple-950/60 border border-purple-800/60 hover:bg-purple-900/60 transition active:scale-95 cursor-pointer shadow-sm"
+                        title="Reshuffle keypad number positions"
+                      >
+                        <Shuffle className="w-2.5 h-2.5" />
+                        <span>Scramble</span>
+                      </button>
+                      <span className="text-[11px] text-purple-300 font-mono">
+                        Selected: {selectedStaff?.name.split(' ')[0]}
+                      </span>
+                    </div>
                   </div>
 
-                  {/* Masked PIN Dots */}
-                  <div className="flex items-center justify-center space-x-4 mb-2">
-                    {[0, 1, 2, 3].map((index) => {
+                  {/* Masked PIN Dots (6 Digits) */}
+                  <div className="flex items-center justify-center space-x-3 sm:space-x-4 mb-2">
+                    {[0, 1, 2, 3, 4, 5].map((index) => {
                       const isFilled = pin.length > index;
                       return (
                         <div
                           key={index}
-                          className={`w-4 h-4 rounded-full transition-all duration-200 ${
+                          className={`w-3.5 h-3.5 sm:w-4 sm:h-4 rounded-full transition-all duration-200 ${
                             isFilled
                               ? 'bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] scale-125 shadow-[0_0_12px_rgba(255,138,0,0.6)]'
                               : 'bg-slate-800 border border-slate-700'
@@ -947,10 +985,30 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                     })}
                   </div>
 
+                  {/* Security Badge: Numbers change location on every attempt */}
+                  <div className="flex flex-col items-center justify-center gap-1 mb-2">
+                    <div className="text-[10px] text-slate-400 flex items-center justify-center gap-1">
+                      <ShieldCheck className="w-3 h-3 text-emerald-400 shrink-0" />
+                      <span>Anti-peeking: Keypad scrambles on every login attempt</span>
+                    </div>
+                    {(() => {
+                      const selComp = companies.find((c) => c.company_id === selectedCompanyId) || companies[0];
+                      const bCfg = selComp ? getTenantBackendConfig(selComp) : null;
+                      const adapter = bCfg ? getBackendAdapter(bCfg.backendType) : null;
+                      if (!adapter) return null;
+                      return (
+                        <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-slate-900 border border-slate-700/60 text-[10px] text-slate-300">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                          <span>Backend: <strong className="text-white">{adapter.name}</strong> ({bCfg?.authMode === 'hybrid' ? 'Hybrid PIN / Cloud' : '6-Digit PIN'})</span>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
                   {isLoading && (
                     <div className="text-indigo-300 text-xs font-semibold flex items-center justify-center space-x-1.5 py-1 animate-pulse">
                       <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                      <span>Authenticating with Google Apps Script...</span>
+                      <span>Verifying credentials with active backend adapter...</span>
                     </div>
                   )}
 
@@ -963,16 +1021,16 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   )}
                 </div>
 
-                {/* Numeric Numpad */}
+                {/* Scrambled Numeric Numpad (Numbers change location on every login attempt) */}
                 <div className="grid grid-cols-3 gap-2">
-                  {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((num) => (
+                  {scrambledKeypad.slice(0, 9).map((num) => (
                     <button
                       key={num}
                       id={`pin-btn-${num}`}
                       type="button"
                       onClick={() => handleKeyPress(num)}
                       disabled={isLoading}
-                      className="h-11 rounded-2xl bg-slate-800/80 hover:bg-slate-700/80 active:bg-[#6A4DFF]/30 active:scale-95 text-lg font-bold text-white transition border border-slate-700/60 shadow-sm flex items-center justify-center"
+                      className="h-11 rounded-2xl bg-slate-800/80 hover:bg-slate-700/80 active:bg-[#6A4DFF]/30 active:scale-95 text-lg font-bold font-mono text-white transition border border-slate-700/60 shadow-sm flex items-center justify-center cursor-pointer select-none"
                     >
                       {num}
                     </button>
@@ -982,26 +1040,29 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                     id="pin-btn-clear"
                     type="button"
                     onClick={handleClear}
-                    className="h-11 rounded-2xl bg-slate-800/40 hover:bg-slate-800 active:scale-95 text-xs font-bold text-slate-400 transition border border-slate-700/40 flex items-center justify-center"
+                    className="h-11 rounded-2xl bg-slate-800/40 hover:bg-slate-800 active:scale-95 text-xs font-bold text-slate-400 hover:text-white transition border border-slate-700/40 flex items-center justify-center cursor-pointer"
+                    title="Clear digits & reshuffle"
                   >
                     Clear
                   </button>
 
                   <button
-                    id="pin-btn-0"
+                    key={scrambledKeypad[9]}
+                    id={`pin-btn-${scrambledKeypad[9]}`}
                     type="button"
-                    onClick={() => handleKeyPress('0')}
+                    onClick={() => handleKeyPress(scrambledKeypad[9])}
                     disabled={isLoading}
-                    className="h-11 rounded-2xl bg-slate-800/80 hover:bg-slate-700/80 active:bg-[#6A4DFF]/30 active:scale-95 text-lg font-bold text-white transition border border-slate-700/60 shadow-sm flex items-center justify-center"
+                    className="h-11 rounded-2xl bg-slate-800/80 hover:bg-slate-700/80 active:bg-[#6A4DFF]/30 active:scale-95 text-lg font-bold font-mono text-white transition border border-slate-700/60 shadow-sm flex items-center justify-center cursor-pointer select-none"
                   >
-                    0
+                    {scrambledKeypad[9]}
                   </button>
 
                   <button
                     id="pin-btn-delete"
                     type="button"
                     onClick={handleDelete}
-                    className="h-11 rounded-2xl bg-slate-800/40 hover:bg-slate-800 active:scale-95 text-rose-300 transition border border-slate-700/40 flex items-center justify-center"
+                    className="h-11 rounded-2xl bg-slate-800/40 hover:bg-slate-800 active:scale-95 text-rose-300 hover:text-rose-200 transition border border-slate-700/40 flex items-center justify-center cursor-pointer"
+                    title="Delete digit"
                   >
                     <Delete className="w-5 h-5" />
                   </button>
@@ -1014,7 +1075,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   onClick={handleManualSubmit}
                   disabled={isLoading}
                   className={`w-full py-3 px-4 rounded-2xl font-black text-xs sm:text-sm transition-all shadow-lg flex items-center justify-center space-x-2 ${
-                    pin.length === 4
+                    pin.length === 6
                       ? 'bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] text-white hover:opacity-95 active:scale-[0.98] shadow-purple-900/50 cursor-pointer'
                       : 'bg-purple-600/30 hover:bg-purple-600/50 text-purple-200 border border-purple-500/40 cursor-pointer'
                   }`}

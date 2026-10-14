@@ -32,6 +32,7 @@ import { meshSyncService } from '../../services/meshSyncService';
 import { TenantBranchSwitcher } from '../admin/TenantBranchSwitcher';
 import { persistentSyncEngine, SyncQueueStats } from '../../services/persistentSyncEngine';
 import { getCurrentCompany } from '../../db/roomDatabase';
+import { getTenantBackendConfig, getBackendAdapter } from '../../services/backendAdapter/adapterRegistry';
 
 interface TopHeaderProps {
   currentUser: Salesperson | null;
@@ -88,6 +89,10 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   const isSuperAdmin =
     currentUser?.role === 'SUPER_ADMIN' ||
     currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+
+  const activeComp = getCurrentCompany();
+  const backendConfig = getTenantBackendConfig(activeComp);
+  const activeBackend = getBackendAdapter(backendConfig.backendType);
 
   const canAccessAdmin =
     isSuperAdmin ||
@@ -264,7 +269,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               id="btn-sync-status-badge"
               type="button"
               onClick={() => (onOpenDiagnostics ? onOpenDiagnostics() : onOpenSyncModal?.())}
-              title="Persistent Sync Engine Status (Click to open queue & diagnostics)"
+              title={`Persistent Sync (${activeBackend.name} • ${backendConfig.authMode === 'hybrid' ? 'Hybrid Auth' : 'PIN Auth'})`}
               className={`flex items-center space-x-1 sm:space-x-1.5 text-xs font-semibold px-2 sm:px-3 py-1.5 min-h-[38px] sm:min-h-[44px] rounded-full transition-all border shadow-sm cursor-pointer ${
                 syncStats.failed > 0
                   ? 'bg-rose-500/25 hover:bg-rose-500/35 border-rose-400/80 text-rose-200 shadow-rose-900/40 animate-pulse'
@@ -289,6 +294,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                 <>
                   <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
                   <span>Synced</span>
+                  <span className="hidden lg:inline text-[10px] text-emerald-300/80 font-mono">({activeBackend.type})</span>
                 </>
               )}
             </button>

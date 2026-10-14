@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { Salesperson, CashLogEntry, DirectGrv, CashLiftRecord } from '../../types';
+import { Salesperson, CashLogEntry, DirectGrv, CashLiftRecord, ExpenseEntry } from '../../types';
 import {
   getCashLogs,
   addCashLog,
@@ -16,8 +16,14 @@ import {
   getSalesForStaffAndDate,
   isSupervisorOrAbove,
   getActiveCurrencies,
+  getExpensesForStaffAndDate,
+  approveExpense,
+  approveAllExpensesForStaffAndDate,
+  addExpense,
 } from '../../db/roomDatabase';
 import { downloadCsvFile } from '../../services/googleSheetsSync';
+import { Form2ExpenseModal } from './Form2ExpenseModal';
+import { Form2ExpensesAuditModal } from './Form2ExpensesAuditModal';
 import {
   ReceiptText,
   PlusCircle,
@@ -87,7 +93,7 @@ interface Form2CashLogProps {
 
 export interface StandardFixedPoint {
   id: string;
-  categoryGroup: 'Float & Closeout' | 'Daily Utilities & Home';
+  categoryGroup: 'Float & Closeout' | 'Daily Utilities & Home' | 'Daily Store Expenses';
   description: string;
   defaultIn: number | '';
   defaultOut: number | '';
@@ -131,47 +137,17 @@ export const FIXED_CASH_LOG_ENTRY_POINTS: StandardFixedPoint[] = [
     allowOut: false,
     placeholder: 'Morning drawer float ($20.00)',
   },
-  {
-    id: 'after_hours',
-    categoryGroup: 'Float & Closeout',
-    description: 'After Hours',
-    defaultIn: '',
-    defaultOut: '',
-    allowIn: true,
-    allowOut: true,
-    placeholder: 'After-hours sales / cash in-out',
-  },
 
-  // 2. Daily Utilities & Home
+  // 2. Daily Store Expenses & Petty Cash
   {
-    id: 'bread',
-    categoryGroup: 'Daily Utilities & Home',
-    description: 'Bread',
-    defaultIn: '',
-    defaultOut: 0.0,
-    allowIn: false,
-    allowOut: true,
-    placeholder: 'Staff bread & tea supplies',
-  },
-  {
-    id: 'airtime',
-    categoryGroup: 'Daily Utilities & Home',
-    description: 'Airtime',
-    defaultIn: '',
-    defaultOut: 0.0,
-    allowIn: false,
-    allowOut: true,
-    placeholder: 'Business airtime & data vouchers',
-  },
-  {
-    id: 'home_use',
-    categoryGroup: 'Daily Utilities & Home',
-    description: 'Home use:Meat & vegetables',
+    id: 'expenses',
+    categoryGroup: 'Daily Store Expenses',
+    description: 'Expenses',
     defaultIn: '',
     defaultOut: '',
     allowIn: false,
     allowOut: true,
-    placeholder: 'Groceries, meat & vegetables',
+    placeholder: 'Store petty cash expenses (filled from POS expenses & Form 2)',
   },
 ];
 
@@ -193,10 +169,7 @@ export interface QuickEntryType {
 // Clean types for Quick Add single mode (Direct cash transactions removed; Supervisor Cash Lifts are logged via dual-PIN Lift Modal)
 const QUICK_ENTRY_TYPES: QuickEntryType[] = [
   { id: 'float', label: 'Float', group: 'Float & Closeout', allowIn: true, allowOut: false, defaultIn: 20.0 },
-  { id: 'after_hours', label: 'After Hours', group: 'Float & Closeout', allowIn: true, allowOut: true },
-  { id: 'bread', label: 'Bread', group: 'Daily Utilities & Home', allowIn: false, allowOut: true, defaultOut: 0.0 },
-  { id: 'airtime', label: 'Airtime', group: 'Daily Utilities & Home', allowIn: false, allowOut: true, defaultOut: 0.0 },
-  { id: 'home_use', label: 'Home use:Meat & vegetables', group: 'Daily Utilities & Home', allowIn: false, allowOut: true },
+  { id: 'expenses', label: 'Expenses (Petty Cash)', group: 'Daily Utilities & Home', allowIn: false, allowOut: true },
   { id: 'direct_procurement', label: 'Direct Procurement', group: 'Direct Procurement', allowIn: false, allowOut: true },
 ];
 
@@ -355,6 +328,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       setDirectGrvs(getDirectGrvs());
     };
     window.addEventListener('saimetric_cash_movements_updated', handleLedgerUpdate);
+    window.addEventListener('saimetric_sales_updated', handleLedgerUpdate);
+    window.addEventListener('saimetric_cash_updated', handleLedgerUpdate);
+    window.addEventListener('mesh-catchup-completed', handleLedgerUpdate);
 
     const unsubscribe = subscribeToDatabase(() => {
       setCashCounts(getCashCounts());
@@ -366,6 +342,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
     return () => {
       window.removeEventListener('saimetric_cash_movements_updated', handleLedgerUpdate);
+      window.removeEventListener('saimetric_sales_updated', handleLedgerUpdate);
+      window.removeEventListener('saimetric_cash_updated', handleLedgerUpdate);
+      window.removeEventListener('mesh-catchup-completed', handleLedgerUpdate);
       unsubscribe();
     };
   }, [selectedStaffId, sheetDate]);
@@ -466,19 +445,44 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
           matchLog = savedLogs.find(
             (l) => l.line === 'Float' || l.line === 'Opening Float' || (l.description && l.description.toLowerCase().startsWith('float'))
           );
-        } else if (pt.id === 'after_hours') {
-          matchLog = savedLogs.find((l) => (l.description || '').toLowerCase().includes('after hours'));
-        } else if (pt.id === 'bread') {
-          matchLog = savedLogs.find((l) => (l.description || '').toLowerCase().includes('bread'));
-        } else if (pt.id === 'airtime') {
-          matchLog = savedLogs.find((l) => (l.description || '').toLowerCase().includes('airtime'));
-        } else if (pt.id === 'home_use') {
+        } else if (pt.id === 'expenses') {
           matchLog = savedLogs.find(
-            (l) => {
-              const desc = (l.description || '').toLowerCase();
-              return desc.includes('home use') || desc.includes('meat');
-            }
+            (l) => (l.line || '').toLowerCase().includes('expense') || (l.description || '').toLowerCase().includes('expense')
           );
+        }
+
+        if (pt.id === 'expenses') {
+          const staffExp = getExpensesForStaffAndDate(targetStaffId, targetDate).filter(
+            (e) => !e.isDeleted && e.status !== 'rejected' && (e.paymentMethod === 'Cash' || !e.paymentMethod)
+          );
+          const expTotal = staffExp.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+          const pendingCount = staffExp.filter((e) => e.status !== 'approved').length;
+
+          let outVal = '';
+          if (expTotal > 0) {
+            outVal = expTotal.toFixed(2);
+          } else if (matchLog && matchLog.out > 0) {
+            outVal = matchLog.out.toFixed(2);
+          }
+
+          let noteVal = '';
+          if (staffExp.length > 0) {
+            noteVal = `${staffExp.length} expense(s): ${staffExp.map((e) => e.description || e.category).join(', ')}`;
+            if (pendingCount > 0) {
+              noteVal += ` [${pendingCount} pending supervisor approval]`;
+            } else {
+              noteVal += ` [All Approved]`;
+            }
+          } else if (matchLog?.reference) {
+            noteVal = matchLog.reference;
+          }
+
+          newGrid[pt.id] = {
+            in: '',
+            out: outVal,
+            note: noteVal,
+          };
+          return;
         }
 
         if (matchLog) {
@@ -508,10 +512,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
             !line.includes('final cash out') &&
             !line.startsWith('float') &&
             !desc.startsWith('float') &&
-            !desc.includes('after hours') &&
-            !desc.includes('bread') &&
-            !desc.includes('airtime') &&
-            !desc.includes('home use')
+            !line.startsWith('expense') &&
+            !desc.startsWith('expense')
           );
         }
       );
@@ -676,6 +678,101 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         }
       });
 
+      // Merge any active POS sales / withdrawals for this staff & date that might not be in savedLogs
+      const staffSales = getSalesForStaffAndDate(targetStaffId, targetDate);
+      staffSales.forEach((sale, i) => {
+        const isEco =
+          sale.currency === 'EcoCash' ||
+          sale.currency === 'ECO' ||
+          sale.currency === 'ECOCASH' ||
+          (typeof sale.currency === 'string' && sale.currency.toLowerCase().includes('eco')) ||
+          sale.paymentMethod === 'EcoCash' ||
+          sale.paymentMethod === 'EcoCash/Mobile' ||
+          sale.paymentMethod === 'ECO' ||
+          sale.paymentMethod === 'ECOCASH' ||
+          (typeof sale.paymentMethod === 'string' && sale.paymentMethod.toLowerCase().includes('eco'));
+
+        const isZig =
+          sale.currency === 'ZiG' ||
+          sale.currency === 'ZIG' ||
+          sale.paymentMethod === 'ZiG' ||
+          sale.paymentMethod === 'ZIG' ||
+          (typeof sale.paymentMethod === 'string' && sale.paymentMethod.toLowerCase().includes('zig'));
+
+        const curKey = isZig ? 'ZiG' : isEco ? 'EcoCash' : (sale.currency as string);
+        if (!curKey || curKey === 'USD') return;
+
+        const currConfig = activeCurrenciesList.find(
+          (c) => c.currency === curKey || c.code === curKey || (isEco && (c.currency === 'EcoCash' || c.code === 'ECO'))
+        ) || { currency: curKey, code: curKey, name: isEco ? 'EcoCash Mobile Money' : curKey };
+
+        // Non-cash electronic sale row
+        if (sale.total > 0) {
+          const saleAlreadyExists = newDynamicRows.some(
+            (r) =>
+              !r.isWithdrawal &&
+              (r.id.includes(sale.id) ||
+                (newGrid[r.id] &&
+                  (newGrid[r.id].note.includes(sale.id) ||
+                    (r.currency === curKey && Math.abs(parseFloat(newGrid[r.id].out || '0') - sale.total) < 0.001))))
+          );
+          if (!saleAlreadyExists) {
+            const saleId = `${curKey.toLowerCase()}_sales_pos_m_${i}_${sale.id}`;
+            newDynamicRows.push({
+              id: saleId,
+              type: `${curKey}Sales`,
+              categoryGroup: currConfig.name,
+              label: `${currConfig.name} Sale`,
+              currency: curKey,
+              allowIn: false,
+              allowOut: true,
+              isReadOnly: true,
+              isAutofilledFromPos: true,
+              placeholder: `POS register ${currConfig.name} non-cash sale`,
+            });
+            newGrid[saleId] = {
+              in: '',
+              out: String(sale.total),
+              note: `POS Sale #${sale.id}`,
+            };
+          }
+        }
+
+        // Cash withdrawal row
+        if (sale.cashWithdrawalAmount && Number(sale.cashWithdrawalAmount) > 0) {
+          const wAlreadyExists = newDynamicRows.some(
+            (r) =>
+              r.isWithdrawal &&
+              (r.id.includes(sale.id) ||
+                (newGrid[r.id] &&
+                  (newGrid[r.id].note.includes(sale.id) ||
+                    (r.currency === curKey &&
+                      Math.abs(parseFloat(newGrid[r.id].out || '0') - Number(sale.cashWithdrawalAmount)) < 0.001))))
+          );
+          if (!wAlreadyExists) {
+            const wId = `${curKey.toLowerCase()}_withdrawal_pos_m_${i}_${sale.id}`;
+            newDynamicRows.push({
+              id: wId,
+              type: `${curKey}Withdrawal`,
+              categoryGroup: currConfig.name,
+              label: `${currConfig.name} Cash-Out`,
+              currency: curKey,
+              allowIn: false,
+              allowOut: true,
+              isReadOnly: true,
+              isAutofilledFromPos: true,
+              isWithdrawal: true,
+              placeholder: `POS ${currConfig.name} Cash-Out (Physical Cash OUT)`,
+            });
+            newGrid[wId] = {
+              in: '',
+              out: String(Number(sale.cashWithdrawalAmount)),
+              note: `POS Cash-Out #${sale.id} ($${Number(sale.cashWithdrawalAmount).toFixed(2)})`,
+            };
+          }
+        }
+      });
+
       setDynamicRows(newDynamicRows);
       setGridValues(newGrid);
     } else {
@@ -683,7 +780,31 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       setIsExistingSavedSheet(false);
       const initial: Record<string, { in: string; out: string; note: string; itemBought?: string }> = {};
 
+      const cleanStaffExp = getExpensesForStaffAndDate(targetStaffId, targetDate).filter(
+        (e) => !e.isDeleted && e.status !== 'rejected' && (e.paymentMethod === 'Cash' || !e.paymentMethod)
+      );
+      const cleanExpTotal = cleanStaffExp.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+      const cleanPendingCount = cleanStaffExp.filter((e) => e.status !== 'approved').length;
+
       FIXED_CASH_LOG_ENTRY_POINTS.forEach((pt) => {
+        if (pt.id === 'expenses') {
+          let noteVal = '';
+          if (cleanStaffExp.length > 0) {
+            noteVal = `${cleanStaffExp.length} expense(s): ${cleanStaffExp.map((e) => e.description || e.category).join(', ')}`;
+            if (cleanPendingCount > 0) {
+              noteVal += ` [${cleanPendingCount} pending supervisor approval]`;
+            } else {
+              noteVal += ` [All Approved]`;
+            }
+          }
+          initial[pt.id] = {
+            in: '',
+            out: cleanExpTotal > 0 ? cleanExpTotal.toFixed(2) : '',
+            note: noteVal,
+          };
+          return;
+        }
+
         const initialOut = pt.defaultOut !== '' ? String(pt.defaultOut) : '';
         initial[pt.id] = {
           in: pt.defaultIn !== '' ? String(pt.defaultIn) : '',
@@ -700,13 +821,38 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
       activeCurrenciesList.forEach((curr) => {
         const currKey = curr.currency;
-        const currSalesList = staffSales.filter(
-          (s) =>
+        const currSalesList = staffSales.filter((s) => {
+          const isCurrEco =
+            (curr.currency === 'EcoCash' || curr.code === 'ECO' || curr.code === 'ECOCASH') &&
+            (s.paymentMethod === 'EcoCash' ||
+              s.paymentMethod === 'EcoCash/Mobile' ||
+              s.paymentMethod === 'ECO' ||
+              s.paymentMethod === 'ECOCASH' ||
+              s.currency === 'EcoCash' ||
+              s.currency === 'ECO' ||
+              s.currency === 'ECOCASH' ||
+              (typeof s.paymentMethod === 'string' && s.paymentMethod.toLowerCase().includes('eco')) ||
+              (typeof s.currency === 'string' && s.currency.toLowerCase().includes('eco')));
+
+          const isCurrZig =
+            (curr.currency === 'ZiG' || curr.code === 'ZIG' || curr.code === 'ZiG') &&
+            (s.paymentMethod === 'ZiG' ||
+              s.paymentMethod === 'ZIG' ||
+              s.currency === 'ZiG' ||
+              s.currency === 'ZIG' ||
+              (typeof s.paymentMethod === 'string' && s.paymentMethod.toLowerCase().includes('zig')) ||
+              (typeof s.currency === 'string' && s.currency.toLowerCase().includes('zig')));
+
+          if (isCurrEco) return true;
+          if (isCurrZig) return true;
+
+          return (
             s.paymentMethod === currKey ||
             s.paymentMethod === curr.code ||
             s.currency === currKey ||
             s.currency === curr.code
-        );
+          );
+        });
 
         currSalesList.forEach((sale, i) => {
           // Non-cash electronic sale
@@ -808,11 +954,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
   };
 
-  // Load whenever sheetDate or selectedStaffId changes
+  // Load whenever sheetDate, selectedStaffId or ledger updates
   useEffect(() => {
     loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
     setCashLiftsList(getCashLiftsForStaffAndDate(selectedStaffId, sheetDate));
-  }, [sheetDate, selectedStaffId]);
+  }, [sheetDate, selectedStaffId, ledgerRefreshKey]);
 
   // Handler to remove a dynamic entry row (read-only automated rows cannot be deleted)
   const handleRemoveDynamicRow = (id: string) => {
@@ -831,7 +977,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   };
 
   // Single Quick Add Form State
-  const [selectedQuickId, setSelectedQuickId] = useState<string>('bread');
+  const [selectedQuickId, setSelectedQuickId] = useState<string>('expenses');
   const [singleType, setSingleType] = useState<'IN' | 'OUT'>('OUT');
   const [singleAmount, setSingleAmount] = useState<string>('0.00');
   const [singleItemBought, setSingleItemBought] = useState<string>(''); // For Direct Procurement
@@ -842,6 +988,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   const [selectedVoucher, setSelectedVoucher] = useState<CashLogEntry | null>(null);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
   const [saveSuccessNotice, setSaveSuccessNotice] = useState<string | null>(null);
+  const [isForm2ExpenseModalOpen, setIsForm2ExpenseModalOpen] = useState<boolean>(false);
+  const [isExpensesAuditModalOpen, setIsExpensesAuditModalOpen] = useState<boolean>(false);
 
   // Filters & Search for History
   const [filterType, setFilterType] = useState<'ALL' | 'IN' | 'OUT' | 'TODAY'>('ALL');
@@ -852,6 +1000,21 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   const currentQuickItem = useMemo(() => {
     return QUICK_ENTRY_TYPES.find((p) => p.id === selectedQuickId) || QUICK_ENTRY_TYPES[0];
   }, [selectedQuickId]);
+
+  // Current staff petty cash expenses for this sheet date
+  const currentStaffExpenses = useMemo(() => {
+    return getExpensesForStaffAndDate(selectedStaffId, sheetDate).filter(
+      (e) => !e.isDeleted && e.status !== 'rejected' && (e.paymentMethod === 'Cash' || !e.paymentMethod)
+    );
+  }, [selectedStaffId, sheetDate, ledgerRefreshKey, cashLogs]);
+
+  const currentStaffExpensesTotal = useMemo(() => {
+    return currentStaffExpenses.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+  }, [currentStaffExpenses]);
+
+  const pendingExpensesCount = useMemo(() => {
+    return currentStaffExpenses.filter((e) => e.status !== 'approved').length;
+  }, [currentStaffExpenses]);
 
   // Handle selecting quick add point
   const handleSelectQuickPoint = (pt: QuickEntryType) => {
@@ -1037,14 +1200,12 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       .filter((r) => r.type === 'cash' && !r.isCashLift)
       .reduce((sum, r) => sum + (parseFloat(gridValues[r.id]?.out) || 0), 0);
 
-    const utilitiesOut =
-      (parseFloat(gridValues['bread']?.out) || 0) +
-      (parseFloat(gridValues['airtime']?.out) || 0) +
-      (parseFloat(gridValues['home_use']?.out) || 0) +
+    const expensesOut =
+      (parseFloat(gridValues['expenses']?.out) || 0) +
       derivedProcurementTotalOut;
 
     const totalInflow = floatIn + posCashSalesTotal + otherCashIn;
-    const totalOutflow = cashLiftsOut + otherCashOut + utilitiesOut;
+    const totalOutflow = cashLiftsOut + otherCashOut + expensesOut;
     const estimatedCashInTill = Math.max(0, totalInflow - totalOutflow);
     const threshold = 200.0;
     const isThresholdReached = estimatedCashInTill >= threshold;
@@ -1055,7 +1216,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       otherCashIn,
       cashLiftsOut,
       otherCashOut,
-      utilitiesOut,
+      expensesOut,
+      utilitiesOut: expensesOut,
       estimatedCashInTill,
       threshold,
       isThresholdReached,
@@ -1240,18 +1402,74 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     }
 
     const now = new Date();
-    const created = addCashLog({
-      timestamp: now.toISOString(),
-      date: sheetDate,
-      staffId: currentUser.id,
-      staffName: currentUser.name,
-      line: currentQuickItem.group,
-      description: finalDesc,
-      in: singleType === 'IN' ? numAmt : 0,
-      out: singleType === 'OUT' ? numAmt : 0,
-      category: currentQuickItem.group,
-      reference: singleRef.trim() || undefined,
-    });
+    let created: CashLogEntry;
+
+    if (currentQuickItem.id === 'expenses') {
+      const isSuper = isSupervisorOrAbove(currentUser.role);
+      const newExp = addExpense({
+        date: sheetDate,
+        timestamp: now.toISOString(),
+        category: 'Miscellaneous',
+        vendorOrCustomer: singleCustomDesc.trim() || 'General Store Expense',
+        amount: numAmt,
+        paymentMethod: 'Cash',
+        staffId: currentUser.id,
+        staffName: currentUser.name,
+        description: singleCustomDesc.trim() || 'Petty Cash Expense',
+        receiptRef: singleRef.trim() || undefined,
+        recordCashLog: true,
+        status: isSuper ? 'approved' : 'pending_supervisor',
+        approvedBy: isSuper ? currentUser.id : undefined,
+        approvedByName: isSuper ? currentUser.name : undefined,
+        approvalTimestamp: isSuper ? now.toISOString() : undefined,
+      });
+
+      addMovement({
+        shiftId: getShiftId(currentUser.id, sheetDate),
+        staffId: currentUser.id,
+        date: sheetDate,
+        timestamp: now.toISOString(),
+        type: 'petty_cash',
+        amount: numAmt,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: isSuper ? 'approved' : 'pending',
+        sourceModule: 'form2',
+        notes: `Petty Cash: ${singleCustomDesc.trim() || 'Expense'}`,
+        approvedBy: isSuper ? currentUser.id : undefined,
+        approvedByName: isSuper ? currentUser.name : undefined,
+        approvedAt: isSuper ? now.toISOString() : undefined,
+      });
+
+      const allLogs = getCashLogs();
+      created = allLogs[0] || {
+        id: `LOG-EXP-${Date.now()}`,
+        timestamp: now.toISOString(),
+        date: sheetDate,
+        staffId: currentUser.id,
+        staffName: currentUser.name,
+        line: 'Expenses',
+        description: `Expense #${newExp.id} - ${finalDesc}`,
+        in: 0,
+        out: numAmt,
+        category: 'Expenses',
+      };
+      loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+    } else {
+      created = addCashLog({
+        timestamp: now.toISOString(),
+        date: sheetDate,
+        staffId: currentUser.id,
+        staffName: currentUser.name,
+        line: currentQuickItem.group,
+        description: finalDesc,
+        in: singleType === 'IN' ? numAmt : 0,
+        out: singleType === 'OUT' ? numAmt : 0,
+        category: currentQuickItem.group,
+        reference: singleRef.trim() || undefined,
+      });
+    }
 
     confetti({
       particleCount: 40,
@@ -1324,28 +1542,58 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     return (activeCurrenciesList || []).map((curr) => {
       const cKey = (curr.currency || curr.code || '').toLowerCase();
       const cCode = (curr.code || curr.currency || '').toLowerCase();
-      const salesRows = dynamicRows.filter(
-        (r) =>
-          !r.isWithdrawal &&
-          (r.currency === curr.currency ||
-            r.currency === curr.code ||
-            r.categoryGroup === curr.name ||
-            r.categoryGroup === curr.currency ||
-            (cKey && r.type.toLowerCase().includes(`${cKey}sales`)) ||
-            (cCode && r.type.toLowerCase().includes(`${cCode}sales`)) ||
-            (cKey && r.type.toLowerCase().includes(cKey) && !r.type.toLowerCase().includes('withdrawal')))
-      );
-      const withdrawalRows = dynamicRows.filter(
-        (r) =>
-          (r.isWithdrawal || r.type.toLowerCase().includes('withdrawal')) &&
-          (r.currency === curr.currency ||
-            r.currency === curr.code ||
-            r.categoryGroup === curr.name ||
-            r.categoryGroup === curr.currency ||
-            (cKey && r.type.toLowerCase().includes(`${cKey}withdrawal`)) ||
-            (cCode && r.type.toLowerCase().includes(`${cCode}withdrawal`)) ||
-            (cKey && r.type.toLowerCase().includes(cKey)))
-      );
+      const isEco = cKey.includes('eco') || cCode.includes('eco');
+      const isZig = cKey.includes('zig') || cCode.includes('zig');
+
+      const salesRows = dynamicRows.filter((r) => {
+        if (r.isWithdrawal) return false;
+        const rType = (r.type || '').toLowerCase();
+        const rCurr = (r.currency || '').toLowerCase();
+        const rLabel = (r.label || '').toLowerCase();
+        const rGroup = (r.categoryGroup || '').toLowerCase();
+        if (rType.includes('withdrawal') || rLabel.includes('withdrawal') || rLabel.includes('cash-out')) return false;
+
+        if (isEco) {
+          return rCurr.includes('eco') || rType.includes('eco') || rGroup.includes('eco') || rLabel.includes('eco');
+        }
+        if (isZig) {
+          return rCurr.includes('zig') || rType.includes('zig') || rGroup.includes('zig') || rLabel.includes('zig');
+        }
+        return (
+          r.currency === curr.currency ||
+          r.currency === curr.code ||
+          r.categoryGroup === curr.name ||
+          r.categoryGroup === curr.currency ||
+          (cKey && rType.includes(`${cKey}sales`)) ||
+          (cCode && rType.includes(`${cCode}sales`)) ||
+          (cKey && rType.includes(cKey))
+        );
+      });
+
+      const withdrawalRows = dynamicRows.filter((r) => {
+        const rType = (r.type || '').toLowerCase();
+        const rCurr = (r.currency || '').toLowerCase();
+        const rLabel = (r.label || '').toLowerCase();
+        const rGroup = (r.categoryGroup || '').toLowerCase();
+        const isWith = r.isWithdrawal || rType.includes('withdrawal') || rLabel.includes('withdrawal') || rLabel.includes('cash-out');
+        if (!isWith) return false;
+
+        if (isEco) {
+          return rCurr.includes('eco') || rType.includes('eco') || rGroup.includes('eco') || rLabel.includes('eco');
+        }
+        if (isZig) {
+          return rCurr.includes('zig') || rType.includes('zig') || rGroup.includes('zig') || rLabel.includes('zig');
+        }
+        return (
+          r.currency === curr.currency ||
+          r.currency === curr.code ||
+          r.categoryGroup === curr.name ||
+          r.categoryGroup === curr.currency ||
+          (cKey && rType.includes(`${cKey}withdrawal`)) ||
+          (cCode && rType.includes(`${cCode}withdrawal`)) ||
+          (cKey && rType.includes(cKey))
+        );
+      });
 
       let salesOut = 0;
       let withdrawalOut = 0;
@@ -1381,13 +1629,44 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   }, [currencyGroupedRows, dynamicRows]);
 
   const ecocashSalesRows = useMemo(() => {
-    const group = currencyGroupedRows.find((g) => g.currency?.currency === 'EcoCash' || g.currency?.code === 'ECOCASH' || g.currency?.code === 'ECO');
-    return group ? group.salesRows : dynamicRows.filter((r) => r.type === 'ecocashSales' || (r.type === 'ecocash' && !r.isWithdrawal));
+    const group = currencyGroupedRows.find(
+      (g) =>
+        g.currency?.currency === 'EcoCash' ||
+        g.currency?.code === 'ECOCASH' ||
+        g.currency?.code === 'ECO' ||
+        (g.currency?.currency || '').toLowerCase().includes('eco') ||
+        (g.currency?.name || '').toLowerCase().includes('eco')
+    );
+    return group
+      ? group.salesRows
+      : dynamicRows.filter((r) => {
+          if (r.isWithdrawal) return false;
+          const rType = (r.type || '').toLowerCase();
+          const rCurr = (r.currency || '').toLowerCase();
+          const rLabel = (r.label || '').toLowerCase();
+          if (rType.includes('withdrawal') || rLabel.includes('cash-out')) return false;
+          return rType.includes('eco') || rCurr.includes('eco') || rLabel.includes('eco');
+        });
   }, [currencyGroupedRows, dynamicRows]);
 
   const ecocashWithdrawalRows = useMemo(() => {
-    const group = currencyGroupedRows.find((g) => g.currency?.currency === 'EcoCash' || g.currency?.code === 'ECOCASH' || g.currency?.code === 'ECO');
-    return group ? group.withdrawalRows : dynamicRows.filter((r) => r.type === 'ecocashWithdrawal' || (r.type === 'ecocash' && r.isWithdrawal));
+    const group = currencyGroupedRows.find(
+      (g) =>
+        g.currency?.currency === 'EcoCash' ||
+        g.currency?.code === 'ECOCASH' ||
+        g.currency?.code === 'ECO' ||
+        (g.currency?.currency || '').toLowerCase().includes('eco') ||
+        (g.currency?.name || '').toLowerCase().includes('eco')
+    );
+    return group
+      ? group.withdrawalRows
+      : dynamicRows.filter((r) => {
+          const rType = (r.type || '').toLowerCase();
+          const rCurr = (r.currency || '').toLowerCase();
+          const rLabel = (r.label || '').toLowerCase();
+          const isWith = r.isWithdrawal || rType.includes('withdrawal') || rLabel.includes('cash-out');
+          return isWith && (rType.includes('eco') || rCurr.includes('eco') || rLabel.includes('eco'));
+        });
   }, [currencyGroupedRows, dynamicRows]);
 
   const zigRows = useMemo(() => [...zigSalesRows, ...zigWithdrawalRows], [zigSalesRows, zigWithdrawalRows]);
@@ -1414,7 +1693,14 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     });
 
     const zigGroup = groups.find((g) => g.currency?.currency === 'ZiG' || g.currency?.code === 'ZIG');
-    const ecoGroup = groups.find((g) => g.currency?.currency === 'EcoCash' || g.currency?.code === 'ECO');
+    const ecoGroup = groups.find(
+      (g) =>
+        g.currency?.currency === 'EcoCash' ||
+        g.currency?.code === 'ECO' ||
+        g.currency?.code === 'ECOCASH' ||
+        (g.currency?.currency || '').toLowerCase().includes('eco') ||
+        (g.currency?.name || '').toLowerCase().includes('eco')
+    );
 
     const zigSalesOut = zigGroup ? zigGroup.salesOut : 0;
     const zigWithdrawalOut = zigGroup ? zigGroup.withdrawalOut : 0;
@@ -1659,6 +1945,39 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
             {/* Quick Actions Bar */}
             <div className="flex items-center space-x-2 flex-wrap">
+              {/* Add Expense Trigger */}
+              <button
+                type="button"
+                onClick={() => setIsForm2ExpenseModalOpen(true)}
+                className="py-1.5 px-3 rounded-xl bg-gradient-to-r from-rose-900/80 to-rose-800/80 hover:from-rose-800 hover:to-rose-700 border border-rose-600/60 text-rose-200 text-xs font-bold flex items-center space-x-1.5 transition active:scale-95 shadow-sm"
+                title="Add Cashier Petty Cash Expense (requires supervisor day-end approval)"
+              >
+                <Plus className="w-3.5 h-3.5 text-rose-300" />
+                <span>Add Expense</span>
+              </button>
+
+              {/* Review & Approve Expenses Trigger */}
+              <button
+                type="button"
+                onClick={() => setIsExpensesAuditModalOpen(true)}
+                className={`py-1.5 px-3 rounded-xl border text-xs font-bold flex items-center space-x-1.5 transition active:scale-95 shadow-sm ${
+                  pendingExpensesCount > 0
+                    ? 'bg-amber-950/90 hover:bg-amber-900 border-amber-500/70 text-amber-200 ring-1 ring-amber-500/30'
+                    : 'bg-slate-800/80 hover:bg-slate-700 border-slate-700 text-slate-300'
+                }`}
+                title="Audit Petty Cash Expenses & Day-End Supervisor Sign-Off"
+              >
+                <Eye className="w-3.5 h-3.5 text-amber-400" />
+                <span>
+                  Expenses ({currentStaffExpenses.length})
+                  {pendingExpensesCount > 0 && (
+                    <span className="ml-1 px-1.5 py-0.2 rounded-full bg-amber-500 text-slate-950 font-black text-[10px]">
+                      {pendingExpensesCount} Pending
+                    </span>
+                  )}
+                </span>
+              </button>
+
               {/* Float Adjustment Modal Trigger */}
               <button
                 type="button"
@@ -1812,10 +2131,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                     const hasIn = parseFloat(rowVal.in) > 0;
                     const hasOut = parseFloat(rowVal.out) > 0;
                     const isFinalCashOut = pt.id === 'final_cash_out';
-                    const isSpecialDefault =
-                      (pt.id === 'float' && rowVal.in === '20') ||
-                      (pt.id === 'bread' && rowVal.out === '0') ||
-                      (pt.id === 'airtime' && rowVal.out === '0');
+                    const isSpecialDefault = pt.id === 'float' && rowVal.in === '20';
 
                     return (
                       <tr
@@ -1839,11 +2155,13 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
                         {/* Description */}
                         <td className="py-2 sm:py-2.5 px-2 sm:px-4">
-                          <div className="flex flex-wrap items-center gap-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <span
                               className={`font-black text-xs sm:text-sm tracking-tight ${
                                 pt.id === 'float'
                                   ? 'text-emerald-300'
+                                  : pt.id === 'expenses'
+                                  ? 'text-rose-200'
                                   : 'text-white'
                               }`}
                             >
@@ -1855,14 +2173,30 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                                 <span>Locked</span>
                               </span>
                             )}
-                            {isSpecialDefault && pt.id !== 'float' && (
+                            {pt.id === 'expenses' && pendingExpensesCount > 0 && (
+                              <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 font-bold flex items-center space-x-1">
+                                <Clock className="w-2.5 h-2.5 text-amber-400" />
+                                <span>{pendingExpensesCount} Pending Supervisor</span>
+                              </span>
+                            )}
+                            {pt.id === 'expenses' && currentStaffExpenses.length > 0 && pendingExpensesCount === 0 && (
+                              <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 font-bold flex items-center space-x-1">
+                                <Check className="w-2.5 h-2.5 text-emerald-400" />
+                                <span>All Approved ({currentStaffExpenses.length})</span>
+                              </span>
+                            )}
+                            {isSpecialDefault && (
                               <span className="text-[9px] uppercase px-1.5 py-0.2 rounded bg-purple-950/80 border border-purple-800/60 text-purple-300 font-bold">
                                 Default
                               </span>
                             )}
                           </div>
                           <span className="text-[9px] sm:text-[10px] text-slate-500 block truncate">
-                            {pt.id === 'float' ? 'Opening Till Float ($20 default) + Adjustments' : pt.categoryGroup}
+                            {pt.id === 'float'
+                              ? 'Opening Till Float ($20 default) + Adjustments'
+                              : pt.id === 'expenses'
+                              ? 'Store petty cash expenses (filled from POS expenses & Form 2)'
+                              : pt.categoryGroup}
                           </span>
                         </td>
 
@@ -1958,39 +2292,33 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                               <ShieldCheck className="w-3 h-3 text-[#FF8A00]" />
                               <span>Adjust</span>
                             </button>
-                          ) : pt.id === 'bread' || pt.id === 'airtime' || pt.id === 'home_use' ? (
-                            (() => {
-                              const move = shiftMovements.find(
-                                (m) =>
-                                  m.type === 'petty_cash' &&
-                                  ((pt.id === 'bread' && m.notes?.toLowerCase().includes('bread')) ||
-                                    (pt.id === 'airtime' && m.notes?.toLowerCase().includes('airtime')) ||
-                                    (pt.id === 'home_use' &&
-                                      (m.notes?.toLowerCase().includes('home') || m.notes?.toLowerCase().includes('meat'))))
-                              );
-                              if (move && move.status === 'pending') {
-                                return (
-                                  <button
-                                    type="button"
-                                    onClick={() => handleApproveMovement(move.id)}
-                                    className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-[10px] font-bold flex items-center space-x-0.5 mx-auto transition active:scale-95 shadow-sm"
-                                    title="Approve this Petty Cash expenditure"
-                                  >
-                                    <Check className="w-2.5 h-2.5" />
-                                    <span>Approve</span>
-                                  </button>
-                                );
-                              }
-                              if (move && move.status === 'approved') {
-                                return (
-                                  <span className="text-emerald-400 font-bold text-[10px] flex items-center justify-center space-x-0.5">
-                                    <Check className="w-3 h-3" />
-                                    <span>Approved</span>
-                                  </span>
-                                );
-                              }
-                              return <span className="text-slate-600 font-mono-num text-xs">—</span>;
-                            })()
+                          ) : pt.id === 'expenses' ? (
+                            <div className="flex items-center justify-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => setIsForm2ExpenseModalOpen(true)}
+                                className="px-2 py-1 bg-emerald-600/90 hover:bg-emerald-500 text-white rounded-lg text-[10px] font-bold flex items-center space-x-1 transition active:scale-95 shadow-sm"
+                                title="Add Cashier Petty Cash Expense"
+                              >
+                                <Plus className="w-3 h-3" />
+                                <span>Add</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setIsExpensesAuditModalOpen(true)}
+                                className={`px-2 py-1 rounded-lg text-[10px] font-bold flex items-center space-x-1 transition active:scale-95 border ${
+                                  pendingExpensesCount > 0
+                                    ? 'bg-amber-600/80 hover:bg-amber-500 text-white border-amber-400/50'
+                                    : currentStaffExpenses.length > 0
+                                    ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                                    : 'bg-slate-900 text-slate-500 border-slate-800'
+                                }`}
+                                title="View & Audit Expenses / Supervisor Approval"
+                              >
+                                <Eye className="w-3 h-3" />
+                                <span>Audit ({currentStaffExpenses.length})</span>
+                              </button>
+                            </div>
                           ) : (
                             <span className="text-slate-600 font-mono-num text-xs">—</span>
                           )}
@@ -3313,6 +3641,35 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         currentDate={sheetDate}
         currentTillEstimatedCash={tillCashInfo.estimatedCashInTill}
         onLiftSuccess={handleCashLiftSuccess}
+      />
+
+      {/* 8b. Form 2 Add Petty Cash Expense Modal */}
+      <Form2ExpenseModal
+        isOpen={isForm2ExpenseModalOpen}
+        onClose={() => setIsForm2ExpenseModalOpen(false)}
+        currentUser={currentUser}
+        selectedStaff={selectedStaff}
+        sheetDate={sheetDate}
+        onExpenseAdded={() => {
+          loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+          setLedgerRefreshKey((k) => k + 1);
+        }}
+      />
+
+      {/* 8c. Form 2 Expenses Audit & Supervisor Day-End Sign-Off Modal */}
+      <Form2ExpensesAuditModal
+        isOpen={isExpensesAuditModalOpen}
+        onClose={() => setIsExpensesAuditModalOpen(false)}
+        currentUser={currentUser}
+        selectedStaff={selectedStaff}
+        sheetDate={sheetDate}
+        expenses={currentStaffExpenses}
+        salespeople={salespeople}
+        onExpensesUpdated={() => {
+          loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+          setLedgerRefreshKey((k) => k + 1);
+        }}
+        onOpenAddExpense={() => setIsForm2ExpenseModalOpen(true)}
       />
 
       {/* 9. Cash Lift Voucher Slip View Modal */}

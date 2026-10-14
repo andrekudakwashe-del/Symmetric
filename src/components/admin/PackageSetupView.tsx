@@ -40,6 +40,7 @@ import {
 } from '../../services/packageService';
 import { getCompanies, saveCompany } from '../../db/roomDatabase';
 import { Company } from '../../data/saasData';
+import { getPackageBackendTierSummary } from '../../services/backendAdapter/adapterRegistry';
 import confetti from 'canvas-confetti';
 
 interface PackageSetupViewProps {
@@ -569,6 +570,17 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
                         <span className="font-bold text-amber-300">{tenantCount}</span>
                       </div>
                     </div>
+
+                    {/* Backend Architecture Tier Pill */}
+                    {(() => {
+                      const backendSummary = getPackageBackendTierSummary(pkg.tier);
+                      return (
+                        <div className="mt-2.5 px-2.5 py-1 rounded-xl bg-slate-950/80 border border-slate-800 text-[11px] flex items-center justify-between">
+                          <span className="text-slate-400 font-medium">Backend Architecture:</span>
+                          <span className="font-bold text-amber-300 font-mono text-[10px]">{backendSummary.backendName}</span>
+                        </div>
+                      );
+                    })()}
                   </div>
 
                   <div className="mt-4 pt-3 border-t border-slate-800 flex items-center justify-between">

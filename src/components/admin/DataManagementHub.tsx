@@ -1554,6 +1554,8 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
         onClose={() => setShowBackupModal(false)}
         defaultType={backupModalType}
         staffName={currentUser?.name || 'Administrator'}
+        clearanceLevel={5}
+        clearanceRole={currentUser?.role || 'OWNER'}
       />
 
       {/* Database Restore Modal */}

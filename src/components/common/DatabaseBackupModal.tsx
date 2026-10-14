@@ -25,6 +25,8 @@ interface DatabaseBackupModalProps {
   onClose: () => void;
   defaultType?: BackupType;
   staffName?: string;
+  clearanceLevel?: number;
+  clearanceRole?: string;
   onSuccess?: (fileName: string) => void;
 }
 
@@ -33,6 +35,8 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
   onClose,
   defaultType = 'DELTA',
   staffName = 'Manager',
+  clearanceLevel,
+  clearanceRole,
   onSuccess,
 }) => {
   const [backupType, setBackupType] = useState<BackupType>(defaultType);
@@ -68,7 +72,9 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
         backupType,
         password,
         staffName,
-        shiftNotes.trim() || undefined
+        shiftNotes.trim() || undefined,
+        clearanceLevel,
+        clearanceRole
       );
 
       // Download file to user's device

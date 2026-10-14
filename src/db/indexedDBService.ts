@@ -56,10 +56,20 @@ export interface TenantContextRecord {
 }
 
 export const IDB_NAME = 'saimetric_cash_db';
-export const CURRENT_IDB_SCHEMA_VERSION = 4; // Incremented for unified goodsReceivedNotes store
+export const CURRENT_IDB_SCHEMA_VERSION = 5; // Incremented for fixedMonthlyCosts store
 export const CURRENT_SAAS_SCHEMA_VERSION = 1; // Master SaaS schema version from backend
 
 export const IDB_STORES: Record<string, StoreDefinition> = {
+  fixedMonthlyCosts: {
+    keyPath: 'uuid',
+    indexes: [
+      { name: 'shop_id', keyPath: 'shop_id', options: { unique: false } },
+      { name: 'category', keyPath: 'category', options: { unique: false } },
+      { name: 'currency', keyPath: 'currency', options: { unique: false } },
+      { name: 'is_active', keyPath: 'is_active', options: { unique: false } },
+      { name: 'is_deleted', keyPath: 'is_deleted', options: { unique: false } },
+    ],
+  },
   cashMovements: {
     keyPath: 'id',
     indexes: [

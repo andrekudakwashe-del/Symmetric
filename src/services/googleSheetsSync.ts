@@ -32,10 +32,13 @@ import {
   updateTenantSheetBinding,
   pullTenantInventory,
   ingestMeshInventoryItem,
+  verifySalespersonPin,
 } from '../db/roomDatabase';
 import { SyncQueueItem, SheetName, StaffPermissions, InventoryItem } from '../types';
 import { Company, SaaSBranch } from '../data/saasData';
 import { persistentSyncEngine } from './persistentSyncEngine';
+import { runtimeSyncDispatcher } from './backendAdapter/runtimeSyncDispatcher';
+import { getTenantBackendConfig } from './backendAdapter/adapterRegistry';
 
 export interface SyncResult {
   total: number;
@@ -223,6 +226,23 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
     throw new Error(
       `BRANCH_SECURITY_VIOLATION: User assigned to branch ${userBranchId} attempted to sync data tagged for branch ${branchId}. Cross-branch leakage strictly prevented.`
     );
+  }
+
+  // Phase C: Dynamic Multi-Backend Routing Check
+  // If tenant has been provisioned on Firebase, Supabase, or Room DB, dispatch directly to target backend
+  const targetComp = getCompanies().find((c) => c.company_id === companyId) || currentComp;
+  const tenantBackendConfig = getTenantBackendConfig(targetComp);
+
+  if (
+    tenantBackendConfig.backendType === 'firebase' ||
+    tenantBackendConfig.backendType === 'supabase' ||
+    tenantBackendConfig.backendType === 'room'
+  ) {
+    const dispatchResult = await runtimeSyncDispatcher.dispatchItem(item);
+    if (!dispatchResult.success && tenantBackendConfig.backendType !== 'room') {
+      throw new Error(dispatchResult.message || `Failed to dispatch sync item to ${tenantBackendConfig.backendType}`);
+    }
+    return true;
   }
 
   // Resolve target webhook (tenant-dedicated webhook takes precedence over global default)
@@ -1894,7 +1914,7 @@ export const authenticateStaffWithAppsScript = async (
           const localUser = allLocal.find(
             (sp) => sp.id === cleanStaffId || (sp.name && cleanStaffName && sp.name.trim().toLowerCase() === cleanStaffName.toLowerCase())
           );
-          if (localUser && localUser.pin === cleanPin) {
+          if (localUser && verifySalespersonPin(localUser.pin, cleanPin)) {
             return {
               status: 'success',
               success: true,
@@ -1933,7 +1953,7 @@ export const authenticateStaffWithAppsScript = async (
   );
 
   if (matched) {
-    if (matched.pin === cleanPin || cleanPin === '1234') {
+    if (verifySalespersonPin(matched.pin, cleanPin)) {
       return {
         status: 'success',
         success: true,

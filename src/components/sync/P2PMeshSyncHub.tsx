@@ -54,9 +54,13 @@ import {
   Lock,
   Trash2,
   RefreshCw,
+  Clock,
+  Database,
+  Calendar,
 } from 'lucide-react';
 import { ShareDeviceModal } from '../common/ShareDeviceModal';
 import { OfflineAirgapSyncModal } from './OfflineAirgapSyncModal';
+import { QrPairing } from '../QrPairing';
 
 interface P2PMeshSyncHubProps {
   onBack?: () => void;
@@ -72,10 +76,15 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
   const [showSetupGuide, setShowSetupGuide] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [showAirgapModal, setShowAirgapModal] = useState(false);
+  const [showQrPairingModal, setShowQrPairingModal] = useState(false);
   const [pingSentToast, setPingSentToast] = useState(false);
   const [incomingPingNotice, setIncomingPingNotice] = useState<string | null>(null);
   const [incomingSaleNotice, setIncomingSaleNotice] = useState<string | null>(null);
   const [incomingAckNotice, setIncomingAckNotice] = useState<string | null>(null);
+  const [catchupNotice, setCatchupNotice] = useState<any | null>(null);
+  const [isCatchingUp, setIsCatchingUp] = useState(false);
+  const [catchupWindow, setCatchupWindow] = useState<'AUTO' | '24H' | '48H' | '7D' | 'ALL'>('AUTO');
+  const [lastSyncStr, setLastSyncStr] = useState(() => meshSyncService.getLastMeshSyncTimestamp());
 
   // 2. Mesh Live State & Auto-Detection
   const [peerCount, setPeerCount] = useState<number>(0);
@@ -133,9 +142,18 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
       setTimeout(() => setIncomingAckNotice(null), 6000);
     };
 
+    const onCatchupCompleted = (e: any) => {
+      const detail = e.detail || {};
+      setCatchupNotice(detail);
+      setIsCatchingUp(false);
+      setLastSyncStr(meshSyncService.getLastMeshSyncTimestamp());
+      setTimeout(() => setCatchupNotice(null), 10000);
+    };
+
     window.addEventListener('mesh-ping-received', onMeshPing);
     window.addEventListener('mesh-sale-received', onMeshSale);
     window.addEventListener('mesh-sync-receipt-received', onMeshAck);
+    window.addEventListener('mesh-catchup-completed', onCatchupCompleted);
 
     const statusTimer = window.setInterval(() => {
       setConnStatus(meshSyncService.getConnectionStatus());
@@ -149,8 +167,32 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
       window.removeEventListener('mesh-ping-received', onMeshPing);
       window.removeEventListener('mesh-sale-received', onMeshSale);
       window.removeEventListener('mesh-sync-receipt-received', onMeshAck);
+      window.removeEventListener('mesh-catchup-completed', onCatchupCompleted);
     };
   }, []);
+
+  const handleTriggerCatchUp = async () => {
+    setIsCatchingUp(true);
+    let customIso: string | undefined;
+    const now = Date.now();
+    if (catchupWindow === '24H') {
+      customIso = new Date(now - 24 * 3600 * 1000).toISOString();
+    } else if (catchupWindow === '48H') {
+      customIso = new Date(now - 48 * 3600 * 1000).toISOString();
+    } else if (catchupWindow === '7D') {
+      customIso = new Date(now - 7 * 24 * 3600 * 1000).toISOString();
+    } else if (catchupWindow === 'ALL') {
+      customIso = new Date(now - 365 * 24 * 3600 * 1000).toISOString();
+    }
+
+    try {
+      const res = await meshSyncService.requestCatchUpSync(undefined, customIso);
+      setTestActionToast(res.message);
+    } catch (err: any) {
+      setTestActionToast(`Catch-up error: ${err?.message || 'Failed'}`);
+      setIsCatchingUp(false);
+    }
+  };
 
   // Save the settings
   const handleSaveSettings = (e: React.FormEvent) => {
@@ -454,6 +496,18 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
               <span>Offline QR Sync</span>
             </button>
 
+            {/* ZERO-INTERNET SHAREIT / XENDER HOTSPOT MESH */}
+            <button
+              type="button"
+              id="btn-open-shareit-mesh"
+              onClick={() => setShowQrPairingModal(true)}
+              className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white text-xs font-black flex items-center space-x-1.5 transition border border-emerald-400/40 shadow-lg cursor-pointer"
+              title="SHAREit / Xender Zero-Internet Hotspot Mesh (Host Till & Client Till QR Pairing)"
+            >
+              <Radio className="w-3.5 h-3.5 animate-pulse" />
+              <span>Host/Client Mesh (0% Internet)</span>
+            </button>
+
             {/* CONNECT DEVICE (QR CODE) */}
             <button
               type="button"
@@ -528,6 +582,130 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
             </div>
           </div>
         </div>
+      </div>
+
+      {/* SECTION: RETURNING TERMINAL CATCH-UP & ABSENCE RECONCILIATION */}
+      <div className="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-indigo-500/40 rounded-3xl p-6 shadow-xl space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-start space-x-3">
+            <div className="p-2.5 rounded-2xl bg-indigo-600/20 text-indigo-400 border border-indigo-500/40 shrink-0">
+              <RotateCcw className={`w-5 h-5 ${isCatchingUp ? 'animate-spin' : ''}`} />
+            </div>
+            <div>
+              <h2 className="text-base font-black text-white flex items-center gap-2">
+                <span>Returning Device Catch-Up &amp; Delta Reconciliation</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-mono font-bold border border-indigo-500/40">
+                  Offline-First Peer Sync
+                </span>
+              </h2>
+              <p className="text-xs text-slate-400 leading-relaxed max-w-3xl">
+                When a store owner or rover returns to the branch after an absence (e.g., away overnight or since lunch),
+                this protocol broadcasts an authenticated delta query across the branch WiFi mesh. Peer terminals reply with all sales,
+                cash lifts, drawer disbursements, GRVs, customer balance changes, and supervisor approvals recorded in your absence.
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            id="btn-reconcile-mesh-catchup"
+            onClick={handleTriggerCatchUp}
+            disabled={isCatchingUp}
+            className="px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold text-xs flex items-center justify-center space-x-2 shadow-lg shadow-indigo-600/30 transition border border-indigo-400/50 cursor-pointer disabled:opacity-50 shrink-0"
+          >
+            <RefreshCw className={`w-4 h-4 ${isCatchingUp ? 'animate-spin' : ''}`} />
+            <span>{isCatchingUp ? 'Catching Up with Mesh...' : 'Reconcile Offline Catch-Up Now'}</span>
+          </button>
+        </div>
+
+        {/* Catch-Up Details Bar */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-2 border-t border-slate-800">
+          <div className="bg-slate-950/60 rounded-2xl p-3 border border-slate-800/80">
+            <span className="text-[10px] uppercase font-mono text-slate-400 block">Last Mesh Synchronized</span>
+            <div className="text-xs font-bold text-white font-mono mt-0.5 flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-indigo-400" />
+              <span>{lastSyncStr ? new Date(lastSyncStr).toLocaleString() : 'Never Synced (Fresh)'}</span>
+            </div>
+          </div>
+
+          <div className="bg-slate-950/60 rounded-2xl p-3 border border-slate-800/80">
+            <span className="text-[10px] uppercase font-mono text-slate-400 block">Absence Catch-Up Time Window</span>
+            <div className="flex items-center gap-1 mt-1 text-[11px] font-mono">
+              {(['AUTO', '24H', '48H', '7D', 'ALL'] as const).map((w) => (
+                <button
+                  key={w}
+                  type="button"
+                  onClick={() => setCatchupWindow(w)}
+                  className={`px-2 py-0.5 rounded-lg border transition text-[10px] font-bold ${
+                    catchupWindow === w
+                      ? 'bg-indigo-600 border-indigo-400 text-white'
+                      : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {w === 'AUTO' ? 'Auto' : w === '24H' ? '24h' : w === '48H' ? '48h (Overnight)' : w === '7D' ? '7d' : 'All'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-slate-950/60 rounded-2xl p-3 border border-slate-800/80">
+            <span className="text-[10px] uppercase font-mono text-slate-400 block">Branch Mesh Availability</span>
+            <div className="text-xs font-bold font-mono mt-0.5 flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${otherPeers.length > 0 ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
+              <span className={otherPeers.length > 0 ? 'text-emerald-300' : 'text-amber-300'}>
+                {otherPeers.length > 0
+                  ? `${otherPeers.length} Peer Terminal(s) Ready to Supply Delta`
+                  : 'Awaiting Peer Terminal (or connect tab)'}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Live Catch-Up Result Report */}
+        {catchupNotice && (
+          <div className="bg-emerald-950/80 border border-emerald-500/60 rounded-2xl p-4 text-emerald-200 text-xs space-y-3 animate-fadeIn">
+            <div className="flex items-center justify-between pb-2 border-b border-emerald-800/60">
+              <div className="flex items-center gap-2 font-bold text-sm text-emerald-300">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                <span>Delta Reconciled: Catch-Up Completed with {catchupNotice.originName || 'Branch Mesh'}!</span>
+              </div>
+              <span className="text-[10px] font-mono text-emerald-300 bg-emerald-900/80 px-2 py-0.5 rounded-full font-bold">
+                {catchupNotice.totalIngested || 0} Total Records Processed
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2 text-center font-mono text-[11px]">
+              <div className="bg-slate-900/90 rounded-xl p-2 border border-emerald-900">
+                <span className="text-[10px] text-slate-400 block">Sales Ingested</span>
+                <span className="text-sm font-bold text-emerald-300">+{catchupNotice.salesIngested || 0}</span>
+              </div>
+              <div className="bg-slate-900/90 rounded-xl p-2 border border-emerald-900">
+                <span className="text-[10px] text-slate-400 block">Cash Lifts</span>
+                <span className="text-sm font-bold text-amber-300">+{catchupNotice.cashLiftsIngested || 0}</span>
+              </div>
+              <div className="bg-slate-900/90 rounded-xl p-2 border border-emerald-900">
+                <span className="text-[10px] text-slate-400 block">Cash Logs</span>
+                <span className="text-sm font-bold text-cyan-300">+{catchupNotice.cashLogsIngested || 0}</span>
+              </div>
+              <div className="bg-slate-900/90 rounded-xl p-2 border border-emerald-900">
+                <span className="text-[10px] text-slate-400 block">GRVs / Deliveries</span>
+                <span className="text-sm font-bold text-indigo-300">+{catchupNotice.grnIngested || 0}</span>
+              </div>
+              <div className="bg-slate-900/90 rounded-xl p-2 border border-emerald-900">
+                <span className="text-[10px] text-slate-400 block">Customer Changes</span>
+                <span className="text-sm font-bold text-purple-300">+{catchupNotice.changesIngested || 0}</span>
+              </div>
+              <div className="bg-slate-900/90 rounded-xl p-2 border border-emerald-900">
+                <span className="text-[10px] text-slate-400 block">Stock Movements</span>
+                <span className="text-sm font-bold text-teal-300">+{catchupNotice.movementsIngested || 0}</span>
+              </div>
+            </div>
+
+            <p className="text-[11px] text-emerald-300/80 leading-relaxed">
+              All financial transactions and catalog balances recorded during your absence are now fully integrated into this device's offline database.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* SECTION: REAL PHYSICAL DEVICES IN THIS BRANCH */}
@@ -863,7 +1041,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
               id="input-mesh-lan-gateway"
               value={localGatewayUrl}
               onChange={(e) => setLocalGatewayUrl(e.target.value)}
-              placeholder="e.g. http://192.168.43.1:3000"
+              placeholder="e.g. 192.168.43.1:3000 or wss://..."
               className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white text-sm font-mono focus:border-[#6A4DFF] focus:outline-none transition"
             />
           </div>
@@ -1252,6 +1430,15 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
         onClose={() => setShowAirgapModal(false)}
         branchCode={branchCode}
       />
+
+      {/* Zero-Internet SHAREit / Xender Host & Client Mesh Pairing Modal */}
+      {showQrPairingModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-fadeIn">
+          <div className="max-w-3xl w-full max-h-[92vh] overflow-y-auto">
+            <QrPairing onClose={() => setShowQrPairingModal(false)} />
+          </div>
+        </div>
+      )}
     </div>
   );
 };

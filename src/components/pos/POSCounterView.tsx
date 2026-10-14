@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef } from 'react'; // ADDED useRef
 import { Product, CartItem, Customer, Salesperson, ActiveTab } from '../../types';
-import { getSalespeople, getAllSalespeople, isSupervisorOrAbove, logManagerOverride, getMultiCurrencyConfig } from '../../db/roomDatabase';
+import { getSalespeople, getAllSalespeople, isSupervisorOrAbove, logManagerOverride, getMultiCurrencyConfig, verifySalespersonPin } from '../../db/roomDatabase';
 import { FractionalWeightModal } from './FractionalWeightModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { CartItemGestureRow } from './CartItemGestureRow';
@@ -284,11 +284,11 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
     
     const adminMatch = candidatePool.find(
       (s) => (isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride)) &&
-             String(s.pin || '').trim() === cleanPin &&
+             verifySalespersonPin(s.pin, cleanPin) &&
              s.active === 'Y'
     ) || allStaff.find(
       (s) => (isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride)) &&
-             String(s.pin || '').trim() === cleanPin &&
+             verifySalespersonPin(s.pin, cleanPin) &&
              s.active === 'Y'
     );
 
@@ -298,7 +298,7 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
       setAdminPinInput('');
       setAdminPinError(null);
     } else {
-      setAdminPinError('Invalid Supervisor/Manager PIN. Please enter a valid 4-digit PIN.');
+      setAdminPinError('Invalid Supervisor/Manager PIN. Please enter a valid 6-digit PIN.');
     }
   };
 

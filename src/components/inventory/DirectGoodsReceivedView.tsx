@@ -29,6 +29,11 @@ import {
   HelpCircle,
   Hash,
   RefreshCw,
+  Minus,
+  List,
+  LayoutGrid,
+  Boxes,
+  Package,
 } from 'lucide-react';
 import {
   InventoryItem,
@@ -53,11 +58,13 @@ import {
   getSalespeople,
   subscribeRoomDatabase,
 } from '../../db/roomDatabase';
+import { cleanNumberInput } from './GoodsReceivedView';
 
 interface DirectGoodsReceivedViewProps {
   currentUser: Salesperson | null;
   onGoToMaster?: () => void;
   onGoToHome?: () => void;
+  onOpenReorderHub?: () => void;
   targetGrvId?: string | null;
   onClearTargetGrv?: () => void;
   preselectedGrvId?: string | null;
@@ -70,21 +77,23 @@ interface DirectRow {
   productName: string;
   category?: string;
   receiveAs: 'Cases' | 'Singles' | 'Variant';
-  qtyPerCaseDefault: number;
-  quantityCases: number;
-  quantitySingles: number;
-  pricePerCase: number; // cost price (per case or unit depending on receiveAs)
+  qtyPerCaseDefault: number | string;
+  quantityCases: number | string;
+  quantitySingles: number | string;
+  pricePerCase: number | string; // cost price (per case or unit depending on receiveAs)
   lastCost: number;
-  sellingPrice: number; // Read-only from catalog for cashiers
+  sellingPrice: number | string; // Read-only from catalog for cashiers
   batchNumber?: string;
   expiryDate?: string;
+  trackExpiry?: boolean;
+  shelfLifeDays?: number;
 }
 
 interface PaymentRowState {
   id: string;
   userId: string;
   userName: string;
-  amount: number | '';
+  amount: number | string;
   drawerId: string;
   pin: string;
 }
@@ -93,6 +102,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   currentUser,
   onGoToMaster,
   onGoToHome,
+  onOpenReorderHub,
   targetGrvId,
   onClearTargetGrv,
   preselectedGrvId,
@@ -148,6 +158,10 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const [purchaseOrderNo, setPurchaseOrderNo] = useState<string>('');
   const [selectedBranchId, setSelectedBranchId] = useState<string>(currentBranch.branchId);
 
+  // Direct GRV Draft Auto-Save State (for sudden clerk exit / power outage recovery)
+  const [lastDirectDraftSavedAt, setLastDirectDraftSavedAt] = useState<string | null>(null);
+  const [hasRestoredDirectDraft, setHasRestoredDirectDraft] = useState<boolean>(false);
+
   // Rows Table (Functions identical to Goods Received Voucher)
   const [rows, setRows] = useState<DirectRow[]>([
     {
@@ -156,11 +170,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       productName: '',
       receiveAs: 'Cases',
       qtyPerCaseDefault: 1,
-      quantityCases: 1,
-      quantitySingles: 0,
-      pricePerCase: 0,
+      quantityCases: '',
+      quantitySingles: '',
+      pricePerCase: '',
       lastCost: 0,
-      sellingPrice: 0,
+      sellingPrice: '',
       batchNumber: '',
       expiryDate: '',
     },
@@ -169,6 +183,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   // Product search dropdown
   const [activeSearchRowId, setActiveSearchRowId] = useState<string | null>(null);
   const [productSearchTerm, setProductSearchTerm] = useState<string>('');
+  const [mobileViewMode, setMobileViewMode] = useState<'CARDS' | 'TABLE'>('CARDS');
 
   // Till Payments & Multi-Cashier Allocations
   const [payFromTill, setPayFromTill] = useState<boolean>(true);
@@ -182,7 +197,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       pin: '',
     },
   ]);
-  const [ownerPaymentAmount, setOwnerPaymentAmount] = useState<number | ''>('');
+  const [ownerPaymentAmount, setOwnerPaymentAmount] = useState<number | string>('');
   const [paymentErrors, setPaymentErrors] = useState<{ [key: string]: string }>({});
 
   // Supervisor Approval Modal
@@ -201,6 +216,113 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const showToast = (type: 'success' | 'error', text: string) => {
     setNotification({ type, text });
     setTimeout(() => setNotification(null), 5000);
+  };
+
+  // 1. Recover Direct GRV Draft on initial mount
+  useEffect(() => {
+    try {
+      const savedDraft = localStorage.getItem('saimetric_draft_direct_grv');
+      if (savedDraft) {
+        const parsed = JSON.parse(savedDraft);
+        if (
+          parsed &&
+          Array.isArray(parsed.rows) &&
+          parsed.rows.some((r: any) => r.productId || r.productName || r.quantityCases || r.quantitySingles)
+        ) {
+          if (parsed.grvNumber) setGrvNumber(parsed.grvNumber);
+          if (parsed.voucherDate) setVoucherDate(parsed.voucherDate);
+          if (parsed.supplierName) setSupplierName(parsed.supplierName);
+          if (parsed.supplierId) setSupplierId(parsed.supplierId);
+          if (parsed.invoiceNo) setInvoiceNo(parsed.invoiceNo);
+          if (parsed.purchaseOrderNo) setPurchaseOrderNo(parsed.purchaseOrderNo);
+          if (parsed.selectedBranchId) setSelectedBranchId(parsed.selectedBranchId);
+          if (Array.isArray(parsed.rows)) setRows(parsed.rows);
+          if (Array.isArray(parsed.paymentRows)) setPaymentRows(parsed.paymentRows);
+          if (parsed.payFromTill !== undefined) setPayFromTill(parsed.payFromTill);
+          if (parsed.ownerPaymentAmount !== undefined) setOwnerPaymentAmount(parsed.ownerPaymentAmount);
+          setLastDirectDraftSavedAt(parsed.savedAt || 'Saved');
+          setHasRestoredDirectDraft(true);
+        }
+      }
+    } catch (e) {
+      console.error('[DirectGoodsReceivedView] Failed to restore Direct GRV draft:', e);
+    }
+  }, []);
+
+  // 2. Auto-save Direct GRV Draft on any row or header input
+  useEffect(() => {
+    const hasData =
+      rows.some((r) => r.productId || r.productName || r.quantityCases || r.quantitySingles || r.pricePerCase) ||
+      supplierName.trim() !== '' ||
+      invoiceNo.trim() !== '';
+
+    if (hasData) {
+      try {
+        const timeNow = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const draftData = {
+          grvNumber,
+          voucherDate,
+          supplierName,
+          supplierId,
+          invoiceNo,
+          purchaseOrderNo,
+          selectedBranchId,
+          rows,
+          paymentRows,
+          payFromTill,
+          ownerPaymentAmount,
+          savedAt: timeNow,
+        };
+        localStorage.setItem('saimetric_draft_direct_grv', JSON.stringify(draftData));
+        setLastDirectDraftSavedAt(timeNow);
+      } catch (e) {
+        console.error('[DirectGoodsReceivedView] Failed to auto-save Direct GRV draft:', e);
+      }
+    }
+  }, [
+    rows,
+    grvNumber,
+    voucherDate,
+    supplierName,
+    supplierId,
+    invoiceNo,
+    purchaseOrderNo,
+    selectedBranchId,
+    paymentRows,
+    payFromTill,
+    ownerPaymentAmount,
+  ]);
+
+  const handleDiscardDirectDraft = () => {
+    try {
+      localStorage.removeItem('saimetric_draft_direct_grv');
+    } catch (e) {
+      // ignore
+    }
+    setHasRestoredDirectDraft(false);
+    setLastDirectDraftSavedAt(null);
+    setSupplierName('');
+    setSupplierId('');
+    setInvoiceNo('');
+    setPurchaseOrderNo('');
+    setOwnerPaymentAmount('');
+    setRows([
+      {
+        id: `row-${Date.now()}`,
+        productId: '',
+        productName: '',
+        receiveAs: 'Cases',
+        qtyPerCaseDefault: 1,
+        quantityCases: '',
+        quantitySingles: '',
+        pricePerCase: '',
+        lastCost: 0,
+        sellingPrice: '',
+        batchNumber: '',
+        expiryDate: '',
+      },
+    ]);
+    showToast('success', 'Direct Supplies Received Voucher draft discarded.');
   };
 
   const refreshData = () => {
@@ -321,11 +443,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       productName: '',
       receiveAs: 'Cases',
       qtyPerCaseDefault: 1,
-      quantityCases: 1,
-      quantitySingles: 0,
-      pricePerCase: 0,
+      quantityCases: '',
+      quantitySingles: '',
+      pricePerCase: '',
       lastCost: 0,
-      sellingPrice: 0,
+      sellingPrice: '',
       batchNumber: '',
       expiryDate: '',
     };
@@ -383,6 +505,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           pricePerCase: initialCost,
           lastCost: costPrice,
           sellingPrice, // Locked from master catalog for cashier
+          trackExpiry: Boolean(item.trackExpiry),
+          shelfLifeDays: item.shelfLifeDays,
+          expiryDate: item.trackExpiry && item.shelfLifeDays && !r.expiryDate
+            ? new Date(Date.now() + item.shelfLifeDays * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+            : r.expiryDate,
         };
       });
 
@@ -393,11 +520,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           productName: '',
           receiveAs: 'Cases',
           qtyPerCaseDefault: 1,
-          quantityCases: 1,
-          quantitySingles: 0,
-          pricePerCase: 0,
+          quantityCases: '',
+          quantitySingles: '',
+          pricePerCase: '',
           lastCost: 0,
-          sellingPrice: 0,
+          sellingPrice: '',
           batchNumber: '',
           expiryDate: '',
         });
@@ -643,6 +770,15 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setHistoryFilter('ALL');
     setActiveTab('grv_history');
 
+    // Clear auto-saved draft
+    try {
+      localStorage.removeItem('saimetric_draft_direct_grv');
+    } catch (e) {
+      // ignore
+    }
+    setHasRestoredDirectDraft(false);
+    setLastDirectDraftSavedAt(null);
+
     // Reset Form
     const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     const rand = Math.floor(100 + Math.random() * 900);
@@ -841,6 +977,17 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 </span>
               )}
             </button>
+            {onOpenReorderHub && (
+              <button
+                type="button"
+                onClick={onOpenReorderHub}
+                className="px-4 py-2.5 rounded-2xl text-xs font-bold transition-all flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20"
+                title="Open Procurement & Reorder Hub"
+              >
+                <TrendingUp className="w-4 h-4" />
+                <span>Procurement Reorder Hub</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -869,12 +1016,56 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
       {activeTab === 'create_direct_grv' ? (
         <form onSubmit={handleSubmitDirectGrv} className="space-y-6">
+          {/* RECOVERED DIRECT GRV DRAFT ALERT BANNER */}
+          {hasRestoredDirectDraft && (
+            <div className="bg-gradient-to-r from-amber-500/15 via-amber-500/10 to-transparent border-2 border-amber-500/40 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-md animate-in fade-in">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-amber-500 text-white rounded-xl shadow-xs shrink-0">
+                  <Clock className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="font-black text-xs text-amber-200 flex items-center gap-2">
+                    <span>Unsaved Direct Supplies Received Voucher Recovered</span>
+                    <span className="text-[10px] bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full font-bold border border-amber-500/30">
+                      {rows.filter((r) => r.productId || r.productName).length} items &bull; Last Saved: {lastDirectDraftSavedAt || 'Recent'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-amber-200/80 mt-0.5">
+                    Power outage, load shedding, or browser closed by mistake? Your direct delivery voucher was automatically preserved. Continue where you left off.
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setHasRestoredDirectDraft(false)}
+                  className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold transition shadow-xs cursor-pointer"
+                >
+                  Continue Working
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDiscardDirectDraft}
+                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-rose-300 border border-rose-500/30 rounded-xl text-xs font-bold transition cursor-pointer"
+                >
+                  Discard Draft
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Header Metadata Card */}
           <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-6 shadow-xl space-y-5">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <h2 className="text-base font-bold text-white flex items-center gap-2">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3 flex-wrap gap-2">
+              <h2 className="text-base font-bold text-white flex items-center gap-2 flex-wrap">
                 <FileText className="w-5 h-5 text-amber-400" />
-                Voucher Details & Delivering Vendor
+                <span>Voucher Details &amp; Delivering Vendor</span>
+                {lastDirectDraftSavedAt && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                    Auto-Saved ({lastDirectDraftSavedAt})
+                  </span>
+                )}
               </h2>
               <span className="text-xs font-mono text-slate-400">
                 Logged in as: <strong className="text-white">{currentUser?.name || 'Till Operator'}</strong> ({currentUser?.role || 'CASHIER'})
@@ -1048,21 +1239,358 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 </p>
               </div>
 
-              <button
-                id="btn-add-direct-grv-row"
-                type="button"
-                onClick={handleAddRow}
-                className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs flex items-center gap-2 transition-all shadow-md self-start"
-              >
-                <Plus className="w-4 h-4" />
-                Add Line Item
-              </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                {/* View Mode Toggle: Cards vs Table for Mobile Ergonomics */}
+                <div className="flex items-center bg-slate-950 p-0.5 rounded-xl border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setMobileViewMode('CARDS')}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                      mobileViewMode === 'CARDS'
+                        ? 'bg-amber-500 text-slate-950 shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                    title="Card view: thumb-friendly touch cards with steppers"
+                  >
+                    <LayoutGrid className="w-3.5 h-3.5" />
+                    <span>Cards</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMobileViewMode('TABLE')}
+                    className={`px-2.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                      mobileViewMode === 'TABLE'
+                        ? 'bg-amber-500 text-slate-950 shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                    title="Table view: spreadsheet layout"
+                  >
+                    <List className="w-3.5 h-3.5" />
+                    <span>Table</span>
+                  </button>
+                </div>
+
+                <button
+                  id="btn-add-direct-grv-row"
+                  type="button"
+                  onClick={handleAddRow}
+                  className="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs flex items-center gap-2 transition-all shadow-md self-start cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Line Item
+                </button>
+              </div>
             </div>
 
-            {/* Table */}
-            <div className="overflow-x-auto rounded-2xl border border-slate-800">
-              <table className="w-full text-left text-sm text-slate-300 border-collapse">
-                <thead className="bg-slate-950/80 text-xs uppercase font-bold text-slate-400 border-b border-slate-800">
+            {mobileViewMode === 'CARDS' ? (
+              /* Mobile Cards View with 44px touch steppers and clear tap targets */
+              <div className="space-y-4">
+                {rows.length === 0 ? (
+                  <div className="py-12 text-center text-slate-400 bg-slate-950/40 rounded-2xl border border-slate-800">
+                    <div className="flex flex-col items-center justify-center gap-3">
+                      <Truck className="w-8 h-8 text-amber-500/60" />
+                      <p className="text-sm font-medium">No items added to this direct delivery voucher yet.</p>
+                      <button
+                        type="button"
+                        onClick={handleAddRow}
+                        className="px-4 py-2 text-xs font-semibold rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 transition-all flex items-center gap-1.5 font-bold cursor-pointer"
+                      >
+                        <Plus className="w-4 h-4" />
+                        + Add Product Row
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  rows.map((row, index) => {
+                    const calc = getRowCalculations(row);
+                    const isSearchOpen = activeSearchRowId === row.id;
+
+                    const pTerm = (productSearchTerm || '').trim().toLowerCase();
+                    const filteredAvailableProducts = items.filter(
+                      (i) =>
+                        !pTerm ||
+                        (i.itemName && i.itemName.toLowerCase().includes(pTerm)) ||
+                        (i.itemId && i.itemId.toLowerCase().includes(pTerm)) ||
+                        (i.sku && i.sku.toLowerCase().includes(pTerm)) ||
+                        (i.category && i.category.toLowerCase().includes(pTerm))
+                    );
+
+                    return (
+                      <div
+                        key={row.id}
+                        className="rounded-2xl border border-slate-800 bg-slate-950/80 p-4 space-y-3 shadow-md"
+                      >
+                        {/* Top: Row Number + Product Picker + Delete */}
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-2 flex-1 min-w-0">
+                            <span className="w-6 h-6 rounded-lg bg-slate-800 text-amber-400 font-mono text-xs flex items-center justify-center font-bold shrink-0 mt-0.5">
+                              {index + 1}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <div className="relative">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (isSearchOpen) {
+                                      setActiveSearchRowId(null);
+                                    } else {
+                                      setActiveSearchRowId(row.id);
+                                      setProductSearchTerm('');
+                                    }
+                                  }}
+                                  className="w-full text-left bg-slate-900 border border-slate-700 hover:border-amber-500/70 rounded-xl px-3 py-2 text-xs text-white flex items-center justify-between gap-2 shadow-sm cursor-pointer"
+                                >
+                                  <div className="truncate">
+                                    <div className="font-bold text-white text-sm truncate">
+                                      {row.productName || 'Tap to Select Catalog Product...'}
+                                    </div>
+                                    {row.productId ? (
+                                      <div className="text-[10px] text-amber-400 font-mono mt-0.5">
+                                        ID: {row.productId} &bull; {row.qtyPerCaseDefault || 1} units/cs
+                                      </div>
+                                    ) : (
+                                      <div className="text-[10px] text-slate-400 mt-0.5">
+                                        Select from store master inventory
+                                      </div>
+                                    )}
+                                  </div>
+                                  <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+                                </button>
+
+                                {/* Popover Product List */}
+                                {isSearchOpen && (
+                                  <div className="absolute left-0 right-0 top-full mt-1.5 bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl z-50 overflow-hidden max-h-72 flex flex-col">
+                                    <div className="p-2.5 border-b border-slate-800 flex items-center gap-2 bg-slate-950">
+                                      <Search className="w-4 h-4 text-slate-400 shrink-0" />
+                                      <input
+                                        type="text"
+                                        autoFocus
+                                        value={productSearchTerm}
+                                        onChange={(e) => setProductSearchTerm(e.target.value)}
+                                        placeholder="Search stockline, SKU, barcode..."
+                                        className="w-full bg-transparent text-xs text-white focus:outline-none placeholder-slate-500"
+                                      />
+                                      {productSearchTerm && (
+                                        <button
+                                          type="button"
+                                          onClick={() => setProductSearchTerm('')}
+                                          className="text-slate-400 hover:text-slate-200 text-xs px-1 cursor-pointer"
+                                        >
+                                          ✕
+                                        </button>
+                                      )}
+                                    </div>
+                                    <div className="overflow-y-auto divide-y divide-slate-800 flex-1">
+                                      {filteredAvailableProducts.map((p, pIdx) => (
+                                        <button
+                                          key={`${p.itemId}-${pIdx}`}
+                                          type="button"
+                                          onClick={() => handleSelectProduct(row.id, p)}
+                                          className="w-full text-left p-2.5 hover:bg-slate-800 transition-colors flex items-center justify-between cursor-pointer"
+                                        >
+                                          <div className="min-w-0 pr-2">
+                                            <p className="text-xs font-bold text-slate-200 truncate">{p.itemName}</p>
+                                            <p className="text-[10px] text-slate-400 mt-0.5">
+                                              {p.category} &bull; <span className="font-mono">{p.itemId}</span>
+                                            </p>
+                                          </div>
+                                          <div className="text-right shrink-0">
+                                            <p className="text-xs font-bold text-amber-400 font-mono">
+                                              ${(p.costPerCase || (p.costPerUnit ? p.costPerUnit * (p.unitsPerCase || 1) : 0)).toFixed(2)}/cs
+                                            </p>
+                                          </div>
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveRow(row.id)}
+                            className="p-2 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-xl transition-colors shrink-0 cursor-pointer"
+                            title="Remove line"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+
+                        {/* Receive Package As Toggle: Cases vs Singles */}
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold uppercase text-slate-400">Receive Package As:</span>
+                          <div className="grid grid-cols-2 gap-2 p-1 bg-slate-900 rounded-xl border border-slate-800">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (row.receiveAs !== 'Cases') {
+                                  const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
+                                  const currentUnitCost = calc.unitCost;
+                                  const converted = Number((currentUnitCost * ratio).toFixed(2));
+                                  updateRow(row.id, {
+                                    receiveAs: 'Cases',
+                                    pricePerCase: converted || row.pricePerCase,
+                                  });
+                                }
+                              }}
+                              className={`py-2 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 min-h-[40px] cursor-pointer ${
+                                row.receiveAs === 'Cases'
+                                  ? 'bg-amber-500 text-slate-950 shadow-sm'
+                                  : 'text-slate-400 hover:text-white'
+                              }`}
+                            >
+                              <Boxes className="w-3.5 h-3.5" />
+                              <span>Full Cases</span>
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (row.receiveAs !== 'Singles') {
+                                  const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
+                                  const currentCaseCost = Number(row.pricePerCase) || 0;
+                                  const converted = Number((currentCaseCost / ratio).toFixed(2));
+                                  updateRow(row.id, {
+                                    receiveAs: 'Singles',
+                                    pricePerCase: converted || row.pricePerCase,
+                                  });
+                                }
+                              }}
+                              className={`py-2 px-3 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 min-h-[40px] cursor-pointer ${
+                                row.receiveAs === 'Singles'
+                                  ? 'bg-amber-500 text-slate-950 shadow-sm'
+                                  : 'text-slate-400 hover:text-white'
+                              }`}
+                            >
+                              <Package className="w-3.5 h-3.5" />
+                              <span>Singles</span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Steppers & Quantity Received */}
+                        <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-800/80 items-center">
+                          <div>
+                            <span className="text-[10px] font-bold uppercase text-slate-400 block mb-1">
+                              Qty ({row.receiveAs}):
+                            </span>
+                            <div className="flex items-center bg-slate-900 rounded-xl p-1 border border-slate-700">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (row.receiveAs === 'Cases') {
+                                    updateRow(row.id, { quantityCases: Math.max(0, (Number(row.quantityCases) || 0) - 1) });
+                                  } else {
+                                    updateRow(row.id, { quantitySingles: Math.max(0, (Number(row.quantitySingles) || 0) - 1) });
+                                  }
+                                }}
+                                className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center text-sm active:scale-95 cursor-pointer"
+                                aria-label="Decrease quantity"
+                              >
+                                <Minus className="w-4 h-4" />
+                              </button>
+                              <input
+                                type="number"
+                                min={0}
+                                value={row.receiveAs === 'Cases' ? row.quantityCases ?? '' : row.quantitySingles ?? ''}
+                                onChange={(e) => {
+                                  const val = Number(e.target.value) || 0;
+                                  if (row.receiveAs === 'Cases') updateRow(row.id, { quantityCases: val });
+                                  else updateRow(row.id, { quantitySingles: val });
+                                }}
+                                placeholder="0"
+                                className="w-full text-center font-mono font-black text-amber-300 text-base bg-transparent focus:outline-none"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (row.receiveAs === 'Cases') {
+                                    updateRow(row.id, { quantityCases: (Number(row.quantityCases) || 0) + 1 });
+                                  } else {
+                                    updateRow(row.id, { quantitySingles: (Number(row.quantitySingles) || 0) + 1 });
+                                  }
+                                }}
+                                className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center text-sm active:scale-95 cursor-pointer"
+                                aria-label="Increase quantity"
+                              >
+                                <Plus className="w-4 h-4" />
+                              </button>
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-1 font-mono">
+                              = {calc.totalUnits} total units
+                            </div>
+                          </div>
+
+                          {/* Price / Case or Unit */}
+                          <div>
+                            <span className="text-[10px] font-bold uppercase text-slate-400 block mb-1">
+                              Price / {row.receiveAs === 'Singles' ? 'Unit' : 'Case'} ($):
+                            </span>
+                            <div className="relative">
+                              <span className="absolute left-3 top-2.5 text-xs text-slate-400 font-mono">$</span>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                value={row.pricePerCase ?? ''}
+                                placeholder="0.00"
+                                onChange={(e) => {
+                                  const val = cleanNumberInput(e.target.value, true);
+                                  updateRow(row.id, { pricePerCase: val });
+                                }}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-xl pl-7 pr-3 py-2 text-sm text-white font-mono font-bold focus:outline-none focus:border-amber-500"
+                              />
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-1 font-mono">
+                              Unit Cost: ${calc.unitCost.toFixed(2)}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Line Total & Selling Price */}
+                        <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs font-mono">
+                          <div>
+                            <span className="text-[10px] text-slate-400 block uppercase font-sans font-bold">Line Total</span>
+                            <span className="text-base font-black text-emerald-400 font-mono">
+                              ${calc.lineTotal.toFixed(2)}
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <span className="text-[10px] text-slate-400 block uppercase font-sans font-bold">Selling Price</span>
+                            <div className="flex items-center gap-1.5">
+                              {isCashierOrSales ? (
+                                <span className="inline-flex items-center gap-1 text-slate-300 font-bold font-mono">
+                                  <Lock className="w-3 h-3 text-amber-400" />
+                                  ${calc.sellingPrice.toFixed(2)}
+                                </span>
+                              ) : (
+                                <span className="text-white font-bold font-mono">
+                                  ${calc.sellingPrice.toFixed(2)}
+                                </span>
+                              )}
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                  calc.markupPercent >= 20
+                                    ? 'bg-emerald-950 text-emerald-300'
+                                    : 'bg-amber-950 text-amber-300'
+                                }`}
+                              >
+                                {calc.markupPercent.toFixed(0)}%
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            ) : (
+              /* Table */
+              <div className="overflow-x-auto rounded-2xl border border-slate-800">
+                <table className="w-full text-left text-sm text-slate-300 border-collapse">
+                  <thead className="bg-slate-950/80 text-xs uppercase font-bold text-slate-400 border-b border-slate-800">
                   <tr>
                     <th className="py-3.5 px-3">#</th>
                     <th className="py-3.5 px-3 min-w-[240px]">Product</th>
@@ -1228,23 +1756,35 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
                           {/* 2. Batch # */}
                           <td className="py-2.5 px-3">
-                            <input
-                              type="text"
-                              value={row.batchNumber || ''}
-                              onChange={(e) => updateRow(row.id, { batchNumber: e.target.value })}
-                              placeholder="Auto (BAT-...)"
-                              className="w-24 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-amber-500"
-                            />
+                            {row.productId && !row.trackExpiry ? (
+                              <span className="inline-block py-1 px-2 text-[11px] text-slate-500 bg-slate-900/60 rounded-lg border border-slate-800 font-mono">
+                                N/A
+                              </span>
+                            ) : (
+                              <input
+                                type="text"
+                                value={row.batchNumber || ''}
+                                onChange={(e) => updateRow(row.id, { batchNumber: e.target.value })}
+                                placeholder="Auto (BAT-...)"
+                                className="w-24 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-xs text-white font-mono placeholder:text-slate-600 focus:outline-none focus:border-amber-500"
+                              />
+                            )}
                           </td>
 
                           {/* 3. Expiry Date */}
                           <td className="py-2.5 px-3">
-                            <input
-                              type="date"
-                              value={row.expiryDate || ''}
-                              onChange={(e) => updateRow(row.id, { expiryDate: e.target.value })}
-                              className="w-28 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-mono focus:outline-none focus:border-amber-500"
-                            />
+                            {row.productId && !row.trackExpiry ? (
+                              <span className="inline-block py-1 px-2 text-[11px] text-slate-500 bg-slate-900/60 rounded-lg border border-slate-800 font-mono">
+                                Not Tracked
+                              </span>
+                            ) : (
+                              <input
+                                type="date"
+                                value={row.expiryDate || ''}
+                                onChange={(e) => updateRow(row.id, { expiryDate: e.target.value })}
+                                className="w-28 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-mono focus:outline-none focus:border-amber-500"
+                              />
+                            )}
                           </td>
 
                           {/* 4. Receive As (Pill Toggle) */}
@@ -1254,7 +1794,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 type="button"
                                 onClick={() => {
                                   if (row.receiveAs !== 'Cases') {
-                                    const ratio = Math.max(1, row.qtyPerCaseDefault || 1);
+                                    const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
                                     const currentUnitCost = calc.unitCost;
                                     const converted = Number((currentUnitCost * ratio).toFixed(2));
                                     updateRow(row.id, {
@@ -1297,11 +1837,22 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                           {/* 5. Units/Cs */}
                           <td className="py-2.5 px-3 text-center">
                             <input
-                              type="number"
-                              min={1}
-                              value={row.qtyPerCaseDefault}
-                              onChange={(e) => updateRow(row.id, { qtyPerCaseDefault: Math.max(1, parseInt(e.target.value, 10) || 1) })}
-                              className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-xs text-white font-mono focus:outline-none focus:border-amber-500"
+                              type="text"
+                              inputMode="numeric"
+                              value={row.qtyPerCaseDefault ?? ''}
+                              placeholder="1"
+                              onFocus={(e) => e.target.select()}
+                              onClick={(e) => (e.target as HTMLInputElement).select()}
+                              onChange={(e) => {
+                                const raw = cleanNumberInput(e.target.value, false);
+                                updateRow(row.id, { qtyPerCaseDefault: raw });
+                              }}
+                              onBlur={(e) => {
+                                const num = parseInt(String(row.qtyPerCaseDefault), 10);
+                                const normalized = (!num || num < 1) ? 1 : num;
+                                updateRow(row.id, { qtyPerCaseDefault: normalized });
+                              }}
+                              className="w-16 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-center text-xs text-white font-mono focus:outline-none focus:border-amber-500 cursor-pointer"
                             />
                           </td>
 
@@ -1312,28 +1863,34 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 <div className="flex items-center justify-center gap-1">
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantityCases: Math.max(0, (row.quantityCases || 0) - 1) })}
+                                    onClick={() => updateRow(row.id, { quantityCases: Math.max(0, (Number(row.quantityCases) || 0) - 1) })}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     -
                                   </button>
                                   <input
-                                    type="number"
-                                    min={0}
-                                    value={row.quantityCases}
-                                    onChange={(e) => updateRow(row.id, { quantityCases: Math.max(0, parseInt(e.target.value, 10) || 0) })}
+                                    type="text"
+                                    inputMode="numeric"
+                                    value={row.quantityCases ?? ''}
+                                    placeholder="0"
+                                    onFocus={(e) => e.target.select()}
+                                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                                    onChange={(e) => {
+                                      const val = cleanNumberInput(e.target.value, false);
+                                      updateRow(row.id, { quantityCases: val });
+                                    }}
                                     className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-bold font-mono focus:outline-none focus:border-amber-500"
                                   />
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantityCases: (row.quantityCases || 0) + 1 })}
+                                    onClick={() => updateRow(row.id, { quantityCases: (Number(row.quantityCases) || 0) + 1 })}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     +
                                   </button>
                                 </div>
                                 <span className="text-[10px] text-slate-400 font-mono block">
-                                  = {(row.quantityCases || 0) * (row.qtyPerCaseDefault || 1)} units
+                                  = {(Number(row.quantityCases) || 0) * (Number(row.qtyPerCaseDefault) || 1)} units
                                 </span>
                               </div>
                             ) : (
@@ -1341,21 +1898,27 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 <div className="flex items-center justify-center gap-1">
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantitySingles: Math.max(0, (row.quantitySingles || 0) - 1) })}
+                                    onClick={() => updateRow(row.id, { quantitySingles: Math.max(0, (Number(row.quantitySingles) || 0) - 1) })}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     -
                                   </button>
                                   <input
-                                    type="number"
-                                    min={0}
-                                    value={row.quantitySingles}
-                                    onChange={(e) => updateRow(row.id, { quantitySingles: Math.max(0, parseInt(e.target.value, 10) || 0) })}
+                                    type="text"
+                                    inputMode="numeric"
+                                    value={row.quantitySingles ?? ''}
+                                    placeholder="0"
+                                    onFocus={(e) => e.target.select()}
+                                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                                    onChange={(e) => {
+                                      const val = cleanNumberInput(e.target.value, false);
+                                      updateRow(row.id, { quantitySingles: val });
+                                    }}
                                     className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-bold font-mono focus:outline-none focus:border-amber-500"
                                   />
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantitySingles: (row.quantitySingles || 0) + 1 })}
+                                    onClick={() => updateRow(row.id, { quantitySingles: (Number(row.quantitySingles) || 0) + 1 })}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     +
@@ -1382,12 +1945,16 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                               <div className="relative">
                                 <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs font-mono">$</span>
                                 <input
-                                  type="number"
-                                  step="0.01"
-                                  min={0}
-                                  value={row.pricePerCase}
-                                  onChange={(e) => updateRow(row.id, { pricePerCase: Math.max(0, parseFloat(e.target.value) || 0) })}
-                                  placeholder={row.receiveAs === 'Singles' ? 'Unit cost' : 'Case cost'}
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={row.pricePerCase ?? ''}
+                                  placeholder={row.receiveAs === 'Singles' ? '0.00' : '0.00'}
+                                  onFocus={(e) => e.target.select()}
+                                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                                  onChange={(e) => {
+                                    const val = cleanNumberInput(e.target.value, true);
+                                    updateRow(row.id, { pricePerCase: val });
+                                  }}
                                   className="w-32 bg-slate-900 border border-slate-700 focus:border-amber-500 rounded-lg pl-6 pr-2.5 py-1 text-right text-xs text-white font-mono font-bold focus:outline-none"
                                   required
                                 />
@@ -1422,11 +1989,16 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                               <div className="relative">
                                 <span className="absolute left-2 top-1/2 -translate-y-1/2 text-slate-500 text-xs font-mono">$</span>
                                 <input
-                                  type="number"
-                                  step="0.01"
-                                  min={0}
-                                  value={row.sellingPrice}
-                                  onChange={(e) => updateRow(row.id, { sellingPrice: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={row.sellingPrice ?? ''}
+                                  placeholder="0.00"
+                                  onFocus={(e) => e.target.select()}
+                                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                                  onChange={(e) => {
+                                    const val = cleanNumberInput(e.target.value, true);
+                                    updateRow(row.id, { sellingPrice: val });
+                                  }}
                                   className="w-20 bg-slate-900 border border-slate-700 rounded-lg pl-5 pr-2 py-1 text-right text-xs text-slate-200 font-mono focus:outline-none focus:border-amber-500"
                                 />
                               </div>
@@ -1462,6 +2034,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 </tbody>
               </table>
             </div>
+            )}
 
             {/* Totals Summary Footer */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl bg-slate-950/80 border border-slate-800">
@@ -1594,17 +2167,19 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                           <div className="relative">
                             <span className="absolute left-2.5 top-2 text-xs text-slate-400 font-mono">$</span>
                             <input
-                              type="number"
-                              min="0"
-                              step="0.01"
-                              value={payRow.amount}
-                              onChange={(e) =>
+                              type="text"
+                              inputMode="decimal"
+                              value={payRow.amount ?? ''}
+                              onFocus={(e) => e.target.select()}
+                              onClick={(e) => (e.target as HTMLInputElement).select()}
+                              onChange={(e) => {
+                                const val = cleanNumberInput(e.target.value, true);
                                 handleUpdatePaymentRow(
                                   payRow.id,
                                   'amount',
-                                  e.target.value === '' ? '' : Math.max(0, parseFloat(e.target.value) || 0)
-                                )
-                              }
+                                  val
+                                );
+                              }}
                               placeholder="0.00"
                               className="w-full bg-slate-800 border border-slate-700 text-amber-400 font-mono font-bold rounded-xl pl-6 pr-2.5 py-2 text-xs focus:outline-none focus:border-amber-500"
                               required
@@ -1679,13 +2254,15 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                   <div className="relative max-w-xs ml-auto w-full">
                     <span className="absolute left-3 top-2.5 text-xs text-slate-400 font-mono">$</span>
                     <input
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      value={ownerPaymentAmount}
-                      onChange={(e) =>
-                        setOwnerPaymentAmount(e.target.value === '' ? '' : Math.max(0, parseFloat(e.target.value) || 0))
-                      }
+                      type="text"
+                      inputMode="decimal"
+                      value={ownerPaymentAmount ?? ''}
+                      onFocus={(e) => e.target.select()}
+                      onClick={(e) => (e.target as HTMLInputElement).select()}
+                      onChange={(e) => {
+                        const val = cleanNumberInput(e.target.value, true);
+                        setOwnerPaymentAmount(val);
+                      }}
                       placeholder="0.00"
                       className="w-full bg-slate-800 border border-slate-700 text-sky-400 font-mono font-bold rounded-xl pl-7 pr-3 py-2 text-xs focus:outline-none focus:border-sky-500"
                     />
@@ -1786,11 +2363,43 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
               <button
                 id="btn-submit-direct-grv"
                 type="submit"
-                className="px-6 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black text-sm shadow-xl shadow-amber-500/20 flex items-center gap-2 transition-all transform active:scale-95"
+                className="px-6 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-black text-sm shadow-xl shadow-amber-500/20 flex items-center gap-2 transition-all transform active:scale-95 cursor-pointer"
               >
                 <Check className="w-5 h-5" />
                 {isSupervisorOrAbove ? 'Post & Approve Direct Delivery' : 'Submit Direct Delivery Voucher'}
               </button>
+            </div>
+          </div>
+
+          {/* Mobile Sticky Bottom Action Dock (Handheld bay terminal ergonomics) */}
+          <div className="fixed bottom-0 left-0 right-0 z-40 bg-slate-900/95 backdrop-blur-md border-t border-slate-700 p-3 sm:hidden shadow-2xl">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-[10px] text-slate-400 uppercase font-bold">Total Payable</div>
+                <div className="text-lg font-black font-mono text-amber-400">
+                  ${voucherTotals.totalCost.toFixed(2)}
+                </div>
+                <div className="text-[10px] text-slate-400">
+                  {rows.filter((r) => r.productId).length} items &bull; {voucherTotals.totalUnits} un
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleAddRow}
+                  className="p-2.5 rounded-xl bg-slate-800 text-slate-200 border border-slate-700 font-bold active:scale-95 cursor-pointer"
+                  title="Add Line Item"
+                >
+                  <Plus className="w-5 h-5" />
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2.5 rounded-xl text-xs font-black text-slate-950 bg-gradient-to-r from-amber-500 to-orange-500 shadow-lg flex items-center gap-1.5 active:scale-95 cursor-pointer"
+                >
+                  <Check className="w-4 h-4" />
+                  <span>{isSupervisorOrAbove ? 'Approve' : 'Submit'}</span>
+                </button>
+              </div>
             </div>
           </div>
         </form>

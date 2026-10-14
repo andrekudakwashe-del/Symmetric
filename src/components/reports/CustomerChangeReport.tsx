@@ -1,8 +1,10 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { CustomerChangeReportItem, Salesperson } from '../../types';
+import { CustomerChangeReportItem, Salesperson, Customer } from '../../types';
 import {
   getCustomerChangeReport,
   settleCustomerChangePayout,
+  recordManualCustomerChange,
+  getCustomers,
   subscribeToDatabase,
 } from '../../db/roomDatabase';
 import {
@@ -25,6 +27,10 @@ import {
   Check,
   Send,
   Plus,
+  User,
+  FileText,
+  Tag,
+  Banknote,
 } from 'lucide-react';
 
 interface CustomerChangeReportProps {
@@ -49,6 +55,108 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
   const [payoutAmount, setPayoutAmount] = useState<string>('');
   const [payoutNotes, setPayoutNotes] = useState<string>('');
   const [successToast, setSuccessToast] = useState<string | null>(null);
+
+  // Manual Change Booking Modal State (e.g. customer rejected note, no replacement note available)
+  const [showManualModal, setShowManualModal] = useState<boolean>(false);
+  const [manualCustomerType, setManualCustomerType] = useState<'existing' | 'new'>('existing');
+  const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
+  const [manualCustomerName, setManualCustomerName] = useState<string>('');
+  const [manualCustomerPhone, setManualCustomerPhone] = useState<string>('');
+  const [manualAmount, setManualAmount] = useState<string>('');
+  const [manualReasonPreset, setManualReasonPreset] = useState<string>(
+    'Customer rejected / complained about note after invoice processed (no replacement note)'
+  );
+  const [cashReceivedInDrawer, setCashReceivedInDrawer] = useState<boolean>(true);
+  const [manualCustomNotes, setManualCustomNotes] = useState<string>('');
+  const [manualInvoiceRef, setManualInvoiceRef] = useState<string>('');
+  const [manualDate, setManualDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [allCustomers, setAllCustomers] = useState<Customer[]>(() => getCustomers());
+
+  const handleOpenManualModal = (targetCustomer?: CustomerChangeReportItem | Customer | null) => {
+    const list = getCustomers();
+    setAllCustomers(list);
+    if (targetCustomer) {
+      setManualCustomerType('existing');
+      const custId = (targetCustomer as any).customerId || (targetCustomer as any).id || '';
+      setSelectedCustomerId(custId);
+      setManualCustomerName((targetCustomer as any).customerName || (targetCustomer as any).name || '');
+      setManualCustomerPhone(targetCustomer.phone || '');
+    } else {
+      setSelectedCustomerId('');
+      setManualCustomerName('');
+      setManualCustomerPhone('');
+    }
+    setManualAmount('');
+    setManualCustomNotes('');
+    setManualInvoiceRef('');
+    setManualReasonPreset(
+      'Customer rejected / complained about note after invoice processed (no replacement note)'
+    );
+    setCashReceivedInDrawer(true);
+    setShowManualModal(true);
+  };
+
+  const handleConfirmManualChange = (e: React.FormEvent) => {
+    e.preventDefault();
+    const amt = parseFloat(manualAmount);
+    if (isNaN(amt) || amt <= 0) {
+      alert('Please enter a valid change amount greater than $0.00');
+      return;
+    }
+
+    let finalCustName = manualCustomerName.trim();
+    let finalCustId = selectedCustomerId;
+
+    if (manualCustomerType === 'existing') {
+      const found = allCustomers.find((c) => c.customerId === selectedCustomerId || c.id === selectedCustomerId);
+      if (found) {
+        finalCustName = found.name;
+        finalCustId = found.customerId || found.id;
+        if (!manualCustomerPhone && found.phone) {
+          setManualCustomerPhone(found.phone);
+        }
+      }
+    }
+
+    if (!finalCustName) {
+      alert('Please select an existing customer or enter a customer name.');
+      return;
+    }
+
+    const fullNotes = manualCustomNotes.trim()
+      ? `${manualReasonPreset}: ${manualCustomNotes.trim()}`
+      : manualReasonPreset;
+
+    const staffId = currentUser?.id || '001';
+    const staffName = currentUser?.name || 'Cashier';
+    const staffRole = currentUser?.role || 'Staff';
+
+    recordManualCustomerChange({
+      customerName: finalCustName,
+      customerId: finalCustId,
+      phone: manualCustomerPhone.trim(),
+      amount: amt,
+      date: manualDate,
+      notes: fullNotes,
+      reference: manualInvoiceRef.trim() || undefined,
+      cashReceivedInDrawer,
+      staffId,
+      staffName,
+      staffRole,
+    });
+
+    setReportData(getCustomerChangeReport());
+    setSuccessToast(`Change of $${amt.toFixed(2)} booked for "${finalCustName}". Customer ledger updated.`);
+    setShowManualModal(false);
+
+    // Reset fields
+    setManualAmount('');
+    setManualCustomerName('');
+    setManualCustomerPhone('');
+    setSelectedCustomerId('');
+    setManualCustomNotes('');
+    setManualInvoiceRef('');
+  };
 
   // Subscribe to real-time database updates
   useEffect(() => {
@@ -200,14 +308,25 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
           </div>
 
           <div className="flex items-center space-x-2 flex-wrap gap-y-2">
+            <button
+              type="button"
+              id="btn-book-cash-in-change"
+              onClick={handleOpenManualModal}
+              className="py-2 px-3.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:brightness-110 text-white text-xs font-black shadow-md shadow-purple-950 flex items-center space-x-1.5 transition active:scale-95 border border-purple-400/40 cursor-pointer"
+              title="Book change owed to customer (e.g. customer rejected note / small change unavailable)"
+            >
+              <Coins className="w-3.5 h-3.5 text-amber-300" />
+              <span>+ Book Cash in Change</span>
+            </button>
+
             {onNavigateToForm3 && (
               <button
                 type="button"
                 onClick={() => onNavigateToForm3()}
-                className="py-2 px-3.5 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-purple-600 hover:brightness-110 text-white text-xs font-bold shadow-md shadow-purple-950 flex items-center space-x-1.5 transition active:scale-95 border border-purple-400/40"
+                className="py-2 px-3.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold border border-slate-700 flex items-center space-x-1.5 transition active:scale-95 shadow-sm"
               >
                 <Plus className="w-3.5 h-3.5" />
-                <span>+ Add New Change in Form 3</span>
+                <span>Form 3 Full View</span>
               </button>
             )}
 
@@ -537,9 +656,9 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
 
                           <button
                             type="button"
-                            onClick={() => onNavigateToForm3?.(item.customerName)}
-                            title="Add new change entry for this customer in Form 3"
-                            className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-purple-300 hover:text-white text-[11px] font-bold border border-purple-500/30 transition active:scale-95 flex items-center space-x-1"
+                            onClick={() => handleOpenManualModal(item)}
+                            title="Book cash in change owed to this customer (e.g. note complained about / small change shortage)"
+                            className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-purple-300 hover:text-white text-[11px] font-bold border border-purple-500/30 transition active:scale-95 flex items-center space-x-1 cursor-pointer"
                           >
                             <Plus className="w-3 h-3" />
                             <span>+ Change</span>
@@ -824,6 +943,272 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
                 Close Ledger
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MANUAL CHANGE BOOKING MODAL (Real-world note rejection / small change shortage) */}
+      {showManualModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-slate-900 border border-purple-500/40 rounded-3xl p-5 sm:p-6 max-w-lg w-full shadow-2xl text-white space-y-4 max-h-[92vh] overflow-y-auto">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 rounded-2xl bg-purple-500/20 text-purple-400 border border-purple-500/30 flex items-center justify-center shrink-0">
+                  <Coins className="w-5 h-5 text-amber-300" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black text-white">Book Cash in Change</h3>
+                  <p className="text-xs text-slate-400">
+                    Record change owed when customer rejects note or small denominations are unavailable
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowManualModal(false)}
+                className="p-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmManualChange} className="space-y-4">
+              {/* Customer Selector Type */}
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-300 flex items-center space-x-1.5">
+                  <User className="w-3.5 h-3.5 text-purple-400" />
+                  <span>Customer Selection *</span>
+                </label>
+                <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1 rounded-2xl border border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => setManualCustomerType('existing')}
+                    className={`py-1.5 text-xs font-bold rounded-xl transition ${
+                      manualCustomerType === 'existing'
+                        ? 'bg-purple-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Existing Customer
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setManualCustomerType('new')}
+                    className={`py-1.5 text-xs font-bold rounded-xl transition ${
+                      manualCustomerType === 'new'
+                        ? 'bg-purple-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Walk-in / New Customer
+                  </button>
+                </div>
+
+                {manualCustomerType === 'existing' ? (
+                  <div>
+                    <select
+                      value={selectedCustomerId}
+                      onChange={(e) => {
+                        setSelectedCustomerId(e.target.value);
+                        const found = allCustomers.find(
+                          (c) => c.customerId === e.target.value || c.id === e.target.value
+                        );
+                        if (found) {
+                          setManualCustomerName(found.name);
+                          if (found.phone) setManualCustomerPhone(found.phone);
+                        }
+                      }}
+                      required
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
+                    >
+                      <option value="">-- Choose Existing Customer --</option>
+                      {allCustomers.map((cust) => (
+                        <option key={cust.id || cust.customerId} value={cust.customerId || cust.id}>
+                          {cust.name} {cust.phone ? `(${cust.phone})` : ''} #{cust.customerId || cust.id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div>
+                      <input
+                        type="text"
+                        placeholder="Customer Full Name *"
+                        required
+                        value={manualCustomerName}
+                        onChange={(e) => setManualCustomerName(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
+                      />
+                    </div>
+                    <div>
+                      <input
+                        type="text"
+                        placeholder="Phone Number (Optional)"
+                        value={manualCustomerPhone}
+                        onChange={(e) => setManualCustomerPhone(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Amount Owed */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 flex items-center justify-between">
+                  <span className="flex items-center space-x-1.5">
+                    <Banknote className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Change Amount We Owe ($ USD) *</span>
+                  </span>
+                  {parseFloat(manualAmount) > 0 && (
+                    <span className="font-mono text-emerald-300 text-xs font-black">
+                      ${parseFloat(manualAmount).toFixed(2)}
+                    </span>
+                  )}
+                </label>
+                <div className="relative">
+                  <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    required
+                    placeholder="0.00"
+                    value={manualAmount}
+                    onChange={(e) => setManualAmount(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-8 pr-3 py-2 text-sm font-bold text-white font-mono focus:outline-none focus:border-emerald-500"
+                  />
+                </div>
+                {/* Quick preset chips */}
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  {[0.5, 1, 2, 5, 10, 20, 50].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      onClick={() => setManualAmount(String(preset))}
+                      className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-bold font-mono transition active:scale-95 border border-slate-700"
+                    >
+                      +${preset.toFixed(2)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Reason Presets */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 flex items-center space-x-1.5">
+                  <Tag className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Reason for Booking Change *</span>
+                </label>
+                <select
+                  value={manualReasonPreset}
+                  onChange={(e) => setManualReasonPreset(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
+                >
+                  <option value="Customer rejected / complained about note after invoice processed (no replacement note)">
+                    Customer rejected / complained about note after invoice processed (no replacement note)
+                  </option>
+                  <option value="Customer returned change banknote; placed back into till drawer">
+                    Customer returned change banknote; placed back into till drawer
+                  </option>
+                  <option value="Cashier short on small denomination notes / exact change">
+                    Cashier short on small denomination notes / exact change
+                  </option>
+                  <option value="Customer left change balance to be stored for future visit">
+                    Customer left change balance to be stored for future visit
+                  </option>
+                  <option value="Damaged / defaced / torn banknote returned by customer">
+                    Damaged / defaced / torn banknote returned by customer
+                  </option>
+                  <option value="Special change credit arrangement">
+                    Special change credit arrangement
+                  </option>
+                </select>
+              </div>
+
+              {/* Till Drawer Note Received Toggle */}
+              <div className="p-3 rounded-2xl bg-purple-950/30 border border-purple-500/30 space-y-1">
+                <label className="flex items-start space-x-2.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={cashReceivedInDrawer}
+                    onChange={(e) => setCashReceivedInDrawer(e.target.checked)}
+                    className="mt-0.5 rounded border-purple-500/50 text-purple-600 focus:ring-purple-500 shrink-0"
+                  />
+                  <div className="text-xs">
+                    <span className="font-bold text-purple-200">Returned Banknote Kept in Till Drawer (+ Cash IN)</span>
+                    <p className="text-[11px] text-purple-300/70 mt-0.5">
+                      Records the returned banknote into till drawer cash movements so physical drawer count matches Form 4 cash balancing.
+                    </p>
+                  </div>
+                </label>
+              </div>
+
+              {/* Custom Details / Serial Number / Notes */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-300 flex items-center space-x-1.5">
+                  <FileText className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>Details / Note Description (Optional)</span>
+                </label>
+                <textarea
+                  rows={2}
+                  placeholder="e.g. Customer brought back $10 note with slight tear after invoice processed; kept note in till drawer and credited customer ledger with $10.00 change owed."
+                  value={manualCustomNotes}
+                  onChange={(e) => setManualCustomNotes(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
+                />
+              </div>
+
+              {/* Invoice Reference & Date */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[11px] font-bold text-slate-400 block mb-1">Receipt / Invoice Ref (Optional)</label>
+                  <input
+                    type="text"
+                    placeholder="e.g. INV-1042 / Morning Slip"
+                    value={manualInvoiceRef}
+                    onChange={(e) => setManualInvoiceRef(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-[11px] font-bold text-slate-400 block mb-1">Booking Date</label>
+                  <input
+                    type="date"
+                    required
+                    value={manualDate}
+                    onChange={(e) => setManualDate(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+              </div>
+
+              {/* Staff Stamp */}
+              <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-2.5 text-[11px] text-slate-400 flex items-center justify-between">
+                <span>Attributed Staff: <strong className="text-white">{currentUser?.name || 'Cashier'}</strong> (#{currentUser?.id || '001'})</span>
+                <span className="text-purple-300 font-bold">● Live Room DB Log</span>
+              </div>
+
+              {/* Submit Buttons */}
+              <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setShowManualModal(false)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-300 hover:text-white transition cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:brightness-110 text-xs font-black text-white shadow-lg transition active:scale-95 flex items-center space-x-1.5 cursor-pointer"
+                >
+                  <Coins className="w-3.5 h-3.5 text-amber-300" />
+                  <span>Book Change &amp; Update Ledger</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}
