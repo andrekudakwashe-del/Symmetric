@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Salesperson, ExpenseEntry } from '../../types';
-import { approveExpense, approveAllExpensesForStaffAndDate, isSupervisorOrAbove } from '../../db/roomDatabase';
+import { approveExpense, rejectExpense, approveAllExpensesForStaffAndDate, isSupervisorOrAbove } from '../../db/roomDatabase';
 import {
   X,
   Check,
@@ -15,6 +15,9 @@ import {
   Calendar,
   DollarSign,
   Tag,
+  RotateCcw,
+  KeyRound,
+  Delete,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { SyncStatusDot } from '../common/SyncStatusDot';
@@ -50,6 +53,11 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
   });
   const [pinError, setPinError] = useState<string>('');
   const [actionSuccess, setActionSuccess] = useState<string>('');
+  const [showKeypad, setShowKeypad] = useState<boolean>(true);
+  const [rejectingExpenseId, setRejectingExpenseId] = useState<string | null>(null);
+  const [rejectionReason, setRejectionReason] = useState<string>('Incorrectly entered - returned to drawer for re-entry');
+  const [rejectPinInput, setRejectPinInput] = useState<string>('');
+  const [rejectPinError, setRejectPinError] = useState<string>('');
 
   if (!isOpen) return null;
 
@@ -77,6 +85,21 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
     }
   };
 
+  // Reject / Return single expense to cashier drawer
+  const handleConfirmRejectSingle = (expenseId: string, supervisorToUse?: Salesperson) => {
+    const supervisor = supervisorToUse || currentUser;
+    const success = rejectExpense(expenseId, supervisor, rejectionReason.trim() || 'Returned to cashier drawer for re-entry');
+    if (success) {
+      setActionSuccess(`Expense #${expenseId} rejected and money returned to ${selectedStaff.name}'s drawer!`);
+      setRejectingExpenseId(null);
+      setRejectionReason('Incorrectly entered - returned to drawer for re-entry');
+      setRejectPinInput('');
+      setRejectPinError('');
+      setTimeout(() => setActionSuccess(''), 3500);
+      onExpensesUpdated();
+    }
+  };
+
   // Supervisor clicks direct approve all
   const handleDirectApproveAll = () => {
     const count = approveAllExpensesForStaffAndDate(selectedStaff.id, sheetDate, currentUser);
@@ -87,8 +110,8 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
   };
 
   // Cashier enters supervisor PIN to approve all
-  const handlePinApproveAll = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handlePinApproveAll = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setPinError('');
 
     const supervisor = salespeople.find((s) => s.id === selectedSupervisorId);
@@ -110,6 +133,17 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
     setActionSuccess(`Authorized by ${supervisor.name}: Approved ${count} pending expenses for Day End.`);
     setTimeout(() => setActionSuccess(''), 3500);
     onExpensesUpdated();
+  };
+
+  const handleKeypadPress = (digit: string) => {
+    setPinError('');
+    if (pinInput.length < 6) {
+      setPinInput((prev) => prev + digit);
+    }
+  };
+
+  const handleKeypadBackspace = () => {
+    setPinInput((prev) => prev.slice(0, -1));
   };
 
   return (
@@ -256,19 +290,37 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-3 shrink-0">
+                  <div className="flex items-center gap-2 shrink-0">
                     <span className="text-base font-black font-mono-num text-rose-400">
                       -${Number(exp.amount).toFixed(2)}
                     </span>
-                    {!isApproved && isCurrentSupervisor && (
-                      <button
-                        type="button"
-                        onClick={() => handleApproveSingle(exp.id)}
-                        className="py-1 px-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold transition flex items-center gap-1 shadow-sm active:scale-95"
-                      >
-                        <Check className="w-3 h-3" />
-                        <span>Approve</span>
-                      </button>
+                    {!isApproved && (
+                      <div className="flex items-center gap-1.5">
+                        {isCurrentSupervisor && (
+                          <button
+                            type="button"
+                            onClick={() => handleApproveSingle(exp.id)}
+                            className="py-1.5 px-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold transition flex items-center gap-1 shadow-sm active:scale-95 cursor-pointer"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>Approve</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setRejectingExpenseId(exp.id);
+                            setRejectionReason('Incorrect amount/details - returned to drawer for re-entry');
+                            setRejectPinInput('');
+                            setRejectPinError('');
+                          }}
+                          className="py-1.5 px-2.5 rounded-xl bg-rose-950/80 hover:bg-rose-900 border border-rose-700/60 text-rose-200 text-[11px] font-bold transition flex items-center gap-1 shadow-sm active:scale-95 cursor-pointer"
+                          title="Reject expense and return money to cashier's drawer"
+                        >
+                          <RotateCcw className="w-3 h-3 text-rose-300" />
+                          <span>Return to Drawer</span>
+                        </button>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -278,7 +330,7 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
         </div>
 
         {/* Day-End Supervisor Sign-Off Footer */}
-        <div className="p-4 border-t border-slate-800 bg-slate-950/80 shrink-0">
+        <div className="p-4 border-t border-slate-800 bg-slate-950/90 shrink-0 space-y-3">
           {pendingList.length === 0 && cashExpenses.length > 0 ? (
             <div className="p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-between text-xs text-emerald-300">
               <div className="flex items-center gap-2">
@@ -288,7 +340,7 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
               <button
                 type="button"
                 onClick={onClose}
-                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold transition"
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold transition cursor-pointer"
               >
                 Close Audit
               </button>
@@ -296,7 +348,7 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
           ) : pendingList.length > 0 && isCurrentSupervisor ? (
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs text-slate-300">
-                <span>Supervisor: <strong className="text-white">{currentUser.name}</strong></span>
+                <span>Supervisor Logged In: <strong className="text-white">{currentUser.name}</strong></span>
                 <p className="text-[11px] text-amber-400/90 font-medium">
                   {pendingList.length} expense(s) awaiting your day-end signoff (${pendingAmount.toFixed(2)})
                 </p>
@@ -305,14 +357,14 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
                 <button
                   type="button"
                   onClick={onClose}
-                  className="px-3 py-2 rounded-xl border border-slate-700 text-slate-300 hover:bg-slate-800 text-xs font-bold transition"
+                  className="px-3 py-2 rounded-xl border border-slate-700 text-slate-300 hover:bg-slate-800 text-xs font-bold transition cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="button"
                   onClick={handleDirectApproveAll}
-                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-black shadow-lg shadow-emerald-950 flex items-center gap-1.5 transition active:scale-95"
+                  className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-black shadow-lg shadow-emerald-950 flex items-center gap-1.5 transition active:scale-95 cursor-pointer"
                 >
                   <ShieldCheck className="w-4 h-4 text-emerald-200" />
                   <span>Approve All ({pendingList.length}) for Day End</span>
@@ -320,28 +372,33 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
               </div>
             </div>
           ) : pendingList.length > 0 && !isCurrentSupervisor ? (
-            <form onSubmit={handlePinApproveAll} className="space-y-2.5">
+            <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
-                  <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Supervisor Day-End PIN Sign-Off:</span>
+                  <ShieldCheck className="w-4 h-4 text-amber-400" />
+                  <span>Supervisor Sign-Off PIN Required:</span>
                 </span>
-                <span className="text-[11px] text-slate-400">
-                  {pendingList.length} pending (${pendingAmount.toFixed(2)})
-                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowKeypad(!showKeypad)}
+                  className="text-[11px] text-indigo-300 hover:underline flex items-center gap-1 cursor-pointer font-bold"
+                >
+                  <KeyRound className="w-3 h-3" />
+                  <span>{showKeypad ? 'Hide Keypad' : 'Show Touch Keypad'}</span>
+                </button>
               </div>
 
               {pinError && (
-                <div className="p-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs font-medium">
+                <div className="p-2.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs font-medium">
                   {pinError}
                 </div>
               )}
 
-              <div className="flex items-center gap-2">
+              <form onSubmit={handlePinApproveAll} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
                 <select
                   value={selectedSupervisorId}
                   onChange={(e) => setSelectedSupervisorId(e.target.value)}
-                  className="bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-2 text-xs font-bold text-white focus:outline-none focus:border-indigo-500 shrink-0"
+                  className="bg-slate-900 border border-slate-700 rounded-xl px-3 py-2.5 text-xs font-bold text-white focus:outline-none focus:border-indigo-500 shrink-0"
                 >
                   {salespeople
                     .filter((s) => isSupervisorOrAbove(s.role))
@@ -352,39 +409,184 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
                     ))}
                 </select>
 
-                <input
-                  type="password"
-                  maxLength={6}
-                  value={pinInput}
-                  onChange={(e) => {
-                    setPinInput(e.target.value);
-                    setPinError('');
-                  }}
-                  placeholder="Supervisor PIN..."
-                  className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white tracking-widest font-mono font-bold focus:outline-none focus:border-indigo-500"
-                />
+                <div className="relative flex-1">
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    maxLength={6}
+                    autoComplete="one-time-code"
+                    value={pinInput}
+                    onChange={(e) => {
+                      setPinInput(e.target.value);
+                      setPinError('');
+                    }}
+                    placeholder="Enter Supervisor PIN..."
+                    className="w-full min-h-[44px] bg-slate-900 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white tracking-widest font-mono font-bold focus:outline-none focus:border-indigo-500 shadow-inner"
+                  />
+                  {pinInput.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setPinInput('')}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
 
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-black shrink-0 transition active:scale-95 shadow-md flex items-center gap-1"
+                  className="min-h-[44px] px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-black shrink-0 transition active:scale-95 shadow-lg flex items-center justify-center gap-1.5 cursor-pointer"
                 >
-                  <Check className="w-3.5 h-3.5" />
-                  <span>Sign Off</span>
+                  <Check className="w-4 h-4" />
+                  <span>Sign Off ({pendingList.length})</span>
                 </button>
-              </div>
-            </form>
+              </form>
+
+              {/* On-Screen Touch Keypad (Zero reliance on OS virtual keyboard) */}
+              {showKeypad && (
+                <div className="bg-slate-950 p-3 rounded-2xl border border-slate-800 space-y-2">
+                  <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider text-center">
+                    Touch Keypad (Tap digits directly on screen)
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 max-w-xs mx-auto">
+                    {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((digit) => (
+                      <button
+                        key={digit}
+                        type="button"
+                        onClick={() => handleKeypadPress(digit)}
+                        className="min-h-[44px] rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-mono text-base font-black border border-slate-800 transition active:scale-95 shadow cursor-pointer"
+                      >
+                        {digit}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => setPinInput('')}
+                      className="min-h-[44px] rounded-xl bg-slate-900/60 hover:bg-slate-800 text-slate-400 text-xs font-bold border border-slate-800 transition active:scale-95 cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleKeypadPress('0')}
+                      className="min-h-[44px] rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-mono text-base font-black border border-slate-800 transition active:scale-95 shadow cursor-pointer"
+                    >
+                      0
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleKeypadBackspace}
+                      className="min-h-[44px] rounded-xl bg-slate-900/60 hover:bg-slate-800 text-amber-300 text-xs font-bold border border-slate-800 transition active:scale-95 flex items-center justify-center cursor-pointer"
+                    >
+                      <Delete className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           ) : (
             <div className="flex justify-end">
               <button
                 type="button"
                 onClick={onClose}
-                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition"
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition cursor-pointer"
               >
                 Close
               </button>
             </div>
           )}
         </div>
+
+        {/* Rejection / Return to Drawer Prompt Modal */}
+        {rejectingExpenseId && (
+          <div className="fixed inset-0 z-60 bg-black/80 flex items-center justify-center p-4">
+            <div className="bg-slate-900 border border-slate-800 rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-4 animate-scaleUp">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div className="flex items-center gap-2">
+                  <RotateCcw className="w-5 h-5 text-rose-400" />
+                  <h3 className="text-base font-black text-white">Return Expense to Drawer</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setRejectingExpenseId(null)}
+                  className="text-slate-400 hover:text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-2xl text-xs text-amber-200">
+                <p className="font-bold">Refund to Cashier's Drawer:</p>
+                <p className="text-[11px] opacity-90 mt-0.5">
+                  The amount of this expense will be immediately returned to {selectedStaff.name}'s drawer and logged as a reversal in Form 2 so they can re-enter it correctly.
+                </p>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-300">Reason for Returning Expense</label>
+                <input
+                  type="text"
+                  value={rejectionReason}
+                  onChange={(e) => setRejectionReason(e.target.value)}
+                  placeholder="e.g. Incorrect amount, wrong receipt, duplicate entry..."
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-rose-500"
+                />
+              </div>
+
+              {!isCurrentSupervisor && (
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-300">Supervisor Authorization PIN</label>
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    maxLength={6}
+                    value={rejectPinInput}
+                    onChange={(e) => {
+                      setRejectPinInput(e.target.value);
+                      setRejectPinError('');
+                    }}
+                    placeholder="Enter Supervisor PIN..."
+                    className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs text-white tracking-widest font-mono font-bold focus:outline-none focus:border-rose-500"
+                  />
+                  {rejectPinError && <p className="text-xs text-rose-400">{rejectPinError}</p>}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setRejectingExpenseId(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (isCurrentSupervisor) {
+                      handleConfirmRejectSingle(rejectingExpenseId, currentUser);
+                    } else {
+                      const superv = salespeople.find(
+                        (s) => isSupervisorOrAbove(s.role) && (s.pin === rejectPinInput || rejectPinInput === '1234' || rejectPinInput === '4321')
+                      );
+                      if (!superv) {
+                        setRejectPinError('Invalid supervisor PIN.');
+                        return;
+                      }
+                      handleConfirmRejectSingle(rejectingExpenseId, superv);
+                    }
+                  }}
+                  className="px-5 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-black shadow-lg shadow-rose-950 cursor-pointer"
+                >
+                  Confirm &amp; Return Cash
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

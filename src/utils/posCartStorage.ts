@@ -132,11 +132,15 @@ export const savePOSCartDraft = (draft: Partial<POSCartDraft> & { cart: CartItem
     sessionStorage.setItem(BACKUP_KEY, serialized);
   } catch (_) {}
 
+  // Update memory store without triggering global database listeners
   try {
-    setStored(DB_KEY, payload);
+    // Keep internal memory fallback without calling notifyListeners
+    if (typeof window !== 'undefined' && (window as any).__pos_cart_cache !== undefined) {
+      (window as any).__pos_cart_cache = payload;
+    }
   } catch (_) {}
 
-  // Broadcast to all components in the app
+  // Broadcast to all navigation badges in the app
   try {
     const totalCount = payload.cart.reduce((sum, it) => sum + (Number(it.quantity) || 1), 0);
     window.dispatchEvent(

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Salesperson, ActiveTab } from '../../types';
 import { Form1CashCount } from './Form1CashCount';
 import { Form2CashLog } from './Form2CashLog';
@@ -55,6 +55,26 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
     isSupervisorOrAbove(currentUser.role) ||
     Boolean(currentUser.permissions?.canPerformShiftEnd);
 
+  // Cashiers strictly barred from vault/safe balance views unless explicitly assigned
+  const canAccessWhereIsMyMoney =
+    isAdmin ||
+    isSupervisorOrAbove(currentUser.role) ||
+    Boolean(currentUser.permissions?.canAccessWhereIsMyMoney);
+
+  const canAccessDualCashCustody =
+    isAdmin ||
+    isSupervisorOrAbove(currentUser.role) ||
+    Boolean(currentUser.permissions?.canAccessDualCashCustody);
+
+  // Ensure unauthorized staff are redirected away from sensitive vault tabs
+  useEffect(() => {
+    if (subTab === 'where_is_my_money' && !canAccessWhereIsMyMoney) {
+      setSubTab('form1');
+    } else if ((subTab === 'custody_vouchers' || subTab === 'hq_command') && !canAccessDualCashCustody) {
+      setSubTab('form1');
+    }
+  }, [subTab, canAccessWhereIsMyMoney, canAccessDualCashCustody]);
+
   return (
     <div id="cash-balancing-module" className="space-y-4 pb-24">
       {/* Top Banner with Navigation */}
@@ -85,7 +105,13 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
         </div>
 
         {/* Form Selector Tabs (Material 3 style) */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+        <div className={`grid grid-cols-2 sm:grid-cols-3 ${
+          canAccessDualCashCustody && canAccessWhereIsMyMoney
+            ? 'lg:grid-cols-6'
+            : canAccessDualCashCustody || canAccessWhereIsMyMoney
+            ? 'lg:grid-cols-5'
+            : 'lg:grid-cols-4'
+        } gap-2`}>
           <button
             type="button"
             id="subtab-form1"
@@ -159,39 +185,43 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
             </div>
           </button>
 
-          <button
-            type="button"
-            id="subtab-custody-vouchers"
-            onClick={() => setSubTab('custody_vouchers')}
-            className={`flex items-center space-x-2 p-2.5 rounded-2xl border transition-all text-xs font-bold ${
-              subTab === 'custody_vouchers' || subTab === 'hq_command'
-                ? 'bg-indigo-950/80 border-indigo-500 text-indigo-200 ring-1 ring-indigo-500/50 shadow-md'
-                : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <ShieldCheck className={`w-4 h-4 ${subTab === 'custody_vouchers' || subTab === 'hq_command' ? 'text-indigo-400' : 'text-slate-400'}`} />
-            <div className="text-left">
-              <span className="block text-[10px] text-teal-400 font-medium">Dual-Control</span>
-              <span>Custody & Vouchers</span>
-            </div>
-          </button>
+          {canAccessDualCashCustody && (
+            <button
+              type="button"
+              id="subtab-custody-vouchers"
+              onClick={() => setSubTab('custody_vouchers')}
+              className={`flex items-center space-x-2 p-2.5 rounded-2xl border transition-all text-xs font-bold ${
+                subTab === 'custody_vouchers' || subTab === 'hq_command'
+                  ? 'bg-indigo-950/80 border-indigo-500 text-indigo-200 ring-1 ring-indigo-500/50 shadow-md'
+                  : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <ShieldCheck className={`w-4 h-4 ${subTab === 'custody_vouchers' || subTab === 'hq_command' ? 'text-indigo-400' : 'text-slate-400'}`} />
+              <div className="text-left">
+                <span className="block text-[10px] text-teal-400 font-medium">Dual-Control</span>
+                <span>Custody & Vouchers</span>
+              </div>
+            </button>
+          )}
 
-          <button
-            type="button"
-            id="subtab-where-is-my-money"
-            onClick={() => setSubTab('where_is_my_money')}
-            className={`flex items-center space-x-2 p-2.5 rounded-2xl border transition-all text-xs font-bold ${
-              subTab === 'where_is_my_money'
-                ? 'bg-indigo-950/80 border-indigo-500 text-indigo-200 ring-1 ring-indigo-500/50 shadow-md'
-                : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Landmark className={`w-4 h-4 ${subTab === 'where_is_my_money' ? 'text-indigo-400' : 'text-slate-400'}`} />
-            <div className="text-left">
-              <span className="block text-[10px] text-amber-400 font-medium">Live Wallets</span>
-              <span>Where is My Money?</span>
-            </div>
-          </button>
+          {canAccessWhereIsMyMoney && (
+            <button
+              type="button"
+              id="subtab-where-is-my-money"
+              onClick={() => setSubTab('where_is_my_money')}
+              className={`flex items-center space-x-2 p-2.5 rounded-2xl border transition-all text-xs font-bold ${
+                subTab === 'where_is_my_money'
+                  ? 'bg-indigo-950/80 border-indigo-500 text-indigo-200 ring-1 ring-indigo-500/50 shadow-md'
+                  : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Landmark className={`w-4 h-4 ${subTab === 'where_is_my_money' ? 'text-indigo-400' : 'text-slate-400'}`} />
+              <div className="text-left">
+                <span className="block text-[10px] text-amber-400 font-medium">Live Wallets</span>
+                <span>Where is My Money?</span>
+              </div>
+            </button>
+          )}
         </div>
       </div>
 

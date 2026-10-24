@@ -252,16 +252,16 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                   : connMode === 'LOCAL_HUB'
                   ? `Local Hub Connected: ${connDetails.localHubUrl || 'ws://192.168.43.1:8080'} • Tap to configure`
                   : connDetails.isLocalHubLost
-                  ? 'Local Hub lost. Scanning for new hub... Tap to configure'
-                  : 'Local Offline (Queueing in Room DB) • Tap to connect Local Hub'
+                  ? 'Local Hub unreachable (reconnecting in background)... Tap to configure'
+                  : 'Local Offline (Queueing in Room DB) • Tap to configure Local Hub'
               }
               className={`flex items-center space-x-1.5 text-xs font-bold px-2.5 sm:px-3 py-1.5 min-h-[38px] sm:min-h-[44px] rounded-full transition-all border shadow-sm cursor-pointer ${
                 connMode === 'CLOUD_MESH'
                   ? 'bg-emerald-950/80 hover:bg-emerald-900 border-emerald-400/60 text-emerald-100 shadow-emerald-950/30'
                   : connMode === 'LOCAL_HUB'
-                  ? 'bg-blue-950/90 hover:bg-blue-900 border-blue-400/80 text-blue-100 shadow-blue-950/30 animate-pulse'
+                  ? 'bg-blue-950/90 hover:bg-blue-900 border-blue-400/80 text-blue-100 shadow-blue-950/30'
                   : connDetails.isLocalHubLost
-                  ? 'bg-rose-950/90 hover:bg-rose-900 border-rose-400/80 text-rose-100 shadow-rose-950/30 animate-bounce'
+                  ? 'bg-rose-950/80 hover:bg-rose-900 border-rose-400/70 text-rose-100 shadow-rose-950/30'
                   : 'bg-amber-950/80 hover:bg-amber-900 border-amber-400/60 text-amber-100 shadow-amber-950/30'
               }`}
             >
@@ -284,12 +284,12 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
               )}
               {connMode === 'LOCAL_OFFLINE' && (
                 <>
-                  <span className="w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)] shrink-0 inline-block animate-pulse" />
+                  <span className="w-2 h-2 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)] shrink-0 inline-block" />
                   <WifiOff className="w-3.5 h-3.5 text-amber-300 shrink-0" />
                   <span className="hidden sm:inline">
-                    {connDetails.isLocalHubLost ? 'Hub Lost (Scanning...)' : 'Offline (Queueing)'}
+                    {connDetails.isLocalHubLost ? 'Hub Offline (Reconnecting...)' : 'Offline (Queueing)'}
                   </span>
-                  <span className="sm:hidden">{connDetails.isLocalHubLost ? 'Lost' : 'Offline'}</span>
+                  <span className="sm:hidden">{connDetails.isLocalHubLost ? 'Offline' : 'Offline'}</span>
                 </>
               )}
             </button>

@@ -68,25 +68,25 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
     );
   }
 
-  // 1. Local Hub Lost Banner: "Local Hub lost. Scanning for new hub..."
+  // 1. Delayed Notification Banner (Only after 2-minute continuous disconnect):
   if (connDetails.isLocalHubLost) {
     return (
       <>
         <aside
           id="pwa-offline-banner"
-          aria-label="Local Hub lost notification"
-          className="fixed bottom-4 left-4 right-4 sm:right-auto sm:max-w-md z-50 flex items-center justify-between gap-3 rounded-2xl bg-rose-600/95 text-white px-4 py-2.5 text-xs font-bold shadow-2xl backdrop-blur-md border border-rose-400/60 animate-bounce duration-1000"
+          aria-label="Offline Mode: Reconnecting in background"
+          className="fixed bottom-4 left-4 right-4 sm:right-auto sm:max-w-md z-50 flex items-center justify-between gap-3 rounded-2xl bg-slate-900/95 text-white px-4 py-3 text-xs font-bold shadow-2xl backdrop-blur-md border border-amber-500/40 transition-all duration-300"
         >
           <div className="flex items-center space-x-2.5 min-w-0">
-            <div className="w-6 h-6 rounded-full bg-black/25 flex items-center justify-center shrink-0">
-              <RefreshCw className="w-3.5 h-3.5 text-white animate-spin" />
+            <div className="w-7 h-7 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center shrink-0">
+              <RefreshCw className="w-3.5 h-3.5 text-amber-400 animate-spin" />
             </div>
             <div className="truncate">
-              <p className="font-extrabold text-[11px] uppercase tracking-wider text-rose-100">
-                Local Hub lost. Scanning for new hub...
+              <p className="font-extrabold text-[11px] uppercase tracking-wider text-amber-200">
+                Offline Mode: Reconnecting in background
               </p>
-              <p className="text-[10px] opacity-90 truncate text-rose-200">
-                Auto-reconnecting every 5s • Outgoing sales queued in Room DB.
+              <p className="text-[10px] opacity-80 truncate text-slate-300">
+                Local Hub disconnected • Outgoing sales queued in Room DB.
               </p>
             </div>
           </div>
@@ -94,14 +94,14 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
             <button
               type="button"
               onClick={handleOpenSettings}
-              className="text-[10px] bg-black/30 hover:bg-black/40 px-2 py-1 rounded-lg border border-white/20 transition cursor-pointer"
+              className="text-[10px] bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 font-bold px-2.5 py-1.5 rounded-lg border border-amber-500/40 transition cursor-pointer"
             >
               Configure
             </button>
             <button
               type="button"
               onClick={() => setDismissed(true)}
-              className="text-[11px] underline font-black px-1.5 py-0.5 hover:opacity-75"
+              className="text-[11px] text-slate-400 hover:text-white px-1.5 py-0.5 transition cursor-pointer"
             >
               Dismiss
             </button>
@@ -117,7 +117,7 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
   }
 
   // 2. Connected to Local WebSocket Hub: 🔵 Local Hub Connected
-  if (connMode === 'LOCAL_HUB') {
+  if (connMode === 'LOCAL_HUB' && connDetails.isConnected) {
     return (
       <>
         <aside
@@ -127,7 +127,7 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
         >
           <div className="flex items-center space-x-2.5 min-w-0">
             <div className="w-6 h-6 rounded-full bg-black/25 flex items-center justify-center shrink-0">
-              <Radio className="w-3.5 h-3.5 text-blue-200 animate-pulse" />
+              <Radio className="w-3.5 h-3.5 text-blue-200" />
             </div>
             <div className="truncate">
               <p className="font-extrabold text-[11px] uppercase tracking-wider text-blue-100 flex items-center gap-1.5">
@@ -169,49 +169,23 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
     );
   }
 
-  // 3. Local Offline Queueing: 🟡 Local Offline (Queueing)
-  return (
-    <>
-      <aside
-        id="pwa-offline-banner"
-        aria-label="Offline status notice"
-        className="fixed bottom-4 left-4 right-4 sm:right-auto sm:max-w-md z-50 flex items-center justify-between gap-3 rounded-2xl bg-amber-500/95 text-slate-950 px-4 py-2.5 text-xs font-bold shadow-2xl backdrop-blur-md border border-amber-300/60 transition-all"
-      >
-        <div className="flex items-center space-x-2.5 min-w-0">
-          <div className="w-6 h-6 rounded-full bg-slate-950/20 flex items-center justify-center shrink-0">
-            <WifiOff className="w-3.5 h-3.5 text-slate-950" />
-          </div>
-          <div className="truncate">
-            <p className="font-extrabold text-[11px] uppercase tracking-wider flex items-center gap-1.5">
-              <span>🟡 Local Offline (Queueing)</span>
-            </p>
-            <p className="text-[10px] opacity-90 truncate">
-              {connDetails.pendingQueueCount ? `${connDetails.pendingQueueCount} packet(s) queued` : 'POS & Room DB running offline.'}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-1.5 shrink-0">
-          <button
-            type="button"
-            onClick={handleOpenSettings}
-            className="text-[10px] bg-black/15 hover:bg-black/25 text-slate-950 px-2 py-1 rounded-lg border border-black/20 transition font-bold cursor-pointer"
-          >
-            Connect Hub
-          </button>
-          <button
-            type="button"
-            onClick={() => setDismissed(true)}
-            className="text-[11px] underline font-black px-1.5 py-0.5 hover:opacity-75"
-          >
-            Dismiss
-          </button>
-        </div>
-      </aside>
-
+  // 3. Silent Reconnect Grace Period:
+  // If disconnected but under 2 minutes (not marked as isLocalHubLost), show NO banner.
+  // The app silently reconnects in the background without disturbing the cashier or cashier UI.
+  if (connDetails.isReconnecting || !connDetails.isLocalHubLost) {
+    return (
       <LocalHubSettingsModal
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
       />
-    </>
+    );
+  }
+
+  // Fallback modal container
+  return (
+    <LocalHubSettingsModal
+      isOpen={isModalOpen}
+      onClose={() => setIsModalOpen(false)}
+    />
   );
 };

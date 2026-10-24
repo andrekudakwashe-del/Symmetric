@@ -198,20 +198,24 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     };
   }, []);
 
-  // Auto-save cart draft across multi-tier storage whenever cart or fields change
+  // Auto-save cart draft across multi-tier storage with 200ms debounce to prevent input lag
   useEffect(() => {
     if (cart.length > 0) {
-      savePOSCartDraft({
-        cart,
-        selectedCustomerId,
-        discountInput,
-        discountType,
-        taxAmount,
-        otherCharges,
-        saleNotes,
-        selectedCurrency,
-        lastView: currentView === 'items' ? 'items' : 'counter',
-      });
+      const timer = setTimeout(() => {
+        savePOSCartDraft({
+          cart,
+          selectedCustomerId,
+          discountInput,
+          discountType,
+          taxAmount,
+          otherCharges,
+          saleNotes,
+          selectedCurrency,
+          lastView: currentView === 'items' ? 'items' : 'counter',
+        });
+      }, 200);
+
+      return () => clearTimeout(timer);
     }
   }, [cart, selectedCustomerId, discountInput, discountType, taxAmount, otherCharges, saleNotes, selectedCurrency, currentView]);
 

@@ -130,6 +130,8 @@ export interface StaffPermissions {
   canCreateBankDepositTransfer?: boolean;    // cash_transfer.bank_deposit
   canReceiveHqTransfer?: boolean;            // hq_safe.receive_transfer
   canExecuteOwnerOverride?: boolean;         // hq_safe.owner_override
+  canAccessWhereIsMyMoney?: boolean;         // Explicit access to Where Is My Money report
+  canAccessDualCashCustody?: boolean;        // Explicit access to Dual Cash Custody / Safe
 
   [key: string]: any;
 }

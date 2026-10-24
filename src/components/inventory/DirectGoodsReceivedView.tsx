@@ -854,6 +854,15 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     const res = approveDirectGrv(approvingGrv.id, approverId, approverName);
     if (res.success) {
       showToast('success', res.message);
+      if (viewingGrv?.id === approvingGrv.id) {
+        setViewingGrv({
+          ...viewingGrv,
+          status: 'APPROVED',
+          approvedByStaffId: approverId,
+          approvedByStaffName: approverName,
+          approvedAt: new Date().toISOString(),
+        });
+      }
       setApprovingGrv(null);
       setSupervisorPin('');
       setSupervisorPinError('');
@@ -864,7 +873,40 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     }
   };
 
-  // Supervisor Rejection Execution
+  const isOwnerOrAdmin =
+    userRole === 'OWNER' ||
+    userRole === 'SUPER_ADMIN' ||
+    userRole === 'ADMIN' ||
+    currentUser?.email === 'andrekudakwashe@gmail.com' ||
+    currentUser?.id === 'admin' ||
+    currentUser?.id === 'usr-owner';
+
+  const handleDirectOwnerApprove = (grv: DirectGrv) => {
+    const approverId = currentUser?.id || 'USR-001';
+    const approverName = currentUser?.name || 'Owner / Administrator';
+    const res = approveDirectGrv(grv.id, approverId, approverName);
+    if (res.success) {
+      showToast('success', `Direct Delivery ${grv.grvNumber} APPROVED! Stock posted to inventory and cash movements finalized.`);
+      setApprovingGrv(null);
+      setSupervisorPin('');
+      setSupervisorPinError('');
+      setDirectGrvs(getDirectGrvs());
+      setItems(getInventoryItems());
+      if (viewingGrv?.id === grv.id) {
+        setViewingGrv({
+          ...viewingGrv,
+          status: 'APPROVED',
+          approvedByStaffId: approverId,
+          approvedByStaffName: approverName,
+          approvedAt: new Date().toISOString(),
+        });
+      }
+    } else {
+      showToast('error', res.message);
+    }
+  };
+
+  // Supervisor Rejection Execution (Reverses cash & inventory)
   const handleConfirmRejection = () => {
     if (!rejectingGrv) return;
     if (!rejectReason.trim()) {
@@ -880,9 +922,15 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     );
     if (res.success) {
       showToast('success', res.message);
+      if (viewingGrv?.id === rejectingGrv.id) {
+        setViewingGrv({ ...viewingGrv, status: 'REJECTED' });
+      }
       setRejectingGrv(null);
       setRejectReason('');
       setDirectGrvs(getDirectGrvs());
+      setItems(getInventoryItems());
+    } else {
+      showToast('error', res.message);
     }
   };
 
@@ -2841,25 +2889,104 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
               </div>
             </div>
 
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-slate-300 flex items-center gap-1">
-                <KeyRound className="w-3.5 h-3.5 text-amber-400" />
-                Enter Supervisor / Manager PIN
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-300 flex items-center justify-between">
+                <span className="flex items-center gap-1">
+                  <KeyRound className="w-3.5 h-3.5 text-amber-400" />
+                  Enter Supervisor / Manager PIN
+                </span>
+                <span className="text-[10px] text-slate-500 font-mono">Use touch keypad or keyboard</span>
               </label>
               <input
                 type="password"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                autoComplete="one-time-code"
                 maxLength={6}
                 value={supervisorPin}
                 onChange={(e) => {
                   setSupervisorPin(e.target.value);
                   setSupervisorPinError('');
                 }}
-                placeholder="4-digit PIN..."
-                className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-2.5 text-sm font-mono tracking-widest focus:outline-none focus:border-emerald-500"
+                placeholder="4 or 6-digit PIN..."
+                className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-4 py-3 text-base text-center font-mono tracking-widest focus:outline-none focus:border-emerald-500 min-h-[44px]"
                 autoFocus
               />
-              {supervisorPinError && <p className="text-xs text-rose-400">{supervisorPinError}</p>}
+              {supervisorPinError && <p className="text-xs text-rose-400 font-semibold">{supervisorPinError}</p>}
+
+              {/* Touchscreen On-Screen Numeric Keypad for POS Displays */}
+              <div className="bg-slate-950/80 p-2.5 rounded-2xl border border-slate-800 space-y-1.5 mt-2">
+                <div className="grid grid-cols-3 gap-1.5">
+                  {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((digit) => (
+                    <button
+                      key={digit}
+                      type="button"
+                      onClick={() => {
+                        if (supervisorPin.length < 6) {
+                          setSupervisorPin((prev) => prev + digit);
+                          setSupervisorPinError('');
+                        }
+                      }}
+                      className="py-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 active:bg-emerald-600 active:text-white text-white font-mono font-bold text-sm transition shadow-sm"
+                    >
+                      {digit}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSupervisorPin('');
+                      setSupervisorPinError('');
+                    }}
+                    className="py-2.5 rounded-xl bg-rose-950/60 hover:bg-rose-900/80 active:bg-rose-700 text-rose-300 font-bold text-xs transition"
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (supervisorPin.length < 6) {
+                        setSupervisorPin((prev) => prev + '0');
+                        setSupervisorPinError('');
+                      }
+                    }}
+                    className="py-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 active:bg-emerald-600 active:text-white text-white font-mono font-bold text-sm transition shadow-sm"
+                  >
+                    0
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSupervisorPin((prev) => prev.slice(0, -1));
+                      setSupervisorPinError('');
+                    }}
+                    className="py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-300 font-bold text-xs transition"
+                  >
+                    ⌫
+                  </button>
+                </div>
+              </div>
             </div>
+
+            {/* If logged in as Owner or Admin, offer one-click immediate approval */}
+            {isOwnerOrAdmin && (
+              <div className="p-3 rounded-2xl bg-emerald-950/50 border border-emerald-500/40 space-y-2">
+                <div className="flex items-center space-x-2 text-emerald-300 text-xs">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>
+                    Authenticated as <strong>{currentUser?.name || 'Administrator'}</strong> ({userRole})
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleDirectOwnerApprove(approvingGrv)}
+                  className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs transition shadow-md active:scale-95 flex items-center justify-center space-x-1.5"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>One-Click Approve as Owner / Admin</span>
+                </button>
+              </div>
+            )}
 
             <div className="flex items-center justify-end gap-3 pt-2">
               <button
@@ -2874,7 +3001,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 onClick={handleConfirmApproval}
                 className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-lg shadow-emerald-600/20"
               >
-                Confirm Approval & Post Stock
+                Confirm PIN & Approve
               </button>
             </div>
           </div>
@@ -3081,6 +3208,76 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 </div>
               </div>
             </div>
+
+            {/* Supervisor / Admin / Owner Action Bar */}
+            {isSupervisorOrAbove && (
+              <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+                <div className="text-xs text-slate-400">
+                  <span className="font-bold text-slate-200 block">Voucher Authorization Status:</span>
+                  <span>
+                    Status is <strong className={`font-mono ${viewingGrv.status === 'APPROVED' ? 'text-emerald-400' : viewingGrv.status === 'REJECTED' ? 'text-rose-400' : 'text-amber-400'}`}>{viewingGrv.status}</strong>
+                    {viewingGrv.approvedByStaffName ? ` • Signed off by ${viewingGrv.approvedByStaffName}` : ''}
+                  </span>
+                </div>
+
+                <div className="flex items-center space-x-2 w-full sm:w-auto justify-end flex-wrap gap-2">
+                  {viewingGrv.status === 'PENDING_APPROVAL' && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setRejectingGrv(viewingGrv);
+                          setRejectReason('');
+                        }}
+                        className="px-4 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 text-xs font-bold transition flex items-center space-x-1.5"
+                      >
+                        <X className="w-4 h-4" />
+                        <span>Reject & Return to Till</span>
+                      </button>
+
+                      {isOwnerOrAdmin ? (
+                        <button
+                          type="button"
+                          onClick={() => handleDirectOwnerApprove(viewingGrv)}
+                          className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black transition shadow-lg flex items-center space-x-1.5 active:scale-95"
+                        >
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>Approve Voucher as Admin</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setApprovingGrv(viewingGrv);
+                            setSupervisorPin('');
+                            setSupervisorPinError('');
+                          }}
+                          className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black transition shadow-lg flex items-center space-x-1.5 active:scale-95"
+                        >
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>Enter PIN to Approve</span>
+                        </button>
+                      )}
+                    </>
+                  )}
+
+                  {viewingGrv.status === 'APPROVED' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRejectingGrv(viewingGrv);
+                        setRejectReason('');
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-rose-950/60 hover:bg-rose-900/80 text-rose-300 border border-rose-800/60 text-xs font-bold transition flex items-center space-x-1.5"
+                      title="Reject and reverse till cash payout back into cashier register"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5 text-rose-400" />
+                      <span>Reject & Reverse Cash to Drawer</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

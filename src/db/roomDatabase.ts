@@ -2856,6 +2856,7 @@ export const updateProductStock = (
     reason?: string;
     actionTaken?: string;
     txnType?: 'SALE' | 'RETURN' | 'ADJUSTMENT';
+    fromMesh?: boolean;
   }
 ): void => {
   let realId = id;
@@ -2942,7 +2943,7 @@ export const updateProductStock = (
       totalUnits: finalTotalUnits,
       lastUpdated: new Date().toISOString(),
     };
-    saveInventoryItem(updatedItem);
+    saveInventoryItem(updatedItem, context?.fromMesh ? { fromMesh: true } : undefined);
 
     // Calculate actual case and single deltas for audit trail logging
     const deltaCases = finalCases - prevCases;
@@ -5020,12 +5021,32 @@ export const getAllBranchesSales = (): SaleInvoice[] => {
   });
 };
 
-export const getUserPrefix = (staffId?: string, staffName?: string): string => {
-  const sessionUser = getSessionUser();
-  const rawId = (staffId || sessionUser?.id || '').trim();
-  const rawName = (staffName || sessionUser?.name || sessionUser?.username || '').trim();
+export const getUserPrefix = (staffId?: any, staffName?: string): string => {
+  // Allow passing user object directly
+  if (typeof staffId === 'object' && staffId !== null) {
+    if (staffId.user_prefix || staffId.userPrefix || staffId.prefix) {
+      return String(staffId.user_prefix || staffId.userPrefix || staffId.prefix).trim().toUpperCase();
+    }
+    const oId = String(staffId.id || '').trim();
+    const oName = String(staffId.name || staffId.username || '').trim();
+    return getUserPrefix(oId, oName);
+  }
 
-  // 1. Direct match like KM5, KM01, etc.
+  const sessionUser = getSessionUser();
+  const explicitUserPrefix = (sessionUser as any)?.user_prefix || (sessionUser as any)?.userPrefix || (sessionUser as any)?.prefix;
+  if (explicitUserPrefix && (!staffId || staffId === sessionUser?.id)) {
+    return String(explicitUserPrefix).trim().toUpperCase();
+  }
+
+  const rawId = String(staffId || sessionUser?.id || '').trim();
+  const rawName = String(staffName || sessionUser?.name || sessionUser?.username || '').trim();
+
+  // If already formatted like KM5
+  if (/^[A-Za-z]{1,4}\d{1,4}$/.test(rawId)) {
+    return rawId.toUpperCase();
+  }
+
+  // 1. Direct match like KM-5, STF-001, etc.
   const directMatch = rawId.match(/^([A-Za-z]{1,4})[-_]?(\d{1,4})$/);
   if (directMatch) {
     const letters = directMatch[1].toUpperCase();
@@ -5045,7 +5066,7 @@ export const getUserPrefix = (staffId?: string, staffName?: string): string => {
     return `${letters}${num}`;
   }
 
-  // 2. Derive initials from staff name (e.g. Kevin Moyo -> KM5)
+  // 2. Derive initials from staff name (e.g. Kevin Moyo -> KM5, Kudakwashe Andre -> KM5 or KA2)
   if (rawName) {
     const initials = rawName
       .trim()
@@ -5069,7 +5090,12 @@ export const getUserPrefix = (staffId?: string, staffName?: string): string => {
   return 'KM5';
 };
 
-export const getNextInvoiceId = (staffId?: string, staffName?: string): string => {
+/**
+ * Standard Invoice Number Generator: [user_prefix]-[YYMMDD]-[HHMMSS]-[Random3Digits]
+ * Example: KM5-261023-143022-892
+ * Removes the legacy 'INV-' prefix and eliminates collision renaming ('r001')
+ */
+export const generateInvoiceNumber = (staffId?: any, staffName?: string): string => {
   const prefix = getUserPrefix(staffId, staffName);
   const now = new Date();
   const yy = String(now.getFullYear()).slice(-2);
@@ -5082,6 +5108,9 @@ export const getNextInvoiceId = (staffId?: string, staffName?: string): string =
 
   return `${prefix}-${yy}${mm}${dd}-${hh}${min}${ss}-${rand}`;
 };
+
+export const getNextInvoiceId = generateInvoiceNumber;
+export const generateInvoiceId = generateInvoiceNumber;
 
 type SaleCreationListener = (sale: SaleInvoice) => void;
 const saleCreationListeners: Set<SaleCreationListener> = new Set();
@@ -5155,6 +5184,7 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
           reason: `POS Sale Outflow: Sold ${item.quantity} ${item.name || ''} to ${normalized.customerName || 'Customer'} (Invoice #${normalized.id})`,
           actionTaken: 'POS_SALE',
           txnType: 'SALE',
+          fromMesh: true,
         });
       }
     });
@@ -5796,19 +5826,46 @@ export const refundSaleInvoice = (params: {
     });
   }
 
-  // If cash sale, add Cash Log (Form 2) payout entry for cash drawer balance
+  // If cash sale, add Cash Log (Form 2) payout entry & cash movement for CASHIER's drawer balance
   if (invoice.paymentMethod === 'Cash') {
+    const targetCashierId = params.cashier?.id || invoice.staffId || params.manager.id;
+    const targetCashierName = params.cashier?.name || invoice.staffName || params.manager.name;
+    const shiftDate = now.toISOString().split('T')[0];
+
     addCashLog({
       timestamp: now.toISOString(),
-      date: now.toISOString().split('T')[0],
-      staffId: params.manager.id,
-      staffName: params.manager.name,
+      date: shiftDate,
+      staffId: targetCashierId,
+      staffName: targetCashierName,
       line: 'Refunds / Returns',
-      description: `Cash refund for Invoice #${invoice.id} (${params.reason})`,
+      description: `Cash refund for Invoice #${invoice.id} (${params.reason}) - Auth by ${params.manager.name}`,
       in: 0,
       out: invoice.total,
       category: 'Refund',
       reference: invoice.id,
+      company_id: invoice.company_id || invoice.companyId,
+      branch_id: invoice.branch_id || invoice.branchId,
+    });
+
+    // Write cash deduction movement to the CASHIER's drawer so the cashier's drawer balances correctly
+    addMovement({
+      shiftId: getShiftId(targetCashierId, shiftDate),
+      staffId: targetCashierId,
+      date: shiftDate,
+      timestamp: now.toISOString(),
+      type: 'refund',
+      amount: invoice.total,
+      currency: invoice.currency || 'USD',
+      direction: 'out',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'POS',
+      sourceRef: invoice.id,
+      notes: `Cash refund #${invoice.id} ($${invoice.total.toFixed(2)}) auth by ${params.manager.name} (${params.reason})`,
+      approvedBy: params.manager.id,
+      approvedByName: params.manager.name,
+      company_id: invoice.company_id || invoice.companyId,
+      branch_id: invoice.branch_id || invoice.branchId,
     });
   }
 
@@ -5816,10 +5873,10 @@ export const refundSaleInvoice = (params: {
   logManagerOverride({
     action: 'REFUND_INVOICE',
     manager: params.manager,
-    cashier: params.cashier,
+    cashier: params.cashier || (invoice.staffId ? { id: invoice.staffId, name: invoice.staffName || 'Cashier' } : undefined),
     referenceId: invoice.id,
     amount: invoice.total,
-    details: `Refund processed for Invoice #${invoice.id} ($${invoice.total.toFixed(2)}). Authorized by ${params.manager.role} ${params.manager.name}. Reason: ${params.reason}`,
+    details: `Refund processed for Invoice #${invoice.id} ($${invoice.total.toFixed(2)}). Deducted from Cashier ${params.cashier?.name || invoice.staffName || 'Till'}. Authorized by ${params.manager.role} ${params.manager.name}. Reason: ${params.reason}`,
     metadata: {
       customerName: invoice.customerName,
       paymentMethod: invoice.paymentMethod,
@@ -6212,6 +6269,78 @@ export const approveExpense = (expenseId: string, supervisor: Salesperson): bool
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: all[idx] }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: all[idx] }));
+  }
+  return true;
+};
+
+export const rejectExpense = (
+  expenseId: string,
+  supervisor: Salesperson,
+  reason: string = 'Returned to cashier drawer for re-entry'
+): boolean => {
+  const all = getAllExpenses();
+  const idx = all.findIndex((e) => e.id === expenseId);
+  if (idx === -1) return false;
+  const exp = all[idx];
+
+  const now = new Date().toISOString();
+  all[idx] = {
+    ...exp,
+    status: 'rejected',
+    approvedBy: supervisor.id,
+    approvedByName: supervisor.name,
+    approvalTimestamp: now,
+    notes: `${exp.notes ? exp.notes + ' • ' : ''}Rejected by ${supervisor.name}: ${reason}`,
+  };
+  setStored(STORAGE_KEYS.EXPENSES, all);
+
+  // If cash expense, return the money to the cashier's drawer so it can be re-entered
+  if (exp.paymentMethod === 'Cash' || !exp.paymentMethod) {
+    const shiftDate = exp.date || now.split('T')[0];
+    const targetStaffId = exp.staffId || '001';
+    const targetStaffName = exp.staffName || 'Cashier';
+
+    // 1. Compensatory CashLog entry (IN to balance out previous OUT)
+    addCashLog({
+      timestamp: now,
+      date: shiftDate,
+      staffId: targetStaffId,
+      staffName: targetStaffName,
+      line: 'Expenses',
+      description: `REVERSAL: Expense #${exp.id} returned to drawer by ${supervisor.name} (${reason})`,
+      in: exp.amount,
+      out: 0,
+      category: 'Expense Reversal',
+      reference: exp.id,
+      company_id: exp.company_id,
+      branch_id: exp.branch_id,
+    });
+
+    // 2. Compensatory cash movement into the cashier's drawer
+    addMovement({
+      shiftId: getShiftId(targetStaffId, shiftDate),
+      staffId: targetStaffId,
+      date: shiftDate,
+      timestamp: now,
+      type: 'expense_reversal',
+      amount: exp.amount,
+      currency: 'USD',
+      direction: 'in',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'form2',
+      sourceRef: exp.id,
+      notes: `Expense #${exp.id} rejected by ${supervisor.name} - $${exp.amount.toFixed(2)} returned to till (${reason})`,
+      approvedBy: supervisor.id,
+      approvedByName: supervisor.name,
+    });
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: all[idx] }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: all[idx] }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
   }
   return true;
 };
@@ -8330,7 +8459,7 @@ export const getInventoryItemById = (itemId: string, branchId?: string): Invento
   return null;
 };
 
-export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
+export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: boolean }): InventoryItem => {
   const allItems = getAllInventoryItems();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -8536,14 +8665,16 @@ export const saveInventoryItem = (item: InventoryItem): InventoryItem => {
     console.warn('[RoomDB] Enqueue inventory sync error:', syncErr);
   }
 
-  // 2. Notify inventory listeners so meshSyncService broadcasts to peers
-  inventoryCreationListeners.forEach((fn) => {
-    try {
-      fn(normalized);
-    } catch (e) {
-      console.error('inventoryCreationListener error:', e);
-    }
-  });
+  // 2. Notify inventory listeners so meshSyncService broadcasts to peers (only on user action, never from mesh)
+  if (!options?.fromMesh && !(item as any).fromMesh) {
+    inventoryCreationListeners.forEach((fn) => {
+      try {
+        fn(normalized);
+      } catch (e) {
+        console.error('inventoryCreationListener error:', e);
+      }
+    });
+  }
 
   // 3. Opportunistic background push to server
   try {
@@ -14124,11 +14255,15 @@ export const rejectDirectGrv = (
     return { success: false, message: 'GRV voucher not found.' };
   }
 
+  const wasPreviouslyApproved = grv.status === 'APPROVED';
+  const now = new Date().toISOString();
+  const shiftDate = grv.date || now.split('T')[0];
+
   grv.status = 'REJECTED';
   grv.rejectedReason = reason;
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
 
-  // Update associated cashMovements to rejected status
+  // 1. Update associated cashMovements to rejected status & reverse the money back into cashier till
   const movements = getMovements();
   movements.forEach((m) => {
     if (m.type === 'supplier_payment' && (m.sourceRef === grv.grvNumber || m.sourceRef?.startsWith(grv.grvNumber) || m.sourceRef === grv.id)) {
@@ -14136,18 +14271,101 @@ export const rejectDirectGrv = (
     }
   });
 
+  // 2. Refund till payments back into cashier drawers so cashier Form 2 and live drawer balance are restored!
+  if (grv.payments && grv.payments.length > 0) {
+    grv.payments.forEach((p) => {
+      const amt = Number(p.amount) || 0;
+      if (amt > 0 && p.userId) {
+        // A. Add cash movement (IN) to cashier drawer
+        addMovement({
+          shiftId: getShiftId(p.userId, shiftDate),
+          staffId: p.userId,
+          terminalId: p.drawerId || 'Till 1',
+          date: shiftDate,
+          timestamp: now,
+          type: 'supplier_refund',
+          amount: amt,
+          currency: 'USD',
+          direction: 'in',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'DirectGRV',
+          sourceRef: grv.grvNumber,
+          notes: `REVERSAL: Direct Delivery ${grv.grvNumber} rejected by ${rejectorName} - $${amt.toFixed(2)} refunded to drawer (${reason})`,
+          approvedBy: rejectorId,
+          approvedByName: rejectorName,
+          company_id: (grv as any).company_id || (grv as any).companyId,
+          branch_id: (grv as any).branch_id || (grv as any).branchId,
+        });
+
+        // B. Add Form 2 CashLog entry (IN) so cashier's Daily Cash Log reflects the reversal
+        addCashLog({
+          timestamp: now,
+          date: shiftDate,
+          staffId: p.userId,
+          staffName: p.userName,
+          line: 'Direct Procurement',
+          description: `REVERSAL: Direct Delivery ${grv.grvNumber} rejected by ${rejectorName} - Refunded to ${p.userName}'s till (${reason})`,
+          in: amt,
+          out: 0,
+          category: 'Direct Procurement Reversal',
+          reference: grv.grvNumber,
+          company_id: (grv as any).company_id || (grv as any).companyId,
+          branch_id: (grv as any).branch_id || (grv as any).branchId,
+        });
+      }
+    });
+  }
+
+  // 3. If voucher was previously approved, reverse the stock added to inventory
+  if (wasPreviouslyApproved && Array.isArray(grv.items)) {
+    const allInventory = getAllInventoryItems();
+    grv.items.forEach((item) => {
+      const cleanId = (item.productId || '').trim().toUpperCase();
+      const cleanName = (item.productName || '').trim().toLowerCase();
+      const invItem = allInventory.find((i) =>
+        (cleanId && i.itemId && i.itemId.trim().toUpperCase() === cleanId) ||
+        (cleanId && i.sku && i.sku.trim().toUpperCase() === cleanId) ||
+        (cleanName && i.itemName && i.itemName.trim().toLowerCase() === cleanName)
+      );
+
+      if (invItem) {
+        const unitsPerCase = Math.max(1, invItem.unitsPerCase || item.unitsPerCase || 1);
+        const recCases = Math.max(0, Number(item.quantityCases) || 0);
+        const recSingles = Math.max(0, Number(item.quantitySingles) || 0);
+        const deltaQty = (recCases * unitsPerCase) + recSingles;
+
+        if (deltaQty > 0) {
+          updateProductStock(invItem.itemId, -deltaQty, undefined, undefined, {
+            staffId: rejectorId,
+            staffName: rejectorName,
+            referenceId: grv.grvNumber,
+            reason: `Direct Delivery ${grv.grvNumber} rejected: reversed ${deltaQty} received units`,
+            actionTaken: 'DIRECT_DELIVERY_REVERSAL',
+            txnType: 'ADJUSTMENT',
+          });
+        }
+      }
+    });
+  }
+
   addAuditLog({
     action: 'DIRECT_GRV_REJECT',
     severity: 'SECURITY',
     staffId: rejectorId,
     staffName: rejectorName,
     staffRole: 'SUPERVISOR',
-    details: `Rejected Direct Delivery Voucher ${grv.grvNumber}. Reason: ${reason}`,
+    details: `Rejected Direct Delivery Voucher ${grv.grvNumber}. Reason: ${reason}. Payouts reversed to cashier drawers.`,
     referenceId: grv.grvNumber,
   });
 
   notifyListeners();
-  return { success: true, message: `GRV ${grv.grvNumber} rejected.`, grv };
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+  }
+  return { success: true, message: `GRV ${grv.grvNumber} rejected and cash returned to cashier drawer(s).`, grv };
 };
 
 // ============================================================================

@@ -22,6 +22,8 @@ import {
   addExpense,
   getCashGovernanceConfig,
   getCashTransfers,
+  approveDirectGrv,
+  rejectDirectGrv,
 } from '../../db/roomDatabase';
 import {
   issueTillFloat,
@@ -401,30 +403,35 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     }
   }, [salespeople, selectedStaffId, currentUser.id, currentUser.branchId]);
 
-  // Subscribe to Room DB and cashMovements changes
+  // Debounced subscription to Room DB and cashMovements changes (eliminates 4x mount re-render lag)
   useEffect(() => {
-    const handleLedgerUpdate = () => {
-      setLedgerRefreshKey((k) => k + 1);
-      setDirectGrvs(getDirectGrvs());
+    let refreshTimer: any = null;
+    const debouncedRefresh = () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        setCashCounts(getCashCounts());
+        setCashLogs(getCashLogs());
+        setDirectGrvs(getDirectGrvs());
+        setCashLiftsList(getCashLiftsForStaffAndDate(selectedStaffId, sheetDate));
+        setLedgerRefreshKey((k) => k + 1);
+      }, 50);
     };
-    window.addEventListener('saimetric_cash_movements_updated', handleLedgerUpdate);
-    window.addEventListener('saimetric_sales_updated', handleLedgerUpdate);
-    window.addEventListener('saimetric_cash_updated', handleLedgerUpdate);
-    window.addEventListener('mesh-catchup-completed', handleLedgerUpdate);
+
+    window.addEventListener('saimetric_cash_movements_updated', debouncedRefresh);
+    window.addEventListener('saimetric_sales_updated', debouncedRefresh);
+    window.addEventListener('saimetric_cash_updated', debouncedRefresh);
+    window.addEventListener('mesh-catchup-completed', debouncedRefresh);
 
     const unsubscribe = subscribeToDatabase(() => {
-      setCashCounts(getCashCounts());
-      setCashLogs(getCashLogs());
-      setDirectGrvs(getDirectGrvs());
-      setCashLiftsList(getCashLiftsForStaffAndDate(selectedStaffId, sheetDate));
-      setLedgerRefreshKey((k) => k + 1);
+      debouncedRefresh();
     });
 
     return () => {
-      window.removeEventListener('saimetric_cash_movements_updated', handleLedgerUpdate);
-      window.removeEventListener('saimetric_sales_updated', handleLedgerUpdate);
-      window.removeEventListener('saimetric_cash_updated', handleLedgerUpdate);
-      window.removeEventListener('mesh-catchup-completed', handleLedgerUpdate);
+      if (refreshTimer) clearTimeout(refreshTimer);
+      window.removeEventListener('saimetric_cash_movements_updated', debouncedRefresh);
+      window.removeEventListener('saimetric_sales_updated', debouncedRefresh);
+      window.removeEventListener('saimetric_cash_updated', debouncedRefresh);
+      window.removeEventListener('mesh-catchup-completed', debouncedRefresh);
       unsubscribe();
     };
   }, [selectedStaffId, sheetDate]);
@@ -446,6 +453,22 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     }> = [];
 
     const seenVouchers = new Set<string>();
+
+    const isStaffMatch = (targetId?: string, targetName?: string) => {
+      if (!targetId && !targetName) return false;
+      const cleanTarget = (targetId || '').trim().toLowerCase();
+      const cleanCur = (selectedStaffId || '').trim().toLowerCase();
+      if (cleanTarget && cleanCur) {
+        if (cleanTarget === cleanCur) return true;
+        const normTarget = cleanTarget.replace(/^usr-|^staff-|^0+/, '');
+        const normCur = cleanCur.replace(/^usr-|^staff-|^0+/, '');
+        if (normTarget && normCur && normTarget === normCur) return true;
+      }
+      if (targetName && selectedStaff?.name) {
+        if (targetName.trim().toLowerCase() === selectedStaff.name.trim().toLowerCase()) return true;
+      }
+      return false;
+    };
 
     // 1. First, check shiftMovements for supplier_payment movements
     const procurementMovements = shiftMovements.filter(
@@ -476,15 +499,19 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       });
     });
 
-    // 2. Also incorporate any approved GRVs for this staff & date that may not yet be indexed in movements
+    // 2. Also incorporate any non-rejected GRVs for this staff & date that may not yet be indexed in movements
     directGrvs.forEach((grv) => {
       if (grv.status === 'REJECTED') return;
-      if (grv.date !== sheetDate) return;
+      const grvDate = (grv.date || grv.createdAt || '').slice(0, 10);
+      if (grvDate && grvDate !== sheetDate) return;
+
       if (grv.payments && grv.payments.length > 0) {
         grv.payments.forEach((p) => {
-          if (p.userId === selectedStaffId && p.amount > 0) {
-            if (seenVouchers.has(grv.grvNumber) || seenVouchers.has(grv.id)) return;
+          if (isStaffMatch(p.userId, p.userName) && (Number(p.amount) || 0) > 0) {
+            const vKey = `${grv.grvNumber}-${p.userId}`;
+            if (seenVouchers.has(grv.grvNumber) || seenVouchers.has(grv.id) || seenVouchers.has(vKey)) return;
             seenVouchers.add(grv.grvNumber);
+            seenVouchers.add(vKey);
 
             list.push({
               grvId: grv.id,
@@ -496,15 +523,31 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               drawerId: p.drawerId || 'Till 1',
               status: grv.status,
               approvedByName: grv.approvedByStaffName,
-              date: grv.date,
+              date: grvDate || sheetDate,
             });
           }
+        });
+      } else if (grv.payFromTill && isStaffMatch(grv.receivedByStaffId, grv.receivedByStaffName) && (grv.totalCost || 0) > 0) {
+        if (seenVouchers.has(grv.grvNumber) || seenVouchers.has(grv.id)) return;
+        seenVouchers.add(grv.grvNumber);
+
+        list.push({
+          grvId: grv.id,
+          grvNumber: grv.grvNumber,
+          supplierName: grv.supplierName,
+          invoiceNo: grv.invoiceNo,
+          itemsSummary: grv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', '),
+          amount: Number(grv.totalCost) || 0,
+          drawerId: 'Till 1',
+          status: grv.status,
+          approvedByName: grv.approvedByStaffName,
+          date: grvDate || sheetDate,
         });
       }
     });
 
     return list;
-  }, [shiftMovements, directGrvs, sheetDate, selectedStaffId]);
+  }, [shiftMovements, directGrvs, sheetDate, selectedStaffId, selectedStaff]);
 
   const derivedProcurementTotalOut = useMemo(() => {
     return (derivedProcurements || []).reduce((sum, p) => sum + (Number(p?.amount) || 0), 0);
@@ -2136,16 +2179,20 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                 />
               </div>
 
-              {/* Staff Selector */}
+              {/* Staff Selector with Admin Inspector Mode */}
               <div className="flex items-center space-x-2">
                 <span className="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center space-x-1">
                   <User className="w-3.5 h-3.5 text-[#6A4DFF]" />
-                  <span>Staff:</span>
+                  <span>{isAdmin ? 'Inspect Cashier:' : 'Staff:'}</span>
                 </span>
                 <select
                   value={selectedStaffId}
                   onChange={(e) => setSelectedStaffId(e.target.value)}
-                  className="py-1.5 px-3 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white font-bold outline-none focus:border-[#6A4DFF]"
+                  className={`py-1.5 px-3 bg-slate-950 border rounded-xl text-xs font-bold outline-none ${
+                    isAdmin && selectedStaffId !== currentUser.id
+                      ? 'border-indigo-500/80 text-indigo-200 ring-1 ring-indigo-500/40 bg-indigo-950/40'
+                      : 'border-slate-700 text-white focus:border-[#6A4DFF]'
+                  }`}
                 >
                   {salespeople.map((sp, idx) => (
                     <option key={`${sp.id}-${idx}`} value={sp.id}>
@@ -2153,6 +2200,12 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                     </option>
                   ))}
                 </select>
+                {isAdmin && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-bold border border-indigo-500/40 hidden sm:inline-flex items-center gap-1">
+                    <Eye className="w-3 h-3 text-indigo-400" />
+                    <span>Audit Mode</span>
+                  </span>
+                )}
               </div>
             </div>
 
@@ -4467,27 +4520,79 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
             </div>
 
             {/* Modal Footer */}
-            <div className="p-4 bg-slate-950 border-t border-slate-800 flex items-center justify-between gap-3">
-              <button
-                type="button"
-                onClick={() => setViewingProcurementGrv(null)}
-                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs transition"
-              >
-                Close
-              </button>
-              {onNavigateToDirectGrv && (
+            <div className="p-4 bg-slate-950 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <div className="flex items-center space-x-2">
                 <button
                   type="button"
-                  onClick={() => {
-                    const id = viewingProcurementGrv.id;
-                    setViewingProcurementGrv(null);
-                    onNavigateToDirectGrv(id);
-                  }}
-                  className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs transition flex items-center space-x-1.5 shadow-md active:scale-95"
+                  onClick={() => setViewingProcurementGrv(null)}
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs transition"
                 >
-                  <ExternalLink className="w-3.5 h-3.5" />
-                  <span>Open in Direct GRV Hub</span>
+                  Close
                 </button>
+                {onNavigateToDirectGrv && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const id = viewingProcurementGrv.id;
+                      setViewingProcurementGrv(null);
+                      onNavigateToDirectGrv(id);
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-300 font-bold text-xs transition flex items-center space-x-1.5"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Open in Direct GRV Hub</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Supervisor / Admin Immediate Voucher Actions */}
+              {(isAdmin || currentUser.role === 'SUPERVISOR' || currentUser.role === 'MANAGER' || (currentUser.role as string) === 'super_admin' || currentUser.role === 'OWNER') && (
+                <div className="flex items-center space-x-2 w-full sm:w-auto justify-end flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const reason = window.prompt(
+                        `Reason for rejecting Direct Delivery Voucher ${viewingProcurementGrv.grvNumber}? This will reverse the $${viewingProcurementGrv.totalCost.toFixed(2)} payout back into the cashier's drawer and Form 2:`
+                      );
+                      if (reason !== null && reason.trim()) {
+                        const res = rejectDirectGrv(viewingProcurementGrv.id, currentUser.id, currentUser.name, reason.trim());
+                        if (res.success) {
+                          setViewingProcurementGrv(null);
+                          loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+                          setLedgerRefreshKey((k) => k + 1);
+                          setSaveSuccessNotice(`Voucher ${viewingProcurementGrv.grvNumber} rejected and refunded into cashier's drawer.`);
+                        } else {
+                          alert(res.message);
+                        }
+                      }
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 font-bold text-xs transition flex items-center space-x-1.5"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>Reject & Return to Drawer</span>
+                  </button>
+
+                  {viewingProcurementGrv.status !== 'APPROVED' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const res = approveDirectGrv(viewingProcurementGrv.id, currentUser.id, currentUser.name);
+                        if (res.success) {
+                          setViewingProcurementGrv(null);
+                          loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+                          setLedgerRefreshKey((k) => k + 1);
+                          setSaveSuccessNotice(`Voucher ${viewingProcurementGrv.grvNumber} APPROVED! Stock updated and cashier procurement confirmed.`);
+                        } else {
+                          alert(res.message);
+                        }
+                      }}
+                      className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs transition flex items-center space-x-1.5 shadow-md active:scale-95"
+                    >
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      <span>Approve Voucher</span>
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           </div>

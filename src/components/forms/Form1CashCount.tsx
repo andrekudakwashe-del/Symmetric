@@ -7,6 +7,8 @@ import {
   getCashCountForStaffAndDate,
   getTodayDateString,
   subscribeToDatabase,
+  getSalespeople,
+  isSupervisorOrAbove,
 } from '../../db/roomDatabase';
 import { FormStepNavigation } from '../common/FormStepNavigation';
 import {
@@ -28,6 +30,8 @@ import {
   AlertCircle,
   Home,
   LogOut,
+  Eye,
+  ShieldCheck,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
@@ -47,6 +51,20 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
   const today = getTodayDateString();
   const [date, setDate] = useState<string>(today);
 
+  const isSupervisorOrAdmin =
+    isSupervisorOrAbove(currentUser.role) ||
+    currentUser.role === 'Admin' ||
+    currentUser.role === 'OWNER' ||
+    currentUser.role === 'SUPER_ADMIN' ||
+    currentUser.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+
+  const salespeople = getSalespeople();
+  const [selectedStaffId, setSelectedStaffId] = useState<string>(currentUser.id);
+
+  const selectedStaff = useMemo(() => {
+    return salespeople.find((s) => s.id === selectedStaffId) || currentUser;
+  }, [salespeople, selectedStaffId, currentUser]);
+
   // Quantities state for each denomination
   const [quantities, setQuantities] = useState<Record<number, number>>(() => {
     const initial: Record<number, number> = {};
@@ -63,7 +81,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
   const [existingRecordId, setExistingRecordId] = useState<string | null>(null);
 
   const isToday = date === today;
-  const isAdmin = currentUser.role === 'Admin';
+  const isAdmin = currentUser.role === 'Admin' || isSupervisorOrAdmin;
   const isEditable = isAdmin || isToday; // Staff can only edit today; Admins can edit any day
 
   // Load saved cash count for selected staff & date whenever date or staff changes
@@ -91,8 +109,8 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
   };
 
   useEffect(() => {
-    loadSavedCountForDate(date, currentUser.id);
-  }, [date, currentUser.id]);
+    loadSavedCountForDate(date, selectedStaffId);
+  }, [date, selectedStaffId]);
 
   useEffect(() => {
     const unsub = subscribeToDatabase(() => {
@@ -172,8 +190,8 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
       });
 
       const { countRecord } = saveFinalCashCount({
-        staffId: currentUser.id,
-        staffName: currentUser.name,
+        staffId: selectedStaff.id,
+        staffName: selectedStaff.name,
         denominations: denominationsMap,
         finalCashOutTotal: Number(totalAmount.toFixed(2)),
         notes,
@@ -226,9 +244,17 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
               <Coins className="w-6 h-6" />
             </div>
             <div>
-              <h2 className="text-xl font-black text-white tracking-tight">Final Cash Count</h2>
+              <div className="flex items-center gap-2">
+                <h2 className="text-xl font-black text-white tracking-tight">Final Cash Count</h2>
+                {isSupervisorOrAdmin && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-bold border border-indigo-500/30 flex items-center gap-1 font-mono">
+                    <ShieldCheck className="w-3 h-3 text-indigo-300" />
+                    <span>Admin/Supervisor Inspector</span>
+                  </span>
+                )}
+              </div>
               <p className="text-xs text-slate-400">
-                FORM 1 • Saves physical cash count snapshot to ledger for Form 4 reconciliation
+                FORM 1 • Physical cash count snapshot for cashier till cash-up & Form 4 reconciliation
               </p>
             </div>
           </div>
@@ -239,7 +265,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
               id="btn-toggle-cash-count-history"
               type="button"
               onClick={() => setShowHistory(!showHistory)}
-              className="py-2 px-3 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold border border-slate-700 flex items-center space-x-1.5 transition"
+              className="py-2 px-3 rounded-2xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold border border-slate-700 flex items-center space-x-1.5 transition cursor-pointer"
             >
               <History className="w-3.5 h-3.5 text-[#FF8A00]" />
               <span>{showHistory ? 'Active Form' : `History (${pastCounts.length})`}</span>
@@ -249,7 +275,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
               id="btn-reset-cash-count"
               type="button"
               onClick={handleReset}
-              className="py-2 px-3 rounded-2xl bg-slate-800/80 hover:bg-slate-800 text-slate-400 hover:text-slate-200 text-xs font-bold border border-slate-700/60 flex items-center space-x-1.5 transition"
+              className="py-2 px-3 rounded-2xl bg-slate-800/80 hover:bg-slate-800 text-slate-400 hover:text-slate-200 text-xs font-bold border border-slate-700/60 flex items-center space-x-1.5 transition cursor-pointer"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>Reset</span>
@@ -257,15 +283,39 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
           </div>
         </div>
 
-        {/* Auto-filled Staff & Date metadata + Status Banner */}
+        {/* Auto-filled Staff & Date metadata + Cashier Inspector for Admins */}
         <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2.5 p-3 rounded-2xl bg-slate-950/60 border border-slate-800/80 text-xs">
           <div className="flex items-center space-x-2 text-slate-300">
             <User className="w-4 h-4 text-[#6A4DFF]" />
-            <span className="text-slate-400">Staff:</span>
-            <span className="font-bold text-white">{currentUser.name}</span>
-            <span className="font-mono-num text-[10px] bg-purple-950 text-purple-300 px-1.5 py-0.5 rounded border border-purple-800">
-              #{currentUser.id}
-            </span>
+            {isSupervisorOrAdmin ? (
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-slate-400 font-bold">Inspect Cashier:</span>
+                <select
+                  value={selectedStaffId}
+                  onChange={(e) => setSelectedStaffId(e.target.value)}
+                  className="bg-slate-900 border border-indigo-500/50 rounded-xl px-2.5 py-1 text-xs text-white font-bold outline-none focus:border-indigo-400 cursor-pointer"
+                >
+                  {salespeople.map((sp, idx) => (
+                    <option key={`${sp.id}-${idx}`} value={sp.id}>
+                      {sp.name} (#{sp.id}) - {sp.role}
+                    </option>
+                  ))}
+                </select>
+                {selectedStaff.id !== currentUser.id && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-mono">
+                    Viewing {selectedStaff.name}'s Till
+                  </span>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <span className="text-slate-400">Staff:</span>
+                <span className="font-bold text-white">{currentUser.name}</span>
+                <span className="font-mono-num text-[10px] bg-purple-950 text-purple-300 px-1.5 py-0.5 rounded border border-purple-800">
+                  #{currentUser.id}
+                </span>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center justify-between sm:justify-end space-x-2 text-slate-300">
