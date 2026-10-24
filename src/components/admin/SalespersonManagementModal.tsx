@@ -293,13 +293,13 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
 
           {/* Salespeople List */}
           <div className="space-y-2.5">
-            {salespeople.map((staff) => {
+            {salespeople.map((staff, idx) => {
               const isActive = staff.active === 'Y';
               const isCurrent = staff.id === currentUser.id;
 
               return (
                 <div
-                  key={staff.id}
+                  key={`${staff.id}-${idx}`}
                   className={`p-3.5 rounded-2xl border transition-all flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
                     isActive
                       ? 'bg-slate-950/60 border-slate-800/80'

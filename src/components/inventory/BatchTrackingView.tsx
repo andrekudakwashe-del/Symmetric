@@ -1247,14 +1247,14 @@ export const BatchTrackingView: React.FC<BatchTrackingViewProps> = ({
                       </td>
                     </tr>
                   ) : (
-                    auditLogs.map((log) => {
+                    auditLogs.map((log, logIdx) => {
                       const isPriceChange = log.txnType === 'PRICE_CHANGE' || log.movementType === 'PRICE_CHANGE';
                       const isCostChange = log.txnType === 'COST_CHANGE' || log.movementType === 'COST_CHANGE';
                       const isNeg = Boolean(log.isNegativeSale);
 
                       return (
                         <tr
-                          key={log.txnId}
+                          key={`${log.txnId || log.movementId || 'audit'}-${logIdx}`}
                           className="hover:bg-slate-800/60 transition-colors divide-x divide-slate-800/40 bg-slate-900/80"
                         >
                           <td className="py-2.5 px-3 font-bold text-slate-300">

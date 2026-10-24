@@ -1,10 +1,14 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { Customer, Salesperson } from '../../types';
 import {
   getCustomers,
   getSales,
   getCustomerCreditReport,
   getCustomerChangeReport,
+  getStandardGroupLimit,
+  getCreditGroups,
+  isSupervisorOrAbove,
+  subscribeRoomDatabase,
 } from '../../db/roomDatabase';
 import { CustomerRegistrationModal } from './CustomerRegistrationModal';
 import { CustomerCreditModal } from './CustomerCreditModal';
@@ -31,6 +35,12 @@ import {
   Receipt,
   ArrowRight,
   CheckCircle2,
+  AlertTriangle,
+  ShieldAlert,
+  ShieldCheck,
+  Lock,
+  Plus,
+  SlidersHorizontal,
 } from 'lucide-react';
 
 interface CustomerListScreenProps {
@@ -47,10 +57,22 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
   onNavigateToChangeReport,
 }) => {
   const [search, setSearch] = useState('');
+  const [activeTab, setActiveTab] = useState<'ALL' | 'STANDARD_GROUP' | 'RANDOM_CUSTOM' | 'CREDIT_ALL' | 'CASH_ONLY'>('ALL');
   const [isRegisterModalOpen, setIsRegisterModalOpen] = useState(false);
   const [selectedCustomerForCredit, setSelectedCustomerForCredit] = useState<Customer | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [customers, setCustomers] = useState<Customer[]>(() => getCustomers());
   const customerFileInputRef = React.useRef<HTMLInputElement>(null);
+
+  const standardGroupLimit = getStandardGroupLimit(); // $5.00
+  const isAuthorized = isSupervisorOrAbove(currentUser.role) || Boolean(currentUser.permissions?.canGrantCredit);
+
+  useEffect(() => {
+    const unsub = subscribeRoomDatabase(() => {
+      setCustomers(getCustomers());
+    });
+    return unsub;
+  }, []);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -76,19 +98,65 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
     reader.readAsText(file);
   };
 
-  const customers = getCustomers();
   const sales = getSales();
   const creditReport = useMemo(() => getCustomerCreditReport(), []);
   const changeReport = useMemo(() => getCustomerChangeReport(), []);
 
+  // Category counts
+  const counts = useMemo(() => {
+    const all = customers.length;
+    let standardGroup = 0;
+    let randomAboveGroup = 0;
+    let creditAll = 0;
+    let cashOnly = 0;
+
+    customers.forEach((c) => {
+      const isCreditOn = c.creditAllowed === true;
+      const limit = Number(c.creditLimit) || 0;
+      if (isCreditOn) {
+        creditAll++;
+        if (limit > standardGroupLimit) {
+          randomAboveGroup++;
+        } else {
+          standardGroup++;
+        }
+      } else {
+        cashOnly++;
+      }
+    });
+
+    return { all, standardGroup, randomAboveGroup, creditAll, cashOnly };
+  }, [customers, standardGroupLimit]);
+
   const cleanSearch = (search || '').trim().toLowerCase();
-  const filtered = customers.filter(
-    (c) =>
-      (c.name && c.name.toLowerCase().includes(cleanSearch)) ||
-      (c.customerId && c.customerId.toLowerCase().includes(cleanSearch)) ||
-      (c.phone && c.phone.toLowerCase().includes(cleanSearch)) ||
-      (c.address && c.address.toLowerCase().includes(cleanSearch))
-  );
+  const filtered = useMemo(() => {
+    return customers.filter((c) => {
+      const isCreditOn = c.creditAllowed === true;
+      const limit = Number(c.creditLimit) || 0;
+
+      // Tab filter
+      if (activeTab === 'STANDARD_GROUP') {
+        if (!isCreditOn || limit > standardGroupLimit) return false;
+      } else if (activeTab === 'RANDOM_CUSTOM') {
+        if (!isCreditOn || limit <= standardGroupLimit) return false;
+      } else if (activeTab === 'CREDIT_ALL') {
+        if (!isCreditOn) return false;
+      } else if (activeTab === 'CASH_ONLY') {
+        if (isCreditOn) return false;
+      }
+
+      // Search filter
+      if (cleanSearch) {
+        const matchesName = c.name && c.name.toLowerCase().includes(cleanSearch);
+        const matchesId = c.customerId && c.customerId.toLowerCase().includes(cleanSearch);
+        const matchesPhone = c.phone && c.phone.toLowerCase().includes(cleanSearch);
+        const matchesAddress = c.address && c.address.toLowerCase().includes(cleanSearch);
+        if (!matchesName && !matchesId && !matchesPhone && !matchesAddress) return false;
+      }
+
+      return true;
+    });
+  }, [customers, activeTab, cleanSearch, standardGroupLimit]);
 
   const getCustomerSalesCount = (customerId: string, customerName: string) => {
     const targetName = (customerName || '').toLowerCase().trim();
@@ -212,7 +280,131 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
             className="w-full pl-10 pr-4 py-2.5 bg-slate-950/80 border border-slate-800 focus:border-[#6A4DFF] focus:ring-2 focus:ring-[#6A4DFF]/30 rounded-2xl text-sm text-white placeholder-slate-500 transition outline-none"
           />
         </div>
+
+        {/* Credit Groups & Limits Segmented Navigation Tabs */}
+        <div className="mt-3.5 pt-3 border-t border-slate-800 flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none text-xs">
+          <button
+            type="button"
+            onClick={() => setActiveTab('ALL')}
+            className={`min-h-[36px] px-3 py-1.5 rounded-xl font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === 'ALL'
+                ? 'bg-gradient-to-r from-[#6A4DFF] to-purple-600 text-white shadow-md'
+                : 'bg-slate-950/60 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-800'
+            }`}
+          >
+            <Users className="w-3.5 h-3.5" />
+            <span>All Customers</span>
+            <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-white/20 text-white">{counts.all}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('STANDARD_GROUP')}
+            className={`min-h-[36px] px-3 py-1.5 rounded-xl font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === 'STANDARD_GROUP'
+                ? 'bg-emerald-600 text-white shadow-md'
+                : 'bg-slate-950/60 hover:bg-slate-800 text-emerald-400 border border-emerald-900/40 hover:border-emerald-700/60'
+            }`}
+          >
+            <ShieldCheck className="w-3.5 h-3.5 text-emerald-300" />
+            <span>Standard Credit List (${standardGroupLimit.toFixed(0)} Cap)</span>
+            <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-emerald-500/30 text-emerald-200">{counts.standardGroup}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('RANDOM_CUSTOM')}
+            className={`min-h-[36px] px-3 py-1.5 rounded-xl font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === 'RANDOM_CUSTOM'
+                ? 'bg-amber-600 text-white shadow-md'
+                : 'bg-slate-950/60 hover:bg-slate-800 text-amber-400 border border-amber-900/40 hover:border-amber-700/60'
+            }`}
+          >
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-300" />
+            <span>Random / Custom Limits (&gt;${standardGroupLimit.toFixed(0)})</span>
+            <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-amber-500/30 text-amber-200">{counts.randomAboveGroup}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('CREDIT_ALL')}
+            className={`min-h-[36px] px-3 py-1.5 rounded-xl font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === 'CREDIT_ALL'
+                ? 'bg-purple-600 text-white shadow-md'
+                : 'bg-slate-950/60 hover:bg-slate-800 text-purple-300 border border-purple-900/40'
+            }`}
+          >
+            <CreditCard className="w-3.5 h-3.5" />
+            <span>All Credit Accounts</span>
+            <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-purple-500/30 text-purple-200">{counts.creditAll}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab('CASH_ONLY')}
+            className={`min-h-[36px] px-3 py-1.5 rounded-xl font-bold transition flex items-center gap-1.5 whitespace-nowrap ${
+              activeTab === 'CASH_ONLY'
+                ? 'bg-slate-700 text-white shadow-md'
+                : 'bg-slate-950/60 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Lock className="w-3.5 h-3.5" />
+            <span>Credit Off (Cash Only)</span>
+            <span className="font-mono text-[10px] px-1.5 py-0.2 rounded-full bg-slate-800 text-slate-400">{counts.cashOnly}</span>
+          </button>
+        </div>
       </div>
+
+      {/* Contextual Banner for Credit Group Lists */}
+      {activeTab === 'STANDARD_GROUP' && (
+        <div className="bg-emerald-950/40 border border-emerald-500/40 rounded-3xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-emerald-300 shadow-md">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-xl bg-emerald-500/20 text-emerald-300 flex items-center justify-center shrink-0 border border-emerald-500/30">
+              <ShieldCheck className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="font-bold text-sm text-white flex items-center gap-2">
+                <span>Standard Store Credit List — Cap: ${standardGroupLimit.toFixed(2)}</span>
+                <span className="text-[10px] bg-emerald-500/20 text-emerald-300 font-bold px-2 py-0.5 rounded border border-emerald-500/30">
+                  Authorised Personnel Only
+                </span>
+              </div>
+              <p className="text-[11px] text-emerald-300/80 mt-0.5 leading-relaxed">
+                Customers on this list have an approved micro-credit allowance up to ${standardGroupLimit.toFixed(2)}. Only supervisors and authorized managers are permitted to add customers to this list.
+              </p>
+            </div>
+          </div>
+          {isAuthorized && (
+            <button
+              type="button"
+              onClick={() => setIsRegisterModalOpen(true)}
+              className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shrink-0 transition shadow-md self-start sm:self-center"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Customer to ${standardGroupLimit.toFixed(0)} List</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'RANDOM_CUSTOM' && (
+        <div className="bg-amber-950/40 border border-amber-500/40 rounded-3xl p-4 flex items-start gap-3 text-xs text-amber-300 shadow-md">
+          <div className="w-9 h-9 rounded-xl bg-amber-500/20 text-amber-300 flex items-center justify-center shrink-0 border border-amber-500/30">
+            <AlertTriangle className="w-5 h-5 text-amber-400" />
+          </div>
+          <div>
+            <div className="font-bold text-sm text-white flex items-center gap-2">
+              <span>Customers with Random / Bespoke Credit Limits (Above ${standardGroupLimit.toFixed(2)} Group Cap)</span>
+              <span className="text-[10px] bg-amber-500/20 text-amber-300 font-bold px-2 py-0.5 rounded border border-amber-500/30">
+                Audit Register
+              </span>
+            </div>
+            <p className="text-[11px] text-amber-300/80 mt-0.5 leading-relaxed">
+              This list filters all accounts granted individual credit limits exceeding the standard ${standardGroupLimit.toFixed(2)} group limit. Each entry reflects custom authorization and is tracked here to prevent unauthorized credit inflation and exposure risk.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Customer Grid / Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
@@ -231,7 +423,7 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
             </button>
           </div>
         ) : (
-          filtered.map((customer) => {
+          filtered.map((customer, cIdx) => {
             const salesCount = getCustomerSalesCount(customer.customerId, customer.name);
             const totalSpend = getCustomerTotalSpend(customer.customerId, customer.name);
             const creditDebt = getCustomerCreditBalance(customer.name);
@@ -239,7 +431,7 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
 
             return (
               <div
-                key={customer.customerId}
+                key={`${customer.customerId || 'cust'}-${cIdx}`}
                 id={`customer-card-${customer.customerId}`}
                 className="bg-slate-900/80 border border-slate-800/90 rounded-3xl p-4 shadow-md backdrop-blur-sm flex flex-col justify-between hover:border-purple-500/40 transition group"
               >
@@ -255,13 +447,35 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
                     </div>
                   </div>
 
-                  {/* Customer Name */}
-                  <h3 className="text-base font-bold text-white group-hover:text-purple-300 transition">
-                    {customer.name}
-                  </h3>
+                  {/* Customer Name & Credit Category Badge */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+                    <h3 className="text-base font-bold text-white group-hover:text-purple-300 transition">
+                      {customer.name}
+                    </h3>
+                    <div>
+                      {customer.creditAllowed === true ? (
+                        (customer.creditLimit || 0) > standardGroupLimit ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-bold shadow-sm">
+                            <AlertTriangle className="w-3 h-3 text-amber-400 shrink-0" />
+                            <span>Random Limit: ${(customer.creditLimit || 0).toFixed(0)} (+${((customer.creditLimit || 0) - standardGroupLimit).toFixed(0)} over cap)</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold shadow-sm">
+                            <ShieldCheck className="w-3 h-3 text-emerald-400 shrink-0" />
+                            <span>Standard ${standardGroupLimit.toFixed(0)} Credit List</span>
+                          </span>
+                        )
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-slate-800 text-slate-400 border border-slate-700 text-[10px] font-medium">
+                          <Lock className="w-2.5 h-2.5 text-slate-500 shrink-0" />
+                          <span>Credit Off (Cash Only)</span>
+                        </span>
+                      )}
+                    </div>
+                  </div>
 
                   {/* Phone & Address */}
-                  <div className="mt-2.5 space-y-1.5 text-xs text-slate-300">
+                  <div className="mt-2 space-y-1 text-xs text-slate-300">
                     {customer.phone ? (
                       <a
                         href={`tel:${customer.phone}`}
@@ -286,6 +500,13 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
                       <div className="flex items-center space-x-2 text-slate-500 italic">
                         <MapPin className="w-3.5 h-3.5 text-slate-600" />
                         <span>No address recorded</span>
+                      </div>
+                    )}
+
+                    {customer.creditAllowed === true && customer.creditApprovedBy && (
+                      <div className="text-[10px] text-slate-400 flex items-center space-x-1 pt-0.5">
+                        <User className="w-3 h-3 text-purple-400" />
+                        <span>Authorized by: <strong className="text-slate-300">{customer.creditApprovedBy}</strong></span>
                       </div>
                     )}
                   </div>
@@ -344,7 +565,7 @@ export const CustomerListScreen: React.FC<CustomerListScreenProps> = ({
                       title="Set / Edit Customer Credit Limits & Terms"
                     >
                       <CreditCard className="w-3 h-3 text-[#FF8A00]" />
-                      <span>{customer.creditAllowed === false ? 'Cash Only' : `Limit: $${(customer.creditLimit !== undefined ? customer.creditLimit : 100).toFixed(0)}`}</span>
+                      <span>{customer.creditAllowed === true ? `Limit: $${(customer.creditLimit || 0).toFixed(0)}` : 'Credit Off'}</span>
                     </button>
 
                     {onNavigateToCreditReport && creditDebt > 0 && (

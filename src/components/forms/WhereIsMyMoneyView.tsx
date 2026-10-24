@@ -10,7 +10,18 @@ import {
   updateWalletCountedBalance,
   WalletReconciliationItem,
 } from '../../services/walletService';
-import { getTodayDateString, getSalespeople } from '../../db/roomDatabase';
+import {
+  getCustodyBalancesSummary,
+  getUnpaidGrvsForSafePayment,
+  getInTransitTotal,
+} from '../../services/cashCustodyService';
+import {
+  getCashAccounts,
+  getCashTransfers,
+  getTodayDateString,
+  getSalespeople,
+  subscribeToDatabase,
+} from '../../db/roomDatabase';
 import { WalletTransferModal } from './WalletTransferModal';
 import { OwnerDrawingModal } from './OwnerDrawingModal';
 import {
@@ -30,13 +41,21 @@ import {
   ShieldCheck,
   Scale,
   RefreshCw,
+  Coins,
+  Truck,
+  Building2,
+  ExternalLink,
 } from 'lucide-react';
 
 interface WhereIsMyMoneyViewProps {
   currentUser: Salesperson;
+  onNavigateToCustody?: () => void;
 }
 
-export const WhereIsMyMoneyView: React.FC<WhereIsMyMoneyViewProps> = ({ currentUser }) => {
+export const WhereIsMyMoneyView: React.FC<WhereIsMyMoneyViewProps> = ({
+  currentUser,
+  onNavigateToCustody,
+}) => {
   const [date, setDate] = useState<string>(() => getTodayDateString());
   const [selectedSupervisorId, setSelectedSupervisorId] = useState<string>(currentUser.id);
   const [showTransferModal, setShowTransferModal] = useState(false);
@@ -73,9 +92,42 @@ export const WhereIsMyMoneyView: React.FC<WhereIsMyMoneyViewProps> = ({ currentU
   const drawings = useMemo(() => getOwnerDrawings().filter((d) => d.date === date), [date, refreshKey]);
   const consumptions = useMemo(() => getInternalConsumptions().filter((c) => c.date === date), [date, refreshKey]);
 
+  // Integrated Physical Cash Custody & Voucher Settlement
+  const custodySummary = useMemo(() => {
+    return getCustodyBalancesSummary();
+  }, [refreshKey]);
+
+  const custodyTransfers = useMemo(() => {
+    return getCashTransfers().slice(0, 10);
+  }, [refreshKey]);
+
+  const inTransitVouchers = useMemo(() => {
+    return custodyTransfers.filter((t) => t.status === 'IN_TRANSIT');
+  }, [custodyTransfers]);
+
+  const unpaidGrvs = useMemo(() => {
+    return getUnpaidGrvsForSafePayment().slice(0, 5);
+  }, [refreshKey]);
+
   const handleRefresh = () => {
     setRefreshKey((k) => k + 1);
   };
+
+  useEffect(() => {
+    const handleUpdate = () => {
+      setRefreshKey((k) => k + 1);
+    };
+    const unsub = subscribeToDatabase(handleUpdate);
+    window.addEventListener('saimetric_cash_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_movements_updated', handleUpdate);
+    window.addEventListener('storage', handleUpdate);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_cash_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_movements_updated', handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
+    };
+  }, []);
 
   const formatWalletVal = (val: number, currency: string, prefix: '+' | '-' | '' = '') => {
     const formatted = Math.abs(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -172,8 +224,8 @@ export const WhereIsMyMoneyView: React.FC<WhereIsMyMoneyViewProps> = ({ currentU
               onChange={(e) => setSelectedSupervisorId(e.target.value)}
               className="bg-slate-950 border border-slate-700 rounded-xl px-3 py-1.5 text-xs text-white font-bold"
             >
-              {supervisors.map((s) => (
-                <option key={s.id} value={s.id}>
+              {supervisors.map((s, sIdx) => (
+                <option key={`${s.id}-${sIdx}`} value={s.id}>
                   {s.name} ({s.role})
                 </option>
               ))}
@@ -334,6 +386,165 @@ export const WhereIsMyMoneyView: React.FC<WhereIsMyMoneyViewProps> = ({ currentU
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* SECTION 2.5: PHYSICAL CASH CUSTODY & CHAIN VERIFICATION (MERGED VIEW) */}
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 shadow-xl space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-black text-white flex items-center gap-2">
+              <ShieldCheck className="w-5 h-5 text-indigo-400" />
+              <span>Physical Cash Custody &amp; Location Breakdown</span>
+              <span className="text-xs px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 font-mono border border-indigo-500/30">
+                IAS 7 Cash &amp; Equivalents
+              </span>
+            </h2>
+            <p className="text-xs text-slate-400">
+              Where the physical cash is right now: active tills, branch vault safe, clerk float, and money in transit
+            </p>
+          </div>
+
+          {onNavigateToCustody && (
+            <button
+              type="button"
+              onClick={onNavigateToCustody}
+              className="px-3.5 py-1.5 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-md transition active:scale-95 self-start sm:self-auto"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              <span>Manage Safe &amp; Vouchers</span>
+            </button>
+          )}
+        </div>
+
+        {/* 5 Custody Location Metric Cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+          <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+            <div className="flex items-center space-x-1.5 text-slate-400 text-xs font-semibold mb-1">
+              <Coins className="w-3.5 h-3.5 text-purple-400" />
+              <span>Cashier Tills</span>
+            </div>
+            <div className="text-lg font-black text-white font-mono">
+              ${custodySummary.totalTills.toFixed(2)}
+            </div>
+            <span className="text-[10px] text-slate-500 block">Registers in operation</span>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+            <div className="flex items-center space-x-1.5 text-slate-400 text-xs font-semibold mb-1">
+              <Building2 className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Branch Safe</span>
+            </div>
+            <div className="text-lg font-black text-emerald-400 font-mono">
+              ${custodySummary.totalBranchSafes.toFixed(2)}
+            </div>
+            <span className="text-[10px] text-slate-500 block">Main store vault</span>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+            <div className="flex items-center space-x-1.5 text-slate-400 text-xs font-semibold mb-1">
+              <UserCheck className="w-3.5 h-3.5 text-blue-400" />
+              <span>Clerk Petty Float</span>
+            </div>
+            <div className="text-lg font-black text-blue-400 font-mono">
+              ${custodySummary.totalClerkFloats.toFixed(2)}
+            </div>
+            <span className="text-[10px] text-slate-500 block">Discretionary imprest</span>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+            <div className="flex items-center space-x-1.5 text-slate-400 text-xs font-semibold mb-1">
+              <Truck className="w-3.5 h-3.5 text-amber-400" />
+              <span>Cash In Transit</span>
+            </div>
+            <div className="text-lg font-black text-amber-400 font-mono">
+              ${custodySummary.totalCashInTransit.toFixed(2)}
+            </div>
+            <span className="text-[10px] text-slate-500 block">En route to Bank / HQ</span>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800">
+            <div className="flex items-center space-x-1.5 text-slate-400 text-xs font-semibold mb-1">
+              <Landmark className="w-3.5 h-3.5 text-indigo-400" />
+              <span>HQ Central Vault</span>
+            </div>
+            <div className="text-lg font-black text-indigo-300 font-mono">
+              ${custodySummary.totalHqSafe.toFixed(2)}
+            </div>
+            <span className="text-[10px] text-slate-500 block">Owner central reserve</span>
+          </div>
+
+          <div className="bg-gradient-to-br from-indigo-950 to-purple-950 p-3.5 rounded-2xl border border-indigo-700/60 shadow-inner">
+            <div className="flex items-center space-x-1.5 text-indigo-200 text-xs font-semibold mb-1">
+              <Scale className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Total Liquid Cash</span>
+            </div>
+            <div className="text-lg font-black text-cyan-300 font-mono">
+              ${custodySummary.grandTotal.toFixed(2)}
+            </div>
+            <span className="text-[10px] text-indigo-300 block">All custody points</span>
+          </div>
+        </div>
+
+        {/* In-Transit & Pending Settlement Alert Strip */}
+        {inTransitVouchers.length > 0 && (
+          <div className="p-3.5 rounded-2xl bg-amber-950/40 border border-amber-500/40 space-y-2">
+            <div className="flex items-center justify-between text-xs font-bold text-amber-300">
+              <div className="flex items-center gap-1.5">
+                <Truck className="w-4 h-4 text-amber-400 animate-pulse" />
+                <span>Active Cash in Transit ({inTransitVouchers.length} dispatch vouchers)</span>
+              </div>
+              <span className="font-mono text-amber-200">
+                Total: ${custodySummary.totalCashInTransit.toFixed(2)}
+              </span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+              {inTransitVouchers.map((v) => (
+                <div key={v.transfer_id} className="p-2.5 bg-slate-950/80 rounded-xl border border-amber-800/60 text-xs flex justify-between items-center">
+                  <div>
+                    <div className="font-bold text-white flex items-center gap-1.5">
+                      <span>{v.transfer_id}</span>
+                      <span className="px-1.5 py-0.2 rounded text-[9px] bg-amber-500/20 text-amber-300 uppercase">
+                        {v.type}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      {v.bank_name ? `Bank: ${v.bank_name}` : v.recipient_name ? `For: ${v.recipient_name}` : `Seal: ${v.bag_seal_number || 'Standard'}`}
+                    </div>
+                  </div>
+                  <div className="text-right font-mono font-bold text-amber-400">
+                    ${v.amount.toFixed(2)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Unpaid GRV Supplier Liabilities */}
+        {unpaidGrvs.length > 0 && (
+          <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 text-xs space-y-2">
+            <div className="flex items-center justify-between text-slate-300 font-bold">
+              <div className="flex items-center gap-1.5">
+                <FileText className="w-4 h-4 text-cyan-400" />
+                <span>Pending Supplier Invoices (GRVs Awaiting Safe Payout)</span>
+              </div>
+              <span className="text-[10px] text-slate-500">
+                {unpaidGrvs.length} invoices pending
+              </span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+              {unpaidGrvs.map((g) => (
+                <div key={g.id} className="p-2.5 bg-slate-900 rounded-xl border border-slate-800 flex justify-between items-center">
+                  <div>
+                    <span className="font-bold text-white block">{g.supplierName}</span>
+                    <span className="text-[10px] text-slate-400">{g.grvNumber} • {g.date}</span>
+                  </div>
+                  <span className="font-mono font-bold text-rose-400">${g.totalCost.toFixed(2)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* SECTION 3: RECENT TRANSFERS & OWNER DRAWINGS AUDIT LEDGER */}

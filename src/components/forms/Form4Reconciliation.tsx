@@ -10,6 +10,7 @@ import {
 import {
   getSalespeople,
   getCashLogs,
+  getCashLogsForStaffAndDate,
   getCustomerChanges,
   getCreditSales,
   getCashCounts,
@@ -30,7 +31,14 @@ import {
   saveCompanyBranchSettings,
   logForm4AuditUnlock,
   getActiveCurrencies,
+  getCashGovernanceConfig,
+  getCashTransfers,
 } from '../../db/roomDatabase';
+import {
+  handoverTillToSafe,
+  getCashierRetainedFloat,
+  saveCashierRetainedFloat,
+} from '../../services/cashCustodyService';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { getAllMovements, getShiftId, matchesShift, CashMovement } from '../../db/cashLedger';
 import { CustomerSearchModal } from '../common/CustomerSearchModal';
@@ -179,6 +187,8 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   const [salespeople, setSalespeople] = useState<Salesperson[]>(() => getSalespeople());
   const [expenses, setExpenses] = useState<ExpenseEntry[]>(() => getExpenses());
   const [salesList, setSalesList] = useState<SaleInvoice[]>(() => getSales());
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [customRetainedFloats, setCustomRetainedFloats] = useState<Record<string, string>>({});
 
   // Subscribe to DB changes and window events
   useEffect(() => {
@@ -186,6 +196,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       setSalespeople(getSalespeople());
       setExpenses(getExpenses());
       setSalesList(getSales());
+      setRefreshKey((k) => k + 1);
     };
 
     const unsub = subscribeToDatabase(handleUpdate);
@@ -203,7 +214,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     };
   }, []);
 
-  // Initialize or update sales overrides whenever date changes
+  // Initialize or update sales overrides & retained floats whenever date changes
   useEffect(() => {
     const adminSales = getAdminSales().filter((s) => s.date === date);
     const initialMap: Record<string, string> = {};
@@ -213,9 +224,20 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       }
     });
     setSalesInputs(initialMap);
+
+    // Initialize custom retained floats from saved cashbox entries if present
+    const initialFloatMap: Record<string, string> = {};
+    salespeople.forEach((staff) => {
+      const savedFloat = getCashierRetainedFloat(staff.id, date);
+      if (savedFloat !== null && savedFloat > 0) {
+        initialFloatMap[staff.id] = savedFloat.toString();
+      }
+    });
+    setCustomRetainedFloats(initialFloatMap);
+
     setEditingStaffId(null);
     setSaveSuccessBanner(null);
-  }, [date]);
+  }, [date, salespeople]);
 
   // Calculate balancing metrics for all active salespeople on selected date
   const balancingData = useMemo(() => {
@@ -224,7 +246,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       const parsedSales = rawInput !== undefined && rawInput.trim() !== '' ? parseFloat(rawInput) || 0 : undefined;
       return calculateSalespersonCashBalancing(staff.id, staff.name, date, parsedSales, currentUser?.branchId);
     });
-  }, [salespeople, date, salesInputs, salesList, currentUser?.branchId]);
+  }, [salespeople, date, salesInputs, salesList, currentUser?.branchId, refreshKey]);
 
   // Filtered salespeople rows
   const filteredRows = useMemo(() => {
@@ -385,6 +407,34 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     };
   }, [balancingData]);
 
+  // Compute total surplus available across all tills (taking into account any today's completed surrenders & dynamic retained floats)
+  const totalAvailableSurplus = useMemo(() => {
+    const govConfig = getCashGovernanceConfig();
+    const allTransfers = getCashTransfers(currentUser?.branchId);
+    return balancingData.reduce((sum, row) => {
+      const cashierSurrenders = allTransfers.filter(
+        (t) =>
+          t.type === 'TILL_COLLECTION' &&
+          t.status === 'COMPLETED' &&
+          t.created_at?.startsWith(date) &&
+          (t.recipient_name?.toLowerCase() === row.staffName.toLowerCase() ||
+            t.notes?.toLowerCase().includes(row.staffName.toLowerCase()) ||
+            t.from_account_id?.includes(row.staffId))
+      );
+      const alreadySurrendered = cashierSurrenders.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+      const customVal = customRetainedFloats[row.staffId];
+      const retained = customVal !== undefined && customVal.trim() !== ''
+        ? (parseFloat(customVal) >= 0 ? parseFloat(customVal) : 0)
+        : (row.float > 0 ? row.float : (govConfig.defaultTillFloat || 20.0));
+      const counted =
+        row.actualCashCount !== null && row.actualCashCount !== undefined
+          ? row.actualCashCount
+          : (row.physicalCashCount || row.expectedCash || 0);
+      const net = Math.max(0, Math.round((counted - alreadySurrendered - retained) * 100) / 100);
+      return sum + net;
+    }, 0);
+  }, [balancingData, date, refreshKey, currentUser?.branchId, customRetainedFloats]);
+
   // Handle individual sales amount change in table
   const handleSalesInputChange = (staffId: string, value: string) => {
     setSalesInputs((prev) => ({
@@ -460,6 +510,107 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     }
   };
 
+  // Turn over counted cashier till cash to Branch Safe or Accounts Clerk Account (EOD Custody Transfer)
+  const handleExecuteHandover = (
+    staffId: string,
+    staffName: string,
+    counted: number,
+    retained = 20.0,
+    destinationTarget: 'SAFE' | 'CLERK' = 'SAFE'
+  ) => {
+    try {
+      const net = Math.max(0, Math.round((counted - retained) * 100) / 100);
+      if (net <= 0) {
+        alert(`Counted cash ($${counted.toFixed(2)}) does not exceed retained threshold ($${retained.toFixed(2)}). Nothing to transfer.`);
+        return;
+      }
+      const targetLabel = destinationTarget === 'CLERK' ? 'Accounts Clerk Float (Petty Cash Desk)' : 'Branch Safe Vault';
+      const res = handoverTillToSafe({
+        cashierId: staffId,
+        cashierName: staffName,
+        totalCountedCash: counted,
+        retainedFloat: retained,
+        supervisor: currentUser,
+        destinationTarget,
+        notes: `Form 4 EOD reconciliation on ${date} (to ${targetLabel})`,
+      });
+      if (res.success) {
+        setSaveSuccessBanner(res.message);
+        setRefreshKey((k) => k + 1);
+        confetti({
+          particleCount: 50,
+          spread: 70,
+          origin: { y: 0.6 },
+        });
+      } else {
+        alert(res.message);
+      }
+    } catch (err: any) {
+      alert(err?.message || 'Failed to handover cash.');
+    }
+  };
+
+  // Batch sweep all tills above retained float directly into Branch Safe or Accounts Clerk Account
+  const handleSweepAllTills = (destinationTarget: 'SAFE' | 'CLERK' = 'SAFE') => {
+    const govConfig = getCashGovernanceConfig();
+    const targetLabel = destinationTarget === 'CLERK' ? 'Accounts Clerk Float (Petty Cash Desk)' : 'Branch Safe Vault';
+    const allTransfers = getCashTransfers(currentUser?.branchId);
+    let sweptCount = 0;
+    let totalSwept = 0;
+
+    balancingData.forEach((row) => {
+      const cashierSurrenders = allTransfers.filter(
+        (t) =>
+          t.type === 'TILL_COLLECTION' &&
+          t.status === 'COMPLETED' &&
+          t.created_at?.startsWith(date) &&
+          (t.recipient_name?.toLowerCase() === row.staffName.toLowerCase() ||
+            t.notes?.toLowerCase().includes(row.staffName.toLowerCase()) ||
+            t.from_account_id?.includes(row.staffId))
+      );
+      const alreadySurrendered = cashierSurrenders.reduce((s, t) => s + (Number(t.amount) || 0), 0);
+      const customVal = customRetainedFloats[row.staffId];
+      const retained = customVal !== undefined && customVal.trim() !== ''
+        ? (parseFloat(customVal) >= 0 ? parseFloat(customVal) : 0)
+        : (row.float > 0 ? row.float : (govConfig.defaultTillFloat || 20.0));
+      const counted =
+        row.actualCashCount !== null && row.actualCashCount !== undefined
+          ? row.actualCashCount
+          : (row.physicalCashCount || row.expectedCash || 0);
+      const net = Math.max(0, Math.round((counted - alreadySurrendered - retained) * 100) / 100);
+      if (net > 0) {
+        const res = handoverTillToSafe({
+          cashierId: row.staffId,
+          cashierName: row.staffName,
+          totalCountedCash: alreadySurrendered + net + retained,
+          retainedFloat: retained,
+          supervisor: currentUser,
+          destinationTarget,
+          notes: `Batch EOD Sweep on ${date} to ${targetLabel}`,
+        });
+        if (res.success) {
+          sweptCount++;
+          totalSwept += net;
+        }
+      }
+    });
+
+    if (sweptCount > 0) {
+      setRefreshKey((k) => k + 1);
+      confetti({
+        particleCount: 70,
+        spread: 80,
+        origin: { y: 0.6 },
+      });
+      setSaveSuccessBanner(`Successfully swept $${totalSwept.toFixed(2)} from ${sweptCount} closed tills into the ${targetLabel}! Balance updated.`);
+    } else {
+      alert(`No tills currently have surplus cash remaining above retained float to sweep into ${targetLabel}.`);
+    }
+  };
+
+  // Backward compatible alias
+  const handleSweepAllTillsToSafe = () => handleSweepAllTills('SAFE');
+
   // Selected staff details for audit modal
   const selectedAuditData = useMemo(() => {
     if (!auditStaffId) return null;
@@ -477,7 +628,8 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       balancingData.find((b) => b.staffId === auditStaffId) ||
       calculateSalespersonCashBalancing(staff.id, staff.name, date, undefined, currentUser?.branchId);
 
-    const form2Logs = getCashLogs().filter((l) => l.staffId === auditStaffId && l.date === date);
+    // Form 1-4 is strictly for POS register events: exclude vault custody transfers
+    const form2Logs = getCashLogsForStaffAndDate(auditStaffId, date);
     const form3Changes = getCustomerChanges().filter((c) => c.staffId === auditStaffId && c.date === date);
     const form3Credits = getCreditSales().filter((c) => c.staffId === auditStaffId && c.date === date);
     const form1Count = getCashCounts().find((c) => c.staffId === auditStaffId && c.date === date);
@@ -832,6 +984,51 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
               <span className="hidden sm:inline">Export CSV</span>
             </button>
 
+            <div className="inline-flex rounded-xl p-0.5 bg-slate-900 border border-slate-700 shadow-sm">
+              <button
+                id="btn-sweep-all-safe"
+                type="button"
+                disabled={totalAvailableSurplus <= 0}
+                onClick={() => handleSweepAllTills('SAFE')}
+                className={`px-3 py-1.5 rounded-lg text-white font-bold text-xs flex items-center space-x-1.5 shadow-sm transition active:scale-95 ${
+                  totalAvailableSurplus > 0
+                    ? 'bg-emerald-600/90 hover:bg-emerald-500 cursor-pointer'
+                    : 'bg-slate-800 text-slate-500 cursor-not-allowed opacity-60'
+                }`}
+                title="Transfer all surplus cash from closed tills directly into the Branch Safe Vault (retaining opening floats)"
+              >
+                <Coins className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Sweep to Safe</span>
+                <span className="sm:hidden">To Safe</span>
+                {totalAvailableSurplus > 0 && (
+                  <span className="font-mono text-[10px] bg-emerald-800/90 px-1.5 py-0.2 rounded text-emerald-200 font-black">
+                    ${totalAvailableSurplus.toFixed(0)}
+                  </span>
+                )}
+              </button>
+              <button
+                id="btn-sweep-all-clerk"
+                type="button"
+                disabled={totalAvailableSurplus <= 0}
+                onClick={() => handleSweepAllTills('CLERK')}
+                className={`px-3 py-1.5 rounded-lg text-white font-bold text-xs flex items-center space-x-1.5 shadow-sm transition active:scale-95 ml-1 ${
+                  totalAvailableSurplus > 0
+                    ? 'bg-indigo-600/90 hover:bg-indigo-500 cursor-pointer'
+                    : 'bg-slate-800 text-slate-500 cursor-not-allowed opacity-60'
+                }`}
+                title="Transfer all surplus cash from closed tills directly into Accounts Clerk Float at the petty cash desk"
+              >
+                <User className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Sweep to Clerk</span>
+                <span className="sm:hidden">To Clerk</span>
+                {totalAvailableSurplus > 0 && (
+                  <span className="font-mono text-[10px] bg-indigo-800/90 px-1.5 py-0.2 rounded text-indigo-200 font-black">
+                    ${totalAvailableSurplus.toFixed(0)}
+                  </span>
+                )}
+              </button>
+            </div>
+
             <button
               id="btn-save-all-sales"
               type="button"
@@ -1178,14 +1375,14 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                       </td>
                     </tr>
                   ) : (
-                    filteredRows.map((row) => {
+                    filteredRows.map((row, rowIdx) => {
                       const isBalanced = row.status === 'Balanced';
                       const isShortage = row.status === 'Shortage';
                       const isOver = row.status === 'Over';
 
                       return (
                         <tr
-                          key={row.staffId}
+                          key={`${row.staffId}-${rowIdx}`}
                           id={`row-staff-${row.staffId}`}
                           className={`hover:bg-slate-800/40 transition ${
                             row.hasActivity ? 'bg-slate-900/40' : 'opacity-80'
@@ -1198,9 +1395,23 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                                 {row.staffName.charAt(0)}
                               </div>
                               <div>
-                                <span className="font-bold text-white block leading-tight">
-                                  {row.staffName}
-                                </span>
+                                <div className="flex items-center space-x-1.5">
+                                  <span className="font-bold text-white block leading-tight">
+                                    {row.staffName}
+                                  </span>
+                                  {(() => {
+                                    const sp = salespeople.find((s) => s.id === row.staffId);
+                                    const roleStr = (sp?.role || '').toLowerCase();
+                                    if (roleStr.includes('clerk') || roleStr.includes('account')) {
+                                      return (
+                                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-bold border border-indigo-500/30" title="Only POS Register till events shown. Corporate custody transfers (Safe <-> HQ) are managed in Cash Custody.">
+                                          Till POS Only
+                                        </span>
+                                      );
+                                    }
+                                    return null;
+                                  })()}
+                                </div>
                                 <span className="text-[10px] text-slate-400 font-mono-num">
                                   ID #{row.staffId}
                                 </span>
@@ -1277,18 +1488,134 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                             </div>
                           </td>
 
-                          {/* 6. Actions (Drill-down) */}
+                          {/* 6. Actions (Drill-down & Safe Handover) */}
                           <td className="py-3 px-3 text-center">
-                            <button
-                              id={`btn-audit-staff-${row.staffId}`}
-                              type="button"
-                              onClick={() => setAuditStaffId(row.staffId)}
-                              className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white text-[11px] font-bold inline-flex items-center space-x-1.5 transition border border-slate-700"
-                              title={`Drill-down to see movements for ${row.staffName}`}
-                            >
-                              <Eye className="w-3.5 h-3.5 text-[#6A4DFF]" />
-                              <span>View Movements</span>
-                            </button>
+                            <div className="flex items-center justify-center space-x-1.5">
+                              <button
+                                id={`btn-audit-staff-${row.staffId}`}
+                                type="button"
+                                onClick={() => setAuditStaffId(row.staffId)}
+                                className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white text-[11px] font-bold inline-flex items-center space-x-1.5 transition border border-slate-700"
+                                title={`Drill-down to see movements for ${row.staffName}`}
+                              >
+                                <Eye className="w-3.5 h-3.5 text-[#6A4DFF]" />
+                                <span>Movements</span>
+                              </button>
+
+                              {(() => {
+                                const govConfig = getCashGovernanceConfig();
+                                const customVal = customRetainedFloats[row.staffId];
+                                const effectiveRetainedFloat = customVal !== undefined && customVal.trim() !== ''
+                                  ? (parseFloat(customVal) >= 0 ? parseFloat(customVal) : 0)
+                                  : (row.float > 0 ? row.float : (govConfig.defaultTillFloat || 20.0));
+                                const rawTillCash =
+                                  row.actualCashCount !== null && row.actualCashCount !== undefined
+                                    ? row.actualCashCount
+                                    : (row.physicalCashCount || row.expectedCash || 0);
+
+                                const allTransfers = getCashTransfers(currentUser?.branchId);
+                                const cashierSurrendersToday = allTransfers.filter(
+                                  (t) =>
+                                    t.type === 'TILL_COLLECTION' &&
+                                    t.status === 'COMPLETED' &&
+                                    t.created_at?.startsWith(date) &&
+                                    (t.recipient_name?.toLowerCase() === row.staffName.toLowerCase() ||
+                                      t.notes?.toLowerCase().includes(row.staffName.toLowerCase()) ||
+                                      t.from_account_id?.includes(row.staffId))
+                                );
+                                const totalSurrenderedToday = cashierSurrendersToday.reduce(
+                                  (sum, t) => sum + (Number(t.amount) || 0),
+                                  0
+                                );
+                                const netSurplus = Math.max(0, Math.round((rawTillCash - totalSurrenderedToday - effectiveRetainedFloat) * 100) / 100);
+                                const hasSurplus = netSurplus > 0;
+                                const lastTarget = cashierSurrendersToday[cashierSurrendersToday.length - 1]?.to_account_id?.includes('CLERK') ? 'Clerk' : 'Safe';
+
+                                return (
+                                  <div className="flex items-center space-x-1.5 ml-1">
+                                    {/* Editable Retained Float (e.g. $15, $20, $30) */}
+                                    <div
+                                      className="inline-flex items-center space-x-1 bg-slate-900/90 border border-slate-700/80 px-2 py-0.5 rounded-xl shadow-inner"
+                                      title="Float retained in cashier cashbox for tomorrow's shift (default $20; editable to $15, $30, etc.)"
+                                    >
+                                      <span className="text-[10px] text-slate-400 font-semibold">Retain:</span>
+                                      <div className="relative flex items-center">
+                                        <span className="text-[10px] text-slate-500 font-mono mr-0.5">$</span>
+                                        <input
+                                          type="number"
+                                          step="1"
+                                          min="0"
+                                          value={customRetainedFloats[row.staffId] ?? String(effectiveRetainedFloat)}
+                                          onChange={(e) => {
+                                            const val = e.target.value;
+                                            setCustomRetainedFloats((prev) => ({
+                                              ...prev,
+                                              [row.staffId]: val,
+                                            }));
+                                          }}
+                                          className="w-11 text-center bg-slate-950 border border-slate-700 rounded px-1 py-0.2 text-white font-mono text-[11px] focus:border-emerald-500 focus:outline-none"
+                                          placeholder="20"
+                                        />
+                                      </div>
+                                    </div>
+
+                                    {totalSurrenderedToday > 0 && (
+                                      <span
+                                        className="text-[10px] text-emerald-400 font-bold bg-emerald-950/70 border border-emerald-600/40 px-2 py-0.5 rounded-lg flex items-center space-x-1 whitespace-nowrap"
+                                        title={`Already surrendered $${totalSurrenderedToday.toFixed(2)} to ${lastTarget} today`}
+                                      >
+                                        <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                        <span>Surrendered ${totalSurrenderedToday.toFixed(0)}</span>
+                                      </span>
+                                    )}
+                                    <div className="inline-flex rounded-xl border border-slate-700 p-0.5 bg-slate-950 shadow-sm">
+                                      <button
+                                        type="button"
+                                        disabled={!hasSurplus}
+                                        onClick={() => handleExecuteHandover(row.staffId, row.staffName, rawTillCash, effectiveRetainedFloat, 'SAFE')}
+                                        className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center space-x-1 transition shadow-sm ${
+                                          hasSurplus
+                                            ? 'bg-emerald-950/80 hover:bg-emerald-800 border border-emerald-600/40 text-emerald-200 cursor-pointer active:scale-95'
+                                            : 'bg-slate-900 border border-slate-800 text-slate-500 cursor-not-allowed opacity-50'
+                                        }`}
+                                        title={
+                                          hasSurplus
+                                            ? `Surrender surplus cash ($${netSurplus.toFixed(2)}) directly To Branch Safe (dual-custody vault) retaining $${effectiveRetainedFloat.toFixed(2)} in cashbox`
+                                            : totalSurrenderedToday > 0
+                                            ? `All surplus cash ($${totalSurrenderedToday.toFixed(2)}) already surrendered`
+                                            : `Till cash ($${rawTillCash.toFixed(2)}) does not exceed retained float ($${effectiveRetainedFloat.toFixed(2)})`
+                                        }
+                                      >
+                                        <Coins className={`w-3 h-3 ${hasSurplus ? 'text-emerald-400' : 'text-slate-600'}`} />
+                                        <span>To Safe</span>
+                                        {hasSurplus && <span className="font-mono text-[9px] text-emerald-300 ml-0.5">${netSurplus.toFixed(0)}</span>}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        disabled={!hasSurplus}
+                                        onClick={() => handleExecuteHandover(row.staffId, row.staffName, rawTillCash, effectiveRetainedFloat, 'CLERK')}
+                                        className={`px-2 py-1 rounded-lg text-[11px] font-bold inline-flex items-center space-x-1 transition shadow-sm ml-1 ${
+                                          hasSurplus
+                                            ? 'bg-indigo-950/80 hover:bg-indigo-800 border border-indigo-600/40 text-indigo-200 cursor-pointer active:scale-95'
+                                            : 'bg-slate-900 border border-slate-800 text-slate-500 cursor-not-allowed opacity-50'
+                                        }`}
+                                        title={
+                                          hasSurplus
+                                            ? `Surrender surplus cash ($${netSurplus.toFixed(2)}) To Accounts Clerk (at petty cash/reconciliation desk) retaining $${effectiveRetainedFloat.toFixed(2)} in cashbox`
+                                            : totalSurrenderedToday > 0
+                                            ? `All surplus cash ($${totalSurrenderedToday.toFixed(2)}) already surrendered`
+                                            : `Till cash ($${rawTillCash.toFixed(2)}) does not exceed retained float ($${effectiveRetainedFloat.toFixed(2)})`
+                                        }
+                                      >
+                                        <User className={`w-3 h-3 ${hasSurplus ? 'text-indigo-400' : 'text-slate-600'}`} />
+                                        <span>To Clerk</span>
+                                        {hasSurplus && <span className="font-mono text-[9px] text-indigo-300 ml-0.5">${netSurplus.toFixed(0)}</span>}
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })()}
+                            </div>
                           </td>
                         </tr>
                       );
@@ -1406,11 +1733,11 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                     s.role === 'SUPER_ADMIN' ||
                     isSupervisorOrAbove(s.role)
                 )
-                .map((sup) => {
+                .map((sup, idx) => {
                   const summary = calculateSupervisorExpectedCash(sup.id, date);
                   return (
                     <div
-                      key={sup.id}
+                      key={`${sup.id}-${idx}`}
                       className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-3 shadow-md"
                     >
                       <div className="flex items-center justify-between border-b border-slate-800 pb-2">
@@ -1930,7 +2257,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                   </p>
                 ) : (
                   <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                    {selectedAuditData.staffMovements.map((mov) => {
+                    {selectedAuditData.staffMovements.map((mov, movIdx) => {
                       const isIn = mov.direction === 'in';
                       const isOut = mov.direction === 'out';
                       const timeStr = new Date(mov.timestamp).toLocaleTimeString([], {
@@ -1940,7 +2267,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
 
                       return (
                         <div
-                          key={mov.id}
+                          key={`${mov.id}-${movIdx}`}
                           className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between text-[11px] gap-2"
                         >
                           <div className="space-y-0.5 min-w-0">
@@ -2009,9 +2336,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                   </p>
                 ) : (
                   <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-                    {selectedAuditData.form2Logs.map((log) => (
+                    {selectedAuditData.form2Logs.map((log, logIdx) => (
                       <div
-                        key={log.id}
+                        key={`${log.id}-${logIdx}`}
                         className="p-2 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
                       >
                         <div>
@@ -2043,9 +2370,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                   </p>
                 ) : (
                   <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-                    {selectedAuditData.form3Changes.map((chg) => (
+                    {selectedAuditData.form3Changes.map((chg, chgIdx) => (
                       <div
-                        key={chg.id}
+                        key={`${chg.id}-${chgIdx}`}
                         className="p-2 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
                       >
                         <div>
@@ -2069,9 +2396,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                     <span>Form 3: Credit Sales ({selectedAuditData.form3Credits.length})</span>
                   </h4>
                   <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
-                    {selectedAuditData.form3Credits.map((cr) => (
+                    {selectedAuditData.form3Credits.map((cr, crIdx) => (
                       <div
-                        key={cr.id}
+                        key={`${cr.id}-${crIdx}`}
                         className="p-2 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
                       >
                         <div>
@@ -2135,9 +2462,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                   </p>
                 ) : (
                   <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                    {selectedAuditData.staffSales.map((sale) => (
+                    {selectedAuditData.staffSales.map((sale, saleIdx) => (
                       <div
-                        key={sale.id}
+                        key={`${sale.id}-${saleIdx}`}
                         className="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
                       >
                         <div className="space-y-0.5">

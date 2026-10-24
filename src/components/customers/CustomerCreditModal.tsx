@@ -5,6 +5,8 @@ import {
   getCreditPolicy,
   getCustomerCreditSummary,
   updateCustomerCreditTerms,
+  getCreditGroups,
+  getStandardGroupLimit,
 } from '../../db/roomDatabase';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import {
@@ -17,6 +19,7 @@ import {
   Coins,
   History,
   User,
+  Check,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
@@ -40,10 +43,20 @@ export const CustomerCreditModal: React.FC<CustomerCreditModalProps> = ({
   const policy = getCreditPolicy();
   const maxCap = policy.maxCustomerCreditCap || 300.0;
   const isAuthorized = isSupervisorOrAbove(currentUser.role) || Boolean(currentUser.permissions?.canGrantCredit);
+  const standardGroupLimit = getStandardGroupLimit(); // $5.00
+  const creditGroups = getCreditGroups();
 
-  const [creditAllowed, setCreditAllowed] = useState(customer.creditAllowed !== false);
-  const [creditLimit, setCreditLimit] = useState(String(customer.creditLimit !== undefined ? customer.creditLimit : policy.defaultCreditLimit));
-  const [maxReceipts, setMaxReceipts] = useState(String(customer.maxCreditReceiptCount !== undefined ? customer.maxCreditReceiptCount : policy.defaultMaxReceiptCount));
+  // Strict default: only true if explicitly customer.creditAllowed === true
+  const [creditAllowed, setCreditAllowed] = useState(customer.creditAllowed === true);
+  const [creditLimit, setCreditLimit] = useState(
+    customer.creditAllowed === true
+      ? String(customer.creditLimit !== undefined ? customer.creditLimit : standardGroupLimit)
+      : '0.00'
+  );
+  const [selectedGroupId, setSelectedGroupId] = useState<string>(customer.creditGroupId || 'CGRP-001');
+  const [maxReceipts, setMaxReceipts] = useState(
+    String(customer.maxCreditReceiptCount !== undefined ? customer.maxCreditReceiptCount : policy.defaultMaxReceiptCount)
+  );
   const [showPinModal, setShowPinModal] = useState(false);
   const [authorizer, setAuthorizer] = useState<{ id: string; name: string; role: string } | null>(
     isAuthorized ? { id: currentUser.id, name: currentUser.name, role: currentUser.role } : null
@@ -53,6 +66,14 @@ export const CustomerCreditModal: React.FC<CustomerCreditModalProps> = ({
 
   const summary = getCustomerCreditSummary(customer.customerId);
 
+  const handleSelectGroup = (grpId: string) => {
+    setSelectedGroupId(grpId);
+    const grp = creditGroups.find((g) => g.id === grpId);
+    if (grp) {
+      setCreditLimit(grp.groupLimit.toFixed(2));
+    }
+  };
+
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
     if (!authorizer) {
@@ -60,8 +81,10 @@ export const CustomerCreditModal: React.FC<CustomerCreditModalProps> = ({
       return;
     }
 
-    const numericLimit = Math.max(0, parseFloat(creditLimit) || 0);
+    const numericLimit = creditAllowed ? Math.max(0, parseFloat(creditLimit) || 0) : 0;
     const numericReceipts = Math.max(1, parseInt(maxReceipts, 10) || 1);
+    const isAboveGroupLimit = numericLimit > standardGroupLimit;
+    const grp = creditGroups.find((g) => g.id === selectedGroupId);
 
     if (numericLimit > maxCap && authorizer.role !== 'OWNER' && authorizer.role !== 'SUPER_ADMIN') {
       setError(`Limit ($${numericLimit.toFixed(2)}) exceeds the Owner's maximum policy ceiling ($${maxCap.toFixed(2)}). Only the Business Owner can authorize an override.`);
@@ -78,6 +101,13 @@ export const CustomerCreditModal: React.FC<CustomerCreditModalProps> = ({
           creditAllowed,
           creditLimit: numericLimit,
           maxCreditReceiptCount: numericReceipts,
+          creditGroupId: creditAllowed ? (isAboveGroupLimit ? 'CUSTOM_ABOVE_CAP' : grp?.id || 'CGRP-001') : undefined,
+          creditGroupName: creditAllowed
+            ? isAboveGroupLimit
+              ? `Random / Custom Limit ($${numericLimit.toFixed(2)})`
+              : grp?.name || `Standard Group ($${standardGroupLimit.toFixed(2)})`
+            : undefined,
+          isCustomLimit: isAboveGroupLimit,
         },
         authorizer
       );
@@ -172,7 +202,36 @@ export const CustomerCreditModal: React.FC<CustomerCreditModalProps> = ({
 
           {/* Credit Limit & Max Receipts */}
           {creditAllowed && (
-            <div className="space-y-3 p-3.5 rounded-2xl bg-slate-950/50 border border-slate-800">
+            <div className="space-y-3.5 p-3.5 rounded-2xl bg-slate-950/50 border border-slate-800">
+              {/* Group Limit Presets */}
+              <div>
+                <label className="block text-[10px] font-bold uppercase text-slate-300 mb-1.5 flex items-center justify-between">
+                  <span>Credit Customer List / Group</span>
+                  <span className="text-[10px] font-mono text-purple-400">Standard Cap: ${standardGroupLimit.toFixed(2)}</span>
+                </label>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {creditGroups.map((grp, gIdx) => {
+                    const isSelected = selectedGroupId === grp.id && parseFloat(creditLimit) === grp.groupLimit;
+                    return (
+                      <button
+                        key={`${grp.id}-${gIdx}`}
+                        type="button"
+                        onClick={() => handleSelectGroup(grp.id)}
+                        disabled={!authorizer}
+                        className={`p-2 rounded-xl text-left border transition text-[11px] disabled:opacity-50 ${
+                          isSelected
+                            ? 'bg-purple-950/80 border-purple-500 text-white shadow-sm ring-1 ring-purple-500/40'
+                            : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        <div className="font-bold text-xs font-mono text-emerald-400">${grp.groupLimit.toFixed(0)}</div>
+                        <div className="text-[10px] truncate">{grp.name.split(' (')[0]}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
               <div>
                 <label className="block text-[11px] font-bold text-slate-300 mb-1">
                   Credit Limit ($ USD)
@@ -181,7 +240,7 @@ export const CustomerCreditModal: React.FC<CustomerCreditModalProps> = ({
                   <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-400 font-bold">$</span>
                   <input
                     type="number"
-                    step="5"
+                    step="1"
                     min="0"
                     required
                     value={creditLimit}
@@ -190,9 +249,20 @@ export const CustomerCreditModal: React.FC<CustomerCreditModalProps> = ({
                     className="w-full pl-7 pr-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-sm font-mono font-bold text-white focus:outline-none focus:border-purple-500 disabled:opacity-50"
                   />
                 </div>
-                <p className="text-[10px] text-slate-500 mt-1">
-                  Maximum allowable outstanding debt balance for this customer across all branches.
-                </p>
+                {/* Warning if credit limit is above the standard group limit */}
+                {parseFloat(creditLimit) > standardGroupLimit ? (
+                  <div className="mt-2 p-2.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-[11px] text-amber-300 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
+                    <div>
+                      <span className="font-bold">Above Standard Group Limit:</span> ${parseFloat(creditLimit || '0').toFixed(2)} exceeds the ${standardGroupLimit.toFixed(2)} store group cap. This customer will be tracked in the <strong>"Random Credit Limits"</strong> audit list.
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-1.5 text-[10px] text-emerald-400 flex items-center gap-1 font-medium">
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Within Standard ${standardGroupLimit.toFixed(2)} Group Limit list.</span>
+                  </div>
+                )}
               </div>
 
               <div>

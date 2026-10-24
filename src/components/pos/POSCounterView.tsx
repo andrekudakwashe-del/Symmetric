@@ -5,6 +5,7 @@ import { FractionalWeightModal } from './FractionalWeightModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { CartItemGestureRow } from './CartItemGestureRow';
 import { QuickAddProductModal } from './QuickAddProductModal';
+import { POSCashierFloatModal } from '../cashCustody/POSCashierFloatModal';
 import {
   Menu,
   UserPlus,
@@ -1382,6 +1383,11 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
           setShowQuickAddModal(false);
         }}
       />
+
+      {/* 15. Real-Time Cashier Till Float Physical Custody PIN Acceptance Modal */}
+      {currentUser && (
+        <POSCashierFloatModal currentUser={currentUser} />
+      )}
     </div>
   );
 };

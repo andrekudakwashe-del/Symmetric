@@ -352,7 +352,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
 
       {/* Sessions Grid */}
       <div className="max-w-7xl mx-auto grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {filteredSessions.map((s) => {
+        {filteredSessions.map((s, sIdx) => {
           const verifiedSegs = s.segments.filter((seg) => seg.status === 'VERIFIED').length;
           const totalSegs = s.segments.length;
           const hasRecounts = s.segments.some((seg) => seg.status === 'DISCREPANCY_RECOUNT');
@@ -368,7 +368,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
 
           return (
             <div
-              key={s.sessionId}
+              key={`${s.sessionId}-${sIdx}`}
               onClick={() => setSelectedSession(s)}
               className="bg-slate-900/90 hover:bg-slate-900 border border-slate-800 hover:border-blue-500/50 rounded-2xl p-5 cursor-pointer transition shadow-lg flex flex-col justify-between gap-4 group"
             >
@@ -436,9 +436,9 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                     />
                   </div>
                   <div className="flex flex-wrap gap-1 mt-2">
-                    {s.segments.map((seg) => (
+                    {s.segments.map((seg, segIdx) => (
                       <span
-                        key={seg.segmentId}
+                        key={`${seg.segmentId}-${segIdx}`}
                         className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
                           seg.status === 'VERIFIED'
                             ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'

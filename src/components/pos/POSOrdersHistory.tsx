@@ -30,6 +30,8 @@ import {
 import { ReceiptModal } from '../common/ReceiptModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { EditReceiptModal } from './EditReceiptModal';
+import { SyncStatusDot } from '../common/SyncStatusDot';
+import { retrySyncInvoice } from '../../services/googleSheetsSync';
 
 interface POSOrdersHistoryProps {
   currentUser?: Salesperson | null;
@@ -581,7 +583,7 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
           <table className="w-full text-left text-xs border-collapse">
             <thead>
               <tr className="bg-slate-950/80 border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider text-[10px]">
-                <th className="py-3 px-4">Receipt #</th>
+                <th className="py-3 px-4">Receipt # &amp; Cloud Sync</th>
                 <th className="py-3 px-3">Status</th>
                 <th className="py-3 px-4">Date &amp; Time</th>
                 <th className="py-3 px-4">Customer</th>
@@ -592,7 +594,7 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 font-sans">
-              {displayedSales.map((sale) => {
+              {displayedSales.map((sale, sIdx) => {
                 const isCredit = sale.paymentMethod === 'Credit';
                 const isCash = sale.paymentMethod === 'Cash';
                 const isRefunded = sale.status === 'Refunded';
@@ -600,9 +602,24 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
                 const isCompleted = !isRefunded && !isVoided;
 
                 return (
-                  <tr key={sale.id} className="hover:bg-slate-800/40 transition-colors">
-                    <td className="py-3 px-4 font-mono font-bold text-white">
-                      {sale.id}
+                  <tr key={`${sale.id}-${sIdx}`} className="hover:bg-slate-800/40 transition-colors">
+                    <td className="py-3 px-4">
+                      <div className="font-mono font-bold text-white flex items-center gap-1.5">
+                        <span>{sale.id}</span>
+                      </div>
+                      <div className="mt-1">
+                        <SyncStatusDot
+                          isSynced={sale.synced}
+                          syncStatus={(sale as any).syncStatus}
+                          timestamp={sale.timestamp}
+                          invoiceId={sale.id}
+                          invoiceType="sale"
+                          onRetry={async () => {
+                            await retrySyncInvoice(sale.id, 'sale');
+                            loadData();
+                          }}
+                        />
+                      </div>
                     </td>
                     <td className="py-3 px-3">
                       {isRefunded ? (

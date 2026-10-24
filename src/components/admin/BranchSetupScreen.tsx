@@ -942,8 +942,8 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
                     className="w-full bg-slate-50 border border-slate-300 rounded-xl py-2.5 px-3 text-xs font-bold text-slate-950 focus:outline-none focus:border-blue-600 focus:bg-white"
                   >
                     <option value="">-- No Manager Assigned --</option>
-                    {staffList.map((staff) => (
-                      <option key={staff.id} value={staff.id}>
+                    {staffList.map((staff, sIdx) => (
+                      <option key={`${staff.id}-${sIdx}`} value={staff.id}>
                         {staff.name} ({staff.role})
                       </option>
                     ))}
@@ -1022,11 +1022,11 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
                       Assign team members and define their specific role for this branch (e.g. Cashier here, Manager elsewhere).
                     </p>
                     <div className="space-y-1.5">
-                      {staffList.map((staff) => {
+                      {staffList.map((staff, sIdx) => {
                         const config = teamAssignments[staff.id] || { assigned: false, role: 'CASHIER' };
                         return (
                           <div
-                            key={staff.id}
+                            key={`${staff.id}-${sIdx}`}
                             className={`p-2 rounded-xl flex items-center justify-between gap-2 border text-xs transition-colors ${
                               config.assigned
                                 ? 'bg-white border-indigo-300 shadow-xs'
@@ -1207,14 +1207,14 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
                     s.name.toLowerCase().includes(teamSearchTerm.toLowerCase()) ||
                     s.role.toLowerCase().includes(teamSearchTerm.toLowerCase())
                 )
-                .map((staff) => {
+                .map((staff, sIdx) => {
                   const config = teamAssignments[staff.id] || { assigned: false, role: 'CASHIER' };
                   const bId = selectedBranchForTeam.branchId || selectedBranchForTeam.id || (selectedBranchForTeam as any).branch_id;
                   const otherAssignments = (staff.branchAssignments || []).filter((a) => a.branchId !== bId);
 
                   return (
                     <div
-                      key={staff.id}
+                      key={`${staff.id}-${sIdx}`}
                       className={`p-3 rounded-2xl border transition-all ${
                         config.assigned
                           ? 'bg-white border-indigo-300 shadow-sm'

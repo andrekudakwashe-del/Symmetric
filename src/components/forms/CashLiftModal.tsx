@@ -26,11 +26,19 @@ import {
   getSalespeople,
   addCashLift,
   getTodayDateString,
+  getCashGovernanceConfig,
 } from '../../db/roomDatabase';
 import {
   computeDrawerBalance,
   getShiftId,
 } from '../../db/cashLedger';
+import {
+  getBranchSafeAccount,
+  getClerkFloatAccount,
+} from '../../services/cashCustodyService';
+import { SyncStatusDot } from '../common/SyncStatusDot';
+import { retrySyncInvoice } from '../../services/googleSheetsSync';
+
 
 interface CashLiftModalProps {
   isOpen: boolean;
@@ -99,6 +107,9 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [completedRecord, setCompletedRecord] = useState<CashLiftRecord | null>(null);
+  const [destinationTarget, setDestinationTarget] = useState<'SAFE' | 'CLERK'>('SAFE');
+
+  const govConfig = useMemo(() => getCashGovernanceConfig(), [isOpen]);
 
   // Calculate breakdown & totals
   const breakdown = useMemo(() => {
@@ -125,6 +136,8 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
     return computeDrawerBalance(sId);
   }, [cashier.id, activeDate, isOpen, completedRecord]);
 
+  const isOverage = totalAmount > liveDrawerBalance;
+  const overageDiff = Math.max(0, Math.round((totalAmount - liveDrawerBalance) * 100) / 100);
   const remainingTillCash = Math.max(0, liveDrawerBalance - totalAmount);
 
   // Handlers for steppers
@@ -182,22 +195,23 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
       return;
     }
 
-    // Live Drawer Balance validation - Block lift if lift amount exceeds live drawer balance
+    // Live Drawer Balance validation - with configurable overage tolerance for cashiers with overs
     const sId = getShiftId(cashier.id, activeDate);
     const liveBalance = computeDrawerBalance(sId);
-    if (totalAmount > liveBalance) {
-      setErrorMsg(`Counted lift amount ($${totalAmount.toFixed(2)}) exceeds live drawer balance ($${liveBalance.toFixed(2)}). Cash lift is blocked.`);
+    if (totalAmount > liveBalance && !govConfig.allowOverageLifts) {
+      setErrorMsg(`Counted lift amount ($${totalAmount.toFixed(2)}) exceeds live drawer balance ($${liveBalance.toFixed(2)}). Cash lift is blocked. (Enable "Allow Overage Lifts" in Cash Governance Settings to permit).`);
       return;
     }
 
     // 2. Cashier PIN verification
+    const isLean = govConfig.governanceMode === 'LEAN';
     const trimmedCashierPin = cashierPin.trim();
-    if (!trimmedCashierPin) {
+    if (!isLean && !trimmedCashierPin) {
       setErrorMsg(`Cashier PIN is required for ${cashier.name}.`);
       return;
     }
     const expectedCashierPin = cashier.pin || '1234';
-    if (trimmedCashierPin !== expectedCashierPin && trimmedCashierPin !== '1234' && trimmedCashierPin !== '0000') {
+    if (!isLean && trimmedCashierPin !== expectedCashierPin && trimmedCashierPin !== '1234' && trimmedCashierPin !== '0000') {
       setErrorMsg(`Invalid Cashier PIN for ${cashier.name}. Please enter your 4-digit security PIN.`);
       return;
     }
@@ -209,12 +223,12 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
       return;
     }
     const trimmedSupervisorPin = supervisorPin.trim();
-    if (!trimmedSupervisorPin) {
+    if (!isLean && !trimmedSupervisorPin) {
       setErrorMsg(`Supervisor PIN is required for ${supervisor.name}.`);
       return;
     }
     const expectedSupervisorPin = supervisor.pin || '1234';
-    if (trimmedSupervisorPin !== expectedSupervisorPin && trimmedSupervisorPin !== '1234' && trimmedSupervisorPin !== '9999' && trimmedSupervisorPin !== '4321') {
+    if (!isLean && trimmedSupervisorPin !== expectedSupervisorPin && trimmedSupervisorPin !== '1234' && trimmedSupervisorPin !== '9999' && trimmedSupervisorPin !== '4321') {
       setErrorMsg(`Invalid Supervisor PIN for ${supervisor.name}. Please enter the supervisor authorization PIN.`);
       return;
     }
@@ -230,6 +244,8 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
         }
       });
 
+      const destAcc = destinationTarget === 'SAFE' ? getBranchSafeAccount() : getClerkFloatAccount();
+
       const { liftRecord } = addCashLift({
         cashierId: cashier.id,
         cashierName: cashier.name,
@@ -238,8 +254,9 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
         totalAmount,
         denominations: denomRecord,
         reason: customNotes.trim() ? `${reason} - ${customNotes.trim()}` : reason,
-        notes: customNotes.trim() || undefined,
+        notes: isOverage ? `Cashier Overage (+${overageDiff.toFixed(2)}). Deposited to ${destAcc.account_name}. ${customNotes.trim()}` : `Deposited to ${destAcc.account_name}. ${customNotes.trim()}`.trim(),
         date: activeDate,
+        destinationAccountId: destAcc.account_id,
       });
 
       confetti({
@@ -336,7 +353,18 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
                 <div className="border-b border-dashed border-slate-700 pb-2 flex justify-between items-center">
                   <div>
                     <span className="font-bold text-white block text-sm">CASH LIFT VOUCHER</span>
-                    <span className="text-[10px] text-slate-400">Ref: {completedRecord.id}</span>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <span className="text-[10px] text-slate-400">Ref: {completedRecord.id}</span>
+                      <SyncStatusDot
+                        isSynced={completedRecord.synced}
+                        syncStatus={(completedRecord as any).syncStatus}
+                        timestamp={completedRecord.timestamp}
+                        invoiceId={completedRecord.id}
+                        invoiceType="cash_lift"
+                        targetSheet="CashLifts"
+                        onRetry={() => retrySyncInvoice(completedRecord.id, 'cash_lift')}
+                      />
+                    </div>
                   </div>
                   <div className="text-right">
                     <span className="text-xs text-slate-400">{completedRecord.date}</span>
@@ -528,6 +556,67 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
                 </div>
               </div>
 
+              {/* Cashier Overage Alert if Counted Lift exceeds Live Book Balance */}
+              {isOverage && (
+                <div className="p-3 bg-amber-950/40 border border-amber-500/50 rounded-2xl flex items-start space-x-3 text-amber-200">
+                  <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="text-xs space-y-1">
+                    <div className="font-bold flex items-center space-x-2">
+                      <span>Cashier Overage Detected: +${overageDiff.toFixed(2)}</span>
+                      <span className="px-1.5 py-0.5 bg-amber-500/20 text-amber-300 rounded text-[10px] font-mono">
+                        Overs Allowed
+                      </span>
+                    </div>
+                    <p className="text-slate-300 text-[11px] leading-relaxed">
+                      Counted lift (${totalAmount.toFixed(2)}) exceeds drawer book balance (${liveDrawerBalance.toFixed(2)}). Retail cashiers frequently experience overs from tips, customer change donations, or unrecorded surplus. This will be safely recorded in the audit trail without blocking the lift.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Custody Chain Destination Account Selection */}
+              <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-2xl space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-300 flex items-center space-x-1.5">
+                    <Banknote className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Deposit Lifted Cash Into:</span>
+                  </span>
+                  <span className="text-[10px] text-slate-400 font-mono">Custody Chain Destination</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setDestinationTarget('SAFE')}
+                    className={`p-2 rounded-xl border text-left transition text-xs font-bold ${
+                      destinationTarget === 'SAFE'
+                        ? 'bg-emerald-950/60 border-emerald-500 text-emerald-200 ring-1 ring-emerald-500/40'
+                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center space-x-1 text-[11px]">
+                      <span>🔒 Branch Safe</span>
+                      <span className="text-[9px] px-1 bg-emerald-500/20 text-emerald-400 rounded">Vault</span>
+                    </div>
+                    <span className="block text-[10px] font-normal text-slate-400 mt-0.5">Direct to main safe vault</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDestinationTarget('CLERK')}
+                    className={`p-2 rounded-xl border text-left transition text-xs font-bold ${
+                      destinationTarget === 'CLERK'
+                        ? 'bg-indigo-950/60 border-indigo-500 text-indigo-200 ring-1 ring-indigo-500/40'
+                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <div className="flex items-center space-x-1 text-[11px]">
+                      <span>💼 Accounts Clerk Float</span>
+                      <span className="text-[9px] px-1 bg-indigo-500/20 text-indigo-400 rounded">Floor</span>
+                    </div>
+                    <span className="block text-[10px] font-normal text-slate-400 mt-0.5">Clerk physical petty custody</span>
+                  </button>
+                </div>
+              </div>
+
               {/* Dual PIN Authentication Section */}
               <div className="p-3.5 rounded-2xl bg-gradient-to-br from-purple-950/30 to-indigo-950/20 border border-purple-800/40 space-y-3">
                 <div className="flex items-center space-x-2">
@@ -581,8 +670,8 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
                         onChange={(e) => setSelectedSupervisorId(e.target.value)}
                         className="bg-slate-900 border border-slate-700 text-emerald-300 font-bold text-[11px] rounded px-1.5 py-0.5 outline-none max-w-[130px]"
                       >
-                        {supervisors.map((s) => (
-                          <option key={s.id} value={s.id}>
+                        {supervisors.map((s, sIdx) => (
+                          <option key={`${s.id}-${sIdx}`} value={s.id}>
                             {s.name} ({s.role || 'Supervisor'})
                           </option>
                         ))}

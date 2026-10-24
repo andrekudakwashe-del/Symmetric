@@ -135,14 +135,14 @@ export const FastMovingChecklistTab: React.FC<FastMovingChecklistTabProps> = ({
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {filteredList.map((item) => {
+        {filteredList.map((item, idx) => {
           const inv = inventoryList.find((i) => i.itemId === item.itemId);
           const isAirtime = item.category.toLowerCase().includes('airtime');
           const isGas = item.category.toLowerCase().includes('gas');
 
           return (
             <div
-              key={item.itemId}
+              key={`${item.itemId}-${idx}`}
               className="bg-slate-900/90 border border-slate-800 hover:border-amber-500/40 rounded-xl p-4 shadow-lg flex flex-col justify-between gap-3"
             >
               <div>

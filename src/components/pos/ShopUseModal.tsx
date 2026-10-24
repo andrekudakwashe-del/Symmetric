@@ -698,8 +698,8 @@ export const ShopUseModal: React.FC<ShopUseModalProps> = ({ isOpen, onClose, cur
                           onChange={(e) => setSelectedSupervisorId(e.target.value)}
                           className="w-full bg-slate-950 border border-slate-700 rounded-xl px-2 py-1.5 text-xs text-white"
                         >
-                          {supervisors.map((s) => (
-                            <option key={s.id} value={s.id}>
+                          {supervisors.map((s, sIdx) => (
+                            <option key={`${s.id}-${sIdx}`} value={s.id}>
                               {s.name} ({s.role})
                             </option>
                           ))}
@@ -855,8 +855,8 @@ export const ShopUseModal: React.FC<ShopUseModalProps> = ({ isOpen, onClose, cur
                                   onChange={(e) => setReviewApproverId(e.target.value)}
                                   className="w-full bg-slate-900 border border-slate-700 rounded-xl px-2 py-1 text-xs text-white"
                                 >
-                                  {supervisors.map((s) => (
-                                    <option key={s.id} value={s.id}>
+                                  {supervisors.map((s, sIdx) => (
+                                    <option key={`${s.id}-${sIdx}`} value={s.id}>
                                       {s.name} ({s.role})
                                     </option>
                                   ))}
@@ -946,8 +946,8 @@ export const ShopUseModal: React.FC<ShopUseModalProps> = ({ isOpen, onClose, cur
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800">
-                      {pastRequests.slice(0, 10).map((r) => (
-                        <tr key={r.id} className="hover:bg-slate-800/40">
+                      {pastRequests.slice(0, 10).map((r, rIdx) => (
+                        <tr key={`${r.id}-${rIdx}`} className="hover:bg-slate-800/40">
                           <td className="p-3 font-mono font-bold text-white">{r.id}</td>
                           <td className="p-3 text-slate-400">{r.date}</td>
                           <td className="p-3 font-bold text-slate-300">{r.type}</td>

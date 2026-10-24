@@ -4,15 +4,39 @@ import App from './App.tsx';
 import { GlobalErrorBoundary } from './components/common/GlobalErrorBoundary.tsx';
 import './index.css';
 
-// Register Service Worker immediately for 100% offline access and Chrome WebAPK PWA installation
+// Register Service Worker in production for offline PWA; unregister in development to avoid intercepting Vite
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js', { scope: '/' })
-    .then((reg) => {
-      console.log('SAIMETRIC Service Worker active:', reg.scope);
-    })
-    .catch((err) => {
-      console.warn('SAIMETRIC Service Worker registration notice:', err);
+  if (import.meta.env.DEV) {
+    navigator.serviceWorker.getRegistrations().then((registrations) => {
+      for (const reg of registrations) {
+        reg.unregister().catch(() => {});
+      }
     });
+  } else {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker
+        .register('/sw.js', { scope: '/' })
+        .then((reg) => {
+          console.log('SAIMETRIC Service Worker active:', reg.scope);
+          if (reg.waiting) {
+            reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+          }
+          reg.onupdatefound = () => {
+            const installing = reg.installing;
+            if (installing) {
+              installing.onstatechange = () => {
+                if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+                  installing.postMessage({ type: 'SKIP_WAITING' });
+                }
+              };
+            }
+          };
+        })
+        .catch((err) => {
+          console.warn('SAIMETRIC Service Worker registration notice:', err);
+        });
+    });
+  }
 }
 
 // Request persistent storage so browsers (Chrome, iOS Safari, Edge) do not evict offline data

@@ -394,8 +394,8 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({ onBack }) => {
           className="bg-slate-950 border border-slate-700/80 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-blue-500 transition"
         >
           <option value="ALL">All Staff</option>
-          {staffList.map((s) => (
-            <option key={s.id} value={s.id}>
+          {staffList.map((s, sIdx) => (
+            <option key={`${s.id}-${sIdx}`} value={s.id}>
               {s.name}
             </option>
           ))}
@@ -425,9 +425,9 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({ onBack }) => {
           </div>
         ) : (
           <div className="divide-y divide-slate-800/80 overflow-x-auto">
-            {filteredLogs.map((entry) => (
+            {filteredLogs.map((entry, idx) => (
               <div
-                key={entry.id}
+                key={`${entry.id || 'aud'}-${idx}`}
                 id={`audit-log-entry-${entry.id}`}
                 className="p-4 sm:p-5 hover:bg-slate-800/40 transition flex flex-col md:flex-row md:items-start justify-between gap-3 text-xs"
               >

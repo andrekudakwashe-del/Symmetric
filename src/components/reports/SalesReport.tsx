@@ -676,10 +676,10 @@ export const SalesReport: React.FC<SalesReportProps> = ({
           </div>
         </div>
 
-        {/* Units & Average Basket Card */}
+        {/* Average Basket Size (Sales Value) */}
         <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-4 sm:p-5 relative overflow-hidden shadow-lg">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Average Basket / Units</span>
+            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">Average Basket Size</span>
             <span className="p-2 rounded-xl bg-blue-500/10 text-blue-400">
               <BarChart3 className="w-4 h-4" />
             </span>
@@ -689,7 +689,7 @@ export const SalesReport: React.FC<SalesReportProps> = ({
               ${filteredSales.length > 0 ? (totalRevenue / filteredSales.length).toFixed(2) : '0.00'}
             </h3>
             <p className="text-[11px] text-slate-400 mt-0.5">
-              Avg ticket • {totalUnitsSold} total units fulfilled
+              Avg spend/ticket • {filteredSales.length > 0 ? (totalUnitsSold / filteredSales.length).toFixed(1) : '0'} units/basket ({totalUnitsSold} total units)
             </p>
           </div>
         </div>

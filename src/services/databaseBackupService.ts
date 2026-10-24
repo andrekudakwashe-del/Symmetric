@@ -1,6 +1,8 @@
 import {
   backupCryptoService,
 } from './backupCryptoService';
+import { setStored, cleanupLocalStorageQuota } from '../db/roomDatabase';
+import { setMeta } from '../db/indexedDBService';
 
 export type BackupType = 'FULL' | 'DELTA' | 'EOD_HANDOVER' | 'ADMIN_MASTER_UPDATE';
 
@@ -435,14 +437,25 @@ export function downloadBackupFileToDevice(fileName: string, content: string): v
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+export type RestoreProgressCallback = (progress: {
+  percent: number;
+  currentTable: string;
+  tableIndex: number;
+  totalTables: number;
+  recordsProcessed: number;
+  totalRecords: number;
+  stage: 'restoring' | 'done';
+}) => void;
+
 /**
  * Smart Upsert / Merge Engine:
- * Restores or appends records from a decrypted backup payload into local storage
+ * Restores or appends records from a decrypted backup payload into local storage & IndexedDB safely
  */
-export function restoreDatabaseFromPayload(
+export async function restoreDatabaseFromPayload(
   payload: BackupPayload,
-  mode: 'append' | 'replace' | 'master_only' = 'append'
-): RestoreResult {
+  mode: 'append' | 'replace' | 'master_only' = 'append',
+  onProgress?: RestoreProgressCallback
+): Promise<RestoreResult> {
   if (!payload || !payload.manifest || !payload.tables) {
     return {
       success: false,
@@ -456,6 +469,9 @@ export function restoreDatabaseFromPayload(
     };
   }
 
+  // Pre-emptively reclaim space from transient logs, staging rows, and old snapshots
+  cleanupLocalStorageQuota();
+
   let recordsProcessed = 0;
   let recordsAdded = 0;
   let recordsUpdated = 0;
@@ -467,24 +483,50 @@ export function restoreDatabaseFromPayload(
 
   let protectedTablesPreserved = 0;
 
-  try {
-    for (const tableConfig of BACKUP_STORAGE_TABLES) {
-      if (isMasterOnlyRestore && PROTECTED_TRANSACTIONAL_TABLES.includes(tableConfig.key)) {
-        // SAFETY GUARD: Do NOT overwrite branch sales, cash drawer, reconciliations, or customer credits!
-        protectedTablesPreserved++;
-        continue;
-      }
+  // Calculate total incoming records across all valid tables
+  let totalIncomingRecords = 0;
+  const activeTables: typeof BACKUP_STORAGE_TABLES = [];
+  for (const tableConfig of BACKUP_STORAGE_TABLES) {
+    if (isMasterOnlyRestore && PROTECTED_TRANSACTIONAL_TABLES.includes(tableConfig.key)) {
+      protectedTablesPreserved++;
+      continue;
+    }
+    const incomingRecords = payload.tables[tableConfig.key];
+    if (Array.isArray(incomingRecords)) {
+      totalIncomingRecords += incomingRecords.length;
+      activeTables.push(tableConfig);
+    }
+  }
 
+  try {
+    for (let i = 0; i < activeTables.length; i++) {
+      const tableConfig = activeTables[i];
       const incomingRecords = payload.tables[tableConfig.key];
       if (!Array.isArray(incomingRecords)) continue;
 
+      if (onProgress) {
+        const percent = totalIncomingRecords > 0
+          ? Math.round((recordsProcessed / totalIncomingRecords) * 100)
+          : Math.round((i / activeTables.length) * 100);
+        onProgress({
+          percent,
+          currentTable: tableConfig.name,
+          tableIndex: i + 1,
+          totalTables: activeTables.length,
+          recordsProcessed,
+          totalRecords: totalIncomingRecords,
+          stage: 'restoring',
+        });
+        // Brief yield for UI render paint
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
       recordsProcessed += incomingRecords.length;
 
+      let recordsToSave: any[] = [];
+
       if (mode === 'replace') {
-        // Fresh machine replace: overwrite entire table
-        if (typeof window !== 'undefined' && window.localStorage) {
-          window.localStorage.setItem(tableConfig.key, JSON.stringify(incomingRecords));
-        }
+        recordsToSave = incomingRecords;
         recordsAdded += incomingRecords.length;
       } else {
         // Smart Append / Upsert Mode (or Master Only update)
@@ -534,8 +576,40 @@ export function restoreDatabaseFromPayload(
           }
         }
 
-        if (typeof window !== 'undefined' && window.localStorage) {
-          window.localStorage.setItem(tableConfig.key, JSON.stringify(currentRecords));
+        recordsToSave = currentRecords;
+      }
+
+      // 1. Update in-memory cache and notify local subscribers
+      setStored(tableConfig.key, recordsToSave);
+
+      // 2. Persist to IndexedDB (unlimited quota store)
+      try {
+        await setMeta(`room_${tableConfig.key}`, recordsToSave);
+      } catch (idbErr) {
+        console.warn(`[BackupRestore] IndexedDB write for ${tableConfig.key}:`, idbErr);
+      }
+
+      // 3. LocalStorage persistence with resilient quota guard
+      if (typeof window !== 'undefined' && window.localStorage) {
+        try {
+          window.localStorage.setItem(tableConfig.key, JSON.stringify(recordsToSave));
+        } catch (quotaErr) {
+          console.warn(`[BackupRestore] LocalStorage quota limit reached for ${tableConfig.key}. Preserving in IndexedDB & Memory.`, quotaErr);
+          cleanupLocalStorageQuota();
+          try {
+            window.localStorage.setItem(tableConfig.key, JSON.stringify(recordsToSave));
+          } catch (retryErr) {
+            // If data is massive (>5MB alone), keep recent slice or sentinel in localStorage so it doesn't crash
+            try {
+              if (Array.isArray(recordsToSave)) {
+                window.localStorage.setItem(tableConfig.key, JSON.stringify((recordsToSave as any[]).slice(-80)));
+              } else {
+                window.localStorage.setItem(tableConfig.key, JSON.stringify({ __overflow_idb: true, count: 1 }));
+              }
+            } catch {
+              try { window.localStorage.removeItem(tableConfig.key); } catch {}
+            }
+          }
         }
       }
     }
@@ -544,7 +618,9 @@ export function restoreDatabaseFromPayload(
     if (payload.metadata && typeof window !== 'undefined' && window.localStorage) {
       for (const [k, v] of Object.entries(payload.metadata)) {
         if (typeof v === 'string') {
-          window.localStorage.setItem(k, v);
+          try {
+            window.localStorage.setItem(k, v);
+          } catch {}
         }
       }
     }
@@ -559,6 +635,18 @@ export function restoreDatabaseFromPayload(
       window.dispatchEvent(new CustomEvent('saimetric_grn_updated', { detail: { count: recordsProcessed } }));
       window.dispatchEvent(new CustomEvent('saimetric_trips_updated', { detail: { count: recordsProcessed } }));
       window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: { count: recordsProcessed } }));
+    }
+
+    if (onProgress) {
+      onProgress({
+        percent: 100,
+        currentTable: 'Complete',
+        tableIndex: activeTables.length,
+        totalTables: activeTables.length,
+        recordsProcessed,
+        totalRecords: totalIncomingRecords,
+        stage: 'done',
+      });
     }
 
     const resultMsg = isMasterOnlyRestore
@@ -598,7 +686,8 @@ export function restoreDatabaseFromPayload(
 export async function restoreEncryptedBackup(
   rawContent: string,
   passphrase: string,
-  mode: 'append' | 'replace' | 'master_only' = 'append'
+  mode: 'append' | 'replace' | 'master_only' = 'append',
+  onProgress?: RestoreProgressCallback
 ): Promise<RestoreResult> {
   const decResult = await backupCryptoService.decryptBackupPayload(rawContent, passphrase);
   if (!decResult.success || !decResult.data) {
@@ -614,7 +703,7 @@ export async function restoreEncryptedBackup(
     };
   }
 
-  return restoreDatabaseFromPayload(decResult.data, mode);
+  return restoreDatabaseFromPayload(decResult.data, mode, onProgress);
 }
 
 export const databaseBackupService = {

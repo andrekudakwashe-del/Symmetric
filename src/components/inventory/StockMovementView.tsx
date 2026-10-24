@@ -339,9 +339,9 @@ export const StockMovementView: React.FC<StockMovementViewProps> = ({ currentUse
                   </td>
                 </tr>
               ) : (
-                filteredMovements.map((mov) => {
+                filteredMovements.map((mov, movIdx) => {
                   return (
-                    <tr key={mov.movementId} className="hover:bg-slate-50/75 transition-colors">
+                    <tr key={`${mov.movementId || mov.txnId || 'mov'}-${movIdx}`} className="hover:bg-slate-50/75 transition-colors">
                       {/* ID & Timestamp */}
                       <td className="py-3.5 px-4 font-mono">
                         <div className="text-xs font-bold text-slate-900">{mov.movementId}</div>

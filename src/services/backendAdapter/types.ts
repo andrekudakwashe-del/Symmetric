@@ -88,6 +88,8 @@ export interface TenantDataSnapshot {
     customers?: any[];
     customerChanges?: any[];
     suppliers?: any[];
+    cashAccounts?: any[];
+    cashTransfers?: any[];
     settings?: Record<string, any>;
   };
   metrics: {

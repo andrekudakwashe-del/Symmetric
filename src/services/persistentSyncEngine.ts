@@ -51,6 +51,7 @@ import {
   pullTenantInventory,
   pullTenantSales,
   clearAllSyncQueueItems,
+  markReceiptAsSynced,
 } from '../db/roomDatabase';
 import { retentionLifecycleService } from './backendAdapter/retentionService';
 import { Company, SaaSBranch } from '../data/saasData';
@@ -343,6 +344,8 @@ class PersistentSyncEngine {
     return item;
   }
 
+  public enqueueSyncItem = this.enqueueWrite.bind(this);
+
   /**
    * Drains pending items with tenant isolation and high-speed batching for high volume items.
    */
@@ -468,6 +471,19 @@ class PersistentSyncEngine {
                   postedIds: chunk.map((c) => c.id),
                   sheetName: 'Transactions',
                 });
+                try {
+                  const bReqIds = chunk.map((c) => c.clientRequestId).filter(Boolean) as string[];
+                  const bItemIds = chunk.flatMap((c) => [
+                    c.id,
+                    c.payload?.id,
+                    c.payload?.InvoiceID,
+                    c.payload?.saleId,
+                    c.payload?.invoiceNumber,
+                    c.payload?.grnId,
+                    c.payload?.voucherId,
+                  ]).filter(Boolean) as string[];
+                  markReceiptAsSynced(bReqIds, bItemIds);
+                } catch {}
                 succeeded += chunk.length;
                 processed += chunk.length;
                 continue;
@@ -525,6 +541,20 @@ class PersistentSyncEngine {
           postedIds: [item.id],
           sheetName: item.sheetName,
         });
+
+        // Mark local entity as synced across Room DB
+        try {
+          const targetItemIds = [
+            item.id,
+            item.payload?.id,
+            item.payload?.InvoiceID,
+            item.payload?.saleId,
+            item.payload?.invoiceNumber,
+            item.payload?.grnId,
+            item.payload?.voucherId,
+          ].filter(Boolean) as string[];
+          markReceiptAsSynced(item.clientRequestId ? [item.clientRequestId] : [], targetItemIds);
+        } catch {}
 
         // Trigger immediate entity refresh if staff or branch was modified
         if (item.action === 'upsert_staff' || item.sheetName === 'users') {

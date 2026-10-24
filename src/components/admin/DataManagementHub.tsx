@@ -112,6 +112,7 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
   const [parsedSuppliers, setParsedSuppliers] = useState<Supplier[] | null>(null);
   const [parseErrors, setParseErrors] = useState<string[]>([]);
   const [importSuccessMessage, setImportSuccessMessage] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
 
   // Search filter for reports export grid
   const [reportSearch, setReportSearch] = useState('');
@@ -136,6 +137,7 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
     setParsedSuppliers(null);
     setParseErrors([]);
     setImportSuccessMessage(null);
+    setUploadProgress(null);
   };
 
   // Handle file drop / select
@@ -143,9 +145,16 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
     setUploadedFileName(file.name);
     setParseErrors([]);
     setImportSuccessMessage(null);
+    setUploadProgress(0);
 
     const reader = new FileReader();
+    reader.onprogress = (e) => {
+      if (e.lengthComputable && e.total > 0) {
+        setUploadProgress(Math.min(99, Math.round((e.loaded / e.total) * 100)));
+      }
+    };
     reader.onload = (e) => {
+      setUploadProgress(100);
       const text = e.target?.result as string;
       if (!text) {
         setParseErrors(['Selected file is empty.']);
@@ -710,6 +719,25 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
               </div>
             </div>
 
+            {/* Upload Progress Indicator */}
+            {uploadProgress !== null && uploadProgress < 100 && (
+              <div className="p-3 bg-slate-950 rounded-xl border border-indigo-500/30 space-y-1.5 animate-fadeIn">
+                <div className="flex items-center justify-between text-xs font-bold text-indigo-300">
+                  <span className="flex items-center gap-1.5">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Reading &amp; Validating {uploadedFileName}...</span>
+                  </span>
+                  <span className="font-mono text-white">{uploadProgress}%</span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-indigo-500 h-full rounded-full transition-all duration-150"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
             {/* Parsed Preview Table */}
             {parsedInventory && (
               <div className="space-y-3 animate-fadeIn">
@@ -928,6 +956,25 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
               </div>
             </div>
 
+            {/* Upload Progress Indicator */}
+            {uploadProgress !== null && uploadProgress < 100 && (
+              <div className="p-3 bg-slate-950 rounded-xl border border-blue-500/30 space-y-1.5 animate-fadeIn">
+                <div className="flex items-center justify-between text-xs font-bold text-blue-300">
+                  <span className="flex items-center gap-1.5">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Reading &amp; Validating {uploadedFileName}...</span>
+                  </span>
+                  <span className="font-mono text-white">{uploadProgress}%</span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-blue-500 h-full rounded-full transition-all duration-150"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
             {/* Parsed Preview Table */}
             {parsedCustomers && (
               <div className="space-y-3 animate-fadeIn">
@@ -1130,6 +1177,25 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
                 <p className="text-[11px] text-slate-400 mt-0.5">Supports .CSV (comma delimited) or .JSON files</p>
               </div>
             </div>
+
+            {/* Upload Progress Indicator */}
+            {uploadProgress !== null && uploadProgress < 100 && (
+              <div className="p-3 bg-slate-950 rounded-xl border border-cyan-500/30 space-y-1.5 animate-fadeIn">
+                <div className="flex items-center justify-between text-xs font-bold text-cyan-300">
+                  <span className="flex items-center gap-1.5">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Reading &amp; Validating {uploadedFileName}...</span>
+                  </span>
+                  <span className="font-mono text-white">{uploadProgress}%</span>
+                </div>
+                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                  <div
+                    className="bg-cyan-500 h-full rounded-full transition-all duration-150"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
 
             {/* Parsed Preview Table */}
             {parsedSuppliers && (

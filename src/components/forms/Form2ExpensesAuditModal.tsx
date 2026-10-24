@@ -17,6 +17,8 @@ import {
   Tag,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
+import { SyncStatusDot } from '../common/SyncStatusDot';
+import { retrySyncInvoice } from '../../services/googleSheetsSync';
 
 interface Form2ExpensesAuditModalProps {
   isOpen: boolean;
@@ -204,11 +206,11 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
               </p>
             </div>
           ) : (
-            cashExpenses.map((exp) => {
+            cashExpenses.map((exp, expIdx) => {
               const isApproved = exp.status === 'approved';
               return (
                 <div
-                  key={exp.id}
+                  key={`${exp.id}-${expIdx}`}
                   className={`p-3.5 rounded-2xl border transition flex items-center justify-between gap-3 ${
                     isApproved
                       ? 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
@@ -218,6 +220,18 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
                   <div className="space-y-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-mono text-xs font-black text-white">{exp.id}</span>
+                      <SyncStatusDot
+                        isSynced={exp.synced}
+                        syncStatus={(exp as any).syncStatus}
+                        timestamp={exp.timestamp}
+                        invoiceId={exp.id}
+                        invoiceType="expense"
+                        targetSheet="Expenses"
+                        onRetry={async () => {
+                          await retrySyncInvoice(exp.id, 'expense');
+                          onExpensesUpdated();
+                        }}
+                      />
                       <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-300">
                         {exp.category}
                       </span>
@@ -331,8 +345,8 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
                 >
                   {salespeople
                     .filter((s) => isSupervisorOrAbove(s.role))
-                    .map((s) => (
-                      <option key={s.id} value={s.id} className="bg-slate-900 text-white">
+                    .map((s, sIdx) => (
+                      <option key={`${s.id}-${sIdx}`} value={s.id} className="bg-slate-900 text-white">
                         {s.name} ({s.role})
                       </option>
                     ))}

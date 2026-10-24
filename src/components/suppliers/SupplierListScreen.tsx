@@ -260,9 +260,9 @@ export const SupplierListScreen: React.FC<SupplierListScreenProps> = ({
 
           {/* Category Filter Pills */}
           <div className="flex items-center gap-1.5 overflow-x-auto w-full md:w-auto pb-1 md:pb-0">
-            {categories.map((cat) => (
+            {categories.map((cat, idx) => (
               <button
-                key={cat}
+                key={`${cat}-${idx}`}
                 onClick={() => setSelectedCategory(cat)}
                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
                   selectedCategory === cat
@@ -296,11 +296,11 @@ export const SupplierListScreen: React.FC<SupplierListScreenProps> = ({
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {filteredSuppliers.map((supplier) => {
+            {filteredSuppliers.map((supplier, idx) => {
               const stats = getSupplierStats(supplier.supplierId);
               return (
                 <div
-                  key={supplier.supplierId}
+                  key={`${supplier.supplierId || (supplier as any).id || 'sup'}-${idx}`}
                   onClick={() => setSelectedSupplierForDetails(supplier)}
                   className="p-5 rounded-2xl bg-slate-850 border border-slate-800 hover:border-blue-500/50 transition-all cursor-pointer group hover:shadow-xl hover:shadow-blue-950/20 flex flex-col justify-between"
                 >

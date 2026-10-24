@@ -301,7 +301,7 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
 
                 return (
                   <div
-                    key={cust.customerId}
+                    key={`${cust.customerId || 'cust'}-${idx}`}
                     onMouseDown={(e) => {
                       e.preventDefault(); // Prevent input blur before selection
                       handleSelect(cust);

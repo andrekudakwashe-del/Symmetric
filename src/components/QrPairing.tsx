@@ -502,8 +502,8 @@ export const QrPairing: React.FC<QrPairingProps> = ({ onClose, className = '' })
             <span className="text-[11px] text-emerald-400 font-mono">Instant P2P Sync</span>
           </div>
           <div className="space-y-1.5 max-h-40 overflow-y-auto">
-            {recentSales.map((s) => (
-              <div key={s.id} className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between text-xs">
+            {recentSales.map((s, idx) => (
+              <div key={`${s.id}-${idx}`} className="p-2 rounded-lg bg-slate-900 border border-slate-800 flex items-center justify-between text-xs">
                 <div className="flex items-center gap-2">
                   <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
                   <span className="font-mono font-bold text-white">{s.id}</span>

@@ -41,6 +41,8 @@ import {
   MapPin,
   CreditCard,
   UserCheck,
+  Edit3,
+  Database,
 } from 'lucide-react';
 import {
   InventoryItem,
@@ -65,6 +67,7 @@ import {
   subscribeRoomDatabase,
   getStored,
   STORAGE_KEYS,
+  getFastMovingChecklist,
 } from '../../db/roomDatabase';
 import { SupplierRegistrationModal } from '../suppliers/SupplierRegistrationModal';
 import { INITIAL_GOODS_RECEIVED, INITIAL_SUPPLIER_INVOICES, INITIAL_INVENTORY_ITEMS } from '../../data/initialData';
@@ -186,6 +189,10 @@ export interface ReorderItemAnalysis {
 
   // Budget status
   isFundedInBudget: boolean;
+
+  // Dual-Criteria Velocity Classification
+  isFastMover: boolean;
+  isSlowMover: boolean;
 }
 
 export interface PoLineItem {
@@ -201,6 +208,9 @@ export interface PoLineItem {
   caseCost: number;
   lineTotal: number;
   sellingPrice: number;
+  originalCaseCost?: number;
+  originalUnitCost?: number;
+  isCostModified?: boolean;
 }
 
 export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
@@ -229,12 +239,15 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
   const [selectedCategory, setSelectedCategory] = useState('ALL');
   const [selectedSupplierId, setSelectedSupplierId] = useState('ALL');
   const [tierFilter, setTierFilter] = useState<'ALL' | 'CRITICAL' | 'URGENT' | 'PLAN' | 'ALL_NEEDS'>('ALL_NEEDS');
+  const [fastMoversOnly, setFastMoversOnly] = useState<boolean>(false);
+  const [fastMovingList, setFastMovingList] = useState(() => getFastMovingChecklist());
   const [budgetFilter, setBudgetFilter] = useState<'ALL' | 'FUNDED' | 'UNFUNDED'>('ALL');
   const [sortBy, setSortBy] = useState<'URGENCY' | 'STOCKOUT_DAYS' | 'MARGIN' | 'COST' | 'VELOCITY'>('URGENCY');
   const [mobileViewMode, setMobileViewMode] = useState<'CARDS' | 'TABLE'>('CARDS');
 
-  // User selections overrides: itemId -> custom cases count
+  // User selections overrides: itemId -> custom cases count & custom quoted supplier cost
   const [orderCasesOverrides, setOrderCasesOverrides] = useState<Record<string, number>>({});
+  const [orderCostOverrides, setOrderCostOverrides] = useState<Record<string, number>>({});
   const [selectedItemIds, setSelectedItemIds] = useState<Set<string>>(new Set());
 
   // Commercial Purchase Order Slip Modal State
@@ -353,9 +366,18 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       setSuppliers(getSuppliers());
       setCompany(getCurrentCompany());
       setBranch(getCurrentBranch());
+      setFastMovingList(getFastMovingChecklist());
     });
     return unsub;
   }, []);
+
+  const fastMovingItemIds = useMemo(() => {
+    const set = new Set<string>();
+    fastMovingList.forEach((f) => {
+      if (f.itemId) set.add(f.itemId.trim().toUpperCase());
+    });
+    return set;
+  }, [fastMovingList]);
 
   const todayStr = useMemo(() => new Date().toISOString().split('T')[0], []);
   const todayTime = useMemo(() => new Date(todayStr).getTime(), [todayStr]);
@@ -747,12 +769,27 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       // Reorder Point (ROP) Model = (Daily Sales * Lead Time) + Safety Stock
       const reorderPointUnits = Math.round(avgDailySales * leadTimeDays + safetyStockUnits);
 
-      // Costs and Margins
-      const unitCost = item.costPerUnit !== undefined ? item.costPerUnit : ((item as any).lastCostPrice || (item as any).costPrice || 0);
-      const caseCost = item.costPerCase !== undefined ? item.costPerCase : (unitCost * unitsPerCase);
+      // Costs and Margins (incorporating supplier price changes or clerk overrides)
+      const baseUnitCost = item.costPerUnit !== undefined ? item.costPerUnit : ((item as any).lastCostPrice || (item as any).costPrice || 0);
+      const baseCaseCost = item.costPerCase !== undefined ? item.costPerCase : (baseUnitCost * unitsPerCase);
+      const caseCost = orderCostOverrides[item.itemId] !== undefined ? orderCostOverrides[item.itemId] : baseCaseCost;
+      const unitCost = Number((caseCost / unitsPerCase).toFixed(4));
       const unitSellingPrice = item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price || 0);
       const grossMarginPercent =
         unitSellingPrice > 0 ? Math.max(0, ((unitSellingPrice - unitCost) / unitSellingPrice) * 100) : 0;
+
+      // Dual-Criteria Velocity Classification
+      const rawCode = (item.itemId || '').toUpperCase();
+      const rawSku = (item.sku || '').toUpperCase();
+      const rawBarcode = (item.barcode || '').toUpperCase();
+      const isChecklistFastMover =
+        fastMovingItemIds.has(rawCode) ||
+        (rawSku ? fastMovingItemIds.has(rawSku) : false) ||
+        (rawBarcode ? fastMovingItemIds.has(rawBarcode) : false);
+
+      const isVelocityFastMover = avgDailySales >= 1.0 || salesStats.sales7d >= 7;
+      const isFastMover = isChecklistFastMover || isVelocityFastMover;
+      const isSlowMover = !isFastMover && (salesStats.sales30d === 0 || avgDailySales < 0.2);
 
       // Priority Tiers
       const isLeadTimeBreached = projectedStockoutDays <= leadTimeDays;
@@ -760,8 +797,13 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       let urgencyReason = '';
 
       if (currentStockUnits === 0) {
-        priorityTier = 'CRITICAL';
-        urgencyReason = 'OUT OF STOCK (Immediate Restock)';
+        if (isSlowMover && avgDailySales <= 0 && salesStats.sales30d === 0) {
+          priorityTier = 'PLAN';
+          urgencyReason = 'OUT OF STOCK (Zero 30d Velocity / Slow Mover)';
+        } else {
+          priorityTier = 'CRITICAL';
+          urgencyReason = 'OUT OF STOCK (Immediate Restock)';
+        }
       } else if (isLeadTimeBreached) {
         priorityTier = 'CRITICAL';
         urgencyReason = `Order TODAY (Lead Time ${leadTimeDays}d > Stock Left ${projectedStockoutDays.toFixed(1)}d)`;
@@ -837,6 +879,8 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
         customOrderCases: customCases,
         customOrderUnits: customUnits,
         customTotalCost,
+        isFastMover,
+        isSlowMover,
       };
     });
 
@@ -891,9 +935,11 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     safetyBufferPercent,
     defaultLeadTimeDays,
     orderCasesOverrides,
+    orderCostOverrides,
     selectedItemIds,
     todayTime,
     productSuppliersMap,
+    fastMovingItemIds,
   ]);
 
   // Auto-select critical & urgent items when list loads if no selection yet
@@ -909,9 +955,28 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     }
   }, [analyzedInventoryList.length]);
 
+  // Fast Movers Summary Statistics
+  const fastMoversStats = useMemo(() => {
+    let fastCount = 0;
+    let slowHiddenCount = 0;
+    analyzedInventoryList.forEach((e) => {
+      if (e.isFastMover && !e.isSlowMover) {
+        fastCount++;
+      } else if (e.isSlowMover) {
+        slowHiddenCount++;
+      }
+    });
+    return { fastCount, slowHiddenCount };
+  }, [analyzedInventoryList]);
+
   // Filtered & Sorted Display List with resilient multi-field search
   const displayedList = useMemo(() => {
     let result = analyzedInventoryList.filter((entry) => {
+      // Fast Movers Only filter (hides slow movers and dead stock)
+      if (fastMoversOnly) {
+        if (!entry.isFastMover || entry.isSlowMover) return false;
+      }
+
       // Category filter
       if (selectedCategory !== 'ALL' && entry.item.category !== selectedCategory) {
         return false;
@@ -994,6 +1059,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     return result;
   }, [
     analyzedInventoryList,
+    fastMoversOnly,
     selectedCategory,
     selectedSupplierId,
     tierFilter,
@@ -1228,51 +1294,84 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
   };
 
   // Open Full Commercial Purchase Order Modal
-  const handleOpenPoModal = (overrideSupplierId?: string) => {
-    let initialSupplierId = overrideSupplierId || selectedSupplierId;
+  const handleOpenPoModal = (param?: string | { overrideSupplierId?: string; blank?: boolean }) => {
+    let initialSupplierId: string | undefined;
+    let isBlank = false;
 
-    // If 'ALL' or 'UNASSIGNED', attempt to infer from selected items
+    if (typeof param === 'string') {
+      initialSupplierId = param;
+    } else if (param && typeof param === 'object') {
+      initialSupplierId = param.overrideSupplierId;
+      isBlank = Boolean(param.blank);
+    }
+
+    if (!initialSupplierId) {
+      initialSupplierId = selectedSupplierId;
+    }
+
+    // If 'ALL' or 'UNASSIGNED', attempt to infer from selected items or fallback to first supplier
     if (initialSupplierId === 'ALL' || initialSupplierId === 'UNASSIGNED' || !initialSupplierId) {
-      const firstWithSup = analyzedInventoryList.find(
-        (e) => selectedItemIds.has(e.item.itemId) && e.supplierId
-      );
-      if (firstWithSup && firstWithSup.supplierId) {
-        initialSupplierId = firstWithSup.supplierId;
-      } else if (suppliers.length > 0) {
-        initialSupplierId = suppliers[0].supplierId || suppliers[0].id;
+      if (!isBlank) {
+        const firstWithSup = analyzedInventoryList.find(
+          (e) => selectedItemIds.has(e.item.itemId) && e.supplierId
+        );
+        if (firstWithSup && firstWithSup.supplierId) {
+          initialSupplierId = firstWithSup.supplierId;
+        }
+      }
+      if (!initialSupplierId || initialSupplierId === 'ALL' || initialSupplierId === 'UNASSIGNED') {
+        if (suppliers.length > 0) {
+          initialSupplierId = suppliers[0].supplierId || suppliers[0].id;
+        }
       }
     }
 
-    setPoTargetSupplierId(initialSupplierId);
+    setPoTargetSupplierId(initialSupplierId || '');
 
-    // Initial lines from selected items
-    const lines: PoLineItem[] = analyzedInventoryList
-      .filter((e) => {
-        if (!selectedItemIds.has(e.item.itemId) || e.customOrderCases <= 0) return false;
-        // If an explicit supplier was selected, filter only items matching this supplier (or approved alternate)
-        if (overrideSupplierId && overrideSupplierId !== 'ALL') {
-          const matchesPrimary = e.supplierId === overrideSupplierId;
-          const matchesAlt = e.allSuppliers?.some((s) => s.id === overrideSupplierId);
-          return matchesPrimary || matchesAlt;
-        }
-        return true;
-      })
-      .map((e) => ({
-        itemId: e.item.itemId,
-        name: getItemName(e.item),
-        code: getItemCode(e.item),
-        barcode: e.item.barcode || '',
-        category: e.item.category || 'General',
-        orderCases: e.customOrderCases,
-        unitsPerCase: e.unitsPerCase,
-        totalUnits: e.customOrderUnits,
-        unitCost: e.unitCost,
-        caseCost: e.caseCost,
-        lineTotal: e.customTotalCost,
-        sellingPrice: e.unitSellingPrice,
-      }));
+    if (isBlank) {
+      // Direct blank purchase order: start with 0 days-cover line items
+      setPoCustomLines([]);
+    } else {
+      // Initial lines from selected items
+      const lines: PoLineItem[] = analyzedInventoryList
+        .filter((e) => {
+          if (!selectedItemIds.has(e.item.itemId) || e.customOrderCases <= 0) return false;
+          // If an explicit supplier was selected, filter only items matching this supplier (or approved alternate)
+          if (initialSupplierId && initialSupplierId !== 'ALL' && initialSupplierId !== 'UNASSIGNED') {
+            const matchesPrimary = e.supplierId === initialSupplierId;
+            const matchesAlt = e.allSuppliers?.some((s) => s.id === initialSupplierId);
+            return matchesPrimary || matchesAlt;
+          }
+          return true;
+        })
+        .map((e) => {
+          const originalCaseCost = e.item.costPerCase !== undefined 
+            ? e.item.costPerCase 
+            : ((e.item.costPerUnit !== undefined ? e.item.costPerUnit : ((e.item as any).lastCostPrice || (e.item as any).costPrice || 0)) * e.unitsPerCase);
+          const originalUnitCost = Number((originalCaseCost / e.unitsPerCase).toFixed(4));
+          const isModified = Math.abs(e.caseCost - originalCaseCost) > 0.005;
 
-    setPoCustomLines(lines);
+          return {
+            itemId: e.item.itemId,
+            name: getItemName(e.item),
+            code: getItemCode(e.item),
+            barcode: e.item.barcode || '',
+            category: e.item.category || 'General',
+            orderCases: e.customOrderCases,
+            unitsPerCase: e.unitsPerCase,
+            totalUnits: e.customOrderUnits,
+            unitCost: e.unitCost,
+            caseCost: e.caseCost,
+            lineTotal: e.customTotalCost,
+            sellingPrice: e.unitSellingPrice,
+            originalCaseCost,
+            originalUnitCost,
+            isCostModified: isModified,
+          };
+        });
+
+      setPoCustomLines(lines);
+    }
 
     // Default delivery date: today + leadTime
     const supObj = suppliers.find((s) => (s.supplierId || s.id) === initialSupplierId);
@@ -1299,8 +1398,12 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
   const handleAddAdHocItemToPo = (item: InventoryItem) => {
     const existingIndex = poCustomLines.findIndex((l) => l.itemId === item.itemId);
     const unitsPerCase = Math.max(1, item.unitsPerCase || 1);
-    const unitCost = item.costPerUnit !== undefined ? item.costPerUnit : ((item as any).lastCostPrice || (item as any).costPrice || 0);
-    const caseCost = item.costPerCase !== undefined ? item.costPerCase : (unitCost * unitsPerCase);
+    const rawUnit = item.costPerUnit !== undefined ? item.costPerUnit : ((item as any).lastCostPrice || (item as any).costPrice || 0);
+    const originalCaseCost = item.costPerCase !== undefined ? item.costPerCase : (rawUnit * unitsPerCase);
+    const originalUnitCost = Number((originalCaseCost / unitsPerCase).toFixed(4));
+    const caseCost = orderCostOverrides[item.itemId] !== undefined ? orderCostOverrides[item.itemId] : originalCaseCost;
+    const unitCost = Number((caseCost / unitsPerCase).toFixed(4));
+    const isModified = Math.abs(caseCost - originalCaseCost) > 0.005;
     const pName = getItemName(item);
     const pCode = getItemCode(item);
 
@@ -1331,6 +1434,9 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
         caseCost,
         lineTotal: caseCost,
         sellingPrice: item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price || 0),
+        originalCaseCost,
+        originalUnitCost,
+        isCostModified: isModified,
       };
       setPoCustomLines([...poCustomLines, newLine]);
     }
@@ -1355,6 +1461,93 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       })
       .filter((l) => l.orderCases > 0);
     setPoCustomLines(updated);
+  };
+
+  // Editable Supplier Cost Handler: allows editing either Case Cost or Unit Cost, recalculating dynamically
+  const handleUpdatePoLineCost = (
+    itemId: string,
+    newCost: number,
+    costType: 'case' | 'unit' = 'case'
+  ) => {
+    const updated = poCustomLines.map((line) => {
+      if (line.itemId === itemId) {
+        const uPerCase = Math.max(1, line.unitsPerCase || 1);
+        let updatedCaseCost = line.caseCost;
+        let updatedUnitCost = line.unitCost;
+
+        if (costType === 'case') {
+          updatedCaseCost = Math.max(0, newCost);
+          updatedUnitCost = Number((updatedCaseCost / uPerCase).toFixed(4));
+        } else {
+          updatedUnitCost = Math.max(0, newCost);
+          updatedCaseCost = Number((updatedUnitCost * uPerCase).toFixed(2));
+        }
+
+        const baseOriginal = line.originalCaseCost !== undefined ? line.originalCaseCost : line.caseCost;
+        const isModified = Math.abs(updatedCaseCost - baseOriginal) > 0.005;
+
+        return {
+          ...line,
+          caseCost: updatedCaseCost,
+          unitCost: updatedUnitCost,
+          lineTotal: Number((line.orderCases * updatedCaseCost).toFixed(2)),
+          isCostModified: isModified,
+        };
+      }
+      return line;
+    });
+    setPoCustomLines(updated);
+  };
+
+  // Sync a single edited line cost to the permanent inventory master catalog
+  const handleSyncLineCostToCatalog = (line: PoLineItem) => {
+    const originalItem = inventoryItems.find((it) => it.itemId === line.itemId);
+    if (!originalItem) return;
+
+    const updatedItem: InventoryItem = {
+      ...originalItem,
+      costPerCase: line.caseCost,
+      costPerUnit: line.unitCost,
+      lastCostPrice: line.unitCost,
+    };
+    saveInventoryItem(updatedItem);
+    setToastNotification(`Updated catalog master cost for "${line.name}" to $${line.caseCost.toFixed(2)}/case ($${line.unitCost.toFixed(2)}/unit).`);
+
+    setPoCustomLines((prev) =>
+      prev.map((l) =>
+        l.itemId === line.itemId
+          ? { ...l, originalCaseCost: line.caseCost, originalUnitCost: line.unitCost, isCostModified: false }
+          : l
+      )
+    );
+  };
+
+  // Sync all modified line costs to the permanent inventory master catalog
+  const handleSyncAllCostsToCatalog = () => {
+    let count = 0;
+    poCustomLines.forEach((line) => {
+      if (line.isCostModified) {
+        const originalItem = inventoryItems.find((it) => it.itemId === line.itemId);
+        if (originalItem) {
+          saveInventoryItem({
+            ...originalItem,
+            costPerCase: line.caseCost,
+            costPerUnit: line.unitCost,
+            lastCostPrice: line.unitCost,
+          });
+          count++;
+        }
+      }
+    });
+    setPoCustomLines((prev) =>
+      prev.map((l) => ({
+        ...l,
+        originalCaseCost: l.caseCost,
+        originalUnitCost: l.unitCost,
+        isCostModified: false,
+      }))
+    );
+    setToastNotification(`Saved new supplier prices for ${count} item(s) to catalog master.`);
   };
 
   const handleRemovePoLine = (itemId: string) => {
@@ -1536,6 +1729,15 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                   <span>Catalog Master</span>
                 </button>
               )}
+              <button
+                type="button"
+                onClick={() => handleOpenPoModal({ blank: true })}
+                className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-indigo-300 hover:text-white border border-indigo-500/40 rounded-xl text-xs font-black transition-all flex items-center gap-1.5 shadow-sm cursor-pointer"
+                title="Create a blank or ad-hoc commercial purchase order independent of days-cover suggestions"
+              >
+                <Plus className="w-4 h-4 text-indigo-400" />
+                <span>+ Blank Purchase Order</span>
+              </button>
               <button
                 type="button"
                 onClick={() => handleOpenPoModal()}
@@ -1824,9 +2026,9 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
             All Vendors ({analyzedInventoryList.length})
           </button>
 
-          {supplierBreakdown.map((sb) => (
+          {supplierBreakdown.map((sb, idx) => (
             <button
-              key={sb.id}
+              key={`${sb.id}-${idx}`}
               type="button"
               onClick={() => setSelectedSupplierId(sb.id)}
               className={`px-3 py-2 rounded-xl text-xs font-bold whitespace-nowrap transition-all border flex items-center gap-2 cursor-pointer ${
@@ -1900,8 +2102,8 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
               >
                 <option value="ALL">All Vendors ({suppliers.length})</option>
                 <option value="UNASSIGNED">Unassigned Vendor</option>
-                {suppliers.map((s) => (
-                  <option key={s.supplierId || s.id} value={s.supplierId || s.id}>
+                {suppliers.map((s, idx) => (
+                  <option key={`${s.supplierId || s.id || 'sup'}-${idx}`} value={s.supplierId || s.id}>
                     {s.name}
                   </option>
                 ))}
@@ -1983,7 +2185,57 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
               >
                 ✓ Budget Funded Only ({metrics.fundedCount})
               </button>
+
+              {/* Fast Movers Toggle Pill */}
+              <div className="flex items-center bg-amber-50 border border-amber-300 p-0.5 rounded-xl ml-1">
+                <button
+                  type="button"
+                  onClick={() => setFastMoversOnly(true)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-black transition-all flex items-center gap-1 cursor-pointer ${
+                    fastMoversOnly
+                      ? 'bg-amber-500 text-slate-950 shadow-xs'
+                      : 'text-amber-800 hover:text-amber-950'
+                  }`}
+                  title="Filter to high-velocity staples (daily sales >= 1 unit/day or in Fast-Moving Checklist) and hide slow movers"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-amber-900" />
+                  <span>⚡ Fast Movers Only</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setFastMoversOnly(false)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                    !fastMoversOnly
+                      ? 'bg-slate-900 text-white shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <span>All Products</span>
+                </button>
+              </div>
             </div>
+
+            {/* Fast Movers Summary Badge */}
+            {fastMoversOnly && (
+              <div className="w-full mt-2 flex items-center justify-between gap-2 px-3 py-2 bg-gradient-to-r from-amber-50 via-amber-100/50 to-amber-50 border border-amber-300 rounded-xl text-xs text-amber-950 font-medium animate-fadeIn">
+                <div className="flex items-center gap-2">
+                  <span className="p-1 rounded-lg bg-amber-500 text-slate-950 font-black text-[10px]">
+                    ⚡ RAPID RESTOCK
+                  </span>
+                  <span>
+                    Showing <strong className="font-black text-slate-900">{fastMoversStats.fastCount}</strong> high-velocity staples (
+                    <strong className="font-bold text-amber-800">{fastMoversStats.slowHiddenCount}</strong> slow movers hidden for rapid ordering)
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setFastMoversOnly(false)}
+                  className="text-[11px] font-bold text-amber-800 hover:text-amber-950 underline cursor-pointer"
+                >
+                  Show all products
+                </button>
+              </div>
+            )}
 
             {/* Quick Multi-Select */}
             <div className="flex items-center gap-1.5 flex-wrap">
@@ -2119,6 +2371,16 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                             <span className="bg-slate-100 text-slate-600 font-bold px-1.5 py-0.5 rounded">
                               {entry.unitsPerCase} / case
                             </span>
+                            {entry.isFastMover && (
+                              <span className="bg-amber-100 text-amber-900 border border-amber-300 font-black px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                                <span>⚡ Fast Mover</span>
+                              </span>
+                            )}
+                            {entry.isSlowMover && (
+                              <span className="bg-slate-100 text-slate-500 border border-slate-200 font-semibold px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                                <span>🐢 Slow Mover</span>
+                              </span>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -2229,8 +2491,23 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                           <div className="text-sm font-black font-mono text-slate-900">
                             ${entry.customTotalCost.toFixed(2)}
                           </div>
-                          <div className="text-[10px] text-slate-500 font-mono">
-                            @ ${entry.caseCost.toFixed(2)}/cs
+                          <div className="flex items-center justify-end gap-1 text-[10px] text-slate-500 font-mono mt-0.5">
+                            <span>@ $</span>
+                            <input
+                              type="number"
+                              step="0.01"
+                              min={0}
+                              value={orderCostOverrides[entry.item.itemId] !== undefined ? orderCostOverrides[entry.item.itemId] : entry.caseCost}
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value);
+                                if (!isNaN(val) && val >= 0) {
+                                  setOrderCostOverrides((prev) => ({ ...prev, [entry.item.itemId]: val }));
+                                }
+                              }}
+                              title="Edit agreed supplier cost per case"
+                              className="w-16 py-0.5 px-1 bg-white border border-slate-300 rounded text-right font-mono font-bold text-slate-800 text-[10px] focus:outline-none focus:border-indigo-600 focus:ring-1 focus:ring-indigo-500 shadow-2xs"
+                            />
+                            <span>/cs</span>
                           </div>
                         </div>
                         {entry.isFundedInBudget ? (
@@ -2399,6 +2676,16 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                               <span className="bg-slate-100 text-slate-600 font-bold px-1.5 py-0.5 rounded">
                                 {entry.unitsPerCase} / case
                               </span>
+                              {entry.isFastMover && (
+                                <span className="bg-amber-100 text-amber-900 border border-amber-300 font-black px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                                  <span>⚡ Fast Mover</span>
+                                </span>
+                              )}
+                              {entry.isSlowMover && (
+                                <span className="bg-slate-100 text-slate-500 border border-slate-200 font-semibold px-1.5 py-0.5 rounded flex items-center gap-0.5">
+                                  <span>🐢 Slow Mover</span>
+                                </span>
+                              )}
                             </div>
                             {/* Supplier & Multi-vendor linkage */}
                             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap text-[10px]">
@@ -2579,13 +2866,28 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                             )}
                           </td>
 
-                          {/* Est. Cost */}
+                          {/* Est. Cost with Inline Supplier Cost Editing */}
                           <td className="py-3 px-3 text-right font-mono">
                             <div className="font-black text-slate-900">
                               ${entry.customTotalCost.toFixed(2)}
                             </div>
-                            <div className="text-[10px] text-slate-500">
-                              @ ${entry.caseCost.toFixed(2)}/cs
+                            <div className="flex items-center justify-end gap-1 mt-0.5 text-[10px]">
+                              <span className="text-slate-500">@ $</span>
+                              <input
+                                type="number"
+                                step="0.01"
+                                min={0}
+                                value={orderCostOverrides[entry.item.itemId] !== undefined ? orderCostOverrides[entry.item.itemId] : entry.caseCost}
+                                onChange={(e) => {
+                                  const val = parseFloat(e.target.value);
+                                  if (!isNaN(val) && val >= 0) {
+                                    setOrderCostOverrides((prev) => ({ ...prev, [entry.item.itemId]: val }));
+                                  }
+                                }}
+                                title="Edit agreed supplier cost per case"
+                                className="w-16 py-0.5 px-1 bg-white border border-slate-300 rounded text-right font-mono font-bold text-slate-800 text-[10px] focus:outline-none focus:border-indigo-600 focus:ring-1 focus:ring-indigo-500 shadow-2xs"
+                              />
+                              <span className="text-slate-500">/cs</span>
                             </div>
                           </td>
 
@@ -2647,6 +2949,15 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
 
           {/* Right action buttons */}
           <div className="flex items-center gap-2.5 w-full sm:w-auto">
+            <button
+              type="button"
+              onClick={() => handleOpenPoModal({ blank: true })}
+              className="px-3.5 py-2.5 bg-slate-800 hover:bg-slate-700 text-indigo-300 hover:text-white border border-indigo-500/40 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 shadow-sm cursor-pointer"
+              title="Create an ad-hoc purchase order independent of days-cover suggestions"
+            >
+              <Plus className="w-4 h-4 text-indigo-400" />
+              <span>+ Blank PO</span>
+            </button>
             <button
               type="button"
               onClick={() => handleOpenPoModal()}
@@ -2845,11 +3156,11 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                                 </button>
                               </div>
                             ) : (
-                              filteredPoSuppliers.map((s) => {
+                              filteredPoSuppliers.map((s, idx) => {
                                 const isSelected = (s.supplierId || s.id) === poTargetSupplierId;
                                 return (
                                   <div
-                                    key={s.supplierId || s.id}
+                                    key={`${s.supplierId || s.id || 'po-sup'}-${idx}`}
                                     onClick={() => {
                                       const newSupId = s.supplierId || s.id;
                                       setPoTargetSupplierId(newSupId);
@@ -3057,6 +3368,27 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                 )}
               </div>
 
+              {/* SUPPLIER PRICE ADJUSTMENT BANNER */}
+              {poCustomLines.some((l) => l.isCostModified) && (
+                <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2 text-amber-900 font-medium">
+                    <TrendingUp className="w-4 h-4 text-amber-600 shrink-0" />
+                    <span>
+                      <strong>Supplier Price Adjustments:</strong> {poCustomLines.filter((l) => l.isCostModified).length} item(s) have updated supplier prices differing from current catalog master costs.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleSyncAllCostsToCatalog}
+                    className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-xs cursor-pointer transition"
+                    title="Save these new supplier prices permanently to the product catalog master"
+                  >
+                    <Database className="w-3.5 h-3.5" />
+                    <span>Sync New Prices to Master Catalog</span>
+                  </button>
+                </div>
+              )}
+
               {/* ITEM TABLE IN PO SLIP */}
               <div className="overflow-x-auto rounded-2xl border border-slate-200 shadow-sm">
                 <table className="w-full text-left text-xs">
@@ -3067,9 +3399,14 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                       <th className="py-2.5 px-2 text-center">Order Cases</th>
                       <th className="py-2.5 px-2 text-center">Units / Cs</th>
                       <th className="py-2.5 px-2 text-right">Total Units</th>
-                      <th className="py-2.5 px-3 text-right">Case Cost</th>
+                      <th className="py-2.5 px-3 text-right min-w-[160px]">
+                        <div className="flex items-center justify-end gap-1">
+                          <span>Supplier Cost</span>
+                          <Edit3 className="w-3 h-3 text-indigo-600 print:hidden" />
+                        </div>
+                      </th>
                       <th className="py-2.5 px-3 text-right">Line Total</th>
-                      <th className="py-2.5 px-2 w-8 text-center"></th>
+                      <th className="py-2.5 px-2 w-8 text-center print:hidden"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-medium">
@@ -3094,7 +3431,7 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                               <button
                                 type="button"
                                 onClick={() => handleUpdatePoLineCases(line.itemId, Math.max(1, line.orderCases - 1))}
-                                className="w-7 h-7 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold flex items-center justify-center cursor-pointer"
+                                className="w-7 h-7 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold flex items-center justify-center cursor-pointer print:hidden"
                                 aria-label="Decrease cases"
                               >
                                 <Minus className="w-3 h-3" />
@@ -3104,12 +3441,12 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                                 min={1}
                                 value={line.orderCases}
                                 onChange={(e) => handleUpdatePoLineCases(line.itemId, Number(e.target.value) || 0)}
-                                className="w-14 py-1 px-1 bg-white border border-slate-300 rounded-lg text-center font-mono font-bold text-slate-900 text-xs focus:outline-none focus:border-indigo-600"
+                                className="w-14 py-1 px-1 bg-white border border-slate-300 rounded-lg text-center font-mono font-bold text-slate-900 text-xs focus:outline-none focus:border-indigo-600 print:border-none"
                               />
                               <button
                                 type="button"
                                 onClick={() => handleUpdatePoLineCases(line.itemId, line.orderCases + 1)}
-                                className="w-7 h-7 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold flex items-center justify-center cursor-pointer"
+                                className="w-7 h-7 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold flex items-center justify-center cursor-pointer print:hidden"
                                 aria-label="Increase cases"
                               >
                                 <Plus className="w-3 h-3" />
@@ -3122,13 +3459,83 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                           <td className="py-2.5 px-2 text-right font-mono font-bold text-slate-800">
                             {line.totalUnits}
                           </td>
-                          <td className="py-2.5 px-3 text-right font-mono text-slate-600">
-                            ${line.caseCost.toFixed(2)}
+                          <td className="py-2.5 px-3 text-right font-mono">
+                            {/* On Screen: Interactive Editable Supplier Cost & Variance Diff */}
+                            <div className="print:hidden space-y-1">
+                              <div className="flex items-center justify-end gap-1">
+                                <span className="text-[10px] text-slate-500 font-sans font-semibold">$</span>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min={0}
+                                  value={line.caseCost}
+                                  onChange={(e) => handleUpdatePoLineCost(line.itemId, parseFloat(e.target.value) || 0, 'case')}
+                                  title="Edit agreed supplier cost per case"
+                                  className="w-20 py-1 px-1.5 bg-white border border-slate-300 hover:border-indigo-400 focus:border-indigo-600 rounded-lg text-right font-mono font-bold text-slate-900 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500 transition shadow-2xs"
+                                />
+                                <span className="text-[10px] text-slate-500 font-sans font-medium">/cs</span>
+                              </div>
+
+                              {/* Unit cost breakdown & companion edit */}
+                              <div className="flex items-center justify-end gap-1 text-[10px]">
+                                <span className="text-slate-500 font-sans">Unit: $</span>
+                                <input
+                                  type="number"
+                                  step="0.001"
+                                  min={0}
+                                  value={line.unitCost}
+                                  onChange={(e) => handleUpdatePoLineCost(line.itemId, parseFloat(e.target.value) || 0, 'unit')}
+                                  title="Edit agreed supplier cost per unit"
+                                  className="w-16 py-0.5 px-1 bg-slate-50 hover:bg-white border border-slate-200 focus:border-indigo-500 rounded text-right font-mono text-[10px] text-slate-700 focus:outline-none"
+                                />
+                                <span className="text-slate-400 font-sans">/ea</span>
+                              </div>
+
+                              {/* Price Variance Badge & Sync Option */}
+                              {(() => {
+                                const orig = line.originalCaseCost !== undefined ? line.originalCaseCost : line.caseCost;
+                                const diff = line.caseCost - orig;
+                                const pct = orig > 0 ? (diff / orig) * 100 : 0;
+                                if (Math.abs(diff) < 0.005) return null;
+
+                                const isIncrease = diff > 0;
+                                return (
+                                  <div className="flex items-center justify-end gap-1 pt-0.5">
+                                    <span
+                                      className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                                        isIncrease
+                                          ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                                          : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                      }`}
+                                      title={`Catalog master cost: $${orig.toFixed(2)}/cs`}
+                                    >
+                                      {isIncrease ? '▲ +' : '▼ -'}${Math.abs(diff).toFixed(2)} ({pct > 0 ? `+${pct.toFixed(1)}%` : `${pct.toFixed(1)}%`})
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSyncLineCostToCatalog(line)}
+                                      className="text-[9px] text-indigo-600 hover:text-indigo-800 font-bold underline cursor-pointer"
+                                      title="Update permanent catalog master cost"
+                                    >
+                                      Save
+                                    </button>
+                                  </div>
+                                );
+                              })()}
+                            </div>
+
+                            {/* On Print: Clean Typography */}
+                            <div className="hidden print:block font-mono text-slate-900 font-medium">
+                              ${line.caseCost.toFixed(2)}/cs
+                              <div className="text-[9px] text-slate-500 font-sans font-normal">
+                                (${line.unitCost.toFixed(2)}/ea)
+                              </div>
+                            </div>
                           </td>
                           <td className="py-2.5 px-3 text-right font-mono font-black text-slate-900">
                             ${line.lineTotal.toFixed(2)}
                           </td>
-                          <td className="py-2.5 px-2 text-center">
+                          <td className="py-2.5 px-2 text-center print:hidden">
                             <button
                               type="button"
                               onClick={() => handleRemovePoLine(line.itemId)}
@@ -3316,11 +3723,11 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
             {/* List of Approved Vendors for this item */}
             <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
               {supplierSwitchTarget.allSuppliers && supplierSwitchTarget.allSuppliers.length > 0 ? (
-                supplierSwitchTarget.allSuppliers.map((sup) => {
+                supplierSwitchTarget.allSuppliers.map((sup, idx) => {
                   const isCurrentActive = sup.id === supplierSwitchTarget.supplierId;
                   return (
                     <div
-                      key={sup.id}
+                      key={`${sup.id || 'sup'}-${idx}`}
                       className={`p-3 rounded-2xl border transition-all flex items-center justify-between ${
                         isCurrentActive
                           ? 'bg-indigo-50/70 border-indigo-300 ring-1 ring-indigo-200 shadow-xs'

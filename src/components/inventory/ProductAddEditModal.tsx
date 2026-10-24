@@ -597,8 +597,8 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                     className="w-full py-1.5 px-2 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-900 focus:outline-none focus:border-indigo-600 cursor-pointer shadow-sm"
                   >
                     <option value="">-- No Supplier Assigned (Unassigned) --</option>
-                    {suppliersList.map((sup) => (
-                      <option key={sup.supplierId} value={sup.supplierId}>
+                    {suppliersList.map((sup, idx) => (
+                      <option key={`${sup.supplierId || (sup as any).id || 'prod-sup'}-${idx}`} value={sup.supplierId || (sup as any).id}>
                         {sup.name} ({sup.category || 'General'} &bull; {sup.paymentTerms || 'Credit'})
                       </option>
                     ))}

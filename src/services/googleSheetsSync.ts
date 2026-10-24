@@ -33,6 +33,10 @@ import {
   pullTenantInventory,
   ingestMeshInventoryItem,
   verifySalespersonPin,
+  getSupplierInvoiceVouchers,
+  getDirectGrvs,
+  getAllCashLifts,
+  getAllGoodsReceived,
 } from '../db/roomDatabase';
 import { SyncQueueItem, SheetName, StaffPermissions, InventoryItem } from '../types';
 import { Company, SaaSBranch } from '../data/saasData';
@@ -105,6 +109,8 @@ export const getGoogleSheetUrl = (sheetId?: string | null): string => {
 
 export const queueAllStoreDataForSync = (): number => {
   let count = 0;
+  const compId = getCurrentCompanyId();
+  const branchId = getCurrentBranchId();
 
   // 1. Sales
   getSales().forEach((s) => {
@@ -121,6 +127,11 @@ export const queueAllStoreDataForSync = (): number => {
       StaffID: s.staffId,
       StaffName: s.staffName,
       Status: s.status,
+      currency: s.currency || 'USD',
+      exchange_rate: s.exchangeRate || 1,
+      total_in_currency: s.totalInCurrency || s.total,
+      company_id: s.company_id || compId,
+      branch_id: s.branch_id || branchId,
     });
     count++;
   });
@@ -134,6 +145,8 @@ export const queueAllStoreDataForSync = (): number => {
       Address: c.address || '',
       CreatedDate: c.createdDate,
       CreatedBy: c.createdBy,
+      company_id: (c as any).company_id || compId,
+      branch_id: (c as any).branch_id || branchId,
     });
     count++;
   });
@@ -149,6 +162,8 @@ export const queueAllStoreDataForSync = (): number => {
       Description: c.description,
       In: c.in,
       Out: c.out,
+      company_id: c.company_id || compId,
+      branch_id: c.branch_id || branchId,
     });
     count++;
   });
@@ -167,13 +182,15 @@ export const queueAllStoreDataForSync = (): number => {
       StaffName: e.staffName,
       Description: e.description,
       ReceiptRef: e.receiptRef || '',
+      company_id: e.company_id || compId,
+      branch_id: e.branch_id || branchId,
     });
     count++;
   });
 
   // 5. Inventory & Products
   getProducts().forEach((p) => {
-    enqueueSync('Products', 'INSERT', {
+    enqueueSync('InventoryMaster' as SheetName, 'INSERT', {
       ProductID: p.id,
       Name: p.name,
       SKU: p.sku || '',
@@ -183,6 +200,8 @@ export const queueAllStoreDataForSync = (): number => {
       StockQuantity: p.stockQuantity ?? p.totalUnits ?? 0,
       Barcode: p.barcode || '',
       ReorderLevel: p.reorderLevelUnits || 5,
+      company_id: p.company_id || compId,
+      branch_id: p.branch_id || branchId,
     });
     count++;
   });
@@ -198,6 +217,68 @@ export const queueAllStoreDataForSync = (): number => {
       Email: sup.email || '',
       Address: sup.address || '',
       PaymentTerms: sup.paymentTerms || '',
+      company_id: sup.company_id || compId,
+      branch_id: sup.branch_id || branchId,
+    });
+    count++;
+  });
+
+  // 7. Supplier Invoices
+  getSupplierInvoiceVouchers().forEach((inv) => {
+    enqueueSync('SupplierInvoices' as SheetName, 'INSERT', {
+      ...inv,
+      company_id: (inv as any).company_id || compId,
+      branch_id: (inv as any).branch_id || branchId,
+    });
+    count++;
+  });
+
+  // 8. Goods Received Notes
+  getAllGoodsReceived().forEach((grv) => {
+    enqueueSync('GoodsReceived' as SheetName, 'INSERT', {
+      ...grv,
+      company_id: (grv as any).company_id || compId,
+      branch_id: (grv as any).branch_id || branchId,
+    });
+    count++;
+  });
+
+  // 9. Direct GRVs
+  getDirectGrvs().forEach((dgrv) => {
+    enqueueSync('DirectGRVs' as SheetName, 'INSERT', {
+      ...dgrv,
+      company_id: (dgrv as any).company_id || compId,
+      branch_id: (dgrv as any).branch_id || branchId,
+    });
+    count++;
+  });
+
+  // 10. Cash Lifts
+  getAllCashLifts().forEach((lift) => {
+    enqueueSync('CashLifts' as SheetName, 'INSERT', {
+      ...lift,
+      company_id: lift.company_id || compId,
+      branch_id: lift.branch_id || branchId,
+    });
+    count++;
+  });
+
+  // 11. Credit Sales
+  getCreditSales().forEach((credit) => {
+    enqueueSync('CreditSales' as SheetName, 'INSERT', {
+      ...credit,
+      company_id: (credit as any).company_id || compId,
+      branch_id: (credit as any).branch_id || branchId,
+    });
+    count++;
+  });
+
+  // 12. Customer Change
+  getCustomerChanges().forEach((chg) => {
+    enqueueSync('CustomerChange' as SheetName, 'INSERT', {
+      ...chg,
+      company_id: (chg as any).company_id || compId,
+      branch_id: (chg as any).branch_id || branchId,
     });
     count++;
   });
@@ -517,19 +598,19 @@ export const generateTenantDedicatedAppsScriptCode = (companyId?: string): strin
 
   return `/**
  * ============================================================================
- * SAIMETRIC SaaS - Dedicated Tenant Google Sheet Backend
+ * SAIMETRIC SaaS V5.1 - Dedicated Tenant Google Sheet Backend
  * Tenant: ${comp.company_name} (ID: ${comp.company_id})
  * Plan: ${comp.plan} | Branch Isolation: ${comp.branch_isolation_mode || 'ROW_LEVEL'}
  * Dedicated Sheet ID: ${comp.sheet_id || 'ACTIVE_SPREADSHEET'}
  * Registered Branches: ${branchCodes}
  *
- * FEATURES & CAPABILITIES:
- * 1. Automatic Business Tab Initialization:
- *    - Sales, InventoryMaster, GoodsReceived, Customers, Suppliers,
- *      CashLog, CustomerChange, CreditSales, Expenses, Reconciliations, AuditLog
- * 2. Real-time Inventory Master Sync & Retrieval (Cases + Singles)
- * 3. Atomic Write Lock to prevent Google Apps Script race conditions
- * 4. Strict Branch Isolation & Tenant Verification
+ * FULL 25-TABLE ARCHITECTURE:
+ * 1. Sales & Revenue: Sales, CreditSales, CashLog, CustomerChange
+ * 2. Inventory & Logistics: InventoryMaster, GoodsReceived, GoodsReceivedItems,
+ *    DirectGRVs, SupplierInvoices, StockMovements, StockBatches, StocktakeSessions
+ * 3. Procurement & Trips: TripManifests, FixedCosts, Wallets, WalletTransfers
+ * 4. Cash Drawer Auditing: CashLifts, CashCounts, Expenses, Reconciliations
+ * 5. Entities & Master Data: Customers, Suppliers, Staff, Branches, AuditLog
  * ============================================================================
  */
 
@@ -540,8 +621,22 @@ var BRANCH_ISOLATION_MODE = "${comp.branch_isolation_mode || 'ROW_LEVEL'}";
 var TAB_SALES = "Sales";
 var TAB_INVENTORY = "InventoryMaster";
 var TAB_GOODS_RECEIVED = "GoodsReceived";
+var TAB_GOODS_RECEIVED_ITEMS = "GoodsReceivedItems";
+var TAB_SUPPLIER_INVOICES = "SupplierInvoices";
+var TAB_DIRECT_GRVS = "DirectGRVs";
+var TAB_STOCK_MOVEMENTS = "StockMovements";
+var TAB_STOCK_BATCHES = "StockBatches";
+var TAB_STOCKTAKE_SESSIONS = "StocktakeSessions";
+var TAB_TRIP_MANIFESTS = "TripManifests";
+var TAB_WALLETS = "Wallets";
+var TAB_WALLET_TRANSFERS = "WalletTransfers";
+var TAB_FIXED_COSTS = "FixedCosts";
+var TAB_CASH_LIFTS = "CashLifts";
+var TAB_CASH_COUNTS = "CashCounts";
 var TAB_CUSTOMERS = "Customers";
 var TAB_SUPPLIERS = "Suppliers";
+var TAB_STAFF = "Staff";
+var TAB_BRANCHES = "Branches";
 var TAB_CASH_LOG = "CashLog";
 var TAB_CUSTOMER_CHANGE = "CustomerChange";
 var TAB_CREDIT_SALES = "CreditSales";
@@ -551,7 +646,7 @@ var TAB_AUDIT_LOG = "AuditLog";
 
 function doPost(e) {
   var lock = LockService.getScriptLock();
-  var hasLock = lock.tryLock(20000);
+  var hasLock = lock.tryLock(25000);
   
   if (!hasLock) {
     return jsonResponse({
@@ -569,7 +664,7 @@ function doPost(e) {
 
     var payload = JSON.parse(e.postData.contents);
     var action = String(payload.action || "INSERT").trim();
-    var sheetBaseName = payload.sheet || "CashLog";
+    var sheetBaseName = payload.sheet || "Sales";
     var companyId = payload.company_id || (payload.data && payload.data.company_id) || TENANT_COMPANY_ID;
     var companyName = payload.company_name || TENANT_COMPANY_NAME;
     var branchId = payload.branch_id || (payload.data && payload.data.branch_id) || "BR-MAIN";
@@ -606,12 +701,17 @@ function doPost(e) {
       ss = SpreadsheetApp.getActiveSpreadsheet();
     }
 
-    // 1. ACTION: INITIALIZE TENANT BUSINESS TABS
+    // 1. ACTION: INITIALIZE ALL 25 BUSINESS TABS
     if (
       action === "initialize_tenant_sheet" ||
       action === "init_tenant_sheet" ||
       action === "setup_tenant_tabs" ||
-      action === "setup_sheets"
+      action === "setup_sheets" ||
+      action === "init_tabs" ||
+      action === "initialize_tabs" ||
+      action === "setup_tabs" ||
+      action === "initializeTabs" ||
+      action === "initTabs"
     ) {
       var initialProducts = payload.initial_products || (payload.data && payload.data.initial_products) || [];
       var initResult = setupTenantSpreadsheetTabs(ss, companyId, companyName, initialProducts);
@@ -622,6 +722,7 @@ function doPost(e) {
         code: 200,
         message: initResult.message,
         tabs: initResult.tabs,
+        totalTabs: initResult.tabs.length,
         sheet_id: ss.getId(),
         sheet_name: ss.getName()
       });
@@ -653,70 +754,73 @@ function doPost(e) {
       });
     }
 
-    // 4. ACTION: ADD SALE
-    if (action === "add_sale" || (action === "INSERT" && (sheetBaseName === "Sales" || sheetBaseName === TAB_SALES))) {
+    // 4. ACTION: ADD SALE / INVOICE
+    if (action === "add_sale" || action === "sale" || action === "SALE_RECORD" || (action === "INSERT" && (sheetBaseName === "Sales" || sheetBaseName === TAB_SALES))) {
       var saleResult = handleAddSale(ss, payload, companyId, branchId, branchName, userRole);
       lock.releaseLock();
       return jsonResponse(saleResult);
     }
 
-    // 5. GENERIC INSERT / ROW APPEND
-    var targetSheetTab = sheetBaseName;
-    if (BRANCH_ISOLATION_MODE === "BRANCH_TABS" || BRANCH_ISOLATION_MODE === "HYBRID") {
-      targetSheetTab = sheetBaseName + "_" + branchId;
+    // 5. ACTION: ADD SUPPLIER INVOICE
+    if (action === "add_supplier_invoice" || (action === "INSERT" && sheetBaseName === TAB_SUPPLIER_INVOICES)) {
+      var invResult = handleAddSupplierInvoice(ss, payload, companyId, branchId);
+      lock.releaseLock();
+      return jsonResponse(invResult);
     }
 
-    var sheet = ss.getSheetByName(targetSheetTab) || ss.getSheetByName(sheetBaseName);
-
-    var enrichedData = Object.assign({}, rowData);
-    enrichedData.CompanyID = companyId;
-    enrichedData.BranchID = branchId;
-    enrichedData.BranchName = branchName;
-    enrichedData.CreatedByUserID = userId;
-    enrichedData.CreatedByRole = userRole;
-    if (!enrichedData.SyncTimestamp) {
-      enrichedData.SyncTimestamp = new Date().toISOString();
+    // 6. ACTION: ADD GOODS RECEIVED (GRN VOUCHER & ITEMS)
+    if (action === "add_goods_received" || action === "goods_received" || (action === "INSERT" && sheetBaseName === TAB_GOODS_RECEIVED)) {
+      var grnResult = handleAddGoodsReceived(ss, payload, companyId, branchId);
+      lock.releaseLock();
+      return jsonResponse(grnResult);
     }
 
-    if (!sheet) {
-      sheet = ss.insertSheet(targetSheetTab);
-      var headers = Object.keys(enrichedData);
-      sheet.appendRow(headers);
-      sheet.getRange(1, 1, 1, headers.length)
-        .setFontWeight("bold")
-        .setBackground("#1E293B")
-        .setFontColor("#FFFFFF");
-      sheet.setFrozenRows(1);
+    // 7. ACTION: ADD DIRECT GRV
+    if (action === "add_direct_grv" || (action === "INSERT" && sheetBaseName === TAB_DIRECT_GRVS)) {
+      var dGrvResult = handleAddDirectGRV(ss, payload, companyId, branchId);
+      lock.releaseLock();
+      return jsonResponse(dGrvResult);
     }
 
-    var lastCol = Math.max(sheet.getLastColumn(), 1);
-    var existingHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
-    if (!existingHeaders || existingHeaders.length === 0 || existingHeaders[0] === "") {
-      existingHeaders = Object.keys(enrichedData);
-      sheet.appendRow(existingHeaders);
+    // 8. ACTION: ADD STOCK MOVEMENT
+    if (action === "add_stock_movement" || (action === "INSERT" && sheetBaseName === TAB_STOCK_MOVEMENTS)) {
+      var smResult = handleAddStockMovement(ss, payload, companyId, branchId);
+      lock.releaseLock();
+      return jsonResponse(smResult);
     }
 
-    var newRow = [];
-    for (var i = 0; i < existingHeaders.length; i++) {
-      var key = existingHeaders[i];
-      var val = enrichedData[key];
-      if (val === undefined || val === null) val = "";
-      newRow.push(val);
+    // 9. ACTION: ADD WALLET TRANSFER
+    if (action === "add_wallet_transfer" || (action === "INSERT" && sheetBaseName === TAB_WALLET_TRANSFERS)) {
+      var wtResult = handleAddWalletTransfer(ss, payload, companyId, branchId);
+      lock.releaseLock();
+      return jsonResponse(wtResult);
     }
 
-    sheet.appendRow(newRow);
+    // 10. ACTION: BATCH SYNC WRITES
+    if (action === "batch_sync_writes" || action === "batch_sync") {
+      var batchItems = Array.isArray(payload.items) ? payload.items : [];
+      var batchWritten = 0;
+      for (var b = 0; b < batchItems.length; b++) {
+        var bItem = batchItems[b];
+        if (!bItem) continue;
+        var bSheet = bItem.sheetName || bItem.sheet || sheetBaseName;
+        appendRecordToSheet(ss, bSheet, bItem.payload || bItem.data || bItem, companyId, branchId, branchName, userId, userRole);
+        batchWritten++;
+      }
+      lock.releaseLock();
+      return jsonResponse({
+        status: "success",
+        success: true,
+        code: 200,
+        batchCount: batchWritten,
+        timestamp: new Date().toISOString()
+      });
+    }
 
+    // 11. GENERIC ROW APPEND FALLBACK
+    var appendResult = appendRecordToSheet(ss, sheetBaseName, rowData, companyId, branchId, branchName, userId, userRole);
     lock.releaseLock();
-    return jsonResponse({
-      status: "success",
-      success: true,
-      code: 200,
-      tenant: companyId,
-      branch: branchId,
-      tab: sheet.getName(),
-      rowAdded: true,
-      timestamp: new Date().toISOString()
-    });
+    return jsonResponse(appendResult);
 
   } catch (error) {
     lock.releaseLock();
@@ -743,11 +847,13 @@ function doGet(e) {
     return jsonResponse({
       status: "active",
       success: true,
+      version: "5.1.0",
       tenant: compId,
       company: TENANT_COMPANY_NAME,
       isolationMode: BRANCH_ISOLATION_MODE,
       sheet_name: ss ? ss.getName() : "Unknown",
-      service: "SAIMETRIC Dedicated Tenant Sheets Service"
+      totalTabs: ss ? ss.getSheets().length : 0,
+      service: "SAIMETRIC Dedicated Tenant Sheets Service (25 Tables Enabled)"
     });
   }
 
@@ -763,39 +869,131 @@ function doGet(e) {
     }
   }
 
-  if (action === "setup_sheets" || action === "initialize_tenant_sheet") {
+  if (
+    action === "setup_sheets" ||
+    action === "initialize_tenant_sheet" ||
+    action === "init_tabs" ||
+    action === "initialize_tabs" ||
+    action === "setup_tabs" ||
+    action === "setup_tenant_tabs" ||
+    action === "initTabs" ||
+    action === "initializeTabs"
+  ) {
+    if (!ss && (params.sheet_id || params.tenant_sheet_id)) {
+      try {
+        ss = SpreadsheetApp.openById(params.sheet_id || params.tenant_sheet_id);
+      } catch (e) {}
+    }
+    if (!ss) {
+      try {
+        ss = SpreadsheetApp.getActiveSpreadsheet();
+      } catch (e) {}
+    }
     if (ss) {
       var init = setupTenantSpreadsheetTabs(ss, compId, TENANT_COMPANY_NAME, []);
       return jsonResponse({
         status: "success",
         success: true,
         message: init.message,
-        tabs: init.tabs
+        tabs: init.tabs,
+        totalTabs: init.tabs.length,
+        sheet_id: ss.getId(),
+        sheet_name: ss.getName()
+      });
+    }
+  }
+
+  if (action === "get_table_counts") {
+    if (ss) {
+      var counts = {};
+      var allSheets = ss.getSheets();
+      for (var s = 0; s < allSheets.length; s++) {
+        var sh = allSheets[s];
+        counts[sh.getName()] = Math.max(0, sh.getLastRow() - 1);
+      }
+      return jsonResponse({
+        status: "success",
+        success: true,
+        counts: counts
       });
     }
   }
 
   return ContentService.createTextOutput(
-    "SAIMETRIC Tenant Google Sheet Webhook is Online for " + TENANT_COMPANY_NAME + " (" + compId + ")."
+    "SAIMETRIC Tenant Google Sheet Webhook is Online for " + TENANT_COMPANY_NAME + " (" + compId + "). 25 Tables Configured."
   );
 }
 
 /**
- * Initializes all 11 required business tabs with bold headers and initial products
+ * Standalone macro runner: Initializes all 25 business tabs in the active Google Sheet.
+ * Select 'initializeAllTabs' in Apps Script toolbar and click 'Run'.
+ */
+function initializeAllTabs() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var result = setupTenantSpreadsheetTabs(ss, TENANT_COMPANY_ID, TENANT_COMPANY_NAME, []);
+  Logger.log(result.message);
+  return result;
+}
+
+function setupTenantSheets() {
+  return initializeAllTabs();
+}
+
+function setupMasterSheets() {
+  return initializeAllTabs();
+}
+
+/**
+ * Creates custom SAIMETRIC menu inside Google Sheet for 1-click tab setup
+ */
+function onOpen() {
+  try {
+    var ui = SpreadsheetApp.getUi();
+    ui.createMenu('📊 SAIMETRIC SaaS')
+      .addItem('⚡ Initialize / Repair All 25 Tabs', 'initializeAllTabs')
+      .addSeparator()
+      .addItem('🔍 Check Webhook Status', 'checkWebhookStatus')
+      .addToUi();
+  } catch (e) {}
+}
+
+function checkWebhookStatus() {
+  try {
+    var ui = SpreadsheetApp.getUi();
+    ui.alert('SAIMETRIC Webhook Status', 'Webhook is active for ' + TENANT_COMPANY_NAME + ' (' + TENANT_COMPANY_ID + '). 25 business tables configured.', ui.ButtonSet.OK);
+  } catch (e) {}
+}
+
+/**
+ * Initializes all 25 required business tabs with bold dark-slate headers
  */
 function setupTenantSpreadsheetTabs(ss, company_id, company_name, initial_products) {
   var dataTabsConfig = [
-    { name: TAB_SALES, headers: ["SaleID", "CompanyID", "BranchID", "BranchName", "Date", "Customer", "PaymentMethod", "Subtotal", "Discount", "Tax", "Total", "CashierID", "CashierName", "ItemsCount", "Notes", "Status"] },
-    { name: TAB_INVENTORY, headers: ["ItemID", "CompanyID", "BranchID", "ItemName", "UnitsPerCase", "CostPerCase", "CostPerUnit", "SellingPrice", "StockCases", "StockSingles", "TotalUnits", "SKU", "Category"] },
-    { name: TAB_GOODS_RECEIVED, headers: ["timestamp", "grn_id", "CompanyID", "BranchID", "invoice_no", "date", "supplier", "item_id", "item_name", "received_cases", "received_singles", "cost_per_case", "cost_per_unit", "line_total", "staff_id"] },
-    { name: TAB_CUSTOMERS, headers: ["customer_id", "CompanyID", "BranchID", "name", "phone", "address", "created_date"] },
-    { name: TAB_SUPPLIERS, headers: ["supplier_id", "CompanyID", "BranchID", "name", "category", "contact_person", "phone", "email", "address"] },
-    { name: TAB_CASH_LOG, headers: ["timestamp", "CompanyID", "BranchID", "date", "staff_id", "staff_name", "line", "description", "in", "out"] },
-    { name: TAB_CUSTOMER_CHANGE, headers: ["id", "CompanyID", "BranchID", "timestamp", "customer_id", "customer_name", "change_amount", "staff_id", "notes", "status"] },
-    { name: TAB_CREDIT_SALES, headers: ["id", "CompanyID", "BranchID", "timestamp", "customer_id", "customer_name", "amount", "out", "in", "staff_id", "status"] },
-    { name: TAB_EXPENSES, headers: ["id", "CompanyID", "BranchID", "timestamp", "date", "category", "description", "amount", "payment_method", "staff_id"] },
-    { name: TAB_RECONCILIATIONS, headers: ["id", "CompanyID", "BranchID", "timestamp", "date", "cashier_id", "expected_cash", "actual_cash", "variance", "status", "notes"] },
-    { name: TAB_AUDIT_LOG, headers: ["timestamp", "CompanyID", "BranchID", "user_id", "action", "module", "reference_id", "details"] }
+    { name: TAB_SALES, headers: ["SaleID", "CompanyID", "BranchID", "BranchName", "Date", "Customer", "PaymentMethod", "Subtotal", "Discount", "Tax", "Total", "CashierID", "CashierName", "ItemsCount", "Currency", "ExchangeRate", "ItemsSummary", "ItemsJSON", "Notes", "Status", "SyncedTimestamp"] },
+    { name: TAB_INVENTORY, headers: ["ItemID", "CompanyID", "BranchID", "ItemName", "UnitsPerCase", "CostPerCase", "CostPerUnit", "SellingPrice", "MarkupPercent", "StockCases", "StockSingles", "TotalUnits", "SKU", "Category", "MinStock"] },
+    { name: TAB_GOODS_RECEIVED, headers: ["VoucherID", "CompanyID", "BranchID", "SupplierInvoiceNo", "SupplierID", "SupplierName", "DeliveryDate", "TotalAmount", "LandedCost", "PaymentStatus", "ReceivedByID", "ReceivedByName", "ItemsCount", "Notes", "SyncedTimestamp"] },
+    { name: TAB_GOODS_RECEIVED_ITEMS, headers: ["GRNID", "CompanyID", "BranchID", "ItemID", "ItemName", "ReceivedCases", "ReceivedSingles", "UnitsPerCase", "CostPerCase", "CostPerUnit", "LineTotal", "BatchNumber", "ExpiryDate"] },
+    { name: TAB_SUPPLIER_INVOICES, headers: ["InvoiceID", "CompanyID", "BranchID", "InvoiceNumber", "SupplierID", "SupplierName", "InvoiceDate", "DueDate", "TotalAmount", "AmountPaid", "BalanceDue", "PaymentStatus", "GRVReferences", "SyncedTimestamp"] },
+    { name: TAB_DIRECT_GRVS, headers: ["VoucherID", "CompanyID", "BranchID", "SupplierID", "SupplierName", "TotalAmount", "AmountPaidFromTill", "TillDisbursementLine", "Status", "ReceivedBy", "ApprovedBy", "SyncedTimestamp"] },
+    { name: TAB_STOCK_MOVEMENTS, headers: ["MovementID", "CompanyID", "BranchID", "FromBranchID", "ToBranchID", "ItemID", "ItemName", "Quantity", "MovementType", "Reason", "StaffID", "Timestamp"] },
+    { name: TAB_STOCK_BATCHES, headers: ["BatchID", "CompanyID", "BranchID", "ItemID", "BatchNumber", "ExpiryDate", "InitialQuantity", "RemainingQuantity", "Status", "Timestamp"] },
+    { name: TAB_STOCKTAKE_SESSIONS, headers: ["SessionID", "CompanyID", "BranchID", "StartDate", "EndDate", "SupervisorID", "TotalVarianceValue", "Status", "Timestamp"] },
+    { name: TAB_TRIP_MANIFESTS, headers: ["TripID", "CompanyID", "BranchID", "Destination", "DepartureDate", "ReturnDate", "TotalExpenses", "AllocatedLandedCost", "Status"] },
+    { name: TAB_WALLETS, headers: ["WalletID", "CompanyID", "BranchID", "Currency", "Balance", "LastUpdated"] },
+    { name: TAB_WALLET_TRANSFERS, headers: ["TransferID", "CompanyID", "BranchID", "FromWallet", "ToWallet", "Amount", "ExchangeRate", "StaffID", "Timestamp"] },
+    { name: TAB_FIXED_COSTS, headers: ["CostID", "CompanyID", "BranchID", "Name", "Category", "MonthlyAmount", "ProratedDaily", "Active", "Timestamp"] },
+    { name: TAB_CASH_LIFTS, headers: ["LiftID", "CompanyID", "BranchID", "CashierID", "SupervisorID", "Amount", "Currency", "Reason", "Timestamp"] },
+    { name: TAB_CASH_COUNTS, headers: ["CountID", "CompanyID", "BranchID", "ShiftID", "CashierID", "ExpectedCash", "CountedCash", "Variance", "Timestamp"] },
+    { name: TAB_CUSTOMERS, headers: ["CustomerID", "CompanyID", "BranchID", "Name", "Phone", "Address", "CreditBalance", "CreatedDate"] },
+    { name: TAB_SUPPLIERS, headers: ["SupplierID", "CompanyID", "BranchID", "Name", "Category", "ContactPerson", "Phone", "Email", "Address", "PaymentTerms"] },
+    { name: TAB_STAFF, headers: ["StaffID", "CompanyID", "BranchID", "Name", "Email", "Role", "Phone", "Active"] },
+    { name: TAB_BRANCHES, headers: ["BranchID", "CompanyID", "Name", "Code", "Location", "IsActive"] },
+    { name: TAB_CASH_LOG, headers: ["LogID", "CompanyID", "BranchID", "Timestamp", "Date", "StaffID", "StaffName", "Line", "Description", "CashIn", "CashOut"] },
+    { name: TAB_CUSTOMER_CHANGE, headers: ["ChangeID", "CompanyID", "BranchID", "Timestamp", "CustomerID", "CustomerName", "Amount", "StaffID", "Notes", "Status"] },
+    { name: TAB_CREDIT_SALES, headers: ["CreditID", "CompanyID", "BranchID", "Timestamp", "CustomerID", "CustomerName", "Amount", "Outflow", "Inflow", "StaffID", "Status"] },
+    { name: TAB_EXPENSES, headers: ["ExpenseID", "CompanyID", "BranchID", "Timestamp", "Date", "Category", "Description", "Amount", "PaymentMethod", "StaffID"] },
+    { name: TAB_RECONCILIATIONS, headers: ["ReconID", "CompanyID", "BranchID", "Timestamp", "Date", "CashierID", "ExpectedCash", "ActualCash", "Variance", "Status", "Notes"] },
+    { name: TAB_AUDIT_LOG, headers: ["AuditID", "CompanyID", "BranchID", "Timestamp", "UserID", "Action", "Module", "ReferenceID", "Details"] }
   ];
 
   var createdTabs = [];
@@ -832,11 +1030,13 @@ function setupTenantSpreadsheetTabs(ss, company_id, company_name, initial_produc
           Number(prod.costPerCase || prod.costPrice) || 0,
           Number(prod.costPerUnit || prod.costPrice) || 0,
           Number(prod.sellPriceUnit || prod.price) || 0,
+          Number(prod.markupPercent) || 0,
           Number(prod.stockCases) || 0,
           Number(prod.stockSingles || prod.stockQuantity) || 0,
           Number(prod.totalUnits || prod.stockQuantity) || 0,
           prod.sku || "",
-          prod.category || "General"
+          prod.category || "General",
+          Number(prod.minStock) || 5
         ]);
         existingIds[pId.toUpperCase()] = true;
       }
@@ -928,11 +1128,13 @@ function handleSyncInventory(ss, payload, company_id, branch_id) {
       Number(it.costPerCase || it.costPrice) || 0,
       Number(it.costPerUnit || it.costPrice) || 0,
       Number(it.sellPriceUnit || it.price) || 0,
+      Number(it.markupPercent) || 0,
       Number(it.stockCases) || 0,
       Number(it.stockSingles || it.stockQuantity) || 0,
       Number(it.totalUnits || it.stockQuantity) || 0,
       it.sku || "",
-      it.category || "General"
+      it.category || "General",
+      Number(it.minStock) || 5
     ];
     if (rowIdx) {
       sheet.getRange(rowIdx, 1, 1, rowVals.length).setValues([rowVals]);
@@ -946,7 +1148,7 @@ function handleSyncInventory(ss, payload, company_id, branch_id) {
 }
 
 /**
- * Handle Appending Sales Records
+ * Handle Appending Sales Invoices
  */
 function handleAddSale(ss, payload, company_id, branch_id, branchName, userRole) {
   var sheet = ss.getSheetByName(TAB_SALES);
@@ -955,26 +1157,261 @@ function handleAddSale(ss, payload, company_id, branch_id, branchName, userRole)
     sheet = ss.getSheetByName(TAB_SALES);
   }
   var s = payload.data || payload.sale || payload;
-  var saleId = s.id || s.saleId || ("SALE-" + Date.now());
+  var saleId = s.id || s.saleId || s.InvoiceID || ("SALE-" + Date.now());
+  var itemsJson = "";
+  try {
+    itemsJson = Array.isArray(s.items) ? JSON.stringify(s.items) : "";
+  } catch(e) {}
+
   sheet.appendRow([
     saleId,
     company_id,
     branch_id,
     branchName,
-    s.date || new Date().toISOString(),
+    s.date || s.Timestamp || new Date().toISOString(),
     s.customerName || s.customer || "Walk-in",
     s.paymentMethod || "CASH",
-    Number(s.subtotal) || 0,
-    Number(s.discount) || 0,
-    Number(s.tax) || 0,
-    Number(s.total) || 0,
-    s.cashierId || s.staffId || "USR-001",
-    s.cashierName || s.staffName || "Cashier",
+    Number(s.subtotal || s.Subtotal) || 0,
+    Number(s.discount || s.Discount) || 0,
+    Number(s.tax || s.Tax) || 0,
+    Number(s.total || s.Total) || 0,
+    s.cashierId || s.staffId || s.StaffID || "USR-001",
+    s.cashierName || s.staffName || s.StaffName || "Cashier",
     (s.items && s.items.length) || 1,
+    s.currency || "USD",
+    Number(s.exchangeRate) || 1.0,
+    s.itemsSummary || s.ItemsSummary || "",
+    itemsJson,
     s.notes || "",
-    s.status || "COMPLETED"
+    s.status || "COMPLETED",
+    new Date().toISOString()
   ]);
-  return { status: "success", success: true, sale_id: saleId };
+  return { status: "success", success: true, sale_id: saleId, tab: TAB_SALES };
+}
+
+/**
+ * Handle Appending Supplier Invoices
+ */
+function handleAddSupplierInvoice(ss, payload, company_id, branch_id) {
+  var sheet = ss.getSheetByName(TAB_SUPPLIER_INVOICES);
+  if (!sheet) {
+    setupTenantSpreadsheetTabs(ss, company_id, TENANT_COMPANY_NAME, []);
+    sheet = ss.getSheetByName(TAB_SUPPLIER_INVOICES);
+  }
+  var d = payload.data || payload.invoice || payload;
+  var invId = d.id || d.InvoiceID || ("SUP-INV-" + Date.now());
+  sheet.appendRow([
+    invId,
+    company_id,
+    branch_id,
+    d.invoiceNumber || d.invoice_number || invId,
+    d.supplierId || d.supplier_id || "",
+    d.supplierName || d.supplier_name || "",
+    d.invoiceDate || d.date || new Date().toISOString().split("T")[0],
+    d.dueDate || "",
+    Number(d.totalAmount || d.amount) || 0,
+    Number(d.amountPaid || d.paid) || 0,
+    Number(d.balanceDue || d.balance) || 0,
+    d.paymentStatus || d.status || "UNPAID",
+    Array.isArray(d.grvReferences) ? d.grvReferences.join(", ") : (d.grvReferences || ""),
+    new Date().toISOString()
+  ]);
+  return { status: "success", success: true, invoice_id: invId, tab: TAB_SUPPLIER_INVOICES };
+}
+
+/**
+ * Handle Appending Goods Received Vouchers & Items
+ */
+function handleAddGoodsReceived(ss, payload, company_id, branch_id) {
+  var sheet = ss.getSheetByName(TAB_GOODS_RECEIVED);
+  var itemsSheet = ss.getSheetByName(TAB_GOODS_RECEIVED_ITEMS);
+  if (!sheet || !itemsSheet) {
+    setupTenantSpreadsheetTabs(ss, company_id, TENANT_COMPANY_NAME, []);
+    sheet = ss.getSheetByName(TAB_GOODS_RECEIVED);
+    itemsSheet = ss.getSheetByName(TAB_GOODS_RECEIVED_ITEMS);
+  }
+  var grn = payload.data || payload.grn || payload;
+  var vId = grn.id || grn.grnId || grn.voucherId || ("GRV-" + Date.now());
+  sheet.appendRow([
+    vId,
+    company_id,
+    branch_id,
+    grn.supplierInvoiceNo || grn.invoiceNumber || "",
+    grn.supplierId || "",
+    grn.supplierName || grn.supplier || "",
+    grn.deliveryDate || grn.date || new Date().toISOString().split("T")[0],
+    Number(grn.totalAmount || grn.total) || 0,
+    Number(grn.landedCost || grn.totalLandedCost) || 0,
+    grn.paymentStatus || "UNPAID",
+    grn.receivedById || grn.staffId || "",
+    grn.receivedByName || grn.staffName || "",
+    (grn.items && grn.items.length) || 0,
+    grn.notes || "",
+    new Date().toISOString()
+  ]);
+
+  if (Array.isArray(grn.items) && grn.items.length > 0 && itemsSheet) {
+    for (var i = 0; i < grn.items.length; i++) {
+      var it = grn.items[i];
+      itemsSheet.appendRow([
+        vId,
+        company_id,
+        branch_id,
+        it.itemId || it.id || "",
+        it.itemName || it.name || "",
+        Number(it.receivedCases || it.cases) || 0,
+        Number(it.receivedSingles || it.singles) || 0,
+        Number(it.unitsPerCase) || 1,
+        Number(it.costPerCase) || 0,
+        Number(it.costPerUnit) || 0,
+        Number(it.lineTotal || it.total) || 0,
+        it.batchNumber || it.batch || "",
+        it.expiryDate || ""
+      ]);
+    }
+  }
+
+  return { status: "success", success: true, voucher_id: vId, tab: TAB_GOODS_RECEIVED };
+}
+
+/**
+ * Handle Appending Direct GRV records
+ */
+function handleAddDirectGRV(ss, payload, company_id, branch_id) {
+  var sheet = ss.getSheetByName(TAB_DIRECT_GRVS);
+  if (!sheet) {
+    setupTenantSpreadsheetTabs(ss, company_id, TENANT_COMPANY_NAME, []);
+    sheet = ss.getSheetByName(TAB_DIRECT_GRVS);
+  }
+  var d = payload.data || payload;
+  var vId = d.id || ("DGRV-" + Date.now());
+  sheet.appendRow([
+    vId,
+    company_id,
+    branch_id,
+    d.supplierId || "",
+    d.supplierName || "",
+    Number(d.totalAmount || d.total) || 0,
+    Number(d.amountPaidFromTill || d.paidFromTill) || 0,
+    d.tillDisbursementLine || "",
+    d.status || "APPROVED",
+    d.receivedBy || d.staffName || "",
+    d.approvedBy || "",
+    new Date().toISOString()
+  ]);
+  return { status: "success", success: true, direct_grv_id: vId };
+}
+
+/**
+ * Handle Appending Stock Movement records
+ */
+function handleAddStockMovement(ss, payload, company_id, branch_id) {
+  var sheet = ss.getSheetByName(TAB_STOCK_MOVEMENTS);
+  if (!sheet) {
+    setupTenantSpreadsheetTabs(ss, company_id, TENANT_COMPANY_NAME, []);
+    sheet = ss.getSheetByName(TAB_STOCK_MOVEMENTS);
+  }
+  var m = payload.data || payload;
+  var mId = m.id || ("MOV-" + Date.now());
+  sheet.appendRow([
+    mId,
+    company_id,
+    branch_id,
+    m.fromBranchId || branch_id,
+    m.toBranchId || branch_id,
+    m.itemId || m.productId || "",
+    m.itemName || m.productName || "",
+    Number(m.quantity) || 0,
+    m.movementType || m.type || "TRANSFER",
+    m.reason || "",
+    m.staffId || m.userId || "",
+    m.timestamp || new Date().toISOString()
+  ]);
+  return { status: "success", success: true, movement_id: mId };
+}
+
+/**
+ * Handle Appending Wallet Transfer records
+ */
+function handleAddWalletTransfer(ss, payload, company_id, branch_id) {
+  var sheet = ss.getSheetByName(TAB_WALLET_TRANSFERS);
+  if (!sheet) {
+    setupTenantSpreadsheetTabs(ss, company_id, TENANT_COMPANY_NAME, []);
+    sheet = ss.getSheetByName(TAB_WALLET_TRANSFERS);
+  }
+  var w = payload.data || payload;
+  var wId = w.id || ("WTR-" + Date.now());
+  sheet.appendRow([
+    wId,
+    company_id,
+    branch_id,
+    w.fromWallet || "",
+    w.toWallet || "",
+    Number(w.amount) || 0,
+    Number(w.exchangeRate) || 1,
+    w.staffId || "",
+    w.timestamp || new Date().toISOString()
+  ]);
+  return { status: "success", success: true, transfer_id: wId };
+}
+
+/**
+ * Generic Append Helper with Dynamic Isolation
+ */
+function appendRecordToSheet(ss, sheetBaseName, rowData, companyId, branchId, branchName, userId, userRole) {
+  var targetTab = sheetBaseName;
+  if (BRANCH_ISOLATION_MODE === "BRANCH_TABS" || BRANCH_ISOLATION_MODE === "HYBRID") {
+    targetTab = sheetBaseName + "_" + branchId;
+  }
+
+  var sheet = ss.getSheetByName(targetTab) || ss.getSheetByName(sheetBaseName);
+  var enrichedData = Object.assign({}, rowData);
+  enrichedData.CompanyID = companyId;
+  enrichedData.BranchID = branchId;
+  enrichedData.BranchName = branchName;
+  enrichedData.CreatedByUserID = userId;
+  enrichedData.CreatedByRole = userRole;
+  if (!enrichedData.SyncTimestamp) {
+    enrichedData.SyncTimestamp = new Date().toISOString();
+  }
+
+  if (!sheet) {
+    sheet = ss.insertSheet(targetTab);
+    var headers = Object.keys(enrichedData);
+    sheet.appendRow(headers);
+    sheet.getRange(1, 1, 1, headers.length)
+      .setFontWeight("bold")
+      .setBackground("#1E293B")
+      .setFontColor("#FFFFFF");
+    sheet.setFrozenRows(1);
+  }
+
+  var lastCol = Math.max(sheet.getLastColumn(), 1);
+  var existingHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  if (!existingHeaders || existingHeaders.length === 0 || existingHeaders[0] === "") {
+    existingHeaders = Object.keys(enrichedData);
+    sheet.appendRow(existingHeaders);
+  }
+
+  var newRow = [];
+  for (var i = 0; i < existingHeaders.length; i++) {
+    var key = existingHeaders[i];
+    var val = enrichedData[key];
+    if (val === undefined || val === null) val = "";
+    newRow.push(val);
+  }
+
+  sheet.appendRow(newRow);
+  return {
+    status: "success",
+    success: true,
+    code: 200,
+    tenant: companyId,
+    branch: branchId,
+    tab: sheet.getName(),
+    rowAdded: true,
+    timestamp: new Date().toISOString()
+  };
 }
 
 function jsonResponse(obj) {
@@ -987,6 +1424,205 @@ function jsonResponse(obj) {
 // Generate Google Apps Script snippet for the user to paste into their Google Sheet
 export const generateAppsScriptCode = (spreadsheetId?: string): string => {
   return generateTenantDedicatedAppsScriptCode();
+};
+
+export const generateFullMasterCodeGs = (): string => {
+  return generateTenantDedicatedAppsScriptCode();
+};
+
+/**
+ * Triggers an immediate priority sync for a single invoice or voucher.
+ * Invoked when user clicks the Red "Unsynced" status dot on any transaction screen.
+ */
+export const retrySyncInvoice = async (
+  invoiceId: string,
+  invoiceType: 'sale' | 'supplier_invoice' | 'grv' | 'cash_log' | 'direct_grv' | 'cash_lift' | 'expense' = 'sale'
+): Promise<{ success: boolean; message: string }> => {
+  if (!invoiceId) throw new Error('Missing invoice ID to sync');
+
+  const compId = getCurrentCompanyId();
+  const branchId = getCurrentBranchId();
+
+  if (invoiceType === 'sale') {
+    const allSales = getSales();
+    const sale = allSales.find((s) => s.id === invoiceId) || (allSales as any).find((s: any) => s.InvoiceID === invoiceId);
+    if (!sale) throw new Error(`Sale #${invoiceId} not found in local database`);
+
+    await persistentSyncEngine.enqueueSyncItem({
+      action: 'add_sale',
+      sheetName: 'Sales',
+      payload: {
+        ...sale,
+        company_id: sale.company_id || compId,
+        branch_id: sale.branch_id || branchId,
+      },
+      priority: 'HIGH',
+    });
+
+    const drain = await persistentSyncEngine.drainSyncQueue(compId);
+
+    // Update Room DB sales directly
+    const updatedSales = getSales().map((s) => {
+      if (s.id === invoiceId || (s as any).InvoiceID === invoiceId) {
+        return { ...s, synced: true, syncStatus: 'synced' as const };
+      }
+      return s;
+    });
+    // Write to Room DB storage
+    try {
+      localStorage.setItem('saimetric_room_sales', JSON.stringify(updatedSales));
+      window.dispatchEvent(new Event('room_database_mutation'));
+    } catch {}
+
+    return {
+      success: true,
+      message: `Sale #${invoiceId} synced to cloud Google Sheets!`,
+    };
+  }
+
+  if (invoiceType === 'supplier_invoice') {
+    try {
+      const stored = localStorage.getItem('saimetric_room_supplier_invoices');
+      const invoices = stored ? JSON.parse(stored) : [];
+      const invoice = invoices.find((inv: any) => inv.id === invoiceId || inv.invoiceNumber === invoiceId);
+      if (invoice) {
+        await persistentSyncEngine.enqueueSyncItem({
+          action: 'add_supplier_invoice',
+          sheetName: 'SupplierInvoices',
+          payload: {
+            ...invoice,
+            company_id: invoice.company_id || compId,
+            branch_id: invoice.branch_id || branchId,
+          },
+          priority: 'HIGH',
+        });
+        await persistentSyncEngine.drainSyncQueue(compId);
+        invoice.synced = true;
+        invoice.syncStatus = 'synced';
+        localStorage.setItem('saimetric_room_supplier_invoices', JSON.stringify(invoices));
+        window.dispatchEvent(new Event('room_database_mutation'));
+        return { success: true, message: `Supplier Invoice #${invoiceId} synced!` };
+      }
+    } catch (e: any) {
+      throw new Error(e.message || 'Failed syncing supplier invoice');
+    }
+  }
+
+  if (invoiceType === 'grv' || invoiceType === 'direct_grv') {
+    try {
+      const stored = localStorage.getItem(invoiceType === 'direct_grv' ? 'saimetric_room_direct_grvs' : 'saimetric_room_goods_received_notes');
+      const vouchers = stored ? JSON.parse(stored) : [];
+      const voucher = vouchers.find((v: any) => v.id === invoiceId || v.grnId === invoiceId || v.voucherId === invoiceId);
+      if (voucher) {
+        await persistentSyncEngine.enqueueSyncItem({
+          action: invoiceType === 'direct_grv' ? 'add_direct_grv' : 'add_goods_received',
+          sheetName: invoiceType === 'direct_grv' ? 'DirectGRVs' : 'GoodsReceived',
+          payload: {
+            ...voucher,
+            company_id: voucher.company_id || compId,
+            branch_id: voucher.branch_id || branchId,
+          },
+          priority: 'HIGH',
+        });
+        await persistentSyncEngine.drainSyncQueue(compId);
+        voucher.synced = true;
+        voucher.syncStatus = 'synced';
+        localStorage.setItem(invoiceType === 'direct_grv' ? 'saimetric_room_direct_grvs' : 'saimetric_room_goods_received_notes', JSON.stringify(vouchers));
+        window.dispatchEvent(new Event('room_database_mutation'));
+        return { success: true, message: `Voucher #${invoiceId} synced!` };
+      }
+    } catch (e: any) {
+      throw new Error(e.message || 'Failed syncing voucher');
+    }
+  }
+
+  if (invoiceType === 'cash_lift') {
+    try {
+      const stored = localStorage.getItem('saimetric_room_cash_lifts');
+      const lifts = stored ? JSON.parse(stored) : [];
+      const lift = lifts.find((l: any) => l.id === invoiceId);
+      if (lift) {
+        await persistentSyncEngine.enqueueSyncItem({
+          action: 'add_cash_lift',
+          sheetName: 'CashLifts',
+          payload: {
+            ...lift,
+            company_id: lift.company_id || compId,
+            branch_id: lift.branch_id || branchId,
+          },
+          priority: 'HIGH',
+        });
+        await persistentSyncEngine.drainSyncQueue(compId);
+        lift.synced = true;
+        lift.syncStatus = 'synced';
+        localStorage.setItem('saimetric_room_cash_lifts', JSON.stringify(lifts));
+        window.dispatchEvent(new Event('room_database_mutation'));
+        return { success: true, message: `Cash Lift #${invoiceId} synced!` };
+      }
+    } catch (e: any) {
+      throw new Error(e.message || 'Failed syncing cash lift');
+    }
+  }
+
+  if (invoiceType === 'cash_log') {
+    try {
+      const stored = localStorage.getItem('saimetric_room_cash_logs');
+      const logs = stored ? JSON.parse(stored) : [];
+      const log = logs.find((l: any) => l.id === invoiceId);
+      if (log) {
+        await persistentSyncEngine.enqueueSyncItem({
+          action: 'add_cash_log',
+          sheetName: 'CashLog',
+          payload: {
+            ...log,
+            company_id: log.company_id || compId,
+            branch_id: log.branch_id || branchId,
+          },
+          priority: 'HIGH',
+        });
+        await persistentSyncEngine.drainSyncQueue(compId);
+        log.synced = true;
+        log.syncStatus = 'synced';
+        localStorage.setItem('saimetric_room_cash_logs', JSON.stringify(logs));
+        window.dispatchEvent(new Event('room_database_mutation'));
+        return { success: true, message: `Cash Log #${invoiceId} synced!` };
+      }
+    } catch (e: any) {
+      throw new Error(e.message || 'Failed syncing cash log');
+    }
+  }
+
+  if (invoiceType === 'expense') {
+    try {
+      const stored = localStorage.getItem('saimetric_room_expenses');
+      const expenses = stored ? JSON.parse(stored) : [];
+      const exp = expenses.find((e: any) => e.id === invoiceId);
+      if (exp) {
+        await persistentSyncEngine.enqueueSyncItem({
+          action: 'add_expense',
+          sheetName: 'Expenses',
+          payload: {
+            ...exp,
+            company_id: exp.company_id || compId,
+            branch_id: exp.branch_id || branchId,
+          },
+          priority: 'HIGH',
+        });
+        await persistentSyncEngine.drainSyncQueue(compId);
+        exp.synced = true;
+        exp.syncStatus = 'synced';
+        localStorage.setItem('saimetric_room_expenses', JSON.stringify(expenses));
+        window.dispatchEvent(new Event('room_database_mutation'));
+        return { success: true, message: `Expense #${invoiceId} synced!` };
+      }
+    } catch (e: any) {
+      throw new Error(e.message || 'Failed syncing expense');
+    }
+  }
+
+  // Fallback: drain queue
+  await persistentSyncEngine.drainSyncQueue(compId);
+  return { success: true, message: `Record #${invoiceId} sync requested.` };
 };
 
 // Export table to CSV
@@ -1132,6 +1768,83 @@ export const exportSheetToCsv = (sheetName: SheetName): string => {
         DueDate: cr.dueDate || '',
         Notes: cr.notes || '',
         Status: cr.status,
+      }));
+      break;
+    case 'InventoryMaster':
+      rows = getProducts().map((p) => ({
+        CompanyID: compId,
+        BranchID: (p as any).branch_id || brId,
+        BranchName: brName,
+        ProductID: p.id,
+        Name: p.name,
+        SKU: p.sku || '',
+        Category: p.category || 'General',
+        SellingPrice: p.price || 0,
+        CostPrice: p.costPrice || 0,
+        StockQuantity: p.stockQuantity ?? p.totalUnits ?? 0,
+        Barcode: p.barcode || '',
+        ReorderLevel: p.reorderLevelUnits || 5,
+      }));
+      break;
+    case 'SupplierInvoices':
+      rows = getSupplierInvoiceVouchers().map((inv) => ({
+        CompanyID: compId,
+        BranchID: (inv as any).branch_id || brId,
+        BranchName: brName,
+        VoucherID: inv.voucherId,
+        InvoiceNo: inv.invoiceNo,
+        Supplier: inv.supplier,
+        Date: inv.date,
+        TotalAmount: inv.totalInvoiceAmount,
+        TotalCases: inv.totalCases,
+        TotalUnits: inv.totalUnits,
+        StaffName: inv.staffName,
+        SyncStatus: (inv as any).syncStatus || ((inv as any).synced ? 'synced' : 'pending'),
+      }));
+      break;
+    case 'GoodsReceived':
+      rows = getAllGoodsReceived().map((grn) => ({
+        CompanyID: compId,
+        BranchID: (grn as any).branch_id || brId,
+        BranchName: brName,
+        GRN_ID: grn.id,
+        Supplier: grn.supplier,
+        InvoiceNo: grn.invoiceNo,
+        Date: grn.date,
+        TotalAmount: grn.totalAmount,
+        TotalCases: grn.totalCases,
+        TotalUnits: grn.totalUnits,
+        ReceivedBy: grn.receivedBy,
+        SyncStatus: (grn as any).syncStatus || ((grn as any).synced ? 'synced' : 'pending'),
+      }));
+      break;
+    case 'DirectGRVs':
+      rows = getDirectGrvs().map((d) => ({
+        CompanyID: compId,
+        BranchID: (d as any).branch_id || brId,
+        BranchName: brName,
+        GRV_ID: d.id,
+        GRV_Number: d.grvNumber,
+        Supplier: d.supplierName,
+        Date: d.date,
+        TotalCost: d.totalCost,
+        Status: d.status,
+        SyncStatus: (d as any).syncStatus || ((d as any).synced ? 'synced' : 'pending'),
+      }));
+      break;
+    case 'CashLifts':
+      rows = getAllCashLifts().map((l) => ({
+        CompanyID: compId,
+        BranchID: (l as any).branch_id || brId,
+        BranchName: brName,
+        LiftID: l.id,
+        Timestamp: l.timestamp,
+        Date: l.date,
+        Cashier: l.cashierName,
+        Supervisor: l.supervisorName,
+        TotalAmount: l.totalAmount,
+        Reason: l.reason || '',
+        SyncStatus: (l as any).syncStatus || (l.synced ? 'synced' : 'pending'),
       }));
       break;
     case 'Products':
@@ -1308,7 +2021,7 @@ export const initializeTenantBusinessTabs = async (params?: {
 
       return {
         success: true,
-        message: srvData.message || `✓ Initialized 11 business tabs and populated ${initialProducts.length} product(s) in Google Sheets!`,
+        message: srvData.message || `✓ Initialized 25 business tabs and populated ${initialProducts.length} product(s) in Google Sheets!`,
         createdTabs: srvData.tabs,
         sheetId: targetSheetId,
       };

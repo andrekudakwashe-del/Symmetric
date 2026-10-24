@@ -61,6 +61,8 @@ import {
 import { ShareDeviceModal } from '../common/ShareDeviceModal';
 import { OfflineAirgapSyncModal } from './OfflineAirgapSyncModal';
 import { QrPairing } from '../QrPairing';
+import { LocalHubSettingsModal } from './LocalHubSettingsModal';
+import { LocalHubConfig } from '../../utils/localHubConfig';
 
 interface P2PMeshSyncHubProps {
   onBack?: () => void;
@@ -77,6 +79,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
   const [showShareModal, setShowShareModal] = useState(false);
   const [showAirgapModal, setShowAirgapModal] = useState(false);
   const [showQrPairingModal, setShowQrPairingModal] = useState(false);
+  const [showLocalHubModal, setShowLocalHubModal] = useState(false);
   const [pingSentToast, setPingSentToast] = useState(false);
   const [incomingPingNotice, setIncomingPingNotice] = useState<string | null>(null);
   const [incomingSaleNotice, setIncomingSaleNotice] = useState<string | null>(null);
@@ -186,7 +189,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
     }
 
     try {
-      const res = await meshSyncService.requestCatchUpSync(undefined, customIso);
+      const res = await meshSyncService.requestCatchUpSync(undefined, customIso, false, true);
       setTestActionToast(res.message);
     } catch (err: any) {
       setTestActionToast(`Catch-up error: ${err?.message || 'Failed'}`);
@@ -494,6 +497,18 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
             >
               <Camera className="w-3.5 h-3.5" />
               <span>Offline QR Sync</span>
+            </button>
+
+            {/* LOCAL WEBSOCKET HUB (TERMUX NODE.JS) */}
+            <button
+              type="button"
+              id="btn-open-local-hub-settings"
+              onClick={() => setShowLocalHubModal(true)}
+              className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-black flex items-center space-x-1.5 transition border border-blue-400/40 shadow-lg cursor-pointer"
+              title="Configure or Scan Local WebSocket Hub (Termux / Hotspot)"
+            >
+              <Radio className="w-3.5 h-3.5 animate-pulse" />
+              <span>Local WebSocket Hub</span>
             </button>
 
             {/* ZERO-INTERNET SHAREIT / XENDER HOTSPOT MESH */}
@@ -1178,7 +1193,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
               if (logFilter === 'drops') return log.type === 'SECURITY_DROP' || log.message.toLowerCase().includes('blocked');
               return true;
             })
-            .map((log) => {
+            .map((log, idx) => {
               let badgeColor = 'bg-slate-800 text-slate-300 border-slate-700';
               if (log.type === 'BROADCAST') badgeColor = 'bg-purple-900/60 text-purple-300 border-purple-700';
               if (log.type === 'EPIDEMIC_HOP') badgeColor = 'bg-indigo-900/60 text-indigo-300 border-indigo-700';
@@ -1190,7 +1205,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
 
               return (
                 <div
-                  key={log.id}
+                  key={`${log.id || 'mesh-log'}-${idx}`}
                   className={`p-2.5 rounded-xl border space-y-1 transition ${
                     log.type === 'SECURITY_DROP'
                       ? 'bg-rose-950/30 border-rose-800/80'
@@ -1439,6 +1454,12 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
           </div>
         </div>
       )}
+
+      {/* Local WebSocket Hub Settings Modal */}
+      <LocalHubSettingsModal
+        isOpen={showLocalHubModal}
+        onClose={() => setShowLocalHubModal(false)}
+      />
     </div>
   );
 };

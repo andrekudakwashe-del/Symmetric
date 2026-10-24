@@ -216,9 +216,9 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
         </div>
 
         <div className="space-y-2.5">
-          {auditLogs.map((log) => (
+          {auditLogs.map((log, idx) => (
             <div
-              key={log.id}
+              key={`${log.id || 'lockdown-log'}-${idx}`}
               className="bg-slate-950/80 p-3.5 rounded-xl border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs"
             >
               <div>

@@ -35,6 +35,8 @@ import {
   getBranches,
 } from '../../db/roomDatabase';
 import { BluetoothPrinterModal } from './BluetoothPrinterModal';
+import { SyncStatusDot } from './SyncStatusDot';
+import { retrySyncInvoice } from '../../services/googleSheetsSync';
 
 interface ReceiptModalProps {
   isOpen: boolean;
@@ -320,9 +322,17 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
                 <h3 className="text-sm font-black text-slate-900 leading-tight">
                   Sale Receipt Preview
                 </h3>
-                <p className="text-[11px] text-slate-500 font-medium">
-                  Invoice #{invoice.id} • {effectiveStoreName}
-                </p>
+                <div className="flex items-center gap-2 text-[11px] text-slate-500 font-medium flex-wrap">
+                  <span>Invoice #{invoice.id} • {effectiveStoreName}</span>
+                  <SyncStatusDot
+                    isSynced={invoice.synced}
+                    syncStatus={(invoice as any).syncStatus}
+                    timestamp={invoice.timestamp}
+                    invoiceId={invoice.id}
+                    invoiceType="sale"
+                    onRetry={() => retrySyncInvoice(invoice.id, 'sale')}
+                  />
+                </div>
               </div>
             </div>
 
@@ -517,9 +527,21 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
 
               {/* Receipt Meta (Date, Invoice #, Cashier, Customer) */}
               <div className="py-2.5 border-b border-dashed border-slate-300 text-[11px] space-y-1">
-                <div className="flex justify-between">
+                <div className="flex justify-between items-center">
                   <span className="text-slate-500 font-sans">INVOICE:</span>
-                  <span className="font-bold font-mono">{invoice.id}</span>
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-bold font-mono">{invoice.id}</span>
+                    <SyncStatusDot
+                      isSynced={invoice.synced}
+                      syncStatus={(invoice as any).syncStatus}
+                      timestamp={invoice.timestamp}
+                      invoiceId={invoice.id}
+                      invoiceType="sale"
+                      size="xs"
+                      showLabel={false}
+                      onRetry={() => retrySyncInvoice(invoice.id, 'sale')}
+                    />
+                  </div>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-500 font-sans">DATE:</span>

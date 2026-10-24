@@ -765,7 +765,7 @@ export const ProductAuditTrailModal: React.FC<ProductAuditTrailModalProps> = ({
 
                     return (
                       <tr
-                        key={entry.txnId || entry.movementId || index}
+                        key={`${entry.txnId || entry.movementId || 'trail'}-${index}`}
                         className="hover:bg-slate-900/60 transition-colors"
                       >
                         {/* 1. Date & Time */}
@@ -919,7 +919,7 @@ export const ProductAuditTrailModal: React.FC<ProductAuditTrailModalProps> = ({
 
                 return (
                   <div
-                    key={entry.txnId || entry.movementId || index}
+                    key={`${entry.txnId || entry.movementId || 'card'}-${index}`}
                     className="bg-slate-950 border border-slate-800 rounded-2xl p-4 hover:border-slate-700 transition"
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-3 mb-3">

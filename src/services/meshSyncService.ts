@@ -13,6 +13,7 @@ import {
 import mqtt, { MqttClient } from 'mqtt';
 import {
   getSales,
+  getAllSales,
   addSale,
   getSyncQueue,
   purgeSyncedRecords,
@@ -25,8 +26,11 @@ import {
   getCurrentCompany,
   getCurrentBranchId,
   getCurrentBranch,
+  getBranches,
+  isRecordInBranchScope,
   onDatabaseMutation,
   DatabaseMutationEvent,
+  resolveEntityType,
   ingestMeshBranch,
   ingestMeshStaff,
   ingestMeshSupervisorApproval,
@@ -44,9 +48,19 @@ import {
   ingestMeshStockMovement,
   ingestMeshCashLift,
   ingestMeshGoodsReceived,
+  addExpense,
+  saveReconciliation,
+  saveCashAccount,
+  saveCashTransfer,
+  getAllExpenses,
+  getAllCashAccounts,
+  getAllCashTransfers,
 } from '../db/roomDatabase';
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { processSyncQueue } from './googleSheetsSync';
+import { LocalHubConfig, normalizeHubUrl } from '../utils/localHubConfig';
+
+export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE';
 
 // Keys for localStorage persistence
 const PREFS_BRANCH_KEY = 'saimetric_mesh_branch_code';
@@ -185,12 +199,70 @@ class MeshSyncManager {
   private lastNotifiedPeerSignature: string = '';
   private lastCatchUpRequestTime: Map<string, number> = new Map();
 
+  // Local WebSocket Hub (Termux Node.js server on Android phone)
+  private localHubWs: WebSocket | null = null;
+  private isLocalHubConnected: boolean = false;
+  private isLocalHubLost: boolean = false;
+  private activeConnectionMode: MeshConnectionMode = 'LOCAL_OFFLINE';
+  private localHubHeartbeatTimer: number | null = null;
+  private localHubReconnectTimer: number | null = null;
+  private lastHubPongReceivedAt: number = 0;
+  private connectionModeListeners: Array<(mode: MeshConnectionMode, details: any) => void> = [];
+  private pendingLocalHubQueue: any[] = [];
+  private knownSaleIds: Set<string> = new Set();
+  private broadcastedInvoiceIds: Set<string> = new Set();
+  private batchUiTimer: number | null = null;
+
+  private scheduleBatchUiUpdate() {
+    if (this.batchUiTimer) return;
+    this.batchUiTimer = window.setTimeout(() => {
+      this.batchUiTimer = null;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      }
+    }, 150);
+  }
+
+  private queueOutgoingLocalHubPacket(packet: any) {
+    if (!packet) return;
+    if (this.pendingLocalHubQueue.length > 300) {
+      this.pendingLocalHubQueue.shift();
+    }
+    this.pendingLocalHubQueue.push(packet);
+  }
+
   constructor() {
     this.config = this.loadConfig();
+
+    // Pre-populate known and broadcasted invoice IDs from local DB for fast O(1) deduplication
+    try {
+      const existingSales = getAllSales();
+      for (const s of existingSales) {
+        if (s && s.id) {
+          this.knownSaleIds.add(s.id);
+          this.broadcastedInvoiceIds.add(s.id);
+        }
+      }
+    } catch (e) {}
+
     this.initServerStream();
     this.initBroadcastChannel();
     this.initVirtualMeshDefault();
     this.startOpportunisticCloudSyncTimer();
+
+    // Subscribe to LocalHubConfig changes (URL changes or Force Local Hub toggles)
+    LocalHubConfig.subscribe(() => {
+      this.handleLocalHubConfigChanged();
+    });
+
+    // Auto-attempt local hub connection on boot (or when forced / offline)
+    if (typeof window !== 'undefined') {
+      setTimeout(() => {
+        this.evaluateConnectionPriority();
+      }, 1000);
+    }
 
     // Defer external MQTT relay connection until after critical UI boots
     if (typeof window !== 'undefined') {
@@ -215,13 +287,16 @@ class MeshSyncManager {
         );
         this.initServerStream();
         this.initMqttRelay();
+        this.evaluateConnectionPriority();
       });
       window.addEventListener('offline', () => {
         this.addLog(
           'DISCOVERY',
-          'Internet offline. Operating in 100% Offline Local Wi-Fi & Optical QR Mesh Mode.',
+          'Internet offline. Evaluating failover to Local WebSocket Hub...',
           this.config.deviceName
         );
+        this.evaluateConnectionPriority();
+        this.connectLocalHub();
       });
 
       // When terminal awakens, tab regains focus or user unlocks device after being away
@@ -444,13 +519,23 @@ class MeshSyncManager {
 
   public getConnectionStatus() {
     const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    const forceLocalHub = LocalHubConfig.getForceLocalHub();
+    const hubUrl = LocalHubConfig.getLocalHubUrl();
+    const mode = this.evaluateConnectionPriority();
+
     return {
       isOnline,
+      connectionMode: mode,
+      isCloudMeshConnected: this.isMqttConnected || this.isServerRelayConnected,
+      isLocalHubConnected: this.isLocalHubConnected,
+      isLocalHubLost: this.isLocalHubLost,
+      localHubUrl: hubUrl,
+      forceLocalHub,
       isMqttConnected: this.isMqttConnected || this.isServerRelayConnected,
       isWebRtcConnected: this.isWebRtcConnected,
-      hasLocalGateway: !!this.localGatewayUrl,
-      localGatewayUrl: this.localGatewayUrl,
-      broker: this.brokerName,
+      hasLocalGateway: !!this.localGatewayUrl || !!hubUrl,
+      localGatewayUrl: hubUrl || this.localGatewayUrl,
+      broker: mode === 'LOCAL_HUB' ? `Local WebSocket Hub (${hubUrl})` : this.brokerName,
       companyId: this.config.companyId,
       companyName: this.config.companyName,
       branchId: this.config.branchId,
@@ -598,119 +683,455 @@ class MeshSyncManager {
   }
 
   // =========================================================================
-  // OFFLINE QR SCANNING & FORCED DIRECT WS:// LAN WEBSOCKET CONNECTION
+  // LOCAL WEBSOCKET HUB (TERMUX NODE.JS ON ANDROID HOST / OFFLINE MASTER-SPOKE)
   // =========================================================================
   private directWsClient: WebSocket | null = null;
   private isWsConnected: boolean = false;
   private isTorchOn: boolean = false;
   private activeVideoTrack: MediaStreamTrack | null = null;
 
-  public onScanSuccess(decodedText: string): void {
-    let targetWsUrl = '';
-    const trimmed = (decodedText || '').trim();
-    const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
+  public handleLocalHubConfigChanged(): void {
+    this.addLog(
+      'DISCOVERY',
+      `Local Hub Config updated: URL=[${LocalHubConfig.getLocalHubUrl()}], Forced=${LocalHubConfig.getForceLocalHub()}`,
+      this.config.deviceName
+    );
+    this.evaluateConnectionPriority();
+  }
 
-    if (trimmed.startsWith('wss://')) {
-      targetWsUrl = trimmed;
-    } else if (trimmed.startsWith('ws://')) {
-      targetWsUrl = isHttps ? 'wss://' + trimmed.slice('ws://'.length) : trimmed;
-    } else if (trimmed.startsWith('https://')) {
-      targetWsUrl = 'wss://' + trimmed.slice('https://'.length);
-    } else if (trimmed.startsWith('http://')) {
-      targetWsUrl = isHttps ? 'wss://' + trimmed.slice('http://'.length) : 'ws://' + trimmed.slice('http://'.length);
+  public evaluateConnectionPriority(): MeshConnectionMode {
+    const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
+    const forceLocalHub = LocalHubConfig.getForceLocalHub();
+
+    let newMode: MeshConnectionMode;
+
+    if (forceLocalHub) {
+      // User explicitly forced local hub
+      if (this.isLocalHubConnected) {
+        newMode = 'LOCAL_HUB';
+      } else {
+        newMode = 'LOCAL_OFFLINE';
+        if (!this.localHubWs && !this.localHubReconnectTimer) {
+          this.connectLocalHub();
+        }
+      }
+    } else if (isOnline && (this.isMqttConnected || this.isServerRelayConnected)) {
+      newMode = 'CLOUD_MESH';
+    } else if (this.isLocalHubConnected) {
+      newMode = 'LOCAL_HUB';
     } else {
-      try {
-        const parsed = JSON.parse(trimmed);
-        if (parsed.wsUrl) {
-          targetWsUrl = parsed.wsUrl;
-        } else if (parsed.url) {
-          targetWsUrl = isHttps
-            ? parsed.url.replace(/^https?:\/\//i, 'wss://').replace(/^ws:\/\//i, 'wss://')
-            : parsed.url.replace(/^https?:\/\//i, 'ws://').replace(/^wss:\/\//i, 'ws://');
-        } else if (parsed.host || parsed.ip) {
-          const port = parsed.port || 3000;
-          const proto = isHttps ? 'wss://' : 'ws://';
-          targetWsUrl = `${proto}${parsed.host || parsed.ip}:${port}`;
-        }
-      } catch (e) {
-        const ipMatch = trimmed.match(/(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?::\d+)?/);
-        if (ipMatch) {
-          const proto = isHttps ? 'wss://' : 'ws://';
-          targetWsUrl = `${proto}${ipMatch[0]}`;
-        }
+      newMode = 'LOCAL_OFFLINE';
+      if (!this.localHubWs && !this.localHubReconnectTimer) {
+        this.connectLocalHub();
       }
     }
 
-    if (targetWsUrl) {
-      this.connectToWsUrl(targetWsUrl);
+    const modeChanged = newMode !== this.activeConnectionMode;
+    this.activeConnectionMode = newMode;
+
+    if (modeChanged) {
+      this.notifyConnectionModeChange();
     }
 
+    return this.activeConnectionMode;
+  }
+
+  public connectLocalHub(customUrl?: string) {
+    if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
+
+    if (this.localHubReconnectTimer) {
+      clearTimeout(this.localHubReconnectTimer);
+      this.localHubReconnectTimer = null;
+    }
+
+    if (this.localHubWs) {
+      if (this.localHubWs.readyState === WebSocket.OPEN || this.localHubWs.readyState === WebSocket.CONNECTING) {
+        return; // WebSocket is already connected or handshaking. Never tear down an active socket.
+      }
+      try {
+        this.localHubWs.onopen = null;
+        this.localHubWs.onmessage = null;
+        this.localHubWs.onerror = null;
+        this.localHubWs.onclose = null;
+        this.localHubWs.close();
+      } catch {}
+      this.localHubWs = null;
+    }
+
+    const hubUrl = customUrl ? normalizeHubUrl(customUrl) : LocalHubConfig.getLocalHubUrl();
+    if (!hubUrl) return;
+
+    try {
+      this.addLog('DISCOVERY', `Connecting to Local WebSocket Hub at ${hubUrl}...`, this.config.deviceName);
+      const ws = new WebSocket(hubUrl);
+      this.localHubWs = ws;
+      this.directWsClient = ws;
+
+      ws.onopen = () => {
+        this.isLocalHubConnected = true;
+        this.isWsConnected = true;
+        this.isLocalHubLost = false;
+        this.lastHubPongReceivedAt = Date.now();
+        this.evaluateConnectionPriority();
+
+        this.addLog(
+          'DISCOVERY',
+          `Local WebSocket Hub CONNECTED: ${hubUrl} (0% Internet Required). Master-Spoke offline mesh active.`,
+          this.config.deviceName
+        );
+        playChime();
+
+        // 5. Catch-Up on Open: Trigger catch-up request on open. Termux Hub will replay history.
+        this.requestCatchUpSync().catch(() => {});
+
+        // Flush any pending individual queue items across the local hub
+        this.drainQueueToLocalHub();
+
+        this.notifyPeerSubscribers(true);
+        this.notifyConnectionModeChange();
+      };
+
+      ws.onmessage = async (event) => {
+        try {
+          if (!event.data) return;
+          let rawData = event.data;
+          if (typeof Blob !== 'undefined' && rawData instanceof Blob) {
+            rawData = await rawData.text();
+          } else if (typeof ArrayBuffer !== 'undefined' && rawData instanceof ArrayBuffer) {
+            rawData = new TextDecoder().decode(rawData);
+          }
+          if (typeof rawData !== 'string') return;
+
+          const parsed = JSON.parse(rawData);
+          if (!parsed) return;
+
+          // Termux WebSocket server stores and auto-replays historical packets on connect
+          if (Array.isArray(parsed)) {
+            for (const item of parsed) {
+              this.processSingleLocalHubPacket(item);
+            }
+            return;
+          }
+
+          if (typeof parsed === 'object') {
+            if (Array.isArray((parsed as any).packets)) {
+              for (const item of (parsed as any).packets) {
+                this.processSingleLocalHubPacket(item);
+              }
+              return;
+            }
+            if (Array.isArray((parsed as any).history)) {
+              for (const item of (parsed as any).history) {
+                this.processSingleLocalHubPacket(item);
+              }
+              return;
+            }
+          }
+
+          this.processSingleLocalHubPacket(parsed);
+        } catch (e) {
+          console.warn('[MeshSync] Error parsing local hub message:', e);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.warn(`[MeshSync] Local Hub socket error at ${hubUrl}:`, err);
+        // Only disconnect if socket actually closed or closing
+        if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+          this.handleLocalHubLost('Local Hub WebSocket connection dropped');
+        }
+      };
+
+      ws.onclose = () => {
+        this.handleLocalHubLost('Local Hub WebSocket closed');
+      };
+    } catch (err: any) {
+      this.handleLocalHubLost(err?.message || 'Failed to initialize WebSocket');
+    }
+  }
+
+  private processSingleLocalHubPacket(packet: any) {
+    if (!packet || typeof packet !== 'object') return;
+
+    // Unwrap envelope wrappers if hub relays through { data: ... } or { payload: ... }
+    if (packet.data && typeof packet.data === 'object' && (packet.data.type || packet.data.action)) {
+      packet = packet.data;
+    } else if (packet.payload && typeof packet.payload === 'object' && (packet.payload.type || packet.payload.action)) {
+      packet = packet.payload;
+    }
+
+    // Ignore packets that originated from THIS device
+    const originId =
+      packet.origin_device_id ||
+      packet.originDeviceId ||
+      packet.deviceId ||
+      packet.sourceDevice;
+
+    if (originId && originId === this.config.deviceId) {
+      return;
+    }
+
+    // Fast deduplication by packet ID
+    const packetId = packet.packet_id || packet.id;
+    if (packetId) {
+      if (this.seenPacketIds.has(packetId)) return;
+      this.seenPacketIds.add(packetId);
+    }
+
+    // Fast deduplication for sale packets by ID using [user_prefix]-[YYMMDD]-[HHMMSS]-[Random3Digits] format
+    const saleData = packet.sale || (packet.type === 'sale' ? packet.payload : null);
+    if (saleData && saleData.id) {
+      if (this.knownSaleIds.has(saleData.id)) {
+        return; // Already known/ingested, drop instantly without overhead
+      }
+    }
+
+    // Ingest packet into local Room DB / IndexedDB
+    const actionTopic = packet.action || packet.type || 'packet';
+    this.handleIncomingMeshPacket(`local_hub/${actionTopic}`, packet);
+  }
+
+  private handleLocalHubLost(reason: string) {
+    if (this.localHubHeartbeatTimer) {
+      clearInterval(this.localHubHeartbeatTimer);
+      this.localHubHeartbeatTimer = null;
+    }
+
+    const wasConnected = this.isLocalHubConnected;
+    this.isLocalHubConnected = false;
+    this.isWsConnected = false;
+    this.isLocalHubLost = true;
+
+    if (this.localHubWs) {
+      try {
+        this.localHubWs.onopen = null;
+        this.localHubWs.onmessage = null;
+        this.localHubWs.onerror = null;
+        this.localHubWs.onclose = null;
+        this.localHubWs.close();
+      } catch {}
+      this.localHubWs = null;
+      this.directWsClient = null;
+    }
+
+    if (wasConnected) {
+      this.addLog(
+        'DISCOVERY',
+        `Local Hub lost (${reason}). Outgoing packets queued for hub. Scanning for new hub...`,
+        this.config.deviceName
+      );
+    }
+
+    this.evaluateConnectionPriority();
+    this.notifyPeerSubscribers(true);
+    this.notifyConnectionModeChange();
+
+    // Auto-reconnect every 5 seconds until successful
+    if (!this.localHubReconnectTimer) {
+      this.localHubReconnectTimer = window.setTimeout(() => {
+        this.localHubReconnectTimer = null;
+        this.connectLocalHub();
+      }, 5000);
+    }
+  }
+
+  private async drainQueueToLocalHub() {
+    const wsTarget = this.localHubWs || this.directWsClient;
+    if (!wsTarget || wsTarget.readyState !== WebSocket.OPEN) return;
+    try {
+      // 1. Drain pending in-memory packets that occurred while socket was connecting
+      if (this.pendingLocalHubQueue.length > 0) {
+        const count = this.pendingLocalHubQueue.length;
+        this.addLog(
+          'BROADCAST',
+          `Local Hub connected: Flushing ${count} pending real-time packet(s) to hub...`,
+          this.config.deviceName
+        );
+        while (this.pendingLocalHubQueue.length > 0) {
+          const queuedPacket = this.pendingLocalHubQueue.shift();
+          if (queuedPacket) {
+            wsTarget.send(JSON.stringify(queuedPacket));
+          }
+        }
+      }
+
+      // 2. Drain persistent sync queue
+      const queue = getSyncQueue();
+      if (queue && queue.length > 0) {
+        this.addLog(
+          'BROADCAST',
+          `Local Hub connected: Flushing ${queue.length} queued packet(s) to local hub...`,
+          this.config.deviceName
+        );
+        for (const item of queue.slice(0, 50)) {
+          const entityType = resolveEntityType(item.targetSheet || '');
+          const isSale = item.targetSheet === 'Sales' || entityType === 'sale';
+          const isInventory = item.targetSheet === 'InventoryMaster' || item.targetSheet === 'Products' || entityType === 'inventory';
+
+          let packet: any;
+          if (isSale) {
+            const saleData = item.payload;
+            if (saleData?.id) {
+              if (this.broadcastedInvoiceIds.has(saleData.id)) {
+                continue;
+              }
+              this.broadcastedInvoiceIds.add(saleData.id);
+            }
+            packet = {
+              type: 'sale',
+              action: 'SALE_RECORD',
+              packet_id: `QUEUED-SALE-${item.id || Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+              companyId: this.config.companyId,
+              branchId: this.config.branchId,
+              branchCode: this.config.branchCode,
+              deviceId: this.config.deviceId,
+              originDeviceId: this.config.deviceId,
+              originDeviceName: this.config.deviceName,
+              sale: saleData,
+              payload: saleData,
+              clientRequestId: item.clientRequestId,
+              timestamp: item.timestamp || Date.now(),
+              ttl: 5,
+            };
+          } else if (isInventory) {
+            const itemData = item.payload;
+            packet = {
+              type: 'inventory',
+              action: 'INVENTORY_RECORD',
+              packet_id: `QUEUED-INV-${item.id || Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+              companyId: this.config.companyId,
+              branchId: this.config.branchId,
+              branchCode: this.config.branchCode,
+              deviceId: this.config.deviceId,
+              originDeviceId: this.config.deviceId,
+              originDeviceName: this.config.deviceName,
+              item: itemData,
+              payload: itemData,
+              clientRequestId: item.clientRequestId,
+              timestamp: item.timestamp || Date.now(),
+              ttl: 5,
+            };
+          } else {
+            packet = {
+              type: 'db_mutation',
+              action: 'DB_MUTATION',
+              packet_id: `QUEUED-MUT-${item.id || Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+              companyId: this.config.companyId,
+              branchId: this.config.branchId,
+              branchCode: this.config.branchCode,
+              deviceId: this.config.deviceId,
+              originDeviceId: this.config.deviceId,
+              originDeviceName: this.config.deviceName,
+              entityType,
+              sheetName: item.targetSheet || 'SyncItems',
+              recordId: item.clientRequestId || item.id,
+              payload: item.payload,
+              clientRequestId: item.clientRequestId,
+              timestamp: item.timestamp || Date.now(),
+              ttl: 5,
+            };
+          }
+          wsTarget.send(JSON.stringify(packet));
+        }
+      }
+    } catch (e) {}
+  }
+
+  private notifyConnectionModeChange() {
+    const details = {
+      mode: this.activeConnectionMode,
+      isLocalHubConnected: this.isLocalHubConnected,
+      isLocalHubLost: this.isLocalHubLost,
+      localHubUrl: LocalHubConfig.getLocalHubUrl(),
+      forceLocalHub: LocalHubConfig.getForceLocalHub(),
+      isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+      isCloudMeshConnected: this.isMqttConnected || this.isServerRelayConnected,
+      pendingQueueCount: getSyncQueue().length,
+    };
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('mesh-connection-state-changed', {
+          detail: details,
+        })
+      );
+    }
+
+    this.connectionModeListeners.forEach((listener) => {
+      try {
+        listener(this.activeConnectionMode, details);
+      } catch (e) {}
+    });
+  }
+
+  public getConnectionMode(): MeshConnectionMode {
+    return this.activeConnectionMode;
+  }
+
+  public isLocalHubActive(): boolean {
+    return this.isLocalHubConnected;
+  }
+
+  public isLocalHubLostState(): boolean {
+    return this.isLocalHubLost;
+  }
+
+  public getLocalHubStatus() {
+    return {
+      url: LocalHubConfig.getLocalHubUrl(),
+      isConnected: this.isLocalHubConnected,
+      isLost: this.isLocalHubLost,
+      mode: this.activeConnectionMode,
+      forceLocalHub: LocalHubConfig.getForceLocalHub(),
+      lastPongAt: this.lastHubPongReceivedAt,
+    };
+  }
+
+  public reconnectLocalHub(): void {
+    this.connectLocalHub();
+  }
+
+  public subscribeConnectionMode(listener: (mode: MeshConnectionMode, details: any) => void): () => void {
+    this.connectionModeListeners.push(listener);
+    try {
+      listener(this.activeConnectionMode, {
+        mode: this.activeConnectionMode,
+        isLocalHubConnected: this.isLocalHubConnected,
+        isLocalHubLost: this.isLocalHubLost,
+        localHubUrl: LocalHubConfig.getLocalHubUrl(),
+        forceLocalHub: LocalHubConfig.getForceLocalHub(),
+        isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+        isCloudMeshConnected: this.isMqttConnected || this.isServerRelayConnected,
+        pendingQueueCount: getSyncQueue().length,
+      });
+    } catch (e) {}
+
+    return () => {
+      this.connectionModeListeners = this.connectionModeListeners.filter((fn) => fn !== listener);
+    };
+  }
+
+  public onScanSuccess(decodedText: string): void {
+    const trimmed = (decodedText || '').trim();
+    if (!trimmed) return;
+
+    // Check if it's a hub URL or contains hub details
+    const targetWsUrl = normalizeHubUrl(trimmed);
+    if (targetWsUrl) {
+      LocalHubConfig.setLocalHubUrl(targetWsUrl);
+      this.connectLocalHub(targetWsUrl);
+    }
+
+    // Also try ingesting offline QR sales batch if present
     try {
       this.ingestOfflineBatchPayload(trimmed);
     } catch (e) {}
   }
 
   public connectToWsUrl(wsUrl: string) {
-    let cleanWs = wsUrl.trim();
-    const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
-
-    if (isHttps) {
-      if (cleanWs.startsWith('ws://')) {
-        cleanWs = 'wss://' + cleanWs.slice('ws://'.length);
-      } else if (!cleanWs.startsWith('wss://')) {
-        cleanWs = 'wss://' + cleanWs.replace(/^[a-zA-Z]+:\/\//, '');
-      }
-      // On HTTPS, if targeting a raw LAN IP over WebSocket, skip direct socket to prevent browser mixed content warnings
-      if (/^wss?:\/\/(?:192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)/.test(cleanWs)) {
-        console.info('[MeshSync] Raw LAN IP WebSocket skipped on HTTPS to avoid Mixed Content security warning. Retaining WebRTC DataChannel.');
-        this.addLog('DISCOVERY', `Secure HTTPS environment: LAN raw IP socket avoided to prevent mixed content warnings.`, this.config.deviceName);
-        return;
-      }
-    } else {
-      if (!cleanWs.startsWith('ws://') && !cleanWs.startsWith('wss://')) {
-        cleanWs = 'ws://' + cleanWs.replace(/^[a-zA-Z]+:\/\//, '');
-      }
-    }
-
-    this.localGatewayUrl = cleanWs;
-
-    if (this.directWsClient) {
-      try {
-        this.directWsClient.close();
-      } catch (e) {}
-      this.directWsClient = null;
-    }
-
-    try {
-      const ws = new WebSocket(cleanWs);
-      this.directWsClient = ws;
-
-      ws.onopen = () => {
-        this.isWsConnected = true;
-        this.addLog('DISCOVERY', `Direct LAN WebSocket CONNECTED to ${cleanWs} (0% Internet)`, this.config.deviceName);
-        playChime();
-        this.sendHeartbeat();
-        this.notifyPeerSubscribers();
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const packet = JSON.parse(event.data);
-          this.handleIncomingMeshPacket(`direct_ws/${packet.type || 'packet'}`, packet);
-        } catch (e) {}
-      };
-
-      ws.onerror = (err) => {
-        console.warn(`[MeshSync] Direct WS error for ${cleanWs}:`, err);
-      };
-
-      ws.onclose = () => {
-        this.isWsConnected = false;
-        this.notifyPeerSubscribers();
-      };
-    } catch (err) {
-      console.warn('[MeshSync] Direct WS connection exception:', err);
-    }
+    const clean = normalizeHubUrl(wsUrl);
+    LocalHubConfig.setLocalHubUrl(clean);
+    this.connectLocalHub(clean);
   }
 
   public setActiveVideoTrack(track: MediaStreamTrack | null) {
@@ -1019,6 +1440,7 @@ class MeshSyncManager {
         this.isServerRelayConnected = true;
         this.isMqttConnected = true;
         this.brokerName = 'Integrated Realtime Mesh Relay';
+        this.evaluateConnectionPriority();
         this.addLog(
           'DISCOVERY',
           `Connected to Realtime Mesh Relay (Branch: ${this.config.branchCode} | Tenant: ${this.config.companyId})`,
@@ -1035,6 +1457,7 @@ class MeshSyncManager {
           if (parsed && parsed.type === 'CONNECTED') {
             this.isServerRelayConnected = true;
             this.isMqttConnected = true;
+            this.evaluateConnectionPriority();
             this.sendHeartbeat();
             return;
           }
@@ -1044,6 +1467,7 @@ class MeshSyncManager {
 
       es.onerror = () => {
         this.isServerRelayConnected = false;
+        this.evaluateConnectionPriority();
       };
     } catch (err) {
       console.warn('[MeshSync] Server stream init error:', err);
@@ -1077,6 +1501,7 @@ class MeshSyncManager {
 
       client.on('connect', () => {
         this.isMqttConnected = true;
+        this.evaluateConnectionPriority();
         const topic = this.getMqttTopic('#');
         this.addLog(
           'DISCOVERY',
@@ -1101,14 +1526,17 @@ class MeshSyncManager {
 
       client.on('error', () => {
         this.isMqttConnected = false;
+        this.evaluateConnectionPriority();
         this.tryNextBroker();
       });
 
       client.on('offline', () => {
         this.isMqttConnected = false;
+        this.evaluateConnectionPriority();
       });
     } catch (e) {
       this.isMqttConnected = false;
+      this.evaluateConnectionPriority();
       this.tryNextBroker();
     }
   }
@@ -1204,11 +1632,16 @@ class MeshSyncManager {
       } catch (e) {}
     }
 
-    // 0.1 Direct LAN WebSocket
-    if (this.directWsClient && this.directWsClient.readyState === WebSocket.OPEN) {
+    // 0.1 Direct LAN WebSocket & Local WebSocket Hub (Termux Node Hub)
+    const targetWs = this.localHubWs || this.directWsClient;
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
       try {
-        this.directWsClient.send(jsonStr);
-      } catch (e) {}
+        targetWs.send(jsonStr);
+      } catch (e) {
+        this.queueOutgoingLocalHubPacket(packet);
+      }
+    } else {
+      this.queueOutgoingLocalHubPacket(packet);
     }
 
     // 1. MQTT Over WebSocket
@@ -1258,7 +1691,8 @@ class MeshSyncManager {
     // 1. STRICT TENANT ISOLATION: Packets from another tenant must NEVER be accepted
     const packetComp = (packet.company_id || packet.companyId || (packet.payload && (packet.payload.company_id || packet.payload.companyId)) || '').trim().toUpperCase();
     const localComp = (this.config.companyId || '').trim().toUpperCase();
-    if (packetComp && localComp && packetComp !== localComp) {
+    const normTenant = (c: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' ? 'COMP-001' : c);
+    if (packetComp && localComp && normTenant(packetComp) !== normTenant(localComp)) {
       this.addLog(
         'SECURITY_DROP',
         `Blocked cross-tenant packet from tenant [${packetComp}] (Local: [${localComp}]). Data isolation enforced.`,
@@ -1267,16 +1701,21 @@ class MeshSyncManager {
       return;
     }
 
-    // 2. STRICT BRANCH ISOLATION: Packets from another branch must NEVER populate this branch
+    // 2. STRICT BRANCH ISOLATION: Canonical branch scope checking with alias expansion and single-branch protection
     const packetBranchId = (packet.branch_id || packet.branchId || (packet.payload && (packet.payload.branch_id || packet.payload.branchId)) || '').trim().toUpperCase();
     const packetBranchCode = (packet.branchCode || packet.branch_code || (packet.payload && (packet.payload.branchCode || packet.payload.branch_code)) || '').trim().toUpperCase();
     const localBranchId = (this.config.branchId || '').trim().toUpperCase();
     const localBranchCode = (this.config.branchCode || '').trim().toUpperCase();
 
+    const branchCandidate = packetBranchId || packetBranchCode;
+    const localCandidate = localBranchId || localBranchCode;
     const branchMatches =
-      (!packetBranchId && !packetBranchCode) ||
-      (packetBranchId && (packetBranchId === localBranchId || packetBranchId === localBranchCode)) ||
-      (packetBranchCode && (packetBranchCode === localBranchCode || packetBranchCode === localBranchId));
+      !branchCandidate ||
+      !localCandidate ||
+      branchCandidate === localCandidate ||
+      branchCandidate === 'ALL' ||
+      localCandidate === 'ALL' ||
+      isRecordInBranchScope(branchCandidate, localCandidate, getBranches(), this.config.companyId);
 
     if (!branchMatches) {
       this.addLog(
@@ -1294,9 +1733,9 @@ class MeshSyncManager {
 
     const originName = packet.origin_device_name || packet.originDeviceName || packet.deviceName || 'Peer Terminal';
 
-    // 1. HEARTBEAT DISCOVERY
-    if (topic.endsWith('/heartbeat') || packet.type === 'heartbeat' || packet.action === 'HEARTBEAT') {
-      const isNew = !this.discoveredPeers.has(packetOrigin);
+    // Auto-discover or refresh peer on ANY incoming packet (whether heartbeat, sale, ping, or mutation)
+    const isNew = !this.discoveredPeers.has(packetOrigin);
+    if (isNew) {
       const peerData: P2PMeshPeer = {
         id: packetOrigin,
         name: packet.deviceName || originName,
@@ -1313,26 +1752,33 @@ class MeshSyncManager {
       };
 
       this.discoveredPeers.set(packetOrigin, peerData);
-
-      if (isNew) {
-        playChime();
-        this.addLog(
-          'DISCOVERY',
-          `Discovered terminal: ${peerData.name} on branch [${this.config.branchCode}] of tenant [${this.config.companyId}]!`,
-          peerData.name,
-          this.config.deviceName
-        );
-        // Automatically request catch-up delta from the peer on this branch
-        this.requestCatchUpSync(packetOrigin).catch(() => {});
-      }
+      playChime();
+      this.addLog(
+        'DISCOVERY',
+        `Discovered terminal: ${peerData.name} on branch [${this.config.branchCode}] of tenant [${this.config.companyId}]!`,
+        peerData.name,
+        this.config.deviceName
+      );
+      // Automatically request catch-up delta from the newly discovered peer
+      this.requestCatchUpSync(packetOrigin).catch(() => {});
 
       if (!this.isSimulationMode) {
         this.notifyPeerSubscribers();
       }
+    } else {
+      const peer = this.discoveredPeers.get(packetOrigin)!;
+      peer.lastSeen = Date.now();
+      peer.isOnline = true;
+      if (packet.pendingCount !== undefined) peer.pendingCount = packet.pendingCount;
+      if (packet.salesCount !== undefined) peer.totalSalesCount = packet.salesCount;
+    }
+
+    // 1. HEARTBEAT DISCOVERY
+    if (topic.endsWith('/heartbeat') || packet.type === 'heartbeat' || packet.action === 'HEARTBEAT') {
       return;
     }
 
-    // 1b. P2P CATCH-UP DELTA PROTOCOL (For devices returning after absence)
+    // 1b. P2P CATCH-UP DELTA PROTOCOL (For devices returning after absence or newly connected to local hub)
     if (topic.endsWith('/catchup_request') || packet.type === 'catchup_request' || packet.action === 'CATCHUP_REQUEST') {
       this.handleIncomingCatchupRequest(packet);
       return;
@@ -1347,6 +1793,10 @@ class MeshSyncManager {
     if (topic.endsWith('/sale') || packet.type === 'sale' || packet.action === 'SALE_RECORD') {
       const saleData: SaleInvoice = packet.sale || packet.payload;
       if (saleData && saleData.id) {
+        if (this.knownSaleIds.has(saleData.id)) {
+          return;
+        }
+
         const ingested = ingestMeshSale({
           ...saleData,
           company_id: this.config.companyId,
@@ -1355,7 +1805,9 @@ class MeshSyncManager {
         } as any);
 
         if (ingested) {
-          playChime();
+          this.knownSaleIds.add(saleData.id);
+          this.broadcastedInvoiceIds.add(saleData.id);
+          this.scheduleBatchUiUpdate();
           this.addLog(
             'EPIDEMIC_HOP',
             `Received Sale #${saleData.id} ($${(saleData.total || 0).toFixed(2)}) from ${originName}. Synced into local database!`,
@@ -1363,12 +1815,6 @@ class MeshSyncManager {
             this.config.deviceName,
             packet.ttl || 5,
             saleData.id
-          );
-
-          window.dispatchEvent(
-            new CustomEvent('mesh-sale-received', {
-              detail: { sale: saleData, originName },
-            })
           );
         }
       }
@@ -1401,6 +1847,7 @@ class MeshSyncManager {
               detail: { item: invItem, originName },
             })
           );
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
         }
       }
       return;
@@ -1472,6 +1919,62 @@ class MeshSyncManager {
             originName,
             this.config.deviceName
           );
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+        }
+      }
+      return;
+    }
+
+    // 7b. CASH LIFT BROADCAST
+    if (topic.endsWith('/cash_lift') || packet.type === 'cash_lift' || packet.action === 'CASH_LIFT_RECORD') {
+      const lift = packet.lift || packet.payload;
+      if (lift) {
+        if (ingestMeshCashLift(lift)) {
+          playChime();
+          this.addLog('EPIDEMIC_HOP', `Cash Lift synced from ${originName}: $${lift.totalAmount || lift.amount || 0}`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+      }
+      return;
+    }
+
+    // 7c. CUSTOMER CHANGE (FORM 3) BROADCAST
+    if (topic.endsWith('/customer_change') || packet.type === 'customer_change' || packet.action === 'CUSTOMER_CHANGE_RECORD') {
+      const change = packet.change || packet.payload;
+      if (change) {
+        if (ingestMeshCustomerChange(change)) {
+          playChime();
+          this.addLog('EPIDEMIC_HOP', `Customer Change voucher synced from ${originName}: ${change.customerName} ($${change.amount || change.in || change.out || 0})`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+      }
+      return;
+    }
+
+    // 7d. CREDIT SALE (FORM 3) BROADCAST
+    if (topic.endsWith('/credit_sale') || packet.type === 'credit_sale' || packet.action === 'CREDIT_SALE_RECORD') {
+      const credit = packet.credit || packet.payload;
+      if (credit) {
+        if (ingestMeshCreditSale(credit)) {
+          playChime();
+          this.addLog('EPIDEMIC_HOP', `Credit Sale synced from ${originName}: ${credit.customerName} ($${credit.amount})`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+      }
+      return;
+    }
+
+    // 7e. STOCK MOVEMENT BROADCAST
+    if (topic.endsWith('/stock_movement') || packet.type === 'stock_movement' || packet.action === 'STOCK_MOVEMENT_RECORD') {
+      const sm = packet.movement || packet.payload;
+      if (sm) {
+        if (ingestMeshStockMovement(sm)) {
+          this.addLog('EPIDEMIC_HOP', `Stock Movement synced from ${originName}: ${sm.itemName} (${sm.movementType || sm.txnType})`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
         }
       }
       return;
@@ -1490,7 +1993,36 @@ class MeshSyncManager {
             originName,
             this.config.deviceName
           );
+          window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         }
+      }
+      return;
+    }
+
+    // 8b. GOODS RECEIVED NOTES BROADCAST
+    if (topic.endsWith('/goods_received') || packet.type === 'goods_received' || packet.action === 'GOODS_RECEIVED_RECORD') {
+      const grn = packet.grn || packet.payload;
+      if (grn) {
+        if (ingestMeshGoodsReceived(grn)) {
+          playChime();
+          this.addLog('EPIDEMIC_HOP', `Goods Received Note synced from ${originName}`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        }
+      }
+      return;
+    }
+
+    // 8c. EXPENSES BROADCAST
+    if (topic.endsWith('/expense') || packet.type === 'expense' || packet.action === 'EXPENSE_RECORD') {
+      const expense = packet.expense || packet.payload;
+      if (expense) {
+        addExpense({ ...expense, fromMesh: true });
+        this.addLog('EPIDEMIC_HOP', `Expense synced from ${originName}: $${expense.amount} (${expense.category})`, originName, this.config.deviceName);
+        window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
       return;
     }
@@ -1539,13 +2071,15 @@ class MeshSyncManager {
     const payload = packet.payload;
     if (!payload) return;
     const originName = packet.origin_device_name || packet.originDeviceName || 'Peer Terminal';
+    const sheet = packet.sheetName || '';
+    const entityType = packet.entityType || resolveEntityType(sheet);
 
     // Handle deleted items broadcasted by offline peer devices
     if (packet.action === 'DELETE' || packet.type === 'db_deletion') {
       if (
-        packet.entityType === 'inventory' ||
-        packet.sheetName === 'InventoryMaster' ||
-        packet.sheetName === 'Products'
+        entityType === 'inventory' ||
+        sheet === 'InventoryMaster' ||
+        sheet === 'Products'
       ) {
         const itemId = payload.itemId || payload.id || payload.ItemID || packet.recordId;
         const compId = payload.company_id || payload.CompanyID || packet.companyId || this.config.companyId;
@@ -1562,36 +2096,152 @@ class MeshSyncManager {
       }
     }
 
-    switch (packet.entityType) {
-      case 'branch':
-        ingestMeshBranch({ ...payload, fromMesh: true });
-        break;
-      case 'staff':
-        ingestMeshStaff({ ...payload, fromMesh: true });
-        break;
-      case 'supervisor_approval':
-        ingestMeshSupervisorApproval({ ...payload, fromMesh: true });
-        break;
-      case 'cash_log':
-        ingestMeshCashLog({ ...payload, fromMesh: true });
-        break;
-      case 'customer':
-        ingestMeshCustomer({ ...payload, fromMesh: true });
-        break;
-      case 'grv':
-        ingestMeshGRV({ ...payload, fromMesh: true });
+    let didIngest = false;
+
+    switch (entityType) {
+      case 'sale':
+        didIngest = ingestMeshSale({ ...payload, fromMesh: true });
+        if (didIngest) {
+          playChime();
+          window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        }
         break;
       case 'inventory':
-        ingestMeshInventoryItem({ ...payload, fromMesh: true });
+        didIngest = ingestMeshInventoryItem({ ...payload, fromMesh: true });
+        if (didIngest) {
+          playChime();
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        }
+        break;
+      case 'branch':
+        didIngest = ingestMeshBranch({ ...payload, fromMesh: true });
+        break;
+      case 'staff':
+        didIngest = ingestMeshStaff({ ...payload, fromMesh: true });
+        break;
+      case 'supervisor_approval':
+        didIngest = ingestMeshSupervisorApproval({ ...payload, fromMesh: true });
+        break;
+      case 'cash_log':
+        didIngest = ingestMeshCashLog({ ...payload, fromMesh: true });
+        if (didIngest) {
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+        }
+        break;
+      case 'cash_lift':
+        didIngest = ingestMeshCashLift(payload);
+        if (didIngest) {
+          playChime();
+          window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+        break;
+      case 'customer':
+        if (sheet === 'CustomerChange' || payload.changeId) {
+          didIngest = ingestMeshCustomerChange(payload);
+          if (didIngest) {
+            playChime();
+            window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          }
+        } else if (sheet === 'CreditSales' || payload.creditId) {
+          didIngest = ingestMeshCreditSale(payload);
+          if (didIngest) {
+            playChime();
+            window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          }
+        } else {
+          didIngest = ingestMeshCustomer({ ...payload, fromMesh: true });
+          if (didIngest) {
+            window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+          }
+        }
+        break;
+      case 'grv':
+        if (sheet === 'GoodsReceived' || payload.grnId) {
+          ingestMeshGoodsReceived(payload);
+        }
+        didIngest = ingestMeshGRV({ ...payload, fromMesh: true });
+        if (didIngest) {
+          playChime();
+          window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+        break;
+      case 'stock_movement':
+        didIngest = ingestMeshStockMovement(payload);
+        if (didIngest) {
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        }
+        break;
+      case 'expense':
+        addExpense({ ...payload, fromMesh: true });
+        didIngest = true;
+        window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        break;
+      case 'reconciliation':
+        saveReconciliation(payload);
+        didIngest = true;
         break;
       case 'setting':
-        ingestMeshSettings(payload);
+        didIngest = ingestMeshSettings(payload);
+        break;
+      case 'cash_account':
+        saveCashAccount(payload);
+        didIngest = true;
+        window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
+        break;
+      case 'cash_transfer':
+        saveCashTransfer(payload);
+        didIngest = true;
+        window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        break;
+      default:
+        if (sheet === 'Sales' || payload.invoiceNumber) {
+          didIngest = ingestMeshSale({ ...payload, fromMesh: true });
+          if (didIngest) {
+            window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          }
+        } else if (sheet === 'CashLog' || (payload.staffId && (payload.in !== undefined || payload.out !== undefined))) {
+          didIngest = ingestMeshCashLog({ ...payload, fromMesh: true });
+          if (didIngest) {
+            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          }
+        } else if (sheet === 'StockMovement' || payload.movementType) {
+          didIngest = ingestMeshStockMovement(payload);
+          if (didIngest) {
+            window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          }
+        } else if (sheet === 'GoodsReceived' || payload.grnId) {
+          didIngest = ingestMeshGoodsReceived(payload);
+          if (didIngest) {
+            window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+          }
+        } else if (sheet === 'CashLifts' || payload.liftId) {
+          didIngest = ingestMeshCashLift(payload);
+          if (didIngest) {
+            window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
+          }
+        } else if (sheet === 'Expenses' || payload.vendorOrCustomer) {
+          addExpense({ ...payload, fromMesh: true });
+          didIngest = true;
+          window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+        }
         break;
     }
 
     this.addLog(
       'EPIDEMIC_HOP',
-      `DB Mutation [${packet.sheetName || packet.entityType}] received from ${originName}. Synced locally!`,
+      `DB Mutation [${sheet || entityType}] received from ${originName}. Synced locally!`,
       originName,
       this.config.deviceName
     );
@@ -1713,17 +2363,23 @@ class MeshSyncManager {
   public async requestCatchUpSync(
     targetPeerId?: string,
     customSinceIso?: string,
-    isReciprocal?: boolean
+    isReciprocal?: boolean,
+    force: boolean = false
   ): Promise<{ success: boolean; message: string; sinceTimestamp: string }> {
     const peerKey = targetPeerId || 'ALL';
     const now = Date.now();
     const lastReq = this.lastCatchUpRequestTime.get(peerKey) || 0;
-    if (!customSinceIso && now - lastReq < 45000) {
+    if (!force && !customSinceIso && !isReciprocal && now - lastReq < 15000) {
       return { success: false, message: 'Catch-up recently requested (throttled)', sinceTimestamp: '' };
     }
     this.lastCatchUpRequestTime.set(peerKey, now);
 
-    const sinceTimestamp = customSinceIso || this.getLastMeshSyncTimestamp();
+    // If forced ("Sync All Data"), ensure connection is active and look back 30 days
+    if (force && (!this.localHubWs || this.localHubWs.readyState !== WebSocket.OPEN)) {
+      this.connectLocalHub();
+    }
+
+    const sinceTimestamp = customSinceIso || (force ? new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString() : this.getLastMeshSyncTimestamp());
     const packetId = `CRQ-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
@@ -1739,6 +2395,7 @@ class MeshSyncManager {
       targetDeviceId: targetPeerId || 'ALL',
       sinceTimestamp,
       isReciprocal: Boolean(isReciprocal),
+      isForced: Boolean(force),
       timestamp: Date.now(),
       ttl: 5,
     };
@@ -1768,14 +2425,28 @@ class MeshSyncManager {
     // Strict tenant & branch check
     const packetComp = (packet.companyId || '').trim().toUpperCase();
     const localComp = (this.config.companyId || '').trim().toUpperCase();
-    if (packetComp && localComp && packetComp !== localComp) return;
+    const normTenant = (c: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' ? 'COMP-001' : c);
+    if (packetComp && localComp && normTenant(packetComp) !== normTenant(localComp)) return;
 
     const packetBranch = (packet.branchId || packet.branchCode || '').trim().toUpperCase();
     const localBranch = (this.config.branchId || this.config.branchCode || '').trim().toUpperCase();
-    if (packetBranch && localBranch && packetBranch !== localBranch) return;
+    const branchMatches =
+      !packetBranch ||
+      !localBranch ||
+      packetBranch === localBranch ||
+      packetBranch === 'ALL' ||
+      localBranch === 'ALL' ||
+      isRecordInBranchScope(packetBranch, localBranch, getBranches(), this.config.companyId);
+    if (!branchMatches) return;
 
-    // If targeted to a specific peer, check if target is this device
+    // If targeted to a specific peer, check if target is this device or ALL
     if (packet.targetDeviceId && packet.targetDeviceId !== 'ALL' && packet.targetDeviceId !== this.config.deviceId) {
+      return;
+    }
+
+    // Stop Payload Bloat: When connected to the Local Hub, the Termux server already
+    // stores and replays all historical packets. Terminals must not blast giant table arrays over WebSocket.
+    if (this.isLocalHubConnected || (this.localHubWs && this.localHubWs.readyState === WebSocket.OPEN)) {
       return;
     }
 
@@ -1784,6 +2455,29 @@ class MeshSyncManager {
 
     // Retrieve delta records
     const delta = getDeltaRecordsSince(sinceTimestamp);
+    const sinceTime = new Date(sinceTimestamp).getTime();
+    const filterSince = (list: any[]) => {
+      if (!Array.isArray(list)) return [];
+      return list.filter((r) => {
+        if (!r) return false;
+        const t = r.timestamp || r.updated_at || r.updatedAt || r.createdAt || r.created_at || r.date;
+        if (!t) return false;
+        const tm = new Date(t).getTime();
+        return !isNaN(tm) && tm >= sinceTime;
+      });
+    };
+
+    const deltaExpenses = filterSince(getAllExpenses());
+    const deltaCashAccounts = filterSince(getAllCashAccounts());
+    const deltaCashTransfers = filterSince(getAllCashTransfers());
+
+    const enrichedDelta = {
+      ...delta,
+      expenses: deltaExpenses,
+      cashAccounts: deltaCashAccounts,
+      cashTransfers: deltaCashTransfers,
+    };
+
     const totalRecords =
       delta.sales.length +
       delta.cashLogs.length +
@@ -1793,7 +2487,10 @@ class MeshSyncManager {
       delta.stockMovements.length +
       delta.directGrvs.length +
       (delta.goodsReceivedNotes?.length || 0) +
-      (delta.auditLogs?.length || 0);
+      (delta.auditLogs?.length || 0) +
+      deltaExpenses.length +
+      deltaCashAccounts.length +
+      deltaCashTransfers.length;
 
     const responsePacketId = `CRS-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(responsePacketId);
@@ -1807,11 +2504,11 @@ class MeshSyncManager {
       branchCode: this.config.branchCode,
       originDeviceId: this.config.deviceId,
       originDeviceName: this.config.deviceName,
-      targetDeviceId: packet.originDeviceId,
+      targetDeviceId: packet.originDeviceId || 'ALL',
       targetDeviceName: originName,
       sinceTimestamp,
       cutoffTimestamp: new Date().toISOString(),
-      delta,
+      delta: enrichedDelta,
       summary: {
         salesCount: delta.sales.length,
         cashLogsCount: delta.cashLogs.length,
@@ -1823,6 +2520,9 @@ class MeshSyncManager {
         goodsReceivedNotesCount: delta.goodsReceivedNotes?.length || 0,
         auditLogsCount: delta.auditLogs?.length || 0,
         inventoryItemsCount: delta.inventoryItems.length,
+        expensesCount: deltaExpenses.length,
+        cashAccountsCount: deltaCashAccounts.length,
+        cashTransfersCount: deltaCashTransfers.length,
         totalRecords,
       },
       timestamp: Date.now(),
@@ -1837,16 +2537,37 @@ class MeshSyncManager {
       this.config.deviceName,
       originName
     );
+
+    // If requester did not specify reciprocal sync, request reciprocal catch-up
+    if (!packet.isReciprocal && packet.originDeviceId) {
+      this.requestCatchUpSync(packet.originDeviceId, undefined, true).catch(() => {});
+    }
   }
 
   /**
    * Ingests delta records received from peer in response to a catch-up request
    */
   private async handleIncomingCatchupResponse(packet: any) {
-    if (!packet || packet.originDeviceId === this.config.deviceId) return;
-    if (packet.targetDeviceId && packet.targetDeviceId !== this.config.deviceId && packet.targetDeviceId !== 'ALL') {
-      return;
-    }
+    if (!packet) return;
+    const packetOrigin = packet.origin_device_id || packet.originDeviceId || packet.deviceId;
+    if (packetOrigin === this.config.deviceId) return;
+
+    // Strict tenant & branch check
+    const packetComp = (packet.companyId || packet.company_id || '').trim().toUpperCase();
+    const localComp = (this.config.companyId || '').trim().toUpperCase();
+    const normTenant = (c: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' ? 'COMP-001' : c);
+    if (packetComp && localComp && normTenant(packetComp) !== normTenant(localComp)) return;
+
+    const packetBranch = (packet.branchId || packet.branchCode || '').trim().toUpperCase();
+    const localBranch = (this.config.branchId || this.config.branchCode || '').trim().toUpperCase();
+    const branchMatches =
+      !packetBranch ||
+      !localBranch ||
+      packetBranch === localBranch ||
+      packetBranch === 'ALL' ||
+      localBranch === 'ALL' ||
+      isRecordInBranchScope(packetBranch, localBranch, getBranches(), this.config.companyId);
+    if (!branchMatches) return;
 
     const originName = packet.originDeviceName || packet.origin_device_name || 'Branch Terminal';
     const delta = packet.delta;
@@ -1860,6 +2581,8 @@ class MeshSyncManager {
     let movementsIngested = 0;
     let auditLogsIngested = 0;
     let grnIngested = 0;
+    let expensesIngested = 0;
+    let accountsIngested = 0;
 
     // 1. Ingest Sales
     if (Array.isArray(delta.sales)) {
@@ -1939,6 +2662,28 @@ class MeshSyncManager {
       }
     }
 
+    // 7. Ingest Expenses
+    if (Array.isArray(delta.expenses)) {
+      for (const exp of delta.expenses) {
+        addExpense({ ...exp, fromMesh: true });
+        expensesIngested++;
+      }
+    }
+
+    // 8. Ingest Cash Accounts & Transfers
+    if (Array.isArray(delta.cashAccounts)) {
+      for (const acc of delta.cashAccounts) {
+        saveCashAccount(acc);
+        accountsIngested++;
+      }
+    }
+    if (Array.isArray(delta.cashTransfers)) {
+      for (const trf of delta.cashTransfers) {
+        saveCashTransfer(trf);
+        accountsIngested++;
+      }
+    }
+
     // Update last sync cutoff timestamp
     if (packet.cutoffTimestamp) {
       this.setLastMeshSyncTimestamp(packet.cutoffTimestamp);
@@ -1946,7 +2691,7 @@ class MeshSyncManager {
 
     playChime();
 
-    const logMsg = `Catch-Up Complete: Reconciled with ${originName}. Added ${salesIngested} sales, ${cashLogsIngested} cash logs, ${cashLiftsIngested} cash lifts, ${changesIngested} customer ledgers, ${movementsIngested} movements, ${grnIngested + (delta.directGrvs?.length || 0)} deliveries/GRVs.`;
+    const logMsg = `Catch-Up Complete: Reconciled with ${originName}. Added ${salesIngested} sales, ${cashLogsIngested} cash logs, ${cashLiftsIngested} cash lifts, ${changesIngested} customer ledgers, ${movementsIngested} movements, ${grnIngested + (delta.directGrvs?.length || 0)} deliveries/GRVs, ${expensesIngested} expenses.`;
     this.addLog('ACK', logMsg, originName, this.config.deviceName);
 
     // Live UI dispatch
@@ -1962,6 +2707,8 @@ class MeshSyncManager {
             movementsIngested,
             auditLogsIngested,
             grnIngested,
+            expensesIngested,
+            accountsIngested,
             totalIngested:
               salesIngested +
               cashLogsIngested +
@@ -1969,24 +2716,67 @@ class MeshSyncManager {
               changesIngested +
               movementsIngested +
               auditLogsIngested +
-              grnIngested,
+              grnIngested +
+              expensesIngested +
+              accountsIngested,
             cutoffTimestamp: packet.cutoffTimestamp,
           },
         })
       );
+      window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
+    }
+
+    // Reciprocal catchup trigger: if peer responded to our request and did not send reciprocal request
+    if (!packet.isReciprocal && packet.originDeviceId) {
+      this.requestCatchUpSync(packet.originDeviceId, undefined, true).catch(() => {});
     }
   }
 
   // =========================================================================
-  // BROADCASTING METHODS ACROSS ALL ENTITIES
+  // BROADCASTING METHODS ACROSS ALL ENTITIES (SINGLE ACTION ONLY - NO BLOAT)
   // =========================================================================
+
+  /**
+   * 4. Accurate Deduplication & 2. Stop Payload Bloat:
+   * Checks local database and tracking sets before broadcasting.
+   * If an invoice ID already exists, do not send it to the Hub again.
+   * ONLY sends the specific packet for the current action.
+   */
   public async broadcastSale(sale: SaleInvoice) {
+    if (!sale || !sale.id) return;
+
+    // Check if already broadcasted by this device
+    if (this.broadcastedInvoiceIds.has(sale.id)) {
+      return;
+    }
+
+    // Do not re-broadcast sales received from peers/mesh
+    if ((sale as any).fromMesh) {
+      return;
+    }
+
+    // Check local database: if this invoice already exists in stored sales from mesh
+    const storedSales = getAllSales();
+    const existing = storedSales.find((s) => s.id === sale.id);
+    if (existing && (existing as any).fromMesh) {
+      this.broadcastedInvoiceIds.add(sale.id);
+      this.knownSaleIds.add(sale.id);
+      return;
+    }
+
+    // Mark as broadcasted so we never send it to the Hub again
+    this.broadcastedInvoiceIds.add(sale.id);
+    this.knownSaleIds.add(sale.id);
+
+    // Stop Payload Bloat: Send ONLY the specific packet for this current single sale
     const packetId = `SALE-PKT-${sale.id}-${Date.now()}`;
     this.seenPacketIds.add(packetId);
 
@@ -2009,12 +2799,7 @@ class MeshSyncManager {
 
     this.addLog(
       'BROADCAST',
-      `Sale #${sale.id} ($${sale.total.toFixed(2)}) broadcasted to WiFi mesh (Hash: ${calculateRecordHash(
-        sale.id,
-        this.config.deviceId,
-        Date.now(),
-        sale.total
-      )})`,
+      `Sale #${sale.id} ($${sale.total.toFixed(2)}) broadcasted to WiFi mesh`,
       this.config.deviceName,
       undefined,
       5,
@@ -2126,7 +2911,7 @@ class MeshSyncManager {
     const now = Date.now();
     let count = 0;
     for (const peer of this.discoveredPeers.values()) {
-      if (now - peer.lastSeen <= 9500) count++;
+      if (now - peer.lastSeen <= 35000) count++;
     }
     return count;
   }
@@ -2153,7 +2938,7 @@ class MeshSyncManager {
 
     // Discovered active peers within same tenant and branch
     for (const peer of this.discoveredPeers.values()) {
-      if (now - peer.lastSeen <= 9500) {
+      if (now - peer.lastSeen <= 35000) {
         result.push(peer);
       }
     }

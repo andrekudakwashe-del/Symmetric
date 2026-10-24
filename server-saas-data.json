@@ -11,7 +11,46 @@
       "trial_start_date": "2026-08-01",
       "subscription_status": "ACTIVE",
       "plan": "ENTERPRISE",
-      "next_billing_date": "2027-08-01"
+      "next_billing_date": "2027-08-01",
+      "backend_type": "room",
+      "backend_config": {
+        "backendType": "room",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.496Z"
+        },
+        "isMigrating": false
+      },
+      "webhook_url": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "branch_isolation_mode": "ROW_LEVEL"
     },
     {
       "company_id": "COMP-002",
@@ -24,7 +63,46 @@
       "trial_start_date": "2026-08-15",
       "subscription_status": "ACTIVE",
       "plan": "PROFESSIONAL",
-      "next_billing_date": "2027-08-15"
+      "next_billing_date": "2027-08-15",
+      "backend_type": "room",
+      "backend_config": {
+        "backendType": "room",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.579Z"
+        },
+        "isMigrating": false
+      },
+      "webhook_url": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "branch_isolation_mode": "ROW_LEVEL"
     },
     {
       "company_id": "COMP-MTPNKKVJ",
@@ -143,7 +221,43 @@
         "companyId": "COMP-MTPNKKVJ"
       },
       "branch_isolation_mode": "ROW_LEVEL",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1rUnnxpQw_TwpxL5u61JRvzSmLhKiBfiQhYjv73SNj9U",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.530Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTSRBGFU",
@@ -211,7 +325,43 @@
             "canSeeMargin": true
           }
         }
-      ]
+      ],
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1iek0tXBDONaFckMv00lS_WdcSDPYBDrCahfV3Bgj6HA",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.621Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTPOR09G",
@@ -289,9 +439,45 @@
         "companyId": "COMP-MTPOR09G",
         "company_id": "COMP-MTPOR09G"
       },
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "branch_isolation_mode": "ROW_LEVEL",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.665Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTUD4JH3",
@@ -330,6 +516,42 @@
         "pin": "1234",
         "role": "OWNER",
         "phone": "+263783505493"
+      },
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.706Z"
+        },
+        "isMigrating": false
       }
     },
     {
@@ -340,7 +562,7 @@
       "phone": "+263783505493",
       "business_category": "Grocery & FMCG",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Thu Sep 10 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -407,7 +629,43 @@
         "company_id": "COMP-MTVYXSAJ"
       },
       "branch_isolation_mode": "ROW_LEVEL",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.753Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWG8PU1",
@@ -484,9 +742,45 @@
           }
         }
       ],
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "branch_isolation_mode": "ROW_LEVEL",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.794Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTVO716V",
@@ -553,9 +847,45 @@
           }
         }
       ],
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "branch_isolation_mode": "ROW_LEVEL",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.839Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTVQOR7N",
@@ -565,7 +895,7 @@
       "phone": "+263783505493",
       "business_category": "Wholesale & Retail",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Thu Sep 10 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -624,7 +954,43 @@
         }
       ],
       "branch_isolation_mode": "ROW_LEVEL",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.883Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWHVQP9",
@@ -702,9 +1068,45 @@
           }
         }
       ],
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "branch_isolation_mode": "ROW_LEVEL",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.928Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTVQGJN1",
@@ -772,8 +1174,44 @@
           }
         }
       ],
-      "sheet_id": "",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:08.969Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTVJS6B8",
@@ -841,8 +1279,44 @@
           }
         }
       ],
-      "sheet_id": "",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.012Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTPTQITW",
@@ -910,8 +1384,44 @@
           }
         }
       ],
-      "sheet_id": "",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.055Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTR7CC6E",
@@ -979,8 +1489,44 @@
           }
         }
       ],
-      "sheet_id": "",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.097Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTT1Z5V1",
@@ -1049,7 +1595,43 @@
         }
       ],
       "sheet_id": "1iek0tXBDONaFckMv00lS_WdcSDPYBDrCahfV3Bgj6HA",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1iek0tXBDONaFckMv00lS_WdcSDPYBDrCahfV3Bgj6HA",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.140Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWG4D2Y",
@@ -1117,8 +1699,44 @@
           }
         }
       ],
-      "sheet_id": "",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.182Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWH988C",
@@ -1186,8 +1804,44 @@
           }
         }
       ],
-      "sheet_id": "",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.229Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWGDL9V",
@@ -1255,8 +1909,44 @@
           }
         }
       ],
-      "sheet_id": "",
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.272Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTVQGJYA",
@@ -1266,7 +1956,7 @@
       "phone": "263783505493",
       "business_category": "Grocery & FMCG",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Thu Sep 10 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1274,7 +1964,43 @@
       "offline_activation_code": "SAI-YDAXGM",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.316Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTVJS6RU",
@@ -1292,7 +2018,43 @@
       "offline_activation_code": "SAI-KJL8FD",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1h2oxze3DKnPKQNm9e8koTHOkd1pOLpLhF68yp_yw-FY",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.356Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTPTQIMG",
@@ -1310,7 +2072,43 @@
       "offline_activation_code": "SAI-14OI9D",
       "branch_isolation_mode": "HYBRID",
       "trial_days_remaining": 9,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1dwG7ayeXAnvNMP_QHpwIviOhwSF_c9ItPloVWqwEn8E",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "HYBRID"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.398Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTR7CCYB",
@@ -1320,7 +2118,7 @@
       "phone": "",
       "business_category": "Grocery & FMCG",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Mon Sep 07 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1328,7 +2126,43 @@
       "offline_activation_code": "SAI-ABQ3E6",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.442Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTT1Z5PN",
@@ -1346,7 +2180,43 @@
       "offline_activation_code": "SAI-GCE388",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 28,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1OrHWliVjo-nDBbWEHRekseegR-k0TVX5-kn475GZim0",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.483Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWG42E5",
@@ -1356,7 +2226,7 @@
       "phone": "",
       "business_category": "Grocery & FMCG",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Fri Sep 11 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1364,7 +2234,43 @@
       "offline_activation_code": "SAI-G666UO",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.528Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWH959K",
@@ -1374,7 +2280,7 @@
       "phone": "",
       "business_category": "Hardware & Electrical",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Fri Sep 11 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1382,7 +2288,43 @@
       "offline_activation_code": "SAI-IFZY6H",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.569Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWGD7WA",
@@ -1392,7 +2334,7 @@
       "phone": "",
       "business_category": "Grocery & FMCG",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Fri Sep 11 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1400,7 +2342,43 @@
       "offline_activation_code": "SAI-4T7LRH",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.616Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MU2HG5C3",
@@ -1418,7 +2396,43 @@
       "offline_activation_code": "SAI-1OFMVW",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 4,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1O9R_TntQPe-hAW1i-Gn40C5DIasta7I_VmYRITjSPwY",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.672Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWH6Q7O",
@@ -1428,7 +2442,7 @@
       "phone": "",
       "business_category": "Grocery & FMCG",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Fri Sep 11 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1436,7 +2450,43 @@
       "offline_activation_code": "SAI-ZO39TY",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.728Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTWHCBC4",
@@ -1446,7 +2496,7 @@
       "phone": "",
       "business_category": "Wholesale & Retail",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Fri Sep 11 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1454,7 +2504,43 @@
       "offline_activation_code": "SAI-FSSDUJ",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.789Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MTX3UU1U",
@@ -1464,7 +2550,7 @@
       "phone": "263783505493",
       "business_category": "Wholesale & Retail",
       "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "sheet_id": "",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "Fri Sep 11 2026 02:00:00 GMT+0200 (Central Africa Time)",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1472,7 +2558,43 @@
       "offline_activation_code": "SAI-TQF1JF",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 0,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.864Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MUFBCJAG",
@@ -1490,7 +2612,43 @@
       "offline_activation_code": "SAI-4DJQLM",
       "branch_isolation_mode": "HYBRID",
       "trial_days_remaining": 27,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1qV4jhUjGf5sBFQigO3LJSG14eP4fqt-fb3EEOA34dNQ",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "HYBRID"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.917Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MUGYS509",
@@ -1499,8 +2657,8 @@
       "owner_email": "test@gmail.com",
       "phone": "",
       "business_category": "Grocery & FMCG",
-      "sheet_folder_id": "",
-      "sheet_id": "",
+      "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "2026-09-25",
       "subscription_status": "TRIAL",
       "plan": "PROFESSIONAL",
@@ -1558,7 +2716,44 @@
           "canSeeMargin": true
         }
       },
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:09.969Z"
+        },
+        "isMigrating": false
+      },
+      "branch_isolation_mode": "ROW_LEVEL"
     },
     {
       "company_id": "COMP-MUFLW4KL",
@@ -1576,7 +2771,43 @@
       "offline_activation_code": "SAI-768V8E",
       "branch_isolation_mode": "ROW_LEVEL",
       "trial_days_remaining": 13,
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1vHJRn-983tF1sKpI_S0bjLwAimEHFET2c2icTOYOnN0",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:10.028Z"
+        },
+        "isMigrating": false
+      }
     },
     {
       "company_id": "COMP-MUGZ6ZSM",
@@ -1585,7 +2816,7 @@
       "owner_email": "test2@gmail.com",
       "phone": "",
       "business_category": "Grocery & FMCG",
-      "sheet_folder_id": "",
+      "sheet_folder_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "trial_start_date": "2026-09-25",
       "subscription_status": "TRIAL",
@@ -1644,7 +2875,44 @@
           "canSeeMargin": true
         }
       },
-      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec"
+      "webhook_url": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+      "backend_type": "sheets_appscript",
+      "backend_config": {
+        "backendType": "sheets_appscript",
+        "room": {
+          "keepLocalCache": true,
+          "quotaMb": 50,
+          "indexedDbEnabled": true
+        },
+        "sheets": {
+          "webhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "masterWebhookUrl": "https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec",
+          "spreadsheetId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "sheetFolderId": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+          "isolationMode": "ROW_LEVEL"
+        },
+        "firebase": {
+          "projectId": "",
+          "apiKey": "",
+          "firestoreRegion": "us-central1",
+          "appId": "",
+          "authDomain": ""
+        },
+        "supabase": {
+          "projectUrl": "",
+          "anonKey": "",
+          "serviceRoleKey": "",
+          "schema": "public"
+        },
+        "authMode": "pin_6_digit",
+        "retention": {
+          "autoDeleteEnabled": true,
+          "retentionMonths": 3,
+          "lastPrunedAt": "2026-10-15T07:08:10.099Z"
+        },
+        "isMigrating": false
+      },
+      "branch_isolation_mode": "ROW_LEVEL"
     }
   ],
   "branches": [
@@ -1656,7 +2924,13 @@
       "address": "4th Street Commercial Center, Harare",
       "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "manager_user_id": "USR-002",
-      "is_active": true
+      "is_active": true,
+      "branchId": "BR-MAIN",
+      "id": "BR-MAIN",
+      "companyId": "COMP-001",
+      "name": "Harare Main",
+      "location": "4th Street Commercial Center, Harare",
+      "code": "HQ-01"
     },
     {
       "branch_id": "BR-BYO-01",
@@ -1666,7 +2940,13 @@
       "address": "8th Avenue Commercial Hub, Bulawayo",
       "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
       "manager_user_id": "USR-BYO-01",
-      "is_active": true
+      "is_active": true,
+      "branchId": "BR-BYO-01",
+      "id": "BR-BYO-01",
+      "companyId": "COMP-002",
+      "name": "Bulawayo Central",
+      "location": "8th Avenue Commercial Hub, Bulawayo",
+      "code": "BYO-01"
     },
     {
       "id": "BR-MUFBCKZI",
@@ -1704,6 +2984,348 @@
       "companyId": "COMP-MTUD4JH3",
       "is_active": true,
       "branch_id": "BR-ZGA3-01"
+    },
+    {
+      "id": "BR-001",
+      "branchId": "BR-001",
+      "name": "Downtown Wholesale Outlet",
+      "code": "BR-01",
+      "location": "4th Street Commercial Center, Harare",
+      "address": "4th Street Commercial Center, Harare",
+      "company_id": "COMP-001",
+      "companyId": "COMP-001",
+      "is_active": true,
+      "branch_id": "BR-001"
+    },
+    {
+      "id": "BR-MTT1Z5V1-01",
+      "branchId": "BR-MTT1Z5V1-01",
+      "name": "Main Branch",
+      "code": "HQ-01",
+      "location": "4th Street Commercial Center, Harare",
+      "address": "4th Street Commercial Center, Harare",
+      "company_id": "COMP-MUFBCJAG",
+      "companyId": "COMP-MUFBCJAG",
+      "is_active": false,
+      "branch_id": "BR-MTT1Z5V1-01"
+    },
+    {
+      "branch_id": "BR-METRO-01",
+      "company_id": "COMP-002",
+      "branch_name": "Bulawayo Branch",
+      "branch_code": "BUL-01",
+      "address": "8th Avenue Market, Bulawayo",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-METRO-01",
+      "is_active": true,
+      "branchId": "BR-METRO-01",
+      "id": "BR-METRO-01",
+      "companyId": "COMP-002",
+      "name": "Bulawayo Branch",
+      "location": "8th Avenue Market, Bulawayo",
+      "code": "BUL-01"
+    },
+    {
+      "branchId": "BR-LA17-01",
+      "name": "Main Branch",
+      "code": "SUP-01",
+      "location": "7 Chailey Mabelreign Harare",
+      "isMain": true,
+      "companyId": "COMP-MTVO716V",
+      "company_id": "COMP-MTVO716V",
+      "id": "BR-LA17-01",
+      "address": "7 Chailey Mabelreign Harare",
+      "branch_id": "BR-LA17-01"
+    },
+    {
+      "branchId": "BR-1LAE-01",
+      "name": "Main Branch",
+      "code": "MEM-01",
+      "location": "7 Chailey Mabelreign Harare",
+      "isMain": true,
+      "companyId": "COMP-MTVQOR7N",
+      "company_id": "COMP-MTVQOR7N",
+      "id": "BR-1LAE-01",
+      "address": "7 Chailey Mabelreign Harare",
+      "branch_id": "BR-1LAE-01"
+    },
+    {
+      "branch_id": "BR-IIN0-01",
+      "company_id": "COMP-MTWG8PU1",
+      "branch_name": "Main Branch",
+      "branch_code": "MOS-01",
+      "address": "Central Store",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-IIN0-01",
+      "is_active": true,
+      "branchId": "BR-IIN0-01",
+      "id": "BR-IIN0-01",
+      "companyId": "COMP-MTWG8PU1",
+      "name": "Main Branch",
+      "location": "Central Store",
+      "code": "MOS-01"
+    },
+    {
+      "branch_id": "BR-D3LI-01",
+      "company_id": "COMP-MTWHVQP9",
+      "branch_name": "Main Branch",
+      "branch_code": "TZK-01",
+      "address": "Central Store",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-D3LI-01",
+      "is_active": true,
+      "branchId": "BR-D3LI-01",
+      "id": "BR-D3LI-01",
+      "companyId": "COMP-MTWHVQP9",
+      "name": "Main Branch",
+      "location": "Central Store",
+      "code": "TZK-01"
+    },
+    {
+      "branch_id": "BR-4OBX-01",
+      "company_id": "COMP-MTPNKKVJ",
+      "branch_name": "Main Branch",
+      "branch_code": "CHA-01",
+      "address": "Central Store",
+      "sheet_id": "1rUnnxpQw_TwpxL5u61JRvzSmLhKiBfiQhYjv73SNj9U",
+      "manager_user_id": "USR-4OBX-01",
+      "is_active": true,
+      "branchId": "BR-4OBX-01",
+      "id": "BR-4OBX-01",
+      "companyId": "COMP-MTPNKKVJ",
+      "name": "Main Branch",
+      "location": "Central Store",
+      "code": "CHA-01"
+    },
+    {
+      "branch_id": "BR-CMQJ-01",
+      "company_id": "COMP-MTPOR09G",
+      "branch_name": "Main Branch",
+      "branch_code": "SAN-01",
+      "address": "Central Store",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-CMQJ-01",
+      "is_active": true,
+      "branchId": "BR-CMQJ-01",
+      "id": "BR-CMQJ-01",
+      "companyId": "COMP-MTPOR09G",
+      "name": "Main Branch",
+      "location": "Central Store",
+      "code": "SAN-01"
+    },
+    {
+      "branch_id": "BR-AB4Z-01",
+      "company_id": "COMP-MTVYXSAJ",
+      "branch_name": "Main Branch",
+      "branch_code": "MOS-01",
+      "address": "7 Chailey Mabelreign Harare",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-AB4Z-01",
+      "is_active": true,
+      "branchId": "BR-AB4Z-01",
+      "id": "BR-AB4Z-01",
+      "companyId": "COMP-MTVYXSAJ",
+      "name": "Main Branch",
+      "location": "7 Chailey Mabelreign Harare",
+      "code": "MOS-01"
+    },
+    {
+      "branch_id": "BR-MTVQGJN1-01",
+      "company_id": "COMP-MTVQGJN1",
+      "branch_name": "Main Branch",
+      "branch_code": "HQ-01",
+      "address": "Main Location",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-GJN1-01",
+      "is_active": true,
+      "branchId": "BR-MTVQGJN1-01",
+      "id": "BR-MTVQGJN1-01",
+      "companyId": "COMP-MTVQGJN1",
+      "name": "Main Branch",
+      "location": "Main Location",
+      "code": "HQ-01"
+    },
+    {
+      "branch_id": "BR-MTVJS6B8-01",
+      "company_id": "COMP-MTVJS6B8",
+      "branch_name": "Main Branch",
+      "branch_code": "HQ-01",
+      "address": "Main Location",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-S6B8-01",
+      "is_active": true,
+      "branchId": "BR-MTVJS6B8-01",
+      "id": "BR-MTVJS6B8-01",
+      "companyId": "COMP-MTVJS6B8",
+      "name": "Main Branch",
+      "location": "Main Location",
+      "code": "HQ-01"
+    },
+    {
+      "branch_id": "BR-MTPTQITW-01",
+      "company_id": "COMP-MTPTQITW",
+      "branch_name": "Main Branch",
+      "branch_code": "HQ-01",
+      "address": "Main Location",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-QITW-01",
+      "is_active": true,
+      "branchId": "BR-MTPTQITW-01",
+      "id": "BR-MTPTQITW-01",
+      "companyId": "COMP-MTPTQITW",
+      "name": "Main Branch",
+      "location": "Main Location",
+      "code": "HQ-01"
+    },
+    {
+      "branch_id": "BR-MTR7CC6E-01",
+      "company_id": "COMP-MTR7CC6E",
+      "branch_name": "Main Branch",
+      "branch_code": "HQ-01",
+      "address": "Main Location",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-CC6E-01",
+      "is_active": true,
+      "branchId": "BR-MTR7CC6E-01",
+      "id": "BR-MTR7CC6E-01",
+      "companyId": "COMP-MTR7CC6E",
+      "name": "Main Branch",
+      "location": "Main Location",
+      "code": "HQ-01"
+    },
+    {
+      "branch_id": "BR-MTWG4D2Y-01",
+      "company_id": "COMP-MTWG4D2Y",
+      "branch_name": "Main Branch",
+      "branch_code": "HQ-01",
+      "address": "Main Location",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-4D2Y-01",
+      "is_active": true,
+      "branchId": "BR-MTWG4D2Y-01",
+      "id": "BR-MTWG4D2Y-01",
+      "companyId": "COMP-MTWG4D2Y",
+      "name": "Main Branch",
+      "location": "Main Location",
+      "code": "HQ-01"
+    },
+    {
+      "branch_id": "BR-MTWH988C-01",
+      "company_id": "COMP-MTWH988C",
+      "branch_name": "Main Branch",
+      "branch_code": "HQ-01",
+      "address": "Main Location",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-988C-01",
+      "is_active": true,
+      "branchId": "BR-MTWH988C-01",
+      "id": "BR-MTWH988C-01",
+      "companyId": "COMP-MTWH988C",
+      "name": "Main Branch",
+      "location": "Main Location",
+      "code": "HQ-01"
+    },
+    {
+      "branch_id": "BR-MTWGDL9V-01",
+      "company_id": "COMP-MTWGDL9V",
+      "branch_name": "Main Branch",
+      "branch_code": "HQ-01",
+      "address": "Main Location",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-DL9V-01",
+      "is_active": true,
+      "branchId": "BR-MTWGDL9V-01",
+      "id": "BR-MTWGDL9V-01",
+      "companyId": "COMP-MTWGDL9V",
+      "name": "Main Branch",
+      "location": "Main Location",
+      "code": "HQ-01"
+    },
+    {
+      "branchId": "BR-MUDNL37R",
+      "id": "BR-MUDNL37R",
+      "company_id": "COMP-MTT1Z5V1",
+      "name": "Hit",
+      "code": "BR-02",
+      "location": "Belvedere",
+      "address": "Belvedere",
+      "sheet_id": "POS_Chinavamwe_Branch2_2026.xlsx",
+      "manager_id": "USR-Z5V1-01",
+      "manager_name": "Chinavamwe Owner",
+      "is_active": true,
+      "isMain": false,
+      "companyId": "COMP-MTT1Z5V1",
+      "branch_id": "BR-MUDNL37R"
+    },
+    {
+      "branch_id": "BR-KFVQ-01",
+      "company_id": "COMP-MUGYS509",
+      "branch_name": "Main Branch",
+      "branch_code": "TES-01",
+      "address": "Central Store",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-KFVQ-01",
+      "is_active": true,
+      "branchId": "BR-KFVQ-01",
+      "id": "BR-KFVQ-01",
+      "companyId": "COMP-MUGYS509",
+      "name": "Main Branch",
+      "location": "Central Store",
+      "code": "TES-01"
+    },
+    {
+      "branch_id": "BR-MUGYS4T8",
+      "company_id": "COMP-MUGYS509",
+      "branch_name": "Main Branch",
+      "branch_code": "TES-01",
+      "address": "Main Commercial Center",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-MUGYS4T8",
+      "is_active": true,
+      "branchId": "BR-MUGYS4T8",
+      "id": "BR-MUGYS4T8",
+      "companyId": "COMP-MUGYS509",
+      "name": "Main Branch",
+      "location": "Main Commercial Center",
+      "code": "TES-01"
+    },
+    {
+      "branch_id": "BR-MUGZ6ZN9",
+      "company_id": "COMP-MUGZ6ZSM",
+      "branch_name": "Main Branch",
+      "branch_code": "TES-01",
+      "address": "Main Commercial Center",
+      "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
+      "manager_user_id": "USR-MUGZ6ZN9",
+      "is_active": true,
+      "branchId": "BR-MUGZ6ZN9",
+      "id": "BR-MUGZ6ZN9",
+      "companyId": "COMP-MUGZ6ZSM",
+      "name": "Main Branch",
+      "location": "Main Commercial Center",
+      "code": "TES-01"
+    },
+    {
+      "branchId": "BR-002",
+      "name": "Westside Supermarket Branch",
+      "code": "BR-02",
+      "location": "Westgate Shopping Complex, Harare",
+      "companyId": "COMP-001",
+      "company_id": "COMP-001",
+      "id": "BR-002",
+      "branch_id": "BR-002",
+      "address": "Westgate Shopping Complex, Harare"
+    },
+    {
+      "branchId": "BR-003",
+      "name": "Express Mart & Distribution",
+      "code": "BR-03",
+      "location": "Highlands Square, Harare",
+      "companyId": "COMP-001",
+      "company_id": "COMP-001",
+      "id": "BR-003",
+      "branch_id": "BR-003",
+      "address": "Highlands Square, Harare"
     }
   ],
   "users": [

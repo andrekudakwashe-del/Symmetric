@@ -1174,8 +1174,8 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
               onChange={(e) => setSelectedStaffId(e.target.value)}
               className="bg-transparent text-white font-semibold outline-none cursor-pointer"
             >
-              {salespeople.map((sp) => (
-                <option key={sp.id} value={sp.id} className="bg-slate-900 text-white">
+              {salespeople.map((sp, idx) => (
+                <option key={`${sp.id}-${idx}`} value={sp.id} className="bg-slate-900 text-white">
                   {sp.name} (#{sp.id}) {sp.role === 'Admin' ? '★' : ''}
                 </option>
               ))}
@@ -1261,7 +1261,7 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                       const match = getCustomerMatch(row.customerName);
 
                       return (
-                        <tr key={row.id} className="hover:bg-slate-900/60 transition-colors">
+                        <tr key={`${row.id || 'row'}-${idx}`} className="hover:bg-slate-900/60 transition-colors">
                           <td className="py-3 px-3 text-center text-slate-500 font-mono-num font-bold">
                             {idx + 1}
                           </td>
@@ -1410,7 +1410,7 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                       const match = getCustomerMatch(row.customerName);
 
                       return (
-                        <tr key={row.id} className="hover:bg-slate-900/60 transition-colors">
+                        <tr key={`${row.id || 'row'}-${idx}`} className="hover:bg-slate-900/60 transition-colors">
                           <td className="py-3 px-3 text-center text-slate-500 font-mono-num font-bold">
                             {idx + 1}
                           </td>
@@ -1694,9 +1694,9 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
 
               {/* Quick Customer Chips */}
               <div className="flex flex-wrap gap-1.5 pt-1">
-                {customers.slice(0, 4).map((c) => (
+                {customers.slice(0, 4).map((c, idx) => (
                   <button
-                    key={c.customerId}
+                    key={`${c.customerId || 'c'}-${idx}`}
                     type="button"
                     onClick={() => {
                       setSingleCustomerName(c.name);
@@ -1896,8 +1896,8 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800">
-                    {filteredChangeHistory.map((log) => (
-                      <tr key={log.id} className="hover:bg-slate-900/60">
+                    {filteredChangeHistory.map((log, logIdx) => (
+                      <tr key={`${log.id}-${logIdx}`} className="hover:bg-slate-900/60">
                         <td className="py-2 px-3 font-mono-num text-slate-400">
                           {new Date(log.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                         </td>
@@ -1998,8 +1998,8 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800">
-                    {filteredCreditHistory.map((cr) => (
-                      <tr key={cr.id} className="hover:bg-slate-900/60">
+                    {filteredCreditHistory.map((cr, crIdx) => (
+                      <tr key={`${cr.id}-${crIdx}`} className="hover:bg-slate-900/60">
                         <td className="py-2 px-3 font-mono-num text-slate-400">
                           {new Date(cr.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                         </td>

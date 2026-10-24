@@ -22,6 +22,10 @@ import {
   saveCompany,
   getInventoryItems,
   pullTenantInventory,
+  getSupplierInvoiceVouchers,
+  getAllGoodsReceived,
+  getDirectGrvs,
+  getAllCashLifts,
 } from '../../db/roomDatabase';
 import {
   processSyncQueue,
@@ -281,10 +285,15 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
   };
 
   const sheetTabs: { id: SheetName; label: string; count: number }[] = [
+    { id: 'Sales', label: 'Sales (Invoices)', count: sales.length },
+    { id: 'InventoryMaster', label: 'Inventory Master', count: getInventoryItems().length },
+    { id: 'GoodsReceived', label: 'Goods Received (GRN)', count: getAllGoodsReceived().length },
+    { id: 'SupplierInvoices', label: 'Supplier Invoices', count: getSupplierInvoiceVouchers().length },
+    { id: 'DirectGRVs', label: 'Direct GRVs', count: getDirectGrvs().length },
     { id: 'CashLog', label: 'CashLog', count: cashLogs.length },
-    { id: 'Customers', label: 'Customers', count: customers.length },
-    { id: 'Sales', label: 'Sales', count: sales.length },
+    { id: 'CashLifts', label: 'Cash Lifts', count: getAllCashLifts().length },
     { id: 'Expenses', label: 'Expenses', count: expenses.length },
+    { id: 'Customers', label: 'Customers', count: customers.length },
     { id: 'Reconciliations', label: 'Reconciliations', count: reconciliations.length },
     { id: 'Salespeople', label: 'Salespeople', count: salespeople.length },
   ];
@@ -575,8 +584,8 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/80">
-                        {cashLogs.map((c) => (
-                          <tr key={c.id} className="hover:bg-slate-800/40">
+                        {cashLogs.map((c, idx) => (
+                          <tr key={`${c.id}-${idx}`} className="hover:bg-slate-800/40">
                             <td className="py-2 px-3 text-slate-400">{c.date}</td>
                             <td className="py-2 px-3">
                               <span className="font-mono text-[10px] bg-slate-900 px-1.5 py-0.5 rounded text-amber-300 border border-slate-800">
@@ -611,8 +620,8 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/80">
-                        {customers.map((c) => (
-                          <tr key={c.customerId} className="hover:bg-slate-800/40">
+                        {customers.map((c, idx) => (
+                          <tr key={`${c.customerId || c.id}-${idx}`} className="hover:bg-slate-800/40">
                             <td className="py-2 px-3 text-amber-400 font-bold">{c.customerId}</td>
                             <td className="py-2 px-3">
                               <span className="font-mono text-[10px] bg-slate-900 px-1.5 py-0.5 rounded text-amber-300 border border-slate-800">
@@ -643,8 +652,8 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/80">
-                        {sales.map((s) => (
-                          <tr key={s.id} className="hover:bg-slate-800/40">
+                        {sales.map((s, idx) => (
+                          <tr key={`${s.id}-${idx}`} className="hover:bg-slate-800/40">
                             <td className="py-2 px-3 text-indigo-400 font-bold">{s.id}</td>
                             <td className="py-2 px-3">
                               <span className="font-mono text-[10px] bg-slate-900 px-1.5 py-0.5 rounded text-amber-300 border border-slate-800">
@@ -675,8 +684,8 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/80">
-                        {expenses.map((e) => (
-                          <tr key={e.id} className="hover:bg-slate-800/40">
+                        {expenses.map((e, idx) => (
+                          <tr key={`${e.id}-${idx}`} className="hover:bg-slate-800/40">
                             <td className="py-2 px-3 text-rose-400 font-bold">{e.id}</td>
                             <td className="py-2 px-3 text-slate-400">{e.date}</td>
                             <td className="py-2 px-3 text-purple-300 font-sans">{e.category}</td>
@@ -702,8 +711,8 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/80">
-                        {reconciliations.map((r) => (
-                          <tr key={r.id} className="hover:bg-slate-800/40">
+                        {reconciliations.map((r, idx) => (
+                          <tr key={`${r.id}-${idx}`} className="hover:bg-slate-800/40">
                             <td className="py-2 px-3 text-slate-300">{r.date}</td>
                             <td className="py-2 px-3 text-white font-sans">{r.staffName}</td>
                             <td className="py-2 px-3 text-right">${r.expectedCash.toFixed(2)}</td>
@@ -728,8 +737,8 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/80">
-                        {salespeople.map((s) => (
-                          <tr key={s.id} className="hover:bg-slate-800/40">
+                        {salespeople.map((s, idx) => (
+                          <tr key={`${s.id}-${idx}`} className="hover:bg-slate-800/40">
                             <td className="py-2 px-3 text-[#FF8A00] font-bold">{s.id}</td>
                             <td className="py-2 px-3 text-white font-sans font-bold">{s.name}</td>
                             <td className="py-2 px-3 text-purple-300 font-sans">{s.role}</td>
@@ -834,9 +843,9 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                 </div>
               ) : (
                 <div className="space-y-2 max-h-96 overflow-y-auto">
-                  {syncQueue.map((item) => (
+                  {syncQueue.map((item, idx) => (
                     <div
-                      key={item.id}
+                      key={`${item.id}-${idx}`}
                       className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 flex items-center justify-between text-xs font-mono-num"
                     >
                       <div>
@@ -1353,7 +1362,7 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                           return;
                         }
                         setIsSyncing(true);
-                        setSyncStatusMsg('Initializing all 11 business tabs and populating inventory in Google Sheets...');
+                        setSyncStatusMsg('Initializing all 25 business tabs and populating inventory in Google Sheets...');
                         try {
                           const res = await initializeTenantBusinessTabs({
                             companyId: currentComp.company_id,
@@ -1376,10 +1385,10 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                         }
                       }}
                       className="py-2.5 px-3 rounded-xl bg-indigo-700 hover:bg-indigo-600 text-white text-xs font-bold shadow-md transition whitespace-nowrap active:scale-95 flex items-center space-x-1"
-                      title="Automatically create Sales, InventoryMaster, GoodsReceived, CashLog, Expenses tabs and populate inventory"
+                      title="Automatically create all 25 business tabs (Sales, InventoryMaster, GoodsReceived, SupplierInvoices, DirectGRVs, CashLog, Expenses, CashLifts, etc.) and populate inventory"
                     >
                       <Layers className="w-3.5 h-3.5" />
-                      <span>Initialize Sheet Tabs</span>
+                      <span>Initialize Sheet Tabs (All 25)</span>
                     </button>
                     <button
                       type="button"

@@ -62,6 +62,41 @@ export const getCasePlural = (item?: { casePackageName?: string } | null): strin
   return name.toLowerCase().endsWith('s') ? name : `${name}s`;
 };
 
+export const safeToFixed = (val: any, decimals = 2): string => {
+  if (val === undefined || val === null || val === '') return (0).toFixed(decimals);
+  const n = Number(val);
+  return isNaN(n) ? (0).toFixed(decimals) : n.toFixed(decimals);
+};
+
+export const normalizeInventoryItem = (item: any): InventoryItem => {
+  if (!item) return item;
+  const unitsPerCase = Math.max(1, Number(item.unitsPerCase || item.UnitsPerCase || 1) || 1);
+  const sellPriceUnit = Number(item.sellPriceUnit !== undefined && item.sellPriceUnit !== null ? item.sellPriceUnit : (item.price ?? item.SellingPrice ?? 0)) || 0;
+  const costPerCase = Number(item.costPerCase !== undefined && item.costPerCase !== null ? item.costPerCase : (item.costPrice ?? item.CostPrice ?? (item.costPerUnit ? item.costPerUnit * unitsPerCase : 0))) || 0;
+  const costPerUnit = Number(item.costPerUnit !== undefined && item.costPerUnit !== null ? item.costPerUnit : (unitsPerCase > 0 ? costPerCase / unitsPerCase : 0)) || 0;
+  const sellPriceCase = Number(item.sellPriceCase !== undefined && item.sellPriceCase !== null ? item.sellPriceCase : (sellPriceUnit * unitsPerCase)) || 0;
+  const stockCases = Number(item.stockCases !== undefined && item.stockCases !== null ? item.stockCases : (unitsPerCase > 1 ? Math.floor(Number(item.totalUnits ?? item.stockQuantity ?? 0) / unitsPerCase) : 0)) || 0;
+  const stockSingles = Number(item.stockSingles !== undefined && item.stockSingles !== null ? item.stockSingles : (Number(item.totalUnits ?? item.stockQuantity ?? 0) - (stockCases * unitsPerCase))) || 0;
+  const totalUnits = Number(item.totalUnits !== undefined && item.totalUnits !== null ? item.totalUnits : (item.stockQuantity ?? (stockCases * unitsPerCase + stockSingles))) || 0;
+  const averageCostPerUnit = item.averageCostPerUnit !== undefined && item.averageCostPerUnit !== null && !isNaN(Number(item.averageCostPerUnit))
+    ? Number(item.averageCostPerUnit)
+    : costPerUnit;
+
+  return {
+    ...item,
+    unitsPerCase,
+    sellPriceUnit,
+    costPerCase,
+    costPerUnit,
+    sellPriceCase,
+    stockCases,
+    stockSingles,
+    totalUnits,
+    averageCostPerUnit,
+    canSellAsCase: Boolean(item.canSellAsCase),
+  };
+};
+
 interface InventoryMasterViewProps {
   currentUser: Salesperson | null;
   onOpenGRN?: (itemId?: string) => void;
@@ -83,16 +118,16 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     }
   };
 
-  const [items, setItems] = useState<InventoryItem[]>(getInventoryItems());
+  const [items, setItems] = useState<InventoryItem[]>(() => getInventoryItems().map(normalizeInventoryItem));
   const [auditTrailItem, setAuditTrailItem] = useState<InventoryItem | null>(null);
 
   useEffect(() => {
-    setItems(getInventoryItems());
+    setItems(getInventoryItems().map(normalizeInventoryItem));
     const unsub = subscribeRoomDatabase(() => {
-      setItems(getInventoryItems());
+      setItems(getInventoryItems().map(normalizeInventoryItem));
     });
     const handleUpdateEvent = () => {
-      setItems(getInventoryItems());
+      setItems(getInventoryItems().map(normalizeInventoryItem));
     };
     window.addEventListener('saimetric_inventory_item_deleted', handleUpdateEvent);
     window.addEventListener('saimetric_inventory_updated', handleUpdateEvent);
@@ -249,14 +284,18 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
   }, [allCategoryNames, categorySearchTerm]);
 
   // Metrics
-  const totalValuation = items.reduce(
-    (sum, i) => sum + (i.stockCases * i.costPerCase) + (i.stockSingles * (i.costPerCase / (i.unitsPerCase || 1))),
-    0
-  );
-  const totalCasesInStock = items.reduce((sum, i) => sum + (i.stockCases || 0), 0);
-  const totalSinglesInStock = items.reduce((sum, i) => sum + (i.stockSingles || 0), 0);
+  const totalValuation = items.reduce((sum, i) => {
+    const sc = Number(i.stockCases) || 0;
+    const cc = Number(i.costPerCase) || 0;
+    const ss = Number(i.stockSingles) || 0;
+    const upc = Number(i.unitsPerCase) || 1;
+    const cpu = cc / upc;
+    return sum + (sc * cc) + (ss * cpu);
+  }, 0);
+  const totalCasesInStock = items.reduce((sum, i) => sum + (Number(i.stockCases) || 0), 0);
+  const totalSinglesInStock = items.reduce((sum, i) => sum + (Number(i.stockSingles) || 0), 0);
   const lowStockItems = items.filter(
-    (i) => i.stockCases <= i.reorderLevelCases || i.stockSingles <= i.reorderLevelUnits
+    (i) => (Number(i.stockCases) || 0) <= (Number(i.reorderLevelCases) || 2) || (Number(i.stockSingles) || 0) <= (Number(i.reorderLevelUnits) || 10)
   );
 
   // Filtered items
@@ -271,13 +310,13 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
         (item.category && item.category.toLowerCase().includes(q));
 
       const matchesCategory = selectedCategory === 'ALL' || item.category === selectedCategory;
-      const matchesLowStock = !filterLowStockOnly || item.stockCases <= item.reorderLevelCases;
+      const matchesLowStock = !filterLowStockOnly || (Number(item.stockCases) || 0) <= (Number(item.reorderLevelCases) || 2);
 
       return matchesSearch && matchesCategory && matchesLowStock;
     });
 
     const seen = new Set<string>();
-    const deduped = list.filter((item) => {
+    const deduped = list.map(normalizeInventoryItem).filter((item) => {
       const key = (item.itemId || '').trim().toUpperCase();
       if (!key || seen.has(key)) return false;
       seen.add(key);
@@ -543,7 +582,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             <DollarSign className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="mt-1.5 sm:mt-2">
-            <div className="text-xl sm:text-2xl font-black font-mono tracking-tight">${totalValuation.toFixed(2)}</div>
+            <div className="text-xl sm:text-2xl font-black font-mono tracking-tight">${safeToFixed(totalValuation)}</div>
             <div className="text-[11px] text-slate-400 mt-0.5">{items.length} Tracked SKUs</div>
           </div>
         </div>
@@ -962,7 +1001,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                               <span className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded-md ${
                                 isSelected ? 'bg-amber-500/25 text-amber-200 border border-amber-400/30' : 'bg-amber-50 text-amber-900 border border-amber-200'
                               }`}>
-                                Avg Cost: ${(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || (item.costPerCase / (item.unitsPerCase || 1)))).toFixed(2)}/ea
+                                Avg Cost: ${safeToFixed(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || (item.costPerCase / (item.unitsPerCase || 1))))}/ea
                               </span>
                             </div>
                           </div>
@@ -970,12 +1009,12 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                           {/* Price & Stock Overview on Card */}
                           <div className="text-right flex flex-col items-end">
                             <div className={`font-mono font-black text-base ${isSelected ? 'text-emerald-300' : 'text-emerald-700'}`}>
-                              ${item.sellPriceUnit.toFixed(2)}
+                              ${safeToFixed(item.sellPriceUnit)}
                               <span className={`text-[11px] font-normal ml-0.5 ${isSelected ? 'text-slate-300' : 'text-slate-500'}`}>/ea</span>
                             </div>
-                            {canSellCase && item.sellPriceCase > 0 && (
+                            {canSellCase && (item.sellPriceCase || 0) > 0 && (
                               <div className={`text-xs font-mono font-bold ${isSelected ? 'text-slate-300' : 'text-slate-600'}`}>
-                                ${item.sellPriceCase.toFixed(2)}/{item.casePackageName || 'cs'}
+                                ${safeToFixed(item.sellPriceCase)}/{item.casePackageName || 'cs'}
                               </div>
                             )}
                             <div className="mt-1 flex items-center gap-1">
@@ -1116,13 +1155,13 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                     <div className="p-3 bg-slate-50 rounded-2xl border border-slate-200">
                       <div className="text-[11px] font-bold text-slate-500 uppercase">Single / Each</div>
                       <div className="mt-1 font-mono font-black text-lg text-emerald-700">
-                        ${activeSelectedItem.sellPriceUnit.toFixed(2)}
+                        ${safeToFixed(activeSelectedItem.sellPriceUnit)}
                       </div>
                       <div className="text-xs text-slate-600 mt-1">
                         Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockSingles} Units</span>
                       </div>
                       <div className="text-[10px] text-slate-400 mt-0.5">
-                        Latest Cost: ${(activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)).toFixed(2)}/ea
+                        Latest Cost: ${safeToFixed((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))}/ea
                       </div>
                     </div>
 
@@ -1142,7 +1181,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                       </div>
                       <div className="mt-1 font-mono font-black text-lg text-indigo-950">
                         {activeSelectedItem.canSellAsCase
-                          ? `$${activeSelectedItem.sellPriceCase.toFixed(2)}`
+                          ? `$${safeToFixed(activeSelectedItem.sellPriceCase)}`
                           : 'N/A (Singles only)'}
                       </div>
                       <div className="text-xs text-slate-600 mt-1">
@@ -1162,13 +1201,13 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-200 text-amber-900 font-mono">Real-time</span>
                       </div>
                       <div className="text-base font-black font-mono text-amber-950 mt-0.5">
-                        ${(activeSelectedItem.averageCostPerUnit !== undefined && activeSelectedItem.averageCostPerUnit > 0 ? activeSelectedItem.averageCostPerUnit : (activeSelectedItem.costPerUnit || (activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)))).toFixed(2)} / unit
+                        ${safeToFixed(activeSelectedItem.averageCostPerUnit !== undefined && activeSelectedItem.averageCostPerUnit > 0 ? activeSelectedItem.averageCostPerUnit : (activeSelectedItem.costPerUnit || ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))))} / unit
                       </div>
                     </div>
                     <div className="text-right">
                       <div className="text-amber-800 text-[10px] uppercase font-bold">Latest Purchase Invoice</div>
                       <div className="text-xs font-mono font-bold text-slate-700 mt-0.5">
-                        ${(activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)).toFixed(2)} / unit
+                        ${safeToFixed((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))} / unit
                       </div>
                     </div>
                   </div>
@@ -1184,7 +1223,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                     <div className="text-right">
                       <div className="text-slate-400 text-[10px] uppercase font-bold">Inventory Valuation</div>
                       <div className="text-base font-black font-mono text-emerald-400 mt-0.5">
-                        ${((activeSelectedItem.stockCases * activeSelectedItem.costPerCase) + (activeSelectedItem.stockSingles * (activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)))).toFixed(2)}
+                        ${safeToFixed(((activeSelectedItem.stockCases || 0) * (activeSelectedItem.costPerCase || 0)) + ((activeSelectedItem.stockSingles || 0) * ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))))}
                       </div>
                     </div>
                   </div>
@@ -1385,21 +1424,21 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         </td>
 
                         <td className="py-3.5 px-3 text-right font-mono">
-                          <div className="text-slate-900 font-bold">${item.costPerCase.toFixed(2)}</div>
-                          <div className="text-xs text-slate-500">${costPerUnit.toFixed(2)}</div>
+                          <div className="text-slate-900 font-bold">${safeToFixed(item.costPerCase)}</div>
+                          <div className="text-xs text-slate-500">${safeToFixed(costPerUnit)}</div>
                         </td>
 
                         <td className="py-3.5 px-3 text-right font-mono bg-amber-50/40 border-x border-amber-100">
                           <span className="text-xs font-black text-amber-950 bg-amber-100/90 px-2 py-0.5 rounded border border-amber-300 inline-block shadow-2xs">
-                            ${(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || costPerUnit)).toFixed(2)}
+                            ${safeToFixed(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || costPerUnit))}
                           </span>
                           <span className="text-[10px] text-amber-700 block mt-0.5 font-sans font-semibold">/ea</span>
                         </td>
 
                         <td className="py-3.5 px-3 text-right font-mono">
-                          <div className="text-emerald-800 font-black">${item.sellPriceUnit.toFixed(2)}/ea</div>
+                          <div className="text-emerald-800 font-black">${safeToFixed(item.sellPriceUnit)}/ea</div>
                           {item.canSellAsCase && (
-                            <div className="text-xs text-indigo-700 font-bold">${item.sellPriceCase.toFixed(2)}/cs</div>
+                            <div className="text-xs text-indigo-700 font-bold">${safeToFixed(item.sellPriceCase)}/cs</div>
                           )}
                         </td>
 
@@ -1537,13 +1576,13 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
               <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-200">
                 <div className="text-[11px] font-bold text-slate-500 uppercase">Single / Each</div>
                 <div className="mt-1 font-mono font-black text-xl text-emerald-700">
-                  ${activeSelectedItem.sellPriceUnit.toFixed(2)}
+                  ${safeToFixed(activeSelectedItem.sellPriceUnit)}
                 </div>
                 <div className="text-xs text-slate-600 mt-1">
                   Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockSingles} Units</span>
                 </div>
                 <div className="text-[10px] text-slate-400 mt-0.5">
-                  Cost: ${(activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)).toFixed(2)}/ea
+                  Cost: ${safeToFixed((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))}/ea
                 </div>
               </div>
 
@@ -1563,7 +1602,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                 </div>
                 <div className="mt-1 font-mono font-black text-xl text-indigo-950">
                   {activeSelectedItem.canSellAsCase
-                    ? `$${activeSelectedItem.sellPriceCase.toFixed(2)}`
+                    ? `$${safeToFixed(activeSelectedItem.sellPriceCase)}`
                     : 'N/A (Singles only)'}
                 </div>
                 <div className="text-xs text-slate-600 mt-1">
@@ -1586,7 +1625,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
               <div className="text-right">
                 <div className="text-slate-400 text-[10px] uppercase font-bold">Inventory Valuation</div>
                 <div className="text-lg font-black font-mono text-emerald-400 mt-0.5">
-                  ${((activeSelectedItem.stockCases * activeSelectedItem.costPerCase) + (activeSelectedItem.stockSingles * (activeSelectedItem.costPerCase / (activeSelectedItem.unitsPerCase || 1)))).toFixed(2)}
+                  ${safeToFixed(((activeSelectedItem.stockCases || 0) * (activeSelectedItem.costPerCase || 0)) + ((activeSelectedItem.stockSingles || 0) * ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))))}
                 </div>
               </div>
             </div>
@@ -1872,7 +1911,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-bold text-slate-800 mb-1">
-                      Qty {getCasePlural(quickSellItem)} (${quickSellItem.sellPriceCase.toFixed(2)}/{quickSellItem.casePackageName || 'cs'})
+                      Qty {getCasePlural(quickSellItem)} (${safeToFixed(quickSellItem.sellPriceCase)}/{quickSellItem.casePackageName || 'cs'})
                     </label>
                     <input
                       type="number"
@@ -1886,7 +1925,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                   </div>
                   <div>
                     <label className="block text-xs font-bold text-slate-800 mb-1">
-                      Qty Singles (${quickSellItem.sellPriceUnit.toFixed(2)}/ea)
+                      Qty Singles (${safeToFixed(quickSellItem.sellPriceUnit)}/ea)
                     </label>
                     <input
                       type="number"

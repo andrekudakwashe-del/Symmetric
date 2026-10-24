@@ -542,7 +542,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
 
             {/* Segments Cards Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {session.segments.map((seg) => {
+              {session.segments.map((seg, segIdx) => {
                 const count1Done = seg.count1 && seg.count1.length > 0;
                 const count2Done = seg.count2 && seg.count2.length > 0;
                 const count1Units = seg.count1?.reduce((acc, l) => acc + l.totalUnits, 0) || 0;
@@ -551,7 +551,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
 
                 return (
                   <div
-                    key={seg.segmentId}
+                    key={`${seg.segmentId}-${segIdx}`}
                     className={`bg-slate-900/90 rounded-2xl border p-5 flex flex-col justify-between gap-4 transition shadow-lg ${
                       seg.status === 'VERIFIED'
                         ? 'border-emerald-500/40 ring-1 ring-emerald-500/20'

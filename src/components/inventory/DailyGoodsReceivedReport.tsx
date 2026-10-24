@@ -299,8 +299,8 @@ export const DailyGoodsReceivedReport: React.FC<DailyGoodsReceivedReportProps> =
             </div>
           ) : (
             <div className="space-y-3">
-              {reportData.supplierBreakdown.map((supp) => (
-                <div key={supp.supplier} className="space-y-1.5 p-3 rounded-xl bg-slate-900 border border-slate-800">
+              {reportData.supplierBreakdown.map((supp, idx) => (
+                <div key={`${supp.supplier}-${idx}`} className="space-y-1.5 p-3 rounded-xl bg-slate-900 border border-slate-800">
                   <div className="flex items-center justify-between text-xs">
                     <div className="flex items-center gap-2">
                       <span className="font-bold text-white">{supp.supplier}</span>

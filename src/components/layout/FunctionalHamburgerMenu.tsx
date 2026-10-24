@@ -365,7 +365,7 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
                   const isCurrent = activeTab === mod.id;
                   return (
                     <button
-                      key={mod.id}
+                      key={`${mod.id}-${idx}`}
                       type="button"
                       id={`hamburger-primary-${mod.id}`}
                       onClick={() => {
@@ -457,7 +457,7 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
                   {/* Modules in Category */}
                   {!isCollapsed && (
                     <div className="p-2 pt-0 space-y-1 divide-y divide-slate-800/50">
-                      {modules.map((mod) => {
+                      {modules.map((mod, modIdx) => {
                         const Icon = getModuleIcon(mod.iconName);
                         const isCurrent = activeTab === mod.id;
                         const primaryIdx = roleDef.primaryModules.indexOf(mod.id);
@@ -465,7 +465,7 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
 
                         return (
                           <button
-                            key={mod.id}
+                            key={`${mod.id}-${modIdx}`}
                             type="button"
                             id={`hamburger-mod-${mod.id}`}
                             onClick={() => {

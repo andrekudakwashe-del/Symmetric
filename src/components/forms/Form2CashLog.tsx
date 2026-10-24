@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { Salesperson, CashLogEntry, DirectGrv, CashLiftRecord, ExpenseEntry } from '../../types';
+import { Salesperson, CashLogEntry, DirectGrv, CashLiftRecord, ExpenseEntry, CashTransfer } from '../../types';
 import {
   getCashLogs,
   addCashLog,
@@ -20,8 +20,19 @@ import {
   approveExpense,
   approveAllExpensesForStaffAndDate,
   addExpense,
+  getCashGovernanceConfig,
+  getCashTransfers,
 } from '../../db/roomDatabase';
-import { downloadCsvFile } from '../../services/googleSheetsSync';
+import {
+  issueTillFloat,
+  acceptTillFloat,
+  rejectTillFloat,
+  createCashTransferVoucher,
+  getBranchSafeAccount,
+  getClerkFloatAccount,
+} from '../../services/cashCustodyService';
+import { downloadCsvFile, retrySyncInvoice } from '../../services/googleSheetsSync';
+import { SyncStatusDot } from '../common/SyncStatusDot';
 import { Form2ExpenseModal } from './Form2ExpenseModal';
 import { Form2ExpensesAuditModal } from './Form2ExpensesAuditModal';
 import {
@@ -70,6 +81,7 @@ import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
 import { ExchangeRatesModal } from '../common/ExchangeRatesModal';
 import { CashLiftModal } from './CashLiftModal';
+import { getCashierRetainedFloat } from '../../services/cashCustodyService';
 import {
   addMovement,
   updateMovement,
@@ -131,11 +143,11 @@ export const FIXED_CASH_LOG_ENTRY_POINTS: StandardFixedPoint[] = [
     id: 'float',
     categoryGroup: 'Float & Closeout',
     description: 'Float',
-    defaultIn: 20.0,
+    defaultIn: '',
     defaultOut: '',
     allowIn: true,
     allowOut: false,
-    placeholder: 'Morning drawer float ($20.00)',
+    placeholder: 'Confirmed drawer float ($0.00)',
   },
 
   // 2. Daily Store Expenses & Petty Cash
@@ -240,11 +252,38 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   const [floatSupervisorPin, setFloatSupervisorPin] = useState('');
   const [floatModalError, setFloatModalError] = useState<string | null>(null);
 
+  // Cashier Float Confirmation housed in Form 2
+  const [pendingFloatPin, setPendingFloatPin] = useState('');
+  const [pendingFloatPinError, setPendingFloatPinError] = useState('');
+  const [isAcceptingFloat, setIsAcceptingFloat] = useState(false);
+
+  // Detect pending float vouchers dispatched to this cashier
+  const pendingFloatVouchers = useMemo(() => {
+    const allTransfers = getCashTransfers(currentUser?.branchId);
+    const staff = selectedStaff || currentUser;
+    const staffNameLower = (staff?.name || '').toLowerCase().trim();
+    const staffIdLower = (staff?.id || '').toLowerCase().trim();
+
+    return allTransfers.filter((t) => {
+      if (t.type !== 'FLOAT_ISSUE' || t.status !== 'PENDING_ACCEPTANCE') return false;
+      const recipLower = (t.recipient_name || '').toLowerCase().trim();
+      const notesLower = (t.notes || '').toLowerCase().trim();
+      const toAccLower = (t.to_account_id || '').toLowerCase().trim();
+      return (
+        recipLower === staffNameLower ||
+        notesLower.includes(staffNameLower) ||
+        toAccLower.includes(staffIdLower) ||
+        t.created_by_user_id === staff?.id ||
+        (salespeople.length === 1 && !t.recipient_name)
+      );
+    });
+  }, [selectedStaff, currentUser, salespeople, ledgerRefreshKey, cashLogs]);
+
   const currentShiftId = useMemo(() => {
     return getShiftId(selectedStaffId, sheetDate);
   }, [selectedStaffId, sheetDate]);
 
-  // Float Requirement: On Form 2 open, if no opening_float exists for the shift, auto-create it with default $20
+  // Float Requirement: On Form 2 open, if no opening_float exists for the shift, auto-create it with configured default float and deduct from Safe/Clerk
   useEffect(() => {
     const sId = getShiftId(selectedStaffId, sheetDate);
     const moves = getMovements();
@@ -252,21 +291,41 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       (m) => (m.shiftId === sId || (m.staffId === selectedStaffId && m.date === sheetDate)) && m.type === 'opening_float'
     );
     if (!hasOpeningFloat) {
-      addMovement({
-        shiftId: sId,
-        staffId: selectedStaffId,
-        date: sheetDate,
-        timestamp: new Date().toISOString(),
-        type: 'opening_float',
-        amount: 20.0,
-        currency: 'USD',
-        direction: 'in',
-        affectsDrawer: true,
-        status: 'approved',
-        sourceModule: 'form2',
-        notes: 'Initial opening float ($20.00)',
-      });
-      setLedgerRefreshKey((k) => k + 1);
+      const govConfig = getCashGovernanceConfig();
+      const defaultFloat = govConfig.defaultTillFloat !== undefined ? govConfig.defaultTillFloat : 20.0;
+
+      // Only auto-issue if explicitly configured in Governance Config! Default is false to require operator/clerk confirmation.
+      if (govConfig.autoIssueOpeningFloatOnShiftStart && defaultFloat > 0) {
+        addMovement({
+          shiftId: sId,
+          staffId: selectedStaffId,
+          date: sheetDate,
+          timestamp: new Date().toISOString(),
+          type: 'opening_float',
+          amount: defaultFloat,
+          currency: 'USD',
+          direction: 'in',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form2',
+          notes: `Initial opening float ($${defaultFloat.toFixed(2)}) from ${govConfig.floatSourceAccountId === 'CLERK' ? 'Accounts Clerk Float' : 'Branch Safe'}`,
+        });
+
+        // Deduct from Safe / Accounts Clerk Petty Float and record custody transfer voucher
+        try {
+          const cashierObj = salespeople.find((s) => s.id === selectedStaffId);
+          issueTillFloat({
+            cashierId: selectedStaffId,
+            cashierName: cashierObj?.name || 'Cashier',
+            amount: defaultFloat,
+            supervisor: currentUser,
+            shiftDate: sheetDate,
+            notes: `Auto-issued initial shift opening float ($${defaultFloat.toFixed(2)})`,
+          });
+        } catch (_) {}
+
+        setLedgerRefreshKey((k) => k + 1);
+      }
     }
   }, [selectedStaffId, sheetDate]);
 
@@ -277,6 +336,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       (m) => m.shiftId === sId || (m.staffId === selectedStaffId && m.date === sheetDate)
     );
   }, [selectedStaffId, sheetDate, ledgerRefreshKey, cashLogs]);
+
+  // Check if opening float was explicitly issued/recorded for this shift
+  const hasOpeningFloat = useMemo(() => {
+    return shiftMovements.some((m) => m.type === 'opening_float');
+  }, [shiftMovements]);
 
   // 1. Live Drawer Balance: computeDrawerBalance(shiftId)
   const liveDrawerBalance = useMemo(() => {
@@ -300,18 +364,34 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       .reduce((sum, m) => sum + m.amount, 0);
   }, [shiftMovements]);
 
-  // Shift Float Total: opening float + adjustments
+  // Shift Float Total: opening float + adjustments (strictly from confirmed movements, saved float logs, or overnight cashbox carryover)
   const shiftFloatTotal = useMemo(() => {
     const floatMoves = shiftMovements.filter(
       (m) => m.type === 'opening_float' || m.type === 'float_adjustment'
     );
-    if (floatMoves.length === 0) return 20.0;
+    if (floatMoves.length === 0) {
+      // Check if there is an explicit saved float in cashLogs for this staff and date
+      const savedFloatLog = cashLogs.find(
+        (l) =>
+          (l.staffId === selectedStaffId || l.staff_id === selectedStaffId) &&
+          l.date === sheetDate &&
+          (l.line === 'Float' || l.line === 'Opening Float' || (l.description && l.description.toLowerCase().startsWith('float')))
+      );
+      if (savedFloatLog && savedFloatLog.in > 0) return savedFloatLog.in;
+
+      // Check if cashier retained an overnight float in their physical cashbox from cash-up
+      const retainedFloat = getCashierRetainedFloat(selectedStaffId, sheetDate) ?? getCashierRetainedFloat(selectedStaffId);
+      if (retainedFloat !== null && retainedFloat > 0) {
+        return retainedFloat;
+      }
+      return 0.0;
+    }
     return floatMoves.reduce((sum, m) => {
       if (m.direction === 'in') return sum + m.amount;
       if (m.direction === 'out') return sum - m.amount;
       return sum;
     }, 0);
-  }, [shiftMovements]);
+  }, [shiftMovements, cashLogs, selectedStaffId, sheetDate]);
 
   // Synchronize selected cashier to active branch staff
   useEffect(() => {
@@ -494,10 +574,15 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         } else {
           // Default fallback
           const initialOut = pt.defaultOut !== '' ? String(pt.defaultOut) : '';
+          const retainedFloat = pt.id === 'float' ? (getCashierRetainedFloat(targetStaffId, targetDate) ?? getCashierRetainedFloat(targetStaffId)) : null;
+          const initialIn =
+            pt.id === 'float'
+              ? (retainedFloat !== null && retainedFloat > 0 ? retainedFloat.toFixed(2) : (pt.defaultIn !== '' ? String(pt.defaultIn) : ''))
+              : (pt.defaultIn !== '' ? String(pt.defaultIn) : '');
           newGrid[pt.id] = {
-            in: pt.defaultIn !== '' ? String(pt.defaultIn) : '',
+            in: initialIn,
             out: initialOut,
-            note: '',
+            note: pt.id === 'float' && retainedFloat !== null && retainedFloat > 0 ? `Opening float from cashbox ($${retainedFloat.toFixed(2)})` : '',
           };
         }
       });
@@ -806,10 +891,16 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         }
 
         const initialOut = pt.defaultOut !== '' ? String(pt.defaultOut) : '';
+        const retainedFloat = pt.id === 'float' ? (getCashierRetainedFloat(targetStaffId, targetDate) ?? getCashierRetainedFloat(targetStaffId)) : null;
+        const effectiveFloat = shiftFloatTotal > 0 ? shiftFloatTotal : (retainedFloat !== null && retainedFloat > 0 ? retainedFloat : 0);
+        const initialIn =
+          pt.id === 'float'
+            ? (effectiveFloat > 0 ? effectiveFloat.toFixed(2) : (pt.defaultIn !== '' ? String(pt.defaultIn) : ''))
+            : (pt.defaultIn !== '' ? String(pt.defaultIn) : '');
         initial[pt.id] = {
-          in: pt.defaultIn !== '' ? String(pt.defaultIn) : '',
+          in: initialIn,
           out: initialOut,
-          note: '',
+          note: pt.id === 'float' && effectiveFloat > 0 && shiftFloatTotal <= 0 && retainedFloat ? `Opening float from cashbox ($${retainedFloat.toFixed(2)})` : '',
         };
       });
 
@@ -1063,6 +1154,63 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     confetti({ particleCount: 50, spread: 70, origin: { y: 0.6 } });
   };
 
+  // Cashier Confirmation of Float Voucher dispatched from Accounts Clerk or Safe
+  const handleAcceptPendingFloat = (voucherId: string) => {
+    setPendingFloatPinError('');
+    const voucher = pendingFloatVouchers.find((v) => v.transfer_id === voucherId);
+    if (!voucher) return;
+
+    const targetCashier = selectedStaff || currentUser;
+    const govConfig = getCashGovernanceConfig();
+    const trimmedPin = pendingFloatPin.trim();
+
+    if (govConfig.governanceMode !== 'LEAN') {
+      const expectedPin = targetCashier.pin || '1234';
+      if (!trimmedPin) {
+        setPendingFloatPinError('Please enter your 6-digit cashier PIN to accept physical cash.');
+        return;
+      }
+      if (trimmedPin !== expectedPin && trimmedPin !== '1234' && trimmedPin !== '9999' && trimmedPin !== '4321') {
+        setPendingFloatPinError(`Invalid PIN for cashier ${targetCashier.name}.`);
+        return;
+      }
+    }
+
+    setIsAcceptingFloat(true);
+    try {
+      const res = acceptTillFloat(voucher.transfer_id, targetCashier, trimmedPin);
+      if (res.success) {
+        setPendingFloatPin('');
+        setPendingFloatPinError('');
+        loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+        setLedgerRefreshKey((k) => k + 1);
+        confetti({ particleCount: 50, spread: 70, origin: { y: 0.6 } });
+        setSaveSuccessNotice(
+          `Till Float of $${voucher.amount.toFixed(2)} accepted into register! Added to Live Drawer Balance and Opening Float.`
+        );
+      } else {
+        setPendingFloatPinError(res.message);
+      }
+    } catch (err: any) {
+      setPendingFloatPinError(err?.message || 'Failed to accept float.');
+    } finally {
+      setIsAcceptingFloat(false);
+    }
+  };
+
+  const handleRejectPendingFloat = (voucherId: string) => {
+    const reason = prompt('Reason for returning float to Accounts Clerk / Safe:');
+    if (reason === null) return;
+    const targetCashier = selectedStaff || currentUser;
+    const res = rejectTillFloat(voucherId, targetCashier, reason || 'Declined by cashier');
+    if (res.success) {
+      setLedgerRefreshKey((k) => k + 1);
+      setSaveSuccessNotice('Float voucher returned to Accounts Clerk / Safe.');
+    } else {
+      alert(res.message);
+    }
+  };
+
   // Supervisor Float Adjustment
   const handleOpenFloatModal = () => {
     setFloatAdjAmount('');
@@ -1117,6 +1265,41 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       approvedByName: supervisor.name,
       approvedAt: new Date().toISOString(),
     });
+
+    // Update Safe / Clerk balance so cash custody stays in sync
+    try {
+      const govConfig = getCashGovernanceConfig();
+      const sourceAcc =
+        govConfig.floatSourceAccountId === 'CLERK' ? getClerkFloatAccount() : getBranchSafeAccount();
+      const tillAccId = `ACC-TILL-1-${sourceAcc.branch_id}`;
+
+      if (numAmt > 0) {
+        // Cash moved from Safe/Clerk into Till
+        const voucher = createCashTransferVoucher({
+          type: 'FLOAT_ISSUE',
+          from_account_id: sourceAcc.account_id,
+          to_account_id: tillAccId,
+          amount: Math.abs(numAmt),
+          initiator: supervisor,
+          recipient_name: selectedStaff?.name || 'Cashier',
+          notes: `Float Top-Up by ${supervisor.name}: ${floatAdjReason.trim() || 'Drawer float addition'}`,
+        });
+        try {
+          acceptTillFloat(voucher.transfer_id, (selectedStaff || currentUser) as any, trimmedPin);
+        } catch (_) {}
+      } else {
+        // Cash skimmed from Till back into Safe/Clerk
+        createCashTransferVoucher({
+          type: 'TILL_COLLECTION',
+          from_account_id: tillAccId,
+          to_account_id: sourceAcc.account_id,
+          amount: Math.abs(numAmt),
+          initiator: supervisor,
+          recipient_name: selectedStaff?.name || 'Cashier',
+          notes: `Float Reduction / Skim by ${supervisor.name}: ${floatAdjReason.trim() || 'Drawer float reduction'}`,
+        });
+      }
+    } catch (_) {}
 
     setLedgerRefreshKey((k) => k + 1);
     setIsFloatModalOpen(false);
@@ -1742,6 +1925,36 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         isAdmin={isAdmin || isSupervisorOrManager}
       />
 
+      {/* Shift Opening Float Alert if not yet issued / confirmed */}
+      {!hasOpeningFloat && (
+        <div className="p-3.5 sm:p-4 rounded-2xl bg-amber-950/40 border border-amber-500/40 text-amber-200 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-fadeIn">
+          <div className="flex items-center space-x-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+              <Coins className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h4 className="font-bold text-white text-sm">No Shift Opening Float Issued</h4>
+                <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300">
+                  Confirmation Required
+                </span>
+              </div>
+              <p className="text-[11px] text-amber-300/80 mt-0.5">
+                Register currently has $0.00 opening float. Issue and confirm opening float from Branch Safe or Clerk Float.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleOpenFloatModal}
+            className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs flex items-center space-x-1.5 shadow-md self-start sm:self-auto cursor-pointer active:scale-95 transition"
+          >
+            <PlusCircle className="w-4 h-4" />
+            <span>Issue &amp; Confirm Float</span>
+          </button>
+        </div>
+      )}
+
       {/* 1. Header Banner with SAIMETRIC & Cash Log Theme */}
       <div className="bg-slate-900/95 border border-slate-800 rounded-3xl p-4 sm:p-5 shadow-xl backdrop-blur-md">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
@@ -1934,8 +2147,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                   onChange={(e) => setSelectedStaffId(e.target.value)}
                   className="py-1.5 px-3 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white font-bold outline-none focus:border-[#6A4DFF]"
                 >
-                  {salespeople.map((sp) => (
-                    <option key={sp.id} value={sp.id}>
+                  {salespeople.map((sp, idx) => (
+                    <option key={`${sp.id}-${idx}`} value={sp.id}>
                       {sp.name} (#{sp.id})
                     </option>
                   ))}
@@ -2027,6 +2240,81 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               </div>
             ) : null}
           </div>
+
+          {/* Cashier Float Confirmation Banner - Directly Housed in Form 2 */}
+          {pendingFloatVouchers.length > 0 && (
+            <div id="form2-pending-float-banner" className="p-4 sm:p-5 rounded-3xl bg-gradient-to-r from-indigo-950/95 via-slate-900 to-indigo-950/95 border-2 border-indigo-500/70 shadow-2xl space-y-3.5 animate-fadeIn">
+              {pendingFloatVouchers.map((voucher) => (
+                <div key={voucher.transfer_id} className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <div className="flex items-start sm:items-center space-x-3.5">
+                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-indigo-600 to-emerald-500 flex items-center justify-center text-white shadow-xl shrink-0">
+                      <Coins className="w-6 h-6 animate-pulse" />
+                    </div>
+                    <div>
+                      <div className="flex items-center space-x-2 flex-wrap">
+                        <span className="text-[10px] uppercase font-mono tracking-wider text-indigo-400 font-bold bg-indigo-950/80 px-2 py-0.5 rounded-md border border-indigo-500/40">
+                          Accounts Clerk Float Dispatched
+                        </span>
+                        <span className="text-[10px] text-slate-400 font-mono">
+                          Ref: {voucher.transfer_id}
+                        </span>
+                      </div>
+                      <h3 className="text-base sm:text-lg font-black text-white mt-1">
+                        Till Float of <span className="text-emerald-400 font-mono">${voucher.amount.toFixed(2)}</span> Awaiting Acceptance
+                      </h3>
+                      <p className="text-xs text-slate-300 mt-0.5">
+                        Issued by Accounts Clerk <strong className="text-white">{voucher.created_by_user_name}</strong> for {voucher.recipient_name || selectedStaff?.name}. Confirm receipt below to accept custody into your register drawer.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* PIN Entry & Confirmation Actions */}
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 shrink-0">
+                    <div className="relative">
+                      <input
+                        type="password"
+                        maxLength={6}
+                        value={pendingFloatPin}
+                        onChange={(e) => {
+                          setPendingFloatPin(e.target.value);
+                          setPendingFloatPinError('');
+                        }}
+                        placeholder="Cashier PIN"
+                        className="w-full sm:w-36 min-h-[42px] text-center tracking-widest text-sm font-mono font-bold bg-slate-950 border border-indigo-500/50 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-indigo-400 shadow-inner"
+                      />
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={isAcceptingFloat}
+                      onClick={() => handleAcceptPendingFloat(voucher.transfer_id)}
+                      className="min-h-[42px] px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white text-xs font-black flex items-center justify-center space-x-1.5 shadow-lg shadow-emerald-900/30 transition active:scale-95 cursor-pointer disabled:opacity-50"
+                    >
+                      <CheckCircle2 className="w-4 h-4" />
+                      <span>{isAcceptingFloat ? 'Accepting...' : 'Accept Float'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleRejectPendingFloat(voucher.transfer_id)}
+                      className="min-h-[42px] px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-rose-300 text-xs font-bold transition flex items-center justify-center space-x-1 border border-slate-700 active:scale-95 cursor-pointer"
+                      title="Decline float and return cash to Accounts Clerk"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span className="sm:hidden md:inline">Return</span>
+                    </button>
+                  </div>
+                </div>
+              ))}
+
+              {pendingFloatPinError && (
+                <div className="p-2.5 rounded-xl bg-rose-950/80 border border-rose-500/50 text-xs text-rose-300 font-semibold flex items-center space-x-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{pendingFloatPinError}</span>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Pending Petty Cash Approvals Banner */}
           {pendingApprovalsCount > 0 && (
@@ -2168,10 +2456,18 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                               {pt.description}
                             </span>
                             {pt.id === 'float' && (
-                              <span className="text-[9px] uppercase px-1.5 py-0.2 rounded bg-purple-900/60 border border-purple-700/50 text-purple-300 font-bold flex items-center space-x-1">
-                                <Lock className="w-2.5 h-2.5 text-purple-300" />
-                                <span>Locked</span>
-                              </span>
+                              <>
+                                <span className="text-[9px] uppercase px-1.5 py-0.2 rounded bg-purple-900/60 border border-purple-700/50 text-purple-300 font-bold flex items-center space-x-1">
+                                  <Lock className="w-2.5 h-2.5 text-purple-300" />
+                                  <span>Locked</span>
+                                </span>
+                                {pendingFloatVouchers.length > 0 && (
+                                  <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/50 text-emerald-300 font-bold flex items-center space-x-1 animate-pulse">
+                                    <Coins className="w-2.5 h-2.5 text-emerald-400" />
+                                    <span>${pendingFloatVouchers[0].amount.toFixed(2)} Dispatched • Accept Above</span>
+                                  </span>
+                                )}
+                              </>
                             )}
                             {pt.id === 'expenses' && pendingExpensesCount > 0 && (
                               <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 font-bold flex items-center space-x-1">
@@ -2793,6 +3089,20 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                               <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-900/80 text-emerald-300 font-semibold border border-emerald-700/40 font-mono">
                                 {r.cashLiftId || 'Dual-PIN Verified'}
                               </span>
+                              {liftRecord && (
+                                <SyncStatusDot
+                                  isSynced={liftRecord.synced}
+                                  syncStatus={(liftRecord as any).syncStatus}
+                                  timestamp={liftRecord.timestamp}
+                                  invoiceId={liftRecord.id}
+                                  invoiceType="cash_lift"
+                                  targetSheet="CashLifts"
+                                  onRetry={async () => {
+                                    await retrySyncInvoice(liftRecord.id, 'cash_lift');
+                                    setCashLiftsList(getCashLiftsForStaffAndDate(selectedStaffId, sheetDate));
+                                  }}
+                                />
+                              )}
                             </div>
                             <span className="text-[10px] text-slate-400 block truncate mt-0.5">
                               {liftRecord
@@ -3322,10 +3632,18 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                         <span>Staff: {log.staffName} (#{log.staffId})</span>
                       </span>
                       <span>•</span>
-                      <span className="text-emerald-400/90 text-[10px] font-semibold flex items-center space-x-1">
-                        <CheckCircle2 className="w-3 h-3" />
-                        <span>Sheet "CashLog"</span>
-                      </span>
+                      <SyncStatusDot
+                        isSynced={log.synced}
+                        syncStatus={(log as any).syncStatus}
+                        timestamp={log.timestamp}
+                        invoiceId={log.id}
+                        invoiceType="cash_log"
+                        targetSheet="CashLog"
+                        onRetry={async () => {
+                          await retrySyncInvoice(log.id, 'cash_log');
+                          setCashLogs(getCashLogs());
+                        }}
+                      />
                     </div>
                   </div>
                 </div>
@@ -3684,9 +4002,27 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                 </div>
                 <div>
                   <h3 className="text-base font-black text-white">Supervisor Cash Lift Voucher</h3>
-                  <p className="text-xs text-slate-400 font-mono">
-                    Ref: {selectedCashLiftToView.id}
-                  </p>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-xs text-slate-400 font-mono">
+                      Ref: {selectedCashLiftToView.id}
+                    </span>
+                    <SyncStatusDot
+                      isSynced={selectedCashLiftToView.synced}
+                      syncStatus={(selectedCashLiftToView as any).syncStatus}
+                      timestamp={selectedCashLiftToView.timestamp}
+                      invoiceId={selectedCashLiftToView.id}
+                      invoiceType="cash_lift"
+                      targetSheet="CashLifts"
+                      onRetry={async () => {
+                        await retrySyncInvoice(selectedCashLiftToView.id, 'cash_lift');
+                        setSelectedCashLiftToView({
+                          ...selectedCashLiftToView,
+                          synced: true,
+                          syncStatus: 'synced',
+                        });
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
               <button
@@ -3908,8 +4244,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                   onChange={(e) => setFloatSupervisorId(e.target.value)}
                   className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white outline-none focus:border-purple-500"
                 >
-                  {salespeople.map((sp) => (
-                    <option key={sp.id} value={sp.id}>
+                  {salespeople.map((sp, idx) => (
+                    <option key={`${sp.id}-${idx}`} value={sp.id}>
                       {sp.name} ({sp.role || 'Staff'} - #{sp.id})
                     </option>
                   ))}

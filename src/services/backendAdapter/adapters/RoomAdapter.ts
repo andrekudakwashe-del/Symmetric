@@ -21,6 +21,10 @@ import {
   getExpenses,
   getSuppliers,
   getCustomerChanges,
+  getCashAccounts,
+  getCashTransfers,
+  getAllCashAccounts,
+  getAllCashTransfers,
 } from '../../../db/roomDatabase';
 
 export class RoomBackendAdapter implements IBackendAdapter {
@@ -96,6 +100,8 @@ export class RoomBackendAdapter implements IBackendAdapter {
         customers: allCustomers,
         customerChanges: allCustomerChanges,
         suppliers: allSuppliers,
+        cashAccounts: getCashAccounts().filter((a: any) => !a.company_id || a.company_id === companyId),
+        cashTransfers: getCashTransfers().filter((t: any) => !t.company_id || t.company_id === companyId),
       },
       metrics: {
         totalSales: allSales.length,
@@ -151,6 +157,30 @@ export class RoomBackendAdapter implements IBackendAdapter {
         }));
         setStored(STORAGE_KEYS.CUSTOMERS, [...nonTenantCust, ...mappedCust]);
         written += mappedCust.length;
+      }
+
+      // 4. Cash Accounts
+      if (Array.isArray(snapshot.data.cashAccounts)) {
+        const existingAccs = getAllCashAccounts();
+        const nonTenantAccs = existingAccs.filter((a: any) => a.company_id && a.company_id !== companyId);
+        const mappedAccs = snapshot.data.cashAccounts.map((a) => ({
+          ...a,
+          company_id: companyId,
+        }));
+        setStored(STORAGE_KEYS.CASH_ACCOUNTS, [...nonTenantAccs, ...mappedAccs]);
+        written += mappedAccs.length;
+      }
+
+      // 5. Cash Transfers
+      if (Array.isArray(snapshot.data.cashTransfers)) {
+        const existingTrfs = getAllCashTransfers();
+        const nonTenantTrfs = existingTrfs.filter((t: any) => t.company_id && t.company_id !== companyId);
+        const mappedTrfs = snapshot.data.cashTransfers.map((t) => ({
+          ...t,
+          company_id: companyId,
+        }));
+        setStored(STORAGE_KEYS.CASH_TRANSFERS, [...nonTenantTrfs, ...mappedTrfs]);
+        written += mappedTrfs.length;
       }
 
       return {

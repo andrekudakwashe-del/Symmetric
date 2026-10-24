@@ -187,11 +187,11 @@ export const CustomerSearchModal: React.FC<CustomerSearchModalProps> = ({
                 </button>
               </div>
             ) : (
-              filteredCustomers.map((customer) => {
+              filteredCustomers.map((customer, idx) => {
                 const isSelected = selectedCustomerId === customer.customerId;
                 return (
                   <button
-                    key={customer.customerId}
+                    key={`${customer.customerId || 'cust'}-${idx}`}
                     id={`customer-item-${customer.customerId}`}
                     type="button"
                     onClick={() => handleSelect(customer)}

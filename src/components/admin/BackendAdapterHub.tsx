@@ -1109,9 +1109,9 @@ export const BackendAdapterHub: React.FC<BackendAdapterHubProps> = ({ onShowToas
               </div>
             ) : (
               <div className="space-y-1.5 max-h-36 overflow-y-auto">
-                {pruneLogs.map((log) => (
+                {pruneLogs.map((log, idx) => (
                   <div
-                    key={log.id}
+                    key={`${log.id || 'prune'}-${idx}`}
                     className="p-2.5 rounded-lg bg-slate-950 border border-slate-800/80 text-[11px] flex items-center justify-between"
                   >
                     <div className="space-y-0.5">

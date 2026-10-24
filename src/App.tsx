@@ -531,7 +531,7 @@ export default function App() {
               <div className="flex flex-wrap gap-2 pt-1">
                 {getUserPrimaryModules(currentUser).map((m, idx) => (
                   <button
-                    key={m.id}
+                    key={`${m.id}-${idx}`}
                     type="button"
                     onClick={() => setActiveTab(m.id)}
                     className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-purple-900/60 text-slate-200 hover:text-white font-bold text-xs border border-slate-700 transition cursor-pointer"

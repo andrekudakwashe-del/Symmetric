@@ -195,11 +195,11 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 text-slate-200">
-              {filteredCasuals.map((c) => {
+              {filteredCasuals.map((c, cIdx) => {
                 const seg = session.segments.find((s) => s.segmentId === c.assignedSegmentId);
 
                 return (
-                  <tr key={c.id} className="hover:bg-slate-800/40 transition">
+                  <tr key={`${c.id}-${cIdx}`} className="hover:bg-slate-800/40 transition">
                     <td className="py-3 px-4 font-mono font-bold text-amber-400">{c.id}</td>
                     <td className="py-3 px-4 font-semibold text-white">{c.name}</td>
                     <td className="py-3 px-4">

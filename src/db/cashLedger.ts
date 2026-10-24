@@ -380,11 +380,19 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
 
       case 'change_paid':
       case 'petty_cash':
+      case 'expense':
       case 'supplier_payment':
       case 'ecocash_cash_out':
       case 'zig_cash_out':
-      case 'supervisor_lift':
         balance -= amt;
+        break;
+
+      case 'supervisor_lift':
+        if (m.direction === 'in') {
+          balance += amt;
+        } else {
+          balance -= amt;
+        }
         break;
 
       case 'ecocash_sale':

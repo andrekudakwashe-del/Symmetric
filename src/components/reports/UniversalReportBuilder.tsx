@@ -766,14 +766,14 @@ export const UniversalReportBuilder: React.FC<UniversalReportBuilderProps> = ({
             </div>
           ) : (
             <div className="space-y-3">
-              {suggestedJoins.map((s) => {
+              {suggestedJoins.map((s, sIdx) => {
                 const fromKey = `${s.from_table}.${s.from_column}`;
                 const toKey = `${s.to_table}.${s.to_column}`;
                 const isEnabled = activeJoins.some((j) => j.from === fromKey && j.to === toKey);
 
                 return (
                   <div
-                    key={s.id}
+                    key={`${s.id}-${sIdx}`}
                     className="p-4 rounded-2xl bg-slate-950/70 border border-slate-800 flex items-center justify-between"
                   >
                     <div className="space-y-1">

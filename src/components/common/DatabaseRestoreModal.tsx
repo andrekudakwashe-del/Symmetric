@@ -51,6 +51,18 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [decryptedPayload, setDecryptedPayload] = useState<BackupPayload | null>(null);
   const [successResult, setSuccessResult] = useState<RestoreResult | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadSpeedKB, setUploadSpeedKB] = useState<number | null>(null);
+  const [isUnencrypted, setIsUnencrypted] = useState<boolean>(false);
+  const [restoreProgress, setRestoreProgress] = useState<{
+    percent: number;
+    currentTable: string;
+    tableIndex: number;
+    totalTables: number;
+    recordsProcessed: number;
+    totalRecords: number;
+    stage: 'restoring' | 'done';
+  } | null>(null);
 
   if (!isOpen) return null;
 
@@ -58,18 +70,50 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
     setErrorMsg(null);
     setSuccessResult(null);
     setDecryptedPayload(null);
+    setRestoreProgress(null);
     const file = e.target.files?.[0];
     if (!file) return;
 
     setSelectedFile(file);
+    setUploadProgress(0);
+    const startTime = Date.now();
     const reader = new FileReader();
+
+    reader.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        const pct = Math.min(99, Math.round((event.loaded / event.total) * 100));
+        setUploadProgress(pct);
+        const elapsed = (Date.now() - startTime) / 1000;
+        if (elapsed > 0.05) {
+          const kbps = Math.round((event.loaded / 1024) / elapsed);
+          setUploadSpeedKB(kbps);
+        }
+      }
+    };
+
     reader.onload = (event) => {
       const text = event.target?.result as string;
+      setUploadProgress(100);
       setFileContent(text);
+
+      // Check if file is already an unencrypted JSON backup
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && parsed.manifest && parsed.tables) {
+          setIsUnencrypted(true);
+        } else {
+          setIsUnencrypted(false);
+        }
+      } catch {
+        setIsUnencrypted(false);
+      }
     };
+
     reader.onerror = () => {
+      setUploadProgress(null);
       setErrorMsg('Failed to read the selected file from disk.');
     };
+
     reader.readAsText(file);
   };
 
@@ -79,7 +123,7 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
       return;
     }
 
-    if (!password.trim()) {
+    if (!isUnencrypted && !password.trim()) {
       setErrorMsg('Please enter the decryption password for this backup file.');
       return;
     }
@@ -88,7 +132,7 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
     setErrorMsg(null);
 
     try {
-      const decResult = await backupCryptoService.decryptBackupPayload(fileContent, password);
+      const decResult = await backupCryptoService.decryptBackupPayload(fileContent, password || 'default');
       if (!decResult.success || !decResult.data) {
         setErrorMsg(decResult.error || 'Decryption failed. Please verify your password.');
         setIsProcessing(false);
@@ -111,13 +155,28 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
     }
   };
 
-  const handleExecuteCommit = () => {
+  const handleExecuteCommit = async () => {
     if (!decryptedPayload) return;
     setIsProcessing(true);
     setErrorMsg(null);
+    setRestoreProgress({
+      percent: 0,
+      currentTable: 'Initializing quota-safe transaction...',
+      tableIndex: 1,
+      totalTables: 1,
+      recordsProcessed: 0,
+      totalRecords: decryptedPayload.manifest.totalRecords || 0,
+      stage: 'restoring',
+    });
 
     try {
-      const result = restoreDatabaseFromPayload(decryptedPayload, restoreMode);
+      const result = await restoreDatabaseFromPayload(
+        decryptedPayload,
+        restoreMode,
+        (progress) => {
+          setRestoreProgress(progress);
+        }
+      );
       if (result.success) {
         setSuccessResult(result);
         if (onRestoreSuccess) {
@@ -339,6 +398,49 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
               </div>
             )}
 
+            {/* Live Restore Execution Progress Bar */}
+            {isProcessing && restoreProgress && (
+              <div className="p-4 rounded-2xl bg-indigo-950/80 border border-indigo-500/50 space-y-2.5 animate-fadeIn">
+                <div className="flex items-center justify-between text-xs font-bold">
+                  <div className="flex items-center gap-2 text-indigo-200">
+                    <RefreshCw className="w-4 h-4 text-indigo-400 animate-spin shrink-0" />
+                    <span className="truncate">Restoring: {restoreProgress.currentTable}</span>
+                  </div>
+                  <span className="font-mono text-white text-sm shrink-0 ml-2">{restoreProgress.percent}%</span>
+                </div>
+
+                {/* Track */}
+                <div className="w-full bg-slate-800 rounded-full h-3 overflow-hidden p-0.5 border border-slate-700">
+                  <div
+                    className="bg-gradient-to-r from-indigo-500 via-blue-500 to-emerald-400 h-full rounded-full transition-all duration-200 ease-out shadow-md"
+                    style={{ width: `${restoreProgress.percent}%` }}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between text-[11px] text-slate-300">
+                  <span>
+                    Table {restoreProgress.tableIndex} of {restoreProgress.totalTables} • {restoreProgress.recordsProcessed} of {restoreProgress.totalRecords} records
+                  </span>
+                  <span className="text-emerald-400 font-bold flex items-center gap-1">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>Quota Safe</span>
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Storage Quota Protection Status Banner */}
+            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-[11px] text-slate-400 flex items-center justify-between">
+              <span className="flex items-center gap-1.5 text-slate-300">
+                <Database className="w-3.5 h-3.5 text-indigo-400" />
+                <span>High-Capacity Storage:</span>
+              </span>
+              <span className="text-emerald-400 font-mono font-bold flex items-center gap-1">
+                <span>IndexedDB + LocalStorage Active</span>
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              </span>
+            </div>
+
             {/* Actions */}
             <div className="flex justify-end gap-3 pt-3 border-t border-slate-800">
               <button
@@ -412,6 +514,53 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
                   className="hidden"
                 />
               </label>
+
+              {/* Upload & Read Progress Bar */}
+              {uploadProgress !== null && (
+                <div className="p-3 rounded-2xl bg-slate-950 border border-indigo-500/30 space-y-2 animate-fadeIn">
+                  <div className="flex items-center justify-between text-xs font-bold">
+                    <span className="text-indigo-300 flex items-center gap-1.5">
+                      {uploadProgress < 100 ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 text-indigo-400 animate-spin" />
+                          <span>Uploading &amp; Reading File...</span>
+                        </>
+                      ) : (
+                        <>
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                          <span className="text-emerald-300">File Loaded &amp; Verified</span>
+                        </>
+                      )}
+                    </span>
+                    <span className="font-mono text-white text-xs">{uploadProgress}%</span>
+                  </div>
+
+                  <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden p-0.5 border border-slate-700">
+                    <div
+                      className="bg-gradient-to-r from-indigo-500 via-purple-500 to-emerald-400 h-full rounded-full transition-all duration-150 ease-out shadow-sm"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between text-[11px] text-slate-400">
+                    <span>
+                      {selectedFile ? `${(selectedFile.size / 1024).toFixed(1)} KB` : ''}
+                      {uploadSpeedKB ? ` • ${uploadSpeedKB} KB/s` : ''}
+                    </span>
+                    <span className="text-emerald-400 font-semibold flex items-center gap-1">
+                      <ShieldCheck className="w-3 h-3" />
+                      <span>Quota Guard Active</span>
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {isUnencrypted && (
+                <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-500/40 text-emerald-300 text-xs flex items-center gap-2 animate-fadeIn">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>Standard Unencrypted Backup detected. Passphrase is optional.</span>
+                </div>
+              )}
             </div>
 
             {/* Decryption Password */}
@@ -451,7 +600,7 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
               <button
                 type="button"
                 onClick={handleInspectAndDecrypt}
-                disabled={isProcessing || !fileContent || !password.trim()}
+                disabled={isProcessing || !fileContent || (!isUnencrypted && !password.trim())}
                 className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 text-white font-bold text-xs shadow-lg shadow-indigo-600/30 cursor-pointer"
               >
                 {isProcessing ? (

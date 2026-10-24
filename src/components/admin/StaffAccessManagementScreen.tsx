@@ -101,6 +101,13 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canEditMasterPrice: true,
       canEditExchangeRate: true, // Owner-only by default
       canSeeMargin: true,
+      // Cash Custody Chain & Accounts Clerk Permissions
+      canCreateCashTransferFloat: true,
+      canCollectTillTransfer: true,
+      canPaySupplierTransfer: true,
+      canCreateBankDepositTransfer: true,
+      canReceiveHqTransfer: true,
+      canExecuteOwnerOverride: true,
     };
   }
 
@@ -724,6 +731,49 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
         },
       ],
     },
+    {
+      name: 'Cash Custody Chain, Accounts Clerk & HQ Safe',
+      icon: Shield,
+      color: 'text-emerald-600',
+      items: [
+        {
+          key: 'canCreateCashTransferFloat' as keyof StaffPermissions,
+          title: 'Issue Till Floats (Clerk)',
+          description: 'Issue cash float vouchers from safe to till requiring cashier PIN',
+          critical: true,
+        },
+        {
+          key: 'canCollectTillTransfer' as keyof StaffPermissions,
+          title: 'Collect Till Cash / Skimming',
+          description: 'Create till collection vouchers returning excess cash from till to safe',
+          critical: false,
+        },
+        {
+          key: 'canPaySupplierTransfer' as keyof StaffPermissions,
+          title: 'Pay Supplier Cash (GRV Linked)',
+          description: 'Create supplier payout vouchers linked to GRV (requires Owner approval if > $50)',
+          critical: true,
+        },
+        {
+          key: 'canCreateBankDepositTransfer' as keyof StaffPermissions,
+          title: 'Bank Deposit Cash Transfers',
+          description: 'Prepare cash transit vouchers for bank deposits with deposit slip photo',
+          critical: true,
+        },
+        {
+          key: 'canReceiveHqTransfer' as keyof StaffPermissions,
+          title: 'Receive Branch Cash into HQ Safe',
+          description: 'Owner/HQ privilege to accept physical cash in-transit from branch safes',
+          critical: true,
+        },
+        {
+          key: 'canExecuteOwnerOverride' as keyof StaffPermissions,
+          title: 'Owner Break-Glass Self-Approval Override',
+          description: 'Authorize transactions without clerk secondary checker (flags 7-day forensic alert)',
+          critical: true,
+        },
+      ],
+    },
   ];
 
   return (
@@ -864,7 +914,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
       ) : (
         /* 2. Staff Cards Grid */
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-        {filteredStaff.map((staff) => {
+        {filteredStaff.map((staff, sIdx) => {
           const isCurrentUser = staff.id === currentUser.id;
           const isActive = staff.active === 'Y';
           const perms = staff.permissions || getRolePresetPermissions(staff.role);
@@ -872,7 +922,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
 
           return (
             <div
-              key={staff.id}
+              key={`${staff.id}-${sIdx}`}
               onClick={() => handleOpenEdit(staff, 'profile')}
               className={`bg-white border rounded-3xl p-4 sm:p-5 shadow-sm transition space-y-3.5 cursor-pointer hover:shadow-md hover:border-slate-300 relative overflow-hidden ${
                 isActive ? 'border-slate-200' : 'border-slate-200/60 bg-slate-50 opacity-75'

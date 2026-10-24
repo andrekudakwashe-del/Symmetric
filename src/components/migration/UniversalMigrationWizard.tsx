@@ -1838,8 +1838,8 @@ export const UniversalMigrationWizard: React.FC<UniversalMigrationWizardProps> =
                     className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white"
                   >
                     <option value="">-- Unassigned (Manager Only) --</option>
-                    {staffList.map((s) => (
-                      <option key={s.id} value={s.id}>
+                    {staffList.map((s, sIdx) => (
+                      <option key={`${s.id}-${sIdx}`} value={s.id}>
                         {s.name} ({s.role})
                       </option>
                     ))}

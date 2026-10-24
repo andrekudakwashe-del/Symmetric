@@ -207,6 +207,14 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
           icon: CreditCard,
           color: 'from-rose-500 to-pink-600',
         },
+        {
+          tab: 'cash_balancing' as ActiveTab,
+          label: 'Custody Chain & Clerk Vouchers',
+          description: 'Till floats, supplier cash payments, bank runs & HQ safe custody',
+          icon: ShieldCheck,
+          color: 'from-emerald-600 to-teal-700',
+          badge: 'Dual-Control',
+        },
         ...((isSupervisorOrManager || isAdmin)
           ? [
               {

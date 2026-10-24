@@ -15,6 +15,7 @@ import {
   X,
   Printer,
   Shield,
+  ShieldCheck,
   Lock,
   RotateCcw,
   Clock,
@@ -59,6 +60,8 @@ import {
   subscribeRoomDatabase,
 } from '../../db/roomDatabase';
 import { cleanNumberInput } from './GoodsReceivedView';
+import { SyncStatusDot } from '../common/SyncStatusDot';
+import { retrySyncInvoice } from '../../services/googleSheetsSync';
 
 interface DirectGoodsReceivedViewProps {
   currentUser: Salesperson | null;
@@ -185,8 +188,10 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const [productSearchTerm, setProductSearchTerm] = useState<string>('');
   const [mobileViewMode, setMobileViewMode] = useState<'CARDS' | 'TABLE'>('CARDS');
 
-  // Till Payments & Multi-Cashier Allocations
-  const [payFromTill, setPayFromTill] = useState<boolean>(true);
+  // Till Payments, Safe Payout Queue & Multi-Cashier Allocations
+  const [paymentMode, setPaymentMode] = useState<'SAFE_PAYOUT' | 'TILL' | 'OWNER'>('SAFE_PAYOUT');
+  const [selectedSafeTarget, setSelectedSafeTarget] = useState<'BRANCH_SAFE' | 'HQ_SAFE'>('BRANCH_SAFE');
+  const [payFromTill, setPayFromTill] = useState<boolean>(false);
   const [paymentRows, setPaymentRows] = useState<PaymentRowState[]>([
     {
       id: 'pay-1',
@@ -658,9 +663,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       return;
     }
 
-    // Validate PINs for till payments
+    // Validate PINs for till payments ONLY if paymentMode === 'TILL'
     const errors: { [key: string]: string } = {};
-    if (payFromTill) {
+    if (paymentMode === 'TILL' && payFromTill) {
       paymentRows.forEach((p) => {
         const amt = Number(p.amount) || 0;
         if (amt > 0) {
@@ -708,7 +713,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     });
 
     // Convert till payments
-    const formattedPayments: DirectGrvTillPayment[] = payFromTill
+    const formattedPayments: DirectGrvTillPayment[] = (paymentMode === 'TILL' && payFromTill)
       ? paymentRows
           .filter((p) => (Number(p.amount) || 0) > 0)
           .map((p) => ({
@@ -721,8 +726,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           }))
       : [];
 
-    const ownerPaid = Number(ownerPaymentAmount) || 0;
-    const creditLeft = paymentBreakdown.creditBalance;
+    const ownerPaid = paymentMode === 'OWNER' ? (Number(ownerPaymentAmount) || voucherTotals.totalCost) : (Number(ownerPaymentAmount) || 0);
+    const creditLeft = paymentMode === 'SAFE_PAYOUT' ? 0 : paymentBreakdown.creditBalance;
 
     const newDirectGrv: DirectGrv = {
       id: grvNumber,
@@ -740,7 +745,15 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       items: grvItems,
       totalCost: voucherTotals.totalCost,
       totalSellingPrice: voucherTotals.totalSelling,
-      payFromTill,
+      payFromTill: paymentMode === 'TILL' && payFromTill,
+      paymentMethod: paymentMode,
+      paymentStatus: paymentMode === 'SAFE_PAYOUT' ? 'AWAITING_SAFE_PAYMENT' : 'PAID',
+      allocatedSafeId: paymentMode === 'SAFE_PAYOUT'
+        ? (selectedSafeTarget === 'HQ_SAFE' ? `ACC-HQ-SAFE-${(targetBranch.companyId || 'COMP-001').slice(0, 6)}` : `ACC-BR-SAFE-${targetBranch.branchId}`)
+        : undefined,
+      allocatedSafeName: paymentMode === 'SAFE_PAYOUT'
+        ? (selectedSafeTarget === 'HQ_SAFE' ? 'HQ Central Vault Safe' : 'Branch Safe (Main Vault)')
+        : undefined,
       payments: formattedPayments,
       ownerPaymentAmount: ownerPaid > 0 ? ownerPaid : undefined,
       creditBalance: creditLeft > 0 ? creditLeft : 0,
@@ -1175,11 +1188,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 {/* Dropdown menu */}
                 {isSupplierDropdownOpen && (
                   <div className="absolute left-0 right-0 top-full mt-1 bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl z-30 max-h-48 overflow-y-auto">
-                    {filteredSuppliers.map((s) => {
+                    {filteredSuppliers.map((s, idx) => {
                       const supKey = s.supplierId || s.id || s.name;
                       return (
                         <button
-                          key={supKey}
+                          key={`${supKey}-${idx}`}
                           type="button"
                           onClick={() => {
                             setSupplierName(s.name);
@@ -2068,29 +2081,142 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                   <DollarSign className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-white">Till Drawer Cash-Out & Multi-Operator Settlement</h3>
+                  <h3 className="text-base font-bold text-white">Payment Settlement & Safe Custody Allocation</h3>
                   <p className="text-xs text-slate-400">
-                    Multiple till operators can register their contributions for Form 2 balancing
+                    Choose whether this delivery is queued for Safe Payout by Accounts Clerk or paid from till drawer
                   </p>
                 </div>
               </div>
-
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-slate-400">Pay From Till Drawer(s):</span>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    id="toggle-cash-out-till"
-                    type="checkbox"
-                    checked={payFromTill}
-                    onChange={(e) => setPayFromTill(e.target.checked)}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-500"></div>
-                </label>
-              </div>
             </div>
 
-            {payFromTill ? (
+            {/* 3-Way Payment Mode Choice */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setPaymentMode('SAFE_PAYOUT');
+                  setPayFromTill(false);
+                }}
+                className={`p-3.5 rounded-2xl border text-left transition-all ${
+                  paymentMode === 'SAFE_PAYOUT'
+                    ? 'bg-emerald-950/70 border-emerald-500 text-white shadow-lg ring-1 ring-emerald-500/50'
+                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">Safe Payout Queue</span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
+                    Recommended
+                  </span>
+                </div>
+                <div className="text-sm font-bold text-white mt-1">Allocate to Safe (Clerk)</div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Invoice queued in Accounts Clerk custody hub for vault cash payment. No till PIN needed at dock.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setPaymentMode('TILL');
+                  setPayFromTill(true);
+                }}
+                className={`p-3.5 rounded-2xl border text-left transition-all ${
+                  paymentMode === 'TILL'
+                    ? 'bg-amber-950/70 border-amber-500 text-white shadow-lg ring-1 ring-amber-500/50'
+                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase tracking-wider text-amber-400">Till Drawer</span>
+                </div>
+                <div className="text-sm font-bold text-white mt-1">Pay Cash from Till</div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Operators contribute cash from active till register; cashier PIN required.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setPaymentMode('OWNER');
+                  setPayFromTill(false);
+                }}
+                className={`p-3.5 rounded-2xl border text-left transition-all ${
+                  paymentMode === 'OWNER'
+                    ? 'bg-sky-950/70 border-sky-500 text-white shadow-lg ring-1 ring-sky-500/50'
+                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase tracking-wider text-sky-400">Direct / Credit</span>
+                </div>
+                <div className="text-sm font-bold text-white mt-1">Owner / Bank Payment</div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Paid directly by owner, supplier account credit, or EFT bank transfer.
+                </p>
+              </button>
+            </div>
+
+            {paymentMode === 'SAFE_PAYOUT' && (
+              <div className="p-4 bg-emerald-950/40 border border-emerald-500/40 rounded-2xl space-y-3">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div>
+                    <div className="text-sm font-bold text-white flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+                      <span>Allocated to Safe Cash Payout: ${voucherTotals.totalCost.toFixed(2)}</span>
+                    </div>
+                    <p className="text-xs text-emerald-300/80 mt-0.5">
+                      This GRV will be dispatched immediately to the Accounts Clerk Custody Hub for physical safe cash settlement. No cashier till PIN needed at dock.
+                    </p>
+                  </div>
+                  <span className="text-xs font-bold px-2.5 py-1 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 self-start sm:self-center">
+                    Ready to Post
+                  </span>
+                </div>
+
+                <div className="pt-2 border-t border-emerald-800/40 space-y-1.5">
+                  <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Designated Safe Account for Cash Settlement *</span>
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSafeTarget('BRANCH_SAFE')}
+                      className={`p-2.5 rounded-xl border text-left transition flex items-center justify-between cursor-pointer ${
+                        selectedSafeTarget === 'BRANCH_SAFE'
+                          ? 'bg-emerald-900/60 border-emerald-400 text-white ring-1 ring-emerald-400/50'
+                          : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <div>
+                        <div className="font-bold text-xs text-white">Branch Safe (Main Vault)</div>
+                        <div className="text-[10px] text-slate-400">Standard local store delivery payout — Default</div>
+                      </div>
+                      {selectedSafeTarget === 'BRANCH_SAFE' && <Check className="w-4 h-4 text-emerald-400 shrink-0" />}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedSafeTarget('HQ_SAFE')}
+                      className={`p-2.5 rounded-xl border text-left transition flex items-center justify-between cursor-pointer ${
+                        selectedSafeTarget === 'HQ_SAFE'
+                          ? 'bg-emerald-900/60 border-emerald-400 text-white ring-1 ring-emerald-400/50'
+                          : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <div>
+                        <div className="font-bold text-xs text-white">HQ Safe Vault</div>
+                        <div className="text-[10px] text-slate-400">For major headquarters direct accounts</div>
+                      </div>
+                      {selectedSafeTarget === 'HQ_SAFE' && <Check className="w-4 h-4 text-emerald-400 shrink-0" />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {paymentMode === 'TILL' && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">
@@ -2126,8 +2252,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                             onChange={(e) => handleUpdatePaymentRow(payRow.id, 'userId', e.target.value)}
                             className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-amber-500 font-medium"
                           >
-                            {staffList.map((s) => (
-                              <option key={s.id} value={s.id}>
+                            {staffList.map((s, sIdx) => (
+                              <option key={`${s.id}-${sIdx}`} value={s.id}>
                                 {s.name} ({s.role})
                               </option>
                             ))}
@@ -2333,7 +2459,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                   )}
                 </div>
               </div>
-            ) : (
+            )}
+
+            {paymentMode === 'OWNER' && (
               <div className="p-4 rounded-2xl bg-slate-950/50 border border-slate-800 text-xs text-slate-400 flex items-center gap-2">
                 <FileText className="w-4 h-4 text-slate-500" />
                 <span>
@@ -2552,7 +2680,22 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
                     return (
                       <tr key={grv.id} className="hover:bg-slate-800/40 transition-colors">
-                        <td className="py-3 px-4 font-mono font-bold text-amber-400">{grv.grvNumber}</td>
+                        <td className="py-3 px-4">
+                          <div className="font-mono font-bold text-amber-400">{grv.grvNumber}</div>
+                          <div className="mt-1">
+                            <SyncStatusDot
+                              isSynced={(grv as any).synced}
+                              syncStatus={(grv as any).syncStatus}
+                              timestamp={grv.date}
+                              invoiceId={grv.id || grv.grvNumber}
+                              invoiceType="direct_grv"
+                              onRetry={async () => {
+                                await retrySyncInvoice(grv.id || grv.grvNumber, 'direct_grv');
+                                refreshData();
+                              }}
+                            />
+                          </div>
+                        </td>
                         <td className="py-3 px-4 font-mono text-slate-400">{grv.date}</td>
                         <td className="py-3 px-4 font-medium text-white">
                           <div>{grv.supplierName}</div>
@@ -2826,7 +2969,19 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 </div>
                 <div className="text-right">
                   <span className="text-xs font-mono font-bold text-slate-500 block">VOUCHER #</span>
-                  <span className="text-base font-black font-mono text-slate-900">{viewingGrv.grvNumber}</span>
+                  <div className="flex items-center justify-end gap-1.5">
+                    <span className="text-base font-black font-mono text-slate-900">{viewingGrv.grvNumber}</span>
+                    <SyncStatusDot
+                      isSynced={(viewingGrv as any).synced}
+                      syncStatus={(viewingGrv as any).syncStatus}
+                      timestamp={viewingGrv.date}
+                      invoiceId={viewingGrv.id || viewingGrv.grvNumber}
+                      invoiceType="direct_grv"
+                      size="xs"
+                      showLabel={false}
+                      onRetry={() => retrySyncInvoice(viewingGrv.id || viewingGrv.grvNumber, 'direct_grv')}
+                    />
+                  </div>
                   <span className="text-xs text-slate-500 block">{viewingGrv.date}</span>
                 </div>
               </div>

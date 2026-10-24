@@ -435,9 +435,9 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
             <span>Eligible Authorizers:</span>
           </div>
           <div className="flex items-center space-x-1.5 font-medium">
-            {authorizedManagers.map((m) => (
+            {authorizedManagers.map((m, mIdx) => (
               <span
-                key={m.id}
+                key={`${m.id}-${mIdx}`}
                 className="px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 text-[10px]"
                 title={`PIN: ${m.pin}`}
               >

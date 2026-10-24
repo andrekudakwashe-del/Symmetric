@@ -628,7 +628,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
 
                   return (
                     <tr
-                      key={item.customerId}
+                      key={`${item.customerId || 'cust'}-${idx}`}
                       className={`hover:bg-slate-900/70 transition-colors ${
                         isOwing ? 'bg-amber-950/5' : ''
                       }`}
@@ -971,7 +971,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 font-mono-num">
-                    {selectedItemForHistory.transactions.map((tr) => {
+                    {selectedItemForHistory.transactions.map((tr, trIdx) => {
                       const isRepayment =
                         tr.itemDescription?.toLowerCase().includes('repayment') ||
                         tr.itemDescription?.toLowerCase().includes('settlement') ||
@@ -981,7 +981,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                       const cashInVal = isRepayment ? (Number(tr.in) || Number(tr.out) || Number(tr.amount) || 0) : (Number(tr.in) || 0);
 
                       return (
-                        <tr key={tr.id} className="hover:bg-slate-900/50">
+                        <tr key={`${tr.id || 'tr'}-${trIdx}`} className="hover:bg-slate-900/50">
                           <td className="py-2 px-3 text-slate-300">
                             {tr.date} {tr.timestamp ? `(${new Date(tr.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})` : ''}
                           </td>

@@ -388,7 +388,7 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
               </div>
             ) : (
               <div className="divide-y divide-slate-800/80 max-h-72 overflow-y-auto">
-                {filteredItems.map((item) => {
+                {filteredItems.map((item, idx) => {
                   const isPending = item.status === 'pending';
                   const isSyncing = item.status === 'syncing';
                   const isFailed = item.status === 'failed';
@@ -396,7 +396,7 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
 
                   return (
                     <div
-                      key={item.id}
+                      key={`${item.id}-${idx}`}
                       className="p-3 hover:bg-slate-800/40 transition flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
                     >
                       <div className="space-y-1">

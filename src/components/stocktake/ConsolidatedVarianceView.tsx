@@ -558,9 +558,9 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                             Segment Contributions for {item.itemName}:
                           </div>
                           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
-                            {item.segmentBreakdown.map((sb) => (
+                            {item.segmentBreakdown.map((sb, sbIdx) => (
                               <div
-                                key={sb.segmentId}
+                                key={`${sb.segmentId}-${sbIdx}`}
                                 className="p-2 bg-slate-900 rounded border border-slate-800 text-[11px] flex items-center justify-between"
                               >
                                 <span className="text-slate-300">{sb.segmentName}:</span>

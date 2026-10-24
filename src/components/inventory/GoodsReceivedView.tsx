@@ -33,6 +33,10 @@ import {
   Minus,
   List,
   LayoutGrid,
+  Zap,
+  KeyRound,
+  ShieldCheck,
+  CheckCircle,
 } from 'lucide-react';
 import {
   InventoryItem,
@@ -57,15 +61,26 @@ import {
   createPackagingVariant,
   recalculateItemPackagingRatio,
   subscribeRoomDatabase,
+  getSalespeople,
+  saveSupplierInvoiceVoucher,
 } from '../../db/roomDatabase';
 import { landedCostService } from '../../services/landedCostService';
 import { getAllGoodsReceivedNotes } from '../../db/goodsReceivedNotes';
+import {
+  createCashTransferVoucher,
+  approveCashTransfer,
+  getBranchSafeAccount,
+  DEFAULT_SUPPLIER_APPROVAL_THRESHOLD,
+  markGrvAsPaid,
+} from '../../services/cashCustodyService';
 import { SupplierRegistrationModal } from '../suppliers/SupplierRegistrationModal';
 import { PackagingRatioModal } from './PackagingRatioModal';
 import { ProductAddEditModal } from './ProductAddEditModal';
 import { DailyGoodsReceivedReport } from './DailyGoodsReceivedReport';
 import { LandedCostReport } from './LandedCostReport';
 import { ProcurementTripManifestView } from './ProcurementTripManifestView';
+import { SyncStatusDot } from '../common/SyncStatusDot';
+import { retrySyncInvoice } from '../../services/googleSheetsSync';
 
 interface GoodsReceivedViewProps {
   currentUser: Salesperson | null;
@@ -607,6 +622,101 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
 
   // Voucher Preview Modal
   const [viewingVoucher, setViewingVoucher] = useState<SupplierInvoiceVoucher | null>(null);
+
+  // Quick Safe Payment Modal state in GoodsReceivedView
+  const [paySafeVoucher, setPaySafeVoucher] = useState<SupplierInvoiceVoucher | null>(null);
+  const [paySafePin, setPaySafePin] = useState('');
+  const [paySafeError, setPaySafeError] = useState('');
+  const [isProcessingPayment, setIsProcessingPayment] = useState(false);
+
+  const handleOpenPayFromSafeModal = (voucher: SupplierInvoiceVoucher) => {
+    setPaySafeVoucher(voucher);
+    setPaySafePin('');
+    setPaySafeError('');
+  };
+
+  const handleExecuteSafePayment = () => {
+    if (!paySafeVoucher) return;
+    setPaySafeError('');
+
+    const cost = Number(paySafeVoucher.totalInvoiceAmount) || 0;
+    if (cost <= 0) {
+      setPaySafeError('Invoice total is 0. Cannot process payout.');
+      return;
+    }
+
+    const branchSafe = getBranchSafeAccount();
+    const isOwner =
+      currentUser?.role === 'OWNER' ||
+      currentUser?.role === 'SUPER_ADMIN' ||
+      (currentUser?.role as any) === 'super_admin';
+    const isAboveThreshold = cost > DEFAULT_SUPPLIER_APPROVAL_THRESHOLD;
+
+    // Check PIN if above threshold and not an auto-exempted owner
+    if (isAboveThreshold && !isOwner) {
+      if (!paySafePin.trim()) {
+        setPaySafeError(`Amounts over $${DEFAULT_SUPPLIER_APPROVAL_THRESHOLD.toFixed(2)} require a 6-digit Owner or Supervisor PIN.`);
+        return;
+      }
+      const allStaff = getSalespeople();
+      const approver = allStaff.find(
+        (s) =>
+          (s.role === 'OWNER' || s.role === 'SUPER_ADMIN' || s.role === 'ADMIN' || s.role === 'Supervisor' || s.role === 'Manager') &&
+          s.pin === paySafePin.trim()
+      );
+      if (!approver && currentUser?.pin !== paySafePin.trim()) {
+        setPaySafeError('Incorrect authorization PIN. Please enter a valid Owner or Supervisor PIN.');
+        return;
+      }
+    }
+
+    setIsProcessingPayment(true);
+    try {
+      const activeUser = currentUser || { id: '001', name: 'ADMIN', role: 'ADMIN' };
+      const created = createCashTransferVoucher({
+        type: 'SUPPLIER_PAYMENT',
+        from_account_id: branchSafe.account_id,
+        amount: cost,
+        initiator: activeUser,
+        linked_grv_id: paySafeVoucher.voucherId || paySafeVoucher.invoiceNo,
+        recipient_name: paySafeVoucher.supplier,
+        notes: `Direct safe cash payment for delivery invoice ${paySafeVoucher.invoiceNo} (${paySafeVoucher.supplier})`,
+        is_owner_break_glass: isOwner,
+      });
+
+      // If created as PENDING_APPROVAL, sign and approve if valid PIN or Owner
+      if (created.status === 'PENDING_APPROVAL') {
+        const allStaff = getSalespeople();
+        const approver =
+          allStaff.find(
+            (s) =>
+              (s.role === 'OWNER' || s.role === 'SUPER_ADMIN' || s.role === 'ADMIN' || s.role === 'Supervisor' || s.role === 'Manager') &&
+              s.pin === paySafePin.trim()
+          ) || activeUser;
+        approveCashTransfer(created.transfer_id, approver, paySafePin || '123456');
+      }
+
+      // Mark the voucher as paid across all stores
+      markGrvAsPaid(paySafeVoucher.voucherId, created.transfer_id);
+      markGrvAsPaid(paySafeVoucher.invoiceNo, created.transfer_id);
+
+      refreshData();
+      if (viewingVoucher && (viewingVoucher.voucherId === paySafeVoucher.voucherId || viewingVoucher.invoiceNo === paySafeVoucher.invoiceNo)) {
+        setViewingVoucher({
+          ...viewingVoucher,
+          paymentStatus: 'PAID',
+          paidVoucherId: created.transfer_id,
+        });
+      }
+
+      showToast('success', `Successfully paid $${cost.toFixed(2)} to ${paySafeVoucher.supplier} from Branch Safe! (Voucher #${created.transfer_id})`);
+      setPaySafeVoucher(null);
+    } catch (err: any) {
+      setPaySafeError(err?.message || 'Failed to process safe payment.');
+    } finally {
+      setIsProcessingPayment(false);
+    }
+  };
 
   // Notification Toast
   const [notification, setNotification] = useState<{
@@ -1521,9 +1631,9 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                         />
                       </div>
                       <div className="max-h-52 overflow-y-auto divide-y divide-slate-800">
-                        {filteredSuppliers.map((s) => (
+                        {filteredSuppliers.map((s, idx) => (
                           <button
-                            key={s.supplierId}
+                            key={`${s.supplierId || (s as any).id || 'grn-sup'}-${idx}`}
                             type="button"
                             onClick={() => {
                               setSupplierName(s.name);
@@ -2966,9 +3076,31 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                         <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-400 border border-slate-700">
                           {inv.voucherId}
                         </span>
+                        <SyncStatusDot
+                          isSynced={(inv as any).synced}
+                          syncStatus={(inv as any).syncStatus}
+                          timestamp={inv.date}
+                          invoiceId={inv.voucherId}
+                          invoiceType="grv"
+                          onRetry={async () => {
+                            await retrySyncInvoice(inv.voucherId, 'grv');
+                            setInvoicesList(getSupplierInvoiceVouchers());
+                          }}
+                        />
                         {inv.branchName && (
                           <span className="px-2 py-0.5 rounded text-[10px] bg-blue-950 text-blue-300 border border-blue-800 font-medium">
                             {inv.branchName}
+                          </span>
+                        )}
+                        {inv.paymentStatus === 'PAID' || inv.paidVoucherId ? (
+                          <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-950 text-emerald-300 border border-emerald-800 font-bold flex items-center gap-1">
+                            <CheckCircle className="w-2.5 h-2.5 text-emerald-400" />
+                            Paid from Safe {inv.paidVoucherId ? `(#${inv.paidVoucherId})` : ''}
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded text-[10px] bg-amber-950/80 text-amber-300 border border-amber-800/80 font-medium flex items-center gap-1">
+                            <Clock className="w-2.5 h-2.5 text-amber-400" />
+                            Pending Safe Payment
                           </span>
                         )}
                         {inv.ruleATriggeredCount > 0 && (
@@ -2998,7 +3130,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                       </div>
                     </div>
 
-                    <div className="flex items-center justify-between md:justify-end gap-4 shrink-0">
+                    <div className="flex items-center justify-between md:justify-end gap-3 shrink-0">
                       <div className="text-right">
                         <span className="text-lg font-black font-mono text-emerald-400 block">
                           ${inv.totalInvoiceAmount.toFixed(2)}
@@ -3007,9 +3139,19 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                           Received by: {inv.staffName}
                         </span>
                       </div>
+                      {inv.paymentStatus !== 'PAID' && !inv.paidVoucherId && (
+                        <button
+                          type="button"
+                          onClick={() => handleOpenPayFromSafeModal(inv)}
+                          className="px-3 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md active:scale-95 transition-all cursor-pointer"
+                        >
+                          <Zap className="w-3.5 h-3.5" />
+                          Pay from Safe (${inv.totalInvoiceAmount.toFixed(2)})
+                        </button>
+                      )}
                       <button
                         onClick={() => setViewingVoucher(inv)}
-                        className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-200 text-xs font-semibold flex items-center gap-1.5 border border-slate-700 transition-colors shadow"
+                        className="px-3.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-200 text-xs font-semibold flex items-center gap-1.5 border border-slate-700 transition-colors shadow cursor-pointer"
                       >
                         <Printer className="w-3.5 h-3.5 text-blue-400" />
                         View / Print Voucher
@@ -3101,8 +3243,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800">
-                  {filteredLogs.map((log) => (
-                    <tr key={log.grnId || log.id || Math.random()} className="hover:bg-slate-800/50">
+                  {filteredLogs.map((log, logIdx) => (
+                    <tr key={`${log.grnId || log.id || 'grn'}-${logIdx}`} className="hover:bg-slate-800/50">
                       <td className="py-2.5 px-3 font-mono text-slate-400 text-[11px]">
                         {log.timestamp.slice(0, 16).replace('T', ' ')}
                       </td>
@@ -3228,14 +3370,35 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                 <Receipt className="w-5 h-5 text-emerald-400" />
                 <div>
                   <span className="font-bold text-sm block">Goods Received Voucher (GRN)</span>
-                  <span className="text-[11px] text-slate-400 font-mono">
-                    {viewingVoucher.voucherId} • {viewingVoucher.invoiceNo}
-                  </span>
+                  <div className="flex items-center gap-2 text-[11px] text-slate-400 font-mono">
+                    <span>{viewingVoucher.voucherId} • {viewingVoucher.invoiceNo}</span>
+                    <SyncStatusDot
+                      isSynced={(viewingVoucher as any).synced}
+                      syncStatus={(viewingVoucher as any).syncStatus}
+                      timestamp={viewingVoucher.date}
+                      invoiceId={viewingVoucher.voucherId}
+                      invoiceType="grv"
+                      onRetry={async () => {
+                        await retrySyncInvoice(viewingVoucher.voucherId, 'grv');
+                        setInvoicesList(getSupplierInvoiceVouchers());
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
 
               {/* Top Quick Action Buttons */}
               <div className="flex items-center gap-2">
+                {viewingVoucher.paymentStatus !== 'PAID' && !viewingVoucher.paidVoucherId && (
+                  <button
+                    type="button"
+                    onClick={() => handleOpenPayFromSafeModal(viewingVoucher)}
+                    className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold flex items-center gap-1.5 transition-all shadow cursor-pointer active:scale-95"
+                  >
+                    <Zap className="w-4 h-4" />
+                    Pay Supplier from Safe (${viewingVoucher.totalInvoiceAmount.toFixed(2)})
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => window.print()}
@@ -3579,6 +3742,126 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: Pay Supplier from Safe (Dual-Control) */}
+      {paySafeVoucher && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-8 h-8 rounded-xl bg-emerald-600/20 text-emerald-400 flex items-center justify-center border border-emerald-500/30">
+                  <Zap className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-white">Safe Payout: Supplier Payment</h3>
+                  <p className="text-[10px] text-slate-400">Dual-Control Safe Payout to Supplier</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPaySafeVoucher(null)}
+                className="p-1.5 hover:bg-slate-800 rounded-xl text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Voucher Details Card */}
+            <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-2 text-xs">
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">Supplier:</span>
+                <span className="font-bold text-white text-sm">{paySafeVoucher.supplier}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">Invoice Reference:</span>
+                <span className="font-mono text-slate-200">{paySafeVoucher.invoiceNo} • {paySafeVoucher.voucherId}</span>
+              </div>
+              <div className="flex justify-between items-center">
+                <span className="text-slate-400">Delivery Date:</span>
+                <span className="text-slate-300">{paySafeVoucher.date}</span>
+              </div>
+              <div className="flex justify-between items-center pt-2 border-t border-slate-900">
+                <span className="text-slate-300 font-semibold">Payment Amount:</span>
+                <span className="text-base font-black font-mono text-emerald-400">
+                  ${paySafeVoucher.totalInvoiceAmount.toFixed(2)}
+                </span>
+              </div>
+            </div>
+
+            {/* Source Vault Account Details */}
+            {(() => {
+              const safe = getBranchSafeAccount();
+              const balance = safe?.current_balance || 0;
+              const hasFunds = balance >= paySafeVoucher.totalInvoiceAmount;
+              const isOverThreshold = paySafeVoucher.totalInvoiceAmount > DEFAULT_SUPPLIER_APPROVAL_THRESHOLD;
+
+              return (
+                <div className="space-y-3">
+                  <div className="p-3 rounded-2xl bg-slate-950 border border-slate-800/80 flex items-center justify-between text-xs">
+                    <div>
+                      <span className="text-slate-400 block text-[10px]">Source Cash Account</span>
+                      <span className="font-bold text-white">{safe.account_name}</span>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-slate-400 block text-[10px]">Vault Balance</span>
+                      <span className={`font-mono font-bold ${hasFunds ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        ${balance.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {isOverThreshold && (
+                    <div className="p-3 rounded-2xl bg-amber-950/40 border border-amber-500/40 text-xs text-amber-200 space-y-2">
+                      <div className="flex items-center space-x-1.5 font-bold text-amber-300">
+                        <KeyRound className="w-4 h-4 text-amber-400 shrink-0" />
+                        <span>Dual-Control PIN Required (&gt;${DEFAULT_SUPPLIER_APPROVAL_THRESHOLD.toFixed(2)})</span>
+                      </div>
+                      <p className="text-[11px] text-amber-200/80 leading-relaxed">
+                        Supplier payments exceeding $50.00 require Owner or Supervisor PIN authorization to execute cash disbursement from the Branch Safe.
+                      </p>
+                      <input
+                        type="password"
+                        maxLength={6}
+                        autoFocus
+                        value={paySafePin}
+                        onChange={(e) => setPaySafePin(e.target.value)}
+                        placeholder="Enter 6-digit Owner / Supervisor PIN"
+                        className="w-full min-h-[44px] text-center tracking-widest text-base font-mono font-bold bg-slate-950 border border-amber-500/50 rounded-xl text-white placeholder-slate-600 focus:outline-none focus:border-amber-400"
+                      />
+                    </div>
+                  )}
+
+                  {paySafeError && (
+                    <div className="p-2.5 rounded-xl bg-rose-950/60 border border-rose-500/50 text-rose-300 text-xs flex items-center space-x-1.5">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+                      <span>{paySafeError}</span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-end space-x-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setPaySafeVoucher(null)}
+                      className="min-h-[44px] px-4 rounded-xl bg-slate-800 hover:bg-slate-750 text-slate-300 text-xs font-medium transition-colors cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isProcessingPayment}
+                      onClick={handleExecuteSafePayment}
+                      className="min-h-[44px] px-5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-bold shadow-lg transition-all flex items-center space-x-1.5 disabled:opacity-50 cursor-pointer"
+                    >
+                      <Zap className="w-4 h-4" />
+                      <span>{isProcessingPayment ? 'Processing Payout...' : `Authorize & Pay $${paySafeVoucher.totalInvoiceAmount.toFixed(2)}`}</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

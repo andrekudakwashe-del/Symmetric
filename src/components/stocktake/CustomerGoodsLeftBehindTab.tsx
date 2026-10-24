@@ -201,8 +201,8 @@ export const CustomerGoodsLeftBehindTab: React.FC<CustomerGoodsLeftBehindTabProp
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 text-slate-200">
-              {filteredItems.map((item) => (
-                <tr key={item.id} className="hover:bg-slate-800/40 transition">
+              {filteredItems.map((item, idx) => (
+                <tr key={`${item.id}-${idx}`} className="hover:bg-slate-800/40 transition">
                   <td className="py-3 px-4 font-mono font-bold text-blue-400">{item.id}</td>
                   <td className="py-3 px-4">
                     <div className="font-semibold text-white">{item.customerName}</div>

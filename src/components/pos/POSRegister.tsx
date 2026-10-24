@@ -33,6 +33,7 @@ import {
   getTodayDateString,
 } from '../../db/roomDatabase';
 import { syncService } from '../../services/syncService';
+import { meshSyncService } from '../../services/meshSyncService';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { loadPOSCartDraft, savePOSCartDraft, clearPOSCartDraft } from '../../utils/posCartStorage';
 import {
@@ -854,8 +855,9 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     setLockdownAuthorizedBy(null);
     loadData();
 
-    // Dispatch via offline local mesh to Host Till immediately
+    // Dispatch via offline local mesh to Host Till and peer terminals immediately
     syncService.dispatchSale(newSale).catch(() => {});
+    meshSyncService.broadcastSale(newSale).catch(() => {});
   };
 
   return (

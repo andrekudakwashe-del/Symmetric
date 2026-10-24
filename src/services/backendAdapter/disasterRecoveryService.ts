@@ -185,7 +185,7 @@ export class DisasterRecoveryService {
   private saveBackup(backup: DisasterRecoveryBackup) {
     try {
       const backups = this.listBackups();
-      const updated = [backup, ...backups.filter((b) => b.id !== backup.id)].slice(0, 50);
+      const updated = [backup, ...backups.filter((b) => b.id !== backup.id)].slice(0, 5);
       setStored(STORAGE_KEY_DR_BACKUPS, updated);
     } catch {
       // ignore

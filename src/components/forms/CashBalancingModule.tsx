@@ -5,6 +5,8 @@ import { Form2CashLog } from './Form2CashLog';
 import { Form3SalesEntry } from './Form3SalesEntry';
 import { Form4Reconciliation } from './Form4Reconciliation';
 import { WhereIsMyMoneyView } from './WhereIsMyMoneyView';
+import { AccountsClerkVoucherView } from '../cashCustody/AccountsClerkVoucherView';
+import { OwnerHqCommandCenter } from '../cashCustody/OwnerHqCommandCenter';
 import { isSupervisorOrAbove } from '../../db/roomDatabase';
 import {
   Coins,
@@ -21,7 +23,7 @@ import {
 
 interface CashBalancingModuleProps {
   currentUser: Salesperson;
-  initialSubTab?: 'form1' | 'form2' | 'form3' | 'form4' | 'where_is_my_money';
+  initialSubTab?: 'form1' | 'form2' | 'form3' | 'form4' | 'where_is_my_money' | 'custody_vouchers' | 'hq_command';
   preselectedCustomer?: string | null;
   onNavigateHome: () => void;
   onNavigateToPOS: () => void;
@@ -38,9 +40,9 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
   onNavigateToCreditReport,
   onNavigateToDirectGrv,
 }) => {
-  const [subTab, setSubTab] = useState<'form1' | 'form2' | 'form3' | 'form4' | 'where_is_my_money'>(
-    initialSubTab
-  );
+  const [subTab, setSubTab] = useState<
+    'form1' | 'form2' | 'form3' | 'form4' | 'where_is_my_money' | 'custody_vouchers' | 'hq_command'
+  >(initialSubTab);
 
   const isAdmin =
     currentUser.role === 'Admin' ||
@@ -83,7 +85,7 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
         </div>
 
         {/* Form Selector Tabs (Material 3 style) */}
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
           <button
             type="button"
             id="subtab-form1"
@@ -154,6 +156,23 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
             <div className="text-left">
               <span className="block text-[10px] text-purple-400 font-medium">Form 4 • Supervisor</span>
               <span>Balancing & EOD</span>
+            </div>
+          </button>
+
+          <button
+            type="button"
+            id="subtab-custody-vouchers"
+            onClick={() => setSubTab('custody_vouchers')}
+            className={`flex items-center space-x-2 p-2.5 rounded-2xl border transition-all text-xs font-bold ${
+              subTab === 'custody_vouchers' || subTab === 'hq_command'
+                ? 'bg-indigo-950/80 border-indigo-500 text-indigo-200 ring-1 ring-indigo-500/50 shadow-md'
+                : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <ShieldCheck className={`w-4 h-4 ${subTab === 'custody_vouchers' || subTab === 'hq_command' ? 'text-indigo-400' : 'text-slate-400'}`} />
+            <div className="text-left">
+              <span className="block text-[10px] text-teal-400 font-medium">Dual-Control</span>
+              <span>Custody & Vouchers</span>
             </div>
           </button>
 
@@ -230,7 +249,25 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
         )}
 
         {subTab === 'where_is_my_money' && (
-          <WhereIsMyMoneyView currentUser={currentUser} />
+          <WhereIsMyMoneyView
+            currentUser={currentUser}
+            onNavigateToCustody={() => setSubTab('custody_vouchers')}
+          />
+        )}
+
+        {subTab === 'custody_vouchers' && (
+          <AccountsClerkVoucherView
+            currentUser={currentUser}
+            onOpenOwnerCommand={() => setSubTab('hq_command')}
+          />
+        )}
+
+        {subTab === 'hq_command' && (
+          <OwnerHqCommandCenter
+            currentUser={currentUser}
+            onClose={() => setSubTab('custody_vouchers')}
+            onNavigateClerk={() => setSubTab('custody_vouchers')}
+          />
         )}
       </div>
     </div>

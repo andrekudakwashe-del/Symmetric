@@ -1,4 +1,5 @@
 import { InventoryItem, Product, SaleItem } from '../types';
+import { getAllGoodsReceivedNotes } from '../db/goodsReceivedNotes';
 
 export interface ResolvedItemCost {
   avgCost: number; // AVCO cost basis (per sold item, whether unit, pack, or case)
@@ -12,6 +13,53 @@ export interface ResolvedItemCost {
   stockStatus: 'Out of Stock' | 'Low Stock' | 'In Stock';
   canonicalKey: string;
   displayName: string;
+}
+
+/**
+ * Cache of latest GRN purchase costs to guarantee true replacement cost
+ */
+let latestGrnCostCache: Map<string, number> | null = null;
+let lastGrnCacheTime = 0;
+
+export function getLatestGrnUnitCost(itemId: string, sku?: string): number | undefined {
+  const now = Date.now();
+  if (!latestGrnCostCache || now - lastGrnCacheTime > 4000) {
+    latestGrnCostCache = new Map<string, number>();
+    lastGrnCacheTime = now;
+    try {
+      const grns = getAllGoodsReceivedNotes();
+      const sorted = [...grns].sort((a, b) => {
+        const da = new Date(a.dateReceived || a.createdAt).getTime();
+        const db = new Date(b.dateReceived || b.createdAt).getTime();
+        return db - da;
+      });
+      for (const g of sorted) {
+        if (g.lineItems && Array.isArray(g.lineItems)) {
+          for (const li of g.lineItems) {
+            const cost = Number(li.unitCost) || 0;
+            if (cost > 0) {
+              const idKey = (li.itemId || '').toUpperCase();
+              const skuKey = (li.sku || '').toUpperCase();
+              if (idKey && !latestGrnCostCache.has(idKey)) {
+                latestGrnCostCache.set(idKey, cost);
+              }
+              if (skuKey && !latestGrnCostCache.has(skuKey)) {
+                latestGrnCostCache.set(skuKey, cost);
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // Safe fallback
+    }
+  }
+
+  const cleanId = (itemId || '').toUpperCase();
+  const cleanSku = (sku || '').toUpperCase();
+  if (cleanId && latestGrnCostCache.has(cleanId)) return latestGrnCostCache.get(cleanId);
+  if (cleanSku && latestGrnCostCache.has(cleanSku)) return latestGrnCostCache.get(cleanSku);
+  return undefined;
 }
 
 /**
@@ -148,12 +196,16 @@ export function resolveItemCost(
         ? matchedInv.averageCostPerUnit
         : fallbackUnitCost;
 
+    const grnUnitCost = getLatestGrnUnitCost(matchedInv.itemId, matchedInv.sku);
+
     const latestUnitCost =
-      matchedInv.latestCostPerUnit !== undefined && matchedInv.latestCostPerUnit > 0
-        ? matchedInv.latestCostPerUnit
-        : (matchedInv.costPerUnit && matchedInv.costPerUnit > 0
-            ? matchedInv.costPerUnit
-            : fallbackUnitCost);
+      grnUnitCost !== undefined && grnUnitCost > 0
+        ? grnUnitCost
+        : (matchedInv.latestCostPerUnit !== undefined && matchedInv.latestCostPerUnit > 0
+            ? matchedInv.latestCostPerUnit
+            : (matchedInv.costPerUnit && matchedInv.costPerUnit > 0
+                ? matchedInv.costPerUnit
+                : fallbackUnitCost));
 
     if (isCase) {
       itemType = 'case';
@@ -167,12 +219,15 @@ export function resolveItemCost(
           ? matchedInv.averageCostPerCase
           : (avgUnitCost * unitsPerCase || caseCostFallback);
 
+      const grnCaseCost = grnUnitCost ? grnUnitCost * unitsPerCase : undefined;
       latestCost =
-        matchedInv.latestCostPerCase !== undefined && matchedInv.latestCostPerCase > 0
-          ? matchedInv.latestCostPerCase
-          : (matchedInv.costPerCase && matchedInv.costPerCase > 0
-              ? matchedInv.costPerCase
-              : latestUnitCost * unitsPerCase || caseCostFallback);
+        grnCaseCost !== undefined && grnCaseCost > 0
+          ? grnCaseCost
+          : (matchedInv.latestCostPerCase !== undefined && matchedInv.latestCostPerCase > 0
+              ? matchedInv.latestCostPerCase
+              : (matchedInv.costPerCase && matchedInv.costPerCase > 0
+                  ? matchedInv.costPerCase
+                  : latestUnitCost * unitsPerCase || caseCostFallback));
 
       currentStock =
         matchedInv.stockCases !== undefined
@@ -247,9 +302,13 @@ export function resolveItemCost(
     }
   } else if (matchedProduct) {
     const prodCost = matchedProduct.costPrice || matchedProduct.costPerUnit || 0;
+    const grnProdCost = getLatestGrnUnitCost(matchedProduct.id, matchedProduct.sku);
     if (prodCost > 0) {
       avgCost = prodCost;
-      latestCost = prodCost;
+      latestCost = grnProdCost !== undefined && grnProdCost > 0 ? grnProdCost : prodCost;
+    } else if (grnProdCost !== undefined && grnProdCost > 0) {
+      avgCost = grnProdCost;
+      latestCost = grnProdCost;
     }
     currentStock = matchedProduct.stockQuantity ?? 0;
     canonicalKey = matchedProduct.id;
@@ -275,6 +334,12 @@ export function resolveItemCost(
       avgCost = snapAvg;
       latestCost = Number((item as any).costPerUnitLatest) || snapAvg;
     }
+  }
+
+  // Also check if sale item has a recorded latest cost snapshot
+  const itemLatestSnap = Number((item as any).costPerUnitLatest) || Number((item as any).latestCost);
+  if (itemLatestSnap > 0) {
+    latestCost = itemLatestSnap;
   }
 
   // Final emergency fallback if totally unknown

@@ -1,7 +1,13 @@
 import React, { useState } from 'react';
 import { Customer, Salesperson } from '../../types';
-import { getNextCustomerId, addCustomer, isSupervisorOrAbove } from '../../db/roomDatabase';
-import { X, UserPlus, Phone, MapPin, User, Check, Sparkles, Hash, Lock, ShieldCheck } from 'lucide-react';
+import {
+  getNextCustomerId,
+  addCustomer,
+  isSupervisorOrAbove,
+  getCreditGroups,
+  getStandardGroupLimit,
+} from '../../db/roomDatabase';
+import { X, UserPlus, Phone, MapPin, User, Check, Sparkles, Hash, Lock, ShieldCheck, AlertTriangle } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
 interface CustomerRegistrationModalProps {
@@ -19,17 +25,40 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
 }) => {
   const nextId = getNextCustomerId();
   const isAuthorizedToSetCredit = isSupervisorOrAbove(currentUser.role) || Boolean(currentUser.permissions?.canGrantCredit);
+  const standardGroupLimit = getStandardGroupLimit(); // Default $5.00
+  const creditGroups = getCreditGroups();
 
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [address, setAddress] = useState('');
-  const [creditAllowed, setCreditAllowed] = useState(isAuthorizedToSetCredit);
-  const [creditLimit, setCreditLimit] = useState(isAuthorizedToSetCredit ? '100.00' : '0.00');
+  // CRITICAL REQUIREMENT: Default option must be credit OFF (not $100 automatic credit!)
+  const [creditAllowed, setCreditAllowed] = useState(false);
+  const [creditLimit, setCreditLimit] = useState('0.00');
+  const [selectedGroupId, setSelectedGroupId] = useState<string>('CGRP-001');
   const [maxCreditReceiptCount, setMaxCreditReceiptCount] = useState('2');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   if (!isOpen) return null;
+
+  const handleToggleCredit = (checked: boolean) => {
+    setCreditAllowed(checked);
+    if (checked) {
+      // Default to the standard group limit ($5.00)
+      setCreditLimit(standardGroupLimit.toFixed(2));
+      setSelectedGroupId('CGRP-001');
+    } else {
+      setCreditLimit('0.00');
+    }
+  };
+
+  const handleSelectGroup = (groupId: string) => {
+    setSelectedGroupId(groupId);
+    const grp = creditGroups.find((g) => g.id === groupId);
+    if (grp) {
+      setCreditLimit(grp.groupLimit.toFixed(2));
+    }
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -42,16 +71,27 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
     setError(null);
 
     try {
+      const numLimit = creditAllowed ? Math.max(0, parseFloat(creditLimit) || 0) : 0;
+      const isAboveGroupLimit = numLimit > standardGroupLimit;
+      const grp = creditGroups.find((g) => g.id === selectedGroupId);
+
       const created = addCustomer({
         name: name.trim(),
         phone: phone.trim(),
         address: address.trim(),
         createdBy: currentUser.id,
         creditAllowed,
-        creditLimit: Math.max(0, parseFloat(creditLimit) || 0),
+        creditLimit: numLimit,
         maxCreditReceiptCount: Math.max(1, parseInt(maxCreditReceiptCount, 10) || 1),
-        creditApprovedBy: currentUser.name,
-        creditApprovalDate: new Date().toISOString(),
+        creditApprovedBy: creditAllowed ? currentUser.name : undefined,
+        creditApprovalDate: creditAllowed ? new Date().toISOString() : undefined,
+        creditGroupId: creditAllowed ? (isAboveGroupLimit ? 'CUSTOM_ABOVE_CAP' : grp?.id || 'CGRP-001') : undefined,
+        creditGroupName: creditAllowed
+          ? isAboveGroupLimit
+            ? `Random / Custom Limit ($${numLimit.toFixed(2)})`
+            : grp?.name || `Standard Group ($${standardGroupLimit.toFixed(2)})`
+          : undefined,
+        isCustomLimit: isAboveGroupLimit,
       });
 
       confetti({
@@ -198,54 +238,106 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
                     </span>
                   )}
                 </div>
-                <p className="text-[10px] text-slate-400">Allow this customer to purchase on credit within limits</p>
+                <p className="text-[10px] text-slate-400">
+                  Default option is <strong>Credit OFF</strong>. Enable only for authorized credit customers.
+                </p>
               </div>
               {isAuthorizedToSetCredit ? (
                 <label className="relative inline-flex items-center cursor-pointer">
                   <input
                     type="checkbox"
                     checked={creditAllowed}
-                    onChange={(e) => setCreditAllowed(e.target.checked)}
+                    onChange={(e) => handleToggleCredit(e.target.checked)}
                     className="sr-only peer"
                   />
                   <div className="w-10 h-5 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600"></div>
                 </label>
               ) : (
                 <div className="text-[10px] font-bold text-slate-500 bg-slate-900 px-2 py-1 rounded-lg border border-slate-800">
-                  Cash Only
+                  Credit Off (Cash Only)
                 </div>
               )}
             </div>
 
             {isAuthorizedToSetCredit ? (
-              creditAllowed && (
-                <div className="grid grid-cols-2 gap-3 pt-1 border-t border-slate-800/80">
+              creditAllowed ? (
+                <div className="space-y-2.5 pt-2 border-t border-slate-800/80">
+                  {/* Credit List / Group Selector */}
                   <div>
-                    <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
-                      Credit Limit ($)
+                    <label className="block text-[10px] font-bold uppercase text-slate-300 mb-1 flex items-center justify-between">
+                      <span>Credit Customer List / Tier</span>
+                      <span className="text-[10px] font-mono text-purple-400">Cap: ${standardGroupLimit.toFixed(2)}</span>
                     </label>
-                    <input
-                      type="number"
-                      min="0"
-                      step="5"
-                      value={creditLimit}
-                      onChange={(e) => setCreditLimit(e.target.value)}
-                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono font-bold text-white focus:outline-none focus:border-purple-500"
-                    />
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {creditGroups.map((grp, gIdx) => {
+                        const isSelected = selectedGroupId === grp.id && parseFloat(creditLimit) === grp.groupLimit;
+                        return (
+                          <button
+                            key={`${grp.id}-${gIdx}`}
+                            type="button"
+                            onClick={() => handleSelectGroup(grp.id)}
+                            className={`p-2 rounded-xl text-left border transition text-[11px] ${
+                              isSelected
+                                ? 'bg-purple-950/80 border-purple-500 text-white shadow-sm ring-1 ring-purple-500/40'
+                                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            <div className="font-bold text-xs font-mono text-emerald-400">${grp.groupLimit.toFixed(0)}</div>
+                            <div className="text-[10px] truncate">{grp.name.split(' (')[0]}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
-                  <div>
-                    <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
-                      Max Unpaid Receipts
-                    </label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="10"
-                      value={maxCreditReceiptCount}
-                      onChange={(e) => setMaxCreditReceiptCount(e.target.value)}
-                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono font-bold text-white focus:outline-none focus:border-purple-500"
-                    />
+
+                  <div className="grid grid-cols-2 gap-3 pt-1">
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
+                        Assigned Limit ($)
+                      </label>
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={creditLimit}
+                        onChange={(e) => setCreditLimit(e.target.value)}
+                        className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono font-bold text-white focus:outline-none focus:border-purple-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold uppercase text-slate-400 mb-1">
+                        Max Unpaid Receipts
+                      </label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="10"
+                        value={maxCreditReceiptCount}
+                        onChange={(e) => setMaxCreditReceiptCount(e.target.value)}
+                        className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-xs font-mono font-bold text-white focus:outline-none focus:border-purple-500"
+                      />
+                    </div>
                   </div>
+
+                  {/* Warning if credit limit is above the standard group limit */}
+                  {parseFloat(creditLimit) > standardGroupLimit ? (
+                    <div className="p-2.5 rounded-xl bg-amber-950/40 border border-amber-500/40 text-[11px] text-amber-300 flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
+                      <div>
+                        <span className="font-bold">Above Standard Group Limit:</span> ${parseFloat(creditLimit || '0').toFixed(2)} exceeds the store's ${standardGroupLimit.toFixed(2)} group cap. This customer will be displayed on the <strong>"Random Credit Limits"</strong> audit list.
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-[10px] text-emerald-400 flex items-center gap-1 font-medium">
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Within Standard ${standardGroupLimit.toFixed(2)} Group Limit list.</span>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800 text-[11px] text-slate-400 flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-slate-500 shrink-0" />
+                  <span>Credit is OFF. Customer must pay cash/electronic for all purchases.</span>
                 </div>
               )
             ) : (
