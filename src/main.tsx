@@ -13,6 +13,15 @@ if ('serviceWorker' in navigator) {
       }
     });
   } else {
+    let isRefreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!isRefreshing) {
+        isRefreshing = true;
+        console.info('[PWA] New service worker activated, reloading application seamlessly...');
+        window.location.reload();
+      }
+    });
+
     window.addEventListener('load', () => {
       navigator.serviceWorker
         .register('/sw.js', { scope: '/' })
@@ -31,10 +40,24 @@ if ('serviceWorker' in navigator) {
               };
             }
           };
+
+          // Periodically check for updates every 15 minutes
+          setInterval(() => {
+            if (navigator.onLine) {
+              reg.update().catch(() => {});
+            }
+          }, 15 * 60 * 1000);
         })
         .catch((err) => {
           console.warn('SAIMETRIC Service Worker registration notice:', err);
         });
+    });
+
+    // When connection is restored, immediately check for updates
+    window.addEventListener('online', () => {
+      navigator.serviceWorker.getRegistration().then((reg) => {
+        if (reg) reg.update().catch(() => {});
+      });
     });
   }
 }

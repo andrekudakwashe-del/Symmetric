@@ -1670,6 +1670,8 @@ export const getOwnerDefaultPermissions = () => ({
   canCreateBankDepositTransfer: true,
   canReceiveHqTransfer: true,
   canExecuteOwnerOverride: true,
+  canAccessWhereIsMyMoney: true,
+  canAccessDualCashCustody: true,
 });
 
 export const saveSalesperson = (person: Salesperson): Salesperson => {
@@ -1687,12 +1689,24 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
     return false;
   });
 
+  const existingPerson = index >= 0 ? all[index] : null;
+
+  // Preserve existing permissions if sync did not provide new ones.
+  // Never overwrite cashier permissions with owner defaults when pulling staff delta from server.
+  const resolvedPermissions =
+    person.permissions ||
+    existingPerson?.permissions ||
+    (person.role === 'ADMIN' || person.role === 'OWNER' || (existingPerson?.role === 'ADMIN' || existingPerson?.role === 'OWNER')
+      ? getOwnerDefaultPermissions()
+      : {});
+
   const merged: Salesperson = {
+    ...(existingPerson || {}),
     ...person,
     companyId: compId,
     company_id: compId,
-    active: person.active || 'Y',
-    permissions: person.permissions || getOwnerDefaultPermissions(),
+    active: person.active || existingPerson?.active || 'Y',
+    permissions: resolvedPermissions,
   };
 
   if (index >= 0) {
@@ -5115,6 +5129,27 @@ export const generateInvoiceId = generateInvoiceNumber;
 type SaleCreationListener = (sale: SaleInvoice) => void;
 const saleCreationListeners: Set<SaleCreationListener> = new Set();
 
+const inMemorySeenSaleIds: Set<string> = new Set();
+let hasInitializedSeenSaleIds = false;
+
+export const initSeenSaleIds = () => {
+  if (hasInitializedSeenSaleIds) return;
+  hasInitializedSeenSaleIds = true;
+  try {
+    const list = getAllSales();
+    for (const s of list) {
+      if (s && s.id) {
+        inMemorySeenSaleIds.add(s.id);
+      }
+    }
+  } catch (e) {}
+};
+
+export const registerSeenSaleId = (id: string) => {
+  if (!id) return;
+  inMemorySeenSaleIds.add(id);
+};
+
 export const onSaleCreated = (listener: SaleCreationListener) => {
   saleCreationListeners.add(listener);
   return () => {
@@ -5124,6 +5159,14 @@ export const onSaleCreated = (listener: SaleCreationListener) => {
 
 export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   if (!sale || !sale.id) return false;
+
+  // Ultra-fast O(1) in-memory deduplication check:
+  // Drop immediately without doing expensive disk/JSON deserialization or branch math
+  initSeenSaleIds();
+  if (inMemorySeenSaleIds.has(sale.id)) {
+    return false;
+  }
+
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const currentBranchCode = getCurrentBranch()?.code;
@@ -5156,10 +5199,12 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     return false;
   }
 
+  // Register in memory immediately to prevent race conditions during burst processing
+  inMemorySeenSaleIds.add(sale.id);
+
   const list = getAllSales();
   const existing = list.find((s) => s.id === sale.id);
   if (existing) {
-    // If a packet arrives with an ID that already exists with the exact same timestamp and total, drop it (duplicate sync packet). Do not rename it.
     return false;
   }
 
@@ -5322,6 +5367,7 @@ export const addSale = (
   };
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.SALES, updated);
+  registerSeenSaleId(invId);
 
   // Fire-and-forget push to server central store for multi-tier persistence
   if (typeof fetch !== 'undefined') {

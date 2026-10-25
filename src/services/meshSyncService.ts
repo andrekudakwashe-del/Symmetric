@@ -216,6 +216,11 @@ class MeshSyncManager {
   private knownSaleIds: Set<string> = new Set();
   private broadcastedInvoiceIds: Set<string> = new Set();
   private batchUiTimer: number | null = null;
+  private isIngestingFromHub: boolean = false;
+  private hubIngestQueue: any[] = [];
+  private hubProcessingTimer: number | null = null;
+  private hasPerformedInitialCatchup: boolean = false;
+  private lastInitialCatchupTime: number = 0;
 
   private scheduleBatchUiUpdate() {
     if (this.batchUiTimer) return;
@@ -799,6 +804,16 @@ class MeshSyncManager {
 
         this.notifyPeerSubscribers(true);
         this.notifyConnectionModeChange();
+
+        // Trigger catch-up sync ONCE upon connection to get any missed sales from the last disconnect
+        // Throttled so reconnects don't generate repetitive catch-up requests
+        setTimeout(() => {
+          if (this.isLocalHubConnected && (!this.hasPerformedInitialCatchup || Date.now() - this.lastInitialCatchupTime > 30000)) {
+            this.hasPerformedInitialCatchup = true;
+            this.lastInitialCatchupTime = Date.now();
+            this.requestCatchUpSync('ALL', undefined, false).catch(() => {});
+          }
+        }, 1200);
       };
 
       ws.onmessage = async (event) => {
@@ -815,30 +830,25 @@ class MeshSyncManager {
           const parsed = JSON.parse(rawData);
           if (!parsed) return;
 
-          // Termux WebSocket server stores and auto-replays historical packets on connect
+          // Termux WebSocket server stores and auto-replays historical packets on connect.
+          // Queue in memory and process in small batches of 10 with 50ms pauses so the UI never freezes.
           if (Array.isArray(parsed)) {
-            for (const item of parsed) {
-              this.processSingleLocalHubPacket(item);
-            }
+            this.enqueueHubPackets(parsed);
             return;
           }
 
           if (typeof parsed === 'object') {
             if (Array.isArray((parsed as any).packets)) {
-              for (const item of (parsed as any).packets) {
-                this.processSingleLocalHubPacket(item);
-              }
+              this.enqueueHubPackets((parsed as any).packets);
               return;
             }
             if (Array.isArray((parsed as any).history)) {
-              for (const item of (parsed as any).history) {
-                this.processSingleLocalHubPacket(item);
-              }
+              this.enqueueHubPackets((parsed as any).history);
               return;
             }
           }
 
-          this.processSingleLocalHubPacket(parsed);
+          this.enqueueHubPackets([parsed]);
         } catch (e) {
           console.warn('[MeshSync] Error parsing local hub message:', e);
         }
@@ -860,8 +870,87 @@ class MeshSyncManager {
     }
   }
 
+  private enqueueHubPackets(packets: any[]) {
+    if (!Array.isArray(packets) || packets.length === 0) return;
+
+    // Filter out packets originating from THIS device immediately
+    const filtered = packets.filter((p) => {
+      if (!p || typeof p !== 'object') return false;
+      const originId =
+        p.origin_device_id ||
+        p.originDeviceId ||
+        p.deviceId ||
+        p.sourceDevice ||
+        (p.data && (p.data.origin_device_id || p.data.originDeviceId || p.data.deviceId)) ||
+        (p.payload && (p.payload.origin_device_id || p.payload.originDeviceId || p.payload.deviceId));
+      return !originId || originId !== this.config.deviceId;
+    });
+
+    if (filtered.length === 0) return;
+
+    this.hubIngestQueue.push(...filtered);
+
+    // Guard maximum queue length
+    if (this.hubIngestQueue.length > 5000) {
+      this.hubIngestQueue = this.hubIngestQueue.slice(-5000);
+    }
+
+    this.scheduleHubQueueDrain();
+  }
+
+  private scheduleHubQueueDrain() {
+    if (this.hubProcessingTimer !== null) return;
+    this.hubProcessingTimer = window.setTimeout(() => {
+      this.processHubQueueBatch();
+    }, 10);
+  }
+
+  private processHubQueueBatch() {
+    this.hubProcessingTimer = null;
+    if (this.hubIngestQueue.length === 0) return;
+
+    const BATCH_SIZE = 10;
+    const batch = this.hubIngestQueue.splice(0, BATCH_SIZE);
+
+    // ABSOLUTE STRICT INGEST:
+    // Inside this execution window, ws.send(), sendPacketToAllTransports, and all broadcast functions are strictly prohibited.
+    this.isIngestingFromHub = true;
+    try {
+      for (const item of batch) {
+        this.processSingleLocalHubPacket(item);
+      }
+    } catch (err) {
+      console.warn('[MeshSync] Error processing hub ingest batch:', err);
+    } finally {
+      this.isIngestingFromHub = false;
+    }
+
+    if (this.hubIngestQueue.length > 0) {
+      // 50ms pause between batches yields the event loop to the browser network thread, preventing socket drops
+      this.hubProcessingTimer = window.setTimeout(() => {
+        this.processHubQueueBatch();
+      }, 50);
+    } else {
+      // Completed burst ingestion: trigger UI batch update
+      this.scheduleBatchUiUpdate();
+    }
+  }
+
   private processSingleLocalHubPacket(packet: any) {
     if (!packet || typeof packet !== 'object') return;
+
+    // Immediate drop if packet originated from this device (checked before and after unwrapping)
+    const rawOrigin =
+      packet.origin_device_id ||
+      packet.originDeviceId ||
+      packet.deviceId ||
+      packet.sourceDevice ||
+      (packet.data && (packet.data.origin_device_id || packet.data.originDeviceId || packet.data.deviceId)) ||
+      (packet.payload && (packet.payload.origin_device_id || packet.payload.originDeviceId || packet.payload.deviceId));
+
+    if (rawOrigin && rawOrigin === this.config.deviceId) {
+      return;
+    }
 
     // Unwrap envelope wrappers if hub relays through { data: ... } or { payload: ... }
     if (packet.data && typeof packet.data === 'object' && (packet.data.type || packet.data.action)) {
@@ -889,8 +978,17 @@ class MeshSyncManager {
       return;
     }
 
-    // Fast deduplication by packet ID
-    const packetId = packet.packet_id || packet.id;
+    // Fast deduplication by packet ID or entity ID
+    const packetId =
+      packet.packet_id ||
+      packet.id ||
+      (packet.sale && packet.sale.id) ||
+      (packet.cashLog && packet.cashLog.id) ||
+      (packet.movement && (packet.movement.movementId || packet.movement.txnId)) ||
+      (packet.grv && packet.grv.id) ||
+      (packet.item && (packet.item.itemId || packet.item.id)) ||
+      (packet.payload && (packet.payload.id || packet.payload.itemId || packet.payload.movementId));
+
     if (packetId) {
       if (this.seenPacketIds.has(packetId)) return;
       this.seenPacketIds.add(packetId);
@@ -1729,6 +1827,13 @@ class MeshSyncManager {
   // UNIFIED PACKET TRANSMISSION
   // =========================================================================
   private sendPacketToAllTransports(topicSuffix: string, packet: any) {
+    // ABSOLUTE STRICT INGEST GUARD:
+    // Inside ingest mode from the Local Hub, the client MUST NEVER broadcast
+    // or re-transmit packets back out. Drop immediately.
+    if (this.isIngestingFromHub) {
+      return;
+    }
+
     const jsonStr = JSON.stringify(packet);
 
     // 0. WebRTC DataChannel (Direct Local Wi-Fi / Hotspot)
@@ -1740,8 +1845,15 @@ class MeshSyncManager {
 
     // 0.1 Direct LAN WebSocket & Local WebSocket Hub (Termux Node Hub)
     // Only send real data packets (sales, inventory, mutations); skip heartbeats/pings to keep Termux disk storage clean
-    const isMaintenance = topicSuffix === 'heartbeat' || topicSuffix === 'ping';
-    if (!isMaintenance) {
+    const isMaintenance =
+      topicSuffix === 'heartbeat' ||
+      topicSuffix === 'ping' ||
+      packet.type === 'heartbeat' ||
+      packet.type === 'ping' ||
+      packet.action === 'HEARTBEAT' ||
+      packet.action === 'PING';
+
+    if (!isMaintenance && !this.isIngestingFromHub) {
       const targetWs = this.localHubWs || this.directWsClient;
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         try {
@@ -1869,8 +1981,10 @@ class MeshSyncManager {
         peerData.name,
         this.config.deviceName
       );
-      // Automatically request catch-up delta from the newly discovered peer
-      this.requestCatchUpSync(packetOrigin).catch(() => {});
+      // Only request catch-up delta in direct P2P/MQTT mesh mode (NEVER in Local Hub mode or during ingest to prevent ping-pong storms)
+      if (!this.isLocalHubConnected && !this.isIngestingFromHub) {
+        this.requestCatchUpSync(packetOrigin).catch(() => {});
+      }
 
       if (!this.isSimulationMode) {
         this.notifyPeerSubscribers();
@@ -2371,6 +2485,7 @@ class MeshSyncManager {
     postedIds?: string[];
     sheetName?: string;
   }) {
+    if (this.isIngestingFromHub) return;
     const clientReqIds = receipt.postedClientRequestIds || [];
     const ids = receipt.postedIds || [];
     if (clientReqIds.length === 0 && ids.length === 0) return;
@@ -2648,8 +2763,8 @@ class MeshSyncManager {
       originName
     );
 
-    // If requester did not specify reciprocal sync, request reciprocal catch-up
-    if (!packet.isReciprocal && packet.originDeviceId) {
+    // If requester did not specify reciprocal sync, request reciprocal catch-up (only in P2P mode, never in Local Hub or during ingest)
+    if (!packet.isReciprocal && packet.originDeviceId && !this.isLocalHubConnected && !this.isIngestingFromHub) {
       this.requestCatchUpSync(packet.originDeviceId, undefined, true).catch(() => {});
     }
   }
@@ -2845,7 +2960,7 @@ class MeshSyncManager {
     }
 
     // Reciprocal catchup trigger: if peer responded to our request and did not send reciprocal request
-    if (!packet.isReciprocal && packet.originDeviceId) {
+    if (!packet.isReciprocal && packet.originDeviceId && !this.isLocalHubConnected && !this.isIngestingFromHub) {
       this.requestCatchUpSync(packet.originDeviceId, undefined, true).catch(() => {});
     }
   }
@@ -2861,6 +2976,7 @@ class MeshSyncManager {
    * ONLY sends the specific packet for the current action.
    */
   public async broadcastSale(sale: SaleInvoice) {
+    if (this.isIngestingFromHub) return;
     if (!sale || !sale.id) return;
 
     // Check if already broadcasted by this device
@@ -2920,6 +3036,7 @@ class MeshSyncManager {
   }
 
   public broadcastInventoryItem(item: InventoryItem) {
+    if (this.isIngestingFromHub) return;
     if (!item) return;
     if ((item as any).fromMesh) return;
     const cleanId = (item.itemId || item.id || '').trim();
@@ -2959,6 +3076,7 @@ class MeshSyncManager {
   public broadcastInventoryUpdate = (item: InventoryItem) => this.broadcastInventoryItem(item);
 
   public broadcastDatabaseMutation(mutation: DatabaseMutationEvent) {
+    if (this.isIngestingFromHub) return;
     const packetId = `MUT-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 

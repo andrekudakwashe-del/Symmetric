@@ -1,9 +1,9 @@
 /**
  * SAIMETRIC Service Worker (Offline-First Engine)
- * Provides 100% offline app loading, asset precaching, and network fallback.
+ * Provides 100% offline app loading, clean cache management, and instant updates.
  */
 
-const CACHE_NAME = 'saimetric-v5-offline-v3';
+const CACHE_NAME = 'saimetric-v5-offline-v6';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',
@@ -11,7 +11,7 @@ const PRECACHE_ASSETS = [
   '/icon.svg',
 ];
 
-// Install: precache the core shell resiliently (Promise.allSettled)
+// Install: precache the core shell resiliently
 self.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
@@ -34,18 +34,19 @@ self.addEventListener('install', (event) => {
   );
 });
 
-// Activate: preserve previous cache assets to prevent offline starvation, claim clients immediately
+// Activate: purge ALL obsolete caches so old versions NEVER resurrect, claim clients immediately
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       const keys = await caches.keys();
-      // Keep current cache and immediate previous cache
-      const oldCaches = keys.filter((k) => k !== CACHE_NAME);
-      if (oldCaches.length > 2) {
-        for (const k of oldCaches.slice(0, oldCaches.length - 2)) {
-          await caches.delete(k);
-        }
-      }
+      await Promise.all(
+        keys.map((k) => {
+          if (k !== CACHE_NAME) {
+            console.info('[SW] Purging stale cache:', k);
+            return caches.delete(k);
+          }
+        })
+      );
       await self.clients.claim();
     })()
   );
@@ -79,75 +80,70 @@ self.addEventListener('fetch', (event) => {
   }
 
   // Handle SPA Navigation requests (HTML document)
+  // Network-First when online to ensure fresh version is served; fallback to cache when offline
   if (event.request.mode === 'navigate') {
     event.respondWith(
       (async () => {
-        try {
-          // If online, try network with short timeout to catch fresh HTML
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 2000);
-          const networkResponse = await fetch(event.request, { signal: controller.signal });
-          clearTimeout(timeoutId);
+        if (navigator.onLine) {
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3500);
+            const networkResponse = await fetch(event.request, { signal: controller.signal });
+            clearTimeout(timeoutId);
 
-          if (networkResponse && networkResponse.status === 200) {
-            const copy = networkResponse.clone();
-            const cache = await caches.open(CACHE_NAME);
-            cache.put(event.request, copy.clone());
-            cache.put('/', copy.clone());
-            cache.put('/index.html', copy.clone());
+            if (networkResponse && networkResponse.status === 200) {
+              const copy = networkResponse.clone();
+              const cache = await caches.open(CACHE_NAME);
+              cache.put(event.request, copy.clone());
+              cache.put('/', copy.clone());
+              cache.put('/index.html', copy.clone());
+              return networkResponse;
+            }
+          } catch (err) {
+            console.warn('[SW] Online navigation fetch timed out or failed, falling back to cache');
           }
-          return networkResponse;
-        } catch (err) {
-          // Network failed or offline: locate cached HTML shell
-          const cached =
-            (await caches.match(event.request)) ||
-            (await caches.match(event.request, { ignoreSearch: true })) ||
-            (await caches.match('/index.html')) ||
-            (await caches.match('/'));
-          if (cached) {
-            return cached;
-          }
-
-          // Search across all available caches
-          const allKeys = await caches.keys();
-          for (const k of allKeys) {
-            const c = await caches.open(k);
-            const found =
-              (await c.match('/index.html')) ||
-              (await c.match('/')) ||
-              (await c.match(event.request, { ignoreSearch: true }));
-            if (found) return found;
-          }
-
-          return new Response(
-            '<!doctype html><html><head><meta charset="utf-8"><title>SAIMETRIC Offline</title></head><body style="background:#0f172a;color:#fff;font-family:sans-serif;padding:2rem;"><h2>SAIMETRIC Offline POS</h2><p>Please open the app once while connected to complete initial offline caching.</p></body></html>',
-            { headers: { 'Content-Type': 'text/html' } }
-          );
         }
+
+        // Offline fallback: serve from current cache
+        const cache = await caches.open(CACHE_NAME);
+        const cached =
+          (await cache.match(event.request)) ||
+          (await cache.match(event.request, { ignoreSearch: true })) ||
+          (await cache.match('/index.html')) ||
+          (await cache.match('/'));
+
+        if (cached) {
+          return cached;
+        }
+
+        return new Response(
+          '<!doctype html><html><head><meta charset="utf-8"><title>SAIMETRIC Offline</title></head><body style="background:#0f172a;color:#fff;font-family:sans-serif;padding:2rem;"><h2>SAIMETRIC Offline POS</h2><p>Please open the app once while connected to complete initial offline caching.</p></body></html>',
+          { headers: { 'Content-Type': 'text/html' } }
+        );
       })()
     );
     return;
   }
 
   // Handle static assets (JS chunks, CSS, images, fonts, icons)
-  // Cache-First with network fallback & background revalidation
+  // Cache-First with network fallback
   event.respondWith(
     (async () => {
-      // 1. Try matching in current cache first (ignoreSearch handles Vite query parameters)
-      let cached =
-        (await caches.match(event.request)) ||
-        (await caches.match(event.request, { ignoreSearch: true })) ||
-        (await caches.match(url.pathname, { ignoreSearch: true }));
+      const cache = await caches.open(CACHE_NAME);
 
-      // If found in cache, return immediately (0ms instant offline load!)
+      // 1. Try matching in current cache
+      let cached =
+        (await cache.match(event.request)) ||
+        (await cache.match(event.request, { ignoreSearch: true })) ||
+        (await cache.match(url.pathname, { ignoreSearch: true }));
+
       if (cached) {
-        if (navigator.onLine) {
+        // If it's a non-hashed root asset, revalidate in background when online
+        if (navigator.onLine && !url.pathname.includes('/assets/')) {
           fetch(event.request)
             .then(async (networkResponse) => {
               if (networkResponse && networkResponse.status === 200) {
-                const copy = networkResponse.clone();
-                const cache = await caches.open(CACHE_NAME);
-                cache.put(event.request, copy);
+                await cache.put(event.request, networkResponse);
               }
             })
             .catch(() => {});
@@ -155,27 +151,14 @@ self.addEventListener('fetch', (event) => {
         return cached;
       }
 
-      // 2. Not in current cache: try fetching from network
+      // 2. Fetch from network and store in current cache
       try {
         const networkResponse = await fetch(event.request);
         if (networkResponse && networkResponse.status === 200) {
-          const responseToCache = networkResponse.clone();
-          const cache = await caches.open(CACHE_NAME);
-          cache.put(event.request, responseToCache);
+          cache.put(event.request, networkResponse.clone());
         }
         return networkResponse;
       } catch (networkErr) {
-        // 3. Network failed (offline): search across all caches
-        const allKeys = await caches.keys();
-        for (const k of allKeys) {
-          const c = await caches.open(k);
-          const match =
-            (await c.match(event.request)) ||
-            (await c.match(event.request, { ignoreSearch: true })) ||
-            (await c.match(url.pathname, { ignoreSearch: true }));
-          if (match) return match;
-        }
-
         return new Response(null, { status: 404, statusText: 'Offline Resource Not Found' });
       }
     })()
