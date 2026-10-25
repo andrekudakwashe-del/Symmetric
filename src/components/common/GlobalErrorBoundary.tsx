@@ -29,9 +29,27 @@ export class GlobalErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoun
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
     console.error('Unhandled Application Exception caught by GlobalErrorBoundary:', error, errorInfo);
     this.setState({ errorInfo });
+
+    // Auto-recover from dynamic module loading failures (e.g. after dev server restart or asset updates)
+    const msg = error?.message || '';
+    if (
+      msg.includes('Failed to fetch dynamically imported module') ||
+      msg.includes('Importing a module script failed') ||
+      msg.includes('error loading dynamically imported module')
+    ) {
+      const reloadKey = 'global_error_boundary_chunk_reload';
+      const lastReload = sessionStorage.getItem(reloadKey);
+      if (!lastReload) {
+        sessionStorage.setItem(reloadKey, 'true');
+        setTimeout(() => {
+          window.location.reload();
+        }, 150);
+      }
+    }
   }
 
   handleReload = () => {
+    sessionStorage.removeItem('global_error_boundary_chunk_reload');
     window.location.reload();
   };
 

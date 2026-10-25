@@ -20,7 +20,6 @@ const MODULE_LOADERS: Array<() => Promise<any>> = [
   () => import('../pages/Settings/FixedCosts'),
   () => import('../components/reports/UniversalReportBuilder'),
   () => import('../components/reports/CustomReportsListView'),
-  () => import('../components/sync/P2PMeshSyncHub'),
   () => import('../components/admin/BranchSetupScreen'),
   () => import('../components/admin/SuperAdminDashboard'),
   () => import('../components/sheets/GoogleSheetsSyncModal'),

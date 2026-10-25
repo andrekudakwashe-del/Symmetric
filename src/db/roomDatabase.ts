@@ -2959,13 +2959,50 @@ export const updateProductStock = (
     };
     saveInventoryItem(updatedItem, context?.fromMesh ? { fromMesh: true } : undefined);
 
+    // Safeguard 3: Inventory Reconciliation & Negative Stock Variance
+    // If incoming offline mesh sales cause stock to turn negative, flag as STOCK_VARIANCE and log in the Audit Log
+    const isNegativeStock = finalTotalUnits < 0;
+    if (isNegativeStock) {
+      addAuditLog({
+        action: 'STOCK_VARIANCE',
+        severity: 'WARNING',
+        staffId: context?.staffId || 'SYSTEM',
+        staffName: context?.staffName || 'Mesh Reconciliation Engine',
+        staffRole: 'SYSTEM',
+        authorizedByName: 'Mesh Sync Auditor',
+        reason: `Reconciliation Stock Variance: Stock for "${item.itemName}" (${realId}) fell negative to ${finalTotalUnits} units after offline sale deduction (Invoice #${context?.referenceId || 'N/A'}).`,
+        category: 'INVENTORY_RECONCILIATION',
+        company_id: item.company_id,
+        branch_id: item.branch_id,
+      });
+
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(
+          new CustomEvent('saimetric_stock_variance_detected', {
+            detail: {
+              itemId: realId,
+              itemName: item.itemName,
+              negativeUnits: finalTotalUnits,
+              referenceId: context?.referenceId,
+            },
+          })
+        );
+      }
+    }
+
     // Calculate actual case and single deltas for audit trail logging
     const deltaCases = finalCases - prevCases;
     const deltaSingles = Number((finalSingles - prevSingles).toFixed(3));
 
     const isSale = context?.txnType === 'SALE' || (!context?.txnType && deltaQty < 0);
     const isReturn = context?.txnType === 'RETURN' || (!context?.txnType && deltaQty > 0);
-    const movementType = isSale ? 'SALE' : isReturn ? 'RETURN' : (context?.txnType || 'ADJUSTMENT');
+    const movementType = isNegativeStock
+      ? 'STOCK_VARIANCE'
+      : isSale
+      ? 'SALE'
+      : isReturn
+      ? 'RETURN'
+      : (context?.txnType || 'ADJUSTMENT');
     const txnType = movementType;
 
     const currentUser = getCurrentUser();
@@ -9483,6 +9520,11 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
 };
 
 export const markReceiptAsSynced = markSyncItemsAsSynced;
+
+export const markSaleAsSynced = (invoiceId: string): boolean => {
+  if (!invoiceId) return false;
+  return markSyncItemsAsSynced([], [invoiceId]) > 0;
+};
 
 export async function pullTenantInventory(companyId?: string): Promise<{ added: number; updated: number; count: number }> {
   const compId = companyId || getCurrentCompanyId();

@@ -1,6 +1,6 @@
 {
-  "summary":  "Architectural implementation plan resolving the six reported POS, financial reporting, and cash custody issues:\n1. Latest purchase replacement cost in SalesReport profit calculation.\n2. Sales value-based Average Basket Size with secondary units per ticket.\n3. Form 4 dynamic cashier retained float ($15, $20, $30) with automatic next-morning opening float carryover.\n4. Vault and Clerk Float utility expenses integrated with P&L (IncomeStatement) and Dual Custody ledger without polluting till cash logs.\n5. Clickable Account Statements and transaction ledgers for Branch Safe, Clerk Float, and Commercial Bank.\n6. Compact packaging for unpaid GRVs with integrated selection in the Pay Supplier modal.",
-  "updatedAt":  "2026-10-22T07:19:44.913397589Z",
+  "summary":  "Reliability Audit Implementation Plan & Verification Matrix for Local Hub (Termux) Offline POS Synchronization. Covers Safeguards 1-4 (Sync Receipt ACK Watchdog, Reconnection Catch-Up with last_synced_timestamp, Inventory Reconciliation with STOCK_VARIANCE logging, and Tornado Burst Collision Proofing), plus step-by-step checklists for the 4 Reliability Scenarios.",
+  "updatedAt":  "2026-10-25T09:47:17.814112078Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

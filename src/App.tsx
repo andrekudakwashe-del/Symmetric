@@ -50,30 +50,31 @@ import {
   getUserPrimaryModules,
 } from './services/roleNavigationService';
 import { prefetchAppModules } from './services/modulePrefetcher';
+import { lazyWithRetry } from './utils/lazyWithRetry';
+import { P2PMeshSyncHub } from './components/sync/P2PMeshSyncHub';
 
-// Lazy-loaded secondary admin & heavy setup modules (prefetched automatically in background)
-const AuditLogView = lazy(() => import('./components/admin/AuditLogView').then(m => ({ default: m.AuditLogView })));
-const GoogleSheetsSyncModal = lazy(() => import('./components/sheets/GoogleSheetsSyncModal').then(m => ({ default: m.GoogleSheetsSyncModal })));
-const SalespersonManagementModal = lazy(() => import('./components/admin/SalespersonManagementModal').then(m => ({ default: m.SalespersonManagementModal })));
-const GoodsReceivedView = lazy(() => import('./components/inventory/GoodsReceivedView').then(m => ({ default: m.GoodsReceivedView })));
-const StockMovementView = lazy(() => import('./components/inventory/StockMovementView').then(m => ({ default: m.StockMovementView })));
-const BatchTrackingView = lazy(() => import('./components/inventory/BatchTrackingView').then(m => ({ default: m.BatchTrackingView })));
-const ProcurementReorderHub = lazy(() => import('./components/inventory/ProcurementReorderHub').then(m => ({ default: m.ProcurementReorderHub })));
-const InventorySetupView = lazy(() => import('./components/inventory/InventorySetupView').then(m => ({ default: m.InventorySetupView })));
-const StocktakeHubScreen = lazy(() => import('./components/stocktake/StocktakeHubScreen').then(m => ({ default: m.StocktakeHubScreen })));
-const SupplierListScreen = lazy(() => import('./components/suppliers/SupplierListScreen').then(m => ({ default: m.SupplierListScreen })));
-const DailyGoodsReceivedReport = lazy(() => import('./components/inventory/DailyGoodsReceivedReport').then(m => ({ default: m.DailyGoodsReceivedReport })));
-const DataManagementHub = lazy(() => import('./components/admin/DataManagementHub').then(m => ({ default: m.DataManagementHub })));
-const UniversalReportBuilder = lazy(() => import('./components/reports/UniversalReportBuilder').then(m => ({ default: m.UniversalReportBuilder })));
-const CustomReportsListView = lazy(() => import('./components/reports/CustomReportsListView').then(m => ({ default: m.CustomReportsListView })));
-const P2PMeshSyncHub = lazy(() => import('./components/sync/P2PMeshSyncHub').then(m => ({ default: m.P2PMeshSyncHub })));
-const PermissionsMatrixModal = lazy(() => import('./components/admin/PermissionsMatrixModal').then(m => ({ default: m.PermissionsMatrixModal })));
-const SuperAdminDashboard = lazy(() => import('./components/admin/SuperAdminDashboard').then(m => ({ default: m.SuperAdminDashboard })));
-const TenantDiagnosticsModal = lazy(() => import('./components/admin/TenantDiagnosticsModal').then(m => ({ default: m.TenantDiagnosticsModal })));
-const BranchSetupScreen = lazy(() => import('./components/admin/BranchSetupScreen').then(m => ({ default: m.BranchSetupScreen })));
-const SyncDiagnosticsModal = lazy(() => import('./components/sync/SyncDiagnosticsModal').then(m => ({ default: m.SyncDiagnosticsModal })));
-const IncomeStatement = lazy(() => import('./reports/IncomeStatement').then(m => ({ default: m.IncomeStatement })));
-const FixedCosts = lazy(() => import('./pages/Settings/FixedCosts').then(m => ({ default: m.FixedCosts })));
+// Resilient lazy-loaded secondary admin & heavy setup modules (with automatic retry on network drops)
+const AuditLogView = lazyWithRetry(() => import('./components/admin/AuditLogView').then(m => ({ default: m.AuditLogView })), 'AuditLogView');
+const GoogleSheetsSyncModal = lazyWithRetry(() => import('./components/sheets/GoogleSheetsSyncModal').then(m => ({ default: m.GoogleSheetsSyncModal })), 'GoogleSheetsSyncModal');
+const SalespersonManagementModal = lazyWithRetry(() => import('./components/admin/SalespersonManagementModal').then(m => ({ default: m.SalespersonManagementModal })), 'SalespersonManagementModal');
+const GoodsReceivedView = lazyWithRetry(() => import('./components/inventory/GoodsReceivedView').then(m => ({ default: m.GoodsReceivedView })), 'GoodsReceivedView');
+const StockMovementView = lazyWithRetry(() => import('./components/inventory/StockMovementView').then(m => ({ default: m.StockMovementView })), 'StockMovementView');
+const BatchTrackingView = lazyWithRetry(() => import('./components/inventory/BatchTrackingView').then(m => ({ default: m.BatchTrackingView })), 'BatchTrackingView');
+const ProcurementReorderHub = lazyWithRetry(() => import('./components/inventory/ProcurementReorderHub').then(m => ({ default: m.ProcurementReorderHub })), 'ProcurementReorderHub');
+const InventorySetupView = lazyWithRetry(() => import('./components/inventory/InventorySetupView').then(m => ({ default: m.InventorySetupView })), 'InventorySetupView');
+const StocktakeHubScreen = lazyWithRetry(() => import('./components/stocktake/StocktakeHubScreen').then(m => ({ default: m.StocktakeHubScreen })), 'StocktakeHubScreen');
+const SupplierListScreen = lazyWithRetry(() => import('./components/suppliers/SupplierListScreen').then(m => ({ default: m.SupplierListScreen })), 'SupplierListScreen');
+const DailyGoodsReceivedReport = lazyWithRetry(() => import('./components/inventory/DailyGoodsReceivedReport').then(m => ({ default: m.DailyGoodsReceivedReport })), 'DailyGoodsReceivedReport');
+const DataManagementHub = lazyWithRetry(() => import('./components/admin/DataManagementHub').then(m => ({ default: m.DataManagementHub })), 'DataManagementHub');
+const UniversalReportBuilder = lazyWithRetry(() => import('./components/reports/UniversalReportBuilder').then(m => ({ default: m.UniversalReportBuilder })), 'UniversalReportBuilder');
+const CustomReportsListView = lazyWithRetry(() => import('./components/reports/CustomReportsListView').then(m => ({ default: m.CustomReportsListView })), 'CustomReportsListView');
+const PermissionsMatrixModal = lazyWithRetry(() => import('./components/admin/PermissionsMatrixModal').then(m => ({ default: m.PermissionsMatrixModal })), 'PermissionsMatrixModal');
+const SuperAdminDashboard = lazyWithRetry(() => import('./components/admin/SuperAdminDashboard').then(m => ({ default: m.SuperAdminDashboard })), 'SuperAdminDashboard');
+const TenantDiagnosticsModal = lazyWithRetry(() => import('./components/admin/TenantDiagnosticsModal').then(m => ({ default: m.TenantDiagnosticsModal })), 'TenantDiagnosticsModal');
+const BranchSetupScreen = lazyWithRetry(() => import('./components/admin/BranchSetupScreen').then(m => ({ default: m.BranchSetupScreen })), 'BranchSetupScreen');
+const SyncDiagnosticsModal = lazyWithRetry(() => import('./components/sync/SyncDiagnosticsModal').then(m => ({ default: m.SyncDiagnosticsModal })), 'SyncDiagnosticsModal');
+const IncomeStatement = lazyWithRetry(() => import('./reports/IncomeStatement').then(m => ({ default: m.IncomeStatement })), 'IncomeStatement');
+const FixedCosts = lazyWithRetry(() => import('./pages/Settings/FixedCosts').then(m => ({ default: m.FixedCosts })), 'FixedCosts');
 
 const ViewLoadingFallback = () => (
   <div className="flex flex-col items-center justify-center p-8 min-h-[220px] space-y-2.5">
