@@ -18,6 +18,7 @@ import {
 import { GoodsReceivedNote, Branch, LandedCostItem } from '../../types';
 import { getAllGoodsReceivedNotes } from '../../db/goodsReceivedNotes';
 import { getBranches } from '../../db/roomDatabase';
+import { toDateStringSafe } from '../../utils/dateUtils';
 
 interface LandedCostReportProps {
   onViewVoucher?: (voucherIdOrInvoiceNo: string) => void;
@@ -58,7 +59,7 @@ export const LandedCostReport: React.FC<LandedCostReportProps> = ({
       }
 
       // Period filter
-      const grnDate = grn.dateReceived || grn.createdAt.slice(0, 10);
+      const grnDate = grn.dateReceived || toDateStringSafe(grn.createdAt);
       if (period === 'today' && grnDate !== today) return false;
       if (period === '7days' && grnDate < d7) return false;
       if (period === '30days' && grnDate < d30) return false;

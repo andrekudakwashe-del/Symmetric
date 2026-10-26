@@ -38,6 +38,7 @@ import {
 } from '../db/goodsReceivedNotes';
 import { adjustWalletBalance } from './walletService';
 import { addMovement, getMovements, getShiftId } from '../db/cashLedger';
+import { toDateStringSafe } from '../utils/dateUtils';
 
 // Standard default threshold for Owner PIN approval on supplier payments
 export const DEFAULT_SUPPLIER_APPROVAL_THRESHOLD = 50.0;
@@ -1457,7 +1458,7 @@ export const getUnpaidGrvsForSafePayment = (): UnpaidGrvRecord[] => {
         supplierId: v.supplierId || v.supplier,
         supplierName: v.supplier || 'Supplier Delivery',
         invoiceNo: vInv,
-        date: v.date || (v.timestamp ? v.timestamp.slice(0, 10) : ''),
+        date: v.date || toDateStringSafe(v.timestamp),
         totalCost: cost,
         paymentMethod: 'SAFE_PAYOUT',
         paymentStatus: (v.paymentStatus as any) || 'AWAITING_SAFE_PAYMENT',
@@ -1494,7 +1495,7 @@ export const getUnpaidGrvsForSafePayment = (): UnpaidGrvRecord[] => {
         supplierId: g.supplierId,
         supplierName: g.supplierName || 'General Supplier',
         invoiceNo: g.invoiceNo,
-        date: g.date || (g.createdAt ? g.createdAt.slice(0, 10) : ''),
+        date: g.date || toDateStringSafe(g.createdAt),
         totalCost: cost,
         paymentMethod: g.paymentMethod || (g.payFromTill ? 'TILL' : 'SAFE_PAYOUT'),
         paymentStatus: (g.paymentStatus as any) || (g.paymentMethod === 'SAFE_PAYOUT' ? 'AWAITING_SAFE_PAYMENT' : 'UNPAID'),
@@ -1852,7 +1853,7 @@ export const getAccountTransactionLedger = (
       id: t.transfer_id,
       transferId: t.transfer_id,
       timestamp: t.created_at,
-      date: t.created_at ? t.created_at.slice(0, 10) : new Date().toISOString().slice(0, 10),
+      date: toDateStringSafe(t.created_at) || new Date().toISOString().slice(0, 10),
       type: t.type,
       description: t.notes || `${t.type.replace(/_/g, ' ')} (${otherLabel})`,
       reference: t.receipt_image_url || t.transfer_id,

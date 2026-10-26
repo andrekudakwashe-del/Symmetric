@@ -31,6 +31,7 @@ import {
   getMultiCurrencyConfig,
 } from '../db/roomDatabase';
 import { addMovement, getShiftId } from '../db/cashLedger';
+import { isSameDaySafe } from '../utils/dateUtils';
 
 export const WALLET_STORAGE_KEYS = {
   WALLETS: 'saimetric_wallets',
@@ -577,18 +578,7 @@ export const calculateWhereIsMyMoney = (date: string): WalletReconciliationItem[
   const allSales = getSales();
   const isMatchDate = (sale: any) => {
     if (sale.status === 'Refunded' || sale.status === 'Voided') return false;
-    const saleDate = sale.date || (sale.timestamp ? sale.timestamp.slice(0, 10) : '');
-    if (saleDate === date) return true;
-    if (sale.timestamp) {
-      try {
-        const d = new Date(sale.timestamp);
-        const y = d.getFullYear();
-        const m = String(d.getMonth() + 1).padStart(2, '0');
-        const day = String(d.getDate()).padStart(2, '0');
-        return `${y}-${m}-${day}` === date;
-      } catch {}
-    }
-    return false;
+    return isSameDaySafe(sale.date, sale.timestamp, date);
   };
   const sales = allSales.filter(isMatchDate);
   const transfers = getWalletTransfers().filter((t) => t.date === date);

@@ -14,6 +14,7 @@ import {
   getGoodsReceived,
 } from './roomDatabase';
 import { INITIAL_DATA_DICTIONARY } from './dataDictionary';
+import { toTimeStringSafe } from '../utils/dateUtils';
 
 /**
  * Converts a ReportJsonConfig into parameterized SQL suitable for Room @RawQuery
@@ -158,9 +159,9 @@ function getTableData(tableName: string): Record<string, any>[] {
       const invoices = getSales();
       const rows: Record<string, any>[] = [];
       invoices.forEach((inv) => {
-        const timeVal = inv.timestamp && inv.timestamp.includes('T')
+        const timeVal = (inv.timestamp && typeof inv.timestamp === 'string' && inv.timestamp.includes('T'))
           ? inv.timestamp.split('T')[1].slice(0, 8)
-          : (inv.timestamp || '12:00:00');
+          : (toTimeStringSafe(inv.timestamp) || '12:00:00');
 
         if (inv.items && inv.items.length > 0) {
           inv.items.forEach((item) => {

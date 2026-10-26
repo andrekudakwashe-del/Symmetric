@@ -13,6 +13,7 @@ import {
   subscribeToDatabase,
 } from '../db/roomDatabase';
 import { resolveItemCost } from '../utils/costResolver';
+import { toDateStringSafe } from '../utils/dateUtils';
 import {
   getInternalConsumptions,
   getWalletTransfers,
@@ -123,8 +124,8 @@ export const IncomeStatement: React.FC<IncomeStatementProps> = ({
   }, [datePreset, customStartDate, customEndDate, today]);
 
   // Helper date checker
-  const isDateInRange = (dateStr?: string, timestamp?: string) => {
-    const checkDate = dateStr || (timestamp ? timestamp.slice(0, 10) : '');
+  const isDateInRange = (dateStr?: string, timestamp?: any) => {
+    const checkDate = dateStr || toDateStringSafe(timestamp);
     if (!checkDate) return false;
     return checkDate >= startDate && checkDate <= endDate;
   };

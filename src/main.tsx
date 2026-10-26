@@ -4,24 +4,16 @@ import App from './App.tsx';
 import { GlobalErrorBoundary } from './components/common/GlobalErrorBoundary.tsx';
 import './index.css';
 
-// Register Service Worker in production for offline PWA; unregister in development to avoid intercepting Vite
+// Register Service Worker in production for offline PWA; unregister in development or within iframes to avoid intercepting Vite
 if ('serviceWorker' in navigator) {
-  if (import.meta.env.DEV) {
+  const isIframe = typeof window !== 'undefined' && window.self !== window.top;
+  if (import.meta.env.DEV || isIframe) {
     navigator.serviceWorker.getRegistrations().then((registrations) => {
       for (const reg of registrations) {
         reg.unregister().catch(() => {});
       }
-    });
+    }).catch(() => {});
   } else {
-    let isRefreshing = false;
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (!isRefreshing) {
-        isRefreshing = true;
-        console.info('[PWA] New service worker activated, reloading application seamlessly...');
-        window.location.reload();
-      }
-    });
-
     window.addEventListener('load', () => {
       navigator.serviceWorker
         .register('/sw.js', { scope: '/' })

@@ -1124,6 +1124,16 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
                                 ({Object.values(currentPkg?.features || {}).filter(Boolean).length}/45 fn)
                               </span>
                             </div>
+                            <div className="text-[10px] text-slate-400 mt-1 flex items-center gap-1.5 flex-wrap">
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800/90 text-slate-300 border border-slate-700/80 font-medium">
+                                <Users className="w-2.5 h-2.5 text-indigo-400" />
+                                <span>Staff: {currentPkg?.maxStaff && currentPkg.maxStaff < 999 ? `Up to ${currentPkg.maxStaff} staff` : 'Unlimited staff'}</span>
+                              </span>
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800/90 text-slate-300 border border-slate-700/80 font-medium">
+                                <Building2 className="w-2.5 h-2.5 text-emerald-400" />
+                                <span>Branches: {currentPkg?.maxBranches && currentPkg.maxBranches < 999 ? `Up to ${currentPkg.maxBranches}` : 'Unlimited'}</span>
+                              </span>
+                            </div>
                           </td>
 
                           {/* Package Dropdown Selector */}
@@ -1140,7 +1150,7 @@ export const PackageSetupView: React.FC<PackageSetupViewProps> = ({
                               >
                                 {packages.map((p) => (
                                   <option key={p.id} value={p.id}>
-                                    {p.name} — ${p.priceMonthly}/mo ({Object.values(p.features || {}).filter(Boolean).length} functions)
+                                    {p.name} — ${p.priceMonthly}/mo ({p.maxStaff && p.maxStaff < 999 ? `${p.maxStaff} staff` : 'unlimited staff'}, {Object.values(p.features || {}).filter(Boolean).length} fn)
                                   </option>
                                 ))}
                               </select>

@@ -39,6 +39,7 @@ import {
   getAccountTransactionLedger,
   AccountLedgerEntry,
 } from '../../services/cashCustodyService';
+import { toTimeStringSafe } from '../../utils/dateUtils';
 import {
   PlusCircle,
   ArrowRightLeft,
@@ -255,7 +256,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
     if (!ledgerData || !ledgerData.account) return;
     const acc = ledgerData.account;
     const rows = ledgerData.filteredEntries.map((e) => [
-      `"${e.date} ${e.timestamp ? e.timestamp.slice(11, 16) : ''}"`,
+      `"${e.date} ${toTimeStringSafe(e.timestamp)}"`,
       `"${e.transferId}"`,
       `"${(e.description || '').replace(/"/g, '""')}"`,
       `"${(e.recipientOrSource || '').replace(/"/g, '""')}"`,
@@ -2224,7 +2225,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
                         <tr key={`${e.id}-${idx}`} className="hover:bg-slate-800/40 transition">
                           <td className="py-2.5 px-3 font-mono text-[11px] text-slate-400 whitespace-nowrap">
                             <div>{e.date}</div>
-                            <div className="text-[9px] text-slate-500">{e.timestamp ? e.timestamp.slice(11, 16) : ''}</div>
+                            <div className="text-[9px] text-slate-500">{toTimeStringSafe(e.timestamp)}</div>
                           </td>
 
                           <td className="py-2.5 px-3 font-mono text-[11px] whitespace-nowrap">

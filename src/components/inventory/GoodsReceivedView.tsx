@@ -81,6 +81,7 @@ import { LandedCostReport } from './LandedCostReport';
 import { ProcurementTripManifestView } from './ProcurementTripManifestView';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
+import { safeDateSlice } from '../../utils/dateUtils';
 
 interface GoodsReceivedViewProps {
   currentUser: Salesperson | null;
@@ -3246,7 +3247,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   {filteredLogs.map((log, logIdx) => (
                     <tr key={`${log.grnId || log.id || 'grn'}-${logIdx}`} className="hover:bg-slate-800/50">
                       <td className="py-2.5 px-3 font-mono text-slate-400 text-[11px]">
-                        {log.timestamp.slice(0, 16).replace('T', ' ')}
+                        {safeDateSlice(log.timestamp, 0, 16).replace('T', ' ')}
                       </td>
                       <td className="py-2.5 px-3">
                         <span className="font-mono font-bold text-white block">{log.invoiceNo || log.grnId}</span>

@@ -647,6 +647,8 @@ export const isModuleAllowedForUser = (
   if (tab === 'pos' && roleDef.allowedModules.includes('counter')) return true;
   if (tab === 'reconciliation' && roleDef.allowedModules.includes('cash_balancing')) return true;
   if (tab === 'cash_balancing' && roleDef.allowedModules.includes('reconciliation')) return true;
+  if (tab === 'salespeople' && roleDef.allowedModules.includes('staff_access')) return true;
+  if (tab === 'staff_access' && roleDef.allowedModules.includes('salespeople')) return true;
 
   return false;
 };

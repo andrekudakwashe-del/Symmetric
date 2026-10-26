@@ -34,6 +34,7 @@ import {
 } from '../../services/backendAdapter/adapterRegistry';
 import { migrationEngineService } from '../../services/backendAdapter/migrationEngine';
 import { roomBackendAdapter } from '../../services/backendAdapter/adapters/RoomAdapter';
+import { toTimeStringSafe } from '../../utils/dateUtils';
 
 interface MigrationWizardModalProps {
   isOpen: boolean;
@@ -127,7 +128,7 @@ export const MigrationWizardModal: React.FC<MigrationWizardModalProps> = ({
         sourceRetentionPolicy,
         onProgress: (evt) => {
           setProgressEvent(evt);
-          setLiveLogs((prev) => [...prev, `[${evt.timestamp.split('T')[1].split('.')[0]}] ${evt.message}`]);
+          setLiveLogs((prev) => [...prev, `[${toTimeStringSafe(evt.timestamp) || 'LIVE'}] ${evt.message}`]);
         },
       });
 

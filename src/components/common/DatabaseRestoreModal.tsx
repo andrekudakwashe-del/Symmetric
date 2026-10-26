@@ -28,6 +28,7 @@ import {
   BackupPayload,
 } from '../../services/databaseBackupService';
 import { backupCryptoService } from '../../services/backupCryptoService';
+import { safeDateSlice, toDateStringSafe } from '../../utils/dateUtils';
 
 interface DatabaseRestoreModalProps {
   isOpen: boolean;
@@ -265,7 +266,7 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
                     <span>EOD Supervisor Handover Summary</span>
                   </div>
                   <span className="text-[10px] bg-emerald-900 text-emerald-200 px-2 py-0.5 rounded font-mono font-bold">
-                    {handover.shiftDate || manifest.timestamp.slice(0, 10)}
+                    {handover.shiftDate || toDateStringSafe(manifest.timestamp)}
                   </span>
                 </div>
 
@@ -348,7 +349,7 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>Date:</span>
-                  <span className="text-white">{manifest.timestamp.replace('T', ' ').slice(0, 19)}</span>
+                  <span className="text-white">{safeDateSlice(manifest.timestamp, 0, 19).replace('T', ' ')}</span>
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>Total Records:</span>

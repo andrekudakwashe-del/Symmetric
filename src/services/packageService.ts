@@ -531,7 +531,7 @@ export const DEFAULT_PACKAGES: SaaSPackage[] = [
     priceAnnual: 150,
     currency: 'USD',
     maxBranches: 1,
-    maxStaff: 2,
+    maxStaff: 5,
     isDefault: true,
     isActive: true,
     features: buildFeatureSet('starter'),
@@ -548,7 +548,7 @@ export const DEFAULT_PACKAGES: SaaSPackage[] = [
     priceAnnual: 350,
     currency: 'USD',
     maxBranches: 3,
-    maxStaff: 10,
+    maxStaff: 15,
     isDefault: false,
     isActive: true,
     features: buildFeatureSet('pro'),
@@ -814,8 +814,10 @@ export function checkStaffLimit(companyOrId?: Company | string | null): {
       ? companyOrId
       : companyOrId?.company_id || getCurrentCompany().company_id;
   const staff = getSalespeopleForCompany(compId);
-  const currentCount = staff.length;
-  const max = pkg?.maxStaff ?? 2;
+  // Count active staff only so inactive staff do not consume license slots
+  const activeStaff = staff.filter((s) => s.active !== 'N');
+  const currentCount = activeStaff.length;
+  const max = pkg?.maxStaff ?? 5;
 
   return {
     allowed: max >= 999 ? true : currentCount < max,

@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { SaleInvoice, ActiveTab, PaymentMethod, Salesperson } from '../../types';
 import { getSales, getAllSales, getAllBranchesSales, refundSaleInvoice, voidSaleInvoice, editSaleInvoice, isSupervisorOrAbove, subscribeToDatabase, getTodayDateString, getCurrentBranch } from '../../db/roomDatabase';
+import { toDateStringSafe, isSameDaySafe } from '../../utils/dateUtils';
 import {
   Receipt,
   Search,
@@ -209,19 +210,10 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     const todayLocal = getTodayDateString();
 
     return sales.filter((sale) => {
-      const saleDate = sale.date || (sale.timestamp ? sale.timestamp.slice(0, 10) : '');
+      const saleDate = sale.date || toDateStringSafe(sale.timestamp);
 
       if (activePeriodType === 'today') {
-        let isToday = saleDate === todayLocal || saleDate === todayUtc;
-        if (!isToday && sale.timestamp) {
-          try {
-            const localD = new Date(sale.timestamp);
-            const y = localD.getFullYear();
-            const m = String(localD.getMonth() + 1).padStart(2, '0');
-            const d = String(localD.getDate()).padStart(2, '0');
-            isToday = `${y}-${m}-${d}` === todayLocal || `${y}-${m}-${d}` === todayUtc;
-          } catch {}
-        }
+        const isToday = isSameDaySafe(sale.date, sale.timestamp, todayLocal) || isSameDaySafe(sale.date, sale.timestamp, todayUtc);
         return isToday;
       }
 

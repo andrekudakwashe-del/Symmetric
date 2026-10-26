@@ -43,6 +43,7 @@ import { ManagerPinModal } from '../common/ManagerPinModal';
 import { getAllMovements, getShiftId, matchesShift, CashMovement } from '../../db/cashLedger';
 import { CustomerSearchModal } from '../common/CustomerSearchModal';
 import { downloadCsvFile } from '../../services/googleSheetsSync';
+import { isSameDaySafe } from '../../utils/dateUtils';
 import {
   Scale,
   DollarSign,
@@ -416,7 +417,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         (t) =>
           t.type === 'TILL_COLLECTION' &&
           t.status === 'COMPLETED' &&
-          t.created_at?.startsWith(date) &&
+          isSameDaySafe(undefined, t.created_at, date) &&
           (t.recipient_name?.toLowerCase() === row.staffName.toLowerCase() ||
             t.notes?.toLowerCase().includes(row.staffName.toLowerCase()) ||
             t.from_account_id?.includes(row.staffId))
@@ -563,7 +564,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         (t) =>
           t.type === 'TILL_COLLECTION' &&
           t.status === 'COMPLETED' &&
-          t.created_at?.startsWith(date) &&
+          isSameDaySafe(undefined, t.created_at, date) &&
           (t.recipient_name?.toLowerCase() === row.staffName.toLowerCase() ||
             t.notes?.toLowerCase().includes(row.staffName.toLowerCase()) ||
             t.from_account_id?.includes(row.staffId))
@@ -1518,7 +1519,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                                   (t) =>
                                     t.type === 'TILL_COLLECTION' &&
                                     t.status === 'COMPLETED' &&
-                                    t.created_at?.startsWith(date) &&
+                                    isSameDaySafe(undefined, t.created_at, date) &&
                                     (t.recipient_name?.toLowerCase() === row.staffName.toLowerCase() ||
                                       t.notes?.toLowerCase().includes(row.staffName.toLowerCase()) ||
                                       t.from_account_id?.includes(row.staffId))

@@ -3,6 +3,7 @@ import {
 } from './backupCryptoService';
 import { setStored, cleanupLocalStorageQuota } from '../db/roomDatabase';
 import { setMeta } from '../db/indexedDBService';
+import { toDateStringSafe, safeDateSlice, isSameDaySafe } from '../utils/dateUtils';
 
 export type BackupType = 'FULL' | 'DELTA' | 'EOD_HANDOVER' | 'ADMIN_MASTER_UPDATE';
 
@@ -145,7 +146,7 @@ export function recordBackupCompletion(type: BackupType, timestamp: string, file
       timestamp,
       type,
       fileName,
-      date: timestamp.split('T')[0],
+      date: toDateStringSafe(timestamp),
     };
     const updated = [entry, ...history].slice(0, 10);
     window.localStorage.setItem(STORAGE_BACKUP_HISTORY, JSON.stringify(updated));
@@ -314,13 +315,13 @@ export function generateDatabasePayload(
   if (type === 'EOD_HANDOVER') {
     const allSales = tables['saimetric_room_sales'] || [];
     const todaySales = allSales.filter(
-      (s: any) => s && (s.date === todayStr || (s.timestamp && s.timestamp.startsWith(todayStr)))
+      (s: any) => s && isSameDaySafe(s.date, s.timestamp, todayStr)
     );
     const totalSalesUsd = todaySales.reduce((acc: number, s: any) => acc + (Number(s.total) || 0), 0);
 
     const allCashLogs = tables['saimetric_room_cash_logs'] || [];
     const todayLogs = allCashLogs.filter(
-      (c: any) => c && (c.date === todayStr || (c.timestamp && c.timestamp.startsWith(todayStr)))
+      (c: any) => c && isSameDaySafe(c.date, c.timestamp, todayStr)
     );
     const cashIn = todayLogs.reduce((acc: number, l: any) => acc + (Number(l.in) || 0), 0);
     const cashOut = todayLogs.reduce((acc: number, l: any) => acc + (Number(l.out) || 0), 0);
@@ -331,7 +332,7 @@ export function generateDatabasePayload(
 
     const allChanges = tables['saimetric_room_customer_changes'] || [];
     const todayChanges = allChanges.filter(
-      (c: any) => c && (c.date === todayStr || (c.timestamp && c.timestamp.startsWith(todayStr)))
+      (c: any) => c && isSameDaySafe(c.date, c.timestamp, todayStr)
     );
     const uncollectedChangeUsd = todayChanges.reduce(
       (acc: number, c: any) => acc + (Number(c.amount) || 0),
@@ -340,7 +341,7 @@ export function generateDatabasePayload(
 
     const allCredits = tables['saimetric_room_credit_sales'] || [];
     const todayCredits = allCredits.filter(
-      (c: any) => c && (c.date === todayStr || (c.timestamp && c.timestamp.startsWith(todayStr)))
+      (c: any) => c && isSameDaySafe(c.date, c.timestamp, todayStr)
     );
     const creditIssuedUsd = todayCredits.reduce(
       (acc: number, c: any) => acc + (Number(c.amount) || 0),
@@ -403,7 +404,7 @@ export async function createEncryptedBackupFile(
   const payload = generateDatabasePayload(type, exportedBy, shiftNotes, clearanceLevel, clearanceRole);
   const encryptedContent = await backupCryptoService.encryptBackupPayload(payload, passphrase);
 
-  const cleanDate = payload.manifest.timestamp.slice(0, 10);
+  const cleanDate = safeDateSlice(payload.manifest.timestamp, 0, 10);
   let typeTag = 'DELTA';
   if (type === 'FULL') typeTag = 'FULL_SNAPSHOT';
   if (type === 'EOD_HANDOVER') typeTag = 'EOD_HANDOVER';

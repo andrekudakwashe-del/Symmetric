@@ -11,6 +11,7 @@ import {
   putToIDBStore,
   executeTx,
 } from './indexedDBService';
+import { toDateStringSafe } from '../utils/dateUtils';
 
 export const GRN_STORAGE_KEY = 'saimetric_room_goods_received_notes';
 export const IDB_GRN_STORE = 'goodsReceivedNotes';
@@ -101,7 +102,7 @@ export const saveGoodsReceivedNote = (grn: GoodsReceivedNote): GoodsReceivedNote
  * Convert legacy DirectGrv to unified GoodsReceivedNote
  */
 export const directGrvToGrn = (grv: DirectGrv): GoodsReceivedNote => {
-  const dateReceived = grv.date || (grv.createdAt ? grv.createdAt.slice(0, 10) : new Date().toISOString().split('T')[0]);
+  const dateReceived = grv.date || toDateStringSafe(grv.createdAt) || new Date().toISOString().split('T')[0];
   const paymentRef = grv.tillPayoutId || (grv.payments && grv.payments[0] ? `till_${grv.payments[0].userId}` : undefined);
   const cashMovementId = grv.tillPayoutId || (grv.payments && grv.payments[0] ? `till_${grv.payments[0].userId}` : undefined) || grv.id;
   
@@ -235,7 +236,7 @@ export const grnToDirectGrv = (grn: GoodsReceivedNote): DirectGrv => {
  * Convert legacy SupplierInvoiceVoucher to unified GoodsReceivedNote
  */
 export const supplierInvoiceToGrn = (voucher: SupplierInvoiceVoucher): GoodsReceivedNote => {
-  const dateReceived = voucher.date || (voucher.timestamp ? voucher.timestamp.slice(0, 10) : new Date().toISOString().split('T')[0]);
+  const dateReceived = voucher.date || toDateStringSafe(voucher.timestamp) || new Date().toISOString().split('T')[0];
   const isPaid = (voucher.paymentTerms || '').toLowerCase().includes('paid');
   const paymentMode = isPaid ? 'already_paid' : 'credit_account';
 

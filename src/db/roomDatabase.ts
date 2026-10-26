@@ -129,6 +129,7 @@ import {
 import { landedCostService } from '../services/landedCostService';
 import { LandedCostItem } from '../types';
 import { resolveItemCost } from '../utils/costResolver';
+import { toDateStringSafe, safeDateSlice, isSameDaySafe } from '../utils/dateUtils';
 
 export {
   getAllGoodsReceivedNotes,
@@ -6331,7 +6332,7 @@ export const getExpensesForStaffAndDate = (staffId: string, date: string): Expen
       expStaffId === targetStaffId ||
       (normTarget && normExpStaff === normTarget);
 
-    const isSameDate = (e.date || (e.timestamp ? e.timestamp.slice(0, 10) : '')) === date;
+    const isSameDate = isSameDaySafe(e.date, e.timestamp, date);
     return isSameStaff && isSameDate;
   });
 };
@@ -6436,7 +6437,7 @@ export const approveAllExpensesForStaffAndDate = (staffId: string, date: string,
   const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
 
   const updated = all.map((e) => {
-    const isDateMatch = (e.date || (e.timestamp ? e.timestamp.slice(0, 10) : '')) === date;
+    const isDateMatch = isSameDaySafe(e.date, e.timestamp, date);
     const expStaffId = e.staffId ? String(e.staffId).trim().toLowerCase() : '';
     const normExpStaff = expStaffId.replace(/^usr-|^staff-|^0+/, '');
     const isStaffMatch = !targetStaffId || targetStaffId === 'all' || expStaffId === targetStaffId || (normTarget && normExpStaff === normTarget);
@@ -6665,21 +6666,7 @@ export const getSalesForStaffAndDate = (staffId: string, date: string, staffName
       (saleStaffName && targetStaffId && saleStaffName.toLowerCase().includes(targetStaffId));
 
     // Support both direct date match and local timestamp date match
-    const saleDate = s.date || '';
-    let isSameDate = saleDate === date;
-    if (!isSameDate && s.timestamp) {
-      const utcDate = s.timestamp.slice(0, 10);
-      try {
-        const localD = new Date(s.timestamp);
-        const y = localD.getFullYear();
-        const m = String(localD.getMonth() + 1).padStart(2, '0');
-        const d = String(localD.getDate()).padStart(2, '0');
-        const localDateStr = `${y}-${m}-${d}`;
-        isSameDate = utcDate === date || localDateStr === date;
-      } catch {
-        isSameDate = utcDate === date;
-      }
-    }
+    const isSameDate = isSameDaySafe(s.date, s.timestamp, date);
     const isValidStatus = s.status !== 'Refunded' && s.status !== 'Voided';
     return isSameStaff && isSameDate && isValidStatus;
   });
@@ -10315,7 +10302,7 @@ export const getProductAuditTrail = (itemId: string): StockMovementEntry[] => {
           filtered.push({
             txnId: `SALE-${sale.id}-${sId}`,
             movementId: `SALE-${sale.id}-${sId}`,
-            date: sale.date || (sale.timestamp ? sale.timestamp.split('T')[0] : getTodayDateString()),
+            date: sale.date || toDateStringSafe(sale.timestamp) || getTodayDateString(),
             timestamp: sale.timestamp || new Date().toISOString(),
             staffId: sale.staffId || 'POS-001',
             staffName: sale.staffName || 'Cashier / POS',
@@ -11111,7 +11098,7 @@ export const getDailyGoodsReceivedReport = (
 
   // Filter vouchers for this date and optionally branch
   const vouchers = allVouchers.filter((v) => {
-    const matchesDate = v.date === date || (v.timestamp && v.timestamp.startsWith(date));
+    const matchesDate = isSameDaySafe(v.date, v.timestamp, date);
     const matchesBranch = !branchId || branchId === 'ALL' || v.branchId === branchId;
     return matchesDate && matchesBranch;
   });
@@ -13874,7 +13861,7 @@ export const getDirectGrvsForStaffAndDate = (staffId: string, date: string): Dir
 
   return grvs.filter((g) => {
     if (g.status === 'REJECTED') return false;
-    const gDate = g.date || (g.createdAt ? g.createdAt.slice(0, 10) : '');
+    const gDate = g.date || toDateStringSafe(g.createdAt);
     if (gDate !== date) return false;
 
     // Check receivedByStaffId

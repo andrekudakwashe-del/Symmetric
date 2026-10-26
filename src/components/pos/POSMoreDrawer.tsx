@@ -75,8 +75,8 @@ export const POSMoreDrawer: React.FC<POSMoreDrawerProps> = ({
   const isSupervisorOrManager = isSupervisorOrAbove(currentUser?.role);
   const isAdmin = currentUser?.role === 'Admin' || isOwner || isSuperAdmin;
   const isManager = currentUser?.role === 'MANAGER' || isAdmin || isSupervisorOrManager;
-  const canManageBranches = isSuperAdmin || isOwner;
-  const canManageStaff = isSuperAdmin || isOwner || currentUser?.role === 'Admin' || currentUser?.role === 'MANAGER';
+  const canManageStaff = isSuperAdmin || isOwner || isAdmin || isManager || currentUser?.role === 'Admin' || currentUser?.role === 'MANAGER' || (currentUser?.role || '').toUpperCase().includes('MANAGER') || (currentUser?.role || '').toUpperCase().includes('OWNER') || Boolean(currentUser?.permissions?.canManageStaff);
+  const canManageBranches = isSuperAdmin || isOwner || isAdmin || currentUser?.role === 'Admin' || (currentUser?.role || '').toUpperCase().includes('OWNER');
   const canManageData = isSuperAdmin || isOwner || currentUser?.role === 'Admin' || currentUser?.role === 'MANAGER';
   const canViewReports = isSupervisorOrManager || Boolean(currentUser?.permissions?.canViewReports);
 
