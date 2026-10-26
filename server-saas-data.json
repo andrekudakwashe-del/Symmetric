@@ -5371,5 +5371,18 @@
     }
   ],
   "inventory": [],
-  "sales": []
+  "sales": [
+    {
+      "id": "TEST-ACK-1792998285090",
+      "total": 25.5,
+      "timestamp": 1792998285090,
+      "items": [
+        {
+          "id": "PRD-001",
+          "quantity": 1,
+          "name": "Test Item"
+        }
+      ]
+    }
+  ]
 }

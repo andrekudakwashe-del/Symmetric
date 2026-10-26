@@ -550,12 +550,33 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               </button>
             </div>
 
-            <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 text-left text-xs text-slate-400 space-y-1 max-w-md mx-auto">
-              <p className="font-bold text-slate-300">Termux Android Host Setup:</p>
-              <p className="font-mono text-[11px] text-indigo-300 bg-slate-900 px-2.5 py-1.5 rounded-lg border border-slate-800">
-                node server.js --port 8080
+            <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 text-left text-xs text-slate-400 space-y-2 max-w-md mx-auto">
+              <div className="flex items-center justify-between">
+                <p className="font-bold text-slate-200">Termux Android Host Setup:</p>
+                <a
+                  href="/termux-hub.js"
+                  download="termux-hub.js"
+                  className="text-[10px] font-bold text-indigo-400 hover:text-indigo-300 underline"
+                >
+                  Download termux-hub.js
+                </a>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-relaxed">
+                Run this high-reliability hub script on the host phone. Includes <strong>SYNC_RECEIPT (ACK)</strong>, <strong>Catch-Up Sync</strong>, and <strong>Anti-Echo</strong> safeguards:
               </p>
-              <p className="text-[11px]">
+              <div className="flex items-center justify-between p-2 rounded-lg bg-slate-900 border border-slate-800">
+                <code className="font-mono text-[11px] text-indigo-300 select-all">
+                  node termux-hub.js --port 8080
+                </code>
+                <button
+                  type="button"
+                  onClick={() => handleCopy('node termux-hub.js --port 8080')}
+                  className="text-[10px] font-bold px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+                >
+                  Copy
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-400">
                 Turn on Android Portable Hotspot. Termux will bind to <code>192.168.43.1:8080</code>.
               </p>
             </div>

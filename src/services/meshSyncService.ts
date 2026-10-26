@@ -239,14 +239,40 @@ class MeshSyncManager {
   private checkPendingSaleAcks() {
     if (this.pendingSaleAcks.size === 0) return;
     const now = Date.now();
+    const MAX_RETRIES = 3;
+
     for (const [invoiceId, pending] of this.pendingSaleAcks.entries()) {
+      // 1. Check if already marked synced in local RoomDatabase
+      const allSales = getAllSales();
+      const existing = allSales.find((s) => s.id === invoiceId);
+      if (existing && (existing.synced || existing.syncStatus === 'synced')) {
+        this.pendingSaleAcks.delete(invoiceId);
+        continue;
+      }
+
       if (now - pending.lastRetryAt >= 30000) {
+        // 2. Safeguard against infinite echo storms / bandwidth exhaustion:
+        // Cap retries at 3 attempts (90s). If Hub/peers don't ACK, stop spamming WebSocket.
+        // Sale is 100% safely preserved in local database & IndexedDB queue with zero data loss.
+        if (pending.retries >= MAX_RETRIES) {
+          this.pendingSaleAcks.delete(invoiceId);
+          this.addLog(
+            'CONFLICT_RESOLVED',
+            `Sync Receipt Watchdog: Max retries (${MAX_RETRIES}) reached for Sale #${invoiceId}. Halting WebSocket re-transmission to protect local network bandwidth. Record is safely preserved in local database & sync queue.`,
+            this.config.deviceName,
+            undefined,
+            undefined,
+            invoiceId
+          );
+          continue;
+        }
+
         if (this.isLocalHubConnected && this.localHubWs && this.localHubWs.readyState === WebSocket.OPEN) {
           pending.retries++;
           pending.lastRetryAt = now;
           this.addLog(
             'BROADCAST',
-            `Sync Receipt Watchdog: Sale #${invoiceId} unconfirmed after 30s. Retrying transmission to Local Hub (Attempt #${pending.retries})...`,
+            `Sync Receipt Watchdog: Sale #${invoiceId} unconfirmed after 30s. Retrying transmission to Local Hub (Attempt #${pending.retries}/${MAX_RETRIES})...`,
             this.config.deviceName,
             undefined,
             5,
@@ -914,16 +940,16 @@ class MeshSyncManager {
         this.notifyPeerSubscribers(true);
         this.notifyConnectionModeChange();
 
-        // Safeguard 2: Trigger catch-up sync ONCE upon connection using last_synced_timestamp
+        // Safeguard 2: Trigger catch-up sync upon connection using last_synced_timestamp
         // Pull ONLY missed deltas rather than blindly accepting full history
         setTimeout(() => {
-          if (this.isLocalHubConnected && (!this.hasPerformedInitialCatchup || Date.now() - this.lastInitialCatchupTime > 30000)) {
+          if (this.isLocalHubConnected) {
             this.hasPerformedInitialCatchup = true;
             this.lastInitialCatchupTime = Date.now();
             const lastSync = this.getLastMeshSyncTimestamp();
-            this.requestCatchUpSync('ALL', lastSync, false).catch(() => {});
+            this.requestCatchUpSync('ALL', lastSync, false, true).catch(() => {});
           }
-        }, 1200);
+        }, 800);
       };
 
       ws.onmessage = async (event) => {
@@ -1111,6 +1137,11 @@ class MeshSyncManager {
     if (pType === 'sale' || pType === 'SALE_RECORD' || packet.sale) {
       const saleData: SaleInvoice = packet.sale || packet.payload;
       if (saleData && saleData.id) {
+        // If this sale was waiting for ACK, remove it and mark as synced (implicit ACK on relay)
+        if (this.pendingSaleAcks.has(saleData.id)) {
+          this.handleIncomingSaleSyncReceipt(saleData.id, originName);
+        }
+
         if (this.knownSaleIds.has(saleData.id)) {
           return;
         }
@@ -1255,13 +1286,19 @@ class MeshSyncManager {
       return;
     }
 
-    // 12. CATCHUP RESPONSE (Replayed burst history from server)
+    // 12. CATCHUP RESPONSE (Replayed burst history from server or peer)
     if (pType === 'catchup_response' || pType === 'CATCHUP_RESPONSE') {
       this.handleIncomingCatchupResponse(packet);
       return;
     }
 
-    // For all other packets (heartbeat, ping, catchup_request):
+    // 13. CATCHUP REQUEST (Missed delta request from returning peer or hub)
+    if (pType === 'catchup_request' || pType === 'CATCHUP_REQUEST') {
+      this.handleIncomingCatchupRequest(packet);
+      return;
+    }
+
+    // For all other packets (heartbeat, ping):
     // Ingest silently if needed, but NEVER call sendPacketToAllTransports or ws.send()
   }
 
@@ -1335,7 +1372,7 @@ class MeshSyncManager {
     const wsTarget = this.localHubWs || this.directWsClient;
     if (!wsTarget || wsTarget.readyState !== WebSocket.OPEN) return;
     try {
-      // Drain pending in-memory packets that occurred while socket was connecting
+      // 1. Drain pending in-memory packets that occurred while socket was connecting
       if (this.pendingLocalHubQueue.length > 0) {
         const count = this.pendingLocalHubQueue.length;
         this.addLog(
@@ -1347,6 +1384,53 @@ class MeshSyncManager {
           const queuedPacket = this.pendingLocalHubQueue.shift();
           if (queuedPacket) {
             wsTarget.send(JSON.stringify(queuedPacket));
+          }
+        }
+      }
+
+      // 2. CRITICAL SAFEGUARD: Scan local database for any offline sales made while disconnected
+      // Even if user navigated tabs or refreshed while offline, all unsynced sales are flushed to Hub!
+      const allSales = getAllSales();
+      const unsyncedSales = allSales.filter(
+        (s) => s && s.id && !(s as any).fromMesh && !s.synced && s.syncStatus !== 'synced'
+      );
+
+      if (unsyncedSales.length > 0) {
+        this.addLog(
+          'BROADCAST',
+          `Reconnection Catch-Up: Flushing ${unsyncedSales.length} offline sale(s) to Local Hub...`,
+          this.config.deviceName
+        );
+
+        for (const sale of unsyncedSales) {
+          // Register in pendingSaleAcks to await SYNC_RECEIPT ACK from Hub
+          this.pendingSaleAcks.set(sale.id, {
+            sale,
+            sentAt: Date.now(),
+            lastRetryAt: Date.now(),
+            retries: 0,
+          });
+
+          const offlinePacket = {
+            type: 'sale',
+            action: 'SALE_RECORD',
+            packet_id: `OFFLINE-FLUSH-${sale.id}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: this.config.branchId,
+            branchCode: this.config.branchCode,
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            sale,
+            timestamp: sale.timestamp || Date.now(),
+            ttl: 5,
+            isOfflineCatchup: true,
+          };
+
+          try {
+            wsTarget.send(JSON.stringify(offlinePacket));
+          } catch (err) {
+            console.warn('[MeshSync] Error sending offline sale to hub:', err);
           }
         }
       }
@@ -2851,6 +2935,7 @@ class MeshSyncManager {
       targetDeviceName: originName,
       sinceTimestamp,
       cutoffTimestamp: new Date().toISOString(),
+      isReciprocal: true,
       delta: enrichedDelta,
       summary: {
         salesCount: delta.sales.length,
