@@ -17,6 +17,7 @@ import {
   ExternalLink,
   Plus,
   RotateCcw,
+  ArrowLeftRight,
   Ban,
   ShieldCheck,
   ShieldAlert,
@@ -30,7 +31,7 @@ import {
 } from 'lucide-react';
 import { ReceiptModal } from '../common/ReceiptModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
-import { EditReceiptModal } from './EditReceiptModal';
+import { ItemExchangeModal } from './ItemExchangeModal';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
 
@@ -138,27 +139,16 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     };
   }, []);
 
-  const handleTriggerRefund = (invoice: SaleInvoice) => {
-    if (invoice.status === 'Refunded' || invoice.status === 'Voided') return;
-    setManagerModalConfig({
-      isOpen: true,
-      title: 'Manager Authorization: Invoice Refund',
-      subtitle: `Refunding #${invoice.id} ($${invoice.total.toFixed(2)}) requires authorization`,
-      actionType: 'REFUND',
-      actionDescription: `Full refund for Invoice #${invoice.id} to ${invoice.customerName}`,
-      amount: invoice.total,
-      invoice,
-    });
-  };
+  const [exchangeInvoice, setExchangeInvoice] = useState<SaleInvoice | null>(null);
 
-  const handleTriggerVoid = (invoice: SaleInvoice) => {
+  const handleTriggerRefundVoid = (invoice: SaleInvoice) => {
     if (invoice.status === 'Refunded' || invoice.status === 'Voided') return;
     setManagerModalConfig({
       isOpen: true,
-      title: 'Manager Authorization: Void Invoice',
-      subtitle: `Voiding #${invoice.id} ($${invoice.total.toFixed(2)}) requires authorization`,
-      actionType: 'VOID',
-      actionDescription: `Void transaction #${invoice.id} and reverse inventory & cash entries`,
+      title: 'Manager Authorization: Refund / Void Sale',
+      subtitle: `Refund / Void #${invoice.id} (${invoice.total.toFixed(2)}) requires authorization`,
+      actionType: 'REFUND',
+      actionDescription: `Refund / Void transaction #${invoice.id}, restock items to inventory, and balance cashier drawer`,
       amount: invoice.total,
       invoice,
     });
@@ -168,32 +158,17 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     if (!managerModalConfig) return;
     const { actionType, invoice } = managerModalConfig;
 
-    if (actionType === 'REFUND') {
-      const res = refundSaleInvoice({
-        invoiceId: invoice.id,
-        manager,
-        cashier: currentUser || undefined,
-        reason,
-      });
-      if (res.success) {
-        setActionNotice({ text: `Invoice #${invoice.id} refunded. Authorized by ${manager.role} ${manager.name}.`, type: 'success' });
-        loadData();
-      } else {
-        setActionNotice({ text: res.message, type: 'error' });
-      }
+    const res = refundSaleInvoice({
+      invoiceId: invoice.id,
+      manager,
+      cashier: currentUser || undefined,
+      reason,
+    });
+    if (res.success) {
+      setActionNotice({ text: `Invoice #${invoice.id} refunded / voided. Inventory restocked & cashier till adjusted. Authorized by ${manager.role} ${manager.name}.`, type: 'success' });
+      loadData();
     } else {
-      const res = voidSaleInvoice({
-        invoiceId: invoice.id,
-        manager,
-        cashier: currentUser || undefined,
-        reason,
-      });
-      if (res.success) {
-        setActionNotice({ text: `Invoice #${invoice.id} voided. Authorized by ${manager.role} ${manager.name}.`, type: 'success' });
-        loadData();
-      } else {
-        setActionNotice({ text: res.message, type: 'error' });
-      }
+      setActionNotice({ text: res.message, type: 'error' });
     }
 
     setManagerModalConfig(null);
@@ -703,36 +678,26 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
                           <span>Receipt</span>
                         </button>
 
-                        <button
-                          type="button"
-                          onClick={() => handleTriggerEdit(sale)}
-                          className="px-2.5 py-1 rounded-xl bg-amber-600/30 hover:bg-amber-600 text-amber-200 hover:text-white text-xs font-bold border border-amber-500/40 transition-colors flex items-center space-x-1"
-                          title="Edit Receipt Details (Requires Authorization & Logged in Audit Trail)"
-                        >
-                          <Pencil className="w-3 h-3" />
-                          <span>Edit</span>
-                        </button>
-
                         {isCompleted && (
                           <>
                             <button
                               type="button"
-                              onClick={() => handleTriggerRefund(sale)}
-                              className="px-2 py-1 rounded-xl bg-amber-950/60 hover:bg-amber-900 text-amber-300 hover:text-white text-xs font-semibold border border-amber-800/60 flex items-center space-x-1 transition-colors"
-                              title="Refund Receipt (Requires Manager PIN for Cashiers)"
+                              onClick={() => setExchangeInvoice(sale)}
+                              className="px-2.5 py-1 rounded-xl bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white text-xs font-bold border border-indigo-500/40 transition-colors flex items-center space-x-1"
+                              title="Exchange Item (Square/Lightspeed POS item replacement without voiding receipt)"
                             >
-                              <RotateCcw className="w-3 h-3" />
-                              <span>Refund</span>
+                              <ArrowLeftRight className="w-3 h-3" />
+                              <span>Exchange</span>
                             </button>
 
                             <button
                               type="button"
-                              onClick={() => handleTriggerVoid(sale)}
+                              onClick={() => handleTriggerRefundVoid(sale)}
                               className="px-2 py-1 rounded-xl bg-rose-950/60 hover:bg-rose-900 text-rose-300 hover:text-white text-xs font-semibold border border-rose-800/60 flex items-center space-x-1 transition-colors"
-                              title="Void Receipt (Requires Manager PIN for Cashiers)"
+                              title="Refund / Void Sale (Restocks inventory & reconciles cashier till)"
                             >
-                              <Ban className="w-3 h-3" />
-                              <span>Void</span>
+                              <RotateCcw className="w-3 h-3" />
+                              <span>Refund / Void</span>
                             </button>
                           </>
                         )}
@@ -921,21 +886,21 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
           isOpen={!!selectedInvoice}
           invoice={selectedInvoice}
           onClose={() => setSelectedInvoice(null)}
+          onExchange={(inv) => setExchangeInvoice(inv)}
         />
       )}
 
-      {/* EDIT RECEIPT MODAL (Staff with Access / Authorized) */}
-      {editingInvoice && (
-        <EditReceiptModal
-          isOpen={!!editingInvoice}
-          invoice={editingInvoice}
-          currentUser={currentUser || null}
-          authorizedBy={authorizedEditor}
-          onClose={() => {
-            setEditingInvoice(null);
-            setAuthorizedEditor(null);
+      {/* ITEM EXCHANGE MODAL (Square / Lightspeed Standard Immutability) */}
+      {exchangeInvoice && (
+        <ItemExchangeModal
+          isOpen={!!exchangeInvoice}
+          invoice={exchangeInvoice}
+          currentStaff={currentUser || ({ id: 'staff', name: 'Cashier', role: 'CASHIER' } as any)}
+          onClose={() => setExchangeInvoice(null)}
+          onExchangeSuccess={() => {
+            loadData();
+            setActionNotice({ text: 'Item exchange processed and recorded successfully.', type: 'success' });
           }}
-          onSave={handleSaveReceiptEdit}
         />
       )}
 

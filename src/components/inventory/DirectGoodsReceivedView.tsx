@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Truck,
   Plus,
@@ -188,10 +188,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const [productSearchTerm, setProductSearchTerm] = useState<string>('');
   const [mobileViewMode, setMobileViewMode] = useState<'CARDS' | 'TABLE'>('CARDS');
 
-  // Till Payments, Safe Payout Queue & Multi-Cashier Allocations
-  const [paymentMode, setPaymentMode] = useState<'SAFE_PAYOUT' | 'TILL' | 'OWNER'>('SAFE_PAYOUT');
-  const [selectedSafeTarget, setSelectedSafeTarget] = useState<'BRANCH_SAFE' | 'HQ_SAFE'>('BRANCH_SAFE');
-  const [payFromTill, setPayFromTill] = useState<boolean>(false);
+  // Till Payments & Multi-Cashier Allocations (Direct Payout from Till Drawer)
+  const [payFromTill, setPayFromTill] = useState<boolean>(true);
   const [paymentRows, setPaymentRows] = useState<PaymentRowState[]>([
     {
       id: 'pay-1',
@@ -202,7 +200,6 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       pin: '',
     },
   ]);
-  const [ownerPaymentAmount, setOwnerPaymentAmount] = useState<number | string>('');
   const [paymentErrors, setPaymentErrors] = useState<{ [key: string]: string }>({});
 
   // Supervisor Approval Modal
@@ -244,7 +241,6 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           if (Array.isArray(parsed.rows)) setRows(parsed.rows);
           if (Array.isArray(parsed.paymentRows)) setPaymentRows(parsed.paymentRows);
           if (parsed.payFromTill !== undefined) setPayFromTill(parsed.payFromTill);
-          if (parsed.ownerPaymentAmount !== undefined) setOwnerPaymentAmount(parsed.ownerPaymentAmount);
           setLastDirectDraftSavedAt(parsed.savedAt || 'Saved');
           setHasRestoredDirectDraft(true);
         }
@@ -275,7 +271,6 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           rows,
           paymentRows,
           payFromTill,
-          ownerPaymentAmount,
           savedAt: timeNow,
         };
         localStorage.setItem('saimetric_draft_direct_grv', JSON.stringify(draftData));
@@ -295,7 +290,6 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     selectedBranchId,
     paymentRows,
     payFromTill,
-    ownerPaymentAmount,
   ]);
 
   const handleDiscardDirectDraft = () => {
@@ -310,7 +304,6 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setSupplierId('');
     setInvoiceNo('');
     setPurchaseOrderNo('');
-    setOwnerPaymentAmount('');
     setRows([
       {
         id: `row-${Date.now()}`,
@@ -411,34 +404,44 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     };
   }, [rows]);
 
-  // Payment Breakdown Calculations
+  // Payment Breakdown Calculations (100% Till Drawer Payout)
   const paymentBreakdown = useMemo(() => {
     const tillTotal = paymentRows.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-    const ownerTotal = Number(ownerPaymentAmount) || 0;
-    const totalSettled = tillTotal + ownerTotal;
-    const creditBalance = Math.max(0, voucherTotals.totalCost - totalSettled);
-    const overpayment = Math.max(0, totalSettled - voucherTotals.totalCost);
+    const invoiceBalance = Math.max(0, voucherTotals.totalCost - tillTotal);
+    const overpayment = Math.max(0, tillTotal - voucherTotals.totalCost);
 
     return {
       tillTotal,
-      ownerTotal,
-      totalSettled,
-      creditBalance,
+      totalSettled: tillTotal,
+      invoiceBalance,
       overpayment,
     };
-  }, [paymentRows, ownerPaymentAmount, voucherTotals.totalCost]);
+  }, [paymentRows, voucherTotals.totalCost]);
 
-  // Auto-set initial payment amount when total changes and only 1 payment row exists
+  // Requirement 2: Default till amount paid should be the GRV total, but still editable.
+  // Dynamically update Operator 1's amount to voucher total when line items change,
+  // unless user has added multiple operators or manually modified the amount.
+  const prevTotalCostRef = useRef<number>(0);
   useEffect(() => {
-    if (paymentRows.length === 1 && paymentRows[0].amount === '') {
-      setPaymentRows((prev) => [
-        {
-          ...prev[0],
-          amount: voucherTotals.totalCost > 0 ? voucherTotals.totalCost : '',
-        },
-      ]);
+    if (paymentRows.length === 1) {
+      const curAmt = paymentRows[0].amount;
+      const prevTotal = prevTotalCostRef.current;
+      if (
+        curAmt === '' ||
+        curAmt === 0 ||
+        Number(curAmt) === 0 ||
+        (prevTotal > 0 && Number(curAmt) === prevTotal)
+      ) {
+        setPaymentRows((prev) => [
+          {
+            ...prev[0],
+            amount: voucherTotals.totalCost > 0 ? voucherTotals.totalCost : '',
+          },
+        ]);
+      }
     }
-  }, [voucherTotals.totalCost]);
+    prevTotalCostRef.current = voucherTotals.totalCost;
+  }, [voucherTotals.totalCost, paymentRows.length]);
 
   // Row Manipulation
   const handleAddRow = () => {
@@ -591,8 +594,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     const otherTill = paymentRows
       .filter((p) => p.id !== id)
       .reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-    const ownerVal = Number(ownerPaymentAmount) || 0;
-    const remaining = Math.max(0, voucherTotals.totalCost - otherTill - ownerVal);
+    const remaining = Math.max(0, voucherTotals.totalCost - otherTill);
     handleUpdatePaymentRow(id, 'amount', remaining);
   };
 
@@ -663,28 +665,26 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       return;
     }
 
-    // Validate PINs for till payments ONLY if paymentMode === 'TILL'
+    // Validate PINs for till payments
     const errors: { [key: string]: string } = {};
-    if (paymentMode === 'TILL' && payFromTill) {
-      paymentRows.forEach((p) => {
-        const amt = Number(p.amount) || 0;
-        if (amt > 0) {
-          if (!p.pin.trim()) {
-            errors[p.id] = `PIN required for ${p.userName}`;
-          } else {
-            const staff = staffList.find((s) => s.id === p.userId);
-            if (staff?.pin && staff.pin !== p.pin && p.pin !== '1234' && p.pin !== '4321') {
-              errors[p.id] = `Invalid PIN for ${p.userName}`;
-            }
+    paymentRows.forEach((p) => {
+      const amt = Number(p.amount) || 0;
+      if (amt > 0) {
+        if (!p.pin.trim()) {
+          errors[p.id] = `PIN required for ${p.userName}`;
+        } else {
+          const staff = staffList.find((s) => s.id === p.userId);
+          if (staff?.pin && staff.pin !== p.pin && p.pin !== '1234' && p.pin !== '4321') {
+            errors[p.id] = `Invalid PIN for ${p.userName}`;
           }
         }
-      });
-
-      if (Object.keys(errors).length > 0) {
-        setPaymentErrors(errors);
-        showToast('error', 'Please correct the cashier PIN errors before submitting.');
-        return;
       }
+    });
+
+    if (Object.keys(errors).length > 0) {
+      setPaymentErrors(errors);
+      showToast('error', 'Please correct the cashier PIN errors before submitting.');
+      return;
     }
     setPaymentErrors({});
 
@@ -713,21 +713,18 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     });
 
     // Convert till payments
-    const formattedPayments: DirectGrvTillPayment[] = (paymentMode === 'TILL' && payFromTill)
-      ? paymentRows
-          .filter((p) => (Number(p.amount) || 0) > 0)
-          .map((p) => ({
-            userId: p.userId,
-            userName: p.userName,
-            amount: Number(p.amount) || 0,
-            drawerId: p.drawerId,
-            pinConfirmed: true,
-            confirmedAt: new Date().toISOString(),
-          }))
-      : [];
+    const formattedPayments: DirectGrvTillPayment[] = paymentRows
+      .filter((p) => (Number(p.amount) || 0) > 0)
+      .map((p) => ({
+        userId: p.userId,
+        userName: p.userName,
+        amount: Number(p.amount) || 0,
+        drawerId: p.drawerId,
+        pinConfirmed: true,
+        confirmedAt: new Date().toISOString(),
+      }));
 
-    const ownerPaid = paymentMode === 'OWNER' ? (Number(ownerPaymentAmount) || voucherTotals.totalCost) : (Number(ownerPaymentAmount) || 0);
-    const creditLeft = paymentMode === 'SAFE_PAYOUT' ? 0 : paymentBreakdown.creditBalance;
+    const unpaidInvoiceBalance = Math.max(0, voucherTotals.totalCost - paymentBreakdown.tillTotal);
 
     const newDirectGrv: DirectGrv = {
       id: grvNumber,
@@ -745,18 +742,12 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       items: grvItems,
       totalCost: voucherTotals.totalCost,
       totalSellingPrice: voucherTotals.totalSelling,
-      payFromTill: paymentMode === 'TILL' && payFromTill,
-      paymentMethod: paymentMode,
-      paymentStatus: paymentMode === 'SAFE_PAYOUT' ? 'AWAITING_SAFE_PAYMENT' : 'PAID',
-      allocatedSafeId: paymentMode === 'SAFE_PAYOUT'
-        ? (selectedSafeTarget === 'HQ_SAFE' ? `ACC-HQ-SAFE-${(targetBranch.companyId || 'COMP-001').slice(0, 6)}` : `ACC-BR-SAFE-${targetBranch.branchId}`)
-        : undefined,
-      allocatedSafeName: paymentMode === 'SAFE_PAYOUT'
-        ? (selectedSafeTarget === 'HQ_SAFE' ? 'HQ Central Vault Safe' : 'Branch Safe (Main Vault)')
-        : undefined,
+      payFromTill: true,
+      paymentMethod: 'TILL',
+      paymentStatus: unpaidInvoiceBalance > 0 ? 'PARTIALLY_PAID_TILL' : 'PAID',
+      unpaidBalance: unpaidInvoiceBalance > 0 ? unpaidInvoiceBalance : 0,
+      creditBalance: unpaidInvoiceBalance > 0 ? unpaidInvoiceBalance : 0,
       payments: formattedPayments,
-      ownerPaymentAmount: ownerPaid > 0 ? ownerPaid : undefined,
-      creditBalance: creditLeft > 0 ? creditLeft : 0,
       receivedByStaffId: currentUser?.id || 'USR-003',
       receivedByStaffName: currentUser?.name || 'Cashier',
       approvedByStaffId: isSupervisorOrAbove ? currentUser?.id : undefined,
@@ -800,7 +791,6 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setSupplierId('');
     setInvoiceNo('');
     setPurchaseOrderNo('');
-    setOwnerPaymentAmount('');
     setPaymentRows([
       {
         id: `pay-${Date.now()}`,
@@ -2121,7 +2111,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
             </div>
           </div>
 
-          {/* Cash Out & Multi-Cashier Settlement Section */}
+          {/* Till Drawer Direct Supplier Payout Section */}
           <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-6 shadow-xl space-y-5">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
               <div className="flex items-center gap-3">
@@ -2129,394 +2119,214 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                   <DollarSign className="w-5 h-5" />
                 </div>
                 <div>
-                  <h3 className="text-base font-bold text-white">Payment Settlement & Safe Custody Allocation</h3>
+                  <h3 className="text-base font-bold text-white">Direct Supplier Payout from Till Drawer</h3>
                   <p className="text-xs text-slate-400">
-                    Choose whether this delivery is queued for Safe Payout by Accounts Clerk or paid from till drawer
+                    Cashiers pay suppliers directly from till register cash. One delivery invoice can be split across two or more till operators.
                   </p>
                 </div>
               </div>
-            </div>
-
-            {/* 3-Way Payment Mode Choice */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <button
                 type="button"
-                onClick={() => {
-                  setPaymentMode('SAFE_PAYOUT');
-                  setPayFromTill(false);
-                }}
-                className={`p-3.5 rounded-2xl border text-left transition-all ${
-                  paymentMode === 'SAFE_PAYOUT'
-                    ? 'bg-emerald-950/70 border-emerald-500 text-white shadow-lg ring-1 ring-emerald-500/50'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                }`}
+                onClick={handleAddPaymentRow}
+                className="px-3.5 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold flex items-center gap-1.5 transition-all self-start sm:self-center"
               >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase tracking-wider text-emerald-400">Safe Payout Queue</span>
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
-                    Recommended
-                  </span>
-                </div>
-                <div className="text-sm font-bold text-white mt-1">Allocate to Safe (Clerk)</div>
-                <p className="text-[11px] text-slate-400 mt-0.5">
-                  Invoice queued in Accounts Clerk custody hub for vault cash payment. No till PIN needed at dock.
-                </p>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setPaymentMode('TILL');
-                  setPayFromTill(true);
-                }}
-                className={`p-3.5 rounded-2xl border text-left transition-all ${
-                  paymentMode === 'TILL'
-                    ? 'bg-amber-950/70 border-amber-500 text-white shadow-lg ring-1 ring-amber-500/50'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase tracking-wider text-amber-400">Till Drawer</span>
-                </div>
-                <div className="text-sm font-bold text-white mt-1">Pay Cash from Till</div>
-                <p className="text-[11px] text-slate-400 mt-0.5">
-                  Operators contribute cash from active till register; cashier PIN required.
-                </p>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setPaymentMode('OWNER');
-                  setPayFromTill(false);
-                }}
-                className={`p-3.5 rounded-2xl border text-left transition-all ${
-                  paymentMode === 'OWNER'
-                    ? 'bg-sky-950/70 border-sky-500 text-white shadow-lg ring-1 ring-sky-500/50'
-                    : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase tracking-wider text-sky-400">Direct / Credit</span>
-                </div>
-                <div className="text-sm font-bold text-white mt-1">Owner / Bank Payment</div>
-                <p className="text-[11px] text-slate-400 mt-0.5">
-                  Paid directly by owner, supplier account credit, or EFT bank transfer.
-                </p>
+                <Plus className="w-3.5 h-3.5" />
+                <span>+ Add Another Till Operator</span>
               </button>
             </div>
 
-            {paymentMode === 'SAFE_PAYOUT' && (
-              <div className="p-4 bg-emerald-950/40 border border-emerald-500/40 rounded-2xl space-y-3">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <div>
-                    <div className="text-sm font-bold text-white flex items-center gap-2">
-                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
-                      <span>Allocated to Safe Cash Payout: ${voucherTotals.totalCost.toFixed(2)}</span>
-                    </div>
-                    <p className="text-xs text-emerald-300/80 mt-0.5">
-                      This GRV will be dispatched immediately to the Accounts Clerk Custody Hub for physical safe cash settlement. No cashier till PIN needed at dock.
-                    </p>
-                  </div>
-                  <span className="text-xs font-bold px-2.5 py-1 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shrink-0 self-start sm:self-center">
-                    Ready to Post
-                  </span>
-                </div>
-
-                <div className="pt-2 border-t border-emerald-800/40 space-y-1.5">
-                  <label className="text-xs font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Designated Safe Account for Cash Settlement *</span>
-                  </label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedSafeTarget('BRANCH_SAFE')}
-                      className={`p-2.5 rounded-xl border text-left transition flex items-center justify-between cursor-pointer ${
-                        selectedSafeTarget === 'BRANCH_SAFE'
-                          ? 'bg-emerald-900/60 border-emerald-400 text-white ring-1 ring-emerald-400/50'
-                          : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <div>
-                        <div className="font-bold text-xs text-white">Branch Safe (Main Vault)</div>
-                        <div className="text-[10px] text-slate-400">Standard local store delivery payout — Default</div>
-                      </div>
-                      {selectedSafeTarget === 'BRANCH_SAFE' && <Check className="w-4 h-4 text-emerald-400 shrink-0" />}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedSafeTarget('HQ_SAFE')}
-                      className={`p-2.5 rounded-xl border text-left transition flex items-center justify-between cursor-pointer ${
-                        selectedSafeTarget === 'HQ_SAFE'
-                          ? 'bg-emerald-900/60 border-emerald-400 text-white ring-1 ring-emerald-400/50'
-                          : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <div>
-                        <div className="font-bold text-xs text-white">HQ Safe Vault</div>
-                        <div className="text-[10px] text-slate-400">For major headquarters direct accounts</div>
-                      </div>
-                      {selectedSafeTarget === 'HQ_SAFE' && <Check className="w-4 h-4 text-emerald-400 shrink-0" />}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {paymentMode === 'TILL' && (
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">
-                    Till Operator Contributions ({paymentRows.length} operator{paymentRows.length > 1 ? 's' : ''})
-                  </span>
-                  <button
-                    type="button"
-                    onClick={handleAddPaymentRow}
-                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 border border-slate-700 text-xs font-bold flex items-center gap-1.5 transition-all"
+            {/* Operator Payment Rows */}
+            <div className="space-y-3">
+              {paymentRows.map((payRow, pIdx) => {
+                const error = paymentErrors[payRow.id];
+                return (
+                  <div
+                    key={payRow.id}
+                    className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 grid grid-cols-1 sm:grid-cols-12 gap-3 items-center"
                   >
-                    <Plus className="w-3.5 h-3.5" />
-                    + Add Another Till Operator
-                  </button>
-                </div>
-
-                {/* Operator Payment Rows */}
-                <div className="space-y-3">
-                  {paymentRows.map((payRow, pIdx) => {
-                    const error = paymentErrors[payRow.id];
-                    return (
-                      <div
-                        key={payRow.id}
-                        className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 grid grid-cols-1 sm:grid-cols-12 gap-3 items-center"
+                    {/* Operator Selector */}
+                    <div className="sm:col-span-4 space-y-1">
+                      <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                        <User className="w-3 h-3 text-amber-400" />
+                        Till Operator {pIdx + 1}
+                      </label>
+                      <select
+                        value={payRow.userId}
+                        onChange={(e) => handleUpdatePaymentRow(payRow.id, 'userId', e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-amber-500 font-medium"
                       >
-                        {/* Operator Selector */}
-                        <div className="sm:col-span-4 space-y-1">
-                          <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                            <User className="w-3 h-3 text-amber-400" />
-                            Till Operator {pIdx + 1}
-                          </label>
-                          <select
-                            value={payRow.userId}
-                            onChange={(e) => handleUpdatePaymentRow(payRow.id, 'userId', e.target.value)}
-                            className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-amber-500 font-medium"
-                          >
-                            {staffList.map((s, sIdx) => (
-                              <option key={`${s.id}-${sIdx}`} value={s.id}>
-                                {s.name} ({s.role})
-                              </option>
-                            ))}
-                          </select>
-                        </div>
+                        {staffList.map((s, sIdx) => (
+                          <option key={`${s.id}-${sIdx}`} value={s.id}>
+                            {s.name} ({s.role})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
 
-                        {/* Drawer ID */}
-                        <div className="sm:col-span-2 space-y-1">
-                          <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                            <Layers className="w-3 h-3 text-slate-400" />
-                            Drawer
-                          </label>
-                          <input
-                            type="text"
-                            value={payRow.drawerId}
-                            onChange={(e) => handleUpdatePaymentRow(payRow.id, 'drawerId', e.target.value)}
-                            placeholder="Till 1"
-                            className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none font-medium"
-                          />
-                        </div>
+                    {/* Drawer ID */}
+                    <div className="sm:col-span-2 space-y-1">
+                      <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                        <Layers className="w-3 h-3 text-slate-400" />
+                        Drawer
+                      </label>
+                      <input
+                        type="text"
+                        value={payRow.drawerId}
+                        onChange={(e) => handleUpdatePaymentRow(payRow.id, 'drawerId', e.target.value)}
+                        placeholder="Till 1"
+                        className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none font-medium"
+                      >
+                      </input>
+                    </div>
 
-                        {/* Amount Paid from this Till */}
-                        <div className="sm:col-span-3 space-y-1">
-                          <div className="flex items-center justify-between">
-                            <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                              <DollarSign className="w-3 h-3 text-emerald-400" />
-                              Till Amount Paid ($)
-                            </label>
-                            <button
-                              type="button"
-                              onClick={() => handleFillRemainder(payRow.id)}
-                              className="text-[10px] text-amber-400 hover:underline"
-                            >
-                              Fill Bal
-                            </button>
-                          </div>
-                          <div className="relative">
-                            <span className="absolute left-2.5 top-2 text-xs text-slate-400 font-mono">$</span>
-                            <input
-                              type="text"
-                              inputMode="decimal"
-                              value={payRow.amount ?? ''}
-                              onFocus={(e) => e.target.select()}
-                              onClick={(e) => (e.target as HTMLInputElement).select()}
-                              onChange={(e) => {
-                                const val = cleanNumberInput(e.target.value, true);
-                                handleUpdatePaymentRow(
-                                  payRow.id,
-                                  'amount',
-                                  val
-                                );
-                              }}
-                              placeholder="0.00"
-                              className="w-full bg-slate-800 border border-slate-700 text-amber-400 font-mono font-bold rounded-xl pl-6 pr-2.5 py-2 text-xs focus:outline-none focus:border-amber-500"
-                              required
-                            />
-                          </div>
-                        </div>
-
-                        {/* Operator PIN */}
-                        <div className="sm:col-span-2 space-y-1">
-                          <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                            <KeyRound className="w-3 h-3 text-amber-400" />
-                            Operator PIN
-                          </label>
-                          <input
-                            type="password"
-                            maxLength={6}
-                            value={payRow.pin}
-                            onChange={(e) => {
-                              handleUpdatePaymentRow(payRow.id, 'pin', e.target.value);
-                              if (paymentErrors[payRow.id]) {
-                                setPaymentErrors((prev) => {
-                                  const c = { ...prev };
-                                  delete c[payRow.id];
-                                  return c;
-                                });
-                              }
-                            }}
-                            placeholder="PIN..."
-                            className={`w-full bg-slate-800 border text-white rounded-xl px-2.5 py-2 text-xs font-mono tracking-wider focus:outline-none ${
-                              error ? 'border-rose-500' : 'border-slate-700 focus:border-amber-500'
-                            }`}
-                            required
-                          />
-                        </div>
-
-                        {/* Remove Action */}
-                        <div className="sm:col-span-1 flex items-center justify-center pt-4 sm:pt-0">
-                          {paymentRows.length > 1 && (
-                            <button
-                              type="button"
-                              onClick={() => handleRemovePaymentRow(payRow.id)}
-                              className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition"
-                              title="Remove operator payment"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          )}
-                        </div>
-
-                        {/* Error Message */}
-                        {error && (
-                          <div className="col-span-1 sm:col-span-12">
-                            <p className="text-[11px] text-rose-400">{error}</p>
-                          </div>
-                        )}
+                    {/* Amount Paid from this Till */}
+                    <div className="sm:col-span-3 space-y-1">
+                      <div className="flex items-center justify-between">
+                        <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                          <DollarSign className="w-3 h-3 text-emerald-400" />
+                          Till Amount Paid ($)
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => handleFillRemainder(payRow.id)}
+                          className="text-[10px] text-amber-400 hover:underline font-mono"
+                          title="Auto-fill the remaining invoice balance into this till"
+                        >
+                          Fill Bal
+                        </button>
                       </div>
-                    );
-                  })}
+                      <div className="relative">
+                        <span className="absolute left-2.5 top-2 text-xs text-slate-400 font-mono">$</span>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={payRow.amount ?? ''}
+                          onFocus={(e) => e.target.select()}
+                          onClick={(e) => (e.target as HTMLInputElement).select()}
+                          onChange={(e) => {
+                            const val = cleanNumberInput(e.target.value, true);
+                            handleUpdatePaymentRow(payRow.id, 'amount', val);
+                          }}
+                          placeholder="0.00"
+                          className="w-full bg-slate-800 border border-slate-700 text-amber-400 font-mono font-bold rounded-xl pl-6 pr-2.5 py-2 text-xs focus:outline-none focus:border-amber-500"
+                          required
+                        />
+                      </div>
+                    </div>
+
+                    {/* Operator PIN */}
+                    <div className="sm:col-span-2 space-y-1">
+                      <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                        <KeyRound className="w-3 h-3 text-amber-400" />
+                        Operator PIN
+                      </label>
+                      <input
+                        type="password"
+                        maxLength={6}
+                        value={payRow.pin}
+                        onChange={(e) => {
+                          handleUpdatePaymentRow(payRow.id, 'pin', e.target.value);
+                          if (paymentErrors[payRow.id]) {
+                            setPaymentErrors((prev) => {
+                              const c = { ...prev };
+                              delete c[payRow.id];
+                              return c;
+                            });
+                          }
+                        }}
+                        placeholder="PIN..."
+                        className={`w-full bg-slate-800 border text-white rounded-xl px-2.5 py-2 text-xs font-mono tracking-wider focus:outline-none ${
+                          error ? 'border-rose-500' : 'border-slate-700 focus:border-amber-500'
+                        }`}
+                        required
+                      />
+                    </div>
+
+                    {/* Remove Action */}
+                    <div className="sm:col-span-1 flex items-center justify-center pt-4 sm:pt-0">
+                      {paymentRows.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => handleRemovePaymentRow(payRow.id)}
+                          className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition"
+                          title="Remove operator payment"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Error Message */}
+                    {error && (
+                      <div className="col-span-1 sm:col-span-12">
+                        <p className="text-[11px] text-rose-400">{error}</p>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Live Balancing & Dual-Custody Forwarding Breakdown Card */}
+            <div className="p-4 rounded-2xl bg-gradient-to-br from-slate-950 to-slate-900 border border-slate-800 space-y-3">
+              <div className="flex items-center justify-between text-xs border-b border-slate-800 pb-2">
+                <span className="font-bold text-slate-400 uppercase tracking-wider">Settlement & Balancing Summary</span>
+                <span className="font-mono text-slate-400">Total Invoice: ${voucherTotals.totalCost.toFixed(2)}</span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-bold">Total Invoice Payable</span>
+                  <span className="font-mono text-sm font-bold text-white">
+                    ${voucherTotals.totalCost.toFixed(2)}
+                  </span>
                 </div>
 
-                {/* Additional Non-Till Contribution (e.g. Owner direct payment) */}
-                <div className="p-4 rounded-2xl bg-slate-950/40 border border-slate-800/80 grid grid-cols-1 sm:grid-cols-2 gap-4 items-center">
-                  <div>
-                    <label className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
-                      <CreditCard className="w-4 h-4 text-sky-400" />
-                      Owner / Non-Till Direct Payment ($)
-                    </label>
-                    <p className="text-[11px] text-slate-400 mt-0.5">
-                      Amount paid directly by store owner or company account (does not impact till cash)
-                    </p>
-                  </div>
-                  <div className="relative max-w-xs ml-auto w-full">
-                    <span className="absolute left-3 top-2.5 text-xs text-slate-400 font-mono">$</span>
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      value={ownerPaymentAmount ?? ''}
-                      onFocus={(e) => e.target.select()}
-                      onClick={(e) => (e.target as HTMLInputElement).select()}
-                      onChange={(e) => {
-                        const val = cleanNumberInput(e.target.value, true);
-                        setOwnerPaymentAmount(val);
-                      }}
-                      placeholder="0.00"
-                      className="w-full bg-slate-800 border border-slate-700 text-sky-400 font-mono font-bold rounded-xl pl-7 pr-3 py-2 text-xs focus:outline-none focus:border-sky-500"
-                    />
-                  </div>
+                <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-bold">Total Till Outflow</span>
+                  <span className="font-mono text-sm font-bold text-amber-400">
+                    ${paymentBreakdown.tillTotal.toFixed(2)}
+                  </span>
                 </div>
 
-                {/* Live Balancing Breakdown Card */}
-                <div className="p-4 rounded-2xl bg-gradient-to-br from-slate-950 to-slate-900 border border-slate-800 space-y-3">
-                  <div className="flex items-center justify-between text-xs border-b border-slate-800 pb-2">
-                    <span className="font-bold text-slate-400 uppercase tracking-wider">Settlement & Balancing Summary</span>
-                    <span className="font-mono text-slate-400">Total Invoice: ${voucherTotals.totalCost.toFixed(2)}</span>
-                  </div>
-
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                    <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block font-bold">Total Till Out</span>
-                      <span className="font-mono text-sm font-bold text-amber-400">
-                        ${paymentBreakdown.tillTotal.toFixed(2)}
-                      </span>
-                    </div>
-
-                    <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block font-bold">Owner Direct Cash</span>
-                      <span className="font-mono text-sm font-bold text-sky-400">
-                        ${paymentBreakdown.ownerTotal.toFixed(2)}
-                      </span>
-                    </div>
-
-                    <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block font-bold">Total Settled</span>
-                      <span className="font-mono text-sm font-bold text-emerald-400">
-                        ${paymentBreakdown.totalSettled.toFixed(2)}
-                      </span>
-                    </div>
-
-                    <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                      <span className="text-[10px] text-slate-400 block font-bold">Supplier Credit Balance</span>
-                      <span className="font-mono text-sm font-bold text-orange-400">
-                        ${paymentBreakdown.creditBalance.toFixed(2)}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Visual Status Indicator */}
-                  {paymentBreakdown.creditBalance > 0 ? (
-                    <div className="p-2.5 rounded-xl bg-amber-950/40 border border-amber-800/60 text-xs text-amber-300 flex items-center gap-2">
-                      <Clock className="w-4 h-4 text-amber-400 shrink-0" />
-                      <span>
-                        Partial Payout: <strong>${paymentBreakdown.totalSettled.toFixed(2)}</strong> paid now, remaining{' '}
-                        <strong>${paymentBreakdown.creditBalance.toFixed(2)}</strong> will be left on supplier credit account.
-                      </span>
-                    </div>
-                  ) : paymentBreakdown.overpayment > 0 ? (
-                    <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-center gap-2">
-                      <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                      <span>
-                        Overpayment Warning: Total payments exceed delivery invoice by{' '}
-                        <strong>${paymentBreakdown.overpayment.toFixed(2)}</strong>.
-                      </span>
-                    </div>
-                  ) : (
-                    <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 text-xs text-emerald-300 flex items-center gap-2">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      <span>
-                        Fully Balanced: Delivery invoice of ${voucherTotals.totalCost.toFixed(2)} is 100% accounted for. Each till operator payment will be referenced under Direct Procurement in Form 2.
-                      </span>
-                    </div>
-                  )}
+                <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block font-bold">Forwarded to Dual Custody</span>
+                  <span className={`font-mono text-sm font-bold ${paymentBreakdown.invoiceBalance > 0 ? 'text-indigo-400' : 'text-slate-500'}`}>
+                    ${paymentBreakdown.invoiceBalance.toFixed(2)}
+                  </span>
                 </div>
               </div>
-            )}
 
-            {paymentMode === 'OWNER' && (
-              <div className="p-4 rounded-2xl bg-slate-950/50 border border-slate-800 text-xs text-slate-400 flex items-center gap-2">
-                <FileText className="w-4 h-4 text-slate-500" />
-                <span>
-                  Delivered 100% on supplier credit balance / 30-day invoice. No cash will be deducted from till drawers.
-                </span>
-              </div>
-            )}
+              {/* Visual Status Indicator & Dual-Custody Notification */}
+              {paymentBreakdown.invoiceBalance > 0 ? (
+                <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/40 text-xs text-indigo-300 space-y-1">
+                  <div className="flex items-center gap-2 font-bold text-white">
+                    <Clock className="w-4 h-4 text-indigo-400 shrink-0" />
+                    <span>
+                      Partial Till Payout: ${paymentBreakdown.tillTotal.toFixed(2)} paid from till.
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-indigo-300/90 pl-6">
+                    Remaining unpaid balance of <strong className="text-white font-mono">${paymentBreakdown.invoiceBalance.toFixed(2)}</strong> will be forwarded to the <strong>Dual Custody tab</strong> for Accounts Clerk / Safe Vault payout.
+                  </p>
+                </div>
+              ) : paymentBreakdown.overpayment > 0 ? (
+                <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>
+                    Overpayment Warning: Total operator payments exceed delivery invoice by{' '}
+                    <strong>${paymentBreakdown.overpayment.toFixed(2)}</strong>.
+                  </span>
+                </div>
+              ) : (
+                <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 text-xs text-emerald-300 flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>
+                    Fully Balanced: Delivery invoice of ${voucherTotals.totalCost.toFixed(2)} is 100% paid from till drawer. Each operator's contribution will be deducted under Direct Procurement in Form 2.
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Action Button Bar */}
@@ -2988,21 +2798,37 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
               </div>
             )}
 
-            <div className="flex items-center justify-end gap-3 pt-2">
+            <div className="flex items-center justify-between gap-3 pt-2">
               <button
                 type="button"
-                onClick={() => setApprovingGrv(null)}
-                className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold"
+                onClick={() => {
+                  const grv = approvingGrv;
+                  setApprovingGrv(null);
+                  setRejectingGrv(grv);
+                  setRejectReason('');
+                }}
+                className="px-3.5 py-2.5 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/30 text-xs font-bold transition flex items-center space-x-1.5"
               >
-                Cancel
+                <X className="w-4 h-4" />
+                <span>Reject Voucher</span>
               </button>
-              <button
-                type="button"
-                onClick={handleConfirmApproval}
-                className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-lg shadow-emerald-600/20"
-              >
-                Confirm PIN & Approve
-              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setApprovingGrv(null)}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmApproval}
+                  className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-black shadow-lg shadow-emerald-600/20"
+                >
+                  Confirm PIN & Approve
+                </button>
+              </div>
             </div>
           </div>
         </div>

@@ -547,6 +547,7 @@ export interface ShiftLedgerBreakdown {
   ecocashSales?: number;
   zigSales?: number;
   pettyCash: number;
+  refunds: number;
   cashInTotal: number;
   cashOutTotal: number;
   expectedCash: number;
@@ -577,6 +578,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
   let ecocashSales = 0;
   let zigSales = 0;
   let pettyCash = 0;
+  let refunds = 0;
 
   let physicalCount: number | null = null;
   let movementsCount = 0;
@@ -690,6 +692,14 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
       case 'expense':
         expenses += amt;
         break;
+      case 'refund':
+      case 'exchange_refund':
+        refunds += amt;
+        break;
+      case 'exchange_payment':
+        if (m.direction === 'in') cashSales += amt;
+        else if (m.direction === 'out') refunds += amt;
+        break;
       default:
         if (m.direction === 'in') cashSales += amt;
         else if (m.direction === 'out') expenses += amt;
@@ -741,7 +751,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
   const cashInTotal = Math.round((openingFloat + cashSales + creditPayments + changeReceived) * 100) / 100;
   const cashOutTotal =
     Math.round(
-      (changePaid + pettyCash + directProcurements + cashLift + ecocashCashOut + zigCashOut + expenses) * 100
+      (changePaid + pettyCash + directProcurements + cashLift + ecocashCashOut + zigCashOut + expenses + refunds) * 100
     ) / 100;
   const expectedCash = Math.round((cashInTotal - cashOutTotal) * 100) / 100;
 
@@ -777,6 +787,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
     ecocashSales: Math.round(ecocashSales * 100) / 100,
     zigSales: Math.round(zigSales * 100) / 100,
     pettyCash: Math.round(pettyCash * 100) / 100,
+    refunds: Math.round(refunds * 100) / 100,
     cashInTotal,
     cashOutTotal,
     expectedCash,

@@ -1321,6 +1321,7 @@ export const markGrvAsPaid = (grvNumber: string, voucherId: string): void => {
         (gInv && (normTarget.includes(gInv) || gInv.includes(normTarget)))
       ) {
         g.paymentStatus = 'PAID';
+        g.unpaidBalance = 0;
         g.paidVoucherId = voucherId;
         updated = true;
       }
@@ -1478,12 +1479,19 @@ export const getUnpaidGrvsForSafePayment = (): UnpaidGrvRecord[] => {
     directGrvs.forEach((g) => {
       if (g.status === 'REJECTED') return;
       const gNumber = g.grvNumber || g.id;
-      const explicitPaid = g.paymentStatus === 'PAID' || Boolean(g.paidVoucherId);
+
+      // Calculate total paid from till drawers
+      const tillPaid = Array.isArray(g.payments)
+        ? g.payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0)
+        : (g.payFromTill && g.paymentStatus === 'PAID' ? Number(g.totalCost) || 0 : 0);
+
+      const fullCost = Number(g.totalCost) || 0;
+      const remainingBalance = g.unpaidBalance !== undefined ? Number(g.unpaidBalance) : Math.max(0, fullCost - tillPaid);
+
+      const explicitPaid = (g.paymentStatus === 'PAID' && remainingBalance <= 0) || Boolean(g.paidVoucherId) || remainingBalance <= 0;
 
       if (isAlreadyPaidOrSeen(g.id, gNumber, g.invoiceNo, explicitPaid ? 'PAID' : undefined)) return;
-
-      const cost = Number(g.totalCost) || 0;
-      if (cost <= 0) return;
+      if (remainingBalance <= 0) return;
 
       registerSeen(g.id, gNumber, g.invoiceNo);
 
@@ -1496,9 +1504,9 @@ export const getUnpaidGrvsForSafePayment = (): UnpaidGrvRecord[] => {
         supplierName: g.supplierName || 'General Supplier',
         invoiceNo: g.invoiceNo,
         date: g.date || toDateStringSafe(g.createdAt),
-        totalCost: cost,
-        paymentMethod: g.paymentMethod || (g.payFromTill ? 'TILL' : 'SAFE_PAYOUT'),
-        paymentStatus: (g.paymentStatus as any) || (g.paymentMethod === 'SAFE_PAYOUT' ? 'AWAITING_SAFE_PAYMENT' : 'UNPAID'),
+        totalCost: remainingBalance,
+        paymentMethod: 'SAFE_PAYOUT',
+        paymentStatus: 'AWAITING_SAFE_PAYMENT',
         allocatedSafeId: g.allocatedSafeId,
         allocatedSafeName: safeName,
         receivedByStaffName: g.receivedByStaffName,

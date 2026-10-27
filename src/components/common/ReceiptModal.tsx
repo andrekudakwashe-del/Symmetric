@@ -3,6 +3,7 @@ import { SaleInvoice } from '../../types';
 import {
   X,
   Printer,
+  ArrowLeftRight,
   Share2,
   CheckCircle2,
   Settings,
@@ -42,12 +43,14 @@ interface ReceiptModalProps {
   isOpen: boolean;
   onClose: () => void;
   invoice: SaleInvoice | null;
+  onExchange?: (invoice: SaleInvoice) => void;
 }
 
 export const ReceiptModal: React.FC<ReceiptModalProps> = ({
   isOpen,
   onClose,
   invoice,
+  onExchange,
 }) => {
   const invoiceCompanyId = invoice?.company_id || invoice?.companyId;
   const companiesList = getCompanies();
@@ -790,6 +793,22 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
                     : `Print Receipt (${paperWidth})`}
                 </span>
               </button>
+
+              {onExchange && invoice && invoice.status !== 'Refunded' && invoice.status !== 'Voided' && (
+                <button
+                  id="btn-exchange-receipt"
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onExchange(invoice);
+                  }}
+                  className="py-3.5 px-3.5 rounded-2xl bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-black text-sm flex items-center justify-center space-x-1.5 shadow-md shadow-indigo-600/20 transition transform active:scale-95"
+                  title="Exchange Item (Square/Lightspeed POS item replacement without voiding receipt)"
+                >
+                  <ArrowLeftRight className="w-4 h-4" />
+                  <span className="hidden sm:inline">Exchange</span>
+                </button>
+              )}
 
               {/* WhatsApp Share Button */}
               <button

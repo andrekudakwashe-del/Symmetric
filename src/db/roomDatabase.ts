@@ -1502,7 +1502,7 @@ export const logSessionTimeout = (staff: Salesperson): void => {
 };
 
 export const logManagerOverride = (params: {
-  action: 'DISCOUNT_OVERRIDE' | 'VOID_CART' | 'REFUND_INVOICE' | 'VOID_INVOICE';
+  action: 'DISCOUNT_OVERRIDE' | 'VOID_CART' | 'REFUND_INVOICE' | 'VOID_INVOICE' | 'ITEM_EXCHANGE' | 'REFUND_VOID';
   manager: Salesperson;
   cashier?: Salesperson | null;
   details: string;
@@ -5076,8 +5076,9 @@ export const getAllBranchesSales = (): SaleInvoice[] => {
 export const getUserPrefix = (staffId?: any, staffName?: string): string => {
   // Allow passing user object directly
   if (typeof staffId === 'object' && staffId !== null) {
-    if (staffId.user_prefix || staffId.userPrefix || staffId.prefix) {
-      return String(staffId.user_prefix || staffId.userPrefix || staffId.prefix).trim().toUpperCase();
+    const rawP = String(staffId.user_prefix || staffId.userPrefix || staffId.prefix || '').trim().toUpperCase();
+    if (rawP && !rawP.startsWith('INV')) {
+      return rawP;
     }
     const oId = String(staffId.id || '').trim();
     const oName = String(staffId.name || staffId.username || '').trim();
@@ -5085,16 +5086,16 @@ export const getUserPrefix = (staffId?: any, staffName?: string): string => {
   }
 
   const sessionUser = getSessionUser();
-  const explicitUserPrefix = (sessionUser as any)?.user_prefix || (sessionUser as any)?.userPrefix || (sessionUser as any)?.prefix;
-  if (explicitUserPrefix && (!staffId || staffId === sessionUser?.id)) {
-    return String(explicitUserPrefix).trim().toUpperCase();
+  const explicitUserPrefix = String((sessionUser as any)?.user_prefix || (sessionUser as any)?.userPrefix || (sessionUser as any)?.prefix || '').trim().toUpperCase();
+  if (explicitUserPrefix && !explicitUserPrefix.startsWith('INV') && (!staffId || staffId === sessionUser?.id)) {
+    return explicitUserPrefix;
   }
 
   const rawId = String(staffId || sessionUser?.id || '').trim();
   const rawName = String(staffName || sessionUser?.name || sessionUser?.username || '').trim();
 
   // If already formatted like KM5
-  if (/^[A-Za-z]{1,4}\d{1,4}$/.test(rawId)) {
+  if (/^[A-Za-z]{1,4}\d{1,4}$/.test(rawId) && !rawId.toUpperCase().startsWith('INV')) {
     return rawId.toUpperCase();
   }
 
@@ -5103,7 +5104,7 @@ export const getUserPrefix = (staffId?: any, staffName?: string): string => {
   if (directMatch) {
     const letters = directMatch[1].toUpperCase();
     const num = parseInt(directMatch[2], 10);
-    if (letters === 'STF' || letters === 'USR') {
+    if (letters === 'STF' || letters === 'USR' || letters === 'INV') {
       if (rawName) {
         const initials = rawName
           .split(/\s+/)
@@ -5130,12 +5131,15 @@ export const getUserPrefix = (staffId?: any, staffName?: string): string => {
       .toUpperCase();
     const numMatch = rawId.match(/\d+/);
     const num = numMatch ? parseInt(numMatch[0], 10) : 5;
-    return `${initials || 'KM'}${num}`;
+    const res = `${initials || 'KM'}${num}`;
+    if (!res.startsWith('INV')) {
+      return res;
+    }
   }
 
   // 3. Cleaned alphanumeric ID if short
   const cleanedId = rawId.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  if (cleanedId && cleanedId.length <= 5 && !cleanedId.startsWith('COMP') && !cleanedId.startsWith('BR')) {
+  if (cleanedId && cleanedId.length <= 5 && !cleanedId.startsWith('COMP') && !cleanedId.startsWith('BR') && !cleanedId.startsWith('INV')) {
     return cleanedId;
   }
 
@@ -5144,11 +5148,14 @@ export const getUserPrefix = (staffId?: any, staffName?: string): string => {
 
 /**
  * Standard Invoice Number Generator: [user_prefix]-[YYMMDD]-[HHMMSS]-[Random3Digits]
- * Example: KM5-261023-143022-892
- * Removes the legacy 'INV-' prefix and eliminates collision renaming ('r001')
+ * Example: KM5-261024-143022-892
+ * Eliminates legacy 'INV-' prefix and collision renaming ('r001')
  */
 export const generateInvoiceNumber = (staffId?: any, staffName?: string): string => {
-  const prefix = getUserPrefix(staffId, staffName);
+  let prefix = getUserPrefix(staffId, staffName);
+  if (!prefix || prefix.toUpperCase().startsWith('INV')) {
+    prefix = 'KM5';
+  }
   const now = new Date();
   const yy = String(now.getFullYear()).slice(-2);
   const mm = String(now.getMonth() + 1).padStart(2, '0');
@@ -6035,6 +6042,230 @@ export const voidSaleInvoice = (params: {
   return { success: true, message: `Invoice #${invoice.id} voided successfully.`, invoice };
 };
 
+
+export interface ItemExchangeRecord {
+  exchangeId: string;
+  invoiceId: string;
+  timestamp: string;
+  date: string;
+  cashierId: string;
+  cashierName: string;
+  authorizedById?: string;
+  authorizedByName?: string;
+  returnedItem: {
+    id: string;
+    name: string;
+    price: number;
+    quantity: number;
+    totalCredit: number;
+    restockCondition: 'restock' | 'damaged';
+    reason: string;
+  };
+  replacementItem: {
+    id: string;
+    name: string;
+    price: number;
+    quantity: number;
+    totalCost: number;
+  };
+  netDifference: number;
+  paymentMethod?: string;
+  notes?: string;
+}
+
+export const exchangeSaleItems = (params: {
+  invoiceId: string;
+  cashier: Salesperson;
+  manager?: Salesperson;
+  returnedItem: {
+    id: string;
+    name: string;
+    price: number;
+    quantity: number;
+    totalCredit: number;
+    restockCondition: 'restock' | 'damaged';
+    reason: string;
+  };
+  replacementItem: {
+    id: string;
+    name: string;
+    price: number;
+    quantity: number;
+    totalCost: number;
+  };
+  paymentMethod?: string;
+  tenderedAmount?: number;
+  changeGiven?: number;
+  notes?: string;
+}): { success: boolean; message: string; exchangeRecord?: ItemExchangeRecord; invoice?: SaleInvoice } => {
+  const allSales = getAllSales();
+  const invoice = allSales.find((s) => s.id === params.invoiceId);
+  if (!invoice) {
+    return { success: false, message: 'Receipt #' + params.invoiceId + ' not found.' };
+  }
+  if (invoice.status === 'Refunded') {
+    return { success: false, message: 'Receipt #' + params.invoiceId + ' is already refunded and cannot be exchanged.' };
+  }
+  if (invoice.status === 'Voided') {
+    return { success: false, message: 'Receipt #' + params.invoiceId + ' is voided and cannot be exchanged.' };
+  }
+
+  const now = new Date();
+  const dateStr = now.toISOString().split('T')[0];
+  const netDifference = Math.round((params.replacementItem.totalCost - params.returnedItem.totalCredit) * 100) / 100;
+
+  // 1. Inventory Movements:
+  // Restock returned item if condition is 'restock'
+  if (params.returnedItem.restockCondition === 'restock' && params.returnedItem.id && params.returnedItem.quantity > 0) {
+    updateProductStock(params.returnedItem.id, params.returnedItem.quantity, undefined, undefined, {
+      staffId: params.manager?.id || params.cashier.id,
+      staffName: params.manager?.name || params.cashier.name,
+      referenceId: invoice.id,
+      reason: 'Exchange Restock: +' + params.returnedItem.quantity + ' ' + params.returnedItem.name + ' (Invoice #' + invoice.id + ' - ' + params.returnedItem.reason + ')',
+      actionTaken: 'EXCHANGE_RESTOCK',
+      txnType: 'RETURN',
+    });
+  }
+
+  // Deplete stock for replacement item
+  if (params.replacementItem.id && params.replacementItem.quantity > 0) {
+    updateProductStock(params.replacementItem.id, -params.replacementItem.quantity, undefined, undefined, {
+      staffId: params.manager?.id || params.cashier.id,
+      staffName: params.manager?.name || params.cashier.name,
+      referenceId: invoice.id,
+      reason: 'Exchange Issued: -' + params.replacementItem.quantity + ' ' + params.replacementItem.name + ' (Swapped on Invoice #' + invoice.id + ')',
+      actionTaken: 'EXCHANGE_ISSUE',
+      txnType: 'SALE',
+    });
+  }
+
+  // 2. Financial Ledger Movements (Cash Drawer & Form 2):
+  const shiftId = getShiftId(params.cashier.id, dateStr);
+  const compId = invoice.company_id || invoice.companyId;
+  const brId = invoice.branch_id || invoice.branchId;
+
+  if (netDifference > 0) {
+    // Customer pays extra difference
+    if (params.paymentMethod === 'Cash' || !params.paymentMethod) {
+      addCashLog({
+        timestamp: now.toISOString(),
+        date: dateStr,
+        staffId: params.cashier.id,
+        staffName: params.cashier.name,
+        line: 'Item Exchange Payment',
+        description: 'Customer paid difference for exchange on Invoice #' + invoice.id + ' (+' + params.replacementItem.name + ' vs -' + params.returnedItem.name + ')',
+        in: netDifference,
+        out: 0,
+        category: 'Sale',
+        reference: invoice.id,
+        company_id: compId,
+        branch_id: brId,
+      });
+
+      addMovement({
+        shiftId,
+        staffId: params.cashier.id,
+        date: dateStr,
+        timestamp: now.toISOString(),
+        type: 'exchange_payment',
+        amount: netDifference,
+        currency: invoice.currency || 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'POS',
+        sourceRef: invoice.id,
+        notes: `Exchange net payment (+$${netDifference.toFixed(2)}) for Invoice #${invoice.id}`,
+        company_id: compId,
+        branch_id: brId,
+      });
+    }
+  } else if (netDifference < 0) {
+    // Store refunds difference to customer
+    const refundAmt = Math.abs(netDifference);
+    addCashLog({
+      timestamp: now.toISOString(),
+      date: dateStr,
+      staffId: params.cashier.id,
+      staffName: params.cashier.name,
+      line: 'Item Exchange Refund',
+      description: `Store refunded difference for exchange on Invoice #${invoice.id} (+${params.replacementItem.name} vs -${params.returnedItem.name})`,
+      in: 0,
+      out: refundAmt,
+      category: 'Refund',
+      reference: invoice.id,
+      company_id: compId,
+      branch_id: brId,
+    });
+
+    addMovement({
+      shiftId,
+      staffId: params.cashier.id,
+      date: dateStr,
+      timestamp: now.toISOString(),
+      type: 'exchange_refund',
+      amount: refundAmt,
+      currency: invoice.currency || 'USD',
+      direction: 'out',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'POS',
+      sourceRef: invoice.id,
+      notes: `Exchange refund differential (-$${refundAmt.toFixed(2)}) for Invoice #${invoice.id}`,
+      company_id: compId,
+      branch_id: brId,
+    });
+  }
+
+  // 3. Record Exchange on Immutable Invoice:
+  const exchangeRecord: ItemExchangeRecord = {
+    exchangeId: `EXC-${now.getTime().toString(36).toUpperCase()}-${Math.floor(Math.random() * 899 + 100)}`,
+    invoiceId: invoice.id,
+    timestamp: now.toISOString(),
+    date: dateStr,
+    cashierId: params.cashier.id,
+    cashierName: params.cashier.name,
+    authorizedById: params.manager?.id,
+    authorizedByName: params.manager?.name,
+    returnedItem: params.returnedItem,
+    replacementItem: params.replacementItem,
+    netDifference,
+    paymentMethod: params.paymentMethod || 'Cash',
+    notes: params.notes,
+  };
+
+  invoice.exchanges = [...(invoice.exchanges || []), exchangeRecord];
+  invoice.hasExchanges = true;
+  invoice.netTotal = Math.round(((invoice.netTotal ?? invoice.total) + netDifference) * 100) / 100;
+
+  setStored(STORAGE_KEYS.SALES, allSales);
+
+  // 4. Audit Log:
+  logManagerOverride({
+    action: 'ITEM_EXCHANGE',
+    manager: params.manager || params.cashier,
+    cashier: params.cashier,
+    referenceId: invoice.id,
+    amount: Math.abs(netDifference),
+    details: `Item exchange on #${invoice.id}: Returned ${params.returnedItem.quantity}x ${params.returnedItem.name} ($${params.returnedItem.totalCredit.toFixed(2)}) for ${params.replacementItem.quantity}x ${params.replacementItem.name} ($${params.replacementItem.totalCost.toFixed(2)}). Net Difference: $${netDifference >= 0 ? '+' : ''}${netDifference.toFixed(2)}. Restock: ${params.returnedItem.restockCondition}`,
+    metadata: {
+      exchangeId: exchangeRecord.exchangeId,
+      returnedItem: params.returnedItem,
+      replacementItem: params.replacementItem,
+      netDifference,
+    },
+  });
+
+  notifyListeners();
+
+  return {
+    success: true,
+    message: `Item exchange completed successfully. Net difference: $${netDifference >= 0 ? '+' : ''}${netDifference.toFixed(2)}`,
+    exchangeRecord,
+    invoice,
+  };
+};
+
 export const editSaleInvoice = (params: {
   invoiceId: string;
   staff: Salesperson;
@@ -6753,7 +6984,9 @@ export const calculateForm4 = (
   // If cashMovements exist for this shift, use breakdown as the canonical source
   if (breakdown.movementsCount > 0) {
     let float = breakdown.openingFloat;
-    let cashSales = breakdown.cashSales;
+    let refunds = breakdown.refunds || 0;
+    let netCashSales = Math.max(0, (breakdown.cashSales || 0) - refunds);
+    let cashSales = netCashSales;
     let creditPayments = breakdown.creditPayments;
     let changeReceived = breakdown.changeReceived;
     
@@ -6932,9 +7165,31 @@ export const calculateForm4 = (
   );
   const float = floatLog?.in || 0;
 
-  // Direct Procurements (Out) - deduplicate between approved Direct GRVs and manual Form 2 logs
+  // Direct Procurements (Out) - attribute each operator's actual share, not the entire invoice total
+  const staffPayments = getDirectGrvPaymentsForStaff(staffId, date);
   const directGrvs = getDirectGrvsForStaffAndDate(staffId, date);
-  const grvTotal = directGrvs.reduce((sum, g) => sum + (g.totalCost || 0), 0);
+  let grvTotal = 0;
+  const processedGrvIds = new Set<string>();
+
+  staffPayments.forEach(({ grv, payment }) => {
+    grvTotal += payment.amount || 0;
+    processedGrvIds.add(grv.id);
+    if (grv.grvNumber) processedGrvIds.add(grv.grvNumber);
+  });
+
+  // Include any legacy GRVs that didn't have payments array but were received by this staff
+  directGrvs.forEach((g) => {
+    if (!processedGrvIds.has(g.id) && (!g.payments || g.payments.length === 0)) {
+      const gRecId = String(g.receivedByStaffId || '').trim().toLowerCase();
+      const sId = String(staffId).trim().toLowerCase();
+      if ((gRecId === sId || gRecId.replace(/^usr-|^staff-|^0+/, '') === sId.replace(/^usr-|^staff-|^0+/, '')) && g.payFromTill) {
+        grvTotal += g.totalCost || 0;
+        processedGrvIds.add(g.id);
+        if (g.grvNumber) processedGrvIds.add(g.grvNumber);
+      }
+    }
+  });
+
   const nonGrvProcurements = form2Logs
     .filter(
       (l) =>
@@ -6944,12 +7199,10 @@ export const calculateForm4 = (
           (l as any).categoryGroup === 'Direct Procurement' ||
           l.description?.toLowerCase().includes('direct procurement') ||
           l.description?.toLowerCase().includes('procurement')) &&
-        !directGrvs.some((g) => {
-          const gRef = g.grvNumber || g.id;
+        !Array.from(processedGrvIds).some((ref) => {
           return (
-            (l.reference && l.reference === gRef) ||
-            (l.description && l.description.includes(gRef)) ||
-            Math.abs((g.totalCost || 0) - (l.out || 0)) < 0.01
+            (l.reference && l.reference === ref) ||
+            (l.description && l.description.includes(ref))
           );
         })
     )

@@ -119,15 +119,35 @@ wss.on('connection', (ws, req) => {
         }
       }
 
-      const pType = packet.type || packet.action || '';
-      const isSale = pType === 'sale' || pType === 'SALE_RECORD' || pType === 'SALE' || pType === 'SALE_CREATED';
-      const saleObj = packet.sale || packet.payload;
-      const saleId = (saleObj && saleObj.id) || packet.id || packet.invoice_id;
+      const pType = (packet.type || packet.action || '').toUpperCase();
+      const isReceipt =
+        pType === 'SYNC_RECEIPT' ||
+        pType === 'CLOUD_SYNC_ACK' ||
+        pType === 'ANTI-DOUBLE-POST ACK' ||
+        pType === 'ACK' ||
+        pType === 'SALE_ACK' ||
+        pType === 'RECEIPT';
+
+      // Drop ACK packets immediately so they NEVER circulate, echo, or ping-pong in the mesh
+      if (isReceipt) {
+        return;
+      }
+
+      const isSale = pType === 'SALE' || pType === 'SALE_RECORD' || pType === 'SALE_CREATED' || !!packet.sale;
+      const saleObj = packet.sale || (packet.data && (packet.data.items || packet.data.total !== undefined ? packet.data : packet.data.sale)) || packet.payload;
+      const saleId =
+        (saleObj && (saleObj.id || saleObj.invoice_id || saleObj.invoiceId)) ||
+        packet.invoice_id ||
+        packet.invoiceId ||
+        packet.id ||
+        (packet.data && (packet.data.invoice_id || packet.data.id));
 
       // =====================================================================
-      // SAFEGUARD 1: IMMEDIATE SYNC_RECEIPT (ACK) TO SENDER
+      // SAFEGUARD 1: IMMEDIATE SYNC_RECEIPT (ACK) TO SENDER (NON-LEGACY ONLY)
       // =====================================================================
       if (isSale && saleId) {
+        const isLegacyInv = String(saleId).toUpperCase().startsWith('INV-');
+
         // Store sale in hub history
         const existingIdx = salesStore.findIndex((s) => s.id === saleId);
         if (existingIdx >= 0) {
@@ -158,20 +178,25 @@ wss.on('connection', (ws, req) => {
 
         saveData();
 
-        // Send point-to-point SYNC_RECEIPT ACK directly back to the sending device
-        try {
-          const ackPacket = {
-            type: 'SYNC_RECEIPT',
-            action: 'SYNC_RECEIPT',
-            invoice_id: saleId,
-            origin_device_id: 'LOCAL_HUB',
-            origin_device_name: 'Termux Local Hub',
-            timestamp: Date.now(),
-          };
-          ws.send(JSON.stringify(ackPacket));
-          console.log(`[Termux Hub] Sale #${saleId} recorded. Sent SYNC_RECEIPT ACK to sender.`);
-        } catch (ackErr) {
-          console.warn('[Termux Hub] Failed to send SYNC_RECEIPT ACK:', ackErr.message);
+        // Requirement 4: Legacy INV- sales must NOT trigger SYNC_RECEIPT
+        if (!isLegacyInv) {
+          // Send point-to-point SYNC_RECEIPT ACK directly back to the sending device
+          try {
+            const ackPacket = {
+              type: 'SYNC_RECEIPT',
+              action: 'SYNC_RECEIPT',
+              invoice_id: saleId,
+              origin_device_id: 'LOCAL_HUB',
+              origin_device_name: 'Termux Local Hub',
+              timestamp: Date.now(),
+            };
+            ws.send(JSON.stringify(ackPacket));
+            console.log(`[Termux Hub] Sale #${saleId} recorded. Sent SYNC_RECEIPT ACK to sender.`);
+          } catch (ackErr) {
+            console.warn('[Termux Hub] Failed to send SYNC_RECEIPT ACK:', ackErr.message);
+          }
+        } else {
+          console.log(`[Termux Hub] Ingested legacy Sale #${saleId} silently without SYNC_RECEIPT.`);
         }
       }
 

@@ -229,31 +229,122 @@ class MeshSyncManager {
   private pendingSaleAcks: Map<string, { sale: SaleInvoice; sentAt: number; lastRetryAt: number; retries: number }> = new Map();
   private ackWatchdogTimer: number | null = null;
 
+  /**
+   * Robust extractor for Invoice/Sale IDs across standard envelopes,
+   * nested wrappers ({ data: { invoice_id: '...' } }), and legacy formats.
+   */
+  public extractInvoiceId(packet: any): string | null {
+    if (!packet || typeof packet !== 'object') return null;
+    const candidate =
+      packet.invoice_id ||
+      packet.invoiceId ||
+      packet.saleId ||
+      packet.sale_id ||
+      packet.invoiceNumber ||
+      packet.invoice_number ||
+      (packet.data && (
+        packet.data.invoice_id ||
+        packet.data.invoiceId ||
+        packet.data.saleId ||
+        packet.data.sale_id ||
+        packet.data.invoiceNumber ||
+        packet.data.id
+      )) ||
+      (packet.payload && (
+        packet.payload.invoice_id ||
+        packet.payload.invoiceId ||
+        packet.payload.saleId ||
+        packet.payload.sale_id ||
+        packet.payload.invoiceNumber ||
+        packet.payload.id
+      )) ||
+      (packet.sale && (
+        packet.sale.id ||
+        packet.sale.invoice_id ||
+        packet.sale.invoiceId ||
+        packet.sale.invoiceNumber
+      )) ||
+      packet.id;
+
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate.trim();
+    }
+    return null;
+  }
+
+  /**
+   * Invoice generator adhering to: [user_prefix]-[YYMMDD]-[HHMMSS]-[Random3Digits]
+   * Example: KM5-261024-143022-892
+   */
+  public getNextInvoiceId(staffId?: any, staffName?: string): string {
+    return generateInvoiceNumber(staffId, staffName);
+  }
+
   private startAckWatchdogLoop() {
     if (this.ackWatchdogTimer) return;
+    // Slow down watchdog checks to 15 seconds to prevent spamming
     this.ackWatchdogTimer = window.setInterval(() => {
       this.checkPendingSaleAcks();
-    }, 5000);
+    }, 15000);
   }
 
   private checkPendingSaleAcks() {
     if (this.pendingSaleAcks.size === 0) return;
+
+    // Requirement 5: Do NOT retry if the Local Hub is disconnected.
+    // Only retry if the Hub is connected and actively dropping packets.
+    const isHubReady =
+      this.isLocalHubConnected &&
+      this.localHubWs &&
+      this.localHubWs.readyState === WebSocket.OPEN;
+
+    if (!isHubReady) {
+      return;
+    }
+
     const now = Date.now();
     const MAX_RETRIES = 3;
+    const RETRY_INTERVAL_MS = 30000; // 30 seconds
 
-    for (const [invoiceId, pending] of this.pendingSaleAcks.entries()) {
+    for (const [invoiceId, pending] of Array.from(this.pendingSaleAcks.entries())) {
+      // Requirement 4: Silent Legacy Ingestion filter
+      // If legacy INV- invoice, silently drop from pending watchdog queue without retrying
+      if (!invoiceId || /^INV-/i.test(invoiceId)) {
+        this.pendingSaleAcks.delete(invoiceId);
+        continue;
+      }
+
+      // Requirement 2: Handle Nested Payloads
+      // Check for ID in direct key as well as nested wrappers
+      const saleObj: any = pending.sale;
+      const targetId =
+        this.extractInvoiceId(saleObj) ||
+        saleObj?.id ||
+        saleObj?.invoice_id ||
+        saleObj?.invoiceId ||
+        invoiceId;
+
+      if (!targetId || /^INV-/i.test(targetId)) {
+        this.pendingSaleAcks.delete(invoiceId);
+        continue;
+      }
+
       // 1. Check if already marked synced in local RoomDatabase
       const allSales = getAllSales();
-      const existing = allSales.find((s) => s.id === invoiceId);
+      const existing = allSales.find(
+        (s) =>
+          s.id === invoiceId ||
+          s.id === targetId ||
+          (s.id && s.id.toUpperCase() === targetId.toUpperCase())
+      );
       if (existing && (existing.synced || existing.syncStatus === 'synced')) {
         this.pendingSaleAcks.delete(invoiceId);
         continue;
       }
 
-      if (now - pending.lastRetryAt >= 30000) {
-        // 2. Safeguard against infinite echo storms / bandwidth exhaustion:
+      // 2. Only retry if 30s has elapsed since last retry
+      if (now - pending.lastRetryAt >= RETRY_INTERVAL_MS) {
         // Cap retries at 3 attempts (90s). If Hub/peers don't ACK, stop spamming WebSocket.
-        // Sale is 100% safely preserved in local database & IndexedDB queue with zero data loss.
         if (pending.retries >= MAX_RETRIES) {
           this.pendingSaleAcks.delete(invoiceId);
           this.addLog(
@@ -267,38 +358,36 @@ class MeshSyncManager {
           continue;
         }
 
-        if (this.isLocalHubConnected && this.localHubWs && this.localHubWs.readyState === WebSocket.OPEN) {
-          pending.retries++;
-          pending.lastRetryAt = now;
-          this.addLog(
-            'BROADCAST',
-            `Sync Receipt Watchdog: Sale #${invoiceId} unconfirmed after 30s. Retrying transmission to Local Hub (Attempt #${pending.retries}/${MAX_RETRIES})...`,
-            this.config.deviceName,
-            undefined,
-            5,
-            invoiceId
-          );
-          const retryPacket = {
-            type: 'sale',
-            action: 'SALE_RECORD',
-            packet_id: `RETRY-SALE-${invoiceId}-${Date.now()}`,
-            companyId: this.config.companyId,
-            branchId: this.config.branchId,
-            branchCode: this.config.branchCode,
-            deviceId: this.config.deviceId,
-            originDeviceId: this.config.deviceId,
-            originDeviceName: this.config.deviceName,
-            sale: pending.sale,
-            timestamp: Date.now(),
-            ttl: 5,
-            isRetry: true,
-            retryCount: pending.retries,
-          };
-          try {
-            this.localHubWs.send(JSON.stringify(retryPacket));
-          } catch (e) {
-            console.warn('[MeshSync] Error re-transmitting un-ACKed sale:', e);
-          }
+        pending.retries++;
+        pending.lastRetryAt = now;
+        this.addLog(
+          'BROADCAST',
+          `Sync Receipt Watchdog: Sale #${invoiceId} unconfirmed after 30s. Retrying transmission to Local Hub (Attempt #${pending.retries}/${MAX_RETRIES})...`,
+          this.config.deviceName,
+          undefined,
+          5,
+          invoiceId
+        );
+        const retryPacket = {
+          type: 'sale',
+          action: 'SALE_RECORD',
+          packet_id: `RETRY-SALE-${invoiceId}-${Date.now()}`,
+          companyId: this.config.companyId,
+          branchId: this.config.branchId,
+          branchCode: this.config.branchCode,
+          deviceId: this.config.deviceId,
+          originDeviceId: this.config.deviceId,
+          originDeviceName: this.config.deviceName,
+          sale: pending.sale,
+          timestamp: Date.now(),
+          ttl: 5,
+          isRetry: true,
+          retryCount: pending.retries,
+        };
+        try {
+          this.localHubWs.send(JSON.stringify(retryPacket));
+        } catch (e) {
+          console.warn('[MeshSync] Error re-transmitting un-ACKed sale:', e);
         }
       }
     }
@@ -306,23 +395,53 @@ class MeshSyncManager {
 
   public handleIncomingSaleSyncReceipt(invoiceId: string, originName: string = 'Local Hub') {
     if (!invoiceId) return;
-    const hadPending = this.pendingSaleAcks.delete(invoiceId);
-    const didMark = markSaleAsSynced(invoiceId);
-    persistentSyncEngine.markReceiptAsSynced([], [invoiceId]);
+    const cleanId = String(invoiceId).trim();
 
+    // 1. Direct delete from pendingSaleAcks
+    let hadPending = this.pendingSaleAcks.delete(cleanId);
+
+    // 2. If not found by direct key, search case-insensitively and inspect nested payload in pendingSaleAcks
+    if (!hadPending) {
+      for (const [key, pending] of this.pendingSaleAcks.entries()) {
+        const nestedId = this.extractInvoiceId(pending.sale) || (pending.sale as any)?.id;
+        const matchesKey = key.toUpperCase() === cleanId.toUpperCase();
+        const matchesNested = nestedId && nestedId.toUpperCase() === cleanId.toUpperCase();
+        const matchesTrimmed = key.replace(/^INV-0*/i, '') === cleanId.replace(/^INV-0*/i, '');
+
+        if (matchesKey || matchesNested || matchesTrimmed) {
+          this.pendingSaleAcks.delete(key);
+          hadPending = true;
+          break;
+        }
+      }
+    }
+
+    // 3. Mark in local RoomDatabase & Persistent IndexedDB queue
+    const didMark = markSaleAsSynced(cleanId);
+    persistentSyncEngine.markReceiptAsSynced([], [cleanId]);
+
+    // Requirement 1: Add a console.log when a receipt is successfully received so we can verify it.
+    console.log(
+      `[MeshSync] ✅ SYNC_RECEIPT successfully received and verified for Sale #${cleanId} from ${originName}. ` +
+      `Cleared from pending watchdog queue (hadPending: ${hadPending}, markedSynced: ${didMark}). ` +
+      `Remaining pending sales: ${this.pendingSaleAcks.size}`
+    );
+
+    // Fire-and-Forget: Process silently into local database and STOP.
+    // Do NOT generate a new ACK in response. Do NOT rebroadcast it.
     this.addLog(
       'ACK',
-      `Sync Receipt (ACK) confirmed for Sale #${invoiceId} from ${originName}. Marked as Synced locally!`,
+      `Sync Receipt (ACK) confirmed for Sale #${cleanId} from ${originName}. Marked as Synced locally!`,
       originName,
       this.config.deviceName,
       undefined,
-      invoiceId
+      cleanId
     );
 
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_sync_receipt_received', {
-        detail: { invoiceId, originName, hadPending, didMark }
+        detail: { invoiceId: cleanId, originName, hadPending, didMark }
       }));
     }
   }
@@ -1081,18 +1200,25 @@ class MeshSyncManager {
       packet.originDeviceId ||
       packet.deviceId ||
       packet.sourceDevice ||
-      (packet.data && (packet.data.origin_device_id || packet.data.originDeviceId || packet.data.deviceId)) ||
-      (packet.payload && (packet.payload.origin_device_id || packet.payload.originDeviceId || packet.payload.deviceId));
+      packet.origin_device_name ||
+      packet.originDeviceName ||
+      packet.deviceName ||
+      (packet.data && (packet.data.origin_device_id || packet.data.originDeviceId || packet.data.deviceId || packet.data.origin_device_name || packet.data.deviceName)) ||
+      (packet.payload && (packet.payload.origin_device_id || packet.payload.originDeviceId || packet.payload.deviceId || packet.payload.origin_device_name || packet.payload.deviceName));
 
-    if (rawOrigin && rawOrigin === this.config.deviceId) {
+    if (rawOrigin && (rawOrigin === this.config.deviceId || rawOrigin === this.config.deviceName)) {
       return;
     }
 
     // Unwrap envelope wrappers if hub relays through { data: ... } or { payload: ... }
-    if (packet.data && typeof packet.data === 'object' && (packet.data.type || packet.data.action)) {
-      packet = packet.data;
-    } else if (packet.payload && typeof packet.payload === 'object' && (packet.payload.type || packet.payload.action)) {
-      packet = packet.payload;
+    if (packet.data && typeof packet.data === 'object') {
+      if (packet.data.type || packet.data.action) {
+        packet = packet.data;
+      }
+    } else if (packet.payload && typeof packet.payload === 'object') {
+      if (packet.payload.type || packet.payload.action) {
+        packet = packet.payload;
+      }
     }
 
     // Ignore packets that originated from THIS device
@@ -1102,7 +1228,7 @@ class MeshSyncManager {
       packet.deviceId ||
       packet.sourceDevice;
 
-    if (originId && originId === this.config.deviceId) {
+    if (originId && (originId === this.config.deviceId || originId === this.config.deviceName)) {
       return;
     }
 
@@ -1134,22 +1260,36 @@ class MeshSyncManager {
     const originName = packet.origin_device_name || packet.originDeviceName || packet.deviceName || 'Peer Terminal';
 
     // 1. SALE RECORD: Ingest directly into Room DB and mark as known to avoid any re-broadcast
-    if (pType === 'sale' || pType === 'SALE_RECORD' || packet.sale) {
-      const saleData: SaleInvoice = packet.sale || packet.payload;
-      if (saleData && saleData.id) {
+    if (pType === 'sale' || pType === 'SALE_RECORD' || pType === 'SALE' || pType === 'SALE_CREATED' || packet.sale) {
+      const saleData: SaleInvoice =
+        packet.sale ||
+        (packet.data && (packet.data.items || packet.data.total !== undefined) ? packet.data : packet.data?.sale) ||
+        packet.payload?.sale ||
+        packet.payload;
+
+      const saleId = this.extractInvoiceId(packet) || (saleData && (saleData.id || (saleData as any).invoice_id || (saleData as any).invoiceId));
+
+      if (saleData && saleId) {
+        const isLegacyInv = /^INV-/i.test(saleId);
+
         // If this sale was waiting for ACK, remove it and mark as synced (implicit ACK on relay)
-        if (this.pendingSaleAcks.has(saleData.id)) {
-          this.handleIncomingSaleSyncReceipt(saleData.id, originName);
+        if (this.pendingSaleAcks.has(saleId)) {
+          if (isLegacyInv) {
+            this.pendingSaleAcks.delete(saleId);
+          } else {
+            this.handleIncomingSaleSyncReceipt(saleId, originName);
+          }
         }
 
-        if (this.knownSaleIds.has(saleData.id)) {
+        if (this.knownSaleIds.has(saleId)) {
           return;
         }
-        this.knownSaleIds.add(saleData.id);
-        this.broadcastedInvoiceIds.add(saleData.id);
+        this.knownSaleIds.add(saleId);
+        this.broadcastedInvoiceIds.add(saleId);
 
         const ingested = ingestMeshSale({
           ...saleData,
+          id: saleId,
           company_id: this.config.companyId,
           branch_id: this.config.branchId,
           fromMesh: true,
@@ -1159,13 +1299,15 @@ class MeshSyncManager {
           this.scheduleBatchUiUpdate();
           this.addLog(
             'EPIDEMIC_HOP',
-            `Received Sale #${saleData.id} ($${(saleData.total || 0).toFixed(2)}) from ${originName} via Local Hub. Synced locally.`,
+            `Received ${isLegacyInv ? 'Legacy ' : ''}Sale #${saleId} ($${(saleData.total || 0).toFixed(2)}) from ${originName} via Local Hub. Synced locally.`,
             originName,
             this.config.deviceName,
             packet.ttl || 5,
-            saleData.id
+            saleId
           );
         }
+        // Silent Legacy Ingestion & fire-and-forget: do NOT trigger SYNC_RECEIPT or Watchdog retry
+        return;
       }
       return;
     }
@@ -1276,13 +1418,45 @@ class MeshSyncManager {
       return;
     }
 
-    // 11. ANTI-DOUBLE-POSTING SYNC RECEIPT & HUB SALE ACK
-    if (pType === 'sync_receipt' || pType === 'SYNC_RECEIPT' || packet.type === 'SYNC_RECEIPT') {
-      const invId = packet.invoice_id || packet.invoiceId || packet.saleId || (packet.payload && (packet.payload.invoice_id || packet.payload.invoiceId || packet.payload.id));
+    // 11. ANTI-DOUBLE-POSTING SYNC RECEIPT, HUB SALE ACK & CLOUD SYNC ACK
+    const isReceipt =
+      pType === 'sync_receipt' ||
+      pType === 'SYNC_RECEIPT' ||
+      pType === 'cloud_sync_ack' ||
+      pType === 'CLOUD_SYNC_ACK' ||
+      pType === 'ANTI-DOUBLE-POST ACK' ||
+      pType === 'anti_double_post_ack' ||
+      pType === 'sale_ack' ||
+      pType === 'SALE_ACK' ||
+      pType === 'ack' ||
+      pType === 'ACK' ||
+      packet.type === 'SYNC_RECEIPT' ||
+      packet.type === 'CLOUD_SYNC_ACK' ||
+      packet.type === 'ANTI-DOUBLE-POST ACK' ||
+      packet.type === 'ACK' ||
+      packet.action === 'SYNC_RECEIPT' ||
+      packet.action === 'CLOUD_SYNC_ACK';
+
+    if (isReceipt) {
+      const invId = this.extractInvoiceId(packet);
       if (invId) {
         this.handleIncomingSaleSyncReceipt(invId, originName);
       }
+      const postedIds: string[] =
+        packet.postedIds ||
+        packet.invoice_ids ||
+        packet.invoiceIds ||
+        packet.data?.postedIds ||
+        packet.payload?.postedIds ||
+        packet.data?.invoice_ids;
+      if (Array.isArray(postedIds)) {
+        for (const pid of postedIds) {
+          if (pid) this.handleIncomingSaleSyncReceipt(pid, originName);
+        }
+      }
       this.handleIncomingSyncReceipt(packet);
+      // Fire-and-forget: process silently into local database and STOP.
+      // Must NOT generate a new ACK in response or rebroadcast.
       return;
     }
 
@@ -1404,12 +1578,15 @@ class MeshSyncManager {
 
         for (const sale of unsyncedSales) {
           // Register in pendingSaleAcks to await SYNC_RECEIPT ACK from Hub
-          this.pendingSaleAcks.set(sale.id, {
-            sale,
-            sentAt: Date.now(),
-            lastRetryAt: Date.now(),
-            retries: 0,
-          });
+          // Requirement 4: Legacy INV- sales must NOT trigger Watchdog retries
+          if (!/^INV-/i.test(sale.id)) {
+            this.pendingSaleAcks.set(sale.id, {
+              sale,
+              sentAt: Date.now(),
+              lastRetryAt: Date.now(),
+              retries: 0,
+            });
+          }
 
           const offlinePacket = {
             type: 'sale',
@@ -2212,33 +2389,53 @@ class MeshSyncManager {
     }
 
     // 2. SALE RECORD BROADCAST
-    if (topic.endsWith('/sale') || packet.type === 'sale' || packet.action === 'SALE_RECORD') {
-      const saleData: SaleInvoice = packet.sale || packet.payload;
-      if (saleData && saleData.id) {
-        if (this.knownSaleIds.has(saleData.id)) {
+    if (topic.endsWith('/sale') || packet.type === 'sale' || packet.action === 'SALE_RECORD' || packet.type === 'SALE' || packet.type === 'SALE_CREATED' || packet.sale) {
+      const saleData: SaleInvoice =
+        packet.sale ||
+        (packet.data && (packet.data.items || packet.data.total !== undefined) ? packet.data : packet.data?.sale) ||
+        packet.payload?.sale ||
+        packet.payload;
+
+      const saleId = this.extractInvoiceId(packet) || (saleData && (saleData.id || (saleData as any).invoice_id || (saleData as any).invoiceId));
+
+      if (saleData && saleId) {
+        const isLegacyInv = /^INV-/i.test(saleId);
+
+        if (this.pendingSaleAcks.has(saleId)) {
+          if (isLegacyInv) {
+            this.pendingSaleAcks.delete(saleId);
+          } else {
+            this.handleIncomingSaleSyncReceipt(saleId, originName);
+          }
+        }
+
+        if (this.knownSaleIds.has(saleId)) {
           return;
         }
 
         const ingested = ingestMeshSale({
           ...saleData,
+          id: saleId,
           company_id: this.config.companyId,
           branch_id: this.config.branchId,
           fromMesh: true,
         } as any);
 
         if (ingested) {
-          this.knownSaleIds.add(saleData.id);
-          this.broadcastedInvoiceIds.add(saleData.id);
+          this.knownSaleIds.add(saleId);
+          this.broadcastedInvoiceIds.add(saleId);
           this.scheduleBatchUiUpdate();
           this.addLog(
             'EPIDEMIC_HOP',
-            `Received Sale #${saleData.id} ($${(saleData.total || 0).toFixed(2)}) from ${originName}. Synced into local database!`,
+            `Received ${isLegacyInv ? 'Legacy ' : ''}Sale #${saleId} ($${(saleData.total || 0).toFixed(2)}) from ${originName}. Synced into local database!`,
             originName,
             this.config.deviceName,
             packet.ttl || 5,
-            saleData.id
+            saleId
           );
         }
+        // Silent Legacy Ingestion & fire-and-forget: do NOT trigger SYNC_RECEIPT or Watchdog retry
+        return;
       }
       return;
     }
@@ -2467,13 +2664,43 @@ class MeshSyncManager {
       return;
     }
 
-    // 11. ANTI-DOUBLE-POSTING SYNC RECEIPT & HUB SALE ACK
-    if (topic.endsWith('/sync_receipt') || packet.type === 'sync_receipt' || packet.action === 'SYNC_RECEIPT' || packet.type === 'SYNC_RECEIPT') {
-      const invId = packet.invoice_id || packet.invoiceId || packet.saleId || (packet.payload && (packet.payload.invoice_id || packet.payload.invoiceId || packet.payload.id));
+    // 11. ANTI-DOUBLE-POSTING SYNC RECEIPT, HUB SALE ACK & CLOUD SYNC ACK
+    const isReceipt =
+      topic.endsWith('/sync_receipt') ||
+      topic.endsWith('/receipt') ||
+      packet.type === 'sync_receipt' ||
+      packet.action === 'SYNC_RECEIPT' ||
+      packet.type === 'SYNC_RECEIPT' ||
+      packet.type === 'cloud_sync_ack' ||
+      packet.type === 'CLOUD_SYNC_ACK' ||
+      packet.action === 'CLOUD_SYNC_ACK' ||
+      packet.type === 'ANTI-DOUBLE-POST ACK' ||
+      packet.action === 'ANTI-DOUBLE-POST ACK' ||
+      packet.type === 'sale_ack' ||
+      packet.action === 'SALE_ACK' ||
+      packet.type === 'ACK' ||
+      packet.action === 'ACK';
+
+    if (isReceipt) {
+      const invId = this.extractInvoiceId(packet);
       if (invId) {
         this.handleIncomingSaleSyncReceipt(invId, originName);
       }
+      const postedIds: string[] =
+        packet.postedIds ||
+        packet.invoice_ids ||
+        packet.invoiceIds ||
+        packet.data?.postedIds ||
+        packet.payload?.postedIds ||
+        packet.data?.invoice_ids;
+      if (Array.isArray(postedIds)) {
+        for (const pid of postedIds) {
+          if (pid) this.handleIncomingSaleSyncReceipt(pid, originName);
+        }
+      }
       this.handleIncomingSyncReceipt(packet);
+      // Fire-and-forget: process silently into local database and STOP.
+      // Must NOT generate a new ACK in response or rebroadcast.
       return;
     }
 
@@ -3206,13 +3433,15 @@ class MeshSyncManager {
     this.knownSaleIds.add(sale.id);
 
     // Safeguard 1: Register in pendingSaleAcks to await {"type": "SYNC_RECEIPT", "invoice_id": "..."}
-    // If receipt is not received within 30 seconds, it remains in queue and is retried.
-    this.pendingSaleAcks.set(sale.id, {
-      sale,
-      sentAt: Date.now(),
-      lastRetryAt: Date.now(),
-      retries: 0,
-    });
+    // Requirement 4: Legacy INV- sales must NOT trigger Watchdog retries
+    if (!/^INV-/i.test(sale.id)) {
+      this.pendingSaleAcks.set(sale.id, {
+        sale,
+        sentAt: Date.now(),
+        lastRetryAt: Date.now(),
+        retries: 0,
+      });
+    }
 
     // Stop Payload Bloat: Send ONLY the specific packet for this current single sale
     const packetId = `SALE-PKT-${sale.id}-${Date.now()}`;

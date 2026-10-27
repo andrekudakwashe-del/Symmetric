@@ -445,8 +445,10 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       invoiceNo?: string;
       itemsSummary: string;
       amount: number;
+      originalAmount?: number;
       drawerId?: string;
       status: string;
+      rejectionReason?: string;
       approvedByName?: string;
       date: string;
       movementId?: string;
@@ -472,7 +474,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
     // 1. First, check shiftMovements for supplier_payment movements
     const procurementMovements = shiftMovements.filter(
-      (m) => m.type === 'supplier_payment' && m.status !== 'rejected' && (!m.sourceModule || m.sourceModule === 'DirectGRV')
+      (m) => m.type === 'supplier_payment' && (!m.sourceModule || m.sourceModule === 'DirectGRV')
     );
 
     procurementMovements.forEach((m) => {
@@ -484,26 +486,31 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         (g) => g.grvNumber === m.sourceRef || g.id === m.sourceRef || (m.sourceRef && m.sourceRef.startsWith(g.grvNumber))
       );
 
+      const isRejected = m.status === 'rejected' || matchingGrv?.status === 'REJECTED';
+
       list.push({
         grvId: matchingGrv?.id || m.id,
         grvNumber: matchingGrv?.grvNumber || m.sourceRef || m.id,
         supplierName: matchingGrv?.supplierName || m.notes?.replace('Direct Supplier Delivery: ', '').split(' (')[0] || 'Supplier Delivery',
         invoiceNo: matchingGrv?.invoiceNo,
         itemsSummary: matchingGrv ? matchingGrv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', ') : (m.notes || 'Procurement voucher'),
-        amount: Number(m.amount) || 0,
+        amount: isRejected ? 0 : (Number(m.amount) || 0),
+        originalAmount: Number(m.amount) || matchingGrv?.totalCost || 0,
         drawerId: m.terminalId || 'Till 1',
-        status: m.status,
+        status: isRejected ? 'REJECTED' : m.status,
+        rejectionReason: matchingGrv?.rejectedReason,
         approvedByName: matchingGrv?.approvedByStaffName || 'Supervisor',
         date: m.date || sheetDate,
         movementId: m.id,
       });
     });
 
-    // 2. Also incorporate any non-rejected GRVs for this staff & date that may not yet be indexed in movements
+    // 2. Also incorporate any GRVs for this staff & date that may not yet be indexed in movements
     directGrvs.forEach((grv) => {
-      if (grv.status === 'REJECTED') return;
       const grvDate = (grv.date || grv.createdAt || '').slice(0, 10);
       if (grvDate && grvDate !== sheetDate) return;
+
+      const isRejected = grv.status === 'REJECTED';
 
       if (grv.payments && grv.payments.length > 0) {
         grv.payments.forEach((p) => {
@@ -519,9 +526,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               supplierName: grv.supplierName,
               invoiceNo: grv.invoiceNo,
               itemsSummary: grv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', '),
-              amount: Number(p?.amount) || 0,
+              amount: isRejected ? 0 : (Number(p?.amount) || 0),
+              originalAmount: Number(p?.amount) || 0,
               drawerId: p.drawerId || 'Till 1',
               status: grv.status,
+              rejectionReason: grv.rejectedReason,
               approvedByName: grv.approvedByStaffName,
               date: grvDate || sheetDate,
             });
@@ -537,9 +546,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
           supplierName: grv.supplierName,
           invoiceNo: grv.invoiceNo,
           itemsSummary: grv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', '),
-          amount: Number(grv.totalCost) || 0,
+          amount: isRejected ? 0 : (Number(grv.totalCost) || 0),
+          originalAmount: Number(grv.totalCost) || 0,
           drawerId: 'Till 1',
           status: grv.status,
+          rejectionReason: grv.rejectedReason,
           approvedByName: grv.approvedByStaffName,
           date: grvDate || sheetDate,
         });
@@ -550,7 +561,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   }, [shiftMovements, directGrvs, sheetDate, selectedStaffId, selectedStaff]);
 
   const derivedProcurementTotalOut = useMemo(() => {
-    return (derivedProcurements || []).reduce((sum, p) => sum + (Number(p?.amount) || 0), 0);
+    return (derivedProcurements || [])
+      .filter((p) => p.status !== 'REJECTED' && p.status !== 'rejected')
+      .reduce((sum, p) => sum + (Number(p?.amount) || 0), 0);
   }, [derivedProcurements]);
 
   // Core function to load saved daily sheet or initialize blank for staff + date
@@ -1555,6 +1568,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
     // 3. Derived Direct Procurements from Direct Supplier Receiving Vouchers
     derivedProcurements.forEach((proc) => {
+      if (proc.status === 'REJECTED' || proc.status === 'rejected') return;
       entriesToSave.push({
         line: 'Direct Procurement',
         description: `Direct Procurement: ${proc.supplierName} (GRV: ${proc.grvNumber}${proc.invoiceNo ? `, Inv: ${proc.invoiceNo}` : ''})`,
