@@ -44,6 +44,9 @@ import {
   Unlink,
   Database,
   Shuffle,
+  Radio,
+  Wifi,
+  Server,
 } from 'lucide-react';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
 import { RegistrationScreen } from './RegistrationScreen';
@@ -55,6 +58,8 @@ import {
 } from '../../services/googleSheetsSync';
 import { backendAuthService } from '../../services/backendAdapter/backendAuthService';
 import { getTenantBackendConfig, getBackendAdapter } from '../../services/backendAdapter/adapterRegistry';
+import { LocalHubConfig } from '../../utils/localHubConfig';
+import { meshSyncService } from '../../services/meshSyncService';
 
 // Fisher-Yates shuffle algorithm to randomize numeric keypad locations
 const generateScrambledDigits = (): string[] => {
@@ -170,8 +175,53 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         return fresh;
       });
     });
-    return unsub;
+
+    const handleHubIdentity = () => {
+      setHubBranchId(LocalHubConfig.getHubBranchId());
+      setHubBranchName(LocalHubConfig.getHubBranchName());
+      setIsCloudOnly(LocalHubConfig.isCloudOnlyMode());
+      setConnMode(meshSyncService.getConnectionMode());
+    };
+
+    const unsubMesh = meshSyncService.subscribeConnectionMode((mode) => {
+      setConnMode(mode);
+      handleHubIdentity();
+    });
+
+    const unsubConfig = LocalHubConfig.subscribe(() => {
+      handleHubIdentity();
+    });
+
+    window.addEventListener('saimetric_hub_identity_updated', handleHubIdentity);
+    window.addEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
+
+    return () => {
+      unsub();
+      unsubMesh();
+      unsubConfig();
+      window.removeEventListener('saimetric_hub_identity_updated', handleHubIdentity);
+      window.removeEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
+    };
   }, []);
+
+  // Hub Branch Identity & Roaming Owner Safeguard
+  const [hubBranchId, setHubBranchId] = useState<string | null>(() => LocalHubConfig.getHubBranchId());
+  const [hubBranchName, setHubBranchName] = useState<string | null>(() => LocalHubConfig.getHubBranchName());
+  const [connMode, setConnMode] = useState(() => meshSyncService.getConnectionMode());
+  const [isCloudOnly, setIsCloudOnly] = useState(() => LocalHubConfig.isCloudOnlyMode());
+
+  const handleCompleteLogin = (user: Salesperson) => {
+    // Branch-Scoped Isolation & Roaming Owner Safeguard:
+    // If user's branch does not match current Local Hub branch, activate Cloud-Only Mode!
+    const curHubBranch = LocalHubConfig.getHubBranchId();
+    const userBranch = user.branchId || user.branch_id || selectedBranchId;
+    if (curHubBranch && curHubBranch !== 'UNASSIGNED' && userBranch && userBranch !== curHubBranch && userBranch !== 'ALL') {
+      meshSyncService.setCloudOnlyMode(true);
+    } else {
+      meshSyncService.setCloudOnlyMode(false);
+    }
+    onLoginSuccess(user);
+  };
 
   // Helper to get active staff, returning in-memory owner if remote sync hasn't fully loaded users yet
   const getActiveStaffForCompany = (compId: string): Salesperson[] => {
@@ -413,7 +463,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           saveSalesperson(superAdminUser);
           setSessionUser(superAdminUser);
           logLogin(superAdminUser);
-          onLoginSuccess(superAdminUser);
+          handleCompleteLogin(superAdminUser);
           return;
         }
 
@@ -512,7 +562,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         setCurrentBranchId(selectedBranchId);
         setSessionUser(fullStaffUser);
         logLogin(fullStaffUser);
-        onLoginSuccess(fullStaffUser);
+        handleCompleteLogin(fullStaffUser);
       } else {
         setError(response.message || `Incorrect 6-digit PIN for ${staff.name}. Keypad scrambled for security. Please try again.`);
         setPin('');
@@ -585,7 +635,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     return (
       <div className="min-h-[100dvh] w-full max-w-[100vw] overflow-x-hidden overflow-y-auto bg-gradient-to-b from-slate-950 via-[#120d2b] to-slate-950 text-slate-100 flex flex-col justify-between p-3 sm:p-6">
         <RegistrationScreen
-          onRegistrationSuccess={(owner) => onLoginSuccess(owner)}
+          onRegistrationSuccess={(owner) => handleCompleteLogin(owner)}
           onSwitchToLogin={() => setMode('login')}
         />
         <div className="text-center text-xs text-slate-500 pb-2">
@@ -643,6 +693,39 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
             </div>
           </div>
         )}
+
+        {/* Pre-Auth Lobby Hub Identity Banner */}
+        <div className="flex flex-col items-center justify-center gap-1.5 pt-1">
+          {hubBranchId && hubBranchId !== 'UNASSIGNED' ? (
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold shadow-sm">
+              <Radio className="w-3.5 h-3.5 text-emerald-400 animate-pulse" />
+              <span>Connected to {hubBranchName || hubBranchId} Hub</span>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-200 font-mono font-bold">
+                {hubBranchId}
+              </span>
+            </div>
+          ) : connMode === 'LOCAL_HUB' ? (
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-300 text-xs font-semibold shadow-sm">
+              <Radio className="w-3.5 h-3.5 text-blue-400 animate-pulse" />
+              <span>Connected to Local Hub (Identifying...)</span>
+            </div>
+          ) : (
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900/80 border border-slate-800 text-slate-400 text-xs font-medium">
+              <Wifi className="w-3.5 h-3.5 text-slate-500" />
+              <span>Standalone Offline / Cloud Sync</span>
+            </div>
+          )}
+
+          {/* Roaming Owner / Branch Mismatch Warning */}
+          {hubBranchId && hubBranchId !== 'UNASSIGNED' && selectedBranchId && selectedBranchId !== hubBranchId && (
+            <div className="w-full max-w-sm p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-[11px] font-medium flex items-center gap-2 text-left">
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>
+                <strong>Cloud-Only Mode:</strong> Selected branch differs from <strong>{hubBranchName || hubBranchId} Hub</strong>. Hub sync paused to prevent contamination.
+              </span>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Main Login Card */}

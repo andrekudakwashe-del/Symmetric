@@ -56,6 +56,12 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
   const [copied, setCopied] = useState(false);
   const [saveSuccessNotice, setSaveSuccessNotice] = useState<string | null>(null);
 
+  // Hub Branch Identity & Reset Modal
+  const [hubBranchId, setHubBranchId] = useState<string | null>(() => LocalHubConfig.getHubBranchId());
+  const [hubBranchName, setHubBranchName] = useState<string | null>(() => LocalHubConfig.getHubBranchName());
+  const [showResetConfirmModal, setShowResetConfirmModal] = useState<boolean>(false);
+  const [isResettingHub, setIsResettingHub] = useState<boolean>(false);
+
   useEffect(() => {
     if (!isOpen) {
       stopCamera();
@@ -66,15 +72,21 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     setForceLocalHub(LocalHubConfig.getForceLocalHub());
     setConnStatus(meshSyncService.getConnectionStatus());
     setConnMode(meshSyncService.getConnectionMode());
+    setHubBranchId(LocalHubConfig.getHubBranchId());
+    setHubBranchName(LocalHubConfig.getHubBranchName());
 
     const unsubMode = meshSyncService.subscribeConnectionMode((mode, details) => {
       setConnMode(mode);
       setConnStatus(meshSyncService.getConnectionStatus());
+      setHubBranchId(LocalHubConfig.getHubBranchId());
+      setHubBranchName(LocalHubConfig.getHubBranchName());
     });
 
     const unsubConfig = LocalHubConfig.subscribe(() => {
       setHubUrlInput(LocalHubConfig.getLocalHubUrl());
       setForceLocalHub(LocalHubConfig.getForceLocalHub());
+      setHubBranchId(LocalHubConfig.getHubBranchId());
+      setHubBranchName(LocalHubConfig.getHubBranchName());
     });
 
     return () => {
@@ -83,6 +95,21 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
       stopCamera();
     };
   }, [isOpen]);
+
+  const handleConfirmResetHub = async () => {
+    setIsResettingHub(true);
+    try {
+      meshSyncService.resetHubIdentity();
+      setShowResetConfirmModal(false);
+      setHubBranchId(null);
+      setHubBranchName(null);
+      setSaveSuccessNotice('Local Hub identity reset command sent. Memory cleared; return to Scan to Connect state.');
+      setTimeout(() => setSaveSuccessNotice(null), 5000);
+      setActiveTab('connect');
+    } finally {
+      setIsResettingHub(false);
+    }
+  };
 
   const stopCamera = async () => {
     setIsScanning(false);
@@ -225,6 +252,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                     {connMode === 'CLOUD_MESH' && '🟢 Online (Cloud)'}
                     {connMode === 'LOCAL_HUB' && '🔵 Local Hub Connected'}
                     {connMode === 'LOCAL_OFFLINE' && '🟡 Local Offline (Queueing)'}
+                    {connMode === 'CLOUD_ONLY' && '🟠 Cloud-Only Mode (Hub Isolated)'}
                   </span>
                   {forceLocalHub && (
                     <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold">
@@ -234,7 +262,9 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                 </div>
                 <p className="text-[11px] text-slate-400 font-mono truncate mt-0.5">
                   {connMode === 'LOCAL_HUB'
-                    ? `Master Node: ${connStatus.localHubUrl}`
+                    ? `Master Node: ${connStatus.localHubUrl}${hubBranchName ? ` • ${hubBranchName} (${hubBranchId})` : ''}`
+                    : connMode === 'CLOUD_ONLY'
+                    ? `Isolated from ${hubBranchName || hubBranchId || 'Local'} Hub. Syncing directly to central cloud.`
                     : connMode === 'CLOUD_MESH'
                     ? 'Cloud mesh active. Fallback to Local Hub ready.'
                     : connStatus.isLocalHubLost
@@ -497,6 +527,39 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               </button>
             </div>
 
+            {/* Tethered Hub Identity & Repurposing */}
+            <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-black uppercase tracking-wider text-slate-200">
+                    Tethered Hub Identity
+                  </span>
+                  {hubBranchId && hubBranchId !== 'UNASSIGNED' ? (
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
+                      {hubBranchId}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400">
+                      Unassigned
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  {hubBranchName ? `Assigned Branch: ${hubBranchName}` : 'Hardware not yet paired to a specific branch.'}
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowResetConfirmModal(true)}
+                className="text-xs font-bold px-3 py-2 rounded-xl bg-rose-950/40 hover:bg-rose-900/60 text-rose-300 border border-rose-800/50 transition flex items-center gap-1.5 active:scale-95 cursor-pointer self-start sm:self-auto"
+                title="Wipe Local Hub memory to repurpose hardware for a new branch or tenant"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                <span>Reset Hub Identity</span>
+              </button>
+            </div>
+
             {/* Architecture Explainer */}
             <div className="p-4 rounded-2xl bg-indigo-950/20 border border-indigo-500/20 text-xs text-indigo-200/90 space-y-1.5">
               <p className="font-bold text-indigo-200 flex items-center gap-1.5">
@@ -594,6 +657,63 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Reset Hub Identity Confirmation Modal */}
+      {showResetConfirmModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-rose-500/30 rounded-3xl p-5 sm:p-6 max-w-md w-full shadow-2xl space-y-4 animate-scale-in">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5 text-rose-400" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-white">Reset Hub Identity?</h3>
+                <p className="text-xs text-rose-300 font-medium mt-1 leading-relaxed">
+                  This will wipe the Local Hub's memory and allow it to be reassigned to a new branch. Only do this if you are moving the Hub hardware.
+                </p>
+              </div>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-rose-950/20 border border-rose-500/20 text-xs text-slate-300 space-y-1">
+              <p className="font-bold text-rose-300">Action Details:</p>
+              <ul className="list-disc list-inside text-[11px] text-slate-400 space-y-1">
+                <li>Sends a <code>RESET_BRANCH</code> packet to the connected Termux Hub</li>
+                <li>Wipes in-memory and disk records on the Hub hardware</li>
+                <li>Clears local <code>hub_branch_id</code> and returns to Scan to Connect state</li>
+              </ul>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                disabled={isResettingHub}
+                onClick={() => setShowResetConfirmModal(false)}
+                className="text-xs font-bold px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 transition cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isResettingHub}
+                onClick={handleConfirmResetHub}
+                className="text-xs font-bold px-4 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white shadow-md transition flex items-center gap-1.5 active:scale-95 cursor-pointer"
+              >
+                {isResettingHub ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Resetting...</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    <span>Yes, Wipe &amp; Reset Hub</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

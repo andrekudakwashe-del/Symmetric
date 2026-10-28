@@ -6,6 +6,10 @@
 
 export const STORAGE_KEY_LOCAL_HUB_URL = 'saimetric_local_hub_url';
 export const STORAGE_KEY_FORCE_LOCAL_HUB = 'saimetric_force_local_hub';
+export const STORAGE_KEY_HUB_BRANCH_ID = 'saimetric_hub_branch_id';
+export const STORAGE_KEY_HUB_BRANCH_NAME = 'saimetric_hub_branch_name';
+export const STORAGE_KEY_HUB_TENANT_ID = 'saimetric_hub_tenant_id';
+export const STORAGE_KEY_CLOUD_ONLY_MODE = 'saimetric_cloud_only_mode';
 export const DEFAULT_LOCAL_HUB_URL = 'ws://192.168.43.1:8080';
 
 export interface LocalHubTestResult {
@@ -130,6 +134,120 @@ export class LocalHubConfig {
   }
 
   /**
+   * Retrieves the tethered Hub's branch ID.
+   */
+  public static getHubBranchId(): string | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      const val = localStorage.getItem(STORAGE_KEY_HUB_BRANCH_ID);
+      return val && val.trim().length > 0 ? val.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Retrieves the tethered Hub's branch Name (e.g. "Harare Main").
+   */
+  public static getHubBranchName(): string | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      const val = localStorage.getItem(STORAGE_KEY_HUB_BRANCH_NAME);
+      return val && val.trim().length > 0 ? val.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Retrieves the tethered Hub's tenant ID.
+   */
+  public static getHubTenantId(): string | null {
+    if (typeof window === 'undefined') return null;
+    try {
+      const val = localStorage.getItem(STORAGE_KEY_HUB_TENANT_ID);
+      return val && val.trim().length > 0 ? val.trim() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Stores the tethered Local Hub's branch identity.
+   */
+  public static setHubBranchIdentity(branchId: string, branchName: string, tenantId?: string): void {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(STORAGE_KEY_HUB_BRANCH_ID, branchId);
+        localStorage.setItem(STORAGE_KEY_HUB_BRANCH_NAME, branchName);
+        if (tenantId) {
+          localStorage.setItem(STORAGE_KEY_HUB_TENANT_ID, tenantId);
+        }
+        this.dispatchConfigChange();
+        window.dispatchEvent(
+          new CustomEvent('saimetric_hub_identity_updated', {
+            detail: { branch_id: branchId, branch_name: branchName, tenant_id: tenantId },
+          })
+        );
+      } catch (e) {
+        console.warn('[LocalHubConfig] Failed to write hub identity:', e);
+      }
+    }
+  }
+
+  /**
+   * Clears the tethered Local Hub's branch identity (e.g. after RESET_BRANCH).
+   */
+  public static clearHubBranchIdentity(): void {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.removeItem(STORAGE_KEY_HUB_BRANCH_ID);
+        localStorage.removeItem(STORAGE_KEY_HUB_BRANCH_NAME);
+        localStorage.removeItem(STORAGE_KEY_HUB_TENANT_ID);
+        this.dispatchConfigChange();
+        window.dispatchEvent(
+          new CustomEvent('saimetric_hub_identity_updated', {
+            detail: { branch_id: null, branch_name: null },
+          })
+        );
+      } catch (e) {
+        console.warn('[LocalHubConfig] Failed to clear hub identity:', e);
+      }
+    }
+  }
+
+  /**
+   * Checks whether the device is in Cloud-Only Mode due to branch mismatch.
+   */
+  public static isCloudOnlyMode(): boolean {
+    if (typeof window === 'undefined') return false;
+    try {
+      return localStorage.getItem(STORAGE_KEY_CLOUD_ONLY_MODE) === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Sets whether the device is in Cloud-Only Mode.
+   */
+  public static setCloudOnlyMode(enabled: boolean): void {
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(STORAGE_KEY_CLOUD_ONLY_MODE, enabled ? 'true' : 'false');
+        this.dispatchConfigChange();
+        window.dispatchEvent(
+          new CustomEvent('saimetric_cloud_only_mode_changed', {
+            detail: { isCloudOnlyMode: enabled },
+          })
+        );
+      } catch (e) {
+        console.warn('[LocalHubConfig] Failed to set cloud only mode:', e);
+      }
+    }
+  }
+
+  /**
    * Tests connection to a WebSocket Hub with round-trip latency measurement.
    */
   public static async testHubConnection(rawUrl: string, timeoutMs: number = 4000): Promise<LocalHubTestResult> {
@@ -219,6 +337,9 @@ export class LocalHubConfig {
           detail: {
             url: this.getLocalHubUrl(),
             forceLocalHub: this.getForceLocalHub(),
+            hubBranchId: this.getHubBranchId(),
+            hubBranchName: this.getHubBranchName(),
+            isCloudOnlyMode: this.isCloudOnlyMode(),
           },
         })
       );

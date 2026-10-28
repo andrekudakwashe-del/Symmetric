@@ -7714,9 +7714,11 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
       ? crypto.randomUUID()
       : `req_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
 
+  const target_branch_id = payload.target_branch_id || payload.branch_id || currentBranch;
   const enhancedPayload = {
     company_id: payload.company_id || currentCompany,
     branch_id: payload.branch_id || currentBranch,
+    target_branch_id,
     user_branch_id: payload.user_branch_id || sessionUser?.branch_id || currentBranch,
     user_id: payload.user_id || sessionUser?.user_id || 'USR-001',
     user_role: payload.user_role || sessionUser?.role || 'CASHIER',
@@ -7747,13 +7749,14 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
         action,
         companyId: enhancedPayload.company_id,
         branchId: enhancedPayload.branch_id,
+        target_branch_id,
         branchCode: activeBr?.code || 'HQ-01',
         entityType: resolveEntityType(sheetName as string),
         recordId: String(payload.id || payload.itemId || payload.grvNumber || payload.invoiceNumber || newItem.id),
         payload: enhancedPayload,
         timestamp: newItem.timestamp,
         clientRequestId,
-      });
+      } as any);
     } catch (e) {
       console.warn('[enqueueSync] Mutation broadcast error:', e);
     }
@@ -9474,7 +9477,18 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
     all.unshift(normalized);
   }
   setStored(STORAGE_KEYS.DIRECT_GRVS, all);
+
+  // If paid from till, record till payout movement and CashLog for cashier Form 2
+  if (normalized.status !== 'REJECTED') {
+    recordDirectGrvTillPayouts(normalized);
+  }
+
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+  }
   return true;
 };
 
@@ -9598,6 +9612,7 @@ export const getDeltaRecordsSince = (sinceIsoTimestamp: string) => {
     sales: filterByTime(getAllSales()),
     cashLogs: filterByTime(getCashLogs()),
     cashLifts: filterByTime(getAllCashLifts()),
+    cashMovements: filterByTime(getMovements()),
     customerChanges: filterByTime(getCustomerChanges()),
     creditSales: filterByTime(getCreditSales()),
     stockMovements: filterByTime(getStockMovements()),
@@ -14136,7 +14151,22 @@ export const getDirectGrvsForStaffAndDate = (staffId: string, date: string): Dir
 };
 
 export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
-  if (grv.status === 'REJECTED') return;
+  const isPayFromTill = grv.payFromTill !== false && grv.paymentMethod !== 'INVOICE_ON_ACCOUNT' && grv.paymentMethod !== 'CREDIT' && grv.paymentMethod !== 'BANK';
+
+  if (grv.status === 'REJECTED' || !isPayFromTill) {
+    // If not paid from till or rejected, ensure any previous till payout movements/logs for this voucher are removed
+    const existingMovements = getMovements();
+    existingMovements
+      .filter((m) => m.type === 'supplier_payment' && (m.sourceRef === grv.grvNumber || m.sourceRef?.startsWith(grv.grvNumber)))
+      .forEach((m) => deleteMovement(m.id));
+
+    const currentLogs = getCashLogs();
+    currentLogs
+      .filter((l) => l.line === 'Direct Procurement' && (l.reference === grv.grvNumber || l.reference?.startsWith(grv.grvNumber)))
+      .forEach((l) => deleteCashLog(l.id));
+    return;
+  }
+
   const shiftDate = grv.date || (grv.createdAt ? grv.createdAt.split('T')[0] : new Date().toISOString().split('T')[0]);
   const now = grv.createdAt || new Date().toISOString();
   const compId = (grv as any).companyId || (grv as any).company_id || getCurrentCompanyId();
@@ -14144,8 +14174,8 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
 
   // Determine payments
   const payments: DirectGrvTillPayment[] =
-    grv.payments && grv.payments.length > 0
-      ? grv.payments
+    grv.payments && grv.payments.length > 0 && grv.payments.some((p: any) => (Number(p.amount) || 0) > 0)
+      ? grv.payments.filter((p: any) => (Number(p.amount) || 0) > 0)
       : (grv.payFromTill && (grv.totalCost || 0) > 0)
       ? [
           {
@@ -14278,6 +14308,11 @@ export const saveDirectGrv = (grv: DirectGrv): DirectGrv => {
 
   enqueueSync('Direct_GRV', 'INSERT', normalized);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
+  }
   return normalized;
 };
 
@@ -14564,6 +14599,11 @@ export const approveDirectGrv = (
 
   enqueueSync('Direct_GRV', 'UPDATE', grv);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
+  }
   return {
     success: true,
     message: `Direct Delivery ${grv.grvNumber} approved successfully. Stock increased and Till Payout recorded.`,
@@ -14692,6 +14732,7 @@ export const rejectDirectGrv = (
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
   }
   return { success: true, message: `GRV ${grv.grvNumber} rejected and cash returned to cashier drawer(s).`, grv };
 };

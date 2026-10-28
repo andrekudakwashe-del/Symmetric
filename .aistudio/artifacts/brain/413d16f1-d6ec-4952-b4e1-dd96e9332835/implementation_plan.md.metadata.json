@@ -1,6 +1,6 @@
 {
-  "summary":  "Detailed implementation plan and changelog covering the resolution of the offline alert loop, runtime crash prevention, and enabling options to add new staff members across viewports, packages, and branches.",
-  "updatedAt":  "2026-10-26T09:49:39.418697722Z",
+  "summary":  "Detailed implementation plan for Data Isolation & Hub Identity architecture. Covers the pre-auth lobby & handshake (PING_HUB / HUB_INFO), branch-scoped queuing to prevent cross-branch data contamination by roaming owners, Cloud-Only Mode enforcement, and the Reset Hub Identity workflow in Local Hub Settings and termux-hub.js.",
+  "updatedAt":  "2026-10-28T08:40:48.764950225Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

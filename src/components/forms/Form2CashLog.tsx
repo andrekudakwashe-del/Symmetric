@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import { Salesperson, CashLogEntry, DirectGrv, CashLiftRecord, ExpenseEntry, CashTransfer } from '../../types';
 import {
   getCashLogs,
@@ -78,6 +78,7 @@ import {
   Check,
   CreditCard,
   Layers,
+  Building2,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
@@ -209,9 +210,38 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     return salespeople.find((s) => s.id === selectedStaffId) || currentUser;
   }, [salespeople, selectedStaffId, currentUser]);
 
+  // Robust staff matching (handles case differences, prefix formats USR-003 vs usr-003, and name matching)
+  const isStaffMatch = useCallback(
+    (targetId?: string, targetName?: string) => {
+      if (!targetId && !targetName) return false;
+      const cleanTarget = (targetId || '').trim().toLowerCase();
+      const cleanCur = (selectedStaffId || '').trim().toLowerCase();
+      if (cleanTarget && cleanCur) {
+        if (cleanTarget === cleanCur) return true;
+        const normTarget = cleanTarget.replace(/^usr-|^staff-|^0+/, '');
+        const normCur = cleanCur.replace(/^usr-|^staff-|^0+/, '');
+        if (normTarget && normCur && normTarget === normCur) return true;
+      }
+      if (targetName && selectedStaff?.name) {
+        if (targetName.trim().toLowerCase() === selectedStaff.name.trim().toLowerCase()) return true;
+      }
+      return false;
+    },
+    [selectedStaffId, selectedStaff]
+  );
+
   const [cashLogs, setCashLogs] = useState<CashLogEntry[]>(() => getCashLogs());
   const [cashCounts, setCashCounts] = useState(() => getCashCounts());
   const [directGrvs, setDirectGrvs] = useState<DirectGrv[]>(() => getDirectGrvs());
+
+  // Direct GRVs that were processed on the active sheet date
+  const allDateDirectGrvs = useMemo(() => {
+    return directGrvs.filter((g) => {
+      const gDate = (g.date || g.createdAt || '').slice(0, 10);
+      return gDate === sheetDate;
+    });
+  }, [directGrvs, sheetDate]);
+
   const [viewingProcurementGrv, setViewingProcurementGrv] = useState<DirectGrv | null>(null);
   const [isExistingSavedSheet, setIsExistingSavedSheet] = useState(false);
   const [isShiftSubmitted, setIsShiftSubmitted] = useState(false);
@@ -334,10 +364,12 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   // Compute shift movements live from cashMovements
   const shiftMovements = useMemo(() => {
     const sId = getShiftId(selectedStaffId, sheetDate);
-    return getMovements().filter(
-      (m) => m.shiftId === sId || (m.staffId === selectedStaffId && m.date === sheetDate)
-    );
-  }, [selectedStaffId, sheetDate, ledgerRefreshKey, cashLogs]);
+    return getMovements().filter((m) => {
+      if (m.shiftId === sId) return true;
+      if (m.date === sheetDate && isStaffMatch(m.staffId, m.staffName)) return true;
+      return false;
+    });
+  }, [selectedStaffId, sheetDate, ledgerRefreshKey, cashLogs, isStaffMatch]);
 
   // Check if opening float was explicitly issued/recorded for this shift
   const hasOpeningFloat = useMemo(() => {
@@ -420,6 +452,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     window.addEventListener('saimetric_cash_movements_updated', debouncedRefresh);
     window.addEventListener('saimetric_sales_updated', debouncedRefresh);
     window.addEventListener('saimetric_cash_updated', debouncedRefresh);
+    window.addEventListener('saimetric_direct_grvs_updated', debouncedRefresh);
     window.addEventListener('mesh-catchup-completed', debouncedRefresh);
 
     const unsubscribe = subscribeToDatabase(() => {
@@ -431,6 +464,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       window.removeEventListener('saimetric_cash_movements_updated', debouncedRefresh);
       window.removeEventListener('saimetric_sales_updated', debouncedRefresh);
       window.removeEventListener('saimetric_cash_updated', debouncedRefresh);
+      window.removeEventListener('saimetric_direct_grvs_updated', debouncedRefresh);
       window.removeEventListener('mesh-catchup-completed', debouncedRefresh);
       unsubscribe();
     };
@@ -456,22 +490,6 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
     const seenVouchers = new Set<string>();
 
-    const isStaffMatch = (targetId?: string, targetName?: string) => {
-      if (!targetId && !targetName) return false;
-      const cleanTarget = (targetId || '').trim().toLowerCase();
-      const cleanCur = (selectedStaffId || '').trim().toLowerCase();
-      if (cleanTarget && cleanCur) {
-        if (cleanTarget === cleanCur) return true;
-        const normTarget = cleanTarget.replace(/^usr-|^staff-|^0+/, '');
-        const normCur = cleanCur.replace(/^usr-|^staff-|^0+/, '');
-        if (normTarget && normCur && normTarget === normCur) return true;
-      }
-      if (targetName && selectedStaff?.name) {
-        if (targetName.trim().toLowerCase() === selectedStaff.name.trim().toLowerCase()) return true;
-      }
-      return false;
-    };
-
     // 1. First, check shiftMovements for supplier_payment movements
     const procurementMovements = shiftMovements.filter(
       (m) => m.type === 'supplier_payment' && (!m.sourceModule || m.sourceModule === 'DirectGRV')
@@ -480,11 +498,23 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     procurementMovements.forEach((m) => {
       const refKey = m.sourceRef || m.notes || m.id;
       if (seenVouchers.has(refKey)) return;
-      seenVouchers.add(refKey);
 
       const matchingGrv = directGrvs.find(
         (g) => g.grvNumber === m.sourceRef || g.id === m.sourceRef || (m.sourceRef && m.sourceRef.startsWith(g.grvNumber))
       );
+
+      // If matching GRV is explicitly NOT paid from till (e.g. invoice on account / credit), do not record in Form 2
+      if (
+        matchingGrv &&
+        (matchingGrv.payFromTill === false ||
+          matchingGrv.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
+          matchingGrv.paymentMethod === 'CREDIT' ||
+          matchingGrv.paymentMethod === 'BANK')
+      ) {
+        return;
+      }
+
+      seenVouchers.add(refKey);
 
       const isRejected = m.status === 'rejected' || matchingGrv?.status === 'REJECTED';
 
@@ -507,6 +537,16 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
     // 2. Also incorporate any GRVs for this staff & date that may not yet be indexed in movements
     directGrvs.forEach((grv) => {
+      // Exclude non-till / account deliveries
+      if (
+        grv.payFromTill === false ||
+        grv.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
+        grv.paymentMethod === 'CREDIT' ||
+        grv.paymentMethod === 'BANK'
+      ) {
+        return;
+      }
+
       const grvDate = (grv.date || grv.createdAt || '').slice(0, 10);
       if (grvDate && grvDate !== sheetDate) return;
 
@@ -536,7 +576,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
             });
           }
         });
-      } else if (grv.payFromTill && isStaffMatch(grv.receivedByStaffId, grv.receivedByStaffName) && (grv.totalCost || 0) > 0) {
+      } else if (isStaffMatch(grv.receivedByStaffId, grv.receivedByStaffName) && (grv.totalCost || 0) > 0) {
         if (seenVouchers.has(grv.grvNumber) || seenVouchers.has(grv.id)) return;
         seenVouchers.add(grv.grvNumber);
 
@@ -558,7 +598,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     });
 
     return list;
-  }, [shiftMovements, directGrvs, sheetDate, selectedStaffId, selectedStaff]);
+  }, [shiftMovements, directGrvs, sheetDate, selectedStaffId, selectedStaff, isStaffMatch]);
 
   const derivedProcurementTotalOut = useMemo(() => {
     return (derivedProcurements || [])
@@ -3037,29 +3077,112 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                   ) : (
                     <tr>
                       <td colSpan={6} className="py-4 px-4 bg-slate-950/40 text-center">
-                        <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3 rounded-2xl bg-amber-950/20 border border-amber-800/30 text-xs">
-                          <div className="flex items-center space-x-3 text-left">
-                            <div className="w-8 h-8 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
-                              <Truck className="w-4 h-4" />
+                        <div className="space-y-3">
+                          <div className="flex flex-col sm:flex-row items-center justify-between gap-3 p-3 rounded-2xl bg-amber-950/20 border border-amber-800/30 text-xs">
+                            <div className="flex items-center space-x-3 text-left">
+                              <div className="w-8 h-8 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+                                <Truck className="w-4 h-4" />
+                              </div>
+                              <div>
+                                <p className="font-bold text-amber-200">
+                                  No direct supplier delivery payouts registered for {selectedStaff.name} on {sheetDate}.
+                                </p>
+                                <p className="text-slate-400 text-[11px]">
+                                  Direct procurements are derived automatically from cashier till payouts in the Direct Delivery Voucher.
+                                </p>
+                              </div>
                             </div>
-                            <div>
-                              <p className="font-bold text-amber-200">
-                                No direct supplier delivery payouts registered for {selectedStaff.name} on {sheetDate}.
-                              </p>
-                              <p className="text-slate-400 text-[11px]">
-                                Direct procurements are now derived automatically from cashier inputs in the Direct Delivery Voucher.
-                              </p>
-                            </div>
+                            {onNavigateToDirectGrv && (
+                              <button
+                                type="button"
+                                onClick={() => onNavigateToDirectGrv()}
+                                className="py-1.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs flex items-center space-x-1.5 shrink-0 transition"
+                              >
+                                <Truck className="w-3.5 h-3.5" />
+                                <span>Open Direct Supplies Voucher</span>
+                              </button>
+                            )}
                           </div>
-                          {onNavigateToDirectGrv && (
-                            <button
-                              type="button"
-                              onClick={() => onNavigateToDirectGrv()}
-                              className="py-1.5 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs flex items-center space-x-1.5 shrink-0 transition"
-                            >
-                              <Truck className="w-3.5 h-3.5" />
-                              <span>Open Direct Supplies Voucher</span>
-                            </button>
+
+                          {/* Cross-Cashier & On-Account Delivery Status Card */}
+                          {allDateDirectGrvs.length > 0 && (
+                            <div className="p-3.5 rounded-2xl bg-slate-900/90 border border-slate-800 text-left space-y-2.5">
+                              <div className="flex items-center justify-between">
+                                <span className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                                  <Building2 className="w-3.5 h-3.5 text-blue-400" />
+                                  Branch Direct Deliveries on {sheetDate} ({allDateDirectGrvs.length})
+                                </span>
+                                <span className="text-[10px] text-slate-500 font-mono">Status & Attribution</span>
+                              </div>
+
+                              <div className="space-y-1.5">
+                                {allDateDirectGrvs.map((g) => {
+                                  const isOnAccount =
+                                    g.payFromTill === false ||
+                                    g.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
+                                    g.paymentMethod === 'CREDIT' ||
+                                    g.paymentMethod === 'BANK';
+                                  const payers = g.payments?.filter((p) => (Number(p.amount) || 0) > 0) || [];
+                                  const primaryPayer = payers[0]?.userId;
+
+                                  return (
+                                    <div
+                                      key={g.id || g.grvNumber}
+                                      className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-950/60 border border-slate-800/80 text-xs"
+                                    >
+                                      <div className="flex items-center gap-2.5">
+                                        <div
+                                          className={`w-2 h-2 rounded-full shrink-0 ${
+                                            isOnAccount ? 'bg-blue-400' : 'bg-amber-400'
+                                          }`}
+                                        />
+                                        <div>
+                                          <span className="font-mono font-bold text-white mr-2">{g.grvNumber}</span>
+                                          <span className="text-slate-300">{g.supplierName}</span>
+                                          <span className="text-slate-500 ml-1.5 font-mono">
+                                            (${g.totalCost.toFixed(2)})
+                                          </span>
+                                        </div>
+                                      </div>
+
+                                      <div className="flex items-center gap-2 self-end sm:self-center">
+                                        {isOnAccount ? (
+                                          <span className="text-[10px] px-2 py-0.5 rounded-md bg-blue-500/10 border border-blue-500/30 text-blue-400 font-medium">
+                                            Supplier Invoice on Account (No till cash deducted)
+                                          </span>
+                                        ) : (
+                                          <div className="flex items-center gap-2">
+                                            <span className="text-[10px] px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/30 text-amber-400 font-medium">
+                                              Paid by:{' '}
+                                              {payers.map((p) => `${p.userName} ($${p.amount.toFixed(2)})`).join(', ') ||
+                                                g.receivedByStaffName ||
+                                                'Other Cashier'}
+                                            </span>
+                                            {primaryPayer && primaryPayer !== selectedStaffId && (
+                                              <button
+                                                type="button"
+                                                onClick={() => setSelectedStaffId(primaryPayer)}
+                                                className="text-[10px] text-amber-400 hover:underline font-bold"
+                                              >
+                                                Switch to Sheet →
+                                              </button>
+                                            )}
+                                          </div>
+                                        )}
+                                        <button
+                                          type="button"
+                                          onClick={() => setViewingProcurementGrv(g)}
+                                          className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                                          title="View Voucher Details"
+                                        >
+                                          <Eye className="w-3.5 h-3.5" />
+                                        </button>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
                           )}
                         </div>
                       </td>

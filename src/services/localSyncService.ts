@@ -9,6 +9,7 @@
 import { getLocalIp, COMMON_HOTSPOT_IPS } from '../utils/getLocalIp';
 import {
   ingestMeshSale,
+  ingestMeshGRV,
   addSale,
   getSales,
   getCurrentCompanyId,
@@ -693,6 +694,10 @@ class LocalSyncService {
             if (item.action === 'add_sale' || item.sheetName === 'Sales') {
               if (item.payload && item.payload.id) {
                 ingestMeshSale(item.payload);
+              }
+            } else if (item.action === 'add_direct_grv' || item.action === 'approve_direct_grv' || item.sheetName === 'Direct_GRV') {
+              if (item.payload && (item.payload.grvNumber || item.payload.id)) {
+                ingestMeshGRV(item.payload);
               }
             }
           }

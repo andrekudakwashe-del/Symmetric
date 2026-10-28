@@ -26,6 +26,7 @@ import {
   getCurrentCompany,
   getCurrentBranchId,
   getCurrentBranch,
+  getSessionUser,
   getBranches,
   isRecordInBranchScope,
   onDatabaseMutation,
@@ -37,6 +38,7 @@ import {
   ingestMeshCashLog,
   ingestMeshCustomer,
   ingestMeshGRV,
+  getDirectGrvs,
   ingestMeshInventoryDelete,
   getDeletedInventoryItems,
   ingestMeshSettings,
@@ -59,11 +61,12 @@ import {
   getNextInvoiceId,
   markSaleAsSynced,
 } from '../db/roomDatabase';
+import { getMovements, addMovement } from '../db/cashLedger';
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { processSyncQueue } from './googleSheetsSync';
 import { LocalHubConfig, normalizeHubUrl } from '../utils/localHubConfig';
 
-export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE';
+export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE' | 'CLOUD_ONLY';
 
 // Keys for localStorage persistence
 const PREFS_BRANCH_KEY = 'saimetric_mesh_branch_code';
@@ -222,6 +225,11 @@ class MeshSyncManager {
   private hubProcessingTimer: number | null = null;
   private hasPerformedInitialCatchup: boolean = false;
   private lastInitialCatchupTime: number = 0;
+
+  // Hub Branch Identity & Roaming Owner Safeguard
+  private hubBranchId: string | null = LocalHubConfig.getHubBranchId();
+  private hubBranchName: string | null = LocalHubConfig.getHubBranchName();
+  private isCloudOnlyMode: boolean = LocalHubConfig.isCloudOnlyMode();
 
   // Safeguard 1: Sync Receipt (ACK) Watchdog
   // Waits for {"type": "SYNC_RECEIPT", "invoice_id": "..."} before marking sale as synced.
@@ -972,7 +980,9 @@ class MeshSyncManager {
 
     let newMode: MeshConnectionMode;
 
-    if (forceLocalHub) {
+    if (this.isCloudOnlyMode) {
+      newMode = 'CLOUD_ONLY';
+    } else if (forceLocalHub) {
       // User explicitly forced local hub
       if (this.isLocalHubConnected) {
         newMode = 'LOCAL_HUB';
@@ -1048,27 +1058,40 @@ class MeshSyncManager {
 
         this.addLog(
           'DISCOVERY',
-          `Local WebSocket Hub CONNECTED: ${hubUrl} (0% Internet Required). Master-Spoke offline mesh active.`,
+          `Local WebSocket Hub CONNECTED: ${hubUrl} (0% Internet Required). Performing pre-auth identity handshake...`,
           this.config.deviceName
         );
         playChime();
 
-        // Flush any pending in-memory packets from user actions that occurred while connecting
-        this.drainQueueToLocalHub();
+        // Requirement 1: Pre-Auth Lobby & Handshake
+        // Immediately query the Hub's branch identity before draining or catch-up
+        try {
+          ws.send(
+            JSON.stringify({
+              type: 'PING_HUB',
+              action: 'PING_HUB',
+              deviceId: this.config.deviceId,
+              deviceName: this.config.deviceName,
+              timestamp: Date.now(),
+            })
+          );
+        } catch (e) {
+          console.warn('[MeshSync] Error sending PING_HUB:', e);
+        }
 
         this.notifyPeerSubscribers(true);
         this.notifyConnectionModeChange();
 
-        // Safeguard 2: Trigger catch-up sync upon connection using last_synced_timestamp
-        // Pull ONLY missed deltas rather than blindly accepting full history
+        // Fallback for legacy Hubs without HUB_INFO response:
         setTimeout(() => {
-          if (this.isLocalHubConnected) {
+          if (this.isLocalHubConnected && !this.hubBranchId && !this.isCloudOnlyMode) {
+            this.drainQueueToLocalHub();
             this.hasPerformedInitialCatchup = true;
             this.lastInitialCatchupTime = Date.now();
             const lastSync = this.getLastMeshSyncTimestamp();
             this.requestCatchUpSync('ALL', lastSync, false, true).catch(() => {});
           }
-        }, 800);
+        }, 2000);
       };
 
       ws.onmessage = async (event) => {
@@ -1084,6 +1107,19 @@ class MeshSyncManager {
 
           const parsed = JSON.parse(rawData);
           if (!parsed) return;
+
+          // 0. Pre-Auth Lobby Handshake Intercept: HUB_INFO
+          const pType = (parsed.type || parsed.action || '').toUpperCase();
+          if (pType === 'HUB_INFO') {
+            this.handleIncomingHubInfo(parsed);
+            return;
+          }
+
+          // 0.1 Reset Hub Identity Intercept: RESET_CONFIRMED
+          if (pType === 'RESET_CONFIRMED') {
+            this.handleIncomingResetConfirmed(parsed);
+            return;
+          }
 
           // Termux WebSocket server stores and auto-replays historical packets on connect.
           // Queue in memory and process in small batches of 10 with 50ms pauses so the UI never freezes.
@@ -1542,43 +1578,228 @@ class MeshSyncManager {
     }
   }
 
+  public handleIncomingHubInfo(packet: any) {
+    const branchId = (packet.branch_id || packet.branchId || '').trim();
+    const branchName = (packet.branch_name || packet.branchName || branchId || 'Local Hub').trim();
+    const tenantId = packet.tenant_id || packet.tenantId;
+
+    this.hubBranchId = branchId || null;
+    this.hubBranchName = branchName || null;
+
+    if (branchId) {
+      LocalHubConfig.setHubBranchIdentity(branchId, branchName, tenantId);
+    }
+
+    this.addLog(
+      'DISCOVERY',
+      `Hub Handshake Verified: Tethered to [${branchName}] (${branchId || 'UNASSIGNED'}).`,
+      this.config.deviceName
+    );
+
+    // Safeguard 2: Check if logged-in user or active device branch matches Hub branch
+    const sessionUser = getSessionUser();
+    const activeBranchId = (sessionUser?.branch_id || sessionUser?.branchId || getCurrentBranchId() || '').trim().toUpperCase();
+    const targetHubBranch = (branchId || '').trim().toUpperCase();
+
+    if (
+      activeBranchId &&
+      targetHubBranch &&
+      targetHubBranch !== 'UNASSIGNED' &&
+      activeBranchId !== targetHubBranch &&
+      activeBranchId !== 'ALL'
+    ) {
+      this.isCloudOnlyMode = true;
+      LocalHubConfig.setCloudOnlyMode(true);
+      this.addLog(
+        'SECURITY_DROP',
+        `Cloud-Only Mode Activated: Active branch [${activeBranchId}] does not match Hub [${targetHubBranch}]. Hub sync blocked to prevent data contamination.`,
+        this.config.deviceName
+      );
+    } else {
+      this.isCloudOnlyMode = false;
+      LocalHubConfig.setCloudOnlyMode(false);
+
+      // Now drain only branch-scoped items
+      this.drainQueueToLocalHub();
+
+      // Catch-up sync strictly scoped to this branch
+      setTimeout(() => {
+        if (this.isLocalHubConnected && !this.isCloudOnlyMode) {
+          this.hasPerformedInitialCatchup = true;
+          this.lastInitialCatchupTime = Date.now();
+          const lastSync = this.getLastMeshSyncTimestamp();
+          this.requestCatchUpSync(branchId, lastSync, false, true).catch(() => {});
+        }
+      }, 500);
+    }
+
+    this.evaluateConnectionPriority();
+    this.notifyPeerSubscribers(true);
+    this.notifyConnectionModeChange();
+  }
+
+  public handleIncomingResetConfirmed(packet: any) {
+    this.hubBranchId = null;
+    this.hubBranchName = null;
+    this.isCloudOnlyMode = false;
+    LocalHubConfig.clearHubBranchIdentity();
+    LocalHubConfig.setCloudOnlyMode(false);
+
+    this.addLog(
+      'CONFLICT_RESOLVED',
+      'Local Hub reset confirmed. Hub memory wiped and branch unassigned.',
+      this.config.deviceName
+    );
+
+    this.evaluateConnectionPriority();
+    this.notifyPeerSubscribers(true);
+    this.notifyConnectionModeChange();
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_hub_reset_confirmed', { detail: packet }));
+    }
+  }
+
+  public resetHubIdentity(newBranchId?: string, newBranchName?: string): boolean {
+    const wsTarget = this.localHubWs || this.directWsClient;
+    if (!wsTarget || wsTarget.readyState !== WebSocket.OPEN) {
+      this.hubBranchId = null;
+      this.hubBranchName = null;
+      this.isCloudOnlyMode = false;
+      LocalHubConfig.clearHubBranchIdentity();
+      LocalHubConfig.setCloudOnlyMode(false);
+      this.notifyConnectionModeChange();
+      return false;
+    }
+
+    try {
+      const resetPacket = {
+        type: 'RESET_BRANCH',
+        action: 'RESET_BRANCH',
+        deviceId: this.config.deviceId,
+        deviceName: this.config.deviceName,
+        new_branch_id: newBranchId || 'UNASSIGNED',
+        new_branch_name: newBranchName || 'Unassigned Hub',
+        timestamp: Date.now(),
+      };
+      wsTarget.send(JSON.stringify(resetPacket));
+      this.hubBranchId = null;
+      this.hubBranchName = null;
+      this.isCloudOnlyMode = false;
+      LocalHubConfig.clearHubBranchIdentity();
+      LocalHubConfig.setCloudOnlyMode(false);
+      this.notifyConnectionModeChange();
+      this.addLog('BROADCAST', 'Sent RESET_BRANCH command to Local Hub.', this.config.deviceName);
+      return true;
+    } catch (err) {
+      console.warn('[MeshSync] Error sending RESET_BRANCH:', err);
+      return false;
+    }
+  }
+
+  public getHubBranchId(): string | null {
+    return this.hubBranchId || LocalHubConfig.getHubBranchId();
+  }
+
+  public getHubBranchName(): string | null {
+    return this.hubBranchName || LocalHubConfig.getHubBranchName();
+  }
+
+  public isCloudOnly(): boolean {
+    return this.isCloudOnlyMode;
+  }
+
+  public setCloudOnlyMode(enabled: boolean): void {
+    this.isCloudOnlyMode = enabled;
+    LocalHubConfig.setCloudOnlyMode(enabled);
+    this.evaluateConnectionPriority();
+    this.notifyConnectionModeChange();
+  }
+
   private async drainQueueToLocalHub() {
     const wsTarget = this.localHubWs || this.directWsClient;
     if (!wsTarget || wsTarget.readyState !== WebSocket.OPEN) return;
+
+    if (this.isCloudOnlyMode) {
+      this.addLog(
+        'SECURITY_DROP',
+        `Drain paused: Device is in Cloud-Only Mode. Local sales blocked from syncing to Hub.`,
+        this.config.deviceName
+      );
+      return;
+    }
+
+    const currentHubBranch = this.hubBranchId;
+    if (!currentHubBranch || currentHubBranch === 'UNASSIGNED') {
+      return; // Await identity handshake before flushing
+    }
+
     try {
-      // 1. Drain pending in-memory packets that occurred while socket was connecting
+      // 1. Drain pending in-memory packets matching this Hub's branch
       if (this.pendingLocalHubQueue.length > 0) {
-        const count = this.pendingLocalHubQueue.length;
-        this.addLog(
-          'BROADCAST',
-          `Local Hub connected: Flushing ${count} pending real-time packet(s) to hub...`,
-          this.config.deviceName
-        );
-        while (this.pendingLocalHubQueue.length > 0) {
-          const queuedPacket = this.pendingLocalHubQueue.shift();
-          if (queuedPacket) {
+        const matchingPackets: any[] = [];
+        const pausedPackets: any[] = [];
+
+        for (const p of this.pendingLocalHubQueue) {
+          const targetBr = (
+            p.target_branch_id ||
+            p.branchId ||
+            p.branch_id ||
+            (p.payload && (p.payload.branch_id || p.payload.branchId)) ||
+            ''
+          )
+            .trim()
+            .toUpperCase();
+
+          if (targetBr === currentHubBranch.toUpperCase() || !targetBr) {
+            matchingPackets.push(p);
+          } else {
+            pausedPackets.push(p);
+          }
+        }
+
+        this.pendingLocalHubQueue = pausedPackets;
+
+        if (matchingPackets.length > 0) {
+          this.addLog(
+            'BROADCAST',
+            `Local Hub connected (${currentHubBranch}): Flushing ${matchingPackets.length} branch-matched packet(s). (${pausedPackets.length} foreign-branch packet(s) remain paused in queue).`,
+            this.config.deviceName
+          );
+          for (const queuedPacket of matchingPackets) {
             wsTarget.send(JSON.stringify(queuedPacket));
           }
         }
+
+        if (pausedPackets.length > 0) {
+          processSyncQueue().catch(() => {});
+        }
       }
 
-      // 2. CRITICAL SAFEGUARD: Scan local database for any offline sales made while disconnected
-      // Even if user navigated tabs or refreshed while offline, all unsynced sales are flushed to Hub!
+      // 2. CRITICAL SAFEGUARD: Scan local database for offline sales matching this Hub's branch
       const allSales = getAllSales();
       const unsyncedSales = allSales.filter(
         (s) => s && s.id && !(s as any).fromMesh && !s.synced && s.syncStatus !== 'synced'
       );
 
-      if (unsyncedSales.length > 0) {
+      const branchMatchedSales = unsyncedSales.filter((s) => {
+        const sBranch = (s.branchId || s.branch_id || '').trim().toUpperCase();
+        return !sBranch || sBranch === currentHubBranch.toUpperCase();
+      });
+
+      const foreignBranchSales = unsyncedSales.filter((s) => {
+        const sBranch = (s.branchId || s.branch_id || '').trim().toUpperCase();
+        return sBranch && sBranch !== currentHubBranch.toUpperCase();
+      });
+
+      if (branchMatchedSales.length > 0) {
         this.addLog(
           'BROADCAST',
-          `Reconnection Catch-Up: Flushing ${unsyncedSales.length} offline sale(s) to Local Hub...`,
+          `Reconnection Catch-Up: Flushing ${branchMatchedSales.length} offline sale(s) matching [${currentHubBranch}] to Local Hub...`,
           this.config.deviceName
         );
 
-        for (const sale of unsyncedSales) {
-          // Register in pendingSaleAcks to await SYNC_RECEIPT ACK from Hub
-          // Requirement 4: Legacy INV- sales must NOT trigger Watchdog retries
+        for (const sale of branchMatchedSales) {
           if (!/^INV-/i.test(sale.id)) {
             this.pendingSaleAcks.set(sale.id, {
               sale,
@@ -1593,7 +1814,8 @@ class MeshSyncManager {
             action: 'SALE_RECORD',
             packet_id: `OFFLINE-FLUSH-${sale.id}-${Date.now()}`,
             companyId: this.config.companyId,
-            branchId: this.config.branchId,
+            branchId: sale.branchId || sale.branch_id || this.config.branchId,
+            target_branch_id: currentHubBranch,
             branchCode: this.config.branchCode,
             deviceId: this.config.deviceId,
             originDeviceId: this.config.deviceId,
@@ -1611,6 +1833,50 @@ class MeshSyncManager {
           }
         }
       }
+
+      // If foreign branch sales exist, attempt direct push to Cloud in background
+      if (foreignBranchSales.length > 0) {
+        this.addLog(
+          'DISCOVERY',
+          `Data Isolation: ${foreignBranchSales.length} offline sale(s) belong to other branches. Paused for Local Hub; will push directly to Cloud.`,
+          this.config.deviceName
+        );
+        processSyncQueue().catch(() => {});
+      }
+
+      // 3. Scan for offline Direct GRVs matching this Hub's branch
+      const allGrvs = getDirectGrvs();
+      const offlineGrvs = allGrvs.filter((g) => g && g.grvNumber && !(g as any).fromMesh && !(g as any).syncedToHub);
+      const branchMatchedGrvs = offlineGrvs.filter((g) => {
+        const gBranch = (g.branchId || (g as any).branch_id || '').trim().toUpperCase();
+        return !gBranch || gBranch === currentHubBranch.toUpperCase();
+      });
+
+      if (branchMatchedGrvs.length > 0) {
+        for (const grv of branchMatchedGrvs) {
+          (grv as any).syncedToHub = true;
+          const grvPacket = {
+            type: 'DIRECT_GRV',
+            action: 'GRV_RECORD',
+            packet_id: `OFFLINE-GRV-${grv.grvNumber}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: grv.branchId || (grv as any).branch_id || this.config.branchId,
+            target_branch_id: currentHubBranch,
+            branchCode: this.config.branchCode,
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            payload: grv,
+            directGrv: grv,
+            timestamp: grv.createdAt ? new Date(grv.createdAt).getTime() : Date.now(),
+            ttl: 5,
+            isOfflineCatchup: true,
+          };
+          try {
+            wsTarget.send(JSON.stringify(grvPacket));
+          } catch (_) {}
+        }
+      }
     } catch (e) {
       console.warn('[MeshSync] Error draining queue to local hub:', e);
     }
@@ -1623,6 +1889,9 @@ class MeshSyncManager {
       isLocalHubLost: this.isLocalHubLost,
       localHubUrl: LocalHubConfig.getLocalHubUrl(),
       forceLocalHub: LocalHubConfig.getForceLocalHub(),
+      hubBranchId: this.hubBranchId,
+      hubBranchName: this.hubBranchName,
+      isCloudOnlyMode: this.isCloudOnlyMode,
       isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
       isCloudMeshConnected: this.isMqttConnected || this.isServerRelayConnected,
       pendingQueueCount: getSyncQueue().length,
@@ -2228,7 +2497,32 @@ class MeshSyncManager {
       packet.action === 'HEARTBEAT' ||
       packet.action === 'PING';
 
-    if (!isMaintenance && !this.isIngestingFromHub) {
+    // Data Isolation & Roaming Owner Protection:
+    // If in Cloud-Only Mode or if packet's target_branch_id does NOT match the connected Hub's branch,
+    // NEVER send it to the Local Hub!
+    const targetBranch = (
+      packet.target_branch_id ||
+      packet.branchId ||
+      packet.branch_id ||
+      (packet.payload && (packet.payload.branch_id || packet.payload.branchId)) ||
+      (packet.sale && (packet.sale.branchId || packet.sale.branch_id)) ||
+      ''
+    ).trim().toUpperCase();
+
+    const isBranchMismatch =
+      Boolean(this.hubBranchId) &&
+      this.hubBranchId !== 'UNASSIGNED' &&
+      Boolean(targetBranch) &&
+      targetBranch !== this.hubBranchId.toUpperCase() &&
+      targetBranch !== 'ALL';
+
+    const allowLocalHubSend =
+      !isMaintenance &&
+      !this.isIngestingFromHub &&
+      !this.isCloudOnlyMode &&
+      !isBranchMismatch;
+
+    if (allowLocalHubSend) {
       const targetWs = this.localHubWs || this.directWsClient;
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         try {
@@ -2239,6 +2533,9 @@ class MeshSyncManager {
       } else {
         this.queueOutgoingLocalHubPacket(packet);
       }
+    } else if (isBranchMismatch || this.isCloudOnlyMode) {
+      // Packet blocked from Local Hub; push to central cloud when available
+      processSyncQueue().catch(() => {});
     }
 
     // 1. MQTT Over WebSocket
@@ -3136,6 +3433,7 @@ class MeshSyncManager {
       delta.sales.length +
       delta.cashLogs.length +
       (delta.cashLifts?.length || 0) +
+      (delta.cashMovements?.length || 0) +
       delta.customerChanges.length +
       delta.creditSales.length +
       delta.stockMovements.length +
@@ -3248,7 +3546,7 @@ class MeshSyncManager {
       }
     }
 
-    // 2. Ingest Cash Logs & Cash Lifts
+    // 2. Ingest Cash Logs, Cash Lifts & Cash Movements
     if (Array.isArray(delta.cashLogs)) {
       for (const cashLog of delta.cashLogs) {
         if (ingestMeshCashLog({ ...cashLog, fromMesh: true })) {
@@ -3260,6 +3558,15 @@ class MeshSyncManager {
       for (const lift of delta.cashLifts) {
         if (ingestMeshCashLift(lift)) {
           cashLiftsIngested++;
+        }
+      }
+    }
+    if (Array.isArray(delta.cashMovements)) {
+      for (const m of delta.cashMovements) {
+        if (!m || !m.id) continue;
+        const currentMoves = getMovements();
+        if (!currentMoves.some((existing) => existing.id === m.id)) {
+          addMovement({ ...m, fromMesh: true });
         }
       }
     }

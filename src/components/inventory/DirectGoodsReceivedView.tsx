@@ -665,26 +665,28 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       return;
     }
 
-    // Validate PINs for till payments
+    // Validate PINs for till payments only when paying from till
     const errors: { [key: string]: string } = {};
-    paymentRows.forEach((p) => {
-      const amt = Number(p.amount) || 0;
-      if (amt > 0) {
-        if (!p.pin.trim()) {
-          errors[p.id] = `PIN required for ${p.userName}`;
-        } else {
-          const staff = staffList.find((s) => s.id === p.userId);
-          if (staff?.pin && staff.pin !== p.pin && p.pin !== '1234' && p.pin !== '4321') {
-            errors[p.id] = `Invalid PIN for ${p.userName}`;
+    if (payFromTill) {
+      paymentRows.forEach((p) => {
+        const amt = Number(p.amount) || 0;
+        if (amt > 0) {
+          if (!p.pin.trim()) {
+            errors[p.id] = `PIN required for ${p.userName}`;
+          } else {
+            const staff = staffList.find((s) => s.id === p.userId);
+            if (staff?.pin && staff.pin !== p.pin && p.pin !== '1234' && p.pin !== '4321') {
+              errors[p.id] = `Invalid PIN for ${p.userName}`;
+            }
           }
         }
-      }
-    });
+      });
 
-    if (Object.keys(errors).length > 0) {
-      setPaymentErrors(errors);
-      showToast('error', 'Please correct the cashier PIN errors before submitting.');
-      return;
+      if (Object.keys(errors).length > 0) {
+        setPaymentErrors(errors);
+        showToast('error', 'Please correct the cashier PIN errors before submitting.');
+        return;
+      }
     }
     setPaymentErrors({});
 
@@ -712,19 +714,39 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       };
     });
 
-    // Convert till payments
-    const formattedPayments: DirectGrvTillPayment[] = paymentRows
-      .filter((p) => (Number(p.amount) || 0) > 0)
-      .map((p) => ({
-        userId: p.userId,
-        userName: p.userName,
-        amount: Number(p.amount) || 0,
-        drawerId: p.drawerId,
-        pinConfirmed: true,
-        confirmedAt: new Date().toISOString(),
-      }));
+    // Convert till payments (only if payFromTill is true)
+    let formattedPayments: DirectGrvTillPayment[] = [];
+    if (payFromTill) {
+      formattedPayments = paymentRows
+        .filter((p) => (Number(p.amount) || 0) > 0)
+        .map((p) => ({
+          userId: p.userId,
+          userName: p.userName,
+          amount: Number(p.amount) || 0,
+          drawerId: p.drawerId,
+          pinConfirmed: true,
+          confirmedAt: new Date().toISOString(),
+        }));
 
-    const unpaidInvoiceBalance = Math.max(0, voucherTotals.totalCost - paymentBreakdown.tillTotal);
+      // If user chose to pay from till but left payment amount inputs blank, auto-default to current cashier and full voucher total:
+      if (formattedPayments.length === 0 && voucherTotals.totalCost > 0) {
+        formattedPayments = [
+          {
+            userId: currentUser?.id || 'USR-003',
+            userName: currentUser?.name || 'Cashier',
+            amount: voucherTotals.totalCost,
+            drawerId: 'Till 1',
+            pinConfirmed: true,
+            confirmedAt: new Date().toISOString(),
+          },
+        ];
+      }
+    }
+
+    const tillPaidTotal = formattedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const unpaidInvoiceBalance = payFromTill
+      ? Math.max(0, voucherTotals.totalCost - tillPaidTotal)
+      : voucherTotals.totalCost;
 
     const newDirectGrv: DirectGrv = {
       id: grvNumber,
@@ -742,11 +764,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       items: grvItems,
       totalCost: voucherTotals.totalCost,
       totalSellingPrice: voucherTotals.totalSelling,
-      payFromTill: true,
-      paymentMethod: 'TILL',
-      paymentStatus: unpaidInvoiceBalance > 0 ? 'PARTIALLY_PAID_TILL' : 'PAID',
-      unpaidBalance: unpaidInvoiceBalance > 0 ? unpaidInvoiceBalance : 0,
-      creditBalance: unpaidInvoiceBalance > 0 ? unpaidInvoiceBalance : 0,
+      payFromTill: payFromTill,
+      paymentMethod: payFromTill ? 'TILL' : 'INVOICE_ON_ACCOUNT',
+      paymentStatus: !payFromTill ? 'INVOICE_CREDIT' : (unpaidInvoiceBalance > 0 ? 'PARTIALLY_PAID_TILL' : 'PAID'),
+      unpaidBalance: unpaidInvoiceBalance,
+      creditBalance: unpaidInvoiceBalance,
       payments: formattedPayments,
       receivedByStaffId: currentUser?.id || 'USR-003',
       receivedByStaffName: currentUser?.name || 'Cashier',
@@ -760,12 +782,19 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     if (isSupervisorOrAbove) {
       saveDirectGrv(newDirectGrv);
       approveDirectGrv(newDirectGrv.id, currentUser?.id || 'USR-001', currentUser?.name || 'Supervisor');
-      showToast('success', `Direct Delivery ${grvNumber} created & immediately APPROVED! Stock posted to inventory.`);
+      showToast(
+        'success',
+        payFromTill
+          ? `Direct Delivery ${grvNumber} created & APPROVED! Stock posted to inventory and till payout recorded in Form 2.`
+          : `Direct Delivery ${grvNumber} created & APPROVED! Stock posted to inventory (Supplier invoice on account - no till cash payout).`
+      );
     } else {
       saveDirectGrv(newDirectGrv);
       showToast(
         'success',
-        `Direct Delivery ${grvNumber} saved with status PENDING_APPROVAL! It is now recorded in your Delivery Registry.`
+        payFromTill
+          ? `Direct Delivery ${grvNumber} saved (PENDING_APPROVAL)! Till payout recorded in Form 2.`
+          : `Direct Delivery ${grvNumber} saved (PENDING_APPROVAL)! Recorded as supplier invoice on account (no Form 2 till deduction).`
       );
     }
 
@@ -2111,222 +2140,343 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
             </div>
           </div>
 
-          {/* Till Drawer Direct Supplier Payout Section */}
+          {/* Settlement Method Selection & Till Payout Section */}
           <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-6 shadow-xl space-y-5">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-4">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center">
-                  <DollarSign className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-white">Direct Supplier Payout from Till Drawer</h3>
-                  <p className="text-xs text-slate-400">
-                    Cashiers pay suppliers directly from till register cash. One delivery invoice can be split across two or more till operators.
-                  </p>
-                </div>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-4">
+              <div>
+                <h3 className="text-base font-bold text-white flex items-center gap-2">
+                  <CreditCard className="w-5 h-5 text-amber-400" />
+                  Settlement & Payment Method
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Select how this direct delivery is settled: cash out from cashier till vs. supplier credit invoice on account.
+                </p>
               </div>
+              <span className="text-xs font-mono px-3 py-1 rounded-full bg-slate-800 border border-slate-700 text-slate-300 self-start sm:self-auto">
+                Total Payable: ${voucherTotals.totalCost.toFixed(2)}
+              </span>
+            </div>
+
+            {/* Settlement Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <button
                 type="button"
-                onClick={handleAddPaymentRow}
-                className="px-3.5 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold flex items-center gap-1.5 transition-all self-start sm:self-center"
+                onClick={() => setPayFromTill(true)}
+                className={`p-4 rounded-2xl border text-left transition-all flex flex-col justify-between ${
+                  payFromTill
+                    ? 'bg-amber-500/10 border-amber-500/60 shadow-lg shadow-amber-500/5 ring-1 ring-amber-500/30'
+                    : 'bg-slate-950/40 border-slate-800 hover:border-slate-700 text-slate-400'
+                }`}
               >
-                <Plus className="w-3.5 h-3.5" />
-                <span>+ Add Another Till Operator</span>
+                <div className="flex items-start justify-between gap-3 mb-2">
+                  <div className="flex items-center gap-2.5">
+                    <div
+                      className={`w-9 h-9 rounded-xl flex items-center justify-center ${
+                        payFromTill ? 'bg-amber-500/20 text-amber-400' : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      <DollarSign className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="text-sm font-bold text-white flex items-center gap-2">
+                        Pay From Till Drawer
+                        {payFromTill && (
+                          <span className="text-[10px] bg-amber-500/20 text-amber-400 font-semibold px-2 py-0.5 rounded-full">
+                            Active
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-xs text-amber-400/90 font-medium">Cash Out from Register</span>
+                    </div>
+                  </div>
+                  <div
+                    className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 ${
+                      payFromTill ? 'border-amber-400 bg-amber-400 text-slate-950' : 'border-slate-700'
+                    }`}
+                  >
+                    {payFromTill && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                  </div>
+                </div>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Cash is paid directly out of the cashier drawer. Records in <strong className="text-slate-200">Form 2 (Section 3: Direct Procurement)</strong>, reduces till drawer balance, and reconciles in Form 4.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setPayFromTill(false)}
+                className={`p-4 rounded-2xl border text-left transition-all flex flex-col justify-between ${
+                  !payFromTill
+                    ? 'bg-blue-500/10 border-blue-500/60 shadow-lg shadow-blue-500/5 ring-1 ring-blue-500/30'
+                    : 'bg-slate-950/40 border-slate-800 hover:border-slate-700 text-slate-400'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3 mb-2">
+                  <div className="flex items-center gap-2.5">
+                    <div
+                      className={`w-9 h-9 rounded-xl flex items-center justify-center ${
+                        !payFromTill ? 'bg-blue-500/20 text-blue-400' : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      <Building2 className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <div className="text-sm font-bold text-white flex items-center gap-2">
+                        Supplier Invoice on Account / Credit
+                        {!payFromTill && (
+                          <span className="text-[10px] bg-blue-500/20 text-blue-400 font-semibold px-2 py-0.5 rounded-full">
+                            Active
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-xs text-blue-400/90 font-medium">No Cash Out from Till</span>
+                    </div>
+                  </div>
+                  <div
+                    className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 ${
+                      !payFromTill ? 'border-blue-400 bg-blue-400 text-slate-950' : 'border-slate-700'
+                    }`}
+                  >
+                    {!payFromTill && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                  </div>
+                </div>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Stock is received into inventory and AVCO cost is updated. <strong className="text-slate-200">No cash is deducted from the cashier till</strong> and no entry is made in Form 2. Settled via Dual Custody / Accounts Payable.
+                </p>
               </button>
             </div>
 
-            {/* Operator Payment Rows */}
-            <div className="space-y-3">
-              {paymentRows.map((payRow, pIdx) => {
-                const error = paymentErrors[payRow.id];
-                return (
-                  <div
-                    key={payRow.id}
-                    className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 grid grid-cols-1 sm:grid-cols-12 gap-3 items-center"
+            {/* Conditional Sub-View */}
+            {payFromTill ? (
+              <div className="pt-2 border-t border-slate-800/80 space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                      <DollarSign className="w-4 h-4 text-amber-400" />
+                      Till Operator Cash Allocation
+                    </h4>
+                    <p className="text-xs text-slate-400">
+                      Cashiers pay suppliers directly from till register cash. One delivery invoice can be split across two or more till operators.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleAddPaymentRow}
+                    className="px-3.5 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold flex items-center gap-1.5 transition-all self-start sm:self-center"
                   >
-                    {/* Operator Selector */}
-                    <div className="sm:col-span-4 space-y-1">
-                      <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                        <User className="w-3 h-3 text-amber-400" />
-                        Till Operator {pIdx + 1}
-                      </label>
-                      <select
-                        value={payRow.userId}
-                        onChange={(e) => handleUpdatePaymentRow(payRow.id, 'userId', e.target.value)}
-                        className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-amber-500 font-medium"
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>+ Add Another Till Operator</span>
+                  </button>
+                </div>
+
+                {/* Operator Payment Rows */}
+                <div className="space-y-3">
+                  {paymentRows.map((payRow, pIdx) => {
+                    const error = paymentErrors[payRow.id];
+                    return (
+                      <div
+                        key={payRow.id}
+                        className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 grid grid-cols-1 sm:grid-cols-12 gap-3 items-center"
                       >
-                        {staffList.map((s, sIdx) => (
-                          <option key={`${s.id}-${sIdx}`} value={s.id}>
-                            {s.name} ({s.role})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
+                        {/* Operator Selector */}
+                        <div className="sm:col-span-4 space-y-1">
+                          <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                            <User className="w-3 h-3 text-amber-400" />
+                            Till Operator {pIdx + 1}
+                          </label>
+                          <select
+                            value={payRow.userId}
+                            onChange={(e) => handleUpdatePaymentRow(payRow.id, 'userId', e.target.value)}
+                            className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-amber-500 font-medium"
+                          >
+                            {staffList.map((s, sIdx) => (
+                              <option key={`${s.id}-${sIdx}`} value={s.id}>
+                                {s.name} ({s.role})
+                              </option>
+                            ))}
+                          </select>
+                        </div>
 
-                    {/* Drawer ID */}
-                    <div className="sm:col-span-2 space-y-1">
-                      <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                        <Layers className="w-3 h-3 text-slate-400" />
-                        Drawer
-                      </label>
-                      <input
-                        type="text"
-                        value={payRow.drawerId}
-                        onChange={(e) => handleUpdatePaymentRow(payRow.id, 'drawerId', e.target.value)}
-                        placeholder="Till 1"
-                        className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none font-medium"
-                      >
-                      </input>
-                    </div>
+                        {/* Drawer ID */}
+                        <div className="sm:col-span-2 space-y-1">
+                          <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                            <Layers className="w-3 h-3 text-slate-400" />
+                            Drawer
+                          </label>
+                          <input
+                            type="text"
+                            value={payRow.drawerId}
+                            onChange={(e) => handleUpdatePaymentRow(payRow.id, 'drawerId', e.target.value)}
+                            placeholder="Till 1"
+                            className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none font-medium"
+                          />
+                        </div>
 
-                    {/* Amount Paid from this Till */}
-                    <div className="sm:col-span-3 space-y-1">
-                      <div className="flex items-center justify-between">
-                        <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                          <DollarSign className="w-3 h-3 text-emerald-400" />
-                          Till Amount Paid ($)
-                        </label>
-                        <button
-                          type="button"
-                          onClick={() => handleFillRemainder(payRow.id)}
-                          className="text-[10px] text-amber-400 hover:underline font-mono"
-                          title="Auto-fill the remaining invoice balance into this till"
-                        >
-                          Fill Bal
-                        </button>
+                        {/* Amount Paid from this Till */}
+                        <div className="sm:col-span-3 space-y-1">
+                          <div className="flex items-center justify-between">
+                            <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                              <DollarSign className="w-3 h-3 text-emerald-400" />
+                              Till Amount Paid ($)
+                            </label>
+                            <button
+                              type="button"
+                              onClick={() => handleFillRemainder(payRow.id)}
+                              className="text-[10px] text-amber-400 hover:underline font-mono"
+                              title="Auto-fill the remaining invoice balance into this till"
+                            >
+                              Fill Bal
+                            </button>
+                          </div>
+                          <div className="relative">
+                            <span className="absolute left-2.5 top-2 text-xs text-slate-400 font-mono">$</span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={payRow.amount ?? ''}
+                              onFocus={(e) => e.target.select()}
+                              onClick={(e) => (e.target as HTMLInputElement).select()}
+                              onChange={(e) => {
+                                const val = cleanNumberInput(e.target.value, true);
+                                handleUpdatePaymentRow(payRow.id, 'amount', val);
+                              }}
+                              placeholder="0.00"
+                              className="w-full bg-slate-800 border border-slate-700 text-amber-400 font-mono font-bold rounded-xl pl-6 pr-2.5 py-2 text-xs focus:outline-none focus:border-amber-500"
+                              required
+                            />
+                          </div>
+                        </div>
+
+                        {/* Operator PIN */}
+                        <div className="sm:col-span-2 space-y-1">
+                          <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                            <KeyRound className="w-3 h-3 text-amber-400" />
+                            Operator PIN
+                          </label>
+                          <input
+                            type="password"
+                            maxLength={6}
+                            value={payRow.pin}
+                            onChange={(e) => {
+                              handleUpdatePaymentRow(payRow.id, 'pin', e.target.value);
+                              if (paymentErrors[payRow.id]) {
+                                setPaymentErrors((prev) => {
+                                  const c = { ...prev };
+                                  delete c[payRow.id];
+                                  return c;
+                                });
+                              }
+                            }}
+                            placeholder="PIN..."
+                            className={`w-full bg-slate-800 border text-white rounded-xl px-2.5 py-2 text-xs font-mono tracking-wider focus:outline-none ${
+                              error ? 'border-rose-500' : 'border-slate-700 focus:border-amber-500'
+                            }`}
+                            required
+                          />
+                        </div>
+
+                        {/* Remove Action */}
+                        <div className="sm:col-span-1 flex items-center justify-center pt-4 sm:pt-0">
+                          {paymentRows.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemovePaymentRow(payRow.id)}
+                              className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition"
+                              title="Remove operator payment"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Error Message */}
+                        {error && (
+                          <div className="col-span-1 sm:col-span-12">
+                            <p className="text-[11px] text-rose-400">{error}</p>
+                          </div>
+                        )}
                       </div>
-                      <div className="relative">
-                        <span className="absolute left-2.5 top-2 text-xs text-slate-400 font-mono">$</span>
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          value={payRow.amount ?? ''}
-                          onFocus={(e) => e.target.select()}
-                          onClick={(e) => (e.target as HTMLInputElement).select()}
-                          onChange={(e) => {
-                            const val = cleanNumberInput(e.target.value, true);
-                            handleUpdatePaymentRow(payRow.id, 'amount', val);
-                          }}
-                          placeholder="0.00"
-                          className="w-full bg-slate-800 border border-slate-700 text-amber-400 font-mono font-bold rounded-xl pl-6 pr-2.5 py-2 text-xs focus:outline-none focus:border-amber-500"
-                          required
-                        />
-                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Live Balancing & Dual-Custody Forwarding Breakdown Card */}
+                <div className="p-4 rounded-2xl bg-gradient-to-br from-slate-950 to-slate-900 border border-slate-800 space-y-3">
+                  <div className="flex items-center justify-between text-xs border-b border-slate-800 pb-2">
+                    <span className="font-bold text-slate-400 uppercase tracking-wider">Settlement & Balancing Summary</span>
+                    <span className="font-mono text-slate-400">Total Invoice: ${voucherTotals.totalCost.toFixed(2)}</span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                    <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
+                      <span className="text-[10px] text-slate-400 block font-bold">Total Invoice Payable</span>
+                      <span className="font-mono text-sm font-bold text-white">
+                        ${voucherTotals.totalCost.toFixed(2)}
+                      </span>
                     </div>
 
-                    {/* Operator PIN */}
-                    <div className="sm:col-span-2 space-y-1">
-                      <label className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
-                        <KeyRound className="w-3 h-3 text-amber-400" />
-                        Operator PIN
-                      </label>
-                      <input
-                        type="password"
-                        maxLength={6}
-                        value={payRow.pin}
-                        onChange={(e) => {
-                          handleUpdatePaymentRow(payRow.id, 'pin', e.target.value);
-                          if (paymentErrors[payRow.id]) {
-                            setPaymentErrors((prev) => {
-                              const c = { ...prev };
-                              delete c[payRow.id];
-                              return c;
-                            });
-                          }
-                        }}
-                        placeholder="PIN..."
-                        className={`w-full bg-slate-800 border text-white rounded-xl px-2.5 py-2 text-xs font-mono tracking-wider focus:outline-none ${
-                          error ? 'border-rose-500' : 'border-slate-700 focus:border-amber-500'
+                    <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
+                      <span className="text-[10px] text-slate-400 block font-bold">Total Till Outflow</span>
+                      <span className="font-mono text-sm font-bold text-amber-400">
+                        ${paymentBreakdown.tillTotal.toFixed(2)}
+                      </span>
+                    </div>
+
+                    <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
+                      <span className="text-[10px] text-slate-400 block font-bold">Forwarded to Dual Custody</span>
+                      <span
+                        className={`font-mono text-sm font-bold ${
+                          paymentBreakdown.invoiceBalance > 0 ? 'text-indigo-400' : 'text-slate-500'
                         }`}
-                        required
-                      />
+                      >
+                        ${paymentBreakdown.invoiceBalance.toFixed(2)}
+                      </span>
                     </div>
+                  </div>
 
-                    {/* Remove Action */}
-                    <div className="sm:col-span-1 flex items-center justify-center pt-4 sm:pt-0">
-                      {paymentRows.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() => handleRemovePaymentRow(payRow.id)}
-                          className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition"
-                          title="Remove operator payment"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Error Message */}
-                    {error && (
-                      <div className="col-span-1 sm:col-span-12">
-                        <p className="text-[11px] text-rose-400">{error}</p>
+                  {/* Visual Status Indicator & Dual-Custody Notification */}
+                  {paymentBreakdown.invoiceBalance > 0 ? (
+                    <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/40 text-xs text-indigo-300 space-y-1">
+                      <div className="flex items-center gap-2 font-bold text-white">
+                        <Clock className="w-4 h-4 text-indigo-400 shrink-0" />
+                        <span>
+                          Partial Till Payout: ${paymentBreakdown.tillTotal.toFixed(2)} paid from till.
+                        </span>
                       </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Live Balancing & Dual-Custody Forwarding Breakdown Card */}
-            <div className="p-4 rounded-2xl bg-gradient-to-br from-slate-950 to-slate-900 border border-slate-800 space-y-3">
-              <div className="flex items-center justify-between text-xs border-b border-slate-800 pb-2">
-                <span className="font-bold text-slate-400 uppercase tracking-wider">Settlement & Balancing Summary</span>
-                <span className="font-mono text-slate-400">Total Invoice: ${voucherTotals.totalCost.toFixed(2)}</span>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
-                <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <span className="text-[10px] text-slate-400 block font-bold">Total Invoice Payable</span>
-                  <span className="font-mono text-sm font-bold text-white">
-                    ${voucherTotals.totalCost.toFixed(2)}
-                  </span>
-                </div>
-
-                <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <span className="text-[10px] text-slate-400 block font-bold">Total Till Outflow</span>
-                  <span className="font-mono text-sm font-bold text-amber-400">
-                    ${paymentBreakdown.tillTotal.toFixed(2)}
-                  </span>
-                </div>
-
-                <div className="p-2.5 rounded-xl bg-slate-900/80 border border-slate-800">
-                  <span className="text-[10px] text-slate-400 block font-bold">Forwarded to Dual Custody</span>
-                  <span className={`font-mono text-sm font-bold ${paymentBreakdown.invoiceBalance > 0 ? 'text-indigo-400' : 'text-slate-500'}`}>
-                    ${paymentBreakdown.invoiceBalance.toFixed(2)}
-                  </span>
+                      <p className="text-[11px] text-indigo-300/90 pl-6">
+                        Remaining unpaid balance of <strong className="text-white font-mono">${paymentBreakdown.invoiceBalance.toFixed(2)}</strong> will be forwarded to the <strong>Dual Custody tab</strong> for Accounts Clerk / Safe Vault payout.
+                      </p>
+                    </div>
+                  ) : paymentBreakdown.overpayment > 0 ? (
+                    <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                      <span>
+                        Overpayment Warning: Total operator payments exceed delivery invoice by{' '}
+                        <strong>${paymentBreakdown.overpayment.toFixed(2)}</strong>.
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 text-xs text-emerald-300 flex items-center gap-2">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>
+                        Fully Balanced: Delivery invoice of ${voucherTotals.totalCost.toFixed(2)} is 100% paid from till drawer. Each operator's contribution will be deducted under Direct Procurement in Form 2.
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
-
-              {/* Visual Status Indicator & Dual-Custody Notification */}
-              {paymentBreakdown.invoiceBalance > 0 ? (
-                <div className="p-3 rounded-xl bg-indigo-950/40 border border-indigo-500/40 text-xs text-indigo-300 space-y-1">
-                  <div className="flex items-center gap-2 font-bold text-white">
-                    <Clock className="w-4 h-4 text-indigo-400 shrink-0" />
-                    <span>
-                      Partial Till Payout: ${paymentBreakdown.tillTotal.toFixed(2)} paid from till.
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-indigo-300/90 pl-6">
-                    Remaining unpaid balance of <strong className="text-white font-mono">${paymentBreakdown.invoiceBalance.toFixed(2)}</strong> will be forwarded to the <strong>Dual Custody tab</strong> for Accounts Clerk / Safe Vault payout.
-                  </p>
+            ) : (
+              <div className="p-4 rounded-2xl bg-blue-950/30 border border-blue-800/50 text-blue-300 text-xs space-y-2">
+                <div className="flex items-center gap-2 font-bold text-white">
+                  <CheckCircle2 className="w-4 h-4 text-blue-400 shrink-0" />
+                  <span>Supplier Invoice on Account Selected (Zero Till Cash Deducted)</span>
                 </div>
-              ) : paymentBreakdown.overpayment > 0 ? (
-                <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-800/60 text-xs text-rose-300 flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                  <span>
-                    Overpayment Warning: Total operator payments exceed delivery invoice by{' '}
-                    <strong>${paymentBreakdown.overpayment.toFixed(2)}</strong>.
-                  </span>
-                </div>
-              ) : (
-                <div className="p-2.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 text-xs text-emerald-300 flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span>
-                    Fully Balanced: Delivery invoice of ${voucherTotals.totalCost.toFixed(2)} is 100% paid from till drawer. Each operator's contribution will be deducted under Direct Procurement in Form 2.
-                  </span>
-                </div>
-              )}
-            </div>
+                <p className="text-slate-300 pl-6 leading-relaxed">
+                  Upon approval, received goods will increment inventory quantities and update Moving Average Cost (AVCO).
+                  The cashier drawer cash balance remains untouched, and Form 2 cash procurement will not register any deduction. Dual custody / Safe Vault / Accounts Payable will manage settlement outside of the register.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Action Button Bar */}
