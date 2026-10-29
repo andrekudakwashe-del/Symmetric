@@ -1628,8 +1628,13 @@ export const getSalespeopleForCompany = (companyId?: string): Salesperson[] => {
 
 export const getNextSalespersonId = (): string => {
   const list = getRawStoredSalespeople();
-  const numericIds = list
-    .map((s) => parseInt(s.id, 10))
+  const numericIds = (Array.isArray(list) ? list : [])
+    .map((s) => {
+      if (!s) return NaN;
+      const rawId = s.id || (s as any).staffId || (s as any).user_id || '';
+      const match = String(rawId).match(/\d+/);
+      return match ? parseInt(match[0], 10) : NaN;
+    })
     .filter((n) => !isNaN(n));
   const max = numericIds.length > 0 ? Math.max(...numericIds) : 0;
   const next = max + 1;
@@ -1941,9 +1946,11 @@ export const getCustomers = (): Customer[] => {
 
 export const getNextCustomerId = (): string => {
   const list = getRawStoredCustomers();
-  const numericParts = list
+  const numericParts = (Array.isArray(list) ? list : [])
     .map((c) => {
-      const match = c.customerId.match(/^C?(\d+)$/i);
+      if (!c) return null;
+      const rawId = c.customerId || (c as any).id || (c as any).CustomerID || '';
+      const match = String(rawId).match(/^C?(\d+)$/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
@@ -2147,9 +2154,11 @@ export const getSupplierById = (supplierId: string): Supplier | undefined => {
 
 export const getNextSupplierId = (): string => {
   const list = getRawStoredSuppliers();
-  const numericParts = list
+  const numericParts = (Array.isArray(list) ? list : [])
     .map((s) => {
-      const match = s.supplierId.match(/^SUP-?(\d+)$/i);
+      if (!s) return null;
+      const rawId = s.supplierId || (s as any).id || (s as any).SupplierID || '';
+      const match = String(rawId).match(/^SUP-?(\d+)$/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
@@ -3304,9 +3313,11 @@ export const getCashLogs = (): CashLogEntry[] => {
 
 export const getNextCashLogId = (): string => {
   const list = getRawStoredCashLogs();
-  const numbers = list
+  const numbers = (Array.isArray(list) ? list : [])
     .map((c) => {
-      const match = c.id?.match?.(/^CL-(\d+)$/i);
+      if (!c) return null;
+      const rawId = c.id || (c as any).cashLogId || '';
+      const match = String(rawId).match(/^CL-(\d+)$/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
@@ -4174,9 +4185,11 @@ export const getCustomerChanges = (): CustomerChangeEntry[] => {
 
 export const getNextCustomerChangeId = (): string => {
   const list = getAllCustomerChanges();
-  const numbers = list
+  const numbers = (Array.isArray(list) ? list : [])
     .map((c) => {
-      const match = c.id?.match?.(/^CHG-(\d+)$/i);
+      if (!c) return null;
+      const rawId = c.id || (c as any).changeId || '';
+      const match = String(rawId).match(/^CHG-(\d+)$/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
@@ -4474,9 +4487,11 @@ export const getCreditSales = (): CreditSaleEntry[] => {
 
 export const getNextCreditSaleId = (): string => {
   const list = getAllCreditSales();
-  const numbers = list
+  const numbers = (Array.isArray(list) ? list : [])
     .map((c) => {
-      const match = c.id?.match?.(/^CR-(\d+)$/i);
+      if (!c) return null;
+      const rawId = c.id || (c as any).creditSaleId || '';
+      const match = String(rawId).match(/^CR-(\d+)$/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
@@ -6535,9 +6550,11 @@ export const getExpenses = (): ExpenseEntry[] => {
 
 export const getNextExpenseId = (): string => {
   const list = getAllExpenses();
-  const numbers = list
+  const numbers = (Array.isArray(list) ? list : [])
     .map((e) => {
-      const match = e.id.match(/^EXP-(\d+)$/i);
+      if (!e) return null;
+      const rawId = e.id || (e as any).expenseId || (e as any).ExpenseID || '';
+      const match = String(rawId).match(/^EXP-(\d+)$/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);

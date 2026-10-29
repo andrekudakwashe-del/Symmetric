@@ -146,7 +146,9 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
       return `${tillAcc.account_name} — ${matchCashier.name} (${matchCashier.role})`;
     }
 
-    const tillNumMatch = tillAcc.account_name.match(/(\d+)/) || tillAcc.account_id.match(/(\d+)/);
+    const nameStr = tillAcc?.account_name || '';
+    const idStr = tillAcc?.account_id || '';
+    const tillNumMatch = nameStr.match(/(\d+)/) || idStr.match(/(\d+)/);
     const tillNum = tillNumMatch ? tillNumMatch[1] : '1';
     const tillIndex = parseInt(tillNum, 10) - 1;
 
@@ -822,7 +824,9 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
                         if (modalType === 'FLOAT_ISSUE') {
                           const selectedTill = tillAccounts.find((t) => t.account_id === e.target.value);
                           if (selectedTill) {
-                            const tillNum = selectedTill.account_name.match(/(\d+)/)?.[1] || selectedTill.account_id.match(/(\d+)/)?.[1] || '1';
+                            const tName = selectedTill.account_name || '';
+                            const tId = selectedTill.account_id || '';
+                            const tillNum = tName.match(/(\d+)/)?.[1] || tId.match(/(\d+)/)?.[1] || '1';
                             const tillIdx = parseInt(tillNum, 10) - 1;
                             const activeCashiers = salespeople.filter(
                               (s) => s.active !== 'N' && (s.role === 'Cashier' || s.role === 'Staff' || s.role === 'ADMIN' || s.role === 'OWNER')

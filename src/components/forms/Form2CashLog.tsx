@@ -777,8 +777,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         let itemBought = '';
         let note = '';
         if (log) {
-          const desc = log.description;
-          const match = desc.match(/Direct Procurement:\s*([^-]+)(?:\s*-\s*(.*))?/i);
+          const desc = log.description || '';
+          const match = desc ? desc.match(/Direct Procurement:\s*([^-]+)(?:\s*-\s*(.*))?/i) : null;
           if (match) {
             itemBought = match[1]?.trim() || '';
             note = match[2]?.trim() || log.reference || '';
