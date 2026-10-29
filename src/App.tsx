@@ -43,6 +43,7 @@ import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
 import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield } from 'lucide-react';
 import { initializeSystemConfigAndSync } from './services/systemConfig';
 import { persistentSyncEngine } from './services/persistentSyncEngine';
+import { meshSyncService } from './services/meshSyncService';
 import { FunctionalHamburgerMenu } from './components/layout/FunctionalHamburgerMenu';
 import {
   getLandingTabForUser,
@@ -335,6 +336,9 @@ export default function App() {
     setLoggedInUser(user);
     const landingTab = getLandingTabForUser(user);
     setActiveTab(landingTab);
+
+    // Re-Handshake on Login: Dispatch fresh HANDSHAKE packet to Local Hub
+    meshSyncService.sendHandshake(user.branchId || user.branch_id, user.branchName);
 
     // Run login tenant schema version migration check & queue drain
     persistentSyncEngine.handleLoginMigrationCheck();

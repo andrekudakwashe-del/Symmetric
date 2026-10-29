@@ -220,6 +220,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     } else {
       meshSyncService.setCloudOnlyMode(false);
     }
+
+    // Re-Handshake on Login: Dispatch fresh HANDSHAKE packet to Local Hub
+    meshSyncService.sendHandshake(userBranch, user.branchName);
+
     onLoginSuccess(user);
   };
 
@@ -931,6 +935,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                           onClick={() => {
                             setSelectedBranchId(id);
                             setCurrentBranchId(id);
+                            try {
+                              localStorage.setItem('saimetric_last_selected_branch_id', id);
+                            } catch {}
+                            if (LocalHubConfig.getHubBranchId() === 'UNASSIGNED') {
+                              meshSyncService.sendHandshake(id, br.name || br.code);
+                            }
                             setSelectedStaffId(null);
                             setPin('');
                             setError(null);

@@ -613,6 +613,14 @@ class MeshSyncManager {
       // Safeguard 4: Expose Tornado test runner on window
       (window as any).__runTornadoTest = (numDevices = 5, salesPerDevice = 10) =>
         this.simulateTornadoBurst(numDevices, salesPerDevice);
+
+      // Re-Handshake on Login: Automatically dispatch fresh HANDSHAKE packet when user logs in
+      window.addEventListener('saimetric_user_logged_in', (e: any) => {
+        const user = e?.detail;
+        const branchId = user?.branchId || user?.branch_id || getCurrentBranchId();
+        const branchName = user?.branchName;
+        this.sendHandshake(branchId, branchName);
+      });
     }
 
     // Periodic pull from server - gentle background interval to prevent UI freezes
@@ -1578,23 +1586,146 @@ class MeshSyncManager {
     }
   }
 
+  /**
+   * Resolves the current active branch ID, name, and company ID
+   * prioritizing the logged-in session user, current branch setting, and device registration.
+   */
+  public getActiveBranchInfo(): { branchId: string; branchName: string; companyId: string } {
+    const sessionUser = getSessionUser();
+    let regBranchId: string | null = null;
+    let currBranchId: string | null = null;
+    let loginSelectedBranchId: string | null = null;
+
+    try {
+      if (typeof localStorage !== 'undefined') {
+        regBranchId = localStorage.getItem('saimetric_device_reg_branch_id');
+        currBranchId = localStorage.getItem('saimetric_room_current_branch_id');
+        loginSelectedBranchId = localStorage.getItem('saimetric_last_selected_branch_id');
+      }
+    } catch {}
+
+    const branchId = (
+      sessionUser?.branch_id ||
+      sessionUser?.branchId ||
+      currBranchId ||
+      regBranchId ||
+      loginSelectedBranchId ||
+      getCurrentBranchId() ||
+      'VEN-01'
+    ).trim();
+
+    const branches = getBranches();
+    const matched = branches.find(
+      (b) =>
+        b.branchId?.toUpperCase() === branchId.toUpperCase() ||
+        b.id?.toUpperCase() === branchId.toUpperCase() ||
+        b.code?.toUpperCase() === branchId.toUpperCase()
+    );
+
+    const branchName =
+      sessionUser?.branchName ||
+      matched?.name ||
+      (matched as any)?.branch_name ||
+      branchId ||
+      'Main Branch';
+
+    const companyId =
+      sessionUser?.company_id ||
+      sessionUser?.companyId ||
+      getCurrentCompanyId() ||
+      'COMP-001';
+
+    return { branchId, branchName, companyId };
+  }
+
+  /**
+   * Dispatches a HANDSHAKE packet to the Local Hub to assign or re-bind its branch identity.
+   */
+  public sendHandshake(targetBranchId?: string, targetBranchName?: string): boolean {
+    const wsTarget = this.localHubWs || this.directWsClient;
+    const activeInfo = this.getActiveBranchInfo();
+    const branchId = (targetBranchId || activeInfo.branchId || '').trim();
+    const branchName = (targetBranchName || activeInfo.branchName || branchId || 'Active Branch').trim();
+    const companyId = activeInfo.companyId;
+
+    if (!branchId || branchId.toUpperCase() === 'UNASSIGNED') {
+      return false;
+    }
+
+    if (!wsTarget || wsTarget.readyState !== WebSocket.OPEN) {
+      console.warn('[MeshSync] Cannot send Handshake - Local Hub WebSocket is not open for branch:', branchId);
+      return false;
+    }
+
+    try {
+      const handshakePacket = {
+        type: 'HANDSHAKE',
+        action: 'HANDSHAKE',
+        branch_id: branchId,
+        branchId: branchId,
+        branch_name: branchName,
+        branchName: branchName,
+        target_branch_id: branchId,
+        tenant_id: companyId,
+        company_id: companyId,
+        companyId: companyId,
+        deviceId: this.config.deviceId,
+        deviceName: this.config.deviceName,
+        timestamp: Date.now(),
+      };
+
+      wsTarget.send(JSON.stringify(handshakePacket));
+      // Requirement 4: Console Logging
+      console.log('[MeshSync] Handshake sent to Hub for branch:', branchId);
+      this.addLog(
+        'BROADCAST',
+        `Handshake sent to Hub for branch: ${branchId} (${branchName})`,
+        this.config.deviceName
+      );
+      return true;
+    } catch (err) {
+      console.warn('[MeshSync] Error sending HANDSHAKE to Local Hub:', err);
+      return false;
+    }
+  }
+
   public handleIncomingHubInfo(packet: any) {
-    const branchId = (packet.branch_id || packet.branchId || '').trim();
-    const branchName = (packet.branch_name || packet.branchName || branchId || 'Local Hub').trim();
+    const rawBranchId = (packet.branch_id || packet.branchId || '').trim();
+    const branchName = (packet.branch_name || packet.branchName || rawBranchId || 'Local Hub').trim();
     const tenantId = packet.tenant_id || packet.tenantId;
 
-    this.hubBranchId = branchId || null;
-    this.hubBranchName = branchName || null;
+    const isUnassigned = !rawBranchId || rawBranchId.toUpperCase() === 'UNASSIGNED';
+    const branchId = isUnassigned ? 'UNASSIGNED' : rawBranchId;
 
-    if (branchId) {
+    this.hubBranchId = isUnassigned ? 'UNASSIGNED' : branchId;
+    this.hubBranchName = isUnassigned ? 'Unassigned Hub' : branchName;
+
+    if (!isUnassigned) {
       LocalHubConfig.setHubBranchIdentity(branchId, branchName, tenantId);
+    } else {
+      LocalHubConfig.clearHubBranchIdentity();
     }
 
     this.addLog(
       'DISCOVERY',
-      `Hub Handshake Verified: Tethered to [${branchName}] (${branchId || 'UNASSIGNED'}).`,
+      `Hub Handshake Verified: Tethered to [${this.hubBranchName}] (${branchId}).`,
       this.config.deviceName
     );
+
+    // Requirement 1: Auto-Send Handshake on HUB_INFO
+    // When the app receives a HUB_INFO packet where branch_id === 'UNASSIGNED',
+    // it must IMMEDIATELY send the HANDSHAKE packet using the current active user's branch (e.g., VEN-01).
+    // Do not wait for a login event—if a user is already logged in, trigger the handshake instantly.
+    if (isUnassigned) {
+      const activeInfo = this.getActiveBranchInfo();
+      if (activeInfo.branchId && activeInfo.branchId.toUpperCase() !== 'UNASSIGNED') {
+        this.sendHandshake(activeInfo.branchId, activeInfo.branchName);
+      }
+      this.evaluateConnectionPriority();
+      this.notifyPeerSubscribers(true);
+      this.notifyConnectionModeChange();
+      return;
+    }
 
     // Safeguard 2: Check if logged-in user or active device branch matches Hub branch
     const sessionUser = getSessionUser();
@@ -1639,8 +1770,8 @@ class MeshSyncManager {
   }
 
   public handleIncomingResetConfirmed(packet: any) {
-    this.hubBranchId = null;
-    this.hubBranchName = null;
+    this.hubBranchId = 'UNASSIGNED';
+    this.hubBranchName = 'Unassigned Hub';
     this.isCloudOnlyMode = false;
     LocalHubConfig.clearHubBranchIdentity();
     LocalHubConfig.setCloudOnlyMode(false);
@@ -1658,13 +1789,22 @@ class MeshSyncManager {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('saimetric_hub_reset_confirmed', { detail: packet }));
     }
+
+    // Requirement 3: Re-Handshake After Reset
+    // After the app receives RESET_CONFIRMED, wait 2 seconds and then send a new HANDSHAKE with active user's branch info
+    setTimeout(() => {
+      const activeInfo = this.getActiveBranchInfo();
+      if (activeInfo.branchId && activeInfo.branchId.toUpperCase() !== 'UNASSIGNED') {
+        this.sendHandshake(activeInfo.branchId, activeInfo.branchName);
+      }
+    }, 2000);
   }
 
   public resetHubIdentity(newBranchId?: string, newBranchName?: string): boolean {
     const wsTarget = this.localHubWs || this.directWsClient;
     if (!wsTarget || wsTarget.readyState !== WebSocket.OPEN) {
-      this.hubBranchId = null;
-      this.hubBranchName = null;
+      this.hubBranchId = 'UNASSIGNED';
+      this.hubBranchName = 'Unassigned Hub';
       this.isCloudOnlyMode = false;
       LocalHubConfig.clearHubBranchIdentity();
       LocalHubConfig.setCloudOnlyMode(false);
@@ -1683,8 +1823,8 @@ class MeshSyncManager {
         timestamp: Date.now(),
       };
       wsTarget.send(JSON.stringify(resetPacket));
-      this.hubBranchId = null;
-      this.hubBranchName = null;
+      this.hubBranchId = 'UNASSIGNED';
+      this.hubBranchName = 'Unassigned Hub';
       this.isCloudOnlyMode = false;
       LocalHubConfig.clearHubBranchIdentity();
       LocalHubConfig.setCloudOnlyMode(false);

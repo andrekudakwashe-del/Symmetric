@@ -300,6 +300,42 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
+      // 0.2 HANDSHAKE: ASSIGN OR RE-BIND HUB BRANCH IDENTITY
+      // =====================================================================
+      if (pType === 'HANDSHAKE' || pType === 'SET_BRANCH' || pType === 'ASSIGN_BRANCH') {
+        const assignedBranchId = packet.branch_id || packet.branchId || packet.target_branch_id;
+        const assignedBranchName = packet.branch_name || packet.branchName || assignedBranchId;
+        const assignedTenantId = packet.tenant_id || packet.tenantId || packet.company_id || packet.companyId;
+
+        if (assignedBranchId && assignedBranchId !== 'UNASSIGNED') {
+          hubBranchId = assignedBranchId;
+          if (assignedBranchName) hubBranchName = assignedBranchName;
+          if (assignedTenantId) hubTenantId = assignedTenantId;
+          saveData();
+          console.log(`[Termux Hub] 🤝 Handshake accepted: Assigned to Branch ${hubBranchId} ("${hubBranchName}")`);
+
+          // Reply with updated HUB_INFO to confirm binding
+          const hubInfoResponse = {
+            type: 'HUB_INFO',
+            action: 'HUB_INFO',
+            branch_id: hubBranchId,
+            branch_name: hubBranchName,
+            tenant_id: hubTenantId,
+            hub_id: `HUB-${hubBranchId}`,
+            version: '3.1.0',
+            totalRecords: salesStore.length + directGrvsStore.length,
+            timestamp: Date.now(),
+          };
+          try {
+            ws.send(JSON.stringify(hubInfoResponse));
+          } catch (e) {
+            console.warn('[Termux Hub] Failed to send HUB_INFO response after handshake:', e.message);
+          }
+          return;
+        }
+      }
+
+      // =====================================================================
       // 1. SALES INVOICES & LIVE INVENTORY DEDUCTIONS
       // =====================================================================
       const isSale = pType === 'SALE' || pType === 'SALE_RECORD' || pType === 'SALE_CREATED' || !!packet.sale;

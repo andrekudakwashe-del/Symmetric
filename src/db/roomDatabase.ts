@@ -1112,6 +1112,9 @@ export const setSessionUser = (user: Salesperson | null): void => {
     if (brId) {
       setStored(STORAGE_KEYS.CURRENT_BRANCH_ID, brId);
     }
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_user_logged_in', { detail: user }));
+    }
   }
   notifyListeners();
 };
