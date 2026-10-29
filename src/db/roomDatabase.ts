@@ -1363,7 +1363,7 @@ if (typeof window !== 'undefined') {
 }
 
 // ==================== AUDIT LOG DAO ====================
-export const getAllAuditLogs = (): AuditLogEntry[] => {
+export const getRawStoredAuditLogs = (): AuditLogEntry[] => {
   const logs = getStored<AuditLogEntry[]>(STORAGE_KEYS.AUDIT_LOGS, INITIAL_AUDIT_LOGS);
   if (!Array.isArray(logs)) return [];
   const seenIds = new Set<string>();
@@ -1386,18 +1386,23 @@ export const getAllAuditLogs = (): AuditLogEntry[] => {
   return sanitized;
 };
 
-export const getAuditLogs = (): AuditLogEntry[] => {
+export const getAllAuditLogs = (branchId?: string): AuditLogEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
-  const all = getAllAuditLogs();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+  const raw = getRawStoredAuditLogs();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
   }
-  return all.filter((a) => {
+  const branches = getBranches();
+  return raw.filter((a) => {
     const cId = a.company_id || a.companyId;
-    if (!cId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return cId === currentCompany;
+    const brId = a.branch_id || a.branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, cId);
   });
+};
+
+export const getAuditLogs = (): AuditLogEntry[] => {
+  return getAllAuditLogs();
 };
 
 export const addAuditLog = (
@@ -1412,7 +1417,7 @@ export const addAuditLog = (
     branchId?: string;
   }
 ): AuditLogEntry => {
-  const all = getAllAuditLogs();
+  const all = getRawStoredAuditLogs();
   const now = new Date();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -1528,7 +1533,7 @@ export const logManagerOverride = (params: {
 };
 
 // ==================== SALESPERSON DAO ====================
-export const getAllSalespeople = (): Salesperson[] => {
+export const getRawStoredSalespeople = (): Salesperson[] => {
   const raw = getStored<Salesperson[]>(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE);
   const seenIds = new Set<string>();
   const deduped: Salesperson[] = [];
@@ -1543,10 +1548,25 @@ export const getAllSalespeople = (): Salesperson[] => {
   return deduped;
 };
 
+export const getAllSalespeople = (branchId?: string): Salesperson[] => {
+  const raw = getRawStoredSalespeople();
+  if (branchId) {
+    const currentCompany = getCurrentCompanyId();
+    return raw.filter((s) => {
+      const sComp = s.companyId || s.company_id;
+      const compMatches = !sComp ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (sComp === currentCompany);
+      if (!compMatches) return false;
+      const sBranch = s.branchId || s.branch_id;
+      return isRecordInBranchScope(sBranch, branchId, undefined, currentCompany, sComp);
+    });
+  }
+  return raw;
+};
+
 export const getSalespeople = (): Salesperson[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const all = getAllSalespeople();
+  const all = getRawStoredSalespeople();
   const seenIds = new Set<string>();
   const result: Salesperson[] = [];
 
@@ -1558,23 +1578,23 @@ export const getSalespeople = (): Salesperson[] => {
     // Strict branch isolation with fallback for main branch aliases (1 and BR-MAIN) and unassigned/offline staff:
     const sBranch = s.branchId || s.branch_id;
     let branchMatches = false;
-    if (!sBranch || sBranch === 'ALL' || sBranch === currentBranch) {
+    if (sBranch === 'ALL' || sBranch === currentBranch) {
       branchMatches = true;
+    } else if (!sBranch) {
+      branchMatches = isRecordInBranchScope(sBranch, currentBranch, undefined, currentCompany, sComp) || s.role === 'OWNER' || s.role === 'SUPER_ADMIN';
     } else {
-      const isMainBranchMatch =
-        (currentBranch === '1' || currentBranch === 'BR-MAIN' || !currentBranch) &&
-        (sBranch === '1' || sBranch === 'BR-MAIN');
+      const isMainBranchMatch = isRecordInBranchScope(sBranch, currentBranch, undefined, currentCompany, sComp);
       if (isMainBranchMatch) {
         branchMatches = true;
       } else if (
         s.branchAssignments &&
         Array.isArray(s.branchAssignments) &&
         s.branchAssignments.some(
-          (b) => b.branchId === currentBranch || (isMainBranchMatch && (b.branchId === '1' || b.branchId === 'BR-MAIN'))
+          (b) => b.branchId === currentBranch || isRecordInBranchScope(b.branchId, currentBranch, undefined, currentCompany, sComp)
         )
       ) {
         branchMatches = true;
-      } else if (s.role === 'OWNER' || s.role === 'SUPER_ADMIN' || s.role === 'MANAGER') {
+      } else if (s.role === 'OWNER' || s.role === 'SUPER_ADMIN') {
         branchMatches = true;
       }
     }
@@ -1593,7 +1613,7 @@ export const getSalespeople = (): Salesperson[] => {
 
 export const getSalespeopleForCompany = (companyId?: string): Salesperson[] => {
   const targetCompany = companyId || getCurrentCompanyId();
-  const all = getAllSalespeople();
+  const all = getRawStoredSalespeople();
   return all.filter((s) => {
     const sComp = s.companyId || s.company_id;
     if (!sComp) {
@@ -1604,7 +1624,7 @@ export const getSalespeopleForCompany = (companyId?: string): Salesperson[] => {
 };
 
 export const getNextSalespersonId = (): string => {
-  const list = getAllSalespeople();
+  const list = getRawStoredSalespeople();
   const numericIds = list
     .map((s) => parseInt(s.id, 10))
     .filter((n) => !isNaN(n));
@@ -1614,7 +1634,7 @@ export const getNextSalespersonId = (): string => {
 };
 
 export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }): Salesperson => {
-  const all = getAllSalespeople();
+  const all = getRawStoredSalespeople();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const newId = person.id || getNextSalespersonId();
@@ -1676,7 +1696,7 @@ export const getOwnerDefaultPermissions = () => ({
 });
 
 export const saveSalesperson = (person: Salesperson): Salesperson => {
-  const all = getAllSalespeople();
+  const all = getRawStoredSalespeople();
   const compId = person.companyId || person.company_id || getCurrentCompanyId();
   const normalizedEmail = (person.email || '').trim().toLowerCase();
   
@@ -1724,7 +1744,7 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
 };
 
 export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Salesperson | null => {
-  const all = getAllSalespeople();
+  const all = getRawStoredSalespeople();
   const index = all.findIndex((s) => s.id === id);
   if (index === -1) return null;
   const updatedPerson = { ...all[index], ...updates };
@@ -1779,7 +1799,7 @@ export const verifySalespersonPin = (expectedPin: string | undefined | null, inp
 };
 
 export const toggleSalespersonActive = (id: string): Salesperson | null => {
-  const all = getAllSalespeople();
+  const all = getRawStoredSalespeople();
   const index = all.findIndex((s) => s.id === id);
   if (index === -1) return null;
   const newStatus = all[index].active === 'Y' ? 'N' : 'Y';
@@ -1821,27 +1841,28 @@ export const isStaffAssignedToBranch = (staff: Salesperson, branchId: string): b
   if (staff.role === 'OWNER' || staff.role === 'SUPER_ADMIN') {
     return true; // Owner has an account across the company, but must select which branch to log in to
   }
+  const isTargetMain = branchId === '1' || branchId === 'BR-MAIN';
   if (staff.branchAssignments && Array.isArray(staff.branchAssignments) && staff.branchAssignments.length > 0) {
-    const isMainBranch = branchId === '1' || branchId === 'BR-MAIN';
-    return staff.branchAssignments.some((b) => b.branchId === branchId || (isMainBranch && (b.branchId === '1' || b.branchId === 'BR-MAIN')));
+    return staff.branchAssignments.some((b) => b.branchId === branchId || (isTargetMain && (b.branchId === '1' || b.branchId === 'BR-MAIN')));
   }
   const assigned = staff.branchId || staff.branch_id;
-  const isMain = branchId === '1' || branchId === 'BR-MAIN';
-  return (
-    !assigned ||
-    assigned === branchId ||
-    assigned === 'ALL' ||
-    assigned === '1' ||
-    assigned === 'BR-MAIN' ||
-    (isMain && (assigned === '1' || assigned === 'BR-MAIN'))
-  );
+  if (!assigned) {
+    return isTargetMain;
+  }
+  if (assigned === 'ALL' || assigned === branchId) {
+    return true;
+  }
+  if (isTargetMain && (assigned === '1' || assigned === 'BR-MAIN')) {
+    return true;
+  }
+  return false;
 };
 
 export const updateStaffBranchAssignments = (
   staffId: string,
   assignments: StaffBranchAssignment[]
 ): Salesperson | null => {
-  const staff = getAllSalespeople().find((s) => s.id === staffId);
+  const staff = getRawStoredSalespeople().find((s) => s.id === staffId);
   if (!staff) return null;
   const primaryBranch = assignments[0]?.branchId || staff.branchId || '1';
   const primaryRole = assignments[0]?.role || staff.role;
@@ -1854,7 +1875,7 @@ export const updateStaffBranchAssignments = (
 };
 
 // ==================== CUSTOMER DAO ====================
-export const getAllCustomers = (): Customer[] => {
+export const getRawStoredCustomers = (): Customer[] => {
   const stored = getStored<Customer[]>(STORAGE_KEYS.CUSTOMERS, INITIAL_CUSTOMERS);
   // Ensure any initial customers not in stored get included (e.g. Givemore Gondo)
   const existingIds = new Set(stored.map((c) => c.customerId));
@@ -1867,11 +1888,32 @@ export const getAllCustomers = (): Customer[] => {
   return stored;
 };
 
+export const getAllCustomers = (branchId?: string): Customer[] => {
+  const targetBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
+  const raw = getRawStoredCustomers();
+  const settings = getCompanyBranchSettings();
+
+  if (settings.shareCustomersAcrossBranches && !branchId) {
+    return raw.filter((c) => {
+      const compId = c.company_id || c.companyId;
+      if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
+      return compId === currentCompany;
+    });
+  }
+
+  return raw.filter((c) => {
+    const brId = c.branch_id || c.branchId;
+    const compId = c.company_id || c.companyId;
+    return isRecordInBranchScope(brId, targetBranch, undefined, currentCompany, compId);
+  });
+};
+
 export const getCustomers = (): Customer[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
-  const all = getAllCustomers();
+  const all = getRawStoredCustomers();
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
     return all;
   }
@@ -1886,16 +1928,16 @@ export const getCustomers = (): Customer[] => {
     return companyFiltered;
   }
 
-  // Branch-specific directory
+  // Branch-specific directory strictly filtered
   return companyFiltered.filter((c) => {
     const brId = c.branch_id || c.branchId;
-    if (!brId) return true; // Legacy unassigned visible
-    return brId === currentBranch;
+    const compId = c.company_id || c.companyId;
+    return isRecordInBranchScope(brId, currentBranch, undefined, currentCompany, compId);
   });
 };
 
 export const getNextCustomerId = (): string => {
-  const list = getAllCustomers();
+  const list = getRawStoredCustomers();
   const numericParts = list
     .map((c) => {
       const match = c.customerId.match(/^C?(\d+)$/i);
@@ -1908,7 +1950,7 @@ export const getNextCustomerId = (): string => {
 };
 
 export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'createdDate'> & { customerId?: string; createdDate?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string }): Customer => {
-  const all = getAllCustomers();
+  const all = getRawStoredCustomers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const nextId = customerData.customerId || getNextCustomerId();
@@ -2000,7 +2042,7 @@ export const ensureCustomerExists = (
 };
 
 // ==================== SUPPLIER DAO ====================
-export const getAllSuppliers = (): Supplier[] => {
+export const getRawStoredSuppliers = (): Supplier[] => {
   const stored = getStored<Supplier[]>(STORAGE_KEYS.SUPPLIERS, INITIAL_SUPPLIERS);
   if (!Array.isArray(stored)) return INITIAL_SUPPLIERS;
 
@@ -2044,11 +2086,32 @@ export const getAllSuppliers = (): Supplier[] => {
   return deduplicated;
 };
 
+export const getAllSuppliers = (branchId?: string): Supplier[] => {
+  const targetBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
+  const raw = getRawStoredSuppliers();
+  const settings = getCompanyBranchSettings();
+
+  if (settings.shareSuppliersAcrossBranches && !branchId) {
+    return raw.filter((s) => {
+      const compId = s.company_id || s.companyId;
+      if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
+      return compId === currentCompany;
+    });
+  }
+
+  return raw.filter((s) => {
+    const brId = s.branch_id || (s as any).branchId;
+    const compId = s.company_id || s.companyId;
+    return isRecordInBranchScope(brId, targetBranch, undefined, currentCompany, compId);
+  });
+};
+
 export const getSuppliers = (): Supplier[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
-  const all = getAllSuppliers();
+  const all = getRawStoredSuppliers();
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
     return all;
   }
@@ -2063,11 +2126,11 @@ export const getSuppliers = (): Supplier[] => {
     return companyFiltered;
   }
 
-  // Branch-specific suppliers
+  // Branch-specific suppliers strictly isolated
   return companyFiltered.filter((s) => {
     const brId = s.branch_id || (s as any).branchId;
-    if (!brId) return true; // Legacy unassigned visible
-    return brId === currentBranch;
+    const compId = s.company_id || s.companyId;
+    return isRecordInBranchScope(brId, currentBranch, undefined, currentCompany, compId);
   });
 };
 
@@ -2080,7 +2143,7 @@ export const getSupplierById = (supplierId: string): Supplier | undefined => {
 };
 
 export const getNextSupplierId = (): string => {
-  const list = getAllSuppliers();
+  const list = getRawStoredSuppliers();
   const numericParts = list
     .map((s) => {
       const match = s.supplierId.match(/^SUP-?(\d+)$/i);
@@ -2103,7 +2166,7 @@ export const addSupplier = (
     branchId?: string;
   }
 ): Supplier => {
-  const all = getAllSuppliers();
+  const all = getRawStoredSuppliers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const nextId = supplierData.supplierId || getNextSupplierId();
@@ -2152,7 +2215,7 @@ export const updateSupplier = (
   supplierId: string,
   updates: Partial<Supplier>
 ): Supplier | null => {
-  const all = getAllSuppliers();
+  const all = getRawStoredSuppliers();
   const idx = all.findIndex((s) => s.supplierId === supplierId);
   if (idx === -1) return null;
   const updated = { ...all[idx], ...updates };
@@ -2163,7 +2226,7 @@ export const updateSupplier = (
 };
 
 export const deleteSupplier = (supplierId: string): boolean => {
-  const all = getAllSuppliers();
+  const all = getRawStoredSuppliers();
   const filtered = all.filter((s) => s.supplierId !== supplierId);
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.SUPPLIERS, filtered);
@@ -2354,17 +2417,19 @@ export const getBranchById = (branchId: string): Branch | undefined => {
 export const isRecordInBranchScope = (
   recordBranchId: string | undefined | null,
   targetBranchId: string,
-  branchesList: Branch[],
-  targetCompanyId?: string
+  branchesList?: Branch[],
+  targetCompanyId?: string,
+  recordCompanyId?: string
 ): boolean => {
   if (!targetBranchId || targetBranchId === 'ALL') return true;
 
-  // Single-branch tenant protection: if company only has 1 branch, all records of this company belong to this branch
-  if (targetCompanyId) {
-    const compBranches = branchesList.filter(
-      (b) => (b.company_id || b.companyId) === targetCompanyId
-    );
-    if (compBranches.length <= 1) return true;
+  // Strict company isolation: if both companies are present and neither is COMP-MASTER, they must match
+  if (recordCompanyId && targetCompanyId) {
+    const cleanRecComp = recordCompanyId.trim().toUpperCase();
+    const cleanTgtComp = targetCompanyId.trim().toUpperCase();
+    if (cleanRecComp !== 'COMP-MASTER' && cleanTgtComp !== 'COMP-MASTER' && cleanRecComp !== cleanTgtComp) {
+      return false;
+    }
   }
 
   const cleanTarget = (targetBranchId || '').toLowerCase().trim();
@@ -2375,12 +2440,13 @@ export const isRecordInBranchScope = (
 
   // Expand active branch aliases
   const targetAliases = new Set<string>([cleanTarget]);
-  const matched = branchesList.find(
+  const branches = branchesList && branchesList.length > 0 ? branchesList : getBranches();
+  const matched = branches.find(
     (b) =>
-      b.branchId?.toLowerCase() === cleanTarget ||
-      b.id?.toLowerCase() === cleanTarget ||
-      b.code?.toLowerCase() === cleanTarget ||
-      (b as any).branch_id?.toLowerCase() === cleanTarget
+      b.branchId?.toLowerCase().trim() === cleanTarget ||
+      b.id?.toLowerCase().trim() === cleanTarget ||
+      b.code?.toLowerCase().trim() === cleanTarget ||
+      (b as any).branch_id?.toLowerCase().trim() === cleanTarget
   );
   if (matched) {
     if (matched.branchId) targetAliases.add(matched.branchId.toLowerCase().trim());
@@ -2389,7 +2455,7 @@ export const isRecordInBranchScope = (
     if ((matched as any).branch_id) targetAliases.add((matched as any).branch_id.toLowerCase().trim());
   }
 
-  // Main / HQ canonical aliases
+  // Main / HQ canonical aliases (ONLY apply if the target itself is a canonical main branch)
   const isTargetMain =
     cleanTarget === 'br-main' ||
     cleanTarget === 'hq-01' ||
@@ -3101,22 +3167,27 @@ export const deletePackagingVariant = (itemId: string, variantId: string): boole
 };
 
 // ==================== PARKED SALES DAO ====================
-export const getAllParkedSales = (): ParkedSale[] => {
+export const getRawStoredParkedSales = (): ParkedSale[] => {
   return getStored<ParkedSale[]>(STORAGE_KEYS.PARKED_SALES, []);
 };
 
-export const getParkedSales = (): ParkedSale[] => {
+export const getAllParkedSales = (branchId?: string): ParkedSale[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
-  const all = getAllParkedSales();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+  const raw = getRawStoredParkedSales();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
   }
-  return all.filter((p) => {
+  const branches = getBranches();
+  return raw.filter((p) => {
     const compId = p.company_id || p.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const brId = p.branch_id || p.branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getParkedSales = (): ParkedSale[] => {
+  return getAllParkedSales();
 };
 
 export const saveParkedSale = (data: {
@@ -3132,7 +3203,7 @@ export const saveParkedSale = (data: {
   branch_id?: string;
   branchId?: string;
 }): ParkedSale => {
-  const list = getAllParkedSales();
+  const list = getRawStoredParkedSales();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = data.company_id || data.companyId || currentCompany;
@@ -3175,7 +3246,7 @@ export const clearParkedSales = (): void => {
 };
 
 // ==================== CASH LOG DAO (FORM 2 & FORM 1) ====================
-export const getAllCashLogs = (): CashLogEntry[] => {
+export const getRawStoredCashLogs = (): CashLogEntry[] => {
   const logs = getStored<CashLogEntry[]>(STORAGE_KEYS.CASH_LOGS, INITIAL_CASH_LOGS);
   if (!Array.isArray(logs)) return [];
 
@@ -3209,29 +3280,27 @@ export const getAllCashLogs = (): CashLogEntry[] => {
   return sanitized;
 };
 
-export const getCashLogs = (): CashLogEntry[] => {
+export const getAllCashLogs = (branchId?: string): CashLogEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllCashLogs();
+  const raw = getRawStoredCashLogs();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
   const branches = getBranches();
-
-  return all.filter((l) => {
+  return raw.filter((l) => {
     const compId = (l.company_id || l.companyId || '').trim();
-    const matchesComp =
-      !compId ||
-      currentCompany === 'COMP-MASTER' ||
-      compId === 'COMP-MASTER' ||
-      compId === currentCompany ||
-      (!currentCompany && (compId === 'COMP-001' || compId === 'COMP-MASTER'));
-    if (!matchesComp) return false;
-
     const brId = (l as any).branch_id || (l as any).branchId || (l as any).branchCode;
-    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
 };
 
+export const getCashLogs = (): CashLogEntry[] => {
+  return getAllCashLogs();
+};
+
 export const getNextCashLogId = (): string => {
-  const list = getAllCashLogs();
+  const list = getRawStoredCashLogs();
   const numbers = list
     .map((c) => {
       const match = c.id?.match?.(/^CL-(\d+)$/i);
@@ -3244,7 +3313,7 @@ export const getNextCashLogId = (): string => {
 };
 
 export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string; skipSync?: boolean; fromMesh?: boolean }): CashLogEntry => {
-  const all = getAllCashLogs();
+  const all = getRawStoredCashLogs();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
@@ -3275,7 +3344,7 @@ export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: s
     branch_id: brId,
     branchId: brId,
   };
-  const updated = [newEntry, ...all];
+  const updated = [newEntry, ...all.filter((c) => c.id !== newEntry.id)];
   setStored(STORAGE_KEYS.CASH_LOGS, updated);
 
   // Only enqueue write to cloud if this action originated locally (not from mesh peer sync)
@@ -3299,7 +3368,7 @@ export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: s
 };
 
 export const deleteCashLog = (id: string): boolean => {
-  const all = getAllCashLogs();
+  const all = getRawStoredCashLogs();
   const filtered = all.filter((item) => item.id !== id);
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.CASH_LOGS, filtered);
@@ -3647,21 +3716,27 @@ export const saveDailyCashLogSheet = (
 };
 
 // ==================== CASH LIFT / CASH PICK-UP DAO ====================
-export const getAllCashLifts = (): CashLiftRecord[] => {
+export const getRawStoredCashLifts = (): CashLiftRecord[] => {
   return getStored<CashLiftRecord[]>(STORAGE_KEYS.CASH_LIFTS, []);
 };
 
-export const getCashLifts = (): CashLiftRecord[] => {
+export const getAllCashLifts = (branchId?: string): CashLiftRecord[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllCashLifts();
-  return all.filter((c) => {
+  const raw = getRawStoredCashLifts();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
+  const branches = getBranches();
+  return raw.filter((c) => {
     const compId = (c as any).company_id || (c as any).companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
-    if (!matchesComp) return false;
-    const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = (c as any).branch_id || (c as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getCashLifts = (): CashLiftRecord[] => {
+  return getAllCashLifts();
 };
 
 export const getCashLiftsForStaffAndDate = (staffId: string, date: string): CashLiftRecord[] => {
@@ -3924,23 +3999,27 @@ export const deleteCashLift = (liftId: string): boolean => {
 };
 
 // ==================== CASH COUNT DAO (FORM 1) ====================
-export const getAllCashCounts = (): CashCountRecord[] => {
+export const getRawStoredCashCounts = (): CashCountRecord[] => {
   return getStored<CashCountRecord[]>(STORAGE_KEYS.CASH_COUNTS, []);
 };
 
-export const getCashCounts = (): CashCountRecord[] => {
+export const getAllCashCounts = (branchId?: string): CashCountRecord[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllCashCounts();
+  const raw = getRawStoredCashCounts();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
   const branches = getBranches();
-  return all.filter((c) => {
+  return raw.filter((c) => {
     const compId = (c as any).company_id || (c as any).companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
-    if (!matchesComp) return false;
-
     const brId = (c as any).branch_id || (c as any).branchId;
-    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getCashCounts = (): CashCountRecord[] => {
+  return getAllCashCounts();
 };
 
 export const saveFinalCashCount = (data: {
@@ -3955,7 +4034,7 @@ export const saveFinalCashCount = (data: {
 }): { countRecord: CashCountRecord; cashLogRecord: CashLogEntry | null } => {
   const now = new Date();
   const dateStr = data.date || getTodayDateString();
-  const currentCounts = getAllCashCounts();
+  const currentCounts = getRawStoredCashCounts();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = data.branchId || data.branch_id || getCurrentBranchId();
 
@@ -4067,23 +4146,27 @@ export const saveFinalCashCount = (data: {
   return { countRecord, cashLogRecord: null };
 };
 // ==================== CUSTOMER CHANGE DAO (FORM 3) ====================
-export const getAllCustomerChanges = (): CustomerChangeEntry[] => {
+export const getRawStoredCustomerChanges = (): CustomerChangeEntry[] => {
   return getStored<CustomerChangeEntry[]>(STORAGE_KEYS.CUSTOMER_CHANGES, INITIAL_CUSTOMER_CHANGES);
 };
 
-export const getCustomerChanges = (): CustomerChangeEntry[] => {
+export const getAllCustomerChanges = (branchId?: string): CustomerChangeEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllCustomerChanges();
+  const raw = getRawStoredCustomerChanges();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
   const branches = getBranches();
-  return all.filter((c) => {
+  return raw.filter((c) => {
     const compId = c.company_id || c.companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
-    if (!matchesComp) return false;
-
     const brId = (c as any).branch_id || (c as any).branchId;
-    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getCustomerChanges = (): CustomerChangeEntry[] => {
+  return getAllCustomerChanges();
 };
 
 export const getNextCustomerChangeId = (): string => {
@@ -4363,23 +4446,27 @@ export const saveDailyCustomerChangeSheet = (
 };
 
 // ==================== CREDIT SALES DAO (FORM 3) ====================
-export const getAllCreditSales = (): CreditSaleEntry[] => {
+export const getRawStoredCreditSales = (): CreditSaleEntry[] => {
   return getStored<CreditSaleEntry[]>(STORAGE_KEYS.CREDIT_SALES, INITIAL_CREDIT_SALES);
 };
 
-export const getCreditSales = (): CreditSaleEntry[] => {
+export const getAllCreditSales = (branchId?: string): CreditSaleEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllCreditSales();
+  const raw = getRawStoredCreditSales();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
   const branches = getBranches();
-  return all.filter((c) => {
+  return raw.filter((c) => {
     const compId = c.company_id || c.companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
-    if (!matchesComp) return false;
-
     const brId = (c as any).branch_id || (c as any).branchId;
-    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getCreditSales = (): CreditSaleEntry[] => {
+  return getAllCreditSales();
 };
 
 export const getNextCreditSaleId = (): string => {
@@ -4766,7 +4853,7 @@ export const updateCustomerCreditTerms = (
   },
   authorizedBy: { id: string; name: string; role: string }
 ): Customer | null => {
-  const all = getAllCustomers();
+  const all = getRawStoredCustomers();
   const idx = all.findIndex((c) => c.customerId === customerId);
   if (idx === -1) return null;
 
@@ -5038,34 +5125,32 @@ export const saveDailyCreditSalesSheet = (
 };
 
 // ==================== SALES / INVOICE DAO (FORM 3) ====================
-export const getAllSales = (): SaleInvoice[] => {
+export const getRawStoredSales = (): SaleInvoice[] => {
   return getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
 };
 
-export const getSales = (): SaleInvoice[] => {
+export const getAllSales = (branchId?: string): SaleInvoice[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllSales();
+  const raw = getRawStoredSales();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
   const branches = getBranches();
-
-  return all.filter((s) => {
-    const compId = (s.company_id || s.companyId || '').trim();
-    const matchesComp =
-      !compId ||
-      currentCompany === 'COMP-MASTER' ||
-      compId === 'COMP-MASTER' ||
-      compId === currentCompany ||
-      (!currentCompany && (compId === 'COMP-001' || compId === 'COMP-MASTER'));
-    if (!matchesComp) return false;
-
+  return raw.filter((s) => {
     const brId = s.branch_id || s.branchId || (s as any).branchCode;
-    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
+    const compId = (s.company_id || s.companyId || '').trim();
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getSales = (): SaleInvoice[] => {
+  return getAllSales();
 };
 
 export const getAllBranchesSales = (): SaleInvoice[] => {
   const currentCompany = getCurrentCompanyId();
-  const all = getAllSales();
+  const all = getRawStoredSales();
   return all.filter((s) => {
     const compId = s.company_id || s.companyId;
     if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
@@ -5247,7 +5332,7 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   // Register in memory immediately to prevent race conditions during burst processing
   inMemorySeenSaleIds.add(sale.id);
 
-  const list = getAllSales();
+  const list = getRawStoredSales();
   const existing = list.find((s) => s.id === sale.id);
   if (existing) {
     return false;
@@ -5260,7 +5345,7 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     branch_id: sale.branch_id || sale.branchId || currentBranch,
     branchId: sale.branch_id || sale.branchId || currentBranch,
   };
-  const updated = [normalized, ...list];
+  const updated = [normalized, ...list.filter((s) => s.id !== sale.id)];
   setStored(STORAGE_KEYS.SALES, updated);
 
   // Decrement product stock in inventory
@@ -5373,7 +5458,7 @@ export const addSale = (
     branchName?: string;
   }
 ): SaleInvoice => {
-  const all = getAllSales();
+  const all = getRawStoredSales();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = saleData.company_id || saleData.companyId || currentCompany;
@@ -5410,7 +5495,7 @@ export const addSale = (
     branchId: brId,
     branchName: saleData.branchName || matchedBranch?.name || 'Main Branch',
   };
-  const updated = [created, ...all];
+  const updated = [created, ...all.filter((s) => s.id !== invId)];
   setStored(STORAGE_KEYS.SALES, updated);
   registerSeenSaleId(invId);
 
@@ -5883,7 +5968,7 @@ export const refundSaleInvoice = (params: {
   cashier?: Salesperson;
   reason: string;
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
-  const allSales = getAllSales();
+  const allSales = getRawStoredSales();
   const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
     return { success: false, message: `Invoice #${params.invoiceId} not found.` };
@@ -5983,7 +6068,7 @@ export const voidSaleInvoice = (params: {
   cashier?: Salesperson;
   reason: string;
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
-  const allSales = getAllSales();
+  const allSales = getRawStoredSales();
   const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
     return { success: false, message: `Invoice #${params.invoiceId} not found.` };
@@ -6098,7 +6183,7 @@ export const exchangeSaleItems = (params: {
   changeGiven?: number;
   notes?: string;
 }): { success: boolean; message: string; exchangeRecord?: ItemExchangeRecord; invoice?: SaleInvoice } => {
-  const allSales = getAllSales();
+  const allSales = getRawStoredSales();
   const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
     return { success: false, message: 'Receipt #' + params.invoiceId + ' not found.' };
@@ -6289,7 +6374,7 @@ export const editSaleInvoice = (params: {
     notes?: string;
   };
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
-  const allSales = getAllSales();
+  const allSales = getRawStoredSales();
   const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
     return { success: false, message: `Receipt #${params.invoiceId} not found.` };
@@ -6422,21 +6507,27 @@ export const editSaleInvoice = (params: {
 };
 
 // ==================== EXPENSE DAO ====================
-export const getAllExpenses = (): ExpenseEntry[] => {
+export const getRawStoredExpenses = (): ExpenseEntry[] => {
   return getStored<ExpenseEntry[]>(STORAGE_KEYS.EXPENSES, INITIAL_EXPENSES);
 };
 
-export const getExpenses = (): ExpenseEntry[] => {
+export const getAllExpenses = (branchId?: string): ExpenseEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllExpenses();
-  return all.filter((e) => {
+  const raw = getRawStoredExpenses();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
+  const branches = getBranches();
+  return raw.filter((e) => {
     const compId = e.company_id || e.companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
-    if (!matchesComp) return false;
-    const brId = (e as any).branch_id || (e as any).branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = (e as any).branch_id || (e as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getExpenses = (): ExpenseEntry[] => {
+  return getAllExpenses();
 };
 
 export const getNextExpenseId = (): string => {
@@ -6698,26 +6789,31 @@ export const approveAllExpensesForStaffAndDate = (staffId: string, date: string,
 };
 
 // ==================== RECONCILIATIONS DAO (FORM 4) ====================
-export const getAllReconciliations = (): ShiftReconciliation[] => {
+export const getRawStoredReconciliations = (): ShiftReconciliation[] => {
   return getStored<ShiftReconciliation[]>(STORAGE_KEYS.RECONCILIATIONS, []);
 };
 
-export const getReconciliations = (): ShiftReconciliation[] => {
+export const getAllReconciliations = (branchId?: string): ShiftReconciliation[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllReconciliations();
+  const raw = getRawStoredReconciliations();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
   const branches = getBranches();
-  return all.filter((r) => {
+  return raw.filter((r) => {
     const compId = (r as any).company_id || (r as any).companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
-    if (!matchesComp) return false;
     const brId = (r as any).branch_id || (r as any).branchId;
-    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany);
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
 };
 
+export const getReconciliations = (): ShiftReconciliation[] => {
+  return getAllReconciliations();
+};
+
 export const saveReconciliation = (recData: Omit<ShiftReconciliation, 'id' | 'synced' | 'timestamp'> & { id?: string }): ShiftReconciliation => {
-  const list = getAllReconciliations();
+  const list = getRawStoredReconciliations();
   const compId = (recData as any).company_id || (recData as any).companyId || getCurrentCompanyId();
   const brId = (recData as any).branch_id || (recData as any).branchId || getCurrentBranchId();
   const created: ShiftReconciliation = {
@@ -6757,21 +6853,27 @@ export const saveReconciliation = (recData: Omit<ShiftReconciliation, 'id' | 'sy
 };
 
 // ==================== ADMIN SALES & RECONCILIATION BALANCING DAO (FORM 4) ====================
-export const getAllAdminSales = (): AdminSalesEntry[] => {
+export const getRawStoredAdminSales = (): AdminSalesEntry[] => {
   return getStored<AdminSalesEntry[]>(STORAGE_KEYS.ADMIN_SALES, []);
 };
 
-export const getAdminSales = (): AdminSalesEntry[] => {
+export const getAllAdminSales = (branchId?: string): AdminSalesEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllAdminSales();
-  return all.filter((s) => {
+  const raw = getRawStoredAdminSales();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
+  const branches = getBranches();
+  return raw.filter((s) => {
     const compId = (s as any).company_id || (s as any).companyId;
-    const matchesComp = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
-    if (!matchesComp) return false;
-    const brId = (s as any).branch_id || (s as any).branchId || 'BR-MAIN';
-    return brId === currentBranch;
+    const brId = (s as any).branch_id || (s as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getAdminSales = (): AdminSalesEntry[] => {
+  return getAllAdminSales();
 };
 
 export const getAdminSalesForDate = (date: string): AdminSalesEntry[] => {
@@ -8648,7 +8750,7 @@ export const recordManualCustomerCredit = (params: {
 // Rules A, B, C, D Implementation
 // ============================================================================
 
-export const getAllInventoryItems = (): InventoryItem[] => {
+export const getRawStoredInventoryItems = (): InventoryItem[] => {
   const raw = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
   const map = new Map<string, InventoryItem>();
   for (const item of raw) {
@@ -8663,11 +8765,33 @@ export const getAllInventoryItems = (): InventoryItem[] => {
   return Array.from(map.values());
 };
 
+export const getAllInventoryItems = (branchId?: string): InventoryItem[] => {
+  const currentBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
+  const raw = getRawStoredInventoryItems();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
+  const branches = getBranches();
+  return raw.filter((item) => {
+    const compId = item.company_id || (item as any).companyId;
+    if (compId && currentCompany && currentCompany !== 'COMP-MASTER' && compId !== currentCompany && compId !== 'COMP-MASTER') {
+      return false;
+    }
+    if (item.assignedBranchIds && item.assignedBranchIds.length > 0) {
+      return item.assignedBranchIds.some((b) => isRecordInBranchScope(b, currentBranch, branches, currentCompany, compId));
+    }
+    const brId = item.branch_id || (item as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
+  });
+};
+
 export const getInventoryItems = (): InventoryItem[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
-  const all = getAllInventoryItems();
+  const all = getAllInventoryItems(currentBranch);
+  const branches = getBranches();
   let list: InventoryItem[];
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
     list = all;
@@ -8679,13 +8803,13 @@ export const getInventoryItems = (): InventoryItem[] => {
 
       // 1. Branch catalog assignment (e.g. Grocery store vs Hardware store)
       if (item.assignedBranchIds && item.assignedBranchIds.length > 0) {
-        if (!item.assignedBranchIds.includes(currentBranch)) {
+        if (!item.assignedBranchIds.some((b) => isRecordInBranchScope(b, currentBranch, branches, currentCompany, compId))) {
           return false;
         }
       } else {
-        // 2. Branch isolation: items specifically created for this branch, or company-wide unassigned
+        // 2. Strict branch isolation
         const brId = item.branch_id || (item as any).branchId;
-        if (brId && brId !== currentBranch && brId !== 'ALL' && brId !== 'BR-MAIN') {
+        if (!isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) {
           return false;
         }
       }
@@ -8730,8 +8854,8 @@ export const getInventoryItems = (): InventoryItem[] => {
 };
 
 export const getInventoryItemById = (itemId: string, branchId?: string): InventoryItem | null => {
-  const items = getAllInventoryItems();
   const targetBranch = branchId || getCurrentBranchId();
+  const items = getAllInventoryItems(targetBranch);
   const currentCompany = getCurrentCompanyId();
   const clean = (itemId || '').trim().toUpperCase();
   if (!clean) return null;
@@ -8740,17 +8864,19 @@ export const getInventoryItemById = (itemId: string, branchId?: string): Invento
   const exact = items.find((i) => {
     const matchesId = (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean);
     if (!matchesId) return false;
-    const itemBr = (i.branch_id || (i as any).branchId || '').trim().toUpperCase();
-    const itemComp = (i.company_id || (i as any).companyId || '').trim().toUpperCase();
-    return (
-      (!itemComp || itemComp === currentCompany.toUpperCase()) &&
-      (!itemBr || itemBr === targetBranch.toUpperCase())
-    );
+    const itemBr = (i.branch_id || (i as any).branchId || '').trim();
+    const itemComp = (i.company_id || (i as any).companyId || '').trim();
+    return isRecordInBranchScope(itemBr, targetBranch, undefined, currentCompany, itemComp);
   });
   if (exact) return exact;
 
-  // Fallback to any matching item in company
-  const directFallback = items.find((i) => (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean));
+  // Fallback to any matching item in active branch scope
+  const directFallback = items.find((i) => {
+    const matchesId = (i.itemId && i.itemId.toUpperCase() === clean) || (i.sku && i.sku.toUpperCase() === clean);
+    if (!matchesId) return false;
+    const itemBr = (i.branch_id || (i as any).branchId || '').trim();
+    return isRecordInBranchScope(itemBr, targetBranch, undefined, currentCompany, i.company_id || (i as any).companyId);
+  });
   if (directFallback) return directFallback;
 
   // 2. Base ID match (stripping -CASE, -UNIT, or __variantId)
@@ -8763,16 +8889,18 @@ export const getInventoryItemById = (itemId: string, branchId?: string): Invento
     const baseExact = items.find((i) => {
       const matchesId = (i.itemId && i.itemId.toUpperCase() === baseClean) || (i.sku && i.sku.toUpperCase() === baseClean);
       if (!matchesId) return false;
-      const itemBr = (i.branch_id || (i as any).branchId || '').trim().toUpperCase();
-      const itemComp = (i.company_id || (i as any).companyId || '').trim().toUpperCase();
-      return (
-        (!itemComp || itemComp === currentCompany.toUpperCase()) &&
-        (!itemBr || itemBr === targetBranch.toUpperCase())
-      );
+      const itemBr = (i.branch_id || (i as any).branchId || '').trim();
+      const itemComp = (i.company_id || (i as any).companyId || '').trim();
+      return isRecordInBranchScope(itemBr, targetBranch, undefined, currentCompany, itemComp);
     });
     if (baseExact) return baseExact;
 
-    const baseFallback = items.find((i) => (i.itemId && i.itemId.toUpperCase() === baseClean) || (i.sku && i.sku.toUpperCase() === baseClean));
+    const baseFallback = items.find((i) => {
+      const matchesId = (i.itemId && i.itemId.toUpperCase() === baseClean) || (i.sku && i.sku.toUpperCase() === baseClean);
+      if (!matchesId) return false;
+      const itemBr = (i.branch_id || (i as any).branchId || '').trim();
+      return isRecordInBranchScope(itemBr, targetBranch, undefined, currentCompany, i.company_id || (i as any).companyId);
+    });
     if (baseFallback) return baseFallback;
   }
 
@@ -8786,7 +8914,7 @@ export const getInventoryItemById = (itemId: string, branchId?: string): Invento
 };
 
 export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: boolean }): InventoryItem => {
-  const allItems = getAllInventoryItems();
+  const allItems = getRawStoredInventoryItems();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
 
@@ -10001,8 +10129,23 @@ export const addQuickProduct = (params: {
 // CORE RULE 1: BATCH TRACKING & CORE RULE 2: FIFO DEDUCTION WITH NEGATIVE BALANCES
 // ============================================================================
 
-export const getAllStockBatches = (): StockBatch[] => {
+export const getRawStoredStockBatches = (): StockBatch[] => {
   return getStored<StockBatch[]>(STORAGE_KEYS.STOCK_BATCHES, []);
+};
+
+export const getAllStockBatches = (branchId?: string): StockBatch[] => {
+  const currentBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
+  const raw = getRawStoredStockBatches();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
+  }
+  const branches = getBranches();
+  return raw.filter((b) => {
+    const compId = b.company_id || b.companyId;
+    const brId = b.branch_id || b.branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
+  });
 };
 
 export const getStockBatches = (): StockBatch[] => {
@@ -10059,14 +10202,16 @@ export const getStockBatches = (): StockBatch[] => {
   }
 
   const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
     return batches;
   }
+  const branches = getBranches();
   return batches.filter((b) => {
     const compId = b.company_id || b.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const brId = b.branch_id || b.branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
 };
 
@@ -10076,7 +10221,7 @@ export const getBatchesByItemId = (itemId: string): StockBatch[] => {
 };
 
 export const saveStockBatch = (batch: StockBatch): StockBatch => {
-  const batches = getAllStockBatches();
+  const batches = getRawStoredStockBatches();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = batch.company_id || batch.companyId || currentCompany;
@@ -10100,7 +10245,7 @@ export const saveStockBatch = (batch: StockBatch): StockBatch => {
 };
 
 export const deleteStockBatch = (batchId: string): boolean => {
-  const batches = getAllStockBatches();
+  const batches = getRawStoredStockBatches();
   const filtered = batches.filter((b) => b.id !== batchId);
   if (filtered.length !== batches.length) {
     setStored(STORAGE_KEYS.STOCK_BATCHES, filtered);
@@ -10109,26 +10254,31 @@ export const deleteStockBatch = (batchId: string): boolean => {
   return false;
 };
 
-export const getAllNegativeBalances = (): NegativeBalanceEntry[] => {
+export const getRawStoredNegativeBalances = (): NegativeBalanceEntry[] => {
   return getStored<NegativeBalanceEntry[]>(STORAGE_KEYS.NEGATIVE_BALANCES, []);
 };
 
-export const getNegativeBalances = (): NegativeBalanceEntry[] => {
+export const getAllNegativeBalances = (branchId?: string): NegativeBalanceEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
-  const all = getAllNegativeBalances();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+  const raw = getRawStoredNegativeBalances();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
   }
-  return all.filter((n) => {
+  const branches = getBranches();
+  return raw.filter((n) => {
     const compId = (n as any).company_id || (n as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const brId = (n as any).branch_id || (n as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
 };
 
+export const getNegativeBalances = (): NegativeBalanceEntry[] => {
+  return getAllNegativeBalances();
+};
+
 export const saveNegativeBalance = (entry: NegativeBalanceEntry): NegativeBalanceEntry => {
-  const list = getAllNegativeBalances();
+  const list = getRawStoredNegativeBalances();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const normalized: NegativeBalanceEntry = {
@@ -10665,23 +10815,28 @@ export const deleteInventoryItem = (itemId: string): boolean => {
   return false;
 };
 
-export const getAllSupplierInvoiceVouchers = (): SupplierInvoiceVoucher[] => {
+export const getRawStoredSupplierInvoiceVouchers = (): SupplierInvoiceVoucher[] => {
   const legacy = getStored<SupplierInvoiceVoucher[]>(STORAGE_KEYS.SUPPLIER_INVOICES, INITIAL_SUPPLIER_INVOICES);
   return getDualReadSupplierInvoices(legacy);
 };
 
-export const getSupplierInvoiceVouchers = (): SupplierInvoiceVoucher[] => {
+export const getAllSupplierInvoiceVouchers = (branchId?: string): SupplierInvoiceVoucher[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
-  const all = getAllSupplierInvoiceVouchers();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+  const raw = getRawStoredSupplierInvoiceVouchers();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
   }
-  return all.filter((v) => {
+  const branches = getBranches();
+  return raw.filter((v) => {
     const compId = v.company_id || v.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const brId = v.branchId || v.branch_id;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getSupplierInvoiceVouchers = (): SupplierInvoiceVoucher[] => {
+  return getAllSupplierInvoiceVouchers();
 };
 
 export const getSupplierInvoiceVoucherById = (voucherId: string): SupplierInvoiceVoucher | undefined => {
@@ -10693,7 +10848,7 @@ export const getSupplierInvoiceVoucherById = (voucherId: string): SupplierInvoic
 };
 
 export const saveSupplierInvoiceVoucher = (voucher: SupplierInvoiceVoucher): SupplierInvoiceVoucher => {
-  const all = getAllSupplierInvoiceVouchers();
+  const all = getRawStoredSupplierInvoiceVouchers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = voucher.company_id || voucher.companyId || currentCompany;
@@ -11479,26 +11634,31 @@ export const getDailyGoodsReceivedReport = (
   };
 };
 
-export const getAllGoodsReceived = (): GoodsReceivedEntry[] => {
+export const getRawStoredGoodsReceived = (): GoodsReceivedEntry[] => {
   return getStored<GoodsReceivedEntry[]>(STORAGE_KEYS.GOODS_RECEIVED, INITIAL_GOODS_RECEIVED);
 };
 
-export const getGoodsReceived = (): GoodsReceivedEntry[] => {
+export const getAllGoodsReceived = (branchId?: string): GoodsReceivedEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
-  const all = getAllGoodsReceived();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+  const raw = getRawStoredGoodsReceived();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
   }
-  return all.filter((g) => {
+  const branches = getBranches();
+  return raw.filter((g) => {
     const compId = g.company_id || g.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const brId = g.branchId || g.branch_id;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
 };
 
+export const getGoodsReceived = (): GoodsReceivedEntry[] => {
+  return getAllGoodsReceived();
+};
+
 export const addGoodsReceived = (entry: GoodsReceivedEntry): GoodsReceivedEntry => {
-  const all = getAllGoodsReceived();
+  const all = getRawStoredGoodsReceived();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
@@ -11534,7 +11694,7 @@ export const addGoodsReceived = (entry: GoodsReceivedEntry): GoodsReceivedEntry 
   return normalized;
 };
 
-export const getAllStockMovements = (): StockMovementEntry[] => {
+export const getRawStoredStockMovements = (): StockMovementEntry[] => {
   const rawList = getStored<StockMovementEntry[]>(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS);
   if (!Array.isArray(rawList)) return [];
   const seenMovementIds = new Set<string>();
@@ -11575,18 +11735,23 @@ export const getAllStockMovements = (): StockMovementEntry[] => {
   return sanitized;
 };
 
-export const getStockMovements = (): StockMovementEntry[] => {
+export const getAllStockMovements = (branchId?: string): StockMovementEntry[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
-  const all = getAllStockMovements();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+  const raw = getRawStoredStockMovements();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
   }
-  return all.filter((m) => {
+  const branches = getBranches();
+  return raw.filter((m) => {
     const compId = (m as any).company_id || (m as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const brId = (m as any).branch_id || (m as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getStockMovements = (): StockMovementEntry[] => {
+  return getAllStockMovements();
 };
 
 export const addStockMovement = (entry: StockMovementEntry): StockMovementEntry => {
@@ -12229,22 +12394,27 @@ export const breakCase = (
 // Multi-Segment, Blind Double-Count, Automatic Recount Generator, Consolidation & Approval
 // ============================================================================
 
-export const getAllStocktakeSessions = (): StocktakeSession[] => {
+export const getRawStoredStocktakeSessions = (): StocktakeSession[] => {
   return getStored<StocktakeSession[]>(STORAGE_KEYS.STOCKTAKE_SESSIONS, INITIAL_STOCKTAKE_SESSIONS);
 };
 
-export const getStocktakeSessions = (): StocktakeSession[] => {
+export const getAllStocktakeSessions = (branchId?: string): StocktakeSession[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
-  const all = getAllStocktakeSessions();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
+  const raw = getRawStoredStocktakeSessions();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return raw;
   }
-  return all.filter((s) => {
+  const branches = getBranches();
+  return raw.filter((s) => {
     const compId = (s as any).company_id || (s as any).companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const brId = (s as any).branch_id || (s as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getStocktakeSessions = (): StocktakeSession[] => {
+  return getAllStocktakeSessions();
 };
 
 export const getStocktakeSessionById = (sessionId: string): StocktakeSession | undefined => {
@@ -12253,7 +12423,7 @@ export const getStocktakeSessionById = (sessionId: string): StocktakeSession | u
 };
 
 export const saveStocktakeSession = (session: StocktakeSession): StocktakeSession => {
-  const sessions = getAllStocktakeSessions();
+  const sessions = getRawStoredStocktakeSessions();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = (session as any).company_id || (session as any).companyId || currentCompany;
@@ -13398,9 +13568,25 @@ export function getCurrentCompany(): Company {
 export function getCurrentBranchId(): string {
   const user = getSessionUser();
   if (user && (user.branchId || user.branch_id)) {
-    return (user.branchId || user.branch_id)!;
+    return (user.branchId || user.branch_id)!.trim();
   }
-  return getStored<string>(STORAGE_KEYS.CURRENT_BRANCH_ID, 'BR-MAIN');
+  const stored = getStored<string>(STORAGE_KEYS.CURRENT_BRANCH_ID, '');
+  if (stored && stored.trim() && stored !== 'ALL') {
+    return stored.trim();
+  }
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const regBranch = localStorage.getItem('saimetric_device_reg_branch_id');
+      if (regBranch && regBranch.trim() && regBranch !== 'ALL') {
+        return regBranch.trim();
+      }
+      const hubBranch = localStorage.getItem('saimetric_local_hub_branch_id');
+      if (hubBranch && hubBranch.trim() && hubBranch !== 'UNASSIGNED') {
+        return hubBranch.trim();
+      }
+    } catch {}
+  }
+  return stored || 'BR-MAIN';
 }
 
 export function setCurrentBranchId(branchId: string): void {
@@ -14069,27 +14255,28 @@ export const INITIAL_DIRECT_GRVS: DirectGrv[] = [
   },
 ];
 
-export const getAllDirectGrvs = (): DirectGrv[] => {
+export const getRawStoredDirectGrvs = (): DirectGrv[] => {
   const legacy = getStored<DirectGrv[]>(STORAGE_KEYS.DIRECT_GRVS, INITIAL_DIRECT_GRVS);
   return getDualReadDirectGrvs(legacy);
 };
 
-export const getDirectGrvs = (): DirectGrv[] => {
+export const getAllDirectGrvs = (branchId?: string): DirectGrv[] => {
+  const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const all = getAllDirectGrvs();
-  const isMasterOr001 = (c?: string) => !c || c === 'COMP-001' || c === 'COMP-MASTER';
-
+  const all = getRawStoredDirectGrvs();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return all;
+  }
+  const branches = getBranches();
   return all.filter((g) => {
+    const brId = (g as any).branch_id || (g as any).branchId;
     const compId = (g as any).company_id || (g as any).companyId;
-    const matchesComp =
-      (!compId && isMasterOr001(currentCompany)) ||
-      (isMasterOr001(compId) && isMasterOr001(currentCompany)) ||
-      compId === currentCompany;
-    if (!matchesComp) return false;
-    const brId = (g as any).branch_id || (g as any).branchId || 'BR-MAIN';
-    return !currentBranch || brId === currentBranch || brId === 'ALL' || brId === 'BR-MAIN';
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
+};
+
+export const getDirectGrvs = (): DirectGrv[] => {
+  return getAllDirectGrvs();
 };
 
 export const getDirectGrvById = (id: string): DirectGrv | null => {
@@ -14104,7 +14291,7 @@ export const getDirectGrvPaymentsForStaff = (
   grv: DirectGrv;
   payment: DirectGrvTillPayment;
 }> => {
-  const grvs = getAllDirectGrvs();
+  const grvs = getDirectGrvs();
   const results: Array<{ grv: DirectGrv; payment: DirectGrvTillPayment }> = [];
 
   grvs.forEach((grv) => {
@@ -14123,7 +14310,7 @@ export const getDirectGrvPaymentsForStaff = (
 };
 
 export const getDirectGrvsForStaffAndDate = (staffId: string, date: string): DirectGrv[] => {
-  const grvs = getAllDirectGrvs();
+  const grvs = getDirectGrvs();
   const targetId = String(staffId).trim().toLowerCase();
   const normTarget = targetId.replace(/^usr-|^staff-|^0+/, '');
 
@@ -14761,13 +14948,29 @@ export const getCashLogsForCurrentBranch = (): CashLogEntry[] => {
 // CASH CUSTODY CHAIN & CASH TRANSFERS DAO
 // ============================================================================
 
-export const getAllCashAccounts = (): CashAccount[] => {
+export const getRawStoredCashAccounts = (): CashAccount[] => {
   const accounts = getStored<CashAccount[]>(STORAGE_KEYS.CASH_ACCOUNTS, []);
   return Array.isArray(accounts) ? accounts : [];
 };
 
+export const getAllCashAccounts = (branchId?: string): CashAccount[] => {
+  const accounts = getRawStoredCashAccounts();
+  const currentCompany = getCurrentCompanyId();
+  const targetBranch = branchId || getCurrentBranchId();
+  const branches = getBranches();
+
+  return accounts.filter((acc) => {
+    const compMatch = isCashCompanyMatch(acc.company_id, currentCompany);
+    if (!compMatch) return false;
+    // HQ Safe and Commercial Bank accounts are global to company
+    if (acc.account_type === 'HQ_SAFE' || acc.account_type === 'BANK_ACCOUNT') return true;
+    if (targetBranch === 'ALL') return true;
+    return isRecordInBranchScope(acc.branch_id, targetBranch, branches, currentCompany);
+  });
+};
+
 const isCashBranchMatch = (b1?: string, b2?: string): boolean => {
-  if (!b1 || !b2) return true;
+  if (!b1 || !b2) return false;
   if (b1 === b2) return true;
   if ((b1 === '1' || b1 === 'BR-MAIN') && (b2 === '1' || b2 === 'BR-MAIN')) return true;
   return false;
@@ -14781,18 +14984,7 @@ const isCashCompanyMatch = (c1?: string, c2?: string): boolean => {
 };
 
 export const getCashAccounts = (branchId?: string): CashAccount[] => {
-  const all = getAllCashAccounts();
-  const currentCompany = getCurrentCompanyId();
-  const targetBranch = branchId || getCurrentBranchId();
-
-  return all.filter((acc) => {
-    const compMatch = isCashCompanyMatch(acc.company_id, currentCompany);
-    if (!compMatch) return false;
-    // HQ Safe and Commercial Bank accounts are global to company
-    if (acc.account_type === 'HQ_SAFE' || acc.account_type === 'BANK_ACCOUNT') return true;
-    if (!branchId) return true;
-    return !acc.branch_id || acc.branch_id === targetBranch || acc.branch_id === 'HQ' || isCashBranchMatch(acc.branch_id, targetBranch);
-  });
+  return getAllCashAccounts(branchId);
 };
 
 export const setAllCashAccounts = (accounts: CashAccount[]): void => {
@@ -14801,7 +14993,7 @@ export const setAllCashAccounts = (accounts: CashAccount[]): void => {
 };
 
 export const saveCashAccount = (account: CashAccount): CashAccount => {
-  const all = getAllCashAccounts();
+  const all = getRawStoredCashAccounts();
   const currentCompany = getCurrentCompanyId();
   const now = new Date().toISOString();
 
@@ -14849,26 +15041,31 @@ export const saveCashAccount = (account: CashAccount): CashAccount => {
   return toSave;
 };
 
-export const getAllCashTransfers = (): CashTransfer[] => {
+export const getRawStoredCashTransfers = (): CashTransfer[] => {
   const transfers = getStored<CashTransfer[]>(STORAGE_KEYS.CASH_TRANSFERS, []);
   return Array.isArray(transfers) ? transfers : [];
 };
 
-export const getCashTransfers = (branchId?: string): CashTransfer[] => {
-  const all = getAllCashTransfers();
+export const getAllCashTransfers = (branchId?: string): CashTransfer[] => {
+  const all = getRawStoredCashTransfers();
   const currentCompany = getCurrentCompanyId();
   const targetBranch = branchId || getCurrentBranchId();
+  const branches = getBranches();
 
   return all.filter((t) => {
     const compMatch = isCashCompanyMatch(t.company_id, currentCompany);
     if (!compMatch) return false;
-    if (!branchId) return true;
-    return !t.branch_id || t.branch_id === targetBranch || t.branch_id === 'HQ' || isCashBranchMatch(t.branch_id, targetBranch);
+    if (targetBranch === 'ALL') return true;
+    return isRecordInBranchScope(t.branch_id, targetBranch, branches, currentCompany);
   });
 };
 
+export const getCashTransfers = (branchId?: string): CashTransfer[] => {
+  return getAllCashTransfers(branchId);
+};
+
 export const saveCashTransfer = (transfer: CashTransfer): CashTransfer => {
-  const all = getAllCashTransfers();
+  const all = getRawStoredCashTransfers();
   const currentCompany = getCurrentCompanyId();
   const index = all.findIndex((t) => t.transfer_id === transfer.transfer_id);
 

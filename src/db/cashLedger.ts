@@ -20,9 +20,15 @@ export const getActiveBranchId = (): string => {
       const sessionUserRaw = window.localStorage.getItem('saimetric_room_session_user');
       if (sessionUserRaw) {
         const u = JSON.parse(sessionUserRaw);
-        if (u?.branchId || u?.branch_id) return u.branchId || u.branch_id;
+        if (u?.branchId || u?.branch_id) return (u.branchId || u.branch_id).trim();
       }
-      return window.localStorage.getItem('saimetric_room_current_branch_id') || 'BR-MAIN';
+      const cur = window.localStorage.getItem('saimetric_room_current_branch_id');
+      if (cur && cur.trim() && cur !== 'ALL') return cur.trim();
+      const regBranch = window.localStorage.getItem('saimetric_device_reg_branch_id');
+      if (regBranch && regBranch.trim() && regBranch !== 'ALL') return regBranch.trim();
+      const hubBranch = window.localStorage.getItem('saimetric_local_hub_branch_id');
+      if (hubBranch && hubBranch.trim() && hubBranch !== 'UNASSIGNED') return hubBranch.trim();
+      return cur || 'BR-MAIN';
     } catch {
       return 'BR-MAIN';
     }
