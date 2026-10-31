@@ -23,6 +23,8 @@ import {
   addTemporaryCasual,
   deleteTemporaryCasual,
 } from '../../db/roomDatabase';
+import { meshSyncService } from '../../services/meshSyncService';
+import { Share2 } from 'lucide-react';
 
 interface CasualWorkersTabProps {
   session: StocktakeSession;
@@ -71,6 +73,9 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
       assignedGroup,
     });
 
+    const updated = getTemporaryCasuals();
+    meshSyncService.broadcastCasualWorkers(updated);
+
     loadData();
     setShowAddModal(false);
     setName('');
@@ -84,9 +89,17 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
   const handleDelete = (id: string) => {
     if (confirm('Delete this temporary casual worker account?')) {
       deleteTemporaryCasual(id);
+      const updated = getTemporaryCasuals();
+      meshSyncService.broadcastCasualWorkers(updated);
       loadData();
       onRefreshSession();
     }
+  };
+
+  const handleSyncToHub = () => {
+    const list = getTemporaryCasuals();
+    meshSyncService.broadcastCasualWorkers(list);
+    alert(`Synced ${list.length} casual worker accounts to the Local Wi-Fi Hub! All tablets can now authenticate these PINs.`);
   };
 
   const handleCopyPin = (cPin: string, cId: string) => {
@@ -124,14 +137,25 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={() => setShowAddModal(true)}
-          className="px-4 py-2.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/30 flex items-center gap-2 transition shrink-0"
-        >
-          <Plus className="w-4 h-4" />
-          Register Casual Worker
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={handleSyncToHub}
+            className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-600/40 rounded-xl text-xs font-bold shadow flex items-center gap-1.5 transition"
+            title="Broadcast casual worker PINs to all tablets via Local Hub"
+          >
+            <Share2 className="w-4 h-4 text-amber-400" />
+            Sync to Hub
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowAddModal(true)}
+            className="px-4 py-2.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/30 flex items-center gap-2 transition"
+          >
+            <Plus className="w-4 h-4" />
+            Register Casual Worker
+          </button>
+        </div>
       </div>
 
       {/* KPI Stats */}

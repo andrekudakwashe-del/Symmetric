@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Saimetric POS - Standalone High-Reliability Local Hub for Termux Android / Local LAN (v3.0)
+ * Saimetric POS - Standalone High-Reliability Local Hub for Termux Android / Local LAN (v3.2)
  *
  * Designed specifically for Termux Android Hotspot environments (192.168.43.1:8080)
  * and Local Branch LANs. Acts as the local authoritative source of truth for the branch:
@@ -16,9 +16,16 @@
  *    - Customer Credit Accounts & Change Vouchers
  *    - Stock Movements (Wastage, Adjustments)
  *    - Petty Cash Expenses & Vault Cash Transfers
- * 3. Bi-directional Catch-Up Sync: Replays ALL missed deltas when an offline device reconnects.
- * 4. Inventory Reconciliation: Adjusts stock on inward deliveries and sales deductions.
- * 5. Echo-Free Broadcast: Never reflects packets back to sender, completely eliminating loops.
+ * 3. Blind Double-Count Stocktake Protocol:
+ *    - Hub Secret Holding Vault (`hubBlindStore`): Suppresses peer broadcast for Team A count.
+ *    - Automated Server-side Line Comparison: Dispatches STOCKTAKE_MATCH_VERIFIED or STOCKTAKE_VARIANCE_ALERT.
+ *    - Self-Service Zone Claiming & Locking.
+ *    - Peer Dual-Signature Joint Recount Coordination.
+ *    - Casual Worker 4-Digit PIN Distribution.
+ *    - Universal Stocktake Lockdown Broadcast.
+ * 4. 2GB CCTV Safety Threshold & 30-Day Storage Rotation.
+ * 5. Strict Branch Isolation & Repurposing (`PING_HUB`, `HANDSHAKE`, `RESET_BRANCH`).
+ * 6. CommonJS Native Execution for Termux Android (`require` syntax).
  *
  * Quick Start on Termux:
  *   pkg update && pkg install nodejs
@@ -26,10 +33,10 @@
  *   node termux-hub.js --port 8080
  */
 
-import { WebSocketServer, WebSocket } from 'ws';
-import http from 'http';
-import fs from 'fs';
-import path from 'path';
+const { WebSocketServer, WebSocket } = require('ws');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 // Read CLI port or default to 8080
 const portArgIdx = process.argv.indexOf('--port');
@@ -54,6 +61,8 @@ let hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1]
   : (process.env.HUB_TENANT_ID || 'COMP-001');
 
 const DATA_FILE = path.join(process.cwd(), 'termux-hub-data.json');
+const MAX_STORAGE_BYTES = 2 * 1024 * 1024 * 1024; // 2GB Safety Limit for Termux hardware
+const ROTATION_DAYS = 30; // 30-day rotation for archived historical movements
 
 // In-Memory & File-backed Stores
 let salesStore = [];
@@ -67,6 +76,19 @@ let creditSalesStore = [];
 let stockMovementsStore = [];
 let expensesStore = [];
 let cashTransfersStore = [];
+
+// Stocktake Dedicated Stores
+let casualWorkersStore = [];
+let zoneAssignmentsStore = [];
+let branchLockdownsStore = {};
+
+// Staff & Customer Master Stores (Synced across multi-device Wi-Fi)
+let salespeopleStore = [];
+let customersStore = [];
+
+// Secret holding vault for blind double-counting:
+// Structure: { [sessionId]: { [zoneId]: { A: null, B: null } } }
+const hubBlindStore = {};
 
 let packetCounter = 0;
 const seenPacketIds = new Set();
@@ -90,6 +112,21 @@ function getTimestamp(rec) {
   return isNaN(tm) ? 0 : tm;
 }
 
+// 30-Day Disk Rotation & 2GB CCTV Safety Trim
+function pruneOldRecords() {
+  const cutoffTime = Date.now() - (ROTATION_DAYS * 24 * 60 * 60 * 1000);
+  salesStore = salesStore.filter((s) => getTimestamp(s) >= cutoffTime || !s.date);
+  directGrvsStore = directGrvsStore.filter((g) => getTimestamp(g) >= cutoffTime || !g.date);
+  cashMovementsStore = cashMovementsStore.filter((m) => getTimestamp(m) >= cutoffTime || !m.date);
+  cashLogsStore = cashLogsStore.filter((l) => getTimestamp(l) >= cutoffTime || !l.date);
+  cashLiftsStore = cashLiftsStore.filter((l) => getTimestamp(l) >= cutoffTime || !l.date);
+  customerChangesStore = customerChangesStore.filter((c) => getTimestamp(c) >= cutoffTime || !c.date);
+  creditSalesStore = creditSalesStore.filter((cs) => getTimestamp(cs) >= cutoffTime || !cs.date);
+  stockMovementsStore = stockMovementsStore.filter((sm) => getTimestamp(sm) >= cutoffTime || !sm.date);
+  expensesStore = expensesStore.filter((e) => getTimestamp(e) >= cutoffTime || !e.date);
+  cashTransfersStore = cashTransfersStore.filter((t) => getTimestamp(t) >= cutoffTime || !t.date);
+}
+
 // Load persistent data if exists
 function loadData() {
   try {
@@ -110,9 +147,16 @@ function loadData() {
       if (Array.isArray(parsed.stockMovements)) stockMovementsStore = parsed.stockMovements;
       if (Array.isArray(parsed.expenses)) expensesStore = parsed.expenses;
       if (Array.isArray(parsed.cashTransfers)) cashTransfersStore = parsed.cashTransfers;
+      if (Array.isArray(parsed.casualWorkers)) casualWorkersStore = parsed.casualWorkers;
+      if (Array.isArray(parsed.zoneAssignments)) zoneAssignmentsStore = parsed.zoneAssignments;
+      if (Array.isArray(parsed.salespeople)) salespeopleStore = parsed.salespeople;
+      if (Array.isArray(parsed.customers)) customersStore = parsed.customers;
+      if (parsed.branchLockdowns && typeof parsed.branchLockdowns === 'object') {
+        branchLockdownsStore = parsed.branchLockdowns;
+      }
 
       console.log(
-        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items.`
+        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${casualWorkersStore.length} casuals.`
       );
     }
   } catch (e) {
@@ -129,6 +173,8 @@ function scheduleSave() {
 
 function saveData() {
   try {
+    pruneOldRecords();
+
     const payload = {
       hubBranchId,
       hubBranchName,
@@ -144,9 +190,22 @@ function saveData() {
       stockMovements: stockMovementsStore.slice(0, 2000),
       expenses: expensesStore.slice(0, 1000),
       cashTransfers: cashTransfersStore.slice(0, 1000),
+      casualWorkers: casualWorkersStore.slice(0, 500),
+      zoneAssignments: zoneAssignmentsStore.slice(0, 500),
+      salespeople: salespeopleStore.slice(0, 1000),
+      customers: customersStore.slice(0, 3000),
+      branchLockdowns: branchLockdownsStore,
       savedAt: new Date().toISOString(),
     };
-    fs.writeFileSync(DATA_FILE, JSON.stringify(payload, null, 2), 'utf8');
+
+    const serialized = JSON.stringify(payload, null, 2);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_STORAGE_BYTES) {
+      console.warn(`[Termux Hub] Warning: Hub data exceeds 2GB limit. Trimming oldest logs...`);
+      salesStore = salesStore.slice(0, 2500);
+      directGrvsStore = directGrvsStore.slice(0, 500);
+    }
+
+    fs.writeFileSync(DATA_FILE, serialized, 'utf8');
   } catch (e) {
     console.error('[Termux Hub] Error saving data file:', e.message);
   }
@@ -170,15 +229,16 @@ const server = http.createServer((req, res) => {
     return res.end(
       JSON.stringify({
         status: 'ok',
-        hub: 'Saimetric Termux Local Hub v3.0 (Full-Store Multi-Entity)',
+        hub: 'Saimetric Termux Local Hub v3.2 (Blind Stocktake & Full-Store Sync)',
         port: PORT,
+        branchId: hubBranchId,
+        branchName: hubBranchName,
         clientsCount: wss ? wss.clients.size : 0,
         totalSalesStored: salesStore.length,
         totalDirectGrvsStored: directGrvsStore.length,
         totalInventoryItems: inventoryStore.length,
-        totalCashMovements: cashMovementsStore.length,
-        totalCashLifts: cashLiftsStore.length,
-        totalCashLogs: cashLogsStore.length,
+        totalCasualWorkers: casualWorkersStore.length,
+        totalZonesAssigned: zoneAssignmentsStore.length,
         packetsProcessed: packetCounter,
         uptimeSec: Math.round(process.uptime()),
       })
@@ -187,7 +247,7 @@ const server = http.createServer((req, res) => {
 
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(
-    `Saimetric Termux Local Hub v3.0 Running on Port ${PORT}\nConnected Clients: ${wss ? wss.clients.size : 0}\nTotal Sales: ${salesStore.length}\nDirect GRVs: ${directGrvsStore.length}\nInventory Items: ${inventoryStore.length}\nCash Movements: ${cashMovementsStore.length}\nCash Lifts: ${cashLiftsStore.length}\nPackets Processed: ${packetCounter}\n`
+    `Saimetric Termux Local Hub v3.2 Running on Port ${PORT}\nBranch: ${hubBranchId} (${hubBranchName})\nConnected Clients: ${wss ? wss.clients.size : 0}\nTotal Sales: ${salesStore.length}\nDirect GRVs: ${directGrvsStore.length}\nInventory Items: ${inventoryStore.length}\nCasual Workers: ${casualWorkersStore.length}\nPackets Processed: ${packetCounter}\n`
   );
 });
 
@@ -230,7 +290,8 @@ wss.on('connection', (ws, req) => {
         pType === 'ANTI-DOUBLE-POST ACK' ||
         pType === 'ACK' ||
         pType === 'SALE_ACK' ||
-        pType === 'RECEIPT';
+        pType === 'RECEIPT' ||
+        pType === 'STOCKTAKE_ACK_SUBMIT';
       if (isReceipt) {
         return;
       }
@@ -246,8 +307,9 @@ wss.on('connection', (ws, req) => {
           branch_name: hubBranchName,
           tenant_id: hubTenantId,
           hub_id: `HUB-${hubBranchId}`,
-          version: '3.1.0',
+          version: '3.2.0',
           totalRecords: salesStore.length + directGrvsStore.length,
+          casualWorkersCount: casualWorkersStore.length,
           timestamp: Date.now(),
         };
         try {
@@ -275,7 +337,13 @@ wss.on('connection', (ws, req) => {
         stockMovementsStore = [];
         expensesStore = [];
         cashTransfersStore = [];
+        casualWorkersStore = [];
+        zoneAssignmentsStore = [];
+        salespeopleStore = [];
+        customersStore = [];
+        branchLockdownsStore = {};
         seenPacketIds.clear();
+        Object.keys(hubBlindStore).forEach((k) => delete hubBlindStore[k]);
 
         const newBranchId = packet.new_branch_id || packet.branch_id || 'UNASSIGNED';
         const newBranchName = packet.new_branch_name || packet.branch_name || 'Unassigned Hub';
@@ -290,12 +358,28 @@ wss.on('connection', (ws, req) => {
           status: 'WIPED',
           branch_id: hubBranchId,
           branch_name: hubBranchName,
-          message: 'Local Hub memory wiped and branch identity reset successfully.',
+          message: 'Local Hub has been wiped clean and is ready for re-assignment.',
           timestamp: Date.now(),
         };
         try {
           ws.send(JSON.stringify(resetAck));
-        } catch (_) {}
+        } catch (e) {}
+
+        const wipeBroadcast = {
+          type: 'HUB_INFO',
+          action: 'HUB_INFO',
+          branch_id: 'UNASSIGNED',
+          branch_name: 'Unassigned Hub',
+          status: 'UNASSIGNED',
+          timestamp: Date.now(),
+        };
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(JSON.stringify(wipeBroadcast));
+            } catch (e) {}
+          }
+        });
         return;
       }
 
@@ -314,7 +398,6 @@ wss.on('connection', (ws, req) => {
           saveData();
           console.log(`[Termux Hub] 🤝 Handshake accepted: Assigned to Branch ${hubBranchId} ("${hubBranchName}")`);
 
-          // Reply with updated HUB_INFO to confirm binding
           const hubInfoResponse = {
             type: 'HUB_INFO',
             action: 'HUB_INFO',
@@ -322,8 +405,9 @@ wss.on('connection', (ws, req) => {
             branch_name: hubBranchName,
             tenant_id: hubTenantId,
             hub_id: `HUB-${hubBranchId}`,
-            version: '3.1.0',
+            version: '3.2.0',
             totalRecords: salesStore.length + directGrvsStore.length,
+            casualWorkersCount: casualWorkersStore.length,
             timestamp: Date.now(),
           };
           try {
@@ -333,6 +417,324 @@ wss.on('connection', (ws, req) => {
           }
           return;
         }
+      }
+
+      // =====================================================================
+      // 0.3 CASUAL WORKERS PIN SYNC OVER LOCAL HUB
+      // =====================================================================
+      if (pType === 'CASUAL_WORKERS_SYNC') {
+        const incoming = packet.casualWorkers || payload || packet.casuals;
+        if (Array.isArray(incoming)) {
+          // Merge casual workers by PIN or ID
+          incoming.forEach((cw) => {
+            if (!cw || !cw.pin) return;
+            const idx = casualWorkersStore.findIndex((c) => c.pin === cw.pin || c.id === cw.id);
+            if (idx >= 0) {
+              casualWorkersStore[idx] = { ...casualWorkersStore[idx], ...cw };
+            } else {
+              casualWorkersStore.push(cw);
+            }
+          });
+          scheduleSave();
+          console.log(`[Termux Hub] Synced ${incoming.length} casual worker(s). Active casuals: ${casualWorkersStore.length}`);
+        }
+
+        // Broadcast to all other peers so every tablet receives the updated casual credentials
+        wss.clients.forEach((client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(dataStr);
+            } catch (e) {}
+          }
+        });
+        return;
+      }
+
+      // =====================================================================
+      // 0.4 STOCKTAKE BRANCH LOCKDOWN BROADCAST
+      // =====================================================================
+      if (pType === 'STOCKTAKE_LOCKDOWN_BROADCAST') {
+        const brId = packet.branchId || packet.branch_id || hubBranchId;
+        branchLockdownsStore[brId] = {
+          branchId: brId,
+          isLocked: Boolean(packet.isLocked),
+          sessionId: packet.sessionId,
+          lockedAt: packet.isLocked ? new Date().toISOString() : undefined,
+          lockedByName: packet.lockedByName,
+          reason: packet.reason,
+        };
+        scheduleSave();
+        console.log(`[Termux Hub] 🔒 Branch Lockdown status changed: ${brId} isLocked=${packet.isLocked}`);
+
+        // Forward to all clients immediately to freeze/unfreeze POS screens
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(dataStr);
+            } catch (e) {}
+          }
+        });
+        return;
+      }
+
+      // =====================================================================
+      // 0.5 SELF-SERVICE ZONE CLAIMING
+      // =====================================================================
+      if (pType === 'STOCKTAKE_ZONE_CLAIM') {
+        const { sessionId, zoneId, slot, deviceId, staffId, staffName } = packet;
+        if (sessionId && zoneId && (slot === 'A' || slot === 'B')) {
+          let zoneRec = zoneAssignmentsStore.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+          if (!zoneRec) {
+            zoneRec = {
+              zoneId,
+              zoneName: packet.zoneName || zoneId,
+              sessionId,
+              branchId: packet.branchId || hubBranchId,
+              status: slot === 'A' ? 'IN_PROGRESS' : 'AWAITING_DOUBLE_COUNT',
+            };
+            zoneAssignmentsStore.push(zoneRec);
+          }
+
+          if (slot === 'A') {
+            zoneRec.teamA = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: false };
+            zoneRec.status = zoneRec.teamB?.submitted ? 'AWAITING_DOUBLE_COUNT' : 'IN_PROGRESS';
+          } else {
+            zoneRec.teamB = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: false };
+          }
+
+          scheduleSave();
+          console.log(`[Termux Hub] Zone ${zoneId} claimed by ${staffName} as Team ${slot}`);
+
+          const claimedPacket = {
+            type: 'STOCKTAKE_ZONE_CLAIMED',
+            sessionId,
+            zoneId,
+            slot,
+            deviceId,
+            staffId,
+            staffName,
+            zone: zoneRec,
+            timestamp: Date.now(),
+          };
+
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(JSON.stringify(claimedPacket));
+              } catch (e) {}
+            }
+          });
+        }
+        return;
+      }
+
+      // =====================================================================
+      // 0.6 TRUE BLIND COUNTING: HUB SECRET HOLDING VAULT
+      // =====================================================================
+      if (pType === 'STOCKTAKE_COUNT_SUBMIT') {
+        const { sessionId, zoneId, slot, deviceId, staffId, staffName, lines } = packet;
+
+        if (!sessionId || !zoneId || (slot !== 'A' && slot !== 'B' && slot !== 'RECOUNT')) {
+          return;
+        }
+
+        // Initialize secret holding vault for this session & zone
+        if (!hubBlindStore[sessionId]) hubBlindStore[sessionId] = {};
+        if (!hubBlindStore[sessionId][zoneId]) {
+          hubBlindStore[sessionId][zoneId] = { A: null, B: null, recount: null };
+        }
+
+        // Store count in private vault
+        hubBlindStore[sessionId][zoneId][slot] = {
+          deviceId,
+          staffId,
+          staffName,
+          submittedAt: new Date().toISOString(),
+          lines: Array.isArray(lines) ? lines : [],
+        };
+
+        console.log(
+          `[Termux Hub] 🤫 Vaulted Team ${slot} count for Zone ${zoneId} (${(lines || []).length} items) by ${staffName}. Broadcast suppressed to protect blind audit.`
+        );
+
+        // 1. Send point-to-point confirmation back ONLY to the submitting device
+        try {
+          const ackPacket = {
+            type: 'STOCKTAKE_ACK_SUBMIT',
+            sessionId,
+            zoneId,
+            slot,
+            status: 'VAULTED',
+            message: `Count for Zone ${zoneId} secured in Hub Vault. Awaiting Team ${slot === 'A' ? 'B' : 'A'} submission.`,
+            timestamp: Date.now(),
+          };
+          ws.send(JSON.stringify(ackPacket));
+        } catch (e) {}
+
+        // 2. Broadcast generic status update (NO LINE COUNTS OR VALUES) so dashboard grid updates
+        const statusPacket = {
+          type: 'STOCKTAKE_ZONE_STATUS_UPDATE',
+          sessionId,
+          zoneId,
+          slot,
+          hasCountA: Boolean(hubBlindStore[sessionId][zoneId].A),
+          hasCountB: Boolean(hubBlindStore[sessionId][zoneId].B),
+          status:
+            hubBlindStore[sessionId][zoneId].A && hubBlindStore[sessionId][zoneId].B
+              ? 'COMPARING'
+              : slot === 'A'
+              ? 'AWAITING_DOUBLE_COUNT'
+              : 'IN_PROGRESS',
+          timestamp: Date.now(),
+        };
+
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(JSON.stringify(statusPacket));
+            } catch (e) {}
+          }
+        });
+
+        // 3. Automated Server-Side Comparison if BOTH Team A and Team B have submitted
+        const subA = hubBlindStore[sessionId][zoneId].A;
+        const subB = hubBlindStore[sessionId][zoneId].B;
+
+        if (subA && subB) {
+          const mapA = new Map();
+          const mapB = new Map();
+          (subA.lines || []).forEach((l) => mapA.set((l.itemId || l.id || '').toUpperCase(), l));
+          (subB.lines || []).forEach((l) => mapB.set((l.itemId || l.id || '').toUpperCase(), l));
+
+          const allKeys = Array.from(new Set([...Array.from(mapA.keys()), ...Array.from(mapB.keys())]));
+          const discrepancies = [];
+          const verifiedCounts = [];
+
+          allKeys.forEach((key) => {
+            const itemA = mapA.get(key);
+            const itemB = mapB.get(key);
+            const aCases = Number(itemA ? itemA.cases : 0) || 0;
+            const bCases = Number(itemB ? itemB.cases : 0) || 0;
+            const aSingles = Number(itemA ? itemA.singles : 0) || 0;
+            const bSingles = Number(itemB ? itemB.singles : 0) || 0;
+            const aTot = Number(itemA ? itemA.totalUnits : 0) || 0;
+            const bTot = Number(itemB ? itemB.totalUnits : 0) || 0;
+            const baseItem = itemA || itemB;
+
+            if (itemA && itemB && aCases === bCases && aSingles === bSingles && aTot === bTot) {
+              verifiedCounts.push({
+                itemId: baseItem.itemId || key,
+                itemName: baseItem.itemName || key,
+                category: baseItem.category,
+                sku: baseItem.sku,
+                unitsPerCase: baseItem.unitsPerCase || 1,
+                cases: aCases,
+                singles: aSingles,
+                totalUnits: aTot,
+                source: 'MATCHED',
+              });
+            } else {
+              discrepancies.push({
+                itemId: baseItem.itemId || key,
+                itemName: baseItem.itemName || key,
+                sku: baseItem.sku || key,
+                unitsPerCase: baseItem.unitsPerCase || 1,
+                teamACases: aCases,
+                teamASingles: aSingles,
+                teamATotalUnits: aTot,
+                teamBCases: bCases,
+                teamBSingles: bSingles,
+                teamBTotalUnits: bTot,
+                differenceUnits: Math.abs(aTot - bTot),
+              });
+            }
+          });
+
+          if (discrepancies.length === 0) {
+            // 100% MATCH! Auto-verify zone
+            console.log(`[Termux Hub] ✅ Zone ${zoneId} DOUBLE-COUNT MATCHED 100% (${verifiedCounts.length} lines verified).`);
+            const verifiedPacket = {
+              type: 'STOCKTAKE_MATCH_VERIFIED',
+              sessionId,
+              zoneId,
+              status: 'VERIFIED',
+              verifiedCounts,
+              verifiedCount: verifiedCounts.length,
+              timestamp: Date.now(),
+            };
+            wss.clients.forEach((client) => {
+              if (client.readyState === WebSocket.OPEN) {
+                try {
+                  client.send(JSON.stringify(verifiedPacket));
+                } catch (e) {}
+              }
+            });
+          } else {
+            // DISCREPANCIES DETECTED -> Trigger Joint Recount Sheet
+            console.log(`[Termux Hub] ⚠️ Zone ${zoneId} DISCREPANCY: ${discrepancies.length} variance item(s). Alerting Teams A & B.`);
+            const variancePacket = {
+              type: 'STOCKTAKE_VARIANCE_ALERT',
+              sessionId,
+              zoneId,
+              status: 'VARIANCE_FLAGGED',
+              discrepancies,
+              discrepancyCount: discrepancies.length,
+              teamAStaffName: subA.staffName,
+              teamBStaffName: subB.staffName,
+              timestamp: Date.now(),
+            };
+            wss.clients.forEach((client) => {
+              if (client.readyState === WebSocket.OPEN) {
+                try {
+                  client.send(JSON.stringify(variancePacket));
+                } catch (e) {}
+              }
+            });
+          }
+        }
+
+        // Drop packet from standard peer broadcast (Blind Vault Protection)
+        return;
+      }
+
+      // =====================================================================
+      // 0.7 PEER DUAL-SIGNATURE JOINT RECOUNT COORDINATION
+      // =====================================================================
+      if (pType === 'STOCKTAKE_JOINT_PROPOSAL') {
+        // Forward proposal to other peers so Team A & Team B can see agreed numbers live
+        wss.clients.forEach((client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(dataStr);
+            } catch (e) {}
+          }
+        });
+        return;
+      }
+
+      if (pType === 'STOCKTAKE_JOINT_FINALIZED') {
+        const { sessionId, zoneId, resolvedLines, signedByA, signedByB, resolvedByName } = packet;
+        console.log(`[Termux Hub] 🤝 Zone ${zoneId} Joint Recount finalized with Dual-Signatures (A=${signedByA}, B=${signedByB}).`);
+
+        const verifiedPacket = {
+          type: 'STOCKTAKE_MATCH_VERIFIED',
+          sessionId,
+          zoneId,
+          status: 'VERIFIED',
+          source: 'JOINT_RECOUNT',
+          verifiedCounts: resolvedLines || [],
+          resolvedByName,
+          timestamp: Date.now(),
+        };
+
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(JSON.stringify(verifiedPacket));
+            } catch (e) {}
+          }
+        });
+        return;
       }
 
       // =====================================================================
@@ -350,29 +752,65 @@ wss.on('connection', (ws, req) => {
       if (isSale && saleId) {
         const isLegacyInv = String(saleId).toUpperCase().startsWith('INV-');
 
-        // Store sale in hub history
         const existingIdx = salesStore.findIndex((s) => s.id === saleId);
+        const prevSale = existingIdx >= 0 ? salesStore[existingIdx] : null;
         if (existingIdx >= 0) {
           salesStore[existingIdx] = { ...salesStore[existingIdx], ...(saleObj || packet) };
         } else {
           salesStore.unshift(saleObj || packet);
         }
 
-        // Deduct inventory units & monitor variance
+        // Inventory movements: New Sale, Refund, Void, and Item Exchange
+        const isNewRefund = saleObj?.status === 'Refunded' && prevSale?.status !== 'Refunded';
+        const isNewVoid = saleObj?.status === 'Voided' && prevSale?.status !== 'Voided';
+
         if (saleObj && Array.isArray(saleObj.items)) {
           for (const it of saleObj.items) {
             if (!it || !it.id) continue;
             const invIdx = inventoryStore.findIndex((i) => i.itemId === it.id || i.id === it.id);
             if (invIdx >= 0) {
               const curUnits = Number(inventoryStore[invIdx].totalUnits || 0);
-              const deductQty = Number(it.quantity || 0);
-              const newUnits = Number((curUnits - deductQty).toFixed(3));
+              const qty = Number(it.quantity || 0);
+              let newUnits = curUnits;
+
+              if (isNewRefund || isNewVoid) {
+                // Restock inventory for customer refund or invoice void
+                newUnits = Number((curUnits + qty).toFixed(3));
+                console.log(`[Termux Hub] Restocked ${qty}x ${it.name || it.id} from ${isNewRefund ? 'Refund' : 'Void'} on #${saleId}`);
+              } else if (!prevSale && saleObj.status !== 'Refunded' && saleObj.status !== 'Voided') {
+                // Initial sale outflow
+                newUnits = Number((curUnits - qty).toFixed(3));
+              }
+
               inventoryStore[invIdx].totalUnits = newUnits;
               inventoryStore[invIdx].stockSingles = newUnits;
-              if (newUnits < 0) {
-                console.warn(
-                  `[STOCK_VARIANCE] ⚠️ Stock fell negative on Hub for "${inventoryStore[invIdx].itemName || it.id}": ${newUnits} units (Invoice #${saleId})`
-                );
+            }
+          }
+        }
+
+        // Handle item exchanges on immutable invoices
+        if (saleObj && Array.isArray(saleObj.exchanges)) {
+          const prevExchangeCount = (prevSale && Array.isArray(prevSale.exchanges)) ? prevSale.exchanges.length : 0;
+          const newExchanges = saleObj.exchanges.slice(prevExchangeCount);
+          for (const ex of newExchanges) {
+            if (ex.returnedItem?.id && ex.returnedItem.restockCondition === 'restock') {
+              const retIdx = inventoryStore.findIndex((i) => i.itemId === ex.returnedItem.id || i.id === ex.returnedItem.id);
+              if (retIdx >= 0) {
+                const cur = Number(inventoryStore[retIdx].totalUnits || 0);
+                const retUnits = Number((cur + Number(ex.returnedItem.quantity || 1)).toFixed(3));
+                inventoryStore[retIdx].totalUnits = retUnits;
+                inventoryStore[retIdx].stockSingles = retUnits;
+                console.log(`[Termux Hub] Restocked returned exchange item: +${ex.returnedItem.quantity}x ${ex.returnedItem.name}`);
+              }
+            }
+            if (ex.replacementItem?.id) {
+              const repIdx = inventoryStore.findIndex((i) => i.itemId === ex.replacementItem.id || i.id === ex.replacementItem.id);
+              if (repIdx >= 0) {
+                const cur = Number(inventoryStore[repIdx].totalUnits || 0);
+                const repUnits = Number((cur - Number(ex.replacementItem.quantity || 1)).toFixed(3));
+                inventoryStore[repIdx].totalUnits = repUnits;
+                inventoryStore[repIdx].stockSingles = repUnits;
+                console.log(`[Termux Hub] Depleted replacement exchange item: -${ex.replacementItem.quantity}x ${ex.replacementItem.name}`);
               }
             }
           }
@@ -393,9 +831,7 @@ wss.on('connection', (ws, req) => {
             };
             ws.send(JSON.stringify(ackPacket));
             console.log(`[Termux Hub] Sale #${saleId} recorded. Sent SYNC_RECEIPT ACK to sender.`);
-          } catch (ackErr) {
-            console.warn('[Termux Hub] Failed to send SYNC_RECEIPT ACK:', ackErr.message);
-          }
+          } catch (ackErr) {}
         }
       }
 
@@ -422,7 +858,6 @@ wss.on('connection', (ws, req) => {
             directGrvsStore.unshift(grv);
           }
 
-          // Stock Inward: If voucher is APPROVED or posted, increment stock in inventoryStore
           if (grv.status !== 'REJECTED' && Array.isArray(grv.items)) {
             for (const item of grv.items) {
               const cleanId = (item.productId || item.itemId || item.id || '').trim();
@@ -455,46 +890,7 @@ wss.on('connection', (ws, req) => {
             }
           }
 
-          // If paid from till, record till payment cash movement into cashMovementsStore
-          if (grv.status !== 'REJECTED' && grv.payFromTill !== false && grv.paymentMethod !== 'INVOICE_ON_ACCOUNT') {
-            const shiftDate = grv.date || (grv.createdAt ? grv.createdAt.split('T')[0] : new Date().toISOString().split('T')[0]);
-            const payments = Array.isArray(grv.payments) && grv.payments.length > 0 ? grv.payments : [{ userId: grv.receivedByStaffId || 'USR-003', userName: grv.receivedByStaffName || 'Cashier', amount: grv.totalCost || 0 }];
-
-            payments.forEach((p, pIdx) => {
-              const pAmt = Number(p.amount) || 0;
-              if (pAmt <= 0) return;
-              const moveId = `MOVE-GRV-${grv.grvNumber}-${pIdx + 1}`;
-              const mIdx = cashMovementsStore.findIndex((m) => m.id === moveId || m.sourceRef === grv.grvNumber);
-              const moveRecord = {
-                id: moveId,
-                shiftId: `SHIFT-${p.userId}-${shiftDate}`,
-                staffId: p.userId,
-                staffName: p.userName,
-                terminalId: p.drawerId || 'Till 1',
-                date: shiftDate,
-                timestamp: grv.createdAt || new Date().toISOString(),
-                type: 'supplier_payment',
-                amount: pAmt,
-                currency: 'USD',
-                direction: 'out',
-                affectsDrawer: true,
-                status: 'approved',
-                sourceModule: 'DirectGRV',
-                sourceRef: grv.grvNumber,
-                notes: `Direct Supplier Delivery: ${grv.supplierName} (${grv.grvNumber})`,
-                company_id: grv.companyId || grv.company_id || 'COMP-001',
-                branch_id: grv.branchId || grv.branch_id || 'BR-MAIN',
-              };
-              if (mIdx >= 0) {
-                cashMovementsStore[mIdx] = { ...cashMovementsStore[mIdx], ...moveRecord };
-              } else {
-                cashMovementsStore.unshift(moveRecord);
-              }
-            });
-          }
-
           scheduleSave();
-          console.log(`[Termux Hub] Ingested Direct Delivery ${grv.grvNumber} for ${grv.supplierName}. Total: $${(grv.totalCost || 0).toFixed(2)}.`);
         }
       }
 
@@ -526,7 +922,6 @@ wss.on('connection', (ws, req) => {
           }
         }
         scheduleSave();
-        console.log(`[Termux Hub] Upserted ${items.length} product catalog record(s). Catalog size: ${inventoryStore.length}`);
       }
 
       // =====================================================================
@@ -549,7 +944,6 @@ wss.on('connection', (ws, req) => {
             cashMovementsStore.unshift(move);
           }
           scheduleSave();
-          console.log(`[Termux Hub] Ingested Cash Movement ${move.id} (${move.type}: $${move.amount}).`);
         }
       }
 
@@ -575,7 +969,6 @@ wss.on('connection', (ws, req) => {
             cashLiftsStore.unshift(lift);
           }
           scheduleSave();
-          console.log(`[Termux Hub] Ingested Cash Lift ${liftId} ($${lift.amount}).`);
         }
       }
 
@@ -605,12 +998,7 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 7. CUSTOMER CHANGE & CREDIT SALES
       // =====================================================================
-      const isCustomerChange =
-        pType === 'CUSTOMER_CHANGE' ||
-        sheetName === 'CustomerChange' ||
-        (payload && payload.changeId);
-
-      if (isCustomerChange && payload && payload.changeId) {
+      if ((pType === 'CUSTOMER_CHANGE' || sheetName === 'CustomerChange') && payload && payload.changeId) {
         const exIdx = customerChangesStore.findIndex((c) => c.changeId === payload.changeId || c.id === payload.changeId);
         if (exIdx >= 0) {
           customerChangesStore[exIdx] = { ...customerChangesStore[exIdx], ...payload };
@@ -620,12 +1008,7 @@ wss.on('connection', (ws, req) => {
         scheduleSave();
       }
 
-      const isCreditSale =
-        pType === 'CREDIT_SALE' ||
-        sheetName === 'CreditSales' ||
-        (payload && payload.creditId);
-
-      if (isCreditSale && payload && payload.creditId) {
+      if ((pType === 'CREDIT_SALE' || sheetName === 'CreditSales') && payload && payload.creditId) {
         const exIdx = creditSalesStore.findIndex((c) => c.creditId === payload.creditId || c.id === payload.creditId);
         if (exIdx >= 0) {
           creditSalesStore[exIdx] = { ...creditSalesStore[exIdx], ...payload };
@@ -638,13 +1021,7 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 8. STOCK MOVEMENTS (WASTAGE / BREAKAGE / ADJUSTMENTS)
       // =====================================================================
-      const isStockMovement =
-        pType === 'STOCK_MOVEMENT' ||
-        sheetName === 'StockMovement' ||
-        entityType === 'stock_movement' ||
-        (payload && payload.movementType);
-
-      if (isStockMovement && payload && (payload.id || payload.movementId)) {
+      if ((pType === 'STOCK_MOVEMENT' || sheetName === 'StockMovement') && payload && (payload.id || payload.movementId)) {
         const mId = payload.id || payload.movementId;
         const exIdx = stockMovementsStore.findIndex((m) => m.id === mId || m.movementId === mId);
         if (exIdx >= 0) {
@@ -658,28 +1035,54 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 9. EXPENSES & CASH TRANSFERS
       // =====================================================================
-      if (pType === 'EXPENSE' || sheetName === 'Expenses' || entityType === 'expense') {
-        if (payload && payload.id) {
-          const exIdx = expensesStore.findIndex((e) => e.id === payload.id);
-          if (exIdx >= 0) {
-            expensesStore[exIdx] = { ...expensesStore[exIdx], ...payload };
-          } else {
-            expensesStore.unshift(payload);
-          }
-          scheduleSave();
+      if ((pType === 'EXPENSE' || sheetName === 'Expenses') && payload && payload.id) {
+        const exIdx = expensesStore.findIndex((e) => e.id === payload.id);
+        if (exIdx >= 0) {
+          expensesStore[exIdx] = { ...expensesStore[exIdx], ...payload };
+        } else {
+          expensesStore.unshift(payload);
         }
+        scheduleSave();
       }
 
-      if (pType === 'CASH_TRANSFER' || sheetName === 'CashTransfers' || entityType === 'cash_transfer') {
-        if (payload && payload.id) {
-          const exIdx = cashTransfersStore.findIndex((t) => t.id === payload.id);
-          if (exIdx >= 0) {
-            cashTransfersStore[exIdx] = { ...cashTransfersStore[exIdx], ...payload };
-          } else {
-            cashTransfersStore.unshift(payload);
-          }
-          scheduleSave();
+      if ((pType === 'CASH_TRANSFER' || sheetName === 'CashTransfers') && payload && payload.id) {
+        const exIdx = cashTransfersStore.findIndex((t) => t.id === payload.id);
+        if (exIdx >= 0) {
+          cashTransfersStore[exIdx] = { ...cashTransfersStore[exIdx], ...payload };
+        } else {
+          cashTransfersStore.unshift(payload);
         }
+        scheduleSave();
+      }
+
+      // =====================================================================
+      // 9.1 STAFF (TILL OPERATORS) & CUSTOMER PROFILES SYNC
+      // =====================================================================
+      const staffObj = packet.staff || (payload && (payload.pin || payload.role) ? payload : null);
+      const isStaff = pType === 'STAFF' || pType === 'STAFF_SYNC' || pType === 'STAFF_RECORD' || sheetName === 'Salespeople' || sheetName === 'users' || !!staffObj;
+      if (isStaff && staffObj && staffObj.id) {
+        const sIdx = salespeopleStore.findIndex((s) => s.id === staffObj.id);
+        if (sIdx >= 0) {
+          salespeopleStore[sIdx] = { ...salespeopleStore[sIdx], ...staffObj };
+        } else {
+          salespeopleStore.unshift(staffObj);
+        }
+        scheduleSave();
+        console.log(`[Termux Hub] Synced Staff account: ${staffObj.name} (${staffObj.id} - ${staffObj.role})`);
+      }
+
+      const custObj = packet.customer || (payload && (payload.customerId || payload.creditLimit !== undefined) ? payload : null);
+      const isCust = pType === 'CUSTOMER' || pType === 'CUSTOMER_SYNC' || pType === 'CUSTOMER_RECORD' || sheetName === 'Customers' || !!custObj;
+      if (isCust && custObj && (custObj.customerId || custObj.id)) {
+        const cId = custObj.customerId || custObj.id;
+        const cIdx = customersStore.findIndex((c) => (c.customerId || c.id) === cId);
+        if (cIdx >= 0) {
+          customersStore[cIdx] = { ...customersStore[cIdx], ...custObj };
+        } else {
+          customersStore.unshift(custObj);
+        }
+        scheduleSave();
+        console.log(`[Termux Hub] Synced Customer account: ${custObj.name} (${cId})`);
       }
 
       // =====================================================================
@@ -704,6 +1107,8 @@ wss.on('connection', (ws, req) => {
         const missedStockMovements = stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && getTimestamp(sm) >= sinceTime);
         const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && getTimestamp(ex) >= sinceTime);
         const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, reqBranch) && getTimestamp(tr) >= sinceTime);
+        const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, reqBranch));
+        const missedCustomers = customersStore.filter((c) => isMatch(c, reqComp, reqBranch));
 
         const catchupResponse = {
           type: 'catchup_response',
@@ -714,7 +1119,7 @@ wss.on('connection', (ws, req) => {
           targetDeviceId: reqDeviceId,
           sinceTimestamp,
           cutoffTimestamp: new Date().toISOString(),
-          isReciprocal: true, // Prevents ping-pong loops
+          isReciprocal: true,
           delta: {
             sales: missedSales,
             directGrvs: missedDirectGrvs,
@@ -727,24 +1132,29 @@ wss.on('connection', (ws, req) => {
             stockMovements: missedStockMovements,
             expenses: missedExpenses,
             cashTransfers: missedCashTransfers,
+            casualWorkers: casualWorkersStore,
+            zoneAssignments: zoneAssignmentsStore,
+            branchLockdowns: branchLockdownsStore,
+            salespeople: missedSalespeople,
+            customers: missedCustomers,
           },
         };
 
         try {
           ws.send(JSON.stringify(catchupResponse));
           console.log(
-            `[Termux Hub] Replayed catch-up to ${reqDeviceId}: ${missedSales.length} sales, ${missedDirectGrvs.length} GRVs, ${missedCashLogs.length} cash logs, ${missedCashLifts.length} cash lifts, ${missedInventory.length} items (since ${new Date(sinceTime).toLocaleTimeString()}).`
+            `[Termux Hub] Replayed catch-up to ${reqDeviceId}: ${missedSales.length} sales, ${missedDirectGrvs.length} GRVs, ${missedSalespeople.length} staff, ${missedCustomers.length} customers, ${casualWorkersStore.length} casuals.`
           );
         } catch (e) {
           console.warn('[Termux Hub] Failed to send catchup response:', e.message);
         }
-        return; // Handled directly, do NOT broadcast catchup_request to other peers!
+        return;
       }
 
       // =====================================================================
       // 11. STRICT SENDER EXCLUSION BROADCAST (ANTI-ECHO)
       // =====================================================================
-      // Forward real sales and mutations to all other connected devices, never back to sender
+      // Forward real sales and non-blind mutations to all other connected devices
       let forwardedCount = 0;
       wss.clients.forEach((client) => {
         if (client !== ws && client.readyState === WebSocket.OPEN) {
@@ -773,8 +1183,9 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`====================================================`);
-  console.log(` Saimetric Local Hub v3.0 running on ws://0.0.0.0:${PORT}`);
+  console.log(` Saimetric Local Hub v3.2 running on ws://0.0.0.0:${PORT}`);
   console.log(` Portable Hotspot Default IP: ws://192.168.43.1:${PORT}`);
-  console.log(` Ready for 100% offline branch store synchronization.`);
+  console.log(` CommonJS Native Syntax: READY FOR TERMUX NODE.JS`);
+  console.log(` Blind Double-Count Stocktake Vault: ACTIVATED`);
   console.log(`====================================================`);
 });

@@ -59,6 +59,9 @@ import {
   CashTransfer,
   CreditGroup,
   CashGovernanceConfig,
+  StocktakeZoneAssignment,
+  StocktakeVarianceItem,
+  HubBlindSubmission,
 } from '../types';
 import {
   addMovement,
@@ -187,6 +190,7 @@ export const STORAGE_KEYS = {
   CASH_TRANSFERS: 'saimetric_room_cash_transfers',
   CREDIT_GROUPS: 'saimetric_room_credit_groups',
   CASH_GOVERNANCE_CONFIG: 'saimetric_room_cash_governance_config',
+  STOCKTAKE_ZONE_ASSIGNMENTS: 'saimetric_room_stocktake_zone_assignments',
 };
 
 export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
@@ -1658,6 +1662,12 @@ export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }
   };
   const updated = [...all, created];
   setStored(STORAGE_KEYS.SALESPEOPLE, updated);
+  notifyStaffChanged(created);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: created }));
+  }
   
   // Queue sync
   enqueueSync('Salespeople', 'INSERT', created);
@@ -1701,6 +1711,8 @@ export const getOwnerDefaultPermissions = () => ({
   canExecuteOwnerOverride: true,
   canAccessWhereIsMyMoney: true,
   canAccessDualCashCustody: true,
+  canStocktake: true,
+  canManageStocktake: true,
 });
 
 export const saveSalesperson = (person: Salesperson): Salesperson => {
@@ -1741,12 +1753,22 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
   if (index >= 0) {
     all[index] = { ...all[index], ...merged };
     setStored(STORAGE_KEYS.SALESPEOPLE, all);
+    notifyStaffChanged(all[index]);
     notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: all[index] }));
+      window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: all[index] }));
+    }
     return all[index];
   } else {
     const updated = [...all, merged];
     setStored(STORAGE_KEYS.SALESPEOPLE, updated);
+    notifyStaffChanged(merged);
     notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: merged }));
+      window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: merged }));
+    }
     return merged;
   }
 };
@@ -1763,6 +1785,13 @@ export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Sa
   const current = getSessionUser();
   if (current && current.id === id) {
     setSessionUser(updatedPerson);
+  }
+
+  notifyStaffChanged(updatedPerson);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: updatedPerson }));
+    window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: updatedPerson }));
   }
 
   enqueueSync('Salespeople', 'UPDATE', updatedPerson);
@@ -2009,7 +2038,6 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
     });
   }
 
-  // Save to Sheet "Customers": CustomerID, Name, Phone, Address, CreatedDate, CreatedBy
   enqueueSync('Customers', 'INSERT', {
     company_id: compId,
     branch_id: brId,
@@ -2020,6 +2048,12 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
     CreatedDate: created.createdDate,
     CreatedBy: created.createdBy,
   });
+
+  notifyCustomerChanged(created);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: created }));
+  }
 
   return created;
 };
@@ -5305,13 +5339,73 @@ export const onSaleCreated = (listener: SaleCreationListener) => {
   };
 };
 
+export type SaleUpdateListener = (sale: SaleInvoice) => void;
+const saleUpdateListeners: Set<SaleUpdateListener> = new Set();
+export const onSaleUpdated = (listener: SaleUpdateListener) => {
+  saleUpdateListeners.add(listener);
+  return () => {
+    saleUpdateListeners.delete(listener);
+  };
+};
+export const notifySaleUpdated = (sale: SaleInvoice) => {
+  saleUpdateListeners.forEach((fn) => {
+    try {
+      fn(sale);
+    } catch (e) {
+      console.error('saleUpdateListener error:', e);
+    }
+  });
+};
+
+export type StaffChangeListener = (staff: Salesperson) => void;
+const staffChangeListeners: Set<StaffChangeListener> = new Set();
+export const onStaffChanged = (listener: StaffChangeListener) => {
+  staffChangeListeners.add(listener);
+  return () => {
+    staffChangeListeners.delete(listener);
+  };
+};
+export const notifyStaffChanged = (staff: Salesperson) => {
+  staffChangeListeners.forEach((fn) => {
+    try {
+      fn(staff);
+    } catch (e) {
+      console.error('staffChangeListener error:', e);
+    }
+  });
+};
+
+export type CustomerChangeListener = (customer: any) => void;
+const customerChangeListeners: Set<CustomerChangeListener> = new Set();
+export const onCustomerChanged = (listener: CustomerChangeListener) => {
+  customerChangeListeners.add(listener);
+  return () => {
+    customerChangeListeners.delete(listener);
+  };
+};
+export const notifyCustomerChanged = (customer: any) => {
+  customerChangeListeners.forEach((fn) => {
+    try {
+      fn(customer);
+    } catch (e) {
+      console.error('customerChangeListener error:', e);
+    }
+  });
+};
+
 export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   if (!sale || !sale.id) return false;
 
-  // Ultra-fast O(1) in-memory deduplication check:
-  // Drop immediately without doing expensive disk/JSON deserialization or branch math
+  const isSaleUpdate =
+    sale.status === 'Refunded' ||
+    sale.status === 'Voided' ||
+    Boolean(sale.hasExchanges) ||
+    Boolean((sale as any).isUpdate);
+
+  // Ultra-fast O(1) in-memory deduplication check for brand new sales:
+  // Updates (refunds, voids, exchanges) bypass this check
   initSeenSaleIds();
-  if (inMemorySeenSaleIds.has(sale.id)) {
+  if (!isSaleUpdate && inMemorySeenSaleIds.has(sale.id)) {
     return false;
   }
 
@@ -5351,9 +5445,225 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   inMemorySeenSaleIds.add(sale.id);
 
   const list = getRawStoredSales();
-  const existing = list.find((s) => s.id === sale.id);
+  const existingIdx = list.findIndex((s) => s.id === sale.id);
+  const existing = existingIdx >= 0 ? list[existingIdx] : null;
+
   if (existing) {
-    return false;
+    // Check if this incoming sale is an update to an existing sale
+    const isRefundTransition = sale.status === 'Refunded' && existing.status !== 'Refunded';
+    const isVoidTransition = sale.status === 'Voided' && existing.status !== 'Voided';
+    const existingExchangeCount = Array.isArray(existing.exchanges) ? existing.exchanges.length : 0;
+    const incomingExchangeCount = Array.isArray(sale.exchanges) ? sale.exchanges.length : 0;
+    const hasNewExchanges = incomingExchangeCount > existingExchangeCount;
+
+    if (!isRefundTransition && !isVoidTransition && !hasNewExchanges) {
+      // Nothing changed on this sale; safe duplicate drop
+      return false;
+    }
+
+    // APPLY UPDATE:
+    const updatedSale: SaleInvoice = {
+      ...existing,
+      ...sale,
+      status: sale.status || existing.status,
+      refundReason: sale.refundReason || existing.refundReason,
+      refundedAt: sale.refundedAt || existing.refundedAt,
+      refundApprovedBy: sale.refundApprovedBy || existing.refundApprovedBy,
+      refundApprovedById: sale.refundApprovedById || existing.refundApprovedById,
+      voidReason: sale.voidReason || existing.voidReason,
+      voidedAt: sale.voidedAt || existing.voidedAt,
+      voidApprovedBy: sale.voidApprovedBy || existing.voidApprovedBy,
+      voidApprovedById: sale.voidApprovedById || existing.voidApprovedById,
+      exchanges: sale.exchanges || existing.exchanges,
+      hasExchanges: sale.hasExchanges ?? existing.hasExchanges,
+      netTotal: sale.netTotal ?? existing.netTotal,
+    };
+
+    list[existingIdx] = updatedSale;
+    setStored(STORAGE_KEYS.SALES, list);
+
+    // 1. If transitioned to Refunded:
+    if (isRefundTransition) {
+      console.log(`[ingestMeshSale] Processing Peer Refund for Sale #${sale.id}`);
+      // Restock inventory for refunded items
+      if (Array.isArray(sale.items)) {
+        sale.items.forEach((item) => {
+          if (item.id && item.quantity > 0) {
+            updateProductStock(item.id, item.quantity, undefined, undefined, {
+              staffId: sale.refundApprovedById || sale.staffId,
+              staffName: sale.refundApprovedBy || sale.staffName,
+              referenceId: sale.id,
+              reason: `Peer Mesh Refund Restock: +${item.quantity} ${item.name || ''} (Refunded Invoice #${sale.id} - ${sale.refundReason || ''})`,
+              actionTaken: 'REFUND_RESTOCK',
+              txnType: 'RETURN',
+              fromMesh: true,
+            });
+          }
+        });
+      }
+
+      // If cash sale, deduct from Cashier Drawer balance & Form 2 so cash balances across all tablets!
+      if (sale.paymentMethod === 'Cash') {
+        const targetStaffId = sale.staffId || '001';
+        const targetStaffName = sale.staffName || 'Cashier';
+        const refundDate = (sale.refundedAt || new Date().toISOString()).split('T')[0];
+
+        addCashLog({
+          timestamp: sale.refundedAt || new Date().toISOString(),
+          date: refundDate,
+          staffId: targetStaffId,
+          staffName: targetStaffName,
+          line: 'Refunds / Returns',
+          description: `Peer Mesh Cash refund for Invoice #${sale.id} (${sale.refundReason || 'Refund'}) - Auth by ${sale.refundApprovedBy || 'Manager'}`,
+          in: 0,
+          out: sale.total,
+          category: 'Refund',
+          reference: sale.id,
+          company_id: sale.company_id || sale.companyId,
+          branch_id: sale.branch_id || sale.branchId,
+          fromMesh: true,
+          skipSync: true,
+        });
+
+        addMovement({
+          shiftId: getShiftId(targetStaffId, refundDate),
+          staffId: targetStaffId,
+          date: refundDate,
+          timestamp: sale.refundedAt || new Date().toISOString(),
+          type: 'refund',
+          amount: sale.total,
+          currency: sale.currency || 'USD',
+          direction: 'out',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'POS',
+          sourceRef: sale.id,
+          notes: `Peer Mesh Cash refund #${sale.id} ($${sale.total.toFixed(2)}) auth by ${sale.refundApprovedBy || 'Manager'}`,
+          approvedBy: sale.refundApprovedById,
+          approvedByName: sale.refundApprovedBy,
+          company_id: sale.company_id || sale.companyId,
+          branch_id: sale.branch_id || sale.branchId,
+          fromMesh: true,
+        });
+      }
+    }
+
+    // 2. If transitioned to Voided:
+    if (isVoidTransition) {
+      console.log(`[ingestMeshSale] Processing Peer Void for Sale #${sale.id}`);
+      if (Array.isArray(sale.items)) {
+        sale.items.forEach((item) => {
+          if (item.id && item.quantity > 0) {
+            updateProductStock(item.id, item.quantity, undefined, undefined, {
+              staffId: sale.voidApprovedById || sale.staffId,
+              staffName: sale.voidApprovedBy || sale.staffName,
+              referenceId: sale.id,
+              reason: `Peer Mesh Void Restock: +${item.quantity} ${item.name || ''} (Voided Invoice #${sale.id} - ${sale.voidReason || ''})`,
+              actionTaken: 'VOID_RESTOCK',
+              txnType: 'RETURN',
+              fromMesh: true,
+            });
+          }
+        });
+      }
+      if (sale.paymentMethod === 'Cash') {
+        const targetStaffId = sale.staffId || '001';
+        const targetStaffName = sale.staffName || 'Cashier';
+        const voidDate = (sale.voidedAt || new Date().toISOString()).split('T')[0];
+        addCashLog({
+          timestamp: sale.voidedAt || new Date().toISOString(),
+          date: voidDate,
+          staffId: targetStaffId,
+          staffName: targetStaffName,
+          line: 'Voids / Reversals',
+          description: `Peer Mesh Cash reversal for Voided Invoice #${sale.id} (${sale.voidReason || 'Voided'})`,
+          in: 0,
+          out: sale.total,
+          category: 'Refund',
+          reference: sale.id,
+          fromMesh: true,
+          skipSync: true,
+        });
+      }
+    }
+
+    // 3. If new item exchanges:
+    if (hasNewExchanges && Array.isArray(sale.exchanges)) {
+      const newExchanges = sale.exchanges.slice(existingExchangeCount);
+      for (const ex of newExchanges) {
+        if (ex.returnedItem?.id && ex.returnedItem.restockCondition === 'restock' && ex.returnedItem.quantity > 0) {
+          updateProductStock(ex.returnedItem.id, ex.returnedItem.quantity, undefined, undefined, {
+            staffId: ex.cashierId || sale.staffId,
+            staffName: ex.cashierName || sale.staffName,
+            referenceId: sale.id,
+            reason: `Peer Exchange Restock: +${ex.returnedItem.quantity} ${ex.returnedItem.name} (Invoice #${sale.id})`,
+            actionTaken: 'EXCHANGE_RESTOCK',
+            txnType: 'RETURN',
+            fromMesh: true,
+          });
+        }
+        if (ex.replacementItem?.id && ex.replacementItem.quantity > 0) {
+          updateProductStock(ex.replacementItem.id, -ex.replacementItem.quantity, undefined, undefined, {
+            staffId: ex.cashierId || sale.staffId,
+            staffName: ex.cashierName || sale.staffName,
+            referenceId: sale.id,
+            reason: `Peer Exchange Issued: -${ex.replacementItem.quantity} ${ex.replacementItem.name} (Invoice #${sale.id})`,
+            actionTaken: 'EXCHANGE_ISSUE',
+            txnType: 'SALE',
+            fromMesh: true,
+          });
+        }
+        // Drawer cash adjustment for exchange net difference
+        if (ex.netDifference && ex.paymentMethod === 'Cash') {
+          const shiftId = getShiftId(ex.cashierId || sale.staffId, ex.date || sale.date);
+          if (ex.netDifference > 0) {
+            addMovement({
+              shiftId,
+              staffId: ex.cashierId || sale.staffId,
+              date: ex.date || sale.date,
+              timestamp: ex.timestamp || new Date().toISOString(),
+              type: 'exchange_payment',
+              amount: ex.netDifference,
+              currency: sale.currency || 'USD',
+              direction: 'in',
+              affectsDrawer: true,
+              status: 'approved',
+              sourceModule: 'POS',
+              sourceRef: sale.id,
+              notes: `Peer Exchange net payment (+$${ex.netDifference.toFixed(2)}) for Invoice #${sale.id}`,
+              fromMesh: true,
+            });
+          } else if (ex.netDifference < 0) {
+            const refundAmt = Math.abs(ex.netDifference);
+            addMovement({
+              shiftId,
+              staffId: ex.cashierId || sale.staffId,
+              date: ex.date || sale.date,
+              timestamp: ex.timestamp || new Date().toISOString(),
+              type: 'exchange_refund',
+              amount: refundAmt,
+              currency: sale.currency || 'USD',
+              direction: 'out',
+              affectsDrawer: true,
+              status: 'approved',
+              sourceModule: 'POS',
+              sourceRef: sale.id,
+              notes: `Peer Exchange refund differential (-$${refundAmt.toFixed(2)}) for Invoice #${sale.id}`,
+              fromMesh: true,
+            });
+          }
+        }
+      }
+    }
+
+    notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: updatedSale }));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+    }
+    return true;
   }
 
   const normalized: SaleInvoice = {
@@ -6077,6 +6387,15 @@ export const refundSaleInvoice = (params: {
     },
   });
 
+  notifySaleUpdated(invoice);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: invoice }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+  }
+
   return { success: true, message: `Invoice #${invoice.id} successfully refunded.`, invoice };
 };
 
@@ -6141,6 +6460,14 @@ export const voidSaleInvoice = (params: {
     amount: invoice.total,
     details: `Invoice #${invoice.id} ($${invoice.total.toFixed(2)}) voided by ${params.manager.role} ${params.manager.name}. Reason: ${params.reason}`,
   });
+
+  notifySaleUpdated(invoice);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: invoice }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+  }
 
   return { success: true, message: `Invoice #${invoice.id} voided successfully.`, invoice };
 };
@@ -6359,7 +6686,14 @@ export const exchangeSaleItems = (params: {
     },
   });
 
+  notifySaleUpdated(invoice);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: invoice }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+  }
 
   return {
     success: true,
@@ -12596,6 +12930,222 @@ export const authenticateCasualWorker = (pin: string): TemporaryCasualAccount | 
   if (!cleanPin) return null;
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
   return all.find((c) => c.active && c.pin === cleanPin) || null;
+};
+
+export const syncCasualWorkersFromHub = (casuals: TemporaryCasualAccount[]): void => {
+  if (!Array.isArray(casuals)) return;
+  const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  const map = new Map<string, TemporaryCasualAccount>();
+  all.forEach((c) => map.set(c.pin, c));
+  casuals.forEach((c) => {
+    if (c && c.pin) {
+      map.set(c.pin, { ...map.get(c.pin), ...c });
+    }
+  });
+  setStored(STORAGE_KEYS.TEMPORARY_CASUALS, Array.from(map.values()));
+  notifyListeners();
+};
+
+export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
+  if (!lockdown || !lockdown.branchId) return;
+  const lockdowns = getBranchLockdowns();
+  lockdowns[lockdown.branchId] = lockdown;
+  setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
+  notifyListeners();
+};
+
+// ============================================================================
+// SELF-SERVICE ZONE ASSIGNMENT & PEER DUAL-SIGNATURE JOINT RECOUNT DAO
+// ============================================================================
+export const getZoneAssignments = (sessionId?: string): StocktakeZoneAssignment[] => {
+  const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  if (!sessionId) return all;
+  return all.filter((z) => z.sessionId === sessionId);
+};
+
+export const saveZoneAssignment = (zone: StocktakeZoneAssignment): void => {
+  const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  const idx = all.findIndex((z) => z.sessionId === zone.sessionId && z.zoneId === zone.zoneId);
+  if (idx >= 0) {
+    all[idx] = zone;
+  } else {
+    all.push(zone);
+  }
+  setStored(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, all);
+  notifyListeners();
+};
+
+export const claimZoneSlot = (
+  sessionId: string,
+  zoneId: string,
+  slot: 'A' | 'B',
+  deviceId: string,
+  staffId: string,
+  staffName: string,
+  zoneName?: string
+): StocktakeZoneAssignment => {
+  const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  let zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+  const currentBranch = getCurrentBranchId();
+
+  if (!zone) {
+    zone = {
+      zoneId,
+      zoneName: zoneName || zoneId,
+      sessionId,
+      branchId: currentBranch,
+      status: slot === 'A' ? 'IN_PROGRESS' : 'AWAITING_DOUBLE_COUNT',
+    };
+    all.push(zone);
+  }
+
+  if (slot === 'A') {
+    zone.teamA = {
+      deviceId,
+      staffId,
+      staffName,
+      claimedAt: new Date().toISOString(),
+      submitted: false,
+    };
+    if (zone.status === 'AVAILABLE') {
+      zone.status = 'IN_PROGRESS';
+    }
+  } else {
+    zone.teamB = {
+      deviceId,
+      staffId,
+      staffName,
+      claimedAt: new Date().toISOString(),
+      submitted: false,
+    };
+    if (zone.status === 'AVAILABLE' || zone.status === 'IN_PROGRESS') {
+      zone.status = 'IN_PROGRESS';
+    }
+  }
+
+  saveZoneAssignment(zone);
+  return zone;
+};
+
+export const recordBlindSubmissionLocal = (
+  sessionId: string,
+  zoneId: string,
+  slot: 'A' | 'B',
+  lines: StocktakeLineCount[],
+  staffId: string,
+  staffName: string
+): StocktakeZoneAssignment | null => {
+  const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  const zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+  if (!zone) return null;
+
+  if (slot === 'A') {
+    zone.teamA = {
+      ...(zone.teamA || {}),
+      staffId,
+      staffName,
+      submitted: true,
+      submittedAt: new Date().toISOString(),
+      lineCount: lines.length,
+    };
+    zone.count1 = lines;
+    if (!zone.teamB?.submitted) {
+      zone.status = 'AWAITING_DOUBLE_COUNT';
+    }
+  } else {
+    zone.teamB = {
+      ...(zone.teamB || {}),
+      staffId,
+      staffName,
+      submitted: true,
+      submittedAt: new Date().toISOString(),
+      lineCount: lines.length,
+    };
+    zone.count2 = lines;
+    if (!zone.teamA?.submitted) {
+      zone.status = 'IN_PROGRESS';
+    }
+  }
+
+  saveZoneAssignment(zone);
+  return zone;
+};
+
+export const updateZoneFromHubStatus = (
+  sessionId: string,
+  zoneId: string,
+  status: StocktakeZoneAssignment['status'],
+  discrepancies?: StocktakeVarianceItem[],
+  verifiedCounts?: StocktakeVerifiedLine[]
+): StocktakeZoneAssignment | null => {
+  const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  let zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+  if (!zone) {
+    zone = {
+      zoneId,
+      zoneName: zoneId,
+      sessionId,
+      branchId: getCurrentBranchId(),
+      status,
+    };
+    all.push(zone);
+  }
+
+  zone.status = status;
+  if (discrepancies) zone.discrepancies = discrepancies;
+  if (verifiedCounts) zone.verifiedCounts = verifiedCounts;
+
+  saveZoneAssignment(zone);
+  return zone;
+};
+
+export const applyJointRecountSignature = (
+  sessionId: string,
+  zoneId: string,
+  slot: 'A' | 'B',
+  staffName: string,
+  lines?: StocktakeLineCount[]
+): { zone: StocktakeZoneAssignment; isComplete: boolean } => {
+  const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  let zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+  if (!zone) throw new Error(`Zone ${zoneId} not found.`);
+
+  if (!zone.jointRecount) {
+    zone.jointRecount = {
+      signedByA: false,
+      signedByB: false,
+      lines: lines || [],
+    };
+  }
+
+  if (lines && lines.length > 0) {
+    zone.jointRecount.lines = lines;
+    zone.jointRecount.proposedBy = slot;
+    zone.jointRecount.proposedByName = staffName;
+  }
+
+  if (slot === 'A') zone.jointRecount.signedByA = true;
+  if (slot === 'B') zone.jointRecount.signedByB = true;
+
+  const isComplete = Boolean(zone.jointRecount.signedByA && zone.jointRecount.signedByB);
+  if (isComplete) {
+    zone.status = 'VERIFIED';
+    zone.jointRecount.resolvedAt = new Date().toISOString();
+    zone.verifiedCounts = (zone.jointRecount.lines || []).map((l: any) => ({
+      itemId: l.itemId,
+      itemName: l.itemName,
+      category: l.category,
+      sku: l.sku,
+      unitsPerCase: l.unitsPerCase || 1,
+      cases: l.cases || 0,
+      singles: l.singles || 0,
+      totalUnits: l.totalUnits || 0,
+      source: 'JOINT_RECOUNT',
+    }));
+  }
+
+  saveZoneAssignment(zone);
+  return { zone, isComplete };
 };
 
 // ============================================================================

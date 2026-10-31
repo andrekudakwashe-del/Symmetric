@@ -1,6 +1,6 @@
 {
-  "summary":  "Detailed implementation plan for Data Isolation & Hub Identity architecture. Covers the pre-auth lobby & handshake (PING_HUB / HUB_INFO), branch-scoped queuing to prevent cross-branch data contamination by roaming owners, Cloud-Only Mode enforcement, and the Reset Hub Identity workflow in Local Hub Settings and termux-hub.js.",
-  "updatedAt":  "2026-10-28T08:40:48.764950225Z",
+  "summary":  "Updated comprehensive architectural implementation plan incorporating Universal Lockdown & Self-Service Zone Claiming, Casual PIN distribution over Local Hub, True Blind Counting with Hub Secret Vault, Joint Recount with peer-to-peer Dual Signature (no manager bottleneck), CommonJS Termux Hub specification, branch isolation preservation, and Form 2 & Search performance fixes.",
+  "updatedAt":  "2026-10-30T18:18:39.417574211Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

@@ -142,11 +142,29 @@ const saveAllMovements = (movements: CashMovement[]) => {
   }
 };
 
+export type CashMovementListener = (movement: CashMovement) => void;
+const cashMovementListeners: Set<CashMovementListener> = new Set();
+export const onCashMovementCreated = (listener: CashMovementListener) => {
+  cashMovementListeners.add(listener);
+  return () => {
+    cashMovementListeners.delete(listener);
+  };
+};
+export const notifyCashMovementCreated = (movement: CashMovement) => {
+  cashMovementListeners.forEach((fn) => {
+    try {
+      fn(movement);
+    } catch (e) {
+      console.error('cashMovementListener error:', e);
+    }
+  });
+};
+
 /**
  * Add a movement to the ledger
  */
 export const addMovement = (
-  m: Omit<CashMovement, 'id' | 'createdAt' | 'updatedAt'> & { id?: string },
+  m: Omit<CashMovement, 'id' | 'createdAt' | 'updatedAt'> & { id?: string; fromMesh?: boolean },
   options?: { allowNegativeBalance?: boolean }
 ): CashMovement => {
   const currentBranch = m.branch_id || getActiveBranchId();
@@ -158,7 +176,8 @@ export const addMovement = (
     m.type === 'supervisor_lift' &&
     m.affectsDrawer &&
     (m.status === 'approved' || m.status === 'pending-POS-auto') &&
-    !options?.allowNegativeBalance
+    !options?.allowNegativeBalance &&
+    !m.fromMesh
   ) {
     const currency = m.currency || 'USD';
     const currentBal = computeDrawerBalance(shiftId, currency, currentBranch);
@@ -184,6 +203,11 @@ export const addMovement = (
   const current = getAllMovements();
   const updated = [fullMovement, ...current];
   saveAllMovements(updated);
+
+  if (!m.fromMesh) {
+    notifyCashMovementCreated(fullMovement);
+  }
+
   return fullMovement;
 };
 

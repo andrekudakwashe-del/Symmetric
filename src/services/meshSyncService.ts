@@ -60,8 +60,15 @@ import {
   generateInvoiceNumber,
   getNextInvoiceId,
   markSaleAsSynced,
+  syncCasualWorkersFromHub,
+  syncLockdownFromHub,
+  claimZoneSlot,
+  updateZoneFromHubStatus,
+  onSaleUpdated,
+  onStaffChanged,
+  onCustomerChanged,
 } from '../db/roomDatabase';
-import { getMovements, addMovement } from '../db/cashLedger';
+import { getMovements, addMovement, onCashMovementCreated, CashMovement } from '../db/cashLedger';
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { processSyncQueue } from './googleSheetsSync';
 import { LocalHubConfig, normalizeHubUrl } from '../utils/localHubConfig';
@@ -574,6 +581,26 @@ class MeshSyncManager {
     // Auto-hook into POS Sales: broadcast in real-time
     onSaleCreated((sale: SaleInvoice) => {
       this.broadcastSale(sale);
+    });
+
+    // Auto-hook into POS Sales updates (Refunds, Voids, Item Exchanges): broadcast in real-time
+    onSaleUpdated((sale: SaleInvoice) => {
+      this.broadcastSaleUpdate(sale);
+    });
+
+    // Auto-hook into Staff creation & edits: broadcast to Local Hub & mesh
+    onStaffChanged((staff: Salesperson) => {
+      this.broadcastStaff(staff);
+    });
+
+    // Auto-hook into Customer creation & edits: broadcast to Local Hub & mesh
+    onCustomerChanged((cust: any) => {
+      this.broadcastCustomer(cust);
+    });
+
+    // Auto-hook into Cash Drawer Movements: broadcast in real-time so cash balances across devices
+    onCashMovementCreated((movement: CashMovement) => {
+      this.broadcastCashMovement(movement);
     });
 
     // Auto-hook into POS Inventory: broadcast product changes
@@ -1325,7 +1352,13 @@ class MeshSyncManager {
           }
         }
 
-        if (this.knownSaleIds.has(saleId)) {
+        const isSaleUpdate =
+          packet.action === 'SALE_UPDATE' ||
+          saleData.status === 'Refunded' ||
+          saleData.status === 'Voided' ||
+          Boolean(saleData.hasExchanges);
+
+        if (this.knownSaleIds.has(saleId) && !isSaleUpdate) {
           return;
         }
         this.knownSaleIds.add(saleId);
@@ -1459,6 +1492,114 @@ class MeshSyncManager {
         window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
+      return;
+    }
+
+    // 10.01 CASH MOVEMENTS
+    if (pType === 'cash_movement' || pType === 'CASH_MOVEMENT' || pType === 'CASH_MOVEMENTS' || pType === 'CASH_MOVEMENT_RECORD') {
+      const movement = packet.movement || packet.payload;
+      if (movement && movement.id) {
+        const cur = getMovements();
+        if (!cur.some((m) => m.id === movement.id)) {
+          addMovement({ ...movement, fromMesh: true });
+          window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+      }
+      return;
+    }
+
+    // 10.02 STAFF (TILL OPERATORS)
+    if (pType === 'staff' || pType === 'STAFF' || pType === 'STAFF_SYNC' || pType === 'STAFF_RECORD') {
+      const staff = packet.staff || packet.payload;
+      if (staff && staff.id) {
+        ingestMeshStaff({ ...staff, fromMesh: true } as any);
+        window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
+      }
+      return;
+    }
+
+    // 10.03 CUSTOMERS
+    if (pType === 'customer' || pType === 'CUSTOMER' || pType === 'CUSTOMER_SYNC' || pType === 'CUSTOMER_RECORD') {
+      const customer = packet.customer || packet.payload;
+      if (customer && (customer.customerId || customer.id)) {
+        ingestMeshCustomer({ ...customer, fromMesh: true });
+        window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+      }
+      return;
+    }
+
+    // 10.1 CASUAL WORKERS PIN SYNC
+    if (pType === 'CASUAL_WORKERS_SYNC') {
+      const casuals = packet.casualWorkers || packet.payload || packet.casuals;
+      if (Array.isArray(casuals)) {
+        syncCasualWorkersFromHub(casuals);
+        window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+      }
+      return;
+    }
+
+    // 10.2 STOCKTAKE BRANCH LOCKDOWN BROADCAST
+    if (pType === 'STOCKTAKE_LOCKDOWN_BROADCAST') {
+      syncLockdownFromHub({
+        branchId: packet.branchId || this.config.branchId,
+        isLocked: Boolean(packet.isLocked),
+        sessionId: packet.sessionId,
+        lockedByName: packet.lockedByName,
+        reason: packet.reason,
+      });
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_lockdown_updated', { detail: packet }));
+      return;
+    }
+
+    // 10.3 STOCKTAKE ZONE CLAIMED
+    if (pType === 'STOCKTAKE_ZONE_CLAIMED') {
+      claimZoneSlot(
+        packet.sessionId,
+        packet.zoneId,
+        packet.slot,
+        packet.deviceId,
+        packet.staffId,
+        packet.staffName,
+        packet.zone?.zoneName
+      );
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      return;
+    }
+
+    // 10.4 STOCKTAKE ZONE STATUS UPDATE (BLIND VAULT)
+    if (pType === 'STOCKTAKE_ZONE_STATUS_UPDATE') {
+      updateZoneFromHubStatus(packet.sessionId, packet.zoneId, packet.status);
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      return;
+    }
+
+    // 10.5 STOCKTAKE MATCH VERIFIED
+    if (pType === 'STOCKTAKE_MATCH_VERIFIED') {
+      updateZoneFromHubStatus(packet.sessionId, packet.zoneId, 'VERIFIED', undefined, packet.verifiedCounts);
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: packet }));
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      return;
+    }
+
+    // 10.6 STOCKTAKE VARIANCE ALERT
+    if (pType === 'STOCKTAKE_VARIANCE_ALERT') {
+      updateZoneFromHubStatus(packet.sessionId, packet.zoneId, 'VARIANCE_FLAGGED', packet.discrepancies);
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_variance_alert', { detail: packet }));
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      return;
+    }
+
+    // 10.7 PEER DUAL-SIGNATURE JOINT PROPOSAL
+    if (pType === 'STOCKTAKE_JOINT_PROPOSAL') {
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_joint_proposal', { detail: packet }));
+      return;
+    }
+
+    // 10.8 BLIND SUBMISSION ACK
+    if (pType === 'STOCKTAKE_ACK_SUBMIT') {
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_ack_submit', { detail: packet }));
       return;
     }
 
@@ -3229,6 +3370,17 @@ class MeshSyncManager {
           window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         }
         break;
+      case 'cash_movement':
+        if (payload && payload.id) {
+          const curMoves = getMovements();
+          if (!curMoves.some((m) => m.id === payload.id)) {
+            addMovement({ ...payload, fromMesh: true });
+            didIngest = true;
+            window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          }
+        }
+        break;
       case 'customer':
         if (sheet === 'CustomerChange' || payload.changeId) {
           didIngest = ingestMeshCustomerChange(payload);
@@ -3786,6 +3938,31 @@ class MeshSyncManager {
       }
     }
 
+    // 8.1 Ingest Staff (Till Operators) & Customers
+    let staffIngested = 0;
+    if (Array.isArray(delta.salespeople)) {
+      for (const st of delta.salespeople) {
+        if (ingestMeshStaff({ ...st, fromMesh: true })) {
+          staffIngested++;
+        }
+      }
+      if (staffIngested > 0 && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
+      }
+    }
+    let custIngested = 0;
+    if (Array.isArray(delta.customers)) {
+      for (const cust of delta.customers) {
+        if (ingestMeshCustomer({ ...cust, fromMesh: true })) {
+          custIngested++;
+        }
+      }
+      if (custIngested > 0 && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+      }
+    }
+
     // Update last sync cutoff timestamp
     if (packet.cutoffTimestamp) {
       this.setLastMeshSyncTimestamp(packet.cutoffTimestamp);
@@ -3920,6 +4097,142 @@ class MeshSyncManager {
       sale.id
     );
 
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast an updated sale (Refund, Void, or Item Exchange) to all peers & Local Hub
+   */
+  public async broadcastSaleUpdate(sale: SaleInvoice) {
+    if (this.isIngestingFromHub) return;
+    if (!sale || !sale.id) return;
+
+    const packetId = `SALE-UPD-${sale.id}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'sale',
+      action: 'SALE_UPDATE',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      sale,
+      timestamp: Date.now(),
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('sale', packet);
+
+    this.addLog(
+      'BROADCAST',
+      `Sale #${sale.id} Update (${sale.status || 'Updated'}${sale.hasExchanges ? ' / Exchange' : ''}) broadcasted to WiFi mesh`,
+      this.config.deviceName,
+      undefined,
+      5,
+      sale.id
+    );
+
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast a staff account (Till Operator, Manager, Casual) creation or edit to peers & Hub
+   */
+  public broadcastStaff(staff: any) {
+    if (this.isIngestingFromHub) return;
+    if (!staff || !staff.id) return;
+    if (staff.fromMesh) return;
+
+    const packetId = `STAFF-PKT-${staff.id}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'staff',
+      action: 'STAFF_SYNC',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      staff,
+      payload: staff,
+      timestamp: Date.now(),
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('staff', packet);
+    this.addLog('BROADCAST', `Staff account ${staff.name} (${staff.id} - ${staff.role}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast a customer profile creation or credit limit update to peers & Hub
+   */
+  public broadcastCustomer(customer: any) {
+    if (this.isIngestingFromHub) return;
+    if (!customer) return;
+    if (customer.fromMesh) return;
+
+    const custId = customer.customerId || customer.id || 'C_NEW';
+    const packetId = `CUST-PKT-${custId}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'customer',
+      action: 'CUSTOMER_SYNC',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      customer,
+      payload: customer,
+      timestamp: Date.now(),
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('customer', packet);
+    this.addLog('BROADCAST', `Customer account ${customer.name} (${custId}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast an individual cash drawer movement (refund, change, credit payment, float)
+   */
+  public broadcastCashMovement(movement: any) {
+    if (this.isIngestingFromHub) return;
+    if (!movement || !movement.id) return;
+    if (movement.fromMesh) return;
+
+    const packetId = `MOV-PKT-${movement.id}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'cash_movement',
+      action: 'CASH_MOVEMENT_RECORD',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      movement,
+      payload: movement,
+      timestamp: Date.now(),
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('cash_movement', packet);
+    this.addLog('BROADCAST', `Cash Movement [${movement.type}] $${movement.amount} broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 
@@ -4511,7 +4824,133 @@ class MeshSyncManager {
       devices: virtualDeviceStaff.map((d) => `${d.name} [${d.prefix}]`),
     };
   }
+
+  // =========================================================================
+  // BLIND DOUBLE-COUNT STOCKTAKE & ZONE CLAIMING PROTOCOL DISPATCHERS
+  // =========================================================================
+  public claimStocktakeZone(
+    sessionId: string,
+    zoneId: string,
+    slot: 'A' | 'B',
+    staffId: string,
+    staffName: string,
+    zoneName?: string
+  ): void {
+    const packet = {
+      type: 'STOCKTAKE_ZONE_CLAIM',
+      sessionId,
+      zoneId,
+      slot,
+      deviceId: this.config.deviceId,
+      staffId,
+      staffName,
+      zoneName: zoneName || zoneId,
+      branchId: this.config.branchId,
+      timestamp: Date.now(),
+    };
+    this.sendPacketToAllTransports('stocktake/zone_claim', packet);
+  }
+
+  public submitBlindStocktakeCount(
+    sessionId: string,
+    zoneId: string,
+    slot: 'A' | 'B' | 'RECOUNT',
+    staffId: string,
+    staffName: string,
+    lines: any[]
+  ): void {
+    const packet = {
+      type: 'STOCKTAKE_COUNT_SUBMIT',
+      sessionId,
+      zoneId,
+      slot,
+      deviceId: this.config.deviceId,
+      staffId,
+      staffName,
+      lines,
+      branchId: this.config.branchId,
+      timestamp: Date.now(),
+    };
+    if (this.localHubWs && this.localHubWs.readyState === WebSocket.OPEN) {
+      try {
+        this.localHubWs.send(JSON.stringify(packet));
+        this.addLog('EPIDEMIC_HOP', `Blind count for Zone ${zoneId} (Slot ${slot}) sent to Local Hub.`, this.config.deviceName);
+        return;
+      } catch (e) {}
+    }
+    this.sendPacketToAllTransports('stocktake/blind_count_submit', packet);
+  }
+
+  public proposeJointRecount(
+    sessionId: string,
+    zoneId: string,
+    slot: 'A' | 'B',
+    staffName: string,
+    lines: any[]
+  ): void {
+    const packet = {
+      type: 'STOCKTAKE_JOINT_PROPOSAL',
+      sessionId,
+      zoneId,
+      proposedBySlot: slot,
+      proposedByName: staffName,
+      recountLines: lines,
+      branchId: this.config.branchId,
+      timestamp: Date.now(),
+    };
+    this.sendPacketToAllTransports('stocktake/joint_proposal', packet);
+  }
+
+  public finalizeJointRecount(
+    sessionId: string,
+    zoneId: string,
+    resolvedLines: any[],
+    resolvedByName: string
+  ): void {
+    const packet = {
+      type: 'STOCKTAKE_JOINT_FINALIZED',
+      sessionId,
+      zoneId,
+      resolvedLines,
+      signedByA: true,
+      signedByB: true,
+      resolvedByName,
+      branchId: this.config.branchId,
+      timestamp: Date.now(),
+    };
+    this.sendPacketToAllTransports('stocktake/joint_finalized', packet);
+  }
+
+  public broadcastCasualWorkers(casuals: any[]): void {
+    const packet = {
+      type: 'CASUAL_WORKERS_SYNC',
+      casualWorkers: casuals,
+      branchId: this.config.branchId,
+      timestamp: Date.now(),
+    };
+    this.sendPacketToAllTransports('stocktake/casual_workers_sync', packet);
+  }
+
+  public broadcastStocktakeLockdown(
+    branchId: string,
+    sessionId: string,
+    isLocked: boolean,
+    lockedByName: string,
+    reason?: string
+  ): void {
+    const packet = {
+      type: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+      branchId,
+      sessionId,
+      isLocked,
+      lockedByName,
+      reason,
+      timestamp: Date.now(),
+    };
+    this.sendPacketToAllTransports('stocktake/lockdown_broadcast', packet);
+  }
 }
 
 export const meshSyncService = new MeshSyncManager();
 export { generateInvoiceNumber, getNextInvoiceId };
+

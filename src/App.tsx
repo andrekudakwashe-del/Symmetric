@@ -14,6 +14,7 @@ import {
   getSessionUser,
   setSessionUser,
   saveSalesperson,
+  isBranchInLockdown,
 } from './db/roomDatabase';
 import { AndroidStatusBar } from './components/layout/AndroidStatusBar';
 import { TopHeader } from './components/layout/TopHeader';
@@ -132,9 +133,33 @@ export default function App() {
   const [toastNotification, setToastNotification] = useState<string | null>(null);
 
   const handleNavigateTab = (newTab: ActiveTab) => {
+    if (isBranchInLockdown(currentUser?.branchId) && (newTab === 'pos' || newTab === 'home' || newTab === 'items' || newTab === 'counter')) {
+      historyNavigationService.pushTab('stocktake');
+      setActiveTab('stocktake');
+      return;
+    }
     historyNavigationService.pushTab(newTab);
     setActiveTab(newTab);
   };
+
+  // Real-time Stocktake Lockdown Listener: Freeze POS and navigate to stocktake when lockdown is broadcasted
+  useEffect(() => {
+    const handleLockdownEvent = (e: any) => {
+      const detail = e.detail;
+      if (detail && detail.isLocked) {
+        setActiveTab((prev) => {
+          if (prev === 'pos' || prev === 'home' || prev === 'items' || prev === 'counter') {
+            return 'stocktake';
+          }
+          return prev;
+        });
+      }
+    };
+    window.addEventListener('saimetric_stocktake_lockdown_updated', handleLockdownEvent);
+    return () => {
+      window.removeEventListener('saimetric_stocktake_lockdown_updated', handleLockdownEvent);
+    };
+  }, []);
 
   const handleNavigateToDirectGrv = (grvId?: string) => {
     if (grvId) {
@@ -335,7 +360,11 @@ export default function App() {
     setCurrentUser(user);
     setLoggedInUser(user);
     const landingTab = getLandingTabForUser(user);
-    setActiveTab(landingTab);
+    if (isBranchInLockdown(user.branchId || user.branch_id)) {
+      setActiveTab('stocktake');
+    } else {
+      setActiveTab(landingTab);
+    }
 
     // Re-Handshake on Login: Dispatch fresh HANDSHAKE packet to Local Hub
     meshSyncService.sendHandshake(user.branchId || user.branch_id, user.branchName);

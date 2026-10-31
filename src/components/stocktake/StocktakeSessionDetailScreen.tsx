@@ -45,9 +45,14 @@ import {
   getStocktakeSessionById,
   getCustomerGoodsLeftBehind,
   getTemporaryCasuals,
+  claimZoneSlot,
+  recordBlindSubmissionLocal,
+  getZoneAssignments,
 } from '../../db/roomDatabase';
+import { meshSyncService } from '../../services/meshSyncService';
 import { DoubleCountTerminal } from './DoubleCountTerminal';
 import { SegmentRecountModal } from './SegmentRecountModal';
+import { JointRecountModal } from './JointRecountModal';
 import { ConsolidatedVarianceView } from './ConsolidatedVarianceView';
 import { StocktakeApprovalModal } from './StocktakeApprovalModal';
 import { CustomerGoodsLeftBehindTab } from './CustomerGoodsLeftBehindTab';
@@ -164,7 +169,37 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     setTerminalCounterSlot(slot);
   };
 
-  // Save Double-Blind Count from Terminal
+  // Joint Recount Modal state (Peer Dual-Signature)
+  const [showJointRecountModalSegment, setShowJointRecountModalSegment] = useState<StocktakeSegment | null>(null);
+
+  // Real-time Stocktake Hub listeners
+  useEffect(() => {
+    const handleHubSync = () => {
+      const refreshed = getStocktakeSessionById(session.sessionId);
+      if (refreshed) {
+        setSession(refreshed);
+      }
+    };
+    window.addEventListener('saimetric_stocktake_zone_updated', handleHubSync);
+    window.addEventListener('saimetric_stocktake_match_verified', handleHubSync);
+    window.addEventListener('saimetric_stocktake_variance_alert', handleHubSync);
+    return () => {
+      window.removeEventListener('saimetric_stocktake_zone_updated', handleHubSync);
+      window.removeEventListener('saimetric_stocktake_match_verified', handleHubSync);
+      window.removeEventListener('saimetric_stocktake_variance_alert', handleHubSync);
+    };
+  }, [session.sessionId]);
+
+  const handleClaimZone = (segment: StocktakeSegment, slot: 'A' | 'B') => {
+    const staffId = currentUser?.id || '001';
+    const staffName = currentUser?.name || (slot === 'A' ? 'Counter A' : 'Counter B');
+    claimZoneSlot(session.sessionId, segment.segmentId, slot, 'DEV-LOCAL', staffId, staffName, segment.name);
+    meshSyncService.claimStocktakeZone(session.sessionId, segment.segmentId, slot, staffId, staffName, segment.name);
+    showToast(`Claimed ${segment.name} as Team ${slot}!`);
+    handleLaunchTerminal(segment, slot);
+  };
+
+  // Save Double-Blind Count from Terminal (Secured in Local Hub Vault)
   const handleSaveCountFromTerminal = (
     slot: 'A' | 'B',
     lines: StocktakeLineCount[],
@@ -174,6 +209,26 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     if (!activeTerminalSegment) return;
 
     try {
+      // 1. Point-to-Point Blind Submission to Local Hub (Suppresses Peer Broadcast)
+      meshSyncService.submitBlindStocktakeCount(
+        session.sessionId,
+        activeTerminalSegment.segmentId,
+        slot,
+        counterStaffId,
+        counterStaffName,
+        lines
+      );
+
+      // 2. Save locally
+      recordBlindSubmissionLocal(
+        session.sessionId,
+        activeTerminalSegment.segmentId,
+        slot,
+        lines,
+        counterStaffId,
+        counterStaffName
+      );
+
       const result = submitSegmentCount(
         session.sessionId,
         activeTerminalSegment.segmentId,
@@ -625,7 +680,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
 
                       {/* Discrepancy Alert / Verification summary */}
                       {seg.status === 'DISCREPANCY_RECOUNT' && (
-                        <div className="mt-3 p-2.5 rounded-lg bg-amber-950/40 border border-amber-800/60 text-xs text-amber-200 flex items-center justify-between">
+                        <div className="mt-3 p-3 rounded-xl bg-amber-950/40 border border-amber-800/60 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
                           <div className="flex items-center gap-2">
                             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
                             <span>
@@ -633,12 +688,23 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                               between Count 1 and Count 2.
                             </span>
                           </div>
-                          <button
-                            onClick={() => setActiveRecountSegment(seg)}
-                            className="px-2.5 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded text-[11px] font-bold transition shrink-0 ml-2"
-                          >
-                            Resolve Recount
-                          </button>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setShowJointRecountModalSegment(seg)}
+                              className="px-3 py-1.5 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white rounded-lg text-xs font-black shadow-md transition flex items-center gap-1.5"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              Joint Dual-Signature Recount
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setActiveRecountSegment(seg)}
+                              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold border border-slate-700 transition"
+                            >
+                              Manual Override
+                            </button>
+                          </div>
                         </div>
                       )}
 
@@ -648,7 +714,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                             <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
                             <span>
                               Verified Count: <strong>{verifiedUnits} units</strong> across{' '}
-                              {seg.verifiedCounts.length} SKUs.
+                              {seg.verifiedCounts?.length || 0} SKUs.
                             </span>
                           </div>
                           {seg.recountedAt && (
@@ -660,27 +726,45 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                       )}
                     </div>
 
-                    {/* Terminal Action Buttons */}
+                    {/* Terminal Action Buttons & Self-Service Claiming */}
                     <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <button
-                          onClick={() => handleLaunchTerminal(seg, 'A')}
-                          className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600/20 text-blue-300 hover:bg-blue-600 hover:text-white border border-blue-500/30 transition flex items-center gap-1.5"
+                          type="button"
+                          onClick={() => (count1Done ? handleLaunchTerminal(seg, 'A') : handleClaimZone(seg, 'A'))}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                            count1Done
+                              ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30 hover:bg-blue-600 hover:text-white'
+                              : 'bg-blue-600 text-white hover:bg-blue-500 shadow-sm'
+                          }`}
                         >
                           <UserCheck className="w-3.5 h-3.5" />
-                          {count1Done ? 'Edit Count 1' : 'Start Count 1'}
+                          {count1Done ? 'Edit Count 1 (Team A)' : 'Claim Zone as Team A'}
                         </button>
+
                         <button
-                          onClick={() => handleLaunchTerminal(seg, 'B')}
-                          className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600/20 text-purple-300 hover:bg-purple-600 hover:text-white border border-purple-500/30 transition flex items-center gap-1.5"
+                          type="button"
+                          onClick={() => (count2Done ? handleLaunchTerminal(seg, 'B') : handleClaimZone(seg, 'B'))}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                            count2Done
+                              ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600 hover:text-white'
+                              : count1Done
+                              ? 'bg-amber-600 text-white hover:bg-amber-500 shadow-sm animate-pulse'
+                              : 'bg-purple-600 text-white hover:bg-purple-500 shadow-sm'
+                          }`}
                         >
                           <UserCheck className="w-3.5 h-3.5" />
-                          {count2Done ? 'Edit Count 2' : 'Start Count 2'}
+                          {count2Done
+                            ? 'Edit Count 2 (Team B)'
+                            : count1Done
+                            ? 'Claim Double-Count as Team B'
+                            : 'Claim as Team B'}
                         </button>
                       </div>
 
                       {!isApproved && (
                         <button
+                          type="button"
                           onClick={() => handleDeleteSegment(seg.segmentId)}
                           className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition"
                           title="Remove Segment"
@@ -929,6 +1013,22 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
           currentUser={currentUser}
           onApprove={handleApprove}
           onClose={() => setShowApprovalModal(false)}
+        />
+      )}
+
+      {/* Peer Dual-Signature Joint Recount Modal */}
+      {showJointRecountModalSegment && (
+        <JointRecountModal
+          session={session}
+          segment={showJointRecountModalSegment}
+          currentUser={currentUser}
+          onClose={() => setShowJointRecountModalSegment(null)}
+          onResolved={() => {
+            const updated = getStocktakeSessionById(session.sessionId);
+            if (updated) refreshSession(updated);
+            setShowJointRecountModalSegment(null);
+            showToast('Joint Recount finalized & marked VERIFIED!');
+          }}
         />
       )}
     </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useDeferredValue } from 'react';
 import {
   Package,
   Plus,
@@ -140,6 +140,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     };
   }, [currentUser]);
   const [searchQuery, setSearchQuery] = useState('');
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [selectedCategory, setSelectedCategory] = useState('ALL');
   const [filterLowStockOnly, setFilterLowStockOnly] = useState(false);
@@ -298,10 +299,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     (i) => (Number(i.stockCases) || 0) <= (Number(i.reorderLevelCases) || 2) || (Number(i.stockSingles) || 0) <= (Number(i.reorderLevelUnits) || 10)
   );
 
-  // Filtered items
+  // Filtered items (Optimized with deferredSearchQuery to eliminate keystroke lag)
   const filteredItems = useMemo(() => {
+    const q = (deferredSearchQuery || '').trim().toLowerCase();
     const list = items.filter((item) => {
-      const q = (searchQuery || '').trim().toLowerCase();
       const matchesSearch =
         !q ||
         (item.itemName && item.itemName.toLowerCase().includes(q)) ||
@@ -316,18 +317,21 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     });
 
     const seen = new Set<string>();
-    const deduped = list.map(normalizeInventoryItem).filter((item) => {
+    const deduped: InventoryItem[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
       const key = (item.itemId || '').trim().toUpperCase();
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        deduped.push(item);
+      }
+    }
 
     // Organize alphabetically from A to Z by item name
     return deduped.sort((a, b) =>
       (a.itemName || '').localeCompare(b.itemName || '', undefined, { sensitivity: 'base' })
     );
-  }, [items, searchQuery, selectedCategory, filterLowStockOnly]);
+  }, [items, deferredSearchQuery, selectedCategory, filterLowStockOnly]);
 
   // Default active selected item for simplistic view
   const activeSelectedItem = useMemo(() => {

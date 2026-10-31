@@ -145,6 +145,73 @@ export type StocktakeLineCount = any;
 export type StocktakeSegment = any;
 export type StocktakeSession = any;
 export type StocktakeVerifiedLine = any;
+
+export interface StocktakeZoneAssignment {
+  zoneId: string;
+  zoneName: string;
+  sessionId: string;
+  branchId: string;
+  status: 'AVAILABLE' | 'IN_PROGRESS' | 'AWAITING_DOUBLE_COUNT' | 'VARIANCE_FLAGGED' | 'VERIFIED';
+  teamA?: {
+    deviceId?: string;
+    staffId?: string;
+    staffName?: string;
+    claimedAt?: string;
+    submitted: boolean;
+    submittedAt?: string;
+    lineCount?: number;
+  };
+  teamB?: {
+    deviceId?: string;
+    staffId?: string;
+    staffName?: string;
+    claimedAt?: string;
+    submitted: boolean;
+    submittedAt?: string;
+    lineCount?: number;
+  };
+  jointRecount?: {
+    proposedBy?: 'A' | 'B';
+    proposedByName?: string;
+    signedByA: boolean;
+    signedByB: boolean;
+    resolvedAt?: string;
+    lines: any[];
+  };
+  count1?: any[];
+  count2?: any[];
+  verifiedCounts?: any[];
+  discrepancies?: StocktakeVarianceItem[];
+}
+
+export interface StocktakeVarianceItem {
+  itemId: string;
+  itemName: string;
+  sku: string;
+  unitsPerCase: number;
+  teamACases: number;
+  teamASingles: number;
+  teamATotalUnits: number;
+  teamBCases: number;
+  teamBSingles: number;
+  teamBTotalUnits: number;
+  differenceUnits: number;
+  jointCases?: number;
+  jointSingles?: number;
+  jointTotalUnits?: number;
+}
+
+export interface HubBlindSubmission {
+  sessionId: string;
+  zoneId: string;
+  teamSlot: 'A' | 'B' | 'RECOUNT';
+  deviceId: string;
+  staffId: string;
+  staffName: string;
+  timestamp: string;
+  lines: any[];
+}
+
 export interface StoreCreditPolicy {
   mode: 'CUSTOMER_LIMIT' | 'TIERED' | 'DISABLED' | 'STRICT_UPFRONT' | string;
   defaultCreditLimit: number;

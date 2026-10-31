@@ -490,6 +490,13 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
     const seenVouchers = new Set<string>();
 
+    // O(1) GRV lookup map to prevent nested linear scans on large datasets
+    const grvMap = new Map<string, DirectGrv>();
+    directGrvs.forEach((g) => {
+      if (g.grvNumber) grvMap.set(g.grvNumber, g);
+      if (g.id) grvMap.set(g.id, g);
+    });
+
     // 1. First, check shiftMovements for supplier_payment movements
     const procurementMovements = shiftMovements.filter(
       (m) => m.type === 'supplier_payment' && (!m.sourceModule || m.sourceModule === 'DirectGRV')
@@ -499,9 +506,10 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       const refKey = m.sourceRef || m.notes || m.id;
       if (seenVouchers.has(refKey)) return;
 
-      const matchingGrv = directGrvs.find(
-        (g) => g.grvNumber === m.sourceRef || g.id === m.sourceRef || (m.sourceRef && m.sourceRef.startsWith(g.grvNumber))
-      );
+      const matchingGrv = (m.sourceRef ? grvMap.get(m.sourceRef) : undefined) ||
+        directGrvs.find(
+          (g) => g.grvNumber === m.sourceRef || g.id === m.sourceRef || (m.sourceRef && m.sourceRef.startsWith(g.grvNumber))
+        );
 
       // If matching GRV is explicitly NOT paid from till (e.g. invoice on account / credit), do not record in Form 2
       if (

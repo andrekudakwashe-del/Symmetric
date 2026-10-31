@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useDeferredValue } from 'react';
 import { Product, CartItem, Salesperson, ActiveTab } from '../../types';
 import { FractionalWeightModal } from './FractionalWeightModal';
 import { QuickAddProductModal } from './QuickAddProductModal';
@@ -72,6 +72,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
   selectedCurrency = 'USD',
 }) => {
   const [searchQuery, setSearchQuery] = useState(initialSearch);
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   const [selectedCategory, setSelectedCategory] = useState<string>('All');
   const [isListView, setIsListView] = useState<boolean>(false);
   const [gridDensity, setGridDensity] = useState<'compact' | 'dense' | 'standard'>(() => {
@@ -150,11 +151,11 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
     return ['All', ...Array.from(set)];
   }, [products]);
 
-  // Filtered products
+  // Filtered products (Optimized with deferredSearchQuery to eliminate keystroke lag)
   const filteredProducts = useMemo(() => {
+    const q = (deferredSearchQuery || '').toLowerCase().trim();
     const list = products.filter((p) => {
       const matchesCategory = selectedCategory === 'All' || p.category === selectedCategory;
-      const q = (searchQuery || '').toLowerCase().trim();
       const matchesSearch =
         !q ||
         (p.name && p.name.toLowerCase().includes(q)) ||
@@ -172,7 +173,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
       seen.add(key);
       return true;
     });
-  }, [products, selectedCategory, searchQuery]);
+  }, [products, selectedCategory, deferredSearchQuery]);
 
   return (
     <div className="space-y-3 pb-28 select-none animate-fadeIn">

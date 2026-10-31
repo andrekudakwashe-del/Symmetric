@@ -23,12 +23,14 @@ import {
   Shield,
   Smartphone,
   Phone,
+  KeyRound,
 } from 'lucide-react';
-import { StocktakeSession, StocktakeCountType, Salesperson } from '../../types';
+import { StocktakeSession, StocktakeCountType, Salesperson, TemporaryCasualAccount } from '../../types';
 import {
   getStocktakeSessions,
   createStocktakeSession,
   deleteStocktakeSession,
+  authenticateCasualWorker,
 } from '../../db/roomDatabase';
 import { StocktakeSessionDetailScreen } from './StocktakeSessionDetailScreen';
 
@@ -172,6 +174,52 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
     return matchesSearch && matchesStatus && matchesType;
   });
 
+  // Casual Login State
+  const [showCasualPinModal, setShowCasualPinModal] = useState(false);
+  const [casualPinInput, setCasualPinInput] = useState('');
+  const [casualAuthError, setCasualAuthError] = useState<string | null>(null);
+  const [activeCasual, setActiveCasual] = useState<TemporaryCasualAccount | null>(null);
+
+  const effectiveUser: Salesperson | null = activeCasual
+    ? ({
+        id: activeCasual.id,
+        name: `${activeCasual.name} (${activeCasual.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B'})`,
+        role: 'CASHIER' as any,
+        pin: activeCasual.pin,
+        phone: activeCasual.phone,
+        active: 'Y',
+      } as Salesperson)
+    : currentUser;
+
+  const handleCasualPinSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setCasualAuthError(null);
+    const pin = casualPinInput.trim();
+    if (!pin) return;
+
+    const account = authenticateCasualWorker(pin);
+    if (!account) {
+      setCasualAuthError('Invalid PIN. Verify your PIN with the Stocktake Manager.');
+      return;
+    }
+
+    setActiveCasual(account);
+    setShowCasualPinModal(false);
+    setCasualPinInput('');
+
+    // Open target session
+    const target =
+      sessions.find((s) => s.sessionId === account.sessionId) ||
+      sessions.find((s) => s.status !== 'APPROVED_POSTED') ||
+      sessions[0];
+
+    if (target) {
+      setSelectedSession(target);
+    } else {
+      alert(`Authenticated as ${account.name}! Waiting for Manager to create an active stocktake session.`);
+    }
+  };
+
   // KPI Metrics
   const totalAudits = sessions.length;
   const dailyCountsCount = sessions.filter((s) => s.countType === 'DAILY_BLIND').length;
@@ -182,7 +230,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
     return (
       <StocktakeSessionDetailScreen
         session={selectedSession}
-        currentUser={currentUser}
+        currentUser={effectiveUser}
         onBack={() => {
           setSelectedSession(null);
           loadSessions();
@@ -215,16 +263,30 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
           </div>
         </div>
 
-        <button
-          onClick={() => {
-            handleSelectCountType('DAILY_BLIND');
-            setShowNewModal(true);
-          }}
-          className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-900/30 flex items-center gap-2 transition"
-        >
-          <Plus className="w-4 h-4" />
-          Initialize New Stocktake Session
-        </button>
+        <div className="flex items-center gap-2.5">
+          <button
+            onClick={() => {
+              setCasualPinInput('');
+              setCasualAuthError(null);
+              setShowCasualPinModal(true);
+            }}
+            className="px-4 py-2.5 bg-amber-600/90 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/30 flex items-center gap-2 transition"
+          >
+            <KeyRound className="w-4 h-4" />
+            Casual PIN Fast-Login
+          </button>
+
+          <button
+            onClick={() => {
+              handleSelectCountType('DAILY_BLIND');
+              setShowNewModal(true);
+            }}
+            className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-900/30 flex items-center gap-2 transition"
+          >
+            <Plus className="w-4 h-4" />
+            Initialize New Stocktake Session
+          </button>
+        </div>
       </div>
 
       {/* KPI Cards */}
@@ -740,6 +802,99 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                   className="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold shadow-lg"
                 >
                   Initialize Stocktake
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Casual Worker Fast Login Modal */}
+      {showCasualPinModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-amber-600/40 rounded-2xl max-w-sm w-full p-6 shadow-2xl text-slate-100 animate-in fade-in zoom-in-95">
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400">
+                <KeyRound className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="font-bold text-base text-white">Casual Worker Terminal Login</h3>
+                <p className="text-xs text-slate-400">Enter your assigned 4-digit stocktake PIN</p>
+              </div>
+            </div>
+
+            <form onSubmit={handleCasualPinSubmit} className="space-y-4">
+              <div>
+                <input
+                  type="password"
+                  maxLength={6}
+                  value={casualPinInput}
+                  onChange={(e) => setCasualPinInput(e.target.value.replace(/\D/g, ''))}
+                  placeholder="• • • •"
+                  autoFocus
+                  className="w-full text-center text-3xl tracking-[0.5em] font-mono py-3 bg-slate-950 border border-slate-700 rounded-xl text-amber-300 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                />
+              </div>
+
+              {casualAuthError && (
+                <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs text-center">
+                  {casualAuthError}
+                </div>
+              )}
+
+              {/* Quick Onscreen Number Pad */}
+              <div className="grid grid-cols-3 gap-2">
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
+                  <button
+                    key={num}
+                    type="button"
+                    onClick={() => setCasualPinInput((prev) => (prev.length < 6 ? prev + num : prev))}
+                    className="py-3 bg-slate-800 hover:bg-slate-700 text-white font-mono font-bold text-lg rounded-xl border border-slate-700/60 active:scale-95 transition"
+                  >
+                    {num}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setCasualPinInput('')}
+                  className="py-3 bg-slate-800/60 hover:bg-slate-700 text-slate-400 font-semibold text-xs rounded-xl border border-slate-700/60 transition"
+                >
+                  CLEAR
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCasualPinInput((prev) => (prev.length < 6 ? prev + '0' : prev))}
+                  className="py-3 bg-slate-800 hover:bg-slate-700 text-white font-mono font-bold text-lg rounded-xl border border-slate-700/60 active:scale-95 transition"
+                >
+                  0
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCasualPinInput((prev) => prev.slice(0, -1))}
+                  className="py-3 bg-slate-800/60 hover:bg-slate-700 text-slate-400 font-semibold text-xs rounded-xl border border-slate-700/60 transition"
+                >
+                  DEL
+                </button>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowCasualPinModal(false);
+                    setCasualPinInput('');
+                    setCasualAuthError(null);
+                  }}
+                  className="flex-1 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={casualPinInput.length < 4}
+                  className="flex-1 py-2.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition shadow-lg shadow-amber-900/30"
+                >
+                  Enter Terminal
                 </button>
               </div>
             </form>
