@@ -25,6 +25,7 @@ import {
   getInventoryItems,
   logEmergencyLockdownSale,
   getAuditLogs,
+  verifySalespersonPin,
 } from '../../db/roomDatabase';
 
 interface LockdownEmergencySalesTabProps {
@@ -105,8 +106,8 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
     e.preventDefault();
     setPinError('');
 
-    if (supervisorPin.trim() !== '1234' && currentUser?.pin && supervisorPin.trim() !== currentUser.pin) {
-      setPinError('Invalid Supervisor Authorization PIN. (Default: 1234)');
+    if (supervisorPin.trim() !== '1234' && (!currentUser || !verifySalespersonPin(currentUser, supervisorPin.trim()))) {
+      setPinError('Invalid Supervisor Authorization PIN.');
       return;
     }
 

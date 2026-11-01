@@ -63,6 +63,7 @@ import {
   subscribeRoomDatabase,
   getSalespeople,
   saveSupplierInvoiceVoucher,
+  verifySalespersonPin,
 } from '../../db/roomDatabase';
 import { landedCostService } from '../../services/landedCostService';
 import { getAllGoodsReceivedNotes } from '../../db/goodsReceivedNotes';
@@ -663,9 +664,9 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       const approver = allStaff.find(
         (s) =>
           (s.role === 'OWNER' || s.role === 'SUPER_ADMIN' || s.role === 'ADMIN' || s.role === 'Supervisor' || s.role === 'Manager') &&
-          s.pin === paySafePin.trim()
+          verifySalespersonPin(s, paySafePin.trim())
       );
-      if (!approver && currentUser?.pin !== paySafePin.trim()) {
+      if (!approver && (!currentUser || !verifySalespersonPin(currentUser, paySafePin.trim()))) {
         setPaySafeError('Incorrect authorization PIN. Please enter a valid Owner or Supervisor PIN.');
         return;
       }
@@ -692,7 +693,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
           allStaff.find(
             (s) =>
               (s.role === 'OWNER' || s.role === 'SUPER_ADMIN' || s.role === 'ADMIN' || s.role === 'Supervisor' || s.role === 'Manager') &&
-              s.pin === paySafePin.trim()
+              verifySalespersonPin(s, paySafePin.trim())
           ) || activeUser;
         approveCashTransfer(created.transfer_id, approver, paySafePin || '123456');
       }
@@ -2193,9 +2194,24 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                             <div className="text-right">
                               <span className="text-[10px] text-slate-400 block uppercase font-sans font-bold">Selling Price</span>
                               <div className="flex items-center gap-1.5">
-                                <span className="text-white font-bold font-mono">
-                                  ${(Number(row.sellingPrice) || 0).toFixed(2)}
-                                </span>
+                                <div className="relative inline-flex items-center">
+                                  <span className="absolute left-2.5 text-slate-500 text-xs font-mono">$</span>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={row.sellingPrice ?? ''}
+                                    placeholder="0.00"
+                                    onFocus={(e) => e.target.select()}
+                                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                                    onChange={(e) => {
+                                      const val = cleanNumberInput(e.target.value, true);
+                                      updateRow(row.id, {
+                                        sellingPrice: val,
+                                      });
+                                    }}
+                                    className="w-24 bg-slate-900 border border-slate-700 rounded-lg pl-6 pr-2 py-1 text-right text-xs text-white font-mono font-bold focus:outline-none focus:border-emerald-500"
+                                  />
+                                </div>
                                 <span
                                   className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
                                     calc.marginPercent >= 20
@@ -2219,7 +2235,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   <table className="w-full text-left text-xs border-collapse">
                     <thead>
                       <tr className="bg-slate-900 text-slate-300 font-semibold border-b border-slate-700 divide-x divide-slate-700/50">
-                        <th className="py-3 px-3 min-w-[220px] sticky left-0 bg-slate-900 z-10">Product *</th>
+                        <th className="py-3 px-3 min-w-[170px] sm:min-w-[220px] md:sticky md:left-0 bg-slate-900 z-10">Product *</th>
                       <th className="py-3 px-2 min-w-[110px] text-center">Batch #</th>
                       <th className="py-3 px-2 min-w-[125px] text-center">Expiry Date</th>
                       <th className="py-3 px-3 min-w-[160px] text-center bg-slate-850">
@@ -2320,8 +2336,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                               index % 2 === 0 ? 'bg-slate-800/40' : 'bg-slate-800/80'
                             }`}
                           >
-                            {/* 1. Product (Searchable / Dropdown / Add new) - Sticky Left for Mobile Table Scrolling */}
-                            <td className="py-2.5 px-3 relative sticky left-0 bg-slate-850 z-10 shadow-[2px_0_5px_rgba(0,0,0,0.3)]">
+                            {/* 1. Product (Searchable / Dropdown / Add new) - Unfrozen on mobile, sticky on desktop */}
+                            <td className="py-2.5 px-3 relative min-w-[170px] sm:min-w-[220px] md:sticky md:left-0 bg-slate-850 z-10 md:shadow-[2px_0_5px_rgba(0,0,0,0.3)]">
                               <div className="relative">
                                 <button
                                   type="button"

@@ -15,6 +15,7 @@ import {
   setSessionUser,
   saveSalesperson,
   isBranchInLockdown,
+  checkPreviousBusinessDayStatus,
 } from './db/roomDatabase';
 import { AndroidStatusBar } from './components/layout/AndroidStatusBar';
 import { TopHeader } from './components/layout/TopHeader';
@@ -41,7 +42,7 @@ import { getActiveCartItemCount, subscribeToPOSCart } from './utils/posCartStora
 import { historyNavigationService } from './services/historyNavigationService';
 import { OfflineIndicator } from './components/pwa/OfflineIndicator';
 import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
-import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield } from 'lucide-react';
+import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield, X } from 'lucide-react';
 import { initializeSystemConfigAndSync } from './services/systemConfig';
 import { persistentSyncEngine } from './services/persistentSyncEngine';
 import { meshSyncService } from './services/meshSyncService';
@@ -131,6 +132,26 @@ export default function App() {
 
   // Navigation & Android Phone Hardware Back Button Handler
   const [toastNotification, setToastNotification] = useState<string | null>(null);
+  const toastTimeoutRef = useRef<any>(null);
+
+  const showToastNotification = (msg: string, durationMs = 3500) => {
+    setToastNotification(msg);
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    toastTimeoutRef.current = setTimeout(() => {
+      setToastNotification(null);
+    }, durationMs);
+  };
+
+  // Listen to EOD completion to automatically clear any day-lock notifications and inform user
+  useEffect(() => {
+    const onEodDone = () => {
+      setToastNotification(null);
+      if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+      showToastNotification('✓ End of Day Z-Report successfully completed. Modules unlocked!', 3500);
+    };
+    window.addEventListener('saimetric_eod_completed', onEodDone);
+    return () => window.removeEventListener('saimetric_eod_completed', onEodDone);
+  }, []);
 
   const handleNavigateTab = (newTab: ActiveTab) => {
     if (isBranchInLockdown(currentUser?.branchId) && (newTab === 'pos' || newTab === 'home' || newTab === 'items' || newTab === 'counter')) {
@@ -138,6 +159,18 @@ export default function App() {
       setActiveTab('stocktake');
       return;
     }
+
+    // Day-Lock Gatekeeper: prevent opening new day sales/POS if previous business day was never closed with EOD
+    if (newTab === 'pos' || newTab === 'items' || newTab === 'counter') {
+      const eodCheck = checkPreviousBusinessDayStatus(currentUser?.branchId);
+      if (eodCheck.requiresEod && eodCheck.unclosedDate) {
+        showToastNotification(`Day-Lock Active: End-of-Day (Z-Report) has not been run for ${eodCheck.unclosedDate}. Please finalize reconciliation in Form 4 first.`, 4000);
+        historyNavigationService.pushTab('form4');
+        setActiveTab('form4');
+        return;
+      }
+    }
+
     historyNavigationService.pushTab(newTab);
     setActiveTab(newTab);
   };
@@ -360,8 +393,12 @@ export default function App() {
     setCurrentUser(user);
     setLoggedInUser(user);
     const landingTab = getLandingTabForUser(user);
+    const eodCheck = checkPreviousBusinessDayStatus(user.branchId || user.branch_id);
     if (isBranchInLockdown(user.branchId || user.branch_id)) {
       setActiveTab('stocktake');
+    } else if (eodCheck.requiresEod && (landingTab === 'pos' || landingTab === 'items' || landingTab === 'counter')) {
+      showToastNotification(`Day-Lock Active: Prior business day (${eodCheck.unclosedDate}) requires End-of-Day closure before new sales can open.`, 4000);
+      setActiveTab('form4');
     } else {
       setActiveTab(landingTab);
     }
@@ -451,8 +488,18 @@ export default function App() {
 
       {/* Toast Notification (e.g. Android Hardware Back Key "Press back again to exit") */}
       {toastNotification && (
-        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white px-5 py-2.5 rounded-full shadow-2xl font-bold text-xs flex items-center space-x-2 border border-slate-700 backdrop-blur-md animate-fadeIn">
-          <span>{toastNotification}</span>
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 bg-slate-900/95 text-white pl-4 pr-3 py-2 rounded-full shadow-2xl font-bold text-xs flex items-center space-x-2 border border-slate-700 backdrop-blur-md animate-fadeIn max-w-[90vw]">
+          <span className="truncate">{toastNotification}</span>
+          <button
+            onClick={() => {
+              if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+              setToastNotification(null);
+            }}
+            className="text-slate-400 hover:text-white p-1 rounded-full transition-colors shrink-0"
+            title="Dismiss notification"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 

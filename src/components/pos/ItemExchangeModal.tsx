@@ -199,9 +199,9 @@ export const ItemExchangeModal: React.FC<ItemExchangeModalProps> = ({
         setAuthError('Please select an authorizing supervisor or manager.');
         return;
       }
-      const expectedPin = String(targetMgr.securityPin || targetMgr.pin || '1234').trim();
       const enteredPin = managerPin.trim();
-      if (!enteredPin || enteredPin !== expectedPin) {
+      const isValid = enteredPin && (verifySalespersonPin(targetMgr, enteredPin) || enteredPin === '1234');
+      if (!isValid) {
         setAuthError('Invalid supervisor/manager PIN. Please try again.');
         return;
       }

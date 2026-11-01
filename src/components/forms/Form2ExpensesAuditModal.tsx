@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Salesperson, ExpenseEntry } from '../../types';
-import { approveExpense, rejectExpense, approveAllExpensesForStaffAndDate, isSupervisorOrAbove } from '../../db/roomDatabase';
+import { approveExpense, rejectExpense, approveAllExpensesForStaffAndDate, isSupervisorOrAbove, verifySalespersonPin } from '../../db/roomDatabase';
 import {
   X,
   Check,
@@ -121,8 +121,8 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
     }
 
     const trimmed = pinInput.trim();
-    const expected = supervisor.pin || '1234';
-    if (trimmed !== expected && trimmed !== '1234' && trimmed !== '9999' && trimmed !== '4321') {
+    const isValid = verifySalespersonPin(supervisor, trimmed) || trimmed === '1234' || trimmed === '9999' || trimmed === '4321';
+    if (!isValid) {
       setPinError(`Incorrect supervisor security PIN for ${supervisor.name}.`);
       return;
     }
@@ -570,7 +570,7 @@ export const Form2ExpensesAuditModal: React.FC<Form2ExpensesAuditModalProps> = (
                       handleConfirmRejectSingle(rejectingExpenseId, currentUser);
                     } else {
                       const superv = salespeople.find(
-                        (s) => isSupervisorOrAbove(s.role) && (s.pin === rejectPinInput || rejectPinInput === '1234' || rejectPinInput === '4321')
+                        (s) => isSupervisorOrAbove(s.role) && (verifySalespersonPin(s, rejectPinInput) || rejectPinInput === '1234' || rejectPinInput === '4321')
                       );
                       if (!superv) {
                         setRejectPinError('Invalid supervisor PIN.');

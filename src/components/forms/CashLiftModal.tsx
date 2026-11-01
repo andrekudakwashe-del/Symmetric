@@ -27,6 +27,7 @@ import {
   addCashLift,
   getTodayDateString,
   getCashGovernanceConfig,
+  verifySalespersonPin,
 } from '../../db/roomDatabase';
 import {
   computeDrawerBalance,
@@ -210,8 +211,8 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
       setErrorMsg(`Cashier PIN is required for ${cashier.name}.`);
       return;
     }
-    const expectedCashierPin = cashier.pin || '1234';
-    if (!isLean && trimmedCashierPin !== expectedCashierPin && trimmedCashierPin !== '1234' && trimmedCashierPin !== '0000') {
+    const isCashierPinValid = verifySalespersonPin(cashier, trimmedCashierPin) || trimmedCashierPin === '1234' || trimmedCashierPin === '0000';
+    if (!isLean && !isCashierPinValid) {
       setErrorMsg(`Invalid Cashier PIN for ${cashier.name}. Please enter your 4-digit security PIN.`);
       return;
     }
@@ -227,8 +228,8 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
       setErrorMsg(`Supervisor PIN is required for ${supervisor.name}.`);
       return;
     }
-    const expectedSupervisorPin = supervisor.pin || '1234';
-    if (!isLean && trimmedSupervisorPin !== expectedSupervisorPin && trimmedSupervisorPin !== '1234' && trimmedSupervisorPin !== '9999' && trimmedSupervisorPin !== '4321') {
+    const isSupervisorPinValid = verifySalespersonPin(supervisor, trimmedSupervisorPin) || trimmedSupervisorPin === '1234' || trimmedSupervisorPin === '9999' || trimmedSupervisorPin === '4321';
+    if (!isLean && !isSupervisorPinValid) {
       setErrorMsg(`Invalid Supervisor PIN for ${supervisor.name}. Please enter the supervisor authorization PIN.`);
       return;
     }

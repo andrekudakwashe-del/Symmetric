@@ -3,9 +3,7 @@
 
 import { BackendType, BackendAuthMode } from './types';
 import { getTenantBackendConfig } from './adapterRegistry';
-import { Company } from '../../data/saasData';
-import { getCompanies, getSalespeopleForCompany, saveSalesperson } from '../../db/roomDatabase';
-import { Salesperson } from '../../types';
+import { getCompanies, getSalespeopleForCompany, saveSalesperson, verifySalespersonPin } from '../../db/roomDatabase';
 import { authenticateStaffWithAppsScript, authenticateOwnerWithAppsScript } from '../googleSheetsSync';
 
 export interface AuthResult {
@@ -203,7 +201,7 @@ export class BackendAuthService {
     const localStaffList = getSalespeopleForCompany(companyId);
     const localUser = localStaffList.find((s) => s.id === staffId || s.name.toLowerCase() === staffName.toLowerCase());
 
-    if (localUser && localUser.pin && String(localUser.pin).trim() === pin) {
+    if (localUser && verifySalespersonPin(localUser, pin)) {
       return {
         status: 'success',
         success: true,

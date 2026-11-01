@@ -1,7 +1,7 @@
 import {
   backupCryptoService,
 } from './backupCryptoService';
-import { setStored, cleanupLocalStorageQuota } from '../db/roomDatabase';
+import { setStored, cleanupLocalStorageQuota, runPinHashingMigration } from '../db/roomDatabase';
 import { setMeta } from '../db/indexedDBService';
 import { toDateStringSafe, safeDateSlice, isSameDaySafe } from '../utils/dateUtils';
 
@@ -249,6 +249,15 @@ export function generateDatabasePayload(
       } catch (err) {
         console.warn(`[DatabaseBackupService] Error parsing table ${table.name}:`, err);
       }
+    }
+
+    // CRITICAL SECURITY UPGRADE: Never export plain text PINs in backup JSON files
+    if (table.key === 'saimetric_room_salespeople' || table.key === 'saimetric_room_temporary_casuals') {
+      parsed = parsed.map((item: any) => {
+        const sanitized = { ...item };
+        delete sanitized.pin;
+        return sanitized;
+      });
     }
 
     if (type === 'ADMIN_MASTER_UPDATE') {
@@ -625,6 +634,9 @@ export async function restoreDatabaseFromPayload(
         }
       }
     }
+
+    // Auto-migrate any legacy plain-text PINs that may have existed in restored backup
+    runPinHashingMigration();
 
     // Dispatch update notifications so UI updates live
     if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {

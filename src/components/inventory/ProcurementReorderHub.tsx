@@ -2569,7 +2569,7 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
               <table className="w-full text-left border-collapse text-xs">
                 <thead>
                   <tr className="bg-slate-900 text-white font-extrabold uppercase text-[10px] tracking-wider border-b border-slate-800 select-none">
-                    <th className="py-3.5 px-3 w-10 text-center sticky left-0 bg-slate-900 z-20">
+                    <th className="py-3.5 px-3 w-10 text-center md:sticky md:left-0 bg-slate-900 z-20">
                       <input
                         type="checkbox"
                         checked={
@@ -2590,7 +2590,7 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                         className="w-3.5 h-3.5 rounded text-indigo-600 focus:ring-indigo-500 cursor-pointer"
                       />
                     </th>
-                    <th className="py-3.5 px-4 min-w-[240px] sticky left-10 bg-slate-900 z-20 shadow-[2px_0_5px_rgba(0,0,0,0.2)]">
+                    <th className="py-3.5 px-4 min-w-[170px] sm:min-w-[240px] md:sticky md:left-10 bg-slate-900 z-20 md:shadow-[2px_0_5px_rgba(0,0,0,0.2)]">
                       Product Description / Name (SKU / Code)
                     </th>
                     <th className="py-3.5 px-2 text-center min-w-[90px]">Priority</th>
@@ -2635,8 +2635,8 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                           key={entry.item.itemId}
                           className={`transition-colors border-b border-slate-100 ${rowBg}`}
                         >
-                          {/* Checkbox (Sticky Left) */}
-                          <td className="py-3 px-3 text-center sticky left-0 bg-white z-10">
+                          {/* Checkbox (Unfrozen on mobile, Sticky Left on md+) */}
+                          <td className="py-3 px-3 text-center md:sticky md:left-0 bg-white z-10">
                             <input
                               type="checkbox"
                               checked={isSelected}
@@ -2645,8 +2645,8 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                             />
                           </td>
 
-                          {/* PROMINENT PRODUCT NAME & IDENTIFICATION (Sticky Left) */}
-                          <td className="py-3 px-4 sticky left-10 bg-white z-10 shadow-[2px_0_5px_rgba(0,0,0,0.06)] min-w-[240px]">
+                          {/* PROMINENT PRODUCT NAME & IDENTIFICATION (Unfrozen on mobile, Sticky Left on md+) */}
+                          <td className="py-3 px-4 md:sticky md:left-10 bg-white z-10 md:shadow-[2px_0_5px_rgba(0,0,0,0.06)] min-w-[170px] sm:min-w-[240px]">
                             <div className="text-sm font-black text-slate-900 leading-snug tracking-tight">
                               {getItemName(entry.item)}
                             </div>

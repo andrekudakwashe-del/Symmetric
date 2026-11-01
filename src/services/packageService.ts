@@ -727,13 +727,29 @@ export function getCompanyPackage(companyOrId?: Company | string | null): SaaSPa
   const all = getPackages();
 
   if (comp) {
-    // 1. Check direct package_id binding
-    if ((comp as any).package_id) {
-      const found = all.find((p) => p.id === (comp as any).package_id);
-      if (found) return found;
+    // 1. If tenant is on ENTERPRISE plan, prioritize Enterprise package with unlimited limits
+    if (comp.plan === 'ENTERPRISE') {
+      const enterprisePkg = all.find((p) => p.tier === 'ENTERPRISE' || p.code === 'ENTERPRISE') || DEFAULT_PACKAGES[2];
+      if ((comp as any).package_id) {
+        const found = all.find((p) => p.id === (comp as any).package_id);
+        if (found && (found.tier === 'ENTERPRISE' || found.tier === 'CUSTOM')) {
+          return found;
+        }
+      }
+      return enterprisePkg;
     }
 
-    // 2. Fall back to matching plan string ('STARTER', 'PROFESSIONAL', 'ENTERPRISE')
+    // 2. Check direct package_id binding
+    if ((comp as any).package_id) {
+      const found = all.find((p) => p.id === (comp as any).package_id);
+      if (found) {
+        if (!comp.plan || found.tier === 'CUSTOM' || found.tier === comp.plan) {
+          return found;
+        }
+      }
+    }
+
+    // 3. Fall back to matching plan string ('STARTER', 'PROFESSIONAL', 'ENTERPRISE')
     if (comp.plan) {
       const match = all.find(
         (p) =>
@@ -747,8 +763,16 @@ export function getCompanyPackage(companyOrId?: Company | string | null): SaaSPa
   return getDefaultPackage();
 }
 
-// Assign package to a company
-export function assignCompanyPackage(companyId: string, packageId: string): boolean {
+// Assign package to a company with optional custom overrides
+export function assignCompanyPackage(
+  companyId: string,
+  packageId: string,
+  overrides?: {
+    customMaxBranches?: number;
+    customMaxStaff?: number;
+    plan?: 'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE';
+  }
+): boolean {
   const targetPackage = getPackageById(packageId);
   if (!targetPackage) return false;
 
@@ -756,10 +780,34 @@ export function assignCompanyPackage(companyId: string, packageId: string): bool
   const comp = companies.find((c) => c.company_id === companyId);
   if (!comp) return false;
 
+  const targetPlan =
+    overrides?.plan ||
+    (targetPackage.tier === 'CUSTOM'
+      ? targetPackage.maxBranches > 3
+        ? 'ENTERPRISE'
+        : 'PROFESSIONAL'
+      : (targetPackage.tier as any));
+
+  const maxBranches =
+    overrides?.customMaxBranches !== undefined
+      ? overrides.customMaxBranches
+      : targetPlan === 'ENTERPRISE'
+      ? 999
+      : targetPackage.maxBranches;
+
+  const maxStaff =
+    overrides?.customMaxStaff !== undefined
+      ? overrides.customMaxStaff
+      : targetPlan === 'ENTERPRISE'
+      ? 999
+      : targetPackage.maxStaff;
+
   const updated: Company = {
     ...comp,
-    plan: targetPackage.tier === 'CUSTOM' ? 'PROFESSIONAL' : targetPackage.tier,
+    plan: targetPlan,
     ...( { package_id: targetPackage.id } as any ),
+    custom_max_branches: maxBranches,
+    custom_max_staff: maxStaff,
   };
 
   saveCompany(updated);
@@ -784,20 +832,31 @@ export function checkBranchLimit(companyOrId?: Company | string | null): {
   currentBranches: number;
   packageName: string;
 } {
-  const pkg = getCompanyPackage(companyOrId);
-  const compId =
-    typeof companyOrId === 'string'
-      ? companyOrId
-      : companyOrId?.company_id || getCurrentCompany().company_id;
+  let comp: Company | null = null;
+  if (!companyOrId) {
+    comp = getCurrentCompany();
+  } else if (typeof companyOrId === 'string') {
+    comp = getCompanies().find((c) => c.company_id === companyOrId) || null;
+  } else {
+    comp = companyOrId;
+  }
+
+  const pkg = getCompanyPackage(comp);
+  const compId = comp?.company_id || getCurrentCompany().company_id;
   const branches = getBranchesForCompany(compId);
   const currentCount = branches.length;
-  const max = pkg?.maxBranches ?? 1;
+
+  // Custom override from SuperAdmin or Enterprise plan gives unlimited
+  let max = comp?.custom_max_branches !== undefined ? comp.custom_max_branches : (pkg?.maxBranches ?? 1);
+  if (comp?.plan === 'ENTERPRISE' || pkg?.tier === 'ENTERPRISE') {
+    max = 999;
+  }
 
   return {
     allowed: max >= 999 ? true : currentCount < max,
     maxBranches: max,
     currentBranches: currentCount,
-    packageName: pkg?.name || 'Starter POS',
+    packageName: pkg?.name || (comp?.plan === 'ENTERPRISE' ? 'Enterprise Chain & Warehouse' : 'Starter POS'),
   };
 }
 
@@ -808,22 +867,33 @@ export function checkStaffLimit(companyOrId?: Company | string | null): {
   currentStaff: number;
   packageName: string;
 } {
-  const pkg = getCompanyPackage(companyOrId);
-  const compId =
-    typeof companyOrId === 'string'
-      ? companyOrId
-      : companyOrId?.company_id || getCurrentCompany().company_id;
+  let comp: Company | null = null;
+  if (!companyOrId) {
+    comp = getCurrentCompany();
+  } else if (typeof companyOrId === 'string') {
+    comp = getCompanies().find((c) => c.company_id === companyOrId) || null;
+  } else {
+    comp = companyOrId;
+  }
+
+  const pkg = getCompanyPackage(comp);
+  const compId = comp?.company_id || getCurrentCompany().company_id;
   const staff = getSalespeopleForCompany(compId);
   // Count active staff only so inactive staff do not consume license slots
   const activeStaff = staff.filter((s) => s.active !== 'N');
   const currentCount = activeStaff.length;
-  const max = pkg?.maxStaff ?? 5;
+
+  // Custom override from SuperAdmin or Enterprise plan gives unlimited
+  let max = comp?.custom_max_staff !== undefined ? comp.custom_max_staff : (pkg?.maxStaff ?? 5);
+  if (comp?.plan === 'ENTERPRISE' || pkg?.tier === 'ENTERPRISE') {
+    max = 999;
+  }
 
   return {
     allowed: max >= 999 ? true : currentCount < max,
     maxStaff: max,
     currentStaff: currentCount,
-    packageName: pkg?.name || 'Starter POS',
+    packageName: pkg?.name || (comp?.plan === 'ENTERPRISE' ? 'Enterprise Chain & Warehouse' : 'Starter POS'),
   };
 }
 

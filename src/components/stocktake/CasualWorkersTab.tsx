@@ -114,8 +114,7 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
       q === '' ||
       c.name.toLowerCase().includes(q) ||
       c.phone.includes(q) ||
-      (c.badgeNumber && c.badgeNumber.toLowerCase().includes(q)) ||
-      (c.pin && c.pin.includes(q))
+      (c.badgeNumber && c.badgeNumber.toLowerCase().includes(q))
     );
   });
 
@@ -233,20 +232,13 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                       </div>
                     </td>
                     <td className="py-3 px-4 text-center">
-                      <button
-                        type="button"
-                        onClick={() => handleCopyPin(c.pin, c.id)}
-                        className="px-2.5 py-1 bg-slate-950 border border-slate-700 hover:border-amber-500 rounded font-mono font-bold text-amber-300 tracking-wider inline-flex items-center gap-1.5 transition"
-                        title="Click to Copy PIN"
+                      <span
+                        className="px-2.5 py-1 bg-slate-950/80 border border-emerald-700/60 rounded font-mono text-xs font-semibold text-emerald-400 inline-flex items-center gap-1.5"
+                        title="Casual worker PIN is hashed with SHA-256 and salted"
                       >
-                        <KeyRound className="w-3 h-3 text-amber-400" />
-                        {c.pin}
-                        {copiedPinId === c.id && (
-                          <span className="text-[10px] text-emerald-400 font-sans font-normal">
-                            Copied!
-                          </span>
-                        )}
-                      </button>
+                        <KeyRound className="w-3 h-3 text-emerald-400" />
+                        •••• (Hashed)
+                      </span>
                     </td>
                     <td className="py-3 px-4 font-mono text-slate-400">
                       {c.badgeNumber || 'None'}

@@ -28,9 +28,9 @@ import {
   saveSupplierInvoiceVoucher,
   getStored,
   setStored,
-  STORAGE_KEYS,
   getCashGovernanceConfig,
   addExpense,
+  verifySalespersonPin,
 } from '../db/roomDatabase';
 import {
   getAllGoodsReceivedNotes,
@@ -732,7 +732,7 @@ export const approveCashTransfer = (
   }
 
   const govConfig = getCashGovernanceConfig();
-  if (govConfig.governanceMode !== 'LEAN' && approver.pin && approver.pin !== enteredPin) {
+  if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(approver, enteredPin)) {
     return { success: false, message: 'Invalid PIN entered.' };
   }
 
@@ -791,7 +791,7 @@ export const acceptTillFloat = (
   }
 
   const govConfig = getCashGovernanceConfig();
-  if (govConfig.governanceMode !== 'LEAN' && cashier.pin && cashier.pin !== enteredPin) {
+  if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(cashier, enteredPin)) {
     return { success: false, message: 'Incorrect Cashier PIN. Physical custody rejected.' };
   }
 
@@ -915,7 +915,7 @@ export const receiveHqSafeTransfer = (
   }
 
   const govConfig = getCashGovernanceConfig();
-  if (govConfig.governanceMode !== 'LEAN' && owner.pin && owner.pin !== enteredPin) {
+  if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(owner, enteredPin)) {
     return { success: false, message: 'Invalid Owner PIN.' };
   }
 
@@ -963,7 +963,7 @@ export const receiveBranchSafeTransfer = (
   }
 
   const govConfig = getCashGovernanceConfig();
-  if (govConfig.governanceMode !== 'LEAN' && receiver.pin && receiver.pin !== enteredPin) {
+  if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(receiver, enteredPin)) {
     return { success: false, message: 'Invalid Receiver PIN.' };
   }
 

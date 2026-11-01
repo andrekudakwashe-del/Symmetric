@@ -41,6 +41,7 @@ import {
 } from 'lucide-react';
 import { PackageSetupView } from './PackageSetupView';
 import { BackendAdapterHub } from './BackendAdapterHub';
+import { getPackages, assignCompanyPackage } from '../../services/packageService';
 import {
   getCompanies,
   saveCompany,
@@ -119,6 +120,13 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   const [paymentPlan, setPaymentPlan] = useState<'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE'>('PROFESSIONAL');
   const [paymentMonths, setPaymentMonths] = useState<number>(1);
   const [paymentNotes, setPaymentNotes] = useState<string>('Payment verified via Ecocash / Cash');
+
+  // Dedicated Tenant Package Configurator Modal State
+  const [selectedCompanyForPkgModal, setSelectedCompanyForPkgModal] = useState<Company | null>(null);
+  const [pkgModalPlan, setPkgModalPlan] = useState<'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE'>('PROFESSIONAL');
+  const [pkgModalPackageId, setPkgModalPackageId] = useState<string>('pkg_professional');
+  const [pkgModalCustomBranches, setPkgModalCustomBranches] = useState<number>(3);
+  const [pkgModalCustomStaff, setPkgModalCustomStaff] = useState<number>(10);
 
   // Master Sheet Sync & Tabs State
   const [isSyncingWithMaster, setIsSyncingWithMaster] = useState(false);
@@ -477,6 +485,9 @@ function setupMasterSheets() {
       trial_start_date: new Date().toISOString().split('T')[0],
       subscription_status: 'TRIAL',
       plan: newPlan,
+      package_id: newPlan === 'ENTERPRISE' ? 'pkg_enterprise' : newPlan === 'PROFESSIONAL' ? 'pkg_professional' : 'pkg_starter',
+      custom_max_branches: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 3 : 1,
+      custom_max_staff: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 15 : 5,
       next_billing_date: new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
       offline_activation_code: `SAI-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
       trial_days_remaining: 14,
@@ -489,6 +500,56 @@ function setupMasterSheets() {
     setNewOwnerName('');
     setIsAddCompanyModalOpen(false);
     showToast(`Registered ${newComp.company_name} with 14-day trial!`);
+  };
+
+  const handleOpenTenantPkgModal = (comp: Company) => {
+    setSelectedCompanyForPkgModal(comp);
+    const plan = (comp.plan as any) || 'STARTER';
+    const planStr = plan === 'ENTERPRISE' ? 'ENTERPRISE' : plan === 'PROFESSIONAL' ? 'PROFESSIONAL' : 'STARTER';
+    setPkgModalPlan(planStr);
+
+    const pkgId =
+      (comp as any).package_id ||
+      (planStr === 'ENTERPRISE' ? 'pkg_enterprise' : planStr === 'PROFESSIONAL' ? 'pkg_professional' : 'pkg_starter');
+    setPkgModalPackageId(pkgId);
+
+    const defaultBranches = planStr === 'ENTERPRISE' ? 999 : planStr === 'PROFESSIONAL' ? 3 : 1;
+    const defaultStaff = planStr === 'ENTERPRISE' ? 999 : planStr === 'PROFESSIONAL' ? 15 : 5;
+
+    setPkgModalCustomBranches(comp.custom_max_branches !== undefined ? comp.custom_max_branches : defaultBranches);
+    setPkgModalCustomStaff(comp.custom_max_staff !== undefined ? comp.custom_max_staff : defaultStaff);
+  };
+
+  const handleSaveTenantPkgConfig = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCompanyForPkgModal) return;
+
+    const branches = pkgModalPlan === 'ENTERPRISE' ? 999 : Math.max(1, Number(pkgModalCustomBranches) || 1);
+    const staff = pkgModalPlan === 'ENTERPRISE' ? 999 : Math.max(1, Number(pkgModalCustomStaff) || 1);
+
+    const success = assignCompanyPackage(selectedCompanyForPkgModal.company_id, pkgModalPackageId, {
+      plan: pkgModalPlan,
+      customMaxBranches: branches,
+      customMaxStaff: staff,
+    });
+
+    if (success) {
+      const updatedList = getCompanies();
+      setCompanies(updatedList);
+      const updatedComp = updatedList.find((c) => c.company_id === selectedCompanyForPkgModal.company_id);
+      if (updatedComp) {
+        syncCompanyToCloud(updatedComp).catch(() => {});
+      }
+      showToast(
+        `✓ Package & limits enforced for ${selectedCompanyForPkgModal.company_name}! (${pkgModalPlan}: ${
+          branches >= 999 ? 'Unlimited' : branches
+        } branches, ${staff >= 999 ? 'Unlimited' : staff} staff)`
+      );
+      try {
+        confetti({ particleCount: 50, spread: 60, origin: { y: 0.6 } });
+      } catch {}
+      setSelectedCompanyForPkgModal(null);
+    }
   };
 
   const handleOpenSheetLinkModal = (comp: Company) => {
@@ -1549,9 +1610,9 @@ function setupMasterSheets() {
 
                       <button
                         type="button"
-                        onClick={() => setAdminTab('packages')}
+                        onClick={() => handleOpenTenantPkgModal(comp)}
                         className="py-2 px-1 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 text-[11px] font-bold border border-amber-500/30 flex items-center justify-center gap-1 active:scale-95 transition"
-                        title="Manage & Save Package"
+                        title="Configure Package & Limits for this Tenant"
                       >
                         <Package className="w-3.5 h-3.5" />
                         <span>Pkg</span>
@@ -1731,9 +1792,9 @@ function setupMasterSheets() {
 
                             <button
                               type="button"
-                              onClick={() => setAdminTab('packages')}
+                              onClick={() => handleOpenTenantPkgModal(comp)}
                               className="px-2 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[11px] font-bold flex items-center gap-1 cursor-pointer transition"
-                              title="Manage & Save Package for this Tenant"
+                              title="Configure Package & Limits for this Tenant"
                             >
                               <Package className="w-3 h-3 text-amber-400" />
                               <span>Package</span>
@@ -2343,6 +2404,157 @@ function setupMasterSheets() {
                 fullCodeContent || '// Loading code content...'
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tenant Package & Limits Configurator Modal */}
+      {selectedCompanyForPkgModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-amber-500/30 rounded-3xl max-w-lg w-full p-6 shadow-2xl space-y-4 animate-fadeIn">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                <Package className="w-5 h-5 text-amber-400" />
+                Configure Tenant Package & Limits
+              </h3>
+              <button
+                type="button"
+                onClick={() => setSelectedCompanyForPkgModal(null)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 text-xs space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-white text-sm">{selectedCompanyForPkgModal.company_name}</span>
+                <span className="font-mono text-amber-400 font-bold">{selectedCompanyForPkgModal.company_id}</span>
+              </div>
+              <p className="text-slate-400">
+                Owner: {selectedCompanyForPkgModal.owner_name} ({selectedCompanyForPkgModal.owner_email})
+              </p>
+              <div className="flex items-center gap-2 pt-1 text-[11px] text-slate-300">
+                <span>Current Plan: <strong className="text-amber-400">{selectedCompanyForPkgModal.plan}</strong></span>
+                <span>•</span>
+                <span>
+                  Limits: {selectedCompanyForPkgModal.custom_max_branches !== undefined ? (selectedCompanyForPkgModal.custom_max_branches >= 999 ? 'Unlimited' : selectedCompanyForPkgModal.custom_max_branches) : 'Default'} Branches / {selectedCompanyForPkgModal.custom_max_staff !== undefined ? (selectedCompanyForPkgModal.custom_max_staff >= 999 ? 'Unlimited' : selectedCompanyForPkgModal.custom_max_staff) : 'Default'} Staff
+                </span>
+              </div>
+            </div>
+
+            <form onSubmit={handleSaveTenantPkgConfig} className="space-y-4 text-xs">
+              <div>
+                <label className="text-xs font-bold text-slate-300 block mb-1.5">Package Tier</label>
+                <div className="grid grid-cols-3 gap-2">
+                  {(['STARTER', 'PROFESSIONAL', 'ENTERPRISE'] as const).map((tier) => (
+                    <button
+                      key={tier}
+                      type="button"
+                      onClick={() => {
+                        setPkgModalPlan(tier);
+                        if (tier === 'ENTERPRISE') {
+                          setPkgModalPackageId('pkg_enterprise');
+                          setPkgModalCustomBranches(999);
+                          setPkgModalCustomStaff(999);
+                        } else if (tier === 'PROFESSIONAL') {
+                          setPkgModalPackageId('pkg_professional');
+                          setPkgModalCustomBranches(3);
+                          setPkgModalCustomStaff(15);
+                        } else {
+                          setPkgModalPackageId('pkg_starter');
+                          setPkgModalCustomBranches(1);
+                          setPkgModalCustomStaff(5);
+                        }
+                      }}
+                      className={`py-2.5 px-2 rounded-xl font-bold border text-center transition ${
+                        pkgModalPlan === tier
+                          ? 'bg-amber-500/20 border-amber-500 text-amber-300 shadow-md'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white hover:bg-slate-800'
+                      }`}
+                    >
+                      {tier}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-300 block mb-1">Assigned SaaS Package Template</label>
+                <select
+                  value={pkgModalPackageId}
+                  onChange={(e) => setPkgModalPackageId(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs"
+                >
+                  {getPackages().map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({p.tier} - Max {p.maxBranches >= 999 ? 'Unlimited' : p.maxBranches} Branches, {p.maxStaff >= 999 ? 'Unlimited' : p.maxStaff} Staff)
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-300 block mb-1">
+                    Max Branches Limit
+                    {pkgModalPlan === 'ENTERPRISE' && <span className="text-emerald-400 ml-1 font-semibold">(Unlimited)</span>}
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="999"
+                    disabled={pkgModalPlan === 'ENTERPRISE'}
+                    value={pkgModalPlan === 'ENTERPRISE' ? 999 : pkgModalCustomBranches}
+                    onChange={(e) => setPkgModalCustomBranches(Number(e.target.value))}
+                    className="w-full bg-slate-950 border border-slate-700 disabled:opacity-50 text-white rounded-xl px-3 py-2 text-xs"
+                  />
+                  <span className="text-[10px] text-slate-400 block mt-0.5">
+                    {pkgModalPlan === 'ENTERPRISE' ? 'Enterprise includes 999 (Unlimited)' : 'Maximum physical stores allowed'}
+                  </span>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-slate-300 block mb-1">
+                    Max Staff Limit
+                    {pkgModalPlan === 'ENTERPRISE' && <span className="text-emerald-400 ml-1 font-semibold">(Unlimited)</span>}
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="999"
+                    disabled={pkgModalPlan === 'ENTERPRISE'}
+                    value={pkgModalPlan === 'ENTERPRISE' ? 999 : pkgModalCustomStaff}
+                    onChange={(e) => setPkgModalCustomStaff(Number(e.target.value))}
+                    className="w-full bg-slate-950 border border-slate-700 disabled:opacity-50 text-white rounded-xl px-3 py-2 text-xs"
+                  />
+                  <span className="text-[10px] text-slate-400 block mt-0.5">
+                    {pkgModalPlan === 'ENTERPRISE' ? 'Enterprise includes 999 (Unlimited)' : 'Maximum user logins allowed'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200">
+                ⚡ Saving will update <strong>{selectedCompanyForPkgModal.company_name}</strong>'s plan and sync limits in real-time across the branch and staff management screens immediately.
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedCompanyForPkgModal(null)}
+                  className="flex-1 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black flex items-center justify-center gap-1.5 shadow-md shadow-amber-500/20 cursor-pointer"
+                >
+                  <Save className="w-4 h-4" />
+                  <span>Enforce &amp; Save</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

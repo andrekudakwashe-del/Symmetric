@@ -285,11 +285,11 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
     
     const adminMatch = candidatePool.find(
       (s) => (isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride)) &&
-             verifySalespersonPin(s.pin, cleanPin) &&
+             verifySalespersonPin(s, cleanPin) &&
              s.active === 'Y'
     ) || allStaff.find(
       (s) => (isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride)) &&
-             verifySalespersonPin(s.pin, cleanPin) &&
+             verifySalespersonPin(s, cleanPin) &&
              s.active === 'Y'
     );
 

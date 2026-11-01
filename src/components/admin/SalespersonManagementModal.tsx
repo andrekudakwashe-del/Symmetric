@@ -67,7 +67,7 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
     setIsAdding(false);
     setEditingStaffId(staff.id);
     setName(staff.name);
-    setPin(staff.pin);
+    setPin('');
     setRole(staff.role);
     setPhone(staff.phone || '');
     setActive(staff.active);
@@ -86,20 +86,25 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
       setError('Salesperson name is required.');
       return;
     }
-    if (!/^\d{6}$/.test(pin) && !/^\d{4}$/.test(pin)) {
-      setError('PIN must be 6 numeric digits (e.g. 123456).');
-      return;
+    if (!editingStaffId || pin) {
+      if (!/^\d{6}$/.test(pin) && !/^\d{4}$/.test(pin)) {
+        setError('PIN must be 4 or 6 numeric digits (e.g. 123456).');
+        return;
+      }
     }
 
     try {
       if (editingStaffId) {
-        updateSalesperson(editingStaffId, {
+        const payload: any = {
           name: name.trim(),
-          pin,
           role,
           phone: phone.trim() || undefined,
           active,
-        });
+        };
+        if (pin) {
+          payload.pin = pin;
+        }
+        updateSalesperson(editingStaffId, payload);
       } else {
         addSalesperson({
           name: name.trim(),
@@ -212,15 +217,17 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
 
                 {/* 6-digit PIN */}
                 <div>
-                  <label className="block text-xs font-bold text-slate-300 mb-1">6-Digit Security PIN *</label>
+                  <label className="block text-xs font-bold text-slate-300 mb-1">
+                    {editingStaffId ? 'Change PIN (leave blank to keep current)' : '6-Digit Security PIN *'}
+                  </label>
                   <input
                     type="password"
                     maxLength={6}
                     value={pin}
                     onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                    placeholder="e.g. 123456"
+                    placeholder={editingStaffId ? '•••••• (Unchanged)' : 'e.g. 123456'}
                     className="w-full py-2 px-3 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white font-mono-num outline-none focus:border-[#6A4DFF]"
-                    required
+                    required={!editingStaffId}
                   />
                 </div>
               </div>

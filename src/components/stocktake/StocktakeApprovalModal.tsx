@@ -15,6 +15,7 @@ import {
   Unlock,
 } from 'lucide-react';
 import { StocktakeSession, Salesperson } from '../../types';
+import { verifySalespersonPin } from '../../db/roomDatabase';
 
 interface StocktakeApprovalModalProps {
   session: StocktakeSession;
@@ -65,9 +66,9 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
       return;
     }
 
-    // PIN check - accepts admin default PIN '1234' or any 4-digit PIN in prototype
-    if (adminPin && adminPin.trim() !== '1234' && currentUser?.pin && adminPin.trim() !== currentUser.pin) {
-      setPinError('Invalid Admin / Auditor Authorization PIN. Default PIN is 1234.');
+    // PIN check - accepts admin default PIN '1234' or valid hashed PIN
+    if (adminPin && adminPin.trim() !== '1234' && (!currentUser || !verifySalespersonPin(currentUser, adminPin.trim()))) {
+      setPinError('Invalid Admin / Auditor Authorization PIN.');
       return;
     }
 

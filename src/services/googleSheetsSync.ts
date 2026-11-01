@@ -2503,7 +2503,7 @@ export const authenticateOwnerWithAppsScript = async (
   );
 
   if (matchedStaff) {
-    if (rawPassword === 'Pass123' || rawPassword === '1234' || rawPassword === matchedStaff.pin) {
+    if (rawPassword === 'Pass123' || rawPassword === '1234' || verifySalespersonPin(matchedStaff, rawPassword)) {
       const staffCompId = matchedStaff.companyId || matchedStaff.company_id || 'COMP-001';
       const staffComp = localCompanies.find((c) => c.company_id === staffCompId);
       return {
@@ -2627,7 +2627,7 @@ export const authenticateStaffWithAppsScript = async (
           const localUser = allLocal.find(
             (sp) => sp.id === cleanStaffId || (sp.name && cleanStaffName && sp.name.trim().toLowerCase() === cleanStaffName.toLowerCase())
           );
-          if (localUser && verifySalespersonPin(localUser.pin, cleanPin)) {
+          if (localUser && verifySalespersonPin(localUser, cleanPin)) {
             return {
               status: 'success',
               success: true,
@@ -2666,7 +2666,7 @@ export const authenticateStaffWithAppsScript = async (
   );
 
   if (matched) {
-    if (verifySalespersonPin(matched.pin, cleanPin)) {
+    if (verifySalespersonPin(matched, cleanPin)) {
       return {
         status: 'success',
         success: true,

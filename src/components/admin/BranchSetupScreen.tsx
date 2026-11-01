@@ -97,7 +97,7 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
   const [showFormTeamConfig, setShowFormTeamConfig] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
 
-  const company = getCurrentCompany();
+  const [company, setCompany] = useState(() => getCurrentCompany());
   const [branchSharing, setBranchSharing] = useState(() => getCompanyBranchSettings());
 
   const isSuperAdmin =
@@ -110,11 +110,22 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
 
   useEffect(() => {
     const unsub = subscribeRoomDatabase(() => {
+      setCompany(getCurrentCompany());
       setBranches(getBranches());
       setStaffList(getSalespeople());
       setBranchSharing(getCompanyBranchSettings());
     });
-    return unsub;
+    const handlePkgUpdate = () => {
+      setCompany(getCurrentCompany());
+      setBranches(getBranches());
+    };
+    window.addEventListener('saas_packages_updated', handlePkgUpdate);
+    window.addEventListener('saas_company_updated', handlePkgUpdate);
+    return () => {
+      unsub();
+      window.removeEventListener('saas_packages_updated', handlePkgUpdate);
+      window.removeEventListener('saas_company_updated', handlePkgUpdate);
+    };
   }, []);
 
   const handleToggleShareCustomers = (val: boolean) => {

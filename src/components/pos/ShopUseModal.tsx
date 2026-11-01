@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Salesperson, Product, ConsumptionType, InternalConsumption } from '../../types';
-import { getProducts, getSalespeople } from '../../db/roomDatabase';
+import { getProducts, getSalespeople, verifySalespersonPin } from '../../db/roomDatabase';
 import {
   createInternalConsumptionRequest,
   approveInternalConsumption,
@@ -233,7 +233,7 @@ export const ShopUseModal: React.FC<ShopUseModalProps> = ({ isOpen, onClose, cur
       return;
     }
 
-    if (sup.pin && sup.pin !== supervisorPin.trim()) {
+    if (!verifySalespersonPin(sup, supervisorPin.trim())) {
       setStatusNotice({ text: 'Incorrect supervisor PIN. Authorization failed.', type: 'error' });
       return;
     }
@@ -292,7 +292,7 @@ export const ShopUseModal: React.FC<ShopUseModalProps> = ({ isOpen, onClose, cur
       return;
     }
 
-    if (approver.pin && approver.pin !== reviewSupervisorPin.trim()) {
+    if (!verifySalespersonPin(approver, reviewSupervisorPin.trim())) {
       setStatusNotice({ text: 'Incorrect supervisor PIN. Authorization failed.', type: 'error' });
       return;
     }

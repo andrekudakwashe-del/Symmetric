@@ -86,6 +86,10 @@ let branchLockdownsStore = {};
 let salespeopleStore = [];
 let customersStore = [];
 
+// Business Day Closures & EOD Archives
+let businessDayClosuresStore = [];
+let electronicSettlementsStore = [];
+
 // Secret holding vault for blind double-counting:
 // Structure: { [sessionId]: { [zoneId]: { A: null, B: null } } }
 const hubBlindStore = {};
@@ -147,16 +151,28 @@ function loadData() {
       if (Array.isArray(parsed.stockMovements)) stockMovementsStore = parsed.stockMovements;
       if (Array.isArray(parsed.expenses)) expensesStore = parsed.expenses;
       if (Array.isArray(parsed.cashTransfers)) cashTransfersStore = parsed.cashTransfers;
-      if (Array.isArray(parsed.casualWorkers)) casualWorkersStore = parsed.casualWorkers;
+      if (Array.isArray(parsed.casualWorkers)) {
+        casualWorkersStore = parsed.casualWorkers.map((cw) => {
+          if (cw && cw.pin) delete cw.pin;
+          return cw;
+        });
+      }
       if (Array.isArray(parsed.zoneAssignments)) zoneAssignmentsStore = parsed.zoneAssignments;
-      if (Array.isArray(parsed.salespeople)) salespeopleStore = parsed.salespeople;
+      if (Array.isArray(parsed.salespeople)) {
+        salespeopleStore = parsed.salespeople.map((sp) => {
+          if (sp && sp.pin) delete sp.pin;
+          return sp;
+        });
+      }
       if (Array.isArray(parsed.customers)) customersStore = parsed.customers;
+      if (Array.isArray(parsed.businessDayClosures)) businessDayClosuresStore = parsed.businessDayClosures;
+      if (Array.isArray(parsed.electronicSettlements)) electronicSettlementsStore = parsed.electronicSettlements;
       if (parsed.branchLockdowns && typeof parsed.branchLockdowns === 'object') {
         branchLockdownsStore = parsed.branchLockdowns;
       }
 
       console.log(
-        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${casualWorkersStore.length} casuals.`
+        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${businessDayClosuresStore.length} EOD closures.`
       );
     }
   } catch (e) {
@@ -194,6 +210,8 @@ function saveData() {
       zoneAssignments: zoneAssignmentsStore.slice(0, 500),
       salespeople: salespeopleStore.slice(0, 1000),
       customers: customersStore.slice(0, 3000),
+      businessDayClosures: businessDayClosuresStore.slice(0, 365),
+      electronicSettlements: electronicSettlementsStore.slice(0, 365),
       branchLockdowns: branchLockdownsStore,
       savedAt: new Date().toISOString(),
     };
@@ -425,25 +443,41 @@ wss.on('connection', (ws, req) => {
       if (pType === 'CASUAL_WORKERS_SYNC') {
         const incoming = packet.casualWorkers || payload || packet.casuals;
         if (Array.isArray(incoming)) {
-          // Merge casual workers by PIN or ID
+          // Merge casual workers by pin_hash or ID, never store plain pin
           incoming.forEach((cw) => {
-            if (!cw || !cw.pin) return;
-            const idx = casualWorkersStore.findIndex((c) => c.pin === cw.pin || c.id === cw.id);
+            if (!cw) return;
+            const sanitizedCw = { ...cw };
+            delete sanitizedCw.pin; // Ensure raw PIN is never stored
+            const idx = casualWorkersStore.findIndex((c) =>
+              (c.pin_hash && sanitizedCw.pin_hash && c.pin_hash === sanitizedCw.pin_hash) ||
+              (c.id && sanitizedCw.id && c.id === sanitizedCw.id)
+            );
             if (idx >= 0) {
-              casualWorkersStore[idx] = { ...casualWorkersStore[idx], ...cw };
+              casualWorkersStore[idx] = { ...casualWorkersStore[idx], ...sanitizedCw };
             } else {
-              casualWorkersStore.push(cw);
+              casualWorkersStore.push(sanitizedCw);
             }
           });
           scheduleSave();
-          console.log(`[Termux Hub] Synced ${incoming.length} casual worker(s). Active casuals: ${casualWorkersStore.length}`);
+          console.log(`[Termux Hub] Synced ${incoming.length} casual worker(s) securely (PINs hashed). Active casuals: ${casualWorkersStore.length}`);
         }
+
+        // Sanitize packet before broadcasting to ensure no plain PINs are forwarded
+        const sanitizedPacket = { ...packet };
+        if (Array.isArray(sanitizedPacket.casualWorkers)) {
+          sanitizedPacket.casualWorkers = sanitizedPacket.casualWorkers.map((c) => {
+            const copy = { ...c };
+            delete copy.pin;
+            return copy;
+          });
+        }
+        const forwardStr = JSON.stringify(sanitizedPacket);
 
         // Broadcast to all other peers so every tablet receives the updated casual credentials
         wss.clients.forEach((client) => {
           if (client !== ws && client.readyState === WebSocket.OPEN) {
             try {
-              client.send(dataStr);
+              client.send(forwardStr);
             } catch (e) {}
           }
         });
@@ -852,13 +886,32 @@ wss.on('connection', (ws, req) => {
         if (grv && (grv.grvNumber || grv.id)) {
           const gId = grv.grvNumber || grv.id;
           const exIdx = directGrvsStore.findIndex((g) => g.grvNumber === gId || g.id === gId);
+          const prevGrv = exIdx >= 0 ? directGrvsStore[exIdx] : null;
           if (exIdx >= 0) {
             directGrvsStore[exIdx] = { ...directGrvsStore[exIdx], ...grv };
           } else {
             directGrvsStore.unshift(grv);
           }
 
-          if (grv.status !== 'REJECTED' && Array.isArray(grv.items)) {
+          const isNewlyRejected = grv.status === 'REJECTED' && prevGrv && prevGrv.status !== 'REJECTED';
+          const isNewlyApprovedOrCreated = grv.status !== 'REJECTED' && (!prevGrv || prevGrv.status === 'REJECTED');
+
+          if (isNewlyRejected && Array.isArray(grv.items)) {
+            for (const item of grv.items) {
+              const cleanId = (item.productId || item.itemId || item.id || '').trim();
+              if (!cleanId) continue;
+              const unitsToDeduct = Number(item.quantity || 0);
+              const invIdx = inventoryStore.findIndex(
+                (i) => i.itemId === cleanId || i.id === cleanId || (item.productName && i.itemName === item.productName)
+              );
+              if (invIdx >= 0) {
+                const curUnits = Number(inventoryStore[invIdx].totalUnits || 0);
+                inventoryStore[invIdx].totalUnits = Math.max(0, Number((curUnits - unitsToDeduct).toFixed(3)));
+                inventoryStore[invIdx].stockSingles = inventoryStore[invIdx].totalUnits;
+                console.log(`[Termux Hub] Reverted ${unitsToDeduct}x ${item.productName || cleanId} from rejected GRV #${gId}`);
+              }
+            }
+          } else if (isNewlyApprovedOrCreated && Array.isArray(grv.items)) {
             for (const item of grv.items) {
               const cleanId = (item.productId || item.itemId || item.id || '').trim();
               if (!cleanId) continue;
@@ -1058,7 +1111,12 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 9.1 STAFF (TILL OPERATORS) & CUSTOMER PROFILES SYNC
       // =====================================================================
-      const staffObj = packet.staff || (payload && (payload.pin || payload.role) ? payload : null);
+      const rawStaffObj = packet.staff || (payload && (payload.pin_hash || payload.pin || payload.role) ? payload : null);
+      let staffObj = null;
+      if (rawStaffObj) {
+        staffObj = { ...rawStaffObj };
+        delete staffObj.pin; // CRITICAL: Never retain plain-text PIN in hub memory or disk
+      }
       const isStaff = pType === 'STAFF' || pType === 'STAFF_SYNC' || pType === 'STAFF_RECORD' || sheetName === 'Salespeople' || sheetName === 'users' || !!staffObj;
       if (isStaff && staffObj && staffObj.id) {
         const sIdx = salespeopleStore.findIndex((s) => s.id === staffObj.id);
@@ -1068,7 +1126,7 @@ wss.on('connection', (ws, req) => {
           salespeopleStore.unshift(staffObj);
         }
         scheduleSave();
-        console.log(`[Termux Hub] Synced Staff account: ${staffObj.name} (${staffObj.id} - ${staffObj.role})`);
+        console.log(`[Termux Hub] Synced Staff account securely: ${staffObj.name} (${staffObj.id} - ${staffObj.role})`);
       }
 
       const custObj = packet.customer || (payload && (payload.customerId || payload.creditLimit !== undefined) ? payload : null);
@@ -1083,6 +1141,30 @@ wss.on('connection', (ws, req) => {
         }
         scheduleSave();
         console.log(`[Termux Hub] Synced Customer account: ${custObj.name} (${cId})`);
+      }
+
+      // =====================================================================
+      // 9.2 END OF DAY (EOD) & BUSINESS DAY CLOSURES
+      // =====================================================================
+      const isEod =
+        pType === 'END_OF_DAY_COMPLETED' ||
+        pType === 'BUSINESS_DAY_CLOSURE' ||
+        pType === 'EOD_COMPLETED' ||
+        sheetName === 'BusinessDayClosures';
+
+      if (isEod) {
+        const closure = packet.closure || payload || packet.data;
+        if (closure && (closure.id || closure.date)) {
+          const cId = closure.id || `EOD-${closure.date}`;
+          const exIdx = businessDayClosuresStore.findIndex((c) => c.id === cId || c.date === closure.date);
+          if (exIdx >= 0) {
+            businessDayClosuresStore[exIdx] = { ...businessDayClosuresStore[exIdx], ...closure };
+          } else {
+            businessDayClosuresStore.unshift(closure);
+          }
+          scheduleSave();
+          console.log(`[Termux Hub] Recorded End of Day Closure for Date: ${closure.date} by ${closure.closedBySupervisorName || 'Supervisor'}`);
+        }
       }
 
       // =====================================================================
@@ -1137,6 +1219,7 @@ wss.on('connection', (ws, req) => {
             branchLockdowns: branchLockdownsStore,
             salespeople: missedSalespeople,
             customers: missedCustomers,
+            businessDayClosures: businessDayClosuresStore,
           },
         };
 

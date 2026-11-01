@@ -58,6 +58,7 @@ import {
   rejectDirectGrv,
   getSalespeople,
   subscribeRoomDatabase,
+  verifySalespersonPin,
 } from '../../db/roomDatabase';
 import { cleanNumberInput } from './GoodsReceivedView';
 import { SyncStatusDot } from '../common/SyncStatusDot';
@@ -675,7 +676,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
             errors[p.id] = `PIN required for ${p.userName}`;
           } else {
             const staff = staffList.find((s) => s.id === p.userId);
-            if (staff?.pin && staff.pin !== p.pin && p.pin !== '1234' && p.pin !== '4321') {
+            if (staff && !verifySalespersonPin(staff, p.pin) && p.pin !== '1234' && p.pin !== '4321') {
               errors[p.id] = `Invalid PIN for ${p.userName}`;
             }
           }
@@ -859,7 +860,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     const supervisor = staffList.find(
       (s) =>
         (s.role === 'SUPERVISOR' || s.role === 'MANAGER' || s.role === 'ADMIN' || s.role === 'OWNER' || s.role === 'SUPER_ADMIN') &&
-        s.pin === supervisorPin
+        verifySalespersonPin(s, supervisorPin)
     );
 
     if (!supervisor && supervisorPin !== '4321' && supervisorPin !== '1234') {
@@ -1645,9 +1646,22 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                   ${calc.sellingPrice.toFixed(2)}
                                 </span>
                               ) : (
-                                <span className="text-white font-bold font-mono">
-                                  ${calc.sellingPrice.toFixed(2)}
-                                </span>
+                                <div className="relative inline-flex items-center">
+                                  <span className="absolute left-2.5 text-slate-500 text-xs font-mono">$</span>
+                                  <input
+                                    type="text"
+                                    inputMode="decimal"
+                                    value={row.sellingPrice ?? ''}
+                                    placeholder="0.00"
+                                    onFocus={(e) => e.target.select()}
+                                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                                    onChange={(e) => {
+                                      const val = cleanNumberInput(e.target.value, true);
+                                      updateRow(row.id, { sellingPrice: val });
+                                    }}
+                                    className="w-24 bg-slate-900 border border-slate-700 rounded-lg pl-6 pr-2 py-1 text-right text-xs text-white font-mono font-bold focus:outline-none focus:border-amber-500"
+                                  />
+                                </div>
                               )}
                               <span
                                 className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
@@ -1672,8 +1686,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                 <table className="w-full text-left text-sm text-slate-300 border-collapse">
                   <thead className="bg-slate-950/80 text-xs uppercase font-bold text-slate-400 border-b border-slate-800">
                   <tr>
-                    <th className="py-3.5 px-3">#</th>
-                    <th className="py-3.5 px-3 min-w-[240px]">Product</th>
+                    <th className="py-3.5 px-2.5 w-10 text-center md:sticky md:left-0 bg-slate-950 z-20">#</th>
+                    <th className="py-3.5 px-3 min-w-[170px] sm:min-w-[240px] md:sticky md:left-10 bg-slate-950 z-20 md:shadow-[2px_0_5px_rgba(0,0,0,0.3)]">Product</th>
                     <th className="py-3.5 px-3 w-24">Batch #</th>
                     <th className="py-3.5 px-3 w-28">Expiry</th>
                     <th className="py-3.5 px-3 w-36">Receive As</th>
@@ -1729,10 +1743,10 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
                       return (
                         <tr key={row.id} className="hover:bg-slate-800/40 transition-colors">
-                          <td className="py-3 px-3 font-mono text-slate-500 text-center">{index + 1}</td>
+                          <td className="py-3 px-2.5 font-mono text-slate-500 text-center md:sticky md:left-0 bg-slate-900 z-10">{index + 1}</td>
 
                           {/* 1. Product (Searchable Popover) */}
-                          <td className="py-2.5 px-3 relative min-w-[240px]">
+                          <td className="py-2.5 px-3 relative min-w-[170px] sm:min-w-[240px] md:sticky md:left-10 bg-slate-900 z-10 md:shadow-[2px_0_5px_rgba(0,0,0,0.3)]">
                             <div className="relative">
                               <button
                                 type="button"

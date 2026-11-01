@@ -365,7 +365,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
 
     // Prevent double-counting supplier payments / direct procurements if logged in both GRV and Form 2
     if (m.type === 'supplier_payment') {
-      const refKey = m.sourceRef || m.notes || m.id;
+      const refKey = `${m.staffId || ''}_${m.sourceRef || m.notes || m.id}`;
       if (seenSupplierPayments.has(refKey)) return;
       seenSupplierPayments.add(refKey);
     }
@@ -425,6 +425,10 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
         }
         break;
 
+      case 'supplier_refund':
+        // Supplier refund audit entry: handled via rejection of supplier_payment
+        break;
+
       case 'ecocash_sale':
       case 'zig_sale':
         // Explicitly ignored for drawer balance (electronic non-cash)
@@ -450,7 +454,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
         grvs.forEach((g: any) => {
           if (g.status === 'REJECTED') return;
           if (targetDate && g.date !== targetDate) return;
-          const refKey = g.grvNumber || g.id;
+          const refKey = `${targetStaff}_${g.grvNumber || g.id}`;
           if (seenSupplierPayments.has(refKey)) return;
 
           if (g.payments && Array.isArray(g.payments)) {
@@ -658,7 +662,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
 
     // Prevent double-counting supplier payments / direct procurements if logged in both GRV and Form 2
     if (m.type === 'supplier_payment') {
-      const refKey = m.sourceRef || m.notes || m.id;
+      const refKey = `${m.staffId || ''}_${m.sourceRef || m.notes || m.id}`;
       if (seenSupplierPayments.has(refKey)) return;
       seenSupplierPayments.add(refKey);
     }
@@ -730,6 +734,9 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
         if (m.direction === 'in') cashSales += amt;
         else if (m.direction === 'out') refunds += amt;
         break;
+      case 'supplier_refund':
+        // Explicitly handled: audit trail reversal, does not count as cash sales or double-credit
+        break;
       default:
         if (m.direction === 'in') cashSales += amt;
         else if (m.direction === 'out') expenses += amt;
@@ -749,7 +756,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
         grvs.forEach((g: any) => {
           if (g.status === 'REJECTED') return;
           if (targetDate && g.date !== targetDate) return;
-          const refKey = g.grvNumber || g.id;
+          const refKey = `${targetStaff}_${g.grvNumber || g.id}`;
           if (seenSupplierPayments.has(refKey)) return;
 
           if (g.payments && Array.isArray(g.payments)) {

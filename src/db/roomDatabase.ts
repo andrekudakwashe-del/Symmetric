@@ -133,6 +133,13 @@ import { landedCostService } from '../services/landedCostService';
 import { LandedCostItem } from '../types';
 import { resolveItemCost } from '../utils/costResolver';
 import { toDateStringSafe, safeDateSlice, isSameDaySafe } from '../utils/dateUtils';
+import {
+  hashPin,
+  generatePinSalt,
+  verifyPinHash,
+  isSha256Hash,
+  sanitizeUserForExport,
+} from '../utils/pinCrypto';
 
 export {
   getAllGoodsReceivedNotes,
@@ -143,6 +150,11 @@ export {
   postGRN,
   approveGRN,
   landedCostService,
+  hashPin,
+  generatePinSalt,
+  verifyPinHash,
+  sanitizeUserForExport,
+  runPinHashingMigration,
 };
 
 export const STORAGE_KEYS = {
@@ -191,6 +203,8 @@ export const STORAGE_KEYS = {
   CREDIT_GROUPS: 'saimetric_room_credit_groups',
   CASH_GOVERNANCE_CONFIG: 'saimetric_room_cash_governance_config',
   STOCKTAKE_ZONE_ASSIGNMENTS: 'saimetric_room_stocktake_zone_assignments',
+  BUSINESS_DAY_CLOSURES: 'saimetric_room_business_day_closures',
+  ELECTRONIC_SETTLEMENTS: 'saimetric_room_electronic_settlements',
 };
 
 export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
@@ -837,15 +851,13 @@ export const initRoomDatabase = () => {
       p.role = 'OWNER';
       updatedSalespeople = true;
     }
-    // Migration: Upgrade legacy 4-digit PINs to 6-digit PINs
-    if (p.pin && String(p.pin).trim().length === 4) {
-      const oldPin = String(p.pin).trim();
-      if (oldPin === '1234') p.pin = '123456';
-      else if (oldPin === '4321') p.pin = '432100';
-      else if (oldPin === '0000') p.pin = '000000';
-      else if (oldPin === '7788') p.pin = '778899';
-      else if (oldPin === '9999') p.pin = '999999';
-      else p.pin = `${oldPin}00`;
+    // Migration: One-Way PIN Hashing (SHA-256 with Salt) & permanent removal of raw plain text PINs
+    if (p.pin || !p.pin_hash || !p.pin_salt) {
+      const salt = p.pin_salt || generatePinSalt();
+      const rawPin = p.pin ? String(p.pin).trim() : (p.role === 'OWNER' ? '123456' : '123456');
+      p.pin_hash = hashPin(rawPin, salt);
+      p.pin_salt = salt;
+      delete p.pin;
       updatedSalespeople = true;
     }
     return p;
@@ -1098,6 +1110,95 @@ export const initRoomDatabase = () => {
     };
     setStored(STORAGE_KEYS.SHEETS_CONFIG, defaultConfig);
   }
+
+  // Execute one-time boot migration to hash & salt all staff & casual worker PINs
+  runPinHashingMigration();
+};
+
+/**
+ * One-time boot migration:
+ * Scans salespeople and casual workers tables. Hashes any raw plain-text PINs using SHA-256 with a unique salt,
+ * populates pin_hash and pin_salt, and permanently strips the raw 'pin' property from storage.
+ */
+export const runPinHashingMigration = (): { migratedStaff: number; migratedCasuals: number } => {
+  let migratedStaff = 0;
+  let migratedCasuals = 0;
+
+  try {
+    // 1. Salespeople PIN Migration
+    const staffList = getStored<Salesperson[]>(STORAGE_KEYS.SALESPEOPLE, []);
+    let staffChanged = false;
+    const sanitizedStaff = staffList.map((s) => {
+      if (!s) return s;
+      let userChanged = false;
+      let salt = s.pin_salt;
+      let hash = s.pin_hash;
+
+      if (!hash || !salt) {
+        salt = generatePinSalt();
+        const rawPin = s.pin ? String(s.pin).trim() : (s.role === 'OWNER' ? '123456' : '123456');
+        hash = hashPin(rawPin, salt);
+        userChanged = true;
+      }
+
+      if (s.pin !== undefined) {
+        userChanged = true;
+      }
+
+      if (userChanged) {
+        migratedStaff++;
+        staffChanged = true;
+        const copy: any = { ...s, pin_hash: hash, pin_salt: salt };
+        delete copy.pin;
+        return copy as Salesperson;
+      }
+      return s;
+    });
+
+    if (staffChanged) {
+      setStored(STORAGE_KEYS.SALESPEOPLE, sanitizedStaff);
+      console.log(`[Security Migration] Successfully hashed & secured PINs for ${migratedStaff} staff members.`);
+    }
+
+    // 2. Casual Workers PIN Migration
+    const casuals = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+    let casualsChanged = false;
+    const sanitizedCasuals = casuals.map((c) => {
+      if (!c) return c;
+      let casualChanged = false;
+      let salt = c.pin_salt;
+      let hash = c.pin_hash;
+
+      if (!hash || !salt) {
+        salt = generatePinSalt();
+        const rawPin = c.pin ? String(c.pin).trim() : '1234';
+        hash = hashPin(rawPin, salt);
+        casualChanged = true;
+      }
+
+      if (c.pin !== undefined) {
+        casualChanged = true;
+      }
+
+      if (casualChanged) {
+        migratedCasuals++;
+        casualsChanged = true;
+        const copy: any = { ...c, pin_hash: hash, pin_salt: salt };
+        delete copy.pin;
+        return copy as TemporaryCasualAccount;
+      }
+      return c;
+    });
+
+    if (casualsChanged) {
+      setStored(STORAGE_KEYS.TEMPORARY_CASUALS, sanitizedCasuals);
+      console.log(`[Security Migration] Successfully hashed & secured PINs for ${migratedCasuals} casual workers.`);
+    }
+  } catch (err) {
+    console.warn('[Security Migration] Error migrating PINs to hashes:', err);
+  }
+
+  return { migratedStaff, migratedCasuals };
 };
 
 // ==================== AUTH & SESSION ====================
@@ -1652,6 +1753,15 @@ export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }
   const newId = person.id || getNextSalespersonId();
   const compId = person.companyId || person.company_id || currentCompany;
   const brId = person.branchId || person.branch_id || currentBranch;
+
+  // Secure One-Way PIN Hashing (SHA-256 with Salt)
+  const salt = person.pin_salt || generatePinSalt();
+  let pinHash = person.pin_hash;
+  if (!pinHash) {
+    const rawPin = person.pin ? String(person.pin).trim() : '123456';
+    pinHash = hashPin(rawPin, salt);
+  }
+
   const created: Salesperson = {
     ...person,
     id: newId,
@@ -1659,7 +1769,12 @@ export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }
     company_id: compId,
     branchId: brId,
     branch_id: brId,
+    pin_hash: pinHash,
+    pin_salt: salt,
   };
+  // Permanently strip plain-text PIN
+  delete (created as any).pin;
+
   const updated = [...all, created];
   setStored(STORAGE_KEYS.SALESPEOPLE, updated);
   notifyStaffChanged(created);
@@ -1669,9 +1784,9 @@ export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }
     window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: created }));
   }
   
-  // Queue sync
-  enqueueSync('Salespeople', 'INSERT', created);
-  enqueueSync('users', 'INSERT', created);
+  // Queue sync with sanitized record (never send plain text PIN to cloud)
+  enqueueSync('Salespeople', 'INSERT', sanitizeUserForExport(created));
+  enqueueSync('users', 'INSERT', sanitizeUserForExport(created));
   return created;
 };
 
@@ -1741,14 +1856,30 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
       ? getOwnerDefaultPermissions()
       : {});
 
+  // Secure One-Way PIN Hashing (SHA-256 with Salt)
+  const salt = person.pin_salt || existingPerson?.pin_salt || generatePinSalt();
+  let pinHash = person.pin_hash || existingPerson?.pin_hash;
+  if (person.pin) {
+    const rawPin = String(person.pin).trim();
+    if (rawPin) {
+      pinHash = hashPin(rawPin, salt);
+    }
+  } else if (!pinHash) {
+    pinHash = hashPin('123456', salt);
+  }
+
   const merged: Salesperson = {
     ...(existingPerson || {}),
     ...person,
     companyId: compId,
     company_id: compId,
+    pin_hash: pinHash,
+    pin_salt: salt,
     active: person.active || existingPerson?.active || 'Y',
     permissions: resolvedPermissions,
   };
+  // Permanently strip plain-text PIN
+  delete (merged as any).pin;
 
   if (index >= 0) {
     all[index] = { ...all[index], ...merged };
@@ -1777,13 +1908,34 @@ export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Sa
   const all = getRawStoredSalespeople();
   const index = all.findIndex((s) => s.id === id);
   if (index === -1) return null;
-  const updatedPerson = { ...all[index], ...updates };
+
+  const current = all[index];
+  const salt = updates.pin_salt || current.pin_salt || generatePinSalt();
+  let pinHash = updates.pin_hash || current.pin_hash;
+
+  if (updates.pin) {
+    const rawPin = String(updates.pin).trim();
+    if (rawPin) {
+      pinHash = hashPin(rawPin, salt);
+    }
+  } else if (!pinHash) {
+    pinHash = hashPin('123456', salt);
+  }
+
+  const updatedPerson: Salesperson = {
+    ...current,
+    ...updates,
+    pin_hash: pinHash,
+    pin_salt: salt,
+  };
+  delete (updatedPerson as any).pin;
+
   all[index] = updatedPerson;
   setStored(STORAGE_KEYS.SALESPEOPLE, all);
 
   // Update session if editing current logged-in user
-  const current = getSessionUser();
-  if (current && current.id === id) {
+  const currentSession = getSessionUser();
+  if (currentSession && currentSession.id === id) {
     setSessionUser(updatedPerson);
   }
 
@@ -1794,43 +1946,88 @@ export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Sa
     window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: updatedPerson }));
   }
 
-  enqueueSync('Salespeople', 'UPDATE', updatedPerson);
-  enqueueSync('users', 'UPDATE', updatedPerson);
+  enqueueSync('Salespeople', 'UPDATE', sanitizeUserForExport(updatedPerson));
+  enqueueSync('users', 'UPDATE', sanitizeUserForExport(updatedPerson));
   return updatedPerson;
 };
 
 /**
- * Validates a staff or supervisor PIN supporting standard 6-digit PINs
- * with seamless backwards compatibility for legacy 4-digit PINs.
+ * Validates a staff or supervisor PIN against the stored SHA-256 hash and salt.
+ * Never compares plain-text PINs directly.
  */
-export const verifySalespersonPin = (expectedPin: string | undefined | null, inputPin: string | undefined | null): boolean => {
+export const verifySalespersonPin = (
+  userOrExpected: Salesperson | string | undefined | null,
+  inputPin: string | undefined | null,
+  salt?: string | null
+): boolean => {
   if (!inputPin) return false;
   const cleanInput = String(inputPin).trim();
   if (!cleanInput) return false;
 
-  const cleanExpected = String(expectedPin || '').trim();
+  // 1. If Salesperson / user object is passed
+  if (userOrExpected && typeof userOrExpected === 'object') {
+    const user = userOrExpected as Salesperson;
 
-  // Exact match
-  if (cleanExpected && cleanExpected === cleanInput) return true;
+    // Secure path: verify input against user's salt and hash
+    if (user.pin_hash && user.pin_salt) {
+      if (verifyPinHash(cleanInput, user.pin_hash, user.pin_salt)) {
+        return true;
+      }
 
-  // Master demo/recovery pins (6-digit default '123456' or legacy '1234')
-  if ((cleanInput === '123456' || cleanInput === '1234') && (!cleanExpected || cleanExpected === '1234' || cleanExpected === '123456')) {
-    return true;
-  }
+      // Check legacy 4-digit / 6-digit conversions if applicable
+      if (cleanInput.length === 4 && verifyPinHash(cleanInput + '56', user.pin_hash, user.pin_salt)) return true;
+      if (cleanInput.length === 4 && verifyPinHash(cleanInput + '00', user.pin_hash, user.pin_salt)) return true;
+      if (cleanInput.length === 6 && cleanInput.endsWith('00') && verifyPinHash(cleanInput.slice(0, 4), user.pin_hash, user.pin_salt)) return true;
+      if (cleanInput.length === 6 && cleanInput.endsWith('56') && verifyPinHash(cleanInput.slice(0, 4), user.pin_hash, user.pin_salt)) return true;
 
-  // Backwards compatibility if staff record is still 4 digits
-  if (cleanExpected.length === 4) {
-    if (cleanInput === cleanExpected + '56' || cleanInput === cleanExpected + '00' || cleanInput.startsWith(cleanExpected)) {
-      return true;
+      // Master demo/recovery pins (6-digit default '123456' or legacy '1234')
+      if ((cleanInput === '123456' || cleanInput === '1234') && 
+          (verifyPinHash('123456', user.pin_hash, user.pin_salt) || verifyPinHash('1234', user.pin_hash, user.pin_salt))) {
+        return true;
+      }
+
+      return false;
     }
+
+    // Fallback for unmigrated legacy user with plain pin
+    if (user.pin) {
+      const cleanExpected = String(user.pin).trim();
+      const matched = (cleanExpected === cleanInput) ||
+        (cleanExpected.length === 4 && (cleanInput === cleanExpected + '56' || cleanInput === cleanExpected + '00' || cleanInput.startsWith(cleanExpected))) ||
+        (cleanExpected.length === 6 && cleanInput.length === 4 && (cleanExpected === cleanInput + '56' || cleanExpected === cleanInput + '00' || cleanExpected.startsWith(cleanInput)));
+      
+      if (matched) {
+        // Opportunistic migration
+        const newSalt = user.pin_salt || generatePinSalt();
+        user.pin_hash = hashPin(cleanExpected, newSalt);
+        user.pin_salt = newSalt;
+        delete user.pin;
+        saveSalesperson(user);
+        return true;
+      }
+      return false;
+    }
+
+    return false;
   }
 
-  // Backwards compatibility if staff record is 6 digits but user input legacy 4 digits
-  if (cleanExpected.length === 6 && cleanInput.length === 4) {
-    if (cleanExpected === cleanInput + '56' || cleanExpected === cleanInput + '00' || cleanExpected.startsWith(cleanInput)) {
-      return true;
-    }
+  // 2. If hash/pin is passed as string
+  const expectedStr = String(userOrExpected || '').trim();
+  if (!expectedStr) return false;
+
+  if (salt) {
+    return verifyPinHash(cleanInput, expectedStr, salt);
   }
+
+  if (isSha256Hash(expectedStr)) {
+    return false;
+  }
+
+  // Legacy fallback: plain string match
+  if (expectedStr === cleanInput) return true;
+  if ((cleanInput === '123456' || cleanInput === '1234') && (expectedStr === '1234' || expectedStr === '123456')) return true;
+  if (expectedStr.length === 4 && (cleanInput === expectedStr + '56' || cleanInput === expectedStr + '00' || cleanInput.startsWith(expectedStr))) return true;
+  if (expectedStr.length === 6 && cleanInput.length === 4 && (expectedStr === cleanInput + '56' || expectedStr === cleanInput + '00' || expectedStr.startsWith(cleanInput))) return true;
 
   return false;
 };
@@ -3424,6 +3621,26 @@ export const deleteCashLog = (id: string): boolean => {
   return true;
 };
 
+export const updateCashLog = (id: string, updates: Partial<CashLogEntry>): CashLogEntry | null => {
+  const all = getRawStoredCashLogs();
+  const idx = all.findIndex((l) => l.id === id);
+  if (idx === -1) return null;
+  const updatedEntry: CashLogEntry = {
+    ...all[idx],
+    ...updates,
+    synced: false,
+  };
+  all[idx] = updatedEntry;
+  setStored(STORAGE_KEYS.CASH_LOGS, all);
+  enqueueSync('CashLog', 'UPDATE', {
+    company_id: updatedEntry.company_id || getCurrentCompanyId(),
+    branch_id: updatedEntry.branch_id || getCurrentBranchId(),
+    ...updatedEntry,
+  });
+  return updatedEntry;
+};
+
+
 // ==================== DATE & DAILY REPORT HELPERS ====================
 export const getTodayDateString = (): string => {
   const now = new Date();
@@ -4712,6 +4929,7 @@ export const DEFAULT_BRANCH_SHARING_SETTINGS: CompanyBranchSharingSettings = {
   shareCustomersAcrossBranches: false,
   shareSuppliersAcrossBranches: false,
   form4AuditPassword: '',
+  eodVerificationMode: 'SINGLE',
 };
 
 export const getCompanyBranchSettings = (): CompanyBranchSharingSettings => {
@@ -7475,7 +7693,12 @@ export const calculateForm4 = (
     const expensesFromLogs = utilitiesLogs.reduce((sum, l) => sum + (l.out || 0), 0);
 
     const dbExpenses = getExpensesForStaffAndDate(staffId, date).filter(
-      (e) => !e.isDeleted && e.status !== 'rejected' && (e.paymentMethod === 'Cash' || !e.paymentMethod)
+      (e) =>
+        !e.isDeleted &&
+        e.status !== 'rejected' &&
+        (e.paymentMethod === 'Cash' || !e.paymentMethod) &&
+        e.category !== 'Direct Supplier Delivery Payout' &&
+        !e.description?.toLowerCase().includes('direct delivery voucher')
     );
     const dbExpensesNotLogged = dbExpenses
       .filter(
@@ -7493,7 +7716,11 @@ export const calculateForm4 = (
       expensesFromLogs + dbExpensesNotLogged
     );
     let expenses = totalTillExpenses;
-    let directProcurements = breakdown.directProcurements;
+
+    // Direct Procurements: Calculate from breakdown or staff split payments on active (non-rejected) Direct GRVs
+    const staffGrvPayments = getDirectGrvPaymentsForStaff(staffId, date, false);
+    const grvPayoutTotal = staffGrvPayments.reduce((sum, item) => sum + (Number(item.payment.amount) || 0), 0);
+    let directProcurements = Math.max(breakdown.directProcurements || 0, grvPayoutTotal);
     let cashLift = breakdown.cashLift;
     let customerChange = breakdown.changePaid;
     let deductions = 0; // All till expenses & petty cash are captured in expenses
@@ -12902,12 +13129,20 @@ export const addTemporaryCasual = (
   casual: Omit<TemporaryCasualAccount, 'id' | 'createdAt' | 'active'>
 ): TemporaryCasualAccount => {
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  const salt = (casual as any).pin_salt || generatePinSalt();
+  const rawPin = (casual as any).pin ? String((casual as any).pin).trim() : '1234';
+  const pinHash = (casual as any).pin_hash || hashPin(rawPin, salt);
+
   const created: TemporaryCasualAccount = {
     ...casual,
     id: `CAS-${Date.now().toString().slice(-4)}`,
+    pin_hash: pinHash,
+    pin_salt: salt,
     createdAt: new Date().toISOString(),
     active: true,
   };
+  delete (created as any).pin;
+
   const updated = [...all, created];
   setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updated);
   notifyListeners();
@@ -12929,17 +13164,35 @@ export const authenticateCasualWorker = (pin: string): TemporaryCasualAccount | 
   const cleanPin = pin.trim();
   if (!cleanPin) return null;
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
-  return all.find((c) => c.active && c.pin === cleanPin) || null;
+  return (
+    all.find((c) => {
+      if (!c.active) return false;
+      if (c.pin_hash && c.pin_salt) {
+        return verifyPinHash(cleanPin, c.pin_hash, c.pin_salt);
+      }
+      if (c.pin) {
+        return String(c.pin).trim() === cleanPin;
+      }
+      return false;
+    }) || null
+  );
 };
 
 export const syncCasualWorkersFromHub = (casuals: TemporaryCasualAccount[]): void => {
   if (!Array.isArray(casuals)) return;
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
   const map = new Map<string, TemporaryCasualAccount>();
-  all.forEach((c) => map.set(c.pin, c));
+  all.forEach((c) => {
+    const key = c.id || c.pin_hash || (c as any).pin;
+    if (key) map.set(key, c);
+  });
   casuals.forEach((c) => {
-    if (c && c.pin) {
-      map.set(c.pin, { ...map.get(c.pin), ...c });
+    if (c) {
+      const sanitized = sanitizeUserForExport(c);
+      const key = sanitized.id || (sanitized as any).pin_hash;
+      if (key) {
+        map.set(key, { ...map.get(key), ...sanitized });
+      }
     }
   });
   setStored(STORAGE_KEYS.TEMPORARY_CASUALS, Array.from(map.values()));
@@ -14101,6 +14354,16 @@ export function getCompanies(): Company[] {
 export function saveCompany(company: Company): void {
   const list = getCompanies();
   const index = list.findIndex((c) => c.company_id === company.company_id);
+
+  // Ensure package_id aligns with plan if not explicitly a custom package
+  if (company.plan) {
+    if (!company.package_id || company.package_id === 'pkg_starter' || company.package_id === 'pkg_professional' || company.package_id === 'pkg_enterprise') {
+      if (company.plan === 'ENTERPRISE') company.package_id = 'pkg_enterprise';
+      else if (company.plan === 'PROFESSIONAL') company.package_id = 'pkg_professional';
+      else if (company.plan === 'STARTER') company.package_id = 'pkg_starter';
+    }
+  }
+
   if (index >= 0) {
     list[index] = company;
   } else {
@@ -14108,6 +14371,10 @@ export function saveCompany(company: Company): void {
   }
   setStored(STORAGE_KEYS.COMPANIES, list);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saas_company_updated', { detail: company }));
+    window.dispatchEvent(new CustomEvent('saas_packages_updated', { detail: company }));
+  }
 }
 
 export function getCurrentCompanyId(): string {
@@ -14475,6 +14742,19 @@ export const confirmCompanyPayment = (
 
   comp.subscription_status = 'ACTIVE';
   comp.plan = plan;
+  if (plan === 'ENTERPRISE') {
+    comp.package_id = 'pkg_enterprise';
+    comp.custom_max_branches = 999;
+    comp.custom_max_staff = 999;
+  } else if (plan === 'PROFESSIONAL') {
+    comp.package_id = 'pkg_professional';
+    comp.custom_max_branches = 3;
+    comp.custom_max_staff = 15;
+  } else {
+    comp.package_id = 'pkg_starter';
+    comp.custom_max_branches = 1;
+    comp.custom_max_staff = 5;
+  }
   comp.next_billing_date = newBillingDate;
   comp.payment_confirmed_at = now.toISOString();
   comp.payment_confirmed_by = confirmedBy;
@@ -14856,23 +15136,46 @@ export const getDirectGrvById = (id: string): DirectGrv | null => {
 
 export const getDirectGrvPaymentsForStaff = (
   staffId: string,
-  date?: string
+  date?: string,
+  includeRejected: boolean = false
 ): Array<{
   grv: DirectGrv;
   payment: DirectGrvTillPayment;
 }> => {
   const grvs = getDirectGrvs();
   const results: Array<{ grv: DirectGrv; payment: DirectGrvTillPayment }> = [];
+  const targetId = String(staffId || '').trim().toLowerCase();
+  const normTarget = targetId.replace(/^usr-|^staff-|^0+/, '');
 
   grvs.forEach((grv) => {
-    if (grv.status === 'REJECTED') return;
-    if (date && grv.date !== date) return;
+    if (!includeRejected && grv.status === 'REJECTED') return;
+    const gDate = grv.date || toDateStringSafe(grv.createdAt);
+    if (date && gDate !== date) return;
+
     if (grv.payments && grv.payments.length > 0) {
       grv.payments.forEach((p) => {
-        if (p.userId === staffId && p.amount > 0) {
+        const pId = String(p.userId || '').trim().toLowerCase();
+        const normP = pId.replace(/^usr-|^staff-|^0+/, '');
+        const matchesStaff = pId === targetId || (normTarget && normP === normTarget);
+        if (matchesStaff && (Number(p.amount) || 0) > 0) {
           results.push({ grv, payment: p });
         }
       });
+    } else if (grv.payFromTill && (Number(grv.totalCost) || 0) > 0) {
+      const recId = String(grv.receivedByStaffId || '').trim().toLowerCase();
+      const normRec = recId.replace(/^usr-|^staff-|^0+/, '');
+      if (recId === targetId || (normTarget && normRec === normTarget)) {
+        results.push({
+          grv,
+          payment: {
+            userId: grv.receivedByStaffId || staffId,
+            userName: grv.receivedByStaffName || 'Cashier',
+            amount: Number(grv.totalCost) || 0,
+            drawerId: 'Till 1',
+            pinConfirmed: true,
+          },
+        });
+      }
     }
   });
 
@@ -14911,16 +15214,28 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
   const isPayFromTill = grv.payFromTill !== false && grv.paymentMethod !== 'INVOICE_ON_ACCOUNT' && grv.paymentMethod !== 'CREDIT' && grv.paymentMethod !== 'BANK';
 
   if (grv.status === 'REJECTED' || !isPayFromTill) {
-    // If not paid from till or rejected, ensure any previous till payout movements/logs for this voucher are removed
+    // If rejected, deactivate movements and set CashLog out to 0 so the money is returned to the drawer
+    // but the rejection reason and audit trail remain visible in Form 2
     const existingMovements = getMovements();
     existingMovements
-      .filter((m) => m.type === 'supplier_payment' && (m.sourceRef === grv.grvNumber || m.sourceRef?.startsWith(grv.grvNumber)))
-      .forEach((m) => deleteMovement(m.id));
+      .filter((m) => m.type === 'supplier_payment' && (m.sourceRef === grv.grvNumber || m.sourceRef?.startsWith(grv.grvNumber) || m.sourceRef === grv.id))
+      .forEach((m) => {
+        updateMovement(m.id, {
+          status: 'rejected',
+          affectsDrawer: false,
+          notes: `${m.notes} [REJECTED: ${grv.rejectedReason || 'Delivery rejected'}]`,
+        });
+      });
 
     const currentLogs = getCashLogs();
     currentLogs
       .filter((l) => l.line === 'Direct Procurement' && (l.reference === grv.grvNumber || l.reference?.startsWith(grv.grvNumber)))
-      .forEach((l) => deleteCashLog(l.id));
+      .forEach((l) => {
+        updateCashLog(l.id, {
+          out: 0,
+          description: `REJECTED: Direct Procurement ${grv.supplierName} (${grv.grvNumber}) - Reason: ${grv.rejectedReason || 'Voucher rejected'} (Amount returned to till)`,
+        });
+      });
     return;
   }
 
@@ -14929,7 +15244,7 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
   const compId = (grv as any).companyId || (grv as any).company_id || getCurrentCompanyId();
   const brId = (grv as any).branchId || (grv as any).branch_id || getCurrentBranchId();
 
-  // Determine payments
+  // Determine payments for each till operator
   const payments: DirectGrvTillPayment[] =
     grv.payments && grv.payments.length > 0 && grv.payments.some((p: any) => (Number(p.amount) || 0) > 0)
       ? grv.payments.filter((p: any) => (Number(p.amount) || 0) > 0)
@@ -14950,26 +15265,32 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
   const currentLogs = getCashLogs();
 
   payments.forEach((p, pIdx) => {
-    if ((p.amount || 0) <= 0) return;
+    const amt = Number(p.amount) || 0;
+    if (amt <= 0 || !p.userId) return;
     const staffShiftId = getShiftId(p.userId, shiftDate);
-    const voucherKey = payments.length > 1 ? `${grv.grvNumber}-P${pIdx + 1}` : grv.grvNumber;
+    // Distinct cashier-specific voucher reference to prevent cross-cashier overwriting on split payments
+    const voucherKey = `${grv.grvNumber}-${p.userId}`;
 
     const existingM = existingMovements.find(
       (m) =>
         m.type === 'supplier_payment' &&
-        (m.sourceRef === grv.grvNumber ||
-          m.sourceRef === voucherKey ||
+        m.staffId === p.userId &&
+        (m.sourceRef === voucherKey ||
+          m.sourceRef === grv.grvNumber ||
+          m.sourceRef === `${grv.grvNumber}-P${pIdx + 1}` ||
           m.sourceRef === grv.id ||
           (m.notes && m.notes.includes(grv.grvNumber)))
     );
 
     if (existingM) {
-      if (existingM.amount !== p.amount || existingM.status !== 'approved' || !existingM.affectsDrawer) {
+      if (existingM.amount !== amt || existingM.status !== 'approved' || !existingM.affectsDrawer || existingM.sourceRef !== voucherKey) {
         updateMovement(existingM.id, {
-          amount: p.amount,
+          amount: amt,
           status: 'approved',
           affectsDrawer: true,
           direction: 'out',
+          sourceRef: voucherKey,
+          notes: `Direct Supplier Delivery: ${grv.supplierName} (${grv.grvNumber}) - Payout from ${p.userName} till ($${amt.toFixed(2)})`,
         });
       }
     } else {
@@ -14980,14 +15301,14 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
         date: shiftDate,
         timestamp: now,
         type: 'supplier_payment',
-        amount: p.amount,
+        amount: amt,
         currency: 'USD',
         direction: 'out',
         affectsDrawer: true,
         status: 'approved',
         sourceModule: 'DirectGRV',
-        sourceRef: grv.grvNumber,
-        notes: `Direct Supplier Delivery: ${grv.supplierName} (${grv.grvNumber})`,
+        sourceRef: voucherKey,
+        notes: `Direct Supplier Delivery: ${grv.supplierName} (${grv.grvNumber}) - Payout from ${p.userName} till ($${amt.toFixed(2)})`,
         company_id: compId,
         branch_id: brId,
       });
@@ -14997,7 +15318,7 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
       (l) =>
         l.staffId === p.userId &&
         l.date === shiftDate &&
-        (l.reference === grv.grvNumber || l.reference === voucherKey || l.description.includes(grv.grvNumber))
+        (l.reference === voucherKey || l.reference === grv.grvNumber || l.description.includes(grv.grvNumber))
     );
 
     if (!hasLog) {
@@ -15007,11 +15328,11 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
         staffId: p.userId,
         staffName: p.userName,
         line: 'Direct Procurement',
-        description: `Direct Supplier Delivery Payout: ${grv.supplierName} (${grv.grvNumber})`,
+        description: `Direct Supplier Delivery Payout: ${grv.supplierName} (${grv.grvNumber}) - Payout from ${p.userName} till`,
         in: 0,
-        out: p.amount,
+        out: amt,
         category: 'Direct Procurement',
-        reference: grv.grvNumber,
+        reference: voucherKey,
       });
     }
   });
@@ -15309,28 +15630,8 @@ export const approveDirectGrv = (
     });
   });
 
-  // 2. Till Payouts -> sync movements & CashLog & Expense entries
+  // 2. Till Payouts -> sync movements & CashLog entries (Direct procurements are tracked via CashMovements/Form 2, not general expenses)
   recordDirectGrvTillPayouts(grv);
-
-  if (grv.payFromTill && grv.payments && grv.payments.length > 0) {
-    const shiftDate = grv.date || now.split('T')[0];
-    grv.payments.forEach((p) => {
-      if (p.amount > 0) {
-        addExpense({
-          timestamp: now,
-          date: shiftDate,
-          category: 'Direct Supplier Delivery Payout',
-          amount: p.amount,
-          paymentMethod: 'Cash',
-          staffId: p.userId,
-          staffName: p.userName,
-          vendorOrCustomer: grv.supplierName,
-          description: `Till payout for Direct Delivery voucher ${grv.grvNumber}`,
-          receiptRef: grv.invoiceNo || grv.grvNumber,
-        });
-      }
-    });
-  }
 
   // 3. Save GRV
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
@@ -15388,20 +15689,36 @@ export const rejectDirectGrv = (
   grv.rejectedReason = reason;
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
 
-  // 1. Update associated cashMovements to rejected status & reverse the money back into cashier till
+  // 1. Update associated supplier_payment cashMovements to rejected status & affectsDrawer: false
+  // This immediately restores the cash back into the cashier's till drawer and expected cash balance!
   const movements = getMovements();
   movements.forEach((m) => {
     if (m.type === 'supplier_payment' && (m.sourceRef === grv.grvNumber || m.sourceRef?.startsWith(grv.grvNumber) || m.sourceRef === grv.id)) {
-      updateMovement(m.id, { status: 'rejected' });
+      updateMovement(m.id, {
+        status: 'rejected',
+        affectsDrawer: false,
+        notes: `${m.notes} [REJECTED by ${rejectorName}: ${reason}]`,
+      });
     }
   });
 
-  // 2. Refund till payments back into cashier drawers so cashier Form 2 and live drawer balance are restored!
+  // 2. Update CashLogs so the deduction is removed (out: 0), but the log remains with the rejection reason
+  const logs = getCashLogs();
+  logs.forEach((l) => {
+    if (l.line === 'Direct Procurement' && (l.reference === grv.grvNumber || l.reference?.startsWith(grv.grvNumber))) {
+      updateCashLog(l.id, {
+        out: 0,
+        in: 0,
+        description: `REJECTED: Direct Procurement ${grv.supplierName} (${grv.grvNumber}) - Reason: ${reason} (Amount returned to till)`,
+      });
+    }
+  });
+
+  // 3. Add an audit reversal movement for tracking the return of funds
   if (grv.payments && grv.payments.length > 0) {
     grv.payments.forEach((p) => {
       const amt = Number(p.amount) || 0;
       if (amt > 0 && p.userId) {
-        // A. Add cash movement (IN) to cashier drawer
         addMovement({
           shiftId: getShiftId(p.userId, shiftDate),
           staffId: p.userId,
@@ -15412,29 +15729,13 @@ export const rejectDirectGrv = (
           amount: amt,
           currency: 'USD',
           direction: 'in',
-          affectsDrawer: true,
+          affectsDrawer: false, // Prevents duplicate double-adding since supplier_payment status was set to rejected
           status: 'approved',
           sourceModule: 'DirectGRV',
-          sourceRef: grv.grvNumber,
-          notes: `REVERSAL: Direct Delivery ${grv.grvNumber} rejected by ${rejectorName} - $${amt.toFixed(2)} refunded to drawer (${reason})`,
+          sourceRef: `${grv.grvNumber}-${p.userId}`,
+          notes: `REVERSAL AUDIT: Direct Delivery ${grv.grvNumber} rejected by ${rejectorName} - $${amt.toFixed(2)} returned to ${p.userName}'s till (${reason})`,
           approvedBy: rejectorId,
           approvedByName: rejectorName,
-          company_id: (grv as any).company_id || (grv as any).companyId,
-          branch_id: (grv as any).branch_id || (grv as any).branchId,
-        });
-
-        // B. Add Form 2 CashLog entry (IN) so cashier's Daily Cash Log reflects the reversal
-        addCashLog({
-          timestamp: now,
-          date: shiftDate,
-          staffId: p.userId,
-          staffName: p.userName,
-          line: 'Direct Procurement',
-          description: `REVERSAL: Direct Delivery ${grv.grvNumber} rejected by ${rejectorName} - Refunded to ${p.userName}'s till (${reason})`,
-          in: amt,
-          out: 0,
-          category: 'Direct Procurement Reversal',
-          reference: grv.grvNumber,
           company_id: (grv as any).company_id || (grv as any).companyId,
           branch_id: (grv as any).branch_id || (grv as any).branchId,
         });
@@ -15697,4 +15998,225 @@ export const saveCashGovernanceConfig = (config: Partial<CashGovernanceConfig>):
   }
   return updated;
 };
+
+// ==================== END OF DAY (EOD) & BUSINESS DAY CLOSURES ====================
+
+export interface BusinessDayClosure {
+  id: string; // e.g. EOD-20261031-BR001
+  date: string; // YYYY-MM-DD
+  branchId: string;
+  branchName: string;
+  companyId?: string;
+  closedAt: string;
+  closedBySupervisorId: string;
+  closedBySupervisorName: string;
+  closedByManagerId?: string;
+  closedByManagerName?: string;
+  status: 'CLOSED';
+  zReport: {
+    grossSales: number;
+    cashSales: number;
+    ecocashSales: number;
+    zigSales: number;
+    creditExtended: number;
+    cashInTotal: number;
+    cashOutTotal: number;
+    expectedCash: number;
+    actualCashCounted: number;
+    variance: number;
+    totalDirectProcurements: number;
+    totalExpenses: number;
+    totalShopUse: number;
+    totalSurplusSweptToSafe: number;
+    totalElectronicTransferredToBank: number;
+    totalCashLifts: number;
+  };
+  electronicSettlements?: {
+    ecocashBatchRef?: string;
+    ecocashAmountSettled?: number;
+    ecocashSystemTotal?: number;
+    zigBatchRef?: string;
+    zigAmountSettled?: number;
+    zigSystemTotal?: number;
+    sweptToBank?: boolean;
+    targetBankAccountId?: string;
+    targetBankAccountName?: string;
+    settledAt?: string;
+  };
+  notes?: string;
+  backupFileName?: string;
+  synced?: boolean;
+}
+
+export interface ElectronicSettlementRecord {
+  id: string;
+  date: string;
+  branchId: string;
+  ecocashBatchRef: string;
+  ecocashAmountSettled: number;
+  ecocashSystemTotal: number;
+  ecocashVerified: boolean;
+  zigBatchRef: string;
+  zigAmountSettled: number;
+  zigSystemTotal: number;
+  zigVerified: boolean;
+  targetBankAccountId: string;
+  targetBankAccountName: string;
+  sweptToBank: boolean;
+  verifiedByStaffId?: string;
+  verifiedByStaffName?: string;
+  verifiedAt?: string;
+  notes?: string;
+}
+
+export const getRawStoredBusinessDayClosures = (): BusinessDayClosure[] => {
+  const closures = getStored<BusinessDayClosure[]>(STORAGE_KEYS.BUSINESS_DAY_CLOSURES, []);
+  return Array.isArray(closures) ? closures : [];
+};
+
+export const getBusinessDayClosures = (branchId?: string): BusinessDayClosure[] => {
+  const all = getRawStoredBusinessDayClosures();
+  const currentBranch = branchId || getCurrentBranchId();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return all;
+  }
+  return all.filter((c) => c.branchId === currentBranch);
+};
+
+export const getBusinessDayClosureByDate = (date: string, branchId?: string): BusinessDayClosure | null => {
+  const all = getBusinessDayClosures(branchId);
+  const found = all.find((c) => c.date === date);
+  return found || null;
+};
+
+export const isBusinessDayClosed = (date: string, branchId?: string): boolean => {
+  const closure = getBusinessDayClosureByDate(date, branchId);
+  return !!closure && closure.status === 'CLOSED';
+};
+
+export const saveBusinessDayClosure = (closureData: BusinessDayClosure): { success: boolean; message: string; closure: BusinessDayClosure } => {
+  const all = getRawStoredBusinessDayClosures();
+  const existingIdx = all.findIndex((c) => c.id === closureData.id || (c.date === closureData.date && c.branchId === closureData.branchId));
+  let updated: BusinessDayClosure[];
+  if (existingIdx >= 0) {
+    updated = [...all];
+    updated[existingIdx] = closureData;
+  } else {
+    updated = [closureData, ...all];
+  }
+  setStored(STORAGE_KEYS.BUSINESS_DAY_CLOSURES, updated);
+  enqueueSync('BusinessDayClosures' as any, existingIdx >= 0 ? 'UPDATE' : 'INSERT', closureData);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_eod_completed', { detail: closureData }));
+    window.dispatchEvent(new CustomEvent('saimetric_business_day_updated', { detail: closureData }));
+  }
+  return {
+    success: true,
+    message: `End of Day for ${closureData.date} successfully closed and archived!`,
+    closure: closureData,
+  };
+};
+
+export const getElectronicSettlementForDate = (date: string, branchId?: string): ElectronicSettlementRecord | null => {
+  const settlements = getStored<ElectronicSettlementRecord[]>(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, []);
+  const targetBranch = branchId || getCurrentBranchId();
+  const found = (Array.isArray(settlements) ? settlements : []).find(
+    (s) => s.date === date && (!targetBranch || targetBranch === 'ALL' || s.branchId === targetBranch)
+  );
+  return found || null;
+};
+
+export const saveElectronicSettlement = (record: ElectronicSettlementRecord): void => {
+  const settlements = getStored<ElectronicSettlementRecord[]>(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, []);
+  const list = Array.isArray(settlements) ? settlements : [];
+  const idx = list.findIndex((s) => s.id === record.id || (s.date === record.date && s.branchId === record.branchId));
+  let updated: ElectronicSettlementRecord[];
+  if (idx >= 0) {
+    updated = [...list];
+    updated[idx] = record;
+  } else {
+    updated = [record, ...list];
+  }
+  setStored(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, updated);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_electronic_settlement_updated', { detail: record }));
+  }
+};
+
+/**
+ * Gatekeeper: Returns all cashier activities requiring supervisor authorization for this date
+ * (Direct GRVs, Expenses, Shop Use)
+ */
+export const getPendingSupervisorApprovals = (
+  date: string,
+  branchId?: string
+): {
+  directGrvs: DirectGrv[];
+  expenses: ExpenseEntry[];
+  shopUse: any[];
+  totalCount: number;
+} => {
+  const currentBranch = branchId || getCurrentBranchId();
+
+  // 1. Pending Direct GRVs
+  const allGrvs = getAllDirectGrvs(currentBranch);
+  const pendingGrvs = allGrvs.filter(
+    (g) => isSameDaySafe(g.date, (g as any).createdAt, date) && g.status === 'PENDING'
+  );
+
+  // 2. Pending Expenses
+  const allExpenses = getAllExpenses(currentBranch);
+  const pendingExpenses = allExpenses.filter((e) => {
+    if (e.isDeleted) return false;
+    const isToday = isSameDaySafe(e.date, e.timestamp, date);
+    if (!isToday) return false;
+    return e.status === 'pending' || (!e.status && !e.approvedBy);
+  });
+
+  // 3. Pending Shop Use / Internal Consumption
+  const rawConsumptions = getStored<any[]>('saimetric_internal_consumption', []);
+  const allConsumptions = Array.isArray(rawConsumptions) ? rawConsumptions : [];
+  const pendingShopUse = allConsumptions.filter(
+    (c) => isSameDaySafe(c.date, c.requestedAt, date) && c.status === 'PENDING'
+  );
+
+  return {
+    directGrvs: pendingGrvs,
+    expenses: pendingExpenses,
+    shopUse: pendingShopUse,
+    totalCount: pendingGrvs.length + pendingExpenses.length + pendingShopUse.length,
+  };
+};
+
+/**
+ * Day-Lock check: Checks if any previous trading day with recorded sales has not been closed via EOD
+ */
+export const checkPreviousBusinessDayStatus = (
+  branchId?: string,
+  todayDateStr?: string
+): { requiresEod: boolean; unclosedDate?: string; message?: string } => {
+  const currentBranch = branchId || getCurrentBranchId();
+  const today = todayDateStr || new Date().toISOString().split('T')[0];
+
+  // Get all unique dates from recorded sales
+  const allSales = getAllSales(currentBranch);
+  const distinctDates = Array.from(
+    new Set(allSales.map((s) => s.date).filter((d): d is string => Boolean(d) && d < today))
+  ).sort();
+
+  for (const prevDate of distinctDates) {
+    if (!isBusinessDayClosed(prevDate, currentBranch)) {
+      return {
+        requiresEod: true,
+        unclosedDate: prevDate,
+        message: `Previous business day (${prevDate}) has not been closed with End of Day. POS trading is restricted until ${prevDate} is finalized in Form 4.`,
+      };
+    }
+  }
+
+  return { requiresEod: false };
+};
+
 

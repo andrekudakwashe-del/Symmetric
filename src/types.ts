@@ -15,7 +15,12 @@ export type CashMovementDirection = any;
 export type CashMovementSource = any;
 export type CashMovementStatus = any;
 export type CashMovementType = any;
-export type CompanyBranchSharingSettings = any;
+export interface CompanyBranchSharingSettings {
+  shareCustomersAcrossBranches: boolean;
+  shareSuppliersAcrossBranches: boolean;
+  form4AuditPassword?: string;
+  eodVerificationMode?: 'SINGLE' | 'DUAL';
+}
 export type CreditPolicyMode = any;
 export type CreditSaleEntry = any;
 export type CurrencyRateConfig = any;
@@ -90,7 +95,25 @@ export type ReportPermission = any;
 export type Role = any;
 export type RoleId = any;
 export type SaleInvoice = any;
-export type Salesperson = any;
+export interface Salesperson {
+  id: string;
+  name: string;
+  role: Role | string;
+  pin?: string;          // Deprecated: stripped on boot migration
+  pin_hash?: string;     // One-way SHA-256 hash (salt:pin)
+  pin_salt?: string;     // Cryptographic salt
+  companyId?: string;
+  company_id?: string;
+  branchId?: string;
+  branch_id?: string;
+  branchName?: string;
+  email?: string;
+  phone?: string;
+  active?: 'Y' | 'N';
+  permissions?: StaffPermissions;
+  branchAssignments?: StaffBranchAssignment[];
+  [key: string]: any;
+}
 export type SavedReportTemplate = any;
 export type SheetName = any;
 export type ShiftReconciliation = any;
@@ -227,7 +250,20 @@ export type SupplierInvoiceLineItem = any;
 export type SupplierInvoiceVoucher = any;
 export type SyncQueueItem = any;
 export type TableRelationship = any;
-export type TemporaryCasualAccount = any;
+export interface TemporaryCasualAccount {
+  id: string;
+  name: string;
+  pin?: string;          // Deprecated: stripped on boot migration
+  pin_hash?: string;     // One-way SHA-256 hash (salt:pin)
+  pin_salt?: string;     // Cryptographic salt
+  sessionId: string;
+  branchId: string;
+  phone?: string;
+  idNumber?: string;
+  active: boolean;
+  createdAt: string;
+  [key: string]: any;
+}
 export type TripGrnAllocationSummary = any;
 export type TripItemAllocation = any;
 export type TripLandedCost = any;

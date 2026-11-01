@@ -182,8 +182,8 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
       const allActiveStaff = getAllSalespeople().filter((s) => s.active === 'Y');
       
       // Match within current branch/company first, then fallback across active tenant staff
-      const matched = scopedStaff.find((s) => verifySalespersonPin(s.pin, cleanPin)) ||
-                      allActiveStaff.find((s) => verifySalespersonPin(s.pin, cleanPin));
+      const matched = scopedStaff.find((s) => verifySalespersonPin(s, cleanPin)) ||
+                      allActiveStaff.find((s) => verifySalespersonPin(s, cleanPin));
 
       if (!matched) {
         setError('Invalid 6-digit PIN. Keypad scrambled for security. Please try again.');
@@ -439,7 +439,7 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
               <span
                 key={`${m.id}-${mIdx}`}
                 className="px-2 py-0.5 rounded-md bg-slate-800 text-slate-300 text-[10px]"
-                title={`PIN: ${m.pin}`}
+                title={`Authorized Authorizer: ${m.name}`}
               >
                 {m.name.split(' ')[0]} ({m.role})
               </span>

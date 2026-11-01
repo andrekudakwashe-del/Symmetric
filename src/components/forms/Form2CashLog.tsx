@@ -24,6 +24,7 @@ import {
   getCashTransfers,
   approveDirectGrv,
   rejectDirectGrv,
+  verifySalespersonPin,
 } from '../../db/roomDatabase';
 import {
   issueTillFloat,
@@ -497,16 +498,17 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       if (g.id) grvMap.set(g.id, g);
     });
 
-    // 1. First, check shiftMovements for supplier_payment movements
+    // 1. First, check shiftMovements for supplier_payment movements for this specific cashier
     const procurementMovements = shiftMovements.filter(
-      (m) => m.type === 'supplier_payment' && (!m.sourceModule || m.sourceModule === 'DirectGRV')
+      (m) =>
+        m.type === 'supplier_payment' &&
+        (!m.sourceModule || m.sourceModule === 'DirectGRV') &&
+        isStaffMatch(m.staffId, m.staffName)
     );
 
     procurementMovements.forEach((m) => {
-      const refKey = m.sourceRef || m.notes || m.id;
-      if (seenVouchers.has(refKey)) return;
-
-      const matchingGrv = (m.sourceRef ? grvMap.get(m.sourceRef) : undefined) ||
+      const matchingGrv = (m.sourceRef ? grvMap.get(m.sourceRef.split('-')[0]) : undefined) ||
+        (m.sourceRef ? grvMap.get(m.sourceRef) : undefined) ||
         directGrvs.find(
           (g) => g.grvNumber === m.sourceRef || g.id === m.sourceRef || (m.sourceRef && m.sourceRef.startsWith(g.grvNumber))
         );
@@ -522,9 +524,15 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         return;
       }
 
-      seenVouchers.add(refKey);
+      const vKey = `${matchingGrv?.grvNumber || m.sourceRef || m.id}-${selectedStaffId}`;
+      if (seenVouchers.has(vKey)) return;
+      seenVouchers.add(vKey);
 
       const isRejected = m.status === 'rejected' || matchingGrv?.status === 'REJECTED';
+
+      // Find this cashier's portion in grv payments if available
+      const matchingPayment = matchingGrv?.payments?.find((p) => isStaffMatch(p.userId, p.userName));
+      const portionAmount = matchingPayment ? Number(matchingPayment.amount) || 0 : (Number(m.amount) || 0);
 
       list.push({
         grvId: matchingGrv?.id || m.id,
@@ -532,18 +540,18 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         supplierName: matchingGrv?.supplierName || m.notes?.replace('Direct Supplier Delivery: ', '').split(' (')[0] || 'Supplier Delivery',
         invoiceNo: matchingGrv?.invoiceNo,
         itemsSummary: matchingGrv ? matchingGrv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', ') : (m.notes || 'Procurement voucher'),
-        amount: isRejected ? 0 : (Number(m.amount) || 0),
-        originalAmount: Number(m.amount) || matchingGrv?.totalCost || 0,
-        drawerId: m.terminalId || 'Till 1',
-        status: isRejected ? 'REJECTED' : m.status,
-        rejectionReason: matchingGrv?.rejectedReason,
+        amount: isRejected ? 0 : portionAmount,
+        originalAmount: portionAmount || matchingGrv?.totalCost || 0,
+        drawerId: matchingPayment?.drawerId || m.terminalId || 'Till 1',
+        status: isRejected ? 'REJECTED' : (matchingGrv?.status || m.status),
+        rejectionReason: matchingGrv?.rejectedReason || (m.notes?.includes('REJECTED') ? m.notes.split('REJECTED')[1]?.replace(/^[:\s-]+/, '') : undefined),
         approvedByName: matchingGrv?.approvedByStaffName || 'Supervisor',
         date: m.date || sheetDate,
         movementId: m.id,
       });
     });
 
-    // 2. Also incorporate any GRVs for this staff & date that may not yet be indexed in movements
+    // 2. Also incorporate any Direct GRVs for this staff & date that may not yet have movement indexed
     directGrvs.forEach((grv) => {
       // Exclude non-till / account deliveries
       if (
@@ -561,11 +569,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       const isRejected = grv.status === 'REJECTED';
 
       if (grv.payments && grv.payments.length > 0) {
+        // Multi-cashier split payment: find only this cashier's portion!
         grv.payments.forEach((p) => {
           if (isStaffMatch(p.userId, p.userName) && (Number(p.amount) || 0) > 0) {
-            const vKey = `${grv.grvNumber}-${p.userId}`;
-            if (seenVouchers.has(grv.grvNumber) || seenVouchers.has(grv.id) || seenVouchers.has(vKey)) return;
-            seenVouchers.add(grv.grvNumber);
+            const vKey = `${grv.grvNumber}-${selectedStaffId}`;
+            if (seenVouchers.has(vKey)) return;
             seenVouchers.add(vKey);
 
             list.push({
@@ -574,8 +582,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               supplierName: grv.supplierName,
               invoiceNo: grv.invoiceNo,
               itemsSummary: grv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', '),
-              amount: isRejected ? 0 : (Number(p?.amount) || 0),
-              originalAmount: Number(p?.amount) || 0,
+              amount: isRejected ? 0 : (Number(p.amount) || 0),
+              originalAmount: Number(p.amount) || 0,
               drawerId: p.drawerId || 'Till 1',
               status: grv.status,
               rejectionReason: grv.rejectedReason,
@@ -585,8 +593,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
           }
         });
       } else if (isStaffMatch(grv.receivedByStaffId, grv.receivedByStaffName) && (grv.totalCost || 0) > 0) {
-        if (seenVouchers.has(grv.grvNumber) || seenVouchers.has(grv.id)) return;
-        seenVouchers.add(grv.grvNumber);
+        const vKey = `${grv.grvNumber}-${selectedStaffId}`;
+        if (seenVouchers.has(vKey)) return;
+        seenVouchers.add(vKey);
 
         list.push({
           grvId: grv.id,
@@ -735,7 +744,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
             log.category?.toLowerCase().includes('withdrawal') ||
             log.description?.toLowerCase().includes('withdrawal') ||
             log.description?.toLowerCase().includes('cash-out');
-          const id = `${currKey.toLowerCase()}_${isWithdrawal ? 'withdrawal' : 'sales'}_pos_${i}_${log.id || Date.now()}`;
+          const id = `${currKey.toLowerCase()}_${isWithdrawal ? 'withdrawal' : 'sales'}_pos_${i}_${log.id || i}`;
           newDynamicRows.push({
             id,
             type: isWithdrawal ? `${currKey}Withdrawal` : `${currKey}Sales`,
@@ -763,12 +772,15 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         });
       });
 
+      // Filter manual procurement entries; exclude any GRV vouchers which are already rendered under Section 3
       const procLogs = remainingDynamicLogs.filter(
         (l) =>
           !consumedCurrLogs.has(l) &&
           (l.line === 'Direct Procurement' ||
             l.category === 'Direct Procurement' ||
-            (l.description && l.description.toLowerCase().includes('procurement')))
+            (l.description && l.description.toLowerCase().includes('procurement'))) &&
+          !l.reference?.startsWith('GRV-') &&
+          !l.description?.includes('(GRV:')
       );
       const cashLogsList = remainingDynamicLogs.filter(
         (l) =>
@@ -780,8 +792,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       // Add Procurement rows (at least 2)
       const procCount = Math.max(procLogs.length, 2);
       for (let i = 0; i < procCount; i++) {
-        const id = `procurement_dyn_${i}_${Date.now()}`;
         const log = procLogs[i];
+        const id = `procurement_dyn_${i}_${log?.id || i}`;
         let itemBought = '';
         let note = '';
         if (log) {
@@ -821,7 +833,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       );
 
       cashLiftLogs.forEach((log, i) => {
-        const id = `cash_lift_saved_${i}_${log.id || Date.now()}`;
+        const id = `cash_lift_saved_${i}_${log.id || i}`;
         newDynamicRows.push({
           id,
           type: 'cash',
@@ -869,6 +881,17 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
       // Merge any active POS sales / withdrawals for this staff & date that might not be in savedLogs
       const staffSales = getSalesForStaffAndDate(targetStaffId, targetDate);
+      const existingSaleRefKeys = new Set<string>();
+      newDynamicRows.forEach((r) => {
+        existingSaleRefKeys.add(r.id);
+        const gridEntry = newGrid[r.id];
+        if (gridEntry?.note) {
+          existingSaleRefKeys.add(gridEntry.note);
+          const match = gridEntry.note.match(/#([A-Za-z0-9-]+)/);
+          if (match) existingSaleRefKeys.add(match[1]);
+        }
+      });
+
       staffSales.forEach((sale, i) => {
         const isEco =
           sale.currency === 'EcoCash' ||
@@ -897,18 +920,12 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
         // Non-cash electronic sale row
         if (sale.total > 0) {
-          const saleAlreadyExists = newDynamicRows.some(
-            (r) =>
-              !r.isWithdrawal &&
-              (r.id.includes(sale.id) ||
-                (newGrid[r.id] &&
-                  (newGrid[r.id].note.includes(sale.id) ||
-                    (r.currency === curKey && Math.abs(parseFloat(newGrid[r.id].out || '0') - sale.total) < 0.001))))
-          );
-          if (!saleAlreadyExists) {
-            const saleId = `${curKey.toLowerCase()}_sales_pos_m_${i}_${sale.id}`;
+          const saleIdKey = `${curKey.toLowerCase()}_sales_pos_m_${i}_${sale.id}`;
+          if (!existingSaleRefKeys.has(sale.id) && !existingSaleRefKeys.has(saleIdKey)) {
+            existingSaleRefKeys.add(sale.id);
+            existingSaleRefKeys.add(saleIdKey);
             newDynamicRows.push({
-              id: saleId,
+              id: saleIdKey,
               type: `${curKey}Sales`,
               categoryGroup: currConfig.name,
               label: `${currConfig.name} Sale`,
@@ -919,7 +936,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               isAutofilledFromPos: true,
               placeholder: `POS register ${currConfig.name} non-cash sale`,
             });
-            newGrid[saleId] = {
+            newGrid[saleIdKey] = {
               in: '',
               out: String(sale.total),
               note: `POS Sale #${sale.id}`,
@@ -929,19 +946,13 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
         // Cash withdrawal row
         if (sale.cashWithdrawalAmount && Number(sale.cashWithdrawalAmount) > 0) {
-          const wAlreadyExists = newDynamicRows.some(
-            (r) =>
-              r.isWithdrawal &&
-              (r.id.includes(sale.id) ||
-                (newGrid[r.id] &&
-                  (newGrid[r.id].note.includes(sale.id) ||
-                    (r.currency === curKey &&
-                      Math.abs(parseFloat(newGrid[r.id].out || '0') - Number(sale.cashWithdrawalAmount)) < 0.001))))
-          );
-          if (!wAlreadyExists) {
-            const wId = `${curKey.toLowerCase()}_withdrawal_pos_m_${i}_${sale.id}`;
+          const wIdKey = `${curKey.toLowerCase()}_withdrawal_pos_m_${i}_${sale.id}`;
+          const wRef = `withdrawal_${sale.id}`;
+          if (!existingSaleRefKeys.has(wRef) && !existingSaleRefKeys.has(wIdKey)) {
+            existingSaleRefKeys.add(wRef);
+            existingSaleRefKeys.add(wIdKey);
             newDynamicRows.push({
-              id: wId,
+              id: wIdKey,
               type: `${curKey}Withdrawal`,
               categoryGroup: currConfig.name,
               label: `${currConfig.name} Cash-Out`,
@@ -953,7 +964,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               isWithdrawal: true,
               placeholder: `POS ${currConfig.name} Cash-Out (Physical Cash OUT)`,
             });
-            newGrid[wId] = {
+            newGrid[wIdKey] = {
               in: '',
               out: String(Number(sale.cashWithdrawalAmount)),
               note: `POS Cash-Out #${sale.id} ($${Number(sale.cashWithdrawalAmount).toFixed(2)})`,
@@ -1052,7 +1063,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         currSalesList.forEach((sale, i) => {
           // Non-cash electronic sale
           if (sale.total > 0) {
-            const saleId = `${currKey.toLowerCase()}_sales_pos_${i}_${sale.id || Date.now()}`;
+            const saleId = `${currKey.toLowerCase()}_sales_pos_${i}_${sale.id || i}`;
             newDynamicRows.push({
               id: saleId,
               type: `${currKey}Sales`,
@@ -1074,7 +1085,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
           // Cash withdrawal / Cash-Out from till
           if (sale.cashWithdrawalAmount && Number(sale.cashWithdrawalAmount) > 0) {
-            const wId = `${currKey.toLowerCase()}_withdrawal_pos_${i}_${sale.id || Date.now()}`;
+            const wId = `${currKey.toLowerCase()}_withdrawal_pos_${i}_${sale.id || i}`;
             newDynamicRows.push({
               id: wId,
               type: `${currKey}Withdrawal`,
@@ -1269,12 +1280,12 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     const trimmedPin = pendingFloatPin.trim();
 
     if (govConfig.governanceMode !== 'LEAN') {
-      const expectedPin = targetCashier.pin || '1234';
+      const isPinValid = verifySalespersonPin(targetCashier, trimmedPin) || trimmedPin === '1234' || trimmedPin === '9999' || trimmedPin === '4321';
       if (!trimmedPin) {
         setPendingFloatPinError('Please enter your 6-digit cashier PIN to accept physical cash.');
         return;
       }
-      if (trimmedPin !== expectedPin && trimmedPin !== '1234' && trimmedPin !== '9999' && trimmedPin !== '4321') {
+      if (!isPinValid) {
         setPendingFloatPinError(`Invalid PIN for cashier ${targetCashier.name}.`);
         return;
       }
@@ -1345,8 +1356,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     }
 
     const trimmedPin = floatSupervisorPin.trim();
-    const expectedPin = supervisor.pin || '1234';
-    if (trimmedPin !== expectedPin && trimmedPin !== '1234' && trimmedPin !== '9999' && trimmedPin !== '4321') {
+    const isPinValid = verifySalespersonPin(supervisor, trimmedPin) || trimmedPin === '1234' || trimmedPin === '9999' || trimmedPin === '4321';
+    if (!isPinValid) {
       setFloatModalError(`Invalid Supervisor PIN for ${supervisor.name}.`);
       return;
     }
@@ -3012,8 +3023,13 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                             <span className="text-[10px] text-slate-400 block truncate">
                               Voucher: <strong className="font-mono text-slate-300">{proc.grvNumber}</strong> • {proc.itemsSummary}
                             </span>
-                            <div className="flex items-center gap-1.5 pt-0.5">
-                              {proc.status === 'APPROVED' ? (
+                            <div className="flex items-center gap-1.5 pt-0.5 flex-wrap">
+                              {proc.status === 'REJECTED' ? (
+                                <span className="text-[10px] text-rose-400 font-bold flex items-center gap-1 bg-rose-950/80 px-1.5 py-0.5 rounded border border-rose-800/80">
+                                  <AlertTriangle className="w-2.5 h-2.5 text-rose-400 shrink-0" />
+                                  <span>REJECTED (Amount Returned to Till)</span>
+                                </span>
+                              ) : proc.status === 'APPROVED' ? (
                                 <span className="text-[10px] text-emerald-400 font-bold flex items-center gap-0.5">
                                   <CheckCircle2 className="w-2.5 h-2.5" />
                                   Approved by {proc.approvedByName || 'Supervisor'}
@@ -3028,6 +3044,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                                 (Click to view recorded voucher)
                               </span>
                             </div>
+                            {proc.status === 'REJECTED' && (
+                              <span className="text-[10px] text-rose-300 font-medium block pt-0.5">
+                                Rejection Reason: <strong className="text-white">{proc.rejectionReason || 'Voucher rejected by supervisor - funds returned to till'}</strong>
+                              </span>
+                            )}
                           </div>
                         </td>
 
@@ -3046,10 +3067,19 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                               type="text"
                               readOnly
                               value={(Number(proc.amount) || 0).toFixed(2)}
-                              className="w-full pl-5 pr-1 sm:pl-6 sm:pr-2 py-1.5 bg-rose-950/40 border border-rose-500/50 rounded-xl text-xs sm:text-sm font-mono-num font-bold text-rose-300 text-right cursor-default"
-                              title="Derived from Direct Supplier Delivery Voucher"
+                              className={`w-full pl-5 pr-1 sm:pl-6 sm:pr-2 py-1.5 rounded-xl text-xs sm:text-sm font-mono-num font-bold text-right cursor-default ${
+                                proc.status === 'REJECTED'
+                                  ? 'bg-slate-900/90 border border-slate-700 text-slate-400 line-through'
+                                  : 'bg-rose-950/40 border border-rose-500/50 text-rose-300'
+                              }`}
+                              title={proc.status === 'REJECTED' ? 'Delivery rejected - amount returned to drawer' : 'Derived from Direct Supplier Delivery Voucher'}
                             />
                           </div>
+                          {proc.status === 'REJECTED' && (
+                            <span className="text-[9px] text-emerald-400 font-mono font-bold block mt-0.5">
+                              +${(Number(proc.originalAmount) || 0).toFixed(2)} in drawer
+                            </span>
+                          )}
                         </td>
 
                         {/* Note */}
@@ -3059,6 +3089,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                               Voucher: {proc.grvNumber}
                               {proc.invoiceNo ? ` • Inv: ${proc.invoiceNo}` : ''}
                             </span>
+                            {proc.status === 'REJECTED' && proc.rejectionReason && (
+                              <span className="block text-[10px] text-rose-400 truncate">
+                                Rejection: {proc.rejectionReason}
+                              </span>
+                            )}
                           </div>
                         </td>
 
@@ -4641,10 +4676,22 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                         </div>
                       </div>
                       <div className="text-right">
-                        <span className="font-mono-num font-bold text-rose-400 text-sm">
+                        <span
+                          className={`font-mono-num font-bold text-sm ${
+                            viewingProcurementGrv.status === 'REJECTED' ? 'line-through text-slate-500' : 'text-rose-400'
+                          }`}
+                        >
                           -${(p.amount ?? 0).toFixed(2)}
                         </span>
-                        <span className="text-[10px] text-slate-500 block font-mono">Deducted from Drawer</span>
+                        <span
+                          className={`text-[10px] block font-mono ${
+                            viewingProcurementGrv.status === 'REJECTED' ? 'text-emerald-400 font-bold' : 'text-slate-500'
+                          }`}
+                        >
+                          {viewingProcurementGrv.status === 'REJECTED'
+                            ? 'Returned to Drawer ($0 deducted)'
+                            : 'Deducted from Drawer'}
+                        </span>
                       </div>
                     </div>
                   ))}
@@ -4693,31 +4740,33 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               {/* Supervisor / Admin Immediate Voucher Actions */}
               {(isAdmin || currentUser.role === 'SUPERVISOR' || currentUser.role === 'MANAGER' || (currentUser.role as string) === 'super_admin' || currentUser.role === 'OWNER') && (
                 <div className="flex items-center space-x-2 w-full sm:w-auto justify-end flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const reason = window.prompt(
-                        `Reason for rejecting Direct Delivery Voucher ${viewingProcurementGrv.grvNumber}? This will reverse the $${viewingProcurementGrv.totalCost.toFixed(2)} payout back into the cashier's drawer and Form 2:`
-                      );
-                      if (reason !== null && reason.trim()) {
-                        const res = rejectDirectGrv(viewingProcurementGrv.id, currentUser.id, currentUser.name, reason.trim());
-                        if (res.success) {
-                          setViewingProcurementGrv(null);
-                          loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
-                          setLedgerRefreshKey((k) => k + 1);
-                          setSaveSuccessNotice(`Voucher ${viewingProcurementGrv.grvNumber} rejected and refunded into cashier's drawer.`);
-                        } else {
-                          alert(res.message);
+                  {viewingProcurementGrv.status !== 'REJECTED' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const reason = window.prompt(
+                          `Reason for rejecting Direct Delivery Voucher ${viewingProcurementGrv.grvNumber}? This will reverse the $${viewingProcurementGrv.totalCost.toFixed(2)} payout back into the cashier's drawer and Form 2:`
+                        );
+                        if (reason !== null && reason.trim()) {
+                          const res = rejectDirectGrv(viewingProcurementGrv.id, currentUser.id, currentUser.name, reason.trim());
+                          if (res.success) {
+                            setViewingProcurementGrv(null);
+                            loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+                            setLedgerRefreshKey((k) => k + 1);
+                            setSaveSuccessNotice(`Voucher ${viewingProcurementGrv.grvNumber} rejected and refunded into cashier's drawer.`);
+                          } else {
+                            alert(res.message);
+                          }
                         }
-                      }
-                    }}
-                    className="px-3.5 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 font-bold text-xs transition flex items-center space-x-1.5"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                    <span>Reject & Return to Drawer</span>
-                  </button>
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 font-bold text-xs transition flex items-center space-x-1.5"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span>Reject & Return to Drawer</span>
+                    </button>
+                  )}
 
-                  {viewingProcurementGrv.status !== 'APPROVED' && (
+                  {viewingProcurementGrv.status !== 'APPROVED' && viewingProcurementGrv.status !== 'REJECTED' && (
                     <button
                       type="button"
                       onClick={() => {

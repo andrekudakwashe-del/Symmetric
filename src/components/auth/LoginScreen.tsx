@@ -589,8 +589,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   };
 
   const handleDirectQuickLogin = (staff: Salesperson) => {
-    setSelectedStaffId(staff.id);
-    verifyPin(staff.pin || '123456', staff);
+    handleQuickSelect(staff);
   };
 
   const handleManualSubmit = () => {

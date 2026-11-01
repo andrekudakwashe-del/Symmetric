@@ -185,7 +185,8 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
         id: activeCasual.id,
         name: `${activeCasual.name} (${activeCasual.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B'})`,
         role: 'CASHIER' as any,
-        pin: activeCasual.pin,
+        pin_hash: activeCasual.pin_hash,
+        pin_salt: activeCasual.pin_salt,
         phone: activeCasual.phone,
         active: 'Y',
       } as Salesperson)

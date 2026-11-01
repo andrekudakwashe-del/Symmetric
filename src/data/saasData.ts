@@ -33,6 +33,8 @@ export interface Company {
   offline_activation_code?: string;
   trial_days_remaining?: number;
   notes?: string;
+  custom_max_branches?: number;
+  custom_max_staff?: number;
   backend_type?: BackendType;
   backend_config?: TenantBackendConfig;
 }
@@ -57,7 +59,9 @@ export interface SaaSUser {
   email: string;
   password_hash: string;
   role: 'OWNER' | 'ADMIN' | 'SUPERVISOR' | 'CASHIER';
-  pin: string;
+  pin?: string;
+  pin_hash?: string;
+  pin_salt?: string;
   is_active: boolean;
   phone?: string;
 }

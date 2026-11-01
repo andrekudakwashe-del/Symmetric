@@ -28,6 +28,7 @@ import {
   subscribeToDatabase,
   getSalespeople,
   logManagerOverride,
+  verifySalespersonPin,
 } from '../../db/roomDatabase';
 
 interface ExchangeRatesModalProps {
@@ -195,7 +196,7 @@ export const ExchangeRatesModal: React.FC<ExchangeRatesModalProps> = ({
 
     setIsVerifyingPin(true);
     const activeStaff = getSalespeople().filter((s) => s.active === 'Y');
-    const matched = activeStaff.find((s) => s.pin === pinInput);
+    const matched = activeStaff.find((s) => verifySalespersonPin(s, pinInput));
 
     if (!matched) {
       setPinError('Invalid PIN. No active staff member found with this PIN.');

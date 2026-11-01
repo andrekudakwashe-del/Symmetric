@@ -290,17 +290,29 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
     setBranches(getBranches());
   };
 
+  const [packageVersion, setPackageVersion] = useState(0);
+
   useEffect(() => {
     loadData();
     const unsubscribe = subscribeToDatabase(() => {
       loadData();
     });
-    return () => unsubscribe();
+    const handlePkgUpdate = () => {
+      setPackageVersion((v) => v + 1);
+      loadData();
+    };
+    window.addEventListener('saas_packages_updated', handlePkgUpdate);
+    window.addEventListener('saas_company_updated', handlePkgUpdate);
+    return () => {
+      unsubscribe();
+      window.removeEventListener('saas_packages_updated', handlePkgUpdate);
+      window.removeEventListener('saas_company_updated', handlePkgUpdate);
+    };
   }, []);
 
   const staffLimitInfo = React.useMemo(() => {
     return checkStaffLimit(getCurrentCompanyId());
-  }, [salespeople]);
+  }, [salespeople, packageVersion]);
 
   const filteredStaff = salespeople.filter((s) => {
     const q = (searchQuery || '').trim().toLowerCase();
@@ -358,7 +370,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
     setEditingStaff(staff);
     setFormName(staff.name);
     setFormEmail(staff.email || '');
-    setFormPin(staff.pin);
+    setFormPin('');
     setFormRole(staff.role);
     const primaryBId = staff.branch_id || getCurrentBranchId() || '1';
     setFormBranchId(primaryBId);
@@ -406,9 +418,11 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
       setFormError('Please provide the staff member full name.');
       return;
     }
-    if (!/^\d{6}$/.test(formPin) && !/^\d{4}$/.test(formPin)) {
-      setFormError('PIN must be 6 numeric digits (e.g. 123456).');
-      return;
+    if (!editingStaff || formPin) {
+      if (!/^\d{6}$/.test(formPin) && !/^\d{4}$/.test(formPin)) {
+        setFormError('PIN must be 4 or 6 numeric digits (e.g. 123456).');
+        return;
+      }
     }
 
     if (formEmail.trim()) {
@@ -446,10 +460,9 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
 
     try {
       if (editingStaff) {
-        updateSalesperson(editingStaff.id, {
+        const staffPayload: any = {
           name: formName.trim(),
           email: formEmail.trim() || undefined,
-          pin: formPin,
           role: formRole as Role,
           branch_id: resolvedBranchId,
           branchAssignments: finalAssignments,
@@ -457,7 +470,11 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           phone: formPhone.trim() || undefined,
           active: formActive,
           permissions: tempPermissions,
-        });
+        };
+        if (formPin) {
+          staffPayload.pin = formPin;
+        }
+        updateSalesperson(editingStaff.id, staffPayload);
 
         updateStaffBranchAssignments(editingStaff.id, finalAssignments);
 
@@ -1032,7 +1049,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
                       )}
                     </div>
                     <div className="flex items-center space-x-2 mt-0.5 text-xs text-slate-500 font-medium">
-                      <span>PIN: •••••• ({staff.pin})</span>
+                      <span className="text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded text-[10px] font-semibold">PIN Encrypted (SHA-256)</span>
                       {staff.phone && <span>• {staff.phone}</span>}
                     </div>
 
@@ -1297,15 +1314,15 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
 
                   <div>
                     <label className="block text-xs font-bold text-slate-700 mb-1">
-                      6-Digit PIN <span className="text-rose-500">*</span>
+                      {editingStaff ? 'Change PIN (leave blank to keep current)' : '6-Digit Security PIN'} {!editingStaff && <span className="text-rose-500">*</span>}
                     </label>
                     <input
                       type="password"
                       maxLength={6}
-                      required
+                      required={!editingStaff}
                       value={formPin}
                       onChange={(e) => setFormPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                      placeholder="e.g. 123456"
+                      placeholder={editingStaff ? '•••••• (Unchanged)' : 'e.g. 123456'}
                       className="w-full bg-slate-50 border border-slate-300 rounded-xl py-2.5 px-3 text-center text-base font-mono-num font-black text-slate-950 focus:outline-none focus:border-blue-600 focus:bg-white"
                     />
                   </div>

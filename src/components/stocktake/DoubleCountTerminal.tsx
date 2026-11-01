@@ -176,19 +176,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
       setShowCasualPinModal(false);
       setCasualPinInput('');
     } else {
-      // Also check temporary casuals for this session
-      const sessCasuals = getTemporaryCasuals(session.sessionId);
-      const matched = sessCasuals.find((c) => c.pin === casualPinInput.trim());
-      if (matched) {
-        setActiveCasual(matched);
-        setCounterStaffName(matched.name);
-        setCounterStaffId(matched.id);
-        setCounterPhone(matched.phone);
-        setShowCasualPinModal(false);
-        setCasualPinInput('');
-      } else {
-        setCasualPinError('Invalid 4-digit Casual PIN. Please verify with supervisor.');
-      }
+      setCasualPinError('Invalid 4-digit Casual PIN. Please verify with supervisor.');
     }
   };
 
@@ -315,7 +303,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
               <KeyRound className="w-3.5 h-3.5 text-amber-400" />
               {activeCasual ? (
                 <span>
-                  Casual: <strong>{activeCasual.name}</strong> ({activeCasual.pin})
+                  Casual: <strong>{activeCasual.name}</strong>
                 </span>
               ) : (
                 <span>Casual PIN Login</span>

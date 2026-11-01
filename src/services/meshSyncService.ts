@@ -72,6 +72,11 @@ import { getMovements, addMovement, onCashMovementCreated, CashMovement } from '
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { processSyncQueue } from './googleSheetsSync';
 import { LocalHubConfig, normalizeHubUrl } from '../utils/localHubConfig';
+import {
+  hashPin,
+  generatePinSalt,
+  sanitizeUserForExport,
+} from '../utils/pinCrypto';
 
 export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE' | 'CLOUD_ONLY';
 
@@ -4150,6 +4155,9 @@ class MeshSyncManager {
     const packetId = `STAFF-PKT-${staff.id}-${Date.now()}`;
     this.seenPacketIds.add(packetId);
 
+    // CRITICAL SECURITY: Never broadcast raw plain-text PIN across network/Hub
+    const sanitizedStaff = sanitizeUserForExport(staff);
+
     const packet = {
       type: 'staff',
       action: 'STAFF_SYNC',
@@ -4160,14 +4168,14 @@ class MeshSyncManager {
       deviceId: this.config.deviceId,
       originDeviceId: this.config.deviceId,
       originDeviceName: this.config.deviceName,
-      staff,
-      payload: staff,
+      staff: sanitizedStaff,
+      payload: sanitizedStaff,
       timestamp: Date.now(),
       ttl: 5,
     };
 
     this.sendPacketToAllTransports('staff', packet);
-    this.addLog('BROADCAST', `Staff account ${staff.name} (${staff.id} - ${staff.role}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.addLog('BROADCAST', `Staff account ${staff.name} (${staff.id} - ${staff.role}) broadcasted to WiFi mesh (PIN protected)`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 
@@ -4922,9 +4930,20 @@ class MeshSyncManager {
   }
 
   public broadcastCasualWorkers(casuals: any[]): void {
+    // CRITICAL SECURITY: Ensure only pin_hash and pin_salt are transmitted over Local Hub
+    const sanitized = Array.isArray(casuals)
+      ? casuals.map((c) => {
+          const salt = c.pin_salt || generatePinSalt();
+          const hash = c.pin_hash || (c.pin ? hashPin(c.pin, salt) : hashPin('1234', salt));
+          const copy = { ...c, pin_hash: hash, pin_salt: salt };
+          delete copy.pin;
+          return copy;
+        })
+      : [];
+
     const packet = {
       type: 'CASUAL_WORKERS_SYNC',
-      casualWorkers: casuals,
+      casualWorkers: sanitized,
       branchId: this.config.branchId,
       timestamp: Date.now(),
     };
