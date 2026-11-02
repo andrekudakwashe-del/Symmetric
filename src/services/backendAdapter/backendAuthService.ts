@@ -2,6 +2,7 @@
 // Phase C: Dynamic Authentication Handling (6-Digit PIN, Native Cloud, & Hybrid Mode)
 
 import { BackendType, BackendAuthMode } from './types';
+import { Salesperson } from '../../types';
 import { getTenantBackendConfig } from './adapterRegistry';
 import { getCompanies, getSalespeopleForCompany, saveSalesperson, verifySalespersonPin } from '../../db/roomDatabase';
 import { authenticateStaffWithAppsScript, authenticateOwnerWithAppsScript } from '../googleSheetsSync';
@@ -222,7 +223,7 @@ export class BackendAuthService {
           authProvider: backendType,
           authModeUsed: 'pin_6_digit',
           message: response.message || 'Staff authenticated successfully.',
-          user: response.user || localUser,
+          user: (response.user as any) || localUser,
         };
       } else {
         return {

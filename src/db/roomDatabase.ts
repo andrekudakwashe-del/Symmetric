@@ -154,7 +154,6 @@ export {
   generatePinSalt,
   verifyPinHash,
   sanitizeUserForExport,
-  runPinHashingMigration,
 };
 
 export const STORAGE_KEYS = {
@@ -1771,7 +1770,7 @@ export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }
     branch_id: brId,
     pin_hash: pinHash,
     pin_salt: salt,
-  };
+  } as Salesperson;
   // Permanently strip plain-text PIN
   delete (created as any).pin;
 
@@ -6595,7 +6594,7 @@ export const refundSaleInvoice = (params: {
   logManagerOverride({
     action: 'REFUND_INVOICE',
     manager: params.manager,
-    cashier: params.cashier || (invoice.staffId ? { id: invoice.staffId, name: invoice.staffName || 'Cashier' } : undefined),
+    cashier: params.cashier || (invoice.staffId ? ({ id: invoice.staffId, name: invoice.staffName || 'Cashier', role: 'SALES_CLERK' } as Salesperson) : undefined),
     referenceId: invoice.id,
     amount: invoice.total,
     details: `Refund processed for Invoice #${invoice.id} ($${invoice.total.toFixed(2)}). Deducted from Cashier ${params.cashier?.name || invoice.staffName || 'Till'}. Authorized by ${params.manager.role} ${params.manager.name}. Reason: ${params.reason}`,
@@ -9359,11 +9358,12 @@ export const getAllInventoryItems = (branchId?: string): InventoryItem[] => {
     if (compId && currentCompany && currentCompany !== 'COMP-MASTER' && compId !== currentCompany && compId !== 'COMP-MASTER') {
       return false;
     }
+    // 1. Branch catalog assignment (e.g. Grocery store vs Hardware store)
     if (item.assignedBranchIds && item.assignedBranchIds.length > 0) {
       return item.assignedBranchIds.some((b) => isRecordInBranchScope(b, currentBranch, branches, currentCompany, compId));
     }
-    const brId = item.branch_id || (item as any).branchId;
-    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
+    // If assignedBranchIds is not set or empty, this product belongs to the shared company catalog
+    return true;
   });
 };
 
@@ -9387,13 +9387,8 @@ export const getInventoryItems = (): InventoryItem[] => {
         if (!item.assignedBranchIds.some((b) => isRecordInBranchScope(b, currentBranch, branches, currentCompany, compId))) {
           return false;
         }
-      } else {
-        // 2. Strict branch isolation
-        const brId = item.branch_id || (item as any).branchId;
-        if (!isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) {
-          return false;
-        }
       }
+      // Products without assignedBranchIds are available to all branches in this company
       return true;
     });
   }
@@ -9758,7 +9753,7 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     return false;
   }
 
-  const allItems = getAllInventoryItems();
+  const allItems = getRawStoredInventoryItems();
   let cleanId = (item.itemId || (item as any).id || '').trim().toUpperCase();
 
   // If item was previously deleted on this company, do not re-insert or resurrect
@@ -9775,14 +9770,13 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
 
   // Find index by exact ID match (only if names also match or one is missing), or by SKU, or by exact item name
   let idx = allItems.findIndex((i) => {
-    const iComp = i.company_id || (i as any).companyId || currentCompany;
-    if (iComp !== compId) return false;
+    const iComp = (i.company_id || (i as any).companyId || currentCompany).trim().toUpperCase();
+    if (iComp !== compId.toUpperCase()) return false;
     const iName = (i.itemName || '').trim().toLowerCase();
 
     if (item.sku && i.sku && i.sku.toUpperCase() === item.sku.toUpperCase()) return true;
     if (incomingName && iName && incomingName === iName) return true;
     if (cleanId && i.itemId && i.itemId.toUpperCase() === cleanId) {
-      // If names differ substantially (e.g. "Airtime" vs "Bread"), they are conflicting counter IDs from separate devices!
       if (incomingName && iName && incomingName !== iName) return false;
       return true;
     }
@@ -9799,53 +9793,143 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     }
   }
 
-  const normalized: InventoryItem = {
-    ...item,
-    itemId: cleanId,
-    company_id: compId,
-    companyId: compId,
-    branch_id: item.branch_id || getCurrentBranchId(),
-    branchId: item.branch_id || getCurrentBranchId(),
-    lastUpdated: item.lastUpdated || new Date().toISOString(),
-  };
+  const unitsPerCase = Math.max(1, Number(item.unitsPerCase || (item as any).UnitsPerCase) || 1);
+  const costPerCase = Number(item.costPerCase) || 0;
+  const costPerUnit = Number(item.costPerUnit) || (costPerCase > 0 ? costPerCase / unitsPerCase : 0);
+  const sellPriceUnit = Number(item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price ?? (item as any).SellingPrice ?? 0));
+  const sellPriceCase = Number(item.sellPriceCase !== undefined ? item.sellPriceCase : (sellPriceUnit * unitsPerCase));
+  const stockCases = Number(item.stockCases !== undefined ? item.stockCases : 0);
+  const stockSingles = item.stockSingles !== undefined ? Number(item.stockSingles) : 0;
+  const totalUnits = Number(item.totalUnits !== undefined ? item.totalUnits : (stockCases * unitsPerCase + stockSingles));
+
+  let savedItem: InventoryItem;
 
   if (idx >= 0) {
     const existing = allItems[idx];
 
-    // Conflict Resolution: Never overwrite locally updated items with older/stale remote data
-    if (existing.lastUpdated && normalized.lastUpdated) {
+    // Check if price or name or cost has changed:
+    const priceChanged =
+      Math.abs((existing.sellPriceUnit || 0) - sellPriceUnit) > 0.001 ||
+      Math.abs((existing.sellPriceCase || 0) - sellPriceCase) > 0.001 ||
+      Math.abs((existing.costPerUnit || 0) - costPerUnit) > 0.001 ||
+      Math.abs((existing.costPerCase || 0) - costPerCase) > 0.001;
+    const nameChanged = (existing.itemName || '').trim() !== (item.itemName || '').trim();
+
+    // Timestamp check: ONLY skip if existing is newer AND neither price nor name changed (protects against clock skew)
+    if (!priceChanged && !nameChanged && existing.lastUpdated && item.lastUpdated) {
       const existingTime = new Date(existing.lastUpdated).getTime();
-      const incomingTime = new Date(normalized.lastUpdated).getTime();
+      const incomingTime = new Date(item.lastUpdated).getTime();
       if (!isNaN(existingTime) && !isNaN(incomingTime) && existingTime > incomingTime) {
         return false;
       }
     }
 
-    // Check if the item is already identical to prevent unnecessary localStorage serialization and re-render loops
-    const isIdentical =
-      existing.sellPriceUnit === normalized.sellPriceUnit &&
-      existing.sellPriceCase === normalized.sellPriceCase &&
-      existing.stockSingles === normalized.stockSingles &&
-      existing.stockCases === normalized.stockCases &&
-      existing.itemName === normalized.itemName &&
-      existing.costPerUnit === normalized.costPerUnit &&
-      existing.barcode === normalized.barcode &&
-      existing.sku === normalized.sku &&
-      existing.unitsPerCase === normalized.unitsPerCase;
+    // Synchronize branchOverrides across all branches so stale overrides NEVER shadow new incoming prices!
+    const updatedOverrides = { ...(existing.branchOverrides || {}), ...(item.branchOverrides || {}) };
+    Object.keys(updatedOverrides).forEach((b) => {
+      if (updatedOverrides[b]) {
+        updatedOverrides[b] = {
+          ...updatedOverrides[b],
+          sellPriceUnit,
+          sellPriceCase,
+          costPerUnit,
+          costPerCase,
+        };
+      }
+    });
 
-    if (isIdentical) {
-      return false;
-    }
-    allItems[idx] = { ...existing, ...normalized };
+    const mergedPackagingVariants = item.packagingVariants || existing.packagingVariants;
+
+    savedItem = {
+      ...existing,
+      ...item,
+      itemId: cleanId,
+      company_id: compId,
+      companyId: compId,
+      branch_id: item.branch_id || existing.branch_id || 'ALL',
+      branchId: item.branch_id || existing.branchId || 'ALL',
+      unitsPerCase,
+      costPerCase,
+      costPerUnit,
+      sellPriceUnit,
+      sellPriceCase,
+      stockCases,
+      stockSingles,
+      totalUnits,
+      branchOverrides: updatedOverrides,
+      packagingVariants: mergedPackagingVariants,
+      lastUpdated: new Date().toISOString(),
+    };
+    allItems[idx] = savedItem;
   } else {
-    allItems.unshift(normalized);
+    // New Product added on peer terminal!
+    const updatedOverrides = { ...(item.branchOverrides || {}) };
+    Object.keys(updatedOverrides).forEach((b) => {
+      if (updatedOverrides[b]) {
+        updatedOverrides[b] = {
+          ...updatedOverrides[b],
+          sellPriceUnit,
+          sellPriceCase,
+          costPerUnit,
+          costPerCase,
+        };
+      }
+    });
+
+    savedItem = {
+      ...item,
+      itemId: cleanId,
+      company_id: compId,
+      companyId: compId,
+      branch_id: item.branch_id || 'ALL',
+      branchId: item.branch_id || 'ALL',
+      unitsPerCase,
+      costPerCase,
+      costPerUnit,
+      sellPriceUnit,
+      sellPriceCase,
+      stockCases,
+      stockSingles,
+      totalUnits,
+      branchOverrides: updatedOverrides,
+      lastUpdated: new Date().toISOString(),
+    };
+    allItems.unshift(savedItem);
   }
 
-  setStored(STORAGE_KEYS.INVENTORY_ITEMS, allItems);
+  // Deduplicate by clean ID and company before saving
+  const dedupMap = new Map<string, InventoryItem>();
+  for (const it of allItems) {
+    const itId = (it.itemId || (it as any).id || '').trim().toUpperCase();
+    if (!itId) continue;
+    const itComp = (it.company_id || (it as any).companyId || 'DEFAULT').trim().toUpperCase();
+    const key = `${itId}::${itComp}`;
+    if (!dedupMap.has(key)) {
+      dedupMap.set(key, it);
+    }
+  }
+  const cleanAllItems = Array.from(dedupMap.values());
+  setStored(STORAGE_KEYS.INVENTORY_ITEMS, cleanAllItems);
+
+  // Sync PRODUCTS storage immediately
   try {
-    setStored(STORAGE_KEYS.PRODUCTS, allItems.map((item) => inventoryItemToProduct(item)));
-  } catch (e) {}
+    const prodMap = new Map<string, Product>();
+    cleanAllItems.map((it) => inventoryItemToProduct(it)).forEach((p) => {
+      if (p.id && !prodMap.has(p.id)) {
+        prodMap.set(p.id, p);
+      }
+    });
+    setStored(STORAGE_KEYS.PRODUCTS, Array.from(prodMap.values()));
+  } catch (e) {
+    console.warn('Sync products error in ingestMeshInventoryItem:', e);
+  }
+
   notifyListeners();
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: savedItem }));
+    window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: savedItem }));
+    window.dispatchEvent(new CustomEvent('mesh-inventory-received', { detail: { item: savedItem } }));
+  }
   return true;
 };
 
@@ -9868,8 +9952,8 @@ export const ingestMeshInventoryDelete = (itemId: string, companyId?: string): b
     setStored(deletedRegistryKey, updatedDeleted);
   }
 
-  // 2. Remove from active inventory and products store
-  const allItems = getAllInventoryItems();
+  // 2. Remove from active inventory and products store using raw storage
+  const allItems = getRawStoredInventoryItems();
   const filtered = allItems.filter((i) => {
     const cId = (i.company_id || (i as any).companyId || 'COMP-001').toUpperCase();
     if (cId === currentCompany.toUpperCase() && (i.itemId || '').trim().toUpperCase() === cleanId) {
@@ -9890,6 +9974,8 @@ export const ingestMeshInventoryDelete = (itemId: string, companyId?: string): b
           detail: { itemId: cleanId, companyId: currentCompany, fromMesh: true },
         })
       );
+      window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_products_updated'));
     }
     notifyListeners();
     return true;
@@ -10036,17 +10122,32 @@ export const ingestMeshStaff = (staff: Salesperson): boolean => {
   }
   const all = getAllSalespeople();
   const index = all.findIndex((s) => s.id === staff.id);
+
+  // Ensure SHA-256 hash and salt are present
+  let salt = staff.pin_salt;
+  let hash = staff.pin_hash;
+  if (!hash || !salt) {
+    salt = generatePinSalt();
+    const rawPin = staff.pin ? String(staff.pin).trim() : '123456';
+    hash = hashPin(rawPin, salt);
+  }
+
   const normalized: Salesperson = {
     ...staff,
     companyId: compId,
     company_id: compId,
+    pin_hash: hash,
+    pin_salt: salt,
   };
+  delete (normalized as any).pin;
+
   if (index >= 0) {
     const existing = all[index];
     if (
       existing.name === normalized.name &&
       existing.role === normalized.role &&
-      existing.pin === normalized.pin &&
+      existing.pin_hash === normalized.pin_hash &&
+      existing.pin_salt === normalized.pin_salt &&
       existing.active === normalized.active &&
       JSON.stringify(existing.permissions) === JSON.stringify(normalized.permissions) &&
       JSON.stringify(existing.branchAssignments) === JSON.stringify(normalized.branchAssignments)
@@ -13140,7 +13241,7 @@ export const addTemporaryCasual = (
     pin_salt: salt,
     createdAt: new Date().toISOString(),
     active: true,
-  };
+  } as TemporaryCasualAccount;
   delete (created as any).pin;
 
   const updated = [...all, created];

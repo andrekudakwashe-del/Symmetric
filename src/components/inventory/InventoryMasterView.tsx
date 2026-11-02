@@ -131,11 +131,17 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     };
     window.addEventListener('saimetric_inventory_item_deleted', handleUpdateEvent);
     window.addEventListener('saimetric_inventory_updated', handleUpdateEvent);
+    window.addEventListener('saimetric_products_updated', handleUpdateEvent);
+    window.addEventListener('mesh-inventory-received', handleUpdateEvent);
+    window.addEventListener('mesh-catchup-completed', handleUpdateEvent);
     window.addEventListener('saimetric_database_restored', handleUpdateEvent);
     return () => {
       unsub();
       window.removeEventListener('saimetric_inventory_item_deleted', handleUpdateEvent);
       window.removeEventListener('saimetric_inventory_updated', handleUpdateEvent);
+      window.removeEventListener('saimetric_products_updated', handleUpdateEvent);
+      window.removeEventListener('mesh-inventory-received', handleUpdateEvent);
+      window.removeEventListener('mesh-catchup-completed', handleUpdateEvent);
       window.removeEventListener('saimetric_database_restored', handleUpdateEvent);
     };
   }, [currentUser]);

@@ -2253,7 +2253,7 @@ export const fetchCompaniesFromMasterSheet = async (
             name: u.name || u.full_name || 'Staff Member',
             role: (u.role || 'OWNER').toUpperCase() as any,
             email: u.email || '',
-            pin: String(u.pin || '1234'),
+            ...(u.pin_hash ? { pin_hash: u.pin_hash, pin_salt: u.pin_salt } : { pin: String(u.pin || '1234') }),
             phone: u.phone || '',
             active: u.active === 'N' ? 'N' : 'Y',
             companyId: uComp,

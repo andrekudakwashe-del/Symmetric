@@ -98,10 +98,18 @@ let packetCounter = 0;
 const seenPacketIds = new Set();
 
 // Helper: Match record by tenant and branch
-function isMatch(rec, reqComp, reqBranch) {
+function isMatch(rec, reqComp, reqBranch, isCatalog = false) {
   if (!rec) return false;
   const c = (rec.company_id || rec.companyId || 'COMP-001').trim().toUpperCase();
   if (reqComp && c && c !== reqComp && c !== 'COMP-MASTER' && reqComp !== 'COMP-MASTER') return false;
+  if (isCatalog) {
+    if (rec.assignedBranchIds && Array.isArray(rec.assignedBranchIds) && rec.assignedBranchIds.length > 0) {
+      if (reqBranch && reqBranch !== 'ALL' && !rec.assignedBranchIds.map((b) => String(b).toUpperCase()).includes(reqBranch)) {
+        return false;
+      }
+    }
+    return true;
+  }
   const b = (rec.branch_id || rec.branchId || '').trim().toUpperCase();
   if (reqBranch && b && reqBranch !== 'ALL' && b !== 'ALL' && b !== reqBranch) return false;
   return true;
@@ -260,6 +268,30 @@ const server = http.createServer((req, res) => {
         packetsProcessed: packetCounter,
         uptimeSec: Math.round(process.uptime()),
       })
+    );
+  }
+
+  // Direct download route for the hub script itself
+  if (req.url === '/termux-hub.js' || req.url === '/download/termux-hub.js') {
+    try {
+      const filePath = path.join(__dirname, 'termux-hub.js');
+      if (fs.existsSync(filePath)) {
+        res.writeHead(200, {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Content-Disposition': 'attachment; filename="termux-hub.js"',
+        });
+        return res.end(fs.readFileSync(filePath, 'utf8'));
+      }
+    } catch (e) {
+      // ignore error
+    }
+  }
+
+  // Quick installer bash script
+  if (req.url === '/setup.sh' || req.url === '/install.sh') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(
+      `#!/bin/bash\n# Saimetric Local Hub One-Liner Setup\npkg update -y && pkg install nodejs -y && npm install ws\nnode termux-hub.js --port ${PORT}\n`
     );
   }
 
@@ -968,10 +1000,11 @@ wss.on('connection', (ws, req) => {
           const exIdx = inventoryStore.findIndex(
             (i) => i.itemId === cleanId || i.id === cleanId || (it.sku && i.sku === it.sku)
           );
+          const stamped = { ...it, itemId: cleanId, id: cleanId, updatedAt: it.lastUpdated || new Date().toISOString() };
           if (exIdx >= 0) {
-            inventoryStore[exIdx] = { ...inventoryStore[exIdx], ...it, itemId: cleanId };
+            inventoryStore[exIdx] = { ...inventoryStore[exIdx], ...stamped };
           } else {
-            inventoryStore.push({ ...it, itemId: cleanId, id: cleanId });
+            inventoryStore.push(stamped);
           }
         }
         scheduleSave();
@@ -1180,7 +1213,7 @@ wss.on('connection', (ws, req) => {
 
         const missedSales = salesStore.filter((s) => isMatch(s, reqComp, reqBranch) && getTimestamp(s) >= sinceTime);
         const missedDirectGrvs = directGrvsStore.filter((g) => isMatch(g, reqComp, reqBranch) && getTimestamp(g) >= sinceTime);
-        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch) && getTimestamp(i) >= sinceTime);
+        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch, true) && getTimestamp(i) >= sinceTime);
         const missedCashLogs = cashLogsStore.filter((c) => isMatch(c, reqComp, reqBranch) && getTimestamp(c) >= sinceTime);
         const missedCashLifts = cashLiftsStore.filter((l) => isMatch(l, reqComp, reqBranch) && getTimestamp(l) >= sinceTime);
         const missedCashMovements = cashMovementsStore.filter((m) => isMatch(m, reqComp, reqBranch) && getTimestamp(m) >= sinceTime);

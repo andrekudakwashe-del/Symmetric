@@ -193,8 +193,24 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     const unsubscribe = subscribeToDatabase(() => {
       loadData();
     });
+
+    const handleDataRefreshEvent = () => {
+      loadData();
+    };
+
+    window.addEventListener('saimetric_inventory_updated', handleDataRefreshEvent);
+    window.addEventListener('saimetric_products_updated', handleDataRefreshEvent);
+    window.addEventListener('mesh-inventory-received', handleDataRefreshEvent);
+    window.addEventListener('mesh-catchup-completed', handleDataRefreshEvent);
+    window.addEventListener('saimetric_customers_updated', handleDataRefreshEvent);
+
     return () => {
       unsubscribe();
+      window.removeEventListener('saimetric_inventory_updated', handleDataRefreshEvent);
+      window.removeEventListener('saimetric_products_updated', handleDataRefreshEvent);
+      window.removeEventListener('mesh-inventory-received', handleDataRefreshEvent);
+      window.removeEventListener('mesh-catchup-completed', handleDataRefreshEvent);
+      window.removeEventListener('saimetric_customers_updated', handleDataRefreshEvent);
     };
   }, []);
 

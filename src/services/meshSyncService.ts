@@ -1401,11 +1401,19 @@ class MeshSyncManager {
         const ingested = ingestMeshInventoryItem({
           ...invItem,
           company_id: this.config.companyId,
-          branch_id: this.config.branchId,
+          branch_id: invItem.branch_id || 'ALL',
           fromMesh: true,
         });
         if (ingested) {
-          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: invItem }));
+          window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: invItem }));
+          window.dispatchEvent(
+            new CustomEvent('mesh-inventory-received', {
+              detail: { item: invItem, originName },
+            })
+          );
+          this.scheduleBatchUiUpdate();
+          this.notifyPeerSubscribers();
           this.addLog(
             'EPIDEMIC_HOP',
             `Received Product "${invItem.itemName || invItem.name}" from ${originName} via Local Hub. Inventory updated.`,
@@ -2795,7 +2803,16 @@ class MeshSyncManager {
       ''
     ).trim().toUpperCase();
 
+    const isCatalogPacket =
+      topicSuffix === 'inventory' ||
+      packet.type === 'inventory' ||
+      packet.action === 'INVENTORY_RECORD' ||
+      packet.type === 'product' ||
+      packet.target_branch_id === 'ALL' ||
+      targetBranch === 'ALL';
+
     const isBranchMismatch =
+      !isCatalogPacket &&
       Boolean(this.hubBranchId) &&
       this.hubBranchId !== 'UNASSIGNED' &&
       Boolean(targetBranch) &&
@@ -2897,7 +2914,19 @@ class MeshSyncManager {
       localCandidate === 'ALL' ||
       isRecordInBranchScope(branchCandidate, localCandidate, getBranches(), this.config.companyId);
 
-    if (!branchMatches) {
+    const isCatalogOrCompanyPacket =
+      topic.endsWith('/inventory') ||
+      packet.type === 'inventory' ||
+      packet.action === 'INVENTORY_RECORD' ||
+      packet.type === 'product' ||
+      packet.type === 'staff' ||
+      packet.action === 'STAFF_SYNC' ||
+      packet.type === 'customer' ||
+      packet.action === 'CUSTOMER_SYNC' ||
+      packet.target_branch_id === 'ALL' ||
+      branchCandidate === 'ALL';
+
+    if (!isCatalogOrCompanyPacket && !branchMatches) {
       this.addLog(
         'SECURITY_DROP',
         `Blocked cross-branch packet for branch [${packetBranchId || packetBranchCode}] (Active Terminal Branch: [${localBranchId}/${localBranchCode}]).`,
@@ -3030,7 +3059,7 @@ class MeshSyncManager {
         const ingested = ingestMeshInventoryItem({
           ...invItem,
           company_id: this.config.companyId,
-          branch_id: this.config.branchId,
+          branch_id: invItem.branch_id || 'ALL',
           fromMesh: true,
         });
         if (ingested) {
@@ -3049,7 +3078,10 @@ class MeshSyncManager {
               detail: { item: invItem, originName },
             })
           );
-          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: invItem }));
+          window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: invItem }));
+          this.scheduleBatchUiUpdate();
+          this.notifyPeerSubscribers();
         }
       }
       return;
@@ -4009,6 +4041,7 @@ class MeshSyncManager {
       );
       window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_products_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
@@ -4257,8 +4290,9 @@ class MeshSyncManager {
       action: 'INVENTORY_RECORD',
       packet_id: packetId,
       companyId: this.config.companyId,
-      branchId: this.config.branchId,
+      branchId: item.branch_id || 'ALL',
       branchCode: this.config.branchCode,
+      target_branch_id: 'ALL',
       deviceId: this.config.deviceId,
       originDeviceId: this.config.deviceId,
       originDeviceName: this.config.deviceName,

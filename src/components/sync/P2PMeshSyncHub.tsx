@@ -57,6 +57,7 @@ import {
   Clock,
   Database,
   Calendar,
+  Terminal,
 } from 'lucide-react';
 import { ShareDeviceModal } from '../common/ShareDeviceModal';
 import { OfflineAirgapSyncModal } from './OfflineAirgapSyncModal';
@@ -80,6 +81,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
   const [showAirgapModal, setShowAirgapModal] = useState(false);
   const [showQrPairingModal, setShowQrPairingModal] = useState(false);
   const [showLocalHubModal, setShowLocalHubModal] = useState(false);
+  const [localHubInitialTab, setLocalHubInitialTab] = useState<'connect' | 'host' | 'code'>('connect');
   const [pingSentToast, setPingSentToast] = useState(false);
   const [incomingPingNotice, setIncomingPingNotice] = useState<string | null>(null);
   const [incomingSaleNotice, setIncomingSaleNotice] = useState<string | null>(null);
@@ -520,16 +522,34 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
             </button>
 
             {/* LOCAL WEBSOCKET HUB (TERMUX NODE.JS) */}
-            <button
-              type="button"
-              id="btn-open-local-hub-settings"
-              onClick={() => setShowLocalHubModal(true)}
-              className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-black flex items-center space-x-1.5 transition border border-blue-400/40 shadow-lg cursor-pointer"
-              title="Configure or Scan Local WebSocket Hub (Termux / Hotspot)"
-            >
-              <Radio className="w-3.5 h-3.5 animate-pulse" />
-              <span>Local WebSocket Hub</span>
-            </button>
+            <div className="flex items-center space-x-1">
+              <button
+                type="button"
+                id="btn-open-local-hub-settings"
+                onClick={() => {
+                  setLocalHubInitialTab('connect');
+                  setShowLocalHubModal(true);
+                }}
+                className="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-black flex items-center space-x-1.5 transition border border-blue-400/40 shadow-lg cursor-pointer"
+                title="Configure or Scan Local WebSocket Hub (Termux / Hotspot)"
+              >
+                <Radio className="w-3.5 h-3.5 animate-pulse" />
+                <span>Local WebSocket Hub</span>
+              </button>
+              <button
+                type="button"
+                id="btn-open-termux-script"
+                onClick={() => {
+                  setLocalHubInitialTab('code');
+                  setShowLocalHubModal(true);
+                }}
+                className="px-2.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-indigo-300 text-xs font-bold flex items-center space-x-1.5 transition border border-slate-700 shadow-sm cursor-pointer"
+                title="Download or Copy Termux Hub Script (v3.2)"
+              >
+                <Terminal className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">Termux Code</span>
+              </button>
+            </div>
 
             {/* ZERO-INTERNET SHAREIT / XENDER HOTSPOT MESH */}
             <button
@@ -1566,6 +1586,7 @@ export const P2PMeshSyncHub: React.FC<P2PMeshSyncHubProps> = ({ onBack }) => {
       {/* Local WebSocket Hub Settings Modal */}
       <LocalHubSettingsModal
         isOpen={showLocalHubModal}
+        initialTab={localHubInitialTab}
         onClose={() => setShowLocalHubModal(false)}
       />
     </div>

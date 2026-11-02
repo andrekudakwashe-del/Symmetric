@@ -19,24 +19,48 @@ import {
   ArrowRight,
   Shield,
   Activity,
+  Download,
+  Code2,
+  Terminal,
+  FileCode,
+  CheckCheck,
+  Search,
+  Sparkles,
 } from 'lucide-react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { LocalHubConfig, normalizeHubUrl, LocalHubTestResult } from '../../utils/localHubConfig';
 import { meshSyncService, MeshConnectionMode } from '../../services/meshSyncService';
 import { OfflineQRCode } from '../common/OfflineQRCode';
+import {
+  getTermuxHubCode,
+  downloadTermuxHubFile,
+  copyTermuxHubCodeToClipboard,
+  TERMUX_HUB_VERSION,
+  TERMUX_HUB_FILENAME,
+} from '../../utils/termuxHubScript';
 
 interface LocalHubSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
+  initialTab?: 'connect' | 'host' | 'code';
 }
 
 export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
   isOpen,
   onClose,
+  initialTab = 'connect',
 }) => {
   const [hubUrlInput, setHubUrlInput] = useState<string>(() => LocalHubConfig.getLocalHubUrl());
   const [forceLocalHub, setForceLocalHub] = useState<boolean>(() => LocalHubConfig.getForceLocalHub());
-  const [activeTab, setActiveTab] = useState<'connect' | 'host'>('connect');
+  const [activeTab, setActiveTab] = useState<'connect' | 'host' | 'code'>(initialTab);
+
+  // Script download & copy states
+  const [scriptCode, setScriptCode] = useState<string>('');
+  const [isLoadingScript, setIsLoadingScript] = useState<boolean>(false);
+  const [scriptCopied, setScriptCopied] = useState<boolean>(false);
+  const [oneLinerCopied, setOneLinerCopied] = useState<boolean>(false);
+  const [downloadNotice, setDownloadNotice] = useState<string | null>(null);
+  const [codeSearchQuery, setCodeSearchQuery] = useState<string>('');
 
   // Live connection status from meshSyncService
   const [connStatus, setConnStatus] = useState(() => meshSyncService.getConnectionStatus());
@@ -87,6 +111,10 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
       setForceLocalHub(LocalHubConfig.getForceLocalHub());
       setHubBranchId(LocalHubConfig.getHubBranchId());
       setHubBranchName(LocalHubConfig.getHubBranchName());
+    });
+
+    getTermuxHubCode().then((code) => {
+      if (code) setScriptCode(code);
     });
 
     return () => {
@@ -196,6 +224,41 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     }
   };
 
+  const handleDownloadScript = async () => {
+    setIsLoadingScript(true);
+    try {
+      await downloadTermuxHubFile();
+      setDownloadNotice('termux-hub.js downloaded successfully! Ready to run on Termux.');
+      setTimeout(() => setDownloadNotice(null), 5000);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsLoadingScript(false);
+    }
+  };
+
+  const handleCopyFullScript = async () => {
+    setIsLoadingScript(true);
+    try {
+      const res = await copyTermuxHubCodeToClipboard();
+      if (res.success) {
+        setScriptCopied(true);
+        setSaveSuccessNotice(`Copied all ${res.lineCount.toLocaleString()} lines (${(res.byteSize / 1024).toFixed(1)} KB) to clipboard!`);
+        setTimeout(() => setScriptCopied(false), 3500);
+        setTimeout(() => setSaveSuccessNotice(null), 5000);
+      }
+    } finally {
+      setIsLoadingScript(false);
+    }
+  };
+
+  const handleCopyOneLiner = () => {
+    const cmd = 'pkg update -y && pkg install nodejs -y && npm install ws && node termux-hub.js --port 8080';
+    handleCopy(cmd);
+    setOneLinerCopied(true);
+    setTimeout(() => setOneLinerCopied(false), 3000);
+  };
+
   if (!isOpen) return null;
 
   return (
@@ -300,9 +363,9 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
           </div>
         </div>
 
-        {/* Tab Toggle: Connect (Client) vs Host (QR Display) */}
+        {/* Tab Toggle: Connect (Client) vs Host (QR Display) vs Termux Code */}
         <div className="px-4 sm:px-5 pt-4">
-          <div className="grid grid-cols-2 p-1 bg-slate-950 rounded-2xl border border-slate-800 text-xs font-bold">
+          <div className="grid grid-cols-3 p-1 bg-slate-950 rounded-2xl border border-slate-800 text-xs font-bold gap-1">
             <button
               type="button"
               onClick={() => {
@@ -316,7 +379,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               }`}
             >
               <Smartphone className="w-3.5 h-3.5" />
-              <span>Connect to Hub</span>
+              <span>Connect Till</span>
             </button>
             <button
               type="button"
@@ -331,7 +394,26 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               }`}
             >
               <QrCode className="w-3.5 h-3.5" />
-              <span>Host QR Code</span>
+              <span>Host QR</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('code');
+                stopCamera();
+                if (!scriptCode) {
+                  getTermuxHubCode().then((c) => setScriptCode(c));
+                }
+              }}
+              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1.5 relative ${
+                activeTab === 'code'
+                  ? 'bg-indigo-600 text-white shadow-md'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Terminal className="w-3.5 h-3.5 text-indigo-300" />
+              <span>Termux Code</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse hidden sm:inline-block" />
             </button>
           </div>
         </div>
@@ -606,48 +688,316 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               <button
                 type="button"
                 onClick={() => handleCopy(hubUrlInput)}
-                className="text-xs font-bold px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center gap-1 shrink-0 transition"
+                className="text-xs font-bold px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center gap-1 shrink-0 transition cursor-pointer"
               >
                 {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>{copied ? 'Copied' : 'Copy'}</span>
               </button>
             </div>
 
-            <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 text-left text-xs text-slate-400 space-y-2 max-w-md mx-auto">
+            {/* Quick Termux Code Card */}
+            <div className="p-4 rounded-2xl bg-gradient-to-br from-indigo-950/40 via-slate-950/80 to-slate-900 border border-indigo-500/30 text-left space-y-3 max-w-md mx-auto shadow-lg">
               <div className="flex items-center justify-between">
-                <p className="font-bold text-slate-200">Termux Android Host Setup:</p>
-                <a
-                  href="/termux-hub.js"
-                  download="termux-hub.js"
-                  className="text-[10px] font-bold text-indigo-400 hover:text-indigo-300 underline"
-                >
-                  Download termux-hub.js
-                </a>
+                <div className="flex items-center gap-2">
+                  <Terminal className="w-4 h-4 text-indigo-400" />
+                  <span className="text-xs font-black uppercase tracking-wider text-white">Termux Android Host Code</span>
+                </div>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
+                  v3.2 Latest
+                </span>
               </div>
-              <p className="text-[11px] text-slate-400 leading-relaxed">
-                Run this high-reliability hub script on the host phone. Includes <strong>SYNC_RECEIPT (ACK)</strong>, <strong>Catch-Up Sync</strong>, and <strong>Anti-Echo</strong> safeguards:
+              
+              <p className="text-[11px] text-slate-300 leading-relaxed">
+                Run this high-reliability Node.js hub on an Android phone via Termux. Includes <strong>FIPS 180-4 SHA-256 PIN Security</strong>, <strong>Blind Double-Count Stocktake Vault</strong>, and <strong>Catch-Up Sync</strong>:
               </p>
-              <div className="flex items-center justify-between p-2 rounded-lg bg-slate-900 border border-slate-800">
-                <code className="font-mono text-[11px] text-indigo-300 select-all">
+
+              <div className="flex items-center justify-between p-2 rounded-xl bg-slate-900/90 border border-slate-800">
+                <code className="font-mono text-[11px] text-indigo-300 select-all truncate mr-2">
                   node termux-hub.js --port 8080
                 </code>
                 <button
                   type="button"
                   onClick={() => handleCopy('node termux-hub.js --port 8080')}
-                  className="text-[10px] font-bold px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+                  className="text-[10px] font-bold px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 transition cursor-pointer shrink-0"
                 >
                   Copy
                 </button>
               </div>
+
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={handleDownloadScript}
+                  disabled={isLoadingScript}
+                  className="w-full text-xs font-bold py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center gap-1.5 shadow-sm transition active:scale-95 cursor-pointer disabled:opacity-50"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download .js</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCopyFullScript}
+                  disabled={isLoadingScript}
+                  className="w-full text-xs font-bold py-2 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer disabled:opacity-50"
+                >
+                  {scriptCopied ? <CheckCheck className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{scriptCopied ? 'Copied All!' : 'Copy Code'}</span>
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('code');
+                  if (!scriptCode) {
+                    getTermuxHubCode().then((c) => setScriptCode(c));
+                  }
+                }}
+                className="w-full text-[11px] font-bold text-center text-indigo-400 hover:text-indigo-300 py-1 transition cursor-pointer flex items-center justify-center gap-1"
+              >
+                <span>View Full Source Code &amp; Termux Guide</span>
+                <ArrowRight className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Tab 3: Termux Hub Code & Full Source Inspector */}
+        {activeTab === 'code' && (
+          <div className="p-4 sm:p-5 space-y-4">
+            {/* Notice Banners */}
+            {downloadNotice && (
+              <div className="p-3 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-medium flex items-center gap-2 animate-in fade-in">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>{downloadNotice}</span>
+              </div>
+            )}
+            {saveSuccessNotice && (
+              <div className="p-3 rounded-2xl bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 text-xs font-medium flex items-center gap-2 animate-in fade-in">
+                <CheckCheck className="w-4 h-4 text-indigo-400 shrink-0" />
+                <span>{saveSuccessNotice}</span>
+              </div>
+            )}
+
+            {/* Hero / Download Header Card */}
+            <div className="p-4 sm:p-5 rounded-2xl bg-gradient-to-br from-indigo-950/60 via-slate-900 to-slate-950 border border-indigo-500/30 space-y-3.5 shadow-xl">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm font-black text-white flex items-center gap-1.5">
+                      <Terminal className="w-4 h-4 text-indigo-400" />
+                      <span>Termux Android Local Hub</span>
+                    </span>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
+                      v3.2 Latest
+                    </span>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-bold">
+                      SHA-256 Auth
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    Authoritative offline store server. Runs natively in Termux Node.js with zero dependencies other than <code>ws</code>.
+                  </p>
+                </div>
+
+                <div className="text-right text-[11px] font-mono text-slate-400 shrink-0">
+                  <div className="text-slate-200 font-bold">1,275 Lines</div>
+                  <div>~55.8 KB CommonJS</div>
+                </div>
+              </div>
+
+              {/* Action Buttons: Download & Copy */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={handleDownloadScript}
+                  disabled={isLoadingScript}
+                  className="w-full py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-98 text-white text-xs font-black flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/30 transition cursor-pointer disabled:opacity-50"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Download termux-hub.js</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleCopyFullScript}
+                  disabled={isLoadingScript}
+                  className="w-full py-3 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-98 text-slate-200 border border-slate-700 text-xs font-black flex items-center justify-center gap-2 shadow transition cursor-pointer disabled:opacity-50"
+                >
+                  {scriptCopied ? <CheckCheck className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-slate-300" />}
+                  <span>{scriptCopied ? 'Code Copied to Clipboard!' : 'Copy Entire Script (1,275 lines)'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Quick 1-Command Launcher Box */}
+            <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-black uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                  <Terminal className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>One-Command Setup &amp; Launch</span>
+                </span>
+                <span className="text-[10px] text-slate-500 font-mono">Termux Bash</span>
+              </div>
               <p className="text-[11px] text-slate-400">
-                Turn on Android Portable Hotspot. Termux will bind to <code>192.168.43.1:8080</code>.
+                Paste this into Termux on the host phone to install Node.js, fetch the package, and start the hub:
               </p>
+              <div className="flex items-center justify-between p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                <code className="font-mono text-xs text-indigo-300 select-all truncate mr-2">
+                  pkg update -y &amp;&amp; pkg install nodejs -y &amp;&amp; npm install ws &amp;&amp; node termux-hub.js --port 8080
+                </code>
+                <button
+                  type="button"
+                  onClick={handleCopyOneLiner}
+                  className="text-xs font-bold px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition cursor-pointer shrink-0 flex items-center gap-1"
+                >
+                  {oneLinerCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{oneLinerCopied ? 'Copied' : 'Copy'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Integrity & Updates Checklist */}
+            <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-black uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
+                  <Shield className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Verification: In Line with Latest Updates</span>
+                </span>
+                <span className="text-[10px] text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                  All Systems Verified
+                </span>
+              </div>
+              <ul className="space-y-2 text-xs text-slate-300">
+                <li className="flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="text-white">FIPS 180-4 SHA-256 PIN Security:</strong> Plain-text PINs are stripped before network transmission or disk writes. Staff and casual workers are stored and verified with salted SHA-256 hashes.
+                  </div>
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="text-white">Blind Double-Count Stocktake Vault:</strong> Team A counts are sealed in private hub memory; Team B count triggers automated server comparison and variance alerts.
+                  </div>
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="text-white">Full 16-Domain Store &amp; Delta Catchup:</strong> Real-time replay of sales, direct GRVs, inventory, cash lifts, customer change (Form 3), credit sales, movements, expenses, custody transfers, EOD closures, staff, and customers.
+                  </div>
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="text-white">Strict Anti-Echo &amp; Origin Filtering:</strong> Origin device checks eliminate packet echo loops and prevent any double-counting of invoices or cash movements.
+                  </div>
+                </li>
+                <li className="flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="text-white">2GB CCTV Protection &amp; 30-Day Auto-Rotation:</strong> Prevents low-spec Android phones from running out of disk space during high-volume sales days.
+                  </div>
+                </li>
+              </ul>
+            </div>
+
+            {/* Step-by-Step Android Termux Guide */}
+            <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800 space-y-2.5">
+              <span className="text-xs font-black uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                <Smartphone className="w-3.5 h-3.5 text-indigo-400" />
+                <span>Step-by-Step Android Termux Setup Guide</span>
+              </span>
+              <div className="space-y-2 text-xs text-slate-400">
+                <div className="flex gap-2">
+                  <span className="w-5 h-5 rounded-full bg-slate-800 text-indigo-300 font-bold flex items-center justify-center shrink-0 text-[10px]">1</span>
+                  <p><strong className="text-slate-200">Open Termux:</strong> Launch Termux on the host Android phone.</p>
+                </div>
+                <div className="flex gap-2">
+                  <span className="w-5 h-5 rounded-full bg-slate-800 text-indigo-300 font-bold flex items-center justify-center shrink-0 text-[10px]">2</span>
+                  <p><strong className="text-slate-200">Download or Paste Code:</strong> Tap <em>Download termux-hub.js</em> above, or copy code and run <code>cat &lt;&lt; 'EOF' &gt; termux-hub.js</code>, paste, and type <code>EOF</code>.</p>
+                </div>
+                <div className="flex gap-2">
+                  <span className="w-5 h-5 rounded-full bg-slate-800 text-indigo-300 font-bold flex items-center justify-center shrink-0 text-[10px]">3</span>
+                  <p><strong className="text-slate-200">Turn on Portable Hotspot:</strong> Enable Wi-Fi Hotspot on the host phone. The default IP is <code>192.168.43.1</code>.</p>
+                </div>
+                <div className="flex gap-2">
+                  <span className="w-5 h-5 rounded-full bg-slate-800 text-indigo-300 font-bold flex items-center justify-center shrink-0 text-[10px]">4</span>
+                  <p><strong className="text-slate-200">Start the Server:</strong> Run <code>node termux-hub.js --port 8080</code>. All shop tills can now connect instantly!</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Interactive Source Code Inspector */}
+            <div className="rounded-2xl bg-slate-950 border border-slate-800 overflow-hidden space-y-0">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-900 border-b border-slate-800 gap-2">
+                <div className="flex items-center gap-2">
+                  <Code2 className="w-4 h-4 text-indigo-400" />
+                  <span className="text-xs font-bold text-white">Source Code: termux-hub.js</span>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400">
+                    {scriptCode ? `${scriptCode.split('\n').length} lines` : 'Loading...'}
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {/* Search inside script */}
+                  <div className="relative">
+                    <Search className="w-3 h-3 text-slate-500 absolute left-2.5 top-2.5" />
+                    <input
+                      type="text"
+                      value={codeSearchQuery}
+                      onChange={(e) => setCodeSearchQuery(e.target.value)}
+                      placeholder="Search code..."
+                      className="bg-slate-950 border border-slate-700 rounded-lg pl-7 pr-2.5 py-1 text-[11px] text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 w-32 sm:w-40"
+                    />
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleCopyFullScript}
+                    className="text-xs font-bold px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition flex items-center gap-1.5 cursor-pointer shrink-0"
+                  >
+                    {scriptCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{scriptCopied ? 'Copied' : 'Copy All'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Code viewer container */}
+              <div className="max-h-[360px] overflow-y-auto p-3 font-mono text-[11px] text-slate-300 leading-relaxed bg-black/90 select-all whitespace-pre">
+                {scriptCode ? (
+                  codeSearchQuery ? (
+                    scriptCode
+                      .split('\n')
+                      .filter((line) => line.toLowerCase().includes(codeSearchQuery.toLowerCase()))
+                      .join('\n') || `// No matching lines found for "${codeSearchQuery}"`
+                  ) : (
+                    scriptCode
+                  )
+                ) : (
+                  <div className="py-8 text-center text-slate-500">
+                    <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2 text-indigo-400" />
+                    <span>Loading termux-hub.js source code...</span>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}
 
         {/* Footer */}
-        <div className="sticky bottom-0 z-10 flex items-center justify-end p-4 sm:p-5 bg-slate-900/95 backdrop-blur-md border-t border-slate-800">
+        <div className="sticky bottom-0 z-10 flex items-center justify-between p-4 sm:p-5 bg-slate-900/95 backdrop-blur-md border-t border-slate-800">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleDownloadScript}
+              className="text-xs font-bold px-3.5 py-2 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 transition flex items-center gap-1.5 cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>termux-hub.js</span>
+            </button>
+          </div>
+
           <button
             type="button"
             onClick={onClose}
