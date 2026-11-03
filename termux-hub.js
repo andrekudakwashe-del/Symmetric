@@ -1,35 +1,37 @@
 #!/usr/bin/env node
 /**
- * Saimetric POS - Standalone High-Reliability Local Hub for Termux Android / Local LAN (v3.2)
+ * Saimetric POS - Standalone High-Reliability Local Hub for Termux Android / Local LAN (v3.3)
  *
  * Designed specifically for Termux Android Hotspot environments (192.168.43.1:8080)
- * and Local Branch LANs. Acts as the local authoritative source of truth for the branch:
+ * and Local Branch LANs. Acts as the local authoritative source of truth for the branch.
  *
- * 1. Immediate SYNC_RECEIPT (ACK) sent back to sender for every sale.
- * 2. Full-Branch Multi-Entity Store:
- *    - Sales Invoices
- *    - Direct Delivery Vouchers (Direct GRVs) & Till Payouts
- *    - Product Catalog Master & Real-Time Stock Levels
- *    - Cash Movements (Opening Floats, Direct Procurements, Adjustments)
- *    - Supervisor Cash Lifts
- *    - Form 2 Daily Cash Logs
- *    - Customer Credit Accounts & Change Vouchers
- *    - Stock Movements (Wastage, Adjustments)
- *    - Petty Cash Expenses & Vault Cash Transfers
- * 3. Blind Double-Count Stocktake Protocol:
- *    - Hub Secret Holding Vault (`hubBlindStore`): Suppresses peer broadcast for Team A count.
- *    - Automated Server-side Line Comparison: Dispatches STOCKTAKE_MATCH_VERIFIED or STOCKTAKE_VARIANCE_ALERT.
- *    - Self-Service Zone Claiming & Locking.
- *    - Peer Dual-Signature Joint Recount Coordination.
- *    - Casual Worker 4-Digit PIN Distribution.
- *    - Universal Stocktake Lockdown Broadcast.
- * 4. 2GB CCTV Safety Threshold & 30-Day Storage Rotation.
- * 5. Strict Branch Isolation & Repurposing (`PING_HUB`, `HANDSHAKE`, `RESET_BRANCH`).
- * 6. CommonJS Native Execution for Termux Android (`require` syntax).
+ * DUAL-SYNC ARCHITECTURE:
+ * 1. Transactional Data (Append-Only - NO Timestamp Rejection):
+ *    - SALE, GRV, CASH_LOG, STOCK_MOVEMENT, CASH_MOVEMENT, CASH_LIFT, EXPENSE, CASH_TRANSFER.
+ *    - Offline devices pushing 5-hour-old invoices are ALWAYS accepted as long as invoice_id is unique.
+ *    - The Void Exception: If Hub has an invoice marked Voided or Refunded and a device sends an
+ *      old Completed version, the Hub rejects the stale status and sends the Voided record back.
+ *
+ * 2. Configuration Data (Strict LWW - Hub Authority Clock):
+ *    - INVENTORY_ITEM, STAFF (passwords/permissions), CUSTOMER (credit limits).
+ *    - Hub stamps accepted records with new Date().toISOString() and Date.now().
+ *    - Stale updates older than Hub's stored record are rejected and Hub sends authoritative record back.
+ *
+ * 3. Delta Catch-Up (No Firehose):
+ *    - In CATCHUP_REQUEST, only sends records where updatedAt >= sinceTime. Never dumps the entire catalog.
+ *
+ * 4. Flush-Before-Pull:
+ *    - DRAIN_COMPLETE_PING / DRAIN_COMPLETE_ACK handshake guarantees all offline invoices are safely
+ *      vaulted on Hub BEFORE delta catch-up is requested.
+ *
+ * 5. Full Security & Operations:
+ *    - Blind Double-Count Stocktake Holding Vault (`hubBlindStore`).
+ *    - CCTV Limits & 30-Day Disk Rotation (2GB hardware safety limit).
+ *    - Strict Branch Isolation & Handshake (`PING_HUB`, `HUB_INFO`, `RESET_BRANCH`, `HANDSHAKE`).
+ *    - CommonJS Native Execution for Termux Android (`require` syntax).
  *
  * Quick Start on Termux:
- *   pkg update && pkg install nodejs
- *   npm install ws
+ *   pkg update -y && pkg install nodejs -y && npm install ws
  *   node termux-hub.js --port 8080
  */
 
@@ -118,8 +120,17 @@ function isMatch(rec, reqComp, reqBranch, isCatalog = false) {
 // Helper: Extract timestamp in milliseconds
 function getTimestamp(rec) {
   if (!rec) return 0;
-  const t = rec.lastUpdated || rec.updatedAt || rec.updated_at || rec.timestamp || rec.createdAt || rec.created_at || rec.date;
-  if (!t) return 0;
+  const t =
+    rec.updatedAt ??
+    rec.hubTimestamp ??
+    rec.lastUpdated ??
+    rec.updated_at ??
+    rec.timestamp ??
+    rec.createdAt ??
+    rec.created_at ??
+    rec.date;
+  if (t === undefined || t === null) return 0;
+  if (typeof t === 'number') return t;
   const tm = new Date(t).getTime();
   return isNaN(tm) ? 0 : tm;
 }
@@ -226,7 +237,7 @@ function saveData() {
 
     const serialized = JSON.stringify(payload, null, 2);
     if (Buffer.byteLength(serialized, 'utf8') > MAX_STORAGE_BYTES) {
-      console.warn(`[Termux Hub] Warning: Hub data exceeds 2GB limit. Trimming oldest logs...`);
+      console.warn(`[Termux Hub] Warning: Hub data exceeds 2GB limit. Trimming oldest records...`);
       salesStore = salesStore.slice(0, 2500);
       directGrvsStore = directGrvsStore.slice(0, 500);
     }
@@ -250,101 +261,89 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
-  if (req.url === '/health' || req.url === '/api/health' || req.url === '/api/status') {
+  if (req.url === '/ping' || req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(
       JSON.stringify({
         status: 'ok',
-        hub: 'Saimetric Termux Local Hub v3.2 (Blind Stocktake & Full-Store Sync)',
-        port: PORT,
+        hub: 'Termux-Local-Hub-Saimetric',
+        version: '3.3.0',
         branchId: hubBranchId,
         branchName: hubBranchName,
-        clientsCount: wss ? wss.clients.size : 0,
-        totalSalesStored: salesStore.length,
-        totalDirectGrvsStored: directGrvsStore.length,
-        totalInventoryItems: inventoryStore.length,
-        totalCasualWorkers: casualWorkersStore.length,
-        totalZonesAssigned: zoneAssignmentsStore.length,
-        packetsProcessed: packetCounter,
-        uptimeSec: Math.round(process.uptime()),
+        tenantId: hubTenantId,
+        salesCount: salesStore.length,
+        directGrvsCount: directGrvsStore.length,
+        inventoryCount: inventoryStore.length,
+        staffCount: salespeopleStore.length,
+        customerCount: customersStore.length,
+        uptime: process.uptime(),
       })
     );
   }
 
-  // Direct download route for the hub script itself
-  if (req.url === '/termux-hub.js' || req.url === '/download/termux-hub.js') {
-    try {
-      const filePath = path.join(__dirname, 'termux-hub.js');
-      if (fs.existsSync(filePath)) {
-        res.writeHead(200, {
-          'Content-Type': 'application/javascript; charset=utf-8',
-          'Content-Disposition': 'attachment; filename="termux-hub.js"',
-        });
-        return res.end(fs.readFileSync(filePath, 'utf8'));
-      }
-    } catch (e) {
-      // ignore error
-    }
-  }
-
-  // Quick installer bash script
-  if (req.url === '/setup.sh' || req.url === '/install.sh') {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  if (req.url === '/hub-info') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(
-      `#!/bin/bash\n# Saimetric Local Hub One-Liner Setup\npkg update -y && pkg install nodejs -y && npm install ws\nnode termux-hub.js --port ${PORT}\n`
+      JSON.stringify({
+        type: 'HUB_INFO',
+        action: 'HUB_INFO',
+        branch_id: hubBranchId,
+        branch_name: hubBranchName,
+        tenant_id: hubTenantId,
+        hub_id: `HUB-${hubBranchId}`,
+        version: '3.3.0',
+        totalRecords: salesStore.length + directGrvsStore.length,
+        casualWorkersCount: casualWorkersStore.length,
+        timestamp: Date.now(),
+      })
     );
   }
 
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end(
-    `Saimetric Termux Local Hub v3.2 Running on Port ${PORT}\nBranch: ${hubBranchId} (${hubBranchName})\nConnected Clients: ${wss ? wss.clients.size : 0}\nTotal Sales: ${salesStore.length}\nDirect GRVs: ${directGrvsStore.length}\nInventory Items: ${inventoryStore.length}\nCasual Workers: ${casualWorkersStore.length}\nPackets Processed: ${packetCounter}\n`
-  );
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
+// WebSocket Server
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
-  const clientIp = req.socket.remoteAddress || 'unknown';
-  console.log(`[Termux Hub] Client connected from ${clientIp}. Total active clients: ${wss.clients.size}`);
+  const remoteIp = req.socket.remoteAddress;
+  console.log(`[Termux Hub] 🟢 POS Terminal connected from ${remoteIp}`);
 
-  ws.on('message', (msg) => {
+  // Send immediate greeting with branch identity
+  try {
+    const greeting = {
+      type: 'HUB_GREETING',
+      action: 'HUB_INFO',
+      hub_id: `HUB-${hubBranchId}`,
+      branch_id: hubBranchId,
+      branch_name: hubBranchName,
+      tenant_id: hubTenantId,
+      version: '3.3.0',
+      totalSales: salesStore.length,
+      totalInventory: inventoryStore.length,
+      message: `Connected to Saimetric Local Hub (${hubBranchName})`,
+      timestamp: Date.now(),
+    };
+    ws.send(JSON.stringify(greeting));
+  } catch (e) {}
+
+  ws.on('message', (message) => {
     try {
-      const dataStr = msg.toString();
-      const packet = JSON.parse(dataStr);
-      if (!packet || typeof packet !== 'object') return;
-
-      packetCounter++;
-
-      // Deduplicate by packet ID to prevent loop echo
-      const pktId = packet.packet_id || packet.id || packet.clientRequestId;
-      if (pktId) {
-        if (seenPacketIds.has(pktId)) {
-          return; // Drop duplicate packet immediately
-        }
-        seenPacketIds.add(pktId);
-        if (seenPacketIds.size > 10000) {
-          const first = seenPacketIds.values().next().value;
-          seenPacketIds.delete(first);
-        }
-      }
-
-      const pType = (packet.type || packet.action || '').toUpperCase();
-      const entityType = (packet.entityType || '').toLowerCase();
-      const sheetName = packet.sheetName || '';
-      const payload = packet.payload || packet.item || packet.sale || packet.grv || packet.lift || packet.movement || packet.data;
-
-      // Drop ACK packets immediately so they NEVER circulate, echo, or ping-pong in the mesh
-      const isReceipt =
-        pType === 'SYNC_RECEIPT' ||
-        pType === 'CLOUD_SYNC_ACK' ||
-        pType === 'ANTI-DOUBLE-POST ACK' ||
-        pType === 'ACK' ||
-        pType === 'SALE_ACK' ||
-        pType === 'RECEIPT' ||
-        pType === 'STOCKTAKE_ACK_SUBMIT';
-      if (isReceipt) {
+      const dataStr = message.toString();
+      let packet;
+      try {
+        packet = JSON.parse(dataStr);
+      } catch (err) {
         return;
       }
+
+      if (!packet || typeof packet !== 'object') return;
+
+      const pType = (packet.type || packet.action || '').toUpperCase();
+      const payload = packet.payload || packet.data || packet.item;
+      const sheetName = packet.sheetName || packet.sheet;
+      const entityType = packet.entityType || packet.entity;
 
       // =====================================================================
       // 0. PRE-AUTH LOBBY & HUB IDENTITY HANDSHAKE
@@ -357,7 +356,7 @@ wss.on('connection', (ws, req) => {
           branch_name: hubBranchName,
           tenant_id: hubTenantId,
           hub_id: `HUB-${hubBranchId}`,
-          version: '3.2.0',
+          version: '3.3.0',
           totalRecords: salesStore.length + directGrvsStore.length,
           casualWorkersCount: casualWorkersStore.length,
           timestamp: Date.now(),
@@ -389,44 +388,35 @@ wss.on('connection', (ws, req) => {
         cashTransfersStore = [];
         casualWorkersStore = [];
         zoneAssignmentsStore = [];
+        branchLockdownsStore = {};
         salespeopleStore = [];
         customersStore = [];
-        branchLockdownsStore = {};
-        seenPacketIds.clear();
-        Object.keys(hubBlindStore).forEach((k) => delete hubBlindStore[k]);
+        businessDayClosuresStore = [];
+        electronicSettlementsStore = [];
 
-        const newBranchId = packet.new_branch_id || packet.branch_id || 'UNASSIGNED';
-        const newBranchName = packet.new_branch_name || packet.branch_name || 'Unassigned Hub';
-        hubBranchId = newBranchId;
-        hubBranchName = newBranchName;
-
+        hubBranchId = packet.new_branch_id || 'UNASSIGNED';
+        hubBranchName = packet.new_branch_name || 'Unassigned Hub';
         saveData();
 
         const resetAck = {
           type: 'RESET_CONFIRMED',
           action: 'RESET_CONFIRMED',
-          status: 'WIPED',
+          hub_id: `HUB-${hubBranchId}`,
           branch_id: hubBranchId,
           branch_name: hubBranchName,
-          message: 'Local Hub has been wiped clean and is ready for re-assignment.',
+          message: 'Local Hub has been reset and branch unassigned.',
           timestamp: Date.now(),
         };
+
         try {
           ws.send(JSON.stringify(resetAck));
         } catch (e) {}
 
-        const wipeBroadcast = {
-          type: 'HUB_INFO',
-          action: 'HUB_INFO',
-          branch_id: 'UNASSIGNED',
-          branch_name: 'Unassigned Hub',
-          status: 'UNASSIGNED',
-          timestamp: Date.now(),
-        };
+        // Broadcast to all clients so they drop connections or re-handshake
         wss.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
             try {
-              client.send(JSON.stringify(wipeBroadcast));
+              client.send(JSON.stringify(resetAck));
             } catch (e) {}
           }
         });
@@ -455,7 +445,7 @@ wss.on('connection', (ws, req) => {
             branch_name: hubBranchName,
             tenant_id: hubTenantId,
             hub_id: `HUB-${hubBranchId}`,
-            version: '3.2.0',
+            version: '3.3.0',
             totalRecords: salesStore.length + directGrvsStore.length,
             casualWorkersCount: casualWorkersStore.length,
             timestamp: Date.now(),
@@ -470,31 +460,45 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
+      // 0.25 FLUSH-BEFORE-PULL: DRAIN COMPLETE PING & ACK
+      // =====================================================================
+      if (pType === 'DRAIN_COMPLETE_PING') {
+        scheduleSave();
+        const drainAck = {
+          type: 'DRAIN_COMPLETE_ACK',
+          action: 'DRAIN_COMPLETE_ACK',
+          deviceId: packet.deviceId,
+          branchId: packet.branchId,
+          hubTimestamp: Date.now(),
+          timestamp: Date.now(),
+        };
+        try {
+          ws.send(JSON.stringify(drainAck));
+          console.log(`[Termux Hub] 🔄 Received DRAIN_COMPLETE_PING from device [${packet.deviceId}]. Offline queue flushed. Responded with DRAIN_COMPLETE_ACK.`);
+        } catch (e) {}
+        return;
+      }
+
+      // =====================================================================
       // 0.3 CASUAL WORKERS PIN SYNC OVER LOCAL HUB
       // =====================================================================
       if (pType === 'CASUAL_WORKERS_SYNC') {
         const incoming = packet.casualWorkers || payload || packet.casuals;
         if (Array.isArray(incoming)) {
-          // Merge casual workers by pin_hash or ID, never store plain pin
           incoming.forEach((cw) => {
             if (!cw) return;
-            const sanitizedCw = { ...cw };
-            delete sanitizedCw.pin; // Ensure raw PIN is never stored
-            const idx = casualWorkersStore.findIndex((c) =>
-              (c.pin_hash && sanitizedCw.pin_hash && c.pin_hash === sanitizedCw.pin_hash) ||
-              (c.id && sanitizedCw.id && c.id === sanitizedCw.id)
-            );
-            if (idx >= 0) {
-              casualWorkersStore[idx] = { ...casualWorkersStore[idx], ...sanitizedCw };
+            const cleanCw = { ...cw };
+            delete cleanCw.pin; // Never persist raw pin
+            const exIdx = casualWorkersStore.findIndex((c) => (cw.id && c.id === cw.id) || (cw.pin_hash && c.pin_hash === cw.pin_hash));
+            if (exIdx >= 0) {
+              casualWorkersStore[exIdx] = { ...casualWorkersStore[exIdx], ...cleanCw };
             } else {
-              casualWorkersStore.push(sanitizedCw);
+              casualWorkersStore.push(cleanCw);
             }
           });
           scheduleSave();
-          console.log(`[Termux Hub] Synced ${incoming.length} casual worker(s) securely (PINs hashed). Active casuals: ${casualWorkersStore.length}`);
         }
 
-        // Sanitize packet before broadcasting to ensure no plain PINs are forwarded
         const sanitizedPacket = { ...packet };
         if (Array.isArray(sanitizedPacket.casualWorkers)) {
           sanitizedPacket.casualWorkers = sanitizedPacket.casualWorkers.map((c) => {
@@ -504,8 +508,6 @@ wss.on('connection', (ws, req) => {
           });
         }
         const forwardStr = JSON.stringify(sanitizedPacket);
-
-        // Broadcast to all other peers so every tablet receives the updated casual credentials
         wss.clients.forEach((client) => {
           if (client !== ws && client.readyState === WebSocket.OPEN) {
             try {
@@ -532,7 +534,6 @@ wss.on('connection', (ws, req) => {
         scheduleSave();
         console.log(`[Termux Hub] 🔒 Branch Lockdown status changed: ${brId} isLocked=${packet.isLocked}`);
 
-        // Forward to all clients immediately to freeze/unfreeze POS screens
         wss.clients.forEach((client) => {
           if (client.readyState === WebSocket.OPEN) {
             try {
@@ -604,13 +605,11 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // Initialize secret holding vault for this session & zone
         if (!hubBlindStore[sessionId]) hubBlindStore[sessionId] = {};
         if (!hubBlindStore[sessionId][zoneId]) {
           hubBlindStore[sessionId][zoneId] = { A: null, B: null, recount: null };
         }
 
-        // Store count in private vault
         hubBlindStore[sessionId][zoneId][slot] = {
           deviceId,
           staffId,
@@ -623,7 +622,6 @@ wss.on('connection', (ws, req) => {
           `[Termux Hub] 🤫 Vaulted Team ${slot} count for Zone ${zoneId} (${(lines || []).length} items) by ${staffName}. Broadcast suppressed to protect blind audit.`
         );
 
-        // 1. Send point-to-point confirmation back ONLY to the submitting device
         try {
           const ackPacket = {
             type: 'STOCKTAKE_ACK_SUBMIT',
@@ -637,7 +635,6 @@ wss.on('connection', (ws, req) => {
           ws.send(JSON.stringify(ackPacket));
         } catch (e) {}
 
-        // 2. Broadcast generic status update (NO LINE COUNTS OR VALUES) so dashboard grid updates
         const statusPacket = {
           type: 'STOCKTAKE_ZONE_STATUS_UPDATE',
           sessionId,
@@ -662,7 +659,6 @@ wss.on('connection', (ws, req) => {
           }
         });
 
-        // 3. Automated Server-Side Comparison if BOTH Team A and Team B have submitted
         const subA = hubBlindStore[sessionId][zoneId].A;
         const subB = hubBlindStore[sessionId][zoneId].B;
 
@@ -717,7 +713,6 @@ wss.on('connection', (ws, req) => {
           });
 
           if (discrepancies.length === 0) {
-            // 100% MATCH! Auto-verify zone
             console.log(`[Termux Hub] ✅ Zone ${zoneId} DOUBLE-COUNT MATCHED 100% (${verifiedCounts.length} lines verified).`);
             const verifiedPacket = {
               type: 'STOCKTAKE_MATCH_VERIFIED',
@@ -736,7 +731,6 @@ wss.on('connection', (ws, req) => {
               }
             });
           } else {
-            // DISCREPANCIES DETECTED -> Trigger Joint Recount Sheet
             console.log(`[Termux Hub] ⚠️ Zone ${zoneId} DISCREPANCY: ${discrepancies.length} variance item(s). Alerting Teams A & B.`);
             const variancePacket = {
               type: 'STOCKTAKE_VARIANCE_ALERT',
@@ -758,53 +752,11 @@ wss.on('connection', (ws, req) => {
             });
           }
         }
-
-        // Drop packet from standard peer broadcast (Blind Vault Protection)
         return;
       }
 
       // =====================================================================
-      // 0.7 PEER DUAL-SIGNATURE JOINT RECOUNT COORDINATION
-      // =====================================================================
-      if (pType === 'STOCKTAKE_JOINT_PROPOSAL') {
-        // Forward proposal to other peers so Team A & Team B can see agreed numbers live
-        wss.clients.forEach((client) => {
-          if (client !== ws && client.readyState === WebSocket.OPEN) {
-            try {
-              client.send(dataStr);
-            } catch (e) {}
-          }
-        });
-        return;
-      }
-
-      if (pType === 'STOCKTAKE_JOINT_FINALIZED') {
-        const { sessionId, zoneId, resolvedLines, signedByA, signedByB, resolvedByName } = packet;
-        console.log(`[Termux Hub] 🤝 Zone ${zoneId} Joint Recount finalized with Dual-Signatures (A=${signedByA}, B=${signedByB}).`);
-
-        const verifiedPacket = {
-          type: 'STOCKTAKE_MATCH_VERIFIED',
-          sessionId,
-          zoneId,
-          status: 'VERIFIED',
-          source: 'JOINT_RECOUNT',
-          verifiedCounts: resolvedLines || [],
-          resolvedByName,
-          timestamp: Date.now(),
-        };
-
-        wss.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            try {
-              client.send(JSON.stringify(verifiedPacket));
-            } catch (e) {}
-          }
-        });
-        return;
-      }
-
-      // =====================================================================
-      // 1. SALES INVOICES & LIVE INVENTORY DEDUCTIONS
+      // 1. TRANSACTIONAL DATA: SALES INVOICES (APPEND-ONLY, NO TIMESTAMP REJECTION)
       // =====================================================================
       const isSale = pType === 'SALE' || pType === 'SALE_RECORD' || pType === 'SALE_CREATED' || !!packet.sale;
       const saleObj = packet.sale || (packet.data && (packet.data.items || packet.data.total !== undefined ? packet.data : packet.data.sale)) || packet.payload;
@@ -817,13 +769,42 @@ wss.on('connection', (ws, req) => {
 
       if (isSale && saleId) {
         const isLegacyInv = String(saleId).toUpperCase().startsWith('INV-');
-
         const existingIdx = salesStore.findIndex((s) => s.id === saleId);
         const prevSale = existingIdx >= 0 ? salesStore[existingIdx] : null;
+
         if (existingIdx >= 0) {
+          // THE VOID EXCEPTION:
+          // If the Hub already has the invoice marked as Voided or Refunded, and the device sends
+          // an old version marked as Completed, the Hub MUST reject the old version and send the
+          // authoritative Voided/Refunded status back to the device.
+          const isExistingVoidOrRefund = prevSale.status === 'Voided' || prevSale.status === 'Refunded';
+          const isIncomingCompleted = saleObj.status !== 'Voided' && saleObj.status !== 'Refunded';
+
+          if (isExistingVoidOrRefund && isIncomingCompleted) {
+            console.log(`[Termux Hub] 🛡️ Rejected stale Completed status for Sale #${saleId}. Hub is authoritative: invoice is ${prevSale.status}.`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'SALE_UPDATE',
+                action: 'SALE_UPDATE',
+                invoice_id: saleId,
+                sale: prevSale,
+                payload: prevSale,
+                status: prevSale.status,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+
+          // Otherwise update existing record (e.g. cashier issuing refund/void or exchange)
           salesStore[existingIdx] = { ...salesStore[existingIdx], ...(saleObj || packet) };
         } else {
+          // APPEND-ONLY: Offline invoices arriving with old timestamps (e.g. offline for 5 hours)
+          // MUST BE ACCEPTED as long as the invoice_id is unique! NO TIMESTAMP REJECTION!
           salesStore.unshift(saleObj || packet);
+          console.log(`[Termux Hub] 📥 Accepted Offline/Online Sale #${saleId} (Append-Only)`);
         }
 
         // Inventory movements: New Sale, Refund, Void, and Item Exchange
@@ -840,11 +821,9 @@ wss.on('connection', (ws, req) => {
               let newUnits = curUnits;
 
               if (isNewRefund || isNewVoid) {
-                // Restock inventory for customer refund or invoice void
                 newUnits = Number((curUnits + qty).toFixed(3));
                 console.log(`[Termux Hub] Restocked ${qty}x ${it.name || it.id} from ${isNewRefund ? 'Refund' : 'Void'} on #${saleId}`);
               } else if (!prevSale && saleObj.status !== 'Refunded' && saleObj.status !== 'Voided') {
-                // Initial sale outflow
                 newUnits = Number((curUnits - qty).toFixed(3));
               }
 
@@ -902,7 +881,7 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 2. DIRECT GOODS RECEIVED VOUCHERS (GRVs) & STOCK INWARD UPDATES
+      // 2. TRANSACTIONAL DATA: DIRECT GOODS RECEIVED VOUCHERS (GRVs) (APPEND-ONLY)
       // =====================================================================
       const isGrv =
         pType === 'DIRECT_GRV' ||
@@ -919,10 +898,29 @@ wss.on('connection', (ws, req) => {
           const gId = grv.grvNumber || grv.id;
           const exIdx = directGrvsStore.findIndex((g) => g.grvNumber === gId || g.id === gId);
           const prevGrv = exIdx >= 0 ? directGrvsStore[exIdx] : null;
+
           if (exIdx >= 0) {
+            // Protect approved/rejected status from stale pending packets
+            const isFinalized = prevGrv.status === 'APPROVED' || prevGrv.status === 'REJECTED';
+            if (isFinalized && grv.status === 'PENDING') {
+              console.log(`[Termux Hub] 🛡️ Retained final status ${prevGrv.status} for GRV #${gId}.`);
+              try {
+                ws.send(JSON.stringify({
+                  type: 'DIRECT_GRV',
+                  action: 'GRV_RECORD',
+                  grvNumber: gId,
+                  directGrv: prevGrv,
+                  payload: prevGrv,
+                  timestamp: Date.now(),
+                }));
+              } catch (e) {}
+              return;
+            }
             directGrvsStore[exIdx] = { ...directGrvsStore[exIdx], ...grv };
           } else {
+            // Append-Only: Accept unique offline GRVs regardless of timestamp!
             directGrvsStore.unshift(grv);
+            console.log(`[Termux Hub] 📥 Accepted Offline/Online Direct GRV #${gId} (Append-Only)`);
           }
 
           const isNewlyRejected = grv.status === 'REJECTED' && prevGrv && prevGrv.status !== 'REJECTED';
@@ -969,6 +967,8 @@ wss.on('connection', (ws, req) => {
                   sellPriceUnit: item.sellingPrice || 0,
                   company_id: grv.companyId || grv.company_id || packet.companyId || 'COMP-001',
                   branch_id: grv.branchId || grv.branch_id || packet.branchId || 'BR-MAIN',
+                  updatedAt: new Date().toISOString(),
+                  hubTimestamp: Date.now(),
                   lastUpdated: new Date().toISOString(),
                 });
               }
@@ -976,11 +976,24 @@ wss.on('connection', (ws, req) => {
           }
 
           scheduleSave();
+
+          // Send point-to-point confirmation back to sender
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'GRV',
+              id: gId,
+              updatedAt: Date.now(),
+              hubTimestamp: Date.now(),
+              lastUpdated: grv.lastUpdated || new Date().toISOString(),
+            }));
+          } catch (e) {}
         }
       }
 
       // =====================================================================
-      // 3. PRODUCT CATALOG & MASTER INVENTORY UPDATES
+      // 3. CONFIGURATION DATA: PRODUCT CATALOG & INVENTORY (STRICT LWW)
       // =====================================================================
       const isInventory =
         pType === 'INVENTORY' ||
@@ -994,6 +1007,9 @@ wss.on('connection', (ws, req) => {
 
       if (isInventory) {
         const items = Array.isArray(payload) ? payload : [payload || packet.item];
+        const hubNow = Date.now();
+        const hubIso = new Date().toISOString();
+
         for (const it of items) {
           if (!it) continue;
           const cleanId = (it.itemId || it.id || '').trim();
@@ -1001,33 +1017,86 @@ wss.on('connection', (ws, req) => {
           const exIdx = inventoryStore.findIndex(
             (i) => i.itemId === cleanId || i.id === cleanId || (it.sku && i.sku === it.sku)
           );
+          const incomingTime = getTimestamp(it);
+
+          // STRICT LWW:
+          // If incoming update is OLDER than the Hub's existing record, reject it
+          // and send the authoritative Hub data back to the device!
+          if (exIdx >= 0) {
+            const existing = inventoryStore[exIdx];
+            const existingTime = getTimestamp(existing);
+            if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
+              console.log(
+                `[Termux Hub] 🛡️ LWW Reject: Stale inventory update for ${cleanId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative data back.`
+              );
+              try {
+                ws.send(JSON.stringify({
+                  type: 'INVENTORY_ITEM',
+                  action: 'INVENTORY_UPDATE',
+                  itemId: cleanId,
+                  item: existing,
+                  payload: existing,
+                  origin_device_id: 'LOCAL_HUB',
+                  origin_device_name: 'Termux Local Hub',
+                  timestamp: Date.now(),
+                }));
+              } catch (e) {}
+              continue;
+            }
+          }
+
+          // Hub is the Clock: Stamp record with Hub time
           const stamped = {
             ...it,
             itemId: cleanId,
             id: cleanId,
-            lastUpdated: it.lastUpdated || new Date().toISOString(),
-            updatedAt: it.lastUpdated || new Date().toISOString(),
+            updatedAt: hubIso,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
           };
+
           if (exIdx >= 0) {
-            const existingTime = getTimestamp(inventoryStore[exIdx]);
-            const incomingTime = getTimestamp(stamped);
-            if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
-              console.log(
-                `[Termux Hub] ⏭️ Ignored older update for ${cleanId} (existing: ${new Date(existingTime).toISOString()} > incoming: ${new Date(incomingTime).toISOString()})`
-              );
-              continue;
-            }
             inventoryStore[exIdx] = { ...inventoryStore[exIdx], ...stamped };
           } else {
             inventoryStore.push(stamped);
           }
-          console.log(`[Termux Hub] 📦 Updated Inventory Item: ${cleanId} "${it.itemName || ''}" Price: $${it.sellPriceUnit ?? it.price ?? ''}`);
+          console.log(`[Termux Hub] 📦 Updated Inventory Item: ${cleanId} "${it.itemName || ''}" Price: $${it.sellPriceUnit ?? it.price ?? ''} stamped at ${hubIso}`);
+
+          // Send SYNC_ACK to sender
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'INVENTORY',
+              id: cleanId,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
+
+          // Broadcast authoritative price update to all other connected peer devices
+          const broadcastPkt = JSON.stringify({
+            type: 'INVENTORY_ITEM',
+            action: 'INVENTORY_UPDATE',
+            itemId: cleanId,
+            item: stamped,
+            payload: stamped,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: hubNow,
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try { client.send(broadcastPkt); } catch (e) {}
+            }
+          });
         }
         scheduleSave();
       }
 
       // =====================================================================
-      // 4. CASH MOVEMENTS, FLOATS & DRAWER TRANSFERS
+      // 4. TRANSACTIONAL DATA: CASH MOVEMENTS, FLOATS & TRANSFERS (APPEND-ONLY)
       // =====================================================================
       const isCashMovement =
         pType === 'CASH_MOVEMENT' ||
@@ -1044,13 +1113,14 @@ wss.on('connection', (ws, req) => {
             cashMovementsStore[exIdx] = { ...cashMovementsStore[exIdx], ...move };
           } else {
             cashMovementsStore.unshift(move);
+            console.log(`[Termux Hub] 📥 Accepted Cash Movement [${move.id}] (Append-Only)`);
           }
           scheduleSave();
         }
       }
 
       // =====================================================================
-      // 5. SUPERVISOR CASH LIFTS (TILL PICK-UPS)
+      // 5. TRANSACTIONAL DATA: SUPERVISOR CASH LIFTS (APPEND-ONLY)
       // =====================================================================
       const isCashLift =
         pType === 'CASH_LIFT' ||
@@ -1069,13 +1139,14 @@ wss.on('connection', (ws, req) => {
             cashLiftsStore[exIdx] = { ...cashLiftsStore[exIdx], ...lift };
           } else {
             cashLiftsStore.unshift(lift);
+            console.log(`[Termux Hub] 📥 Accepted Cash Lift [${liftId}] (Append-Only)`);
           }
           scheduleSave();
         }
       }
 
       // =====================================================================
-      // 6. FORM 2 DAILY CASH LOGS
+      // 6. TRANSACTIONAL DATA: FORM 2 DAILY CASH LOGS (APPEND-ONLY)
       // =====================================================================
       const isCashLog =
         pType === 'CASH_LOG' ||
@@ -1092,13 +1163,14 @@ wss.on('connection', (ws, req) => {
             cashLogsStore[exIdx] = { ...cashLogsStore[exIdx], ...log };
           } else {
             cashLogsStore.unshift(log);
+            console.log(`[Termux Hub] 📥 Accepted Cash Log [${log.line || logId}] (Append-Only)`);
           }
           scheduleSave();
         }
       }
 
       // =====================================================================
-      // 7. CUSTOMER CHANGE & CREDIT SALES
+      // 7. TRANSACTIONAL DATA: CUSTOMER CHANGE & CREDIT SALES (APPEND-ONLY)
       // =====================================================================
       if ((pType === 'CUSTOMER_CHANGE' || sheetName === 'CustomerChange') && payload && payload.changeId) {
         const exIdx = customerChangesStore.findIndex((c) => c.changeId === payload.changeId || c.id === payload.changeId);
@@ -1106,6 +1178,7 @@ wss.on('connection', (ws, req) => {
           customerChangesStore[exIdx] = { ...customerChangesStore[exIdx], ...payload };
         } else {
           customerChangesStore.unshift(payload);
+          console.log(`[Termux Hub] 📥 Accepted Customer Change [${payload.changeId}] (Append-Only)`);
         }
         scheduleSave();
       }
@@ -1116,12 +1189,13 @@ wss.on('connection', (ws, req) => {
           creditSalesStore[exIdx] = { ...creditSalesStore[exIdx], ...payload };
         } else {
           creditSalesStore.unshift(payload);
+          console.log(`[Termux Hub] 📥 Accepted Credit Sale [${payload.creditId}] (Append-Only)`);
         }
         scheduleSave();
       }
 
       // =====================================================================
-      // 8. STOCK MOVEMENTS (WASTAGE / BREAKAGE / ADJUSTMENTS)
+      // 8. TRANSACTIONAL DATA: STOCK MOVEMENTS (APPEND-ONLY, NO TIMESTAMP REJECTION)
       // =====================================================================
       if ((pType === 'STOCK_MOVEMENT' || sheetName === 'StockMovement') && payload && (payload.id || payload.movementId)) {
         const mId = payload.id || payload.movementId;
@@ -1130,12 +1204,13 @@ wss.on('connection', (ws, req) => {
           stockMovementsStore[exIdx] = { ...stockMovementsStore[exIdx], ...payload };
         } else {
           stockMovementsStore.unshift(payload);
+          console.log(`[Termux Hub] 📥 Accepted Stock Movement [${mId}] (Append-Only)`);
         }
         scheduleSave();
       }
 
       // =====================================================================
-      // 9. EXPENSES & CASH TRANSFERS
+      // 9. TRANSACTIONAL DATA: EXPENSES & CASH TRANSFERS (APPEND-ONLY)
       // =====================================================================
       if ((pType === 'EXPENSE' || sheetName === 'Expenses') && payload && payload.id) {
         const exIdx = expensesStore.findIndex((e) => e.id === payload.id);
@@ -1143,6 +1218,7 @@ wss.on('connection', (ws, req) => {
           expensesStore[exIdx] = { ...expensesStore[exIdx], ...payload };
         } else {
           expensesStore.unshift(payload);
+          console.log(`[Termux Hub] 📥 Accepted Expense [${payload.id}] (Append-Only)`);
         }
         scheduleSave();
       }
@@ -1153,12 +1229,13 @@ wss.on('connection', (ws, req) => {
           cashTransfersStore[exIdx] = { ...cashTransfersStore[exIdx], ...payload };
         } else {
           cashTransfersStore.unshift(payload);
+          console.log(`[Termux Hub] 📥 Accepted Cash Transfer [${payload.id}] (Append-Only)`);
         }
         scheduleSave();
       }
 
       // =====================================================================
-      // 9.1 STAFF (TILL OPERATORS) & CUSTOMER PROFILES SYNC
+      // 9.1 CONFIGURATION DATA: STAFF & PASSWORDS (STRICT LWW - HUB AUTHORITY)
       // =====================================================================
       const rawStaffObj = packet.staff || (payload && (payload.pin_hash || payload.pin || payload.role) ? payload : null);
       let staffObj = null;
@@ -1168,32 +1245,155 @@ wss.on('connection', (ws, req) => {
       }
       const isStaff = pType === 'STAFF' || pType === 'STAFF_SYNC' || pType === 'STAFF_RECORD' || sheetName === 'Salespeople' || sheetName === 'users' || !!staffObj;
       if (isStaff && staffObj && staffObj.id) {
+        const hubNow = Date.now();
+        const hubIso = new Date().toISOString();
         const sIdx = salespeopleStore.findIndex((s) => s.id === staffObj.id);
+        const incomingTime = getTimestamp(staffObj);
+        let accepted = true;
+
         if (sIdx >= 0) {
-          salespeopleStore[sIdx] = { ...salespeopleStore[sIdx], ...staffObj };
-        } else {
-          salespeopleStore.unshift(staffObj);
+          const existing = salespeopleStore[sIdx];
+          const existingTime = getTimestamp(existing);
+          if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
+            console.log(`[Termux Hub] 🛡️ LWW Reject: Stale staff update for ${staffObj.name} (${staffObj.id}). Sending authoritative Hub record back.`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'STAFF',
+                action: 'STAFF_SYNC',
+                staff: existing,
+                payload: existing,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            accepted = false;
+          }
         }
-        scheduleSave();
-        console.log(`[Termux Hub] Synced Staff account securely: ${staffObj.name} (${staffObj.id} - ${staffObj.role})`);
+
+        if (accepted) {
+          staffObj.updatedAt = hubIso;
+          staffObj.hubTimestamp = hubNow;
+          staffObj.lastUpdated = hubIso;
+
+          if (sIdx >= 0) {
+            salespeopleStore[sIdx] = { ...salespeopleStore[sIdx], ...staffObj };
+          } else {
+            salespeopleStore.unshift(staffObj);
+          }
+          scheduleSave();
+          console.log(`[Termux Hub] 👤 Synced Staff account securely: ${staffObj.name} (${staffObj.id} - ${staffObj.role}) stamped at ${hubIso}`);
+
+          // Send SYNC_ACK
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'STAFF',
+              id: staffObj.id,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
+
+          // Broadcast updated staff to other peers
+          const staffBroadcastStr = JSON.stringify({
+            type: 'STAFF',
+            action: 'STAFF_SYNC',
+            staff: staffObj,
+            payload: staffObj,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: hubNow,
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try { client.send(staffBroadcastStr); } catch (e) {}
+            }
+          });
+        }
       }
 
+      // =====================================================================
+      // 9.2 CONFIGURATION DATA: CUSTOMERS & CREDIT LIMITS (STRICT LWW)
+      // =====================================================================
       const custObj = packet.customer || (payload && (payload.customerId || payload.creditLimit !== undefined) ? payload : null);
       const isCust = pType === 'CUSTOMER' || pType === 'CUSTOMER_SYNC' || pType === 'CUSTOMER_RECORD' || sheetName === 'Customers' || !!custObj;
       if (isCust && custObj && (custObj.customerId || custObj.id)) {
         const cId = custObj.customerId || custObj.id;
+        const hubNow = Date.now();
+        const hubIso = new Date().toISOString();
         const cIdx = customersStore.findIndex((c) => (c.customerId || c.id) === cId);
+        const incomingTime = getTimestamp(custObj);
+        let accepted = true;
+
         if (cIdx >= 0) {
-          customersStore[cIdx] = { ...customersStore[cIdx], ...custObj };
-        } else {
-          customersStore.unshift(custObj);
+          const existing = customersStore[cIdx];
+          const existingTime = getTimestamp(existing);
+          if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
+            console.log(`[Termux Hub] 🛡️ LWW Reject: Stale customer update for ${cId}. Sending authoritative Hub record back.`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'CUSTOMER',
+                action: 'CUSTOMER_SYNC',
+                customer: existing,
+                payload: existing,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            accepted = false;
+          }
         }
-        scheduleSave();
-        console.log(`[Termux Hub] Synced Customer account: ${custObj.name} (${cId})`);
+
+        if (accepted) {
+          custObj.updatedAt = hubIso;
+          custObj.hubTimestamp = hubNow;
+          custObj.lastUpdated = hubIso;
+
+          if (cIdx >= 0) {
+            customersStore[cIdx] = { ...customersStore[cIdx], ...custObj };
+          } else {
+            customersStore.unshift(custObj);
+          }
+          scheduleSave();
+          console.log(`[Termux Hub] 👥 Synced Customer account: ${custObj.name} (${cId}) stamped at ${hubIso}`);
+
+          // Send SYNC_ACK
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'CUSTOMER',
+              id: cId,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
+
+          // Broadcast updated customer to other peers
+          const custBroadcastStr = JSON.stringify({
+            type: 'CUSTOMER',
+            action: 'CUSTOMER_SYNC',
+            customer: custObj,
+            payload: custObj,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: hubNow,
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try { client.send(custBroadcastStr); } catch (e) {}
+            }
+          });
+        }
       }
 
       // =====================================================================
-      // 9.2 END OF DAY (EOD) & BUSINESS DAY CLOSURES
+      // 9.3 END OF DAY (EOD) & BUSINESS DAY CLOSURES
       // =====================================================================
       const isEod =
         pType === 'END_OF_DAY_COMPLETED' ||
@@ -1217,7 +1417,7 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 10. RECONNECTION CATCH-UP RESPONSE (REPLAY ALL MISSED DELTAS)
+      // 10. DELTA CATCH-UP RESPONSE (NO FIREHOSE - ONLY updatedAt >= sinceTime)
       // =====================================================================
       const isCatchupReq = pType === 'catchup_request' || pType === 'CATCHUP_REQUEST';
       if (isCatchupReq) {
@@ -1227,19 +1427,21 @@ wss.on('connection', (ws, req) => {
         const reqComp = (packet.companyId || packet.company_id || 'COMP-001').trim().toUpperCase();
         const reqBranch = (packet.branchId || packet.branchCode || 'BR-MAIN').trim().toUpperCase();
 
-        const missedSales = salesStore.filter((s) => isMatch(s, reqComp, reqBranch) && getTimestamp(s) >= sinceTime);
-        const missedDirectGrvs = directGrvsStore.filter((g) => isMatch(g, reqComp, reqBranch) && getTimestamp(g) >= sinceTime);
-        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch, true) && (getTimestamp(i) >= sinceTime || getTimestamp(i) === 0 || !sinceTime || packet.isForced));
-        const missedCashLogs = cashLogsStore.filter((c) => isMatch(c, reqComp, reqBranch) && getTimestamp(c) >= sinceTime);
-        const missedCashLifts = cashLiftsStore.filter((l) => isMatch(l, reqComp, reqBranch) && getTimestamp(l) >= sinceTime);
-        const missedCashMovements = cashMovementsStore.filter((m) => isMatch(m, reqComp, reqBranch) && getTimestamp(m) >= sinceTime);
-        const missedCustomerChanges = customerChangesStore.filter((ch) => isMatch(ch, reqComp, reqBranch) && getTimestamp(ch) >= sinceTime);
-        const missedCreditSales = creditSalesStore.filter((cs) => isMatch(cs, reqComp, reqBranch) && getTimestamp(cs) >= sinceTime);
-        const missedStockMovements = stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && getTimestamp(sm) >= sinceTime);
-        const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && getTimestamp(ex) >= sinceTime);
-        const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, reqBranch) && getTimestamp(tr) >= sinceTime);
-        const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, reqBranch));
-        const missedCustomers = customersStore.filter((c) => isMatch(c, reqComp, reqBranch));
+        // NO FIREHOSE: Send ONLY records where getTimestamp(item) >= sinceTime!
+        // Do not dump the entire 501-item catalog unless explicitly forced!
+        const missedSales = salesStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced));
+        const missedDirectGrvs = directGrvsStore.filter((g) => isMatch(g, reqComp, reqBranch) && (getTimestamp(g) >= sinceTime || packet.isForced));
+        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch, true) && (getTimestamp(i) >= sinceTime || packet.isForced));
+        const missedCashLogs = cashLogsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced));
+        const missedCashLifts = cashLiftsStore.filter((l) => isMatch(l, reqComp, reqBranch) && (getTimestamp(l) >= sinceTime || packet.isForced));
+        const missedCashMovements = cashMovementsStore.filter((m) => isMatch(m, reqComp, reqBranch) && (getTimestamp(m) >= sinceTime || packet.isForced));
+        const missedCustomerChanges = customerChangesStore.filter((ch) => isMatch(ch, reqComp, reqBranch) && (getTimestamp(ch) >= sinceTime || packet.isForced));
+        const missedCreditSales = creditSalesStore.filter((cs) => isMatch(cs, reqComp, reqBranch) && (getTimestamp(cs) >= sinceTime || packet.isForced));
+        const missedStockMovements = stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && (getTimestamp(sm) >= sinceTime || packet.isForced));
+        const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && (getTimestamp(ex) >= sinceTime || packet.isForced));
+        const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, reqBranch) && (getTimestamp(tr) >= sinceTime || packet.isForced));
+        const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced));
+        const missedCustomers = customersStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced));
 
         const catchupResponse = {
           type: 'catchup_response',
@@ -1275,7 +1477,10 @@ wss.on('connection', (ws, req) => {
         try {
           ws.send(JSON.stringify(catchupResponse));
           console.log(
-            `[Termux Hub] Replayed catch-up to ${reqDeviceId}: ${missedSales.length} sales, ${missedDirectGrvs.length} GRVs, ${missedInventory.length} items, ${missedSalespeople.length} staff, ${missedCustomers.length} customers, ${casualWorkersStore.length} casuals.`
+            `[Termux Hub] 📤 Dispatched Delta Catch-up to ${reqDeviceId}: ` +
+            `${missedSales.length} sales, ${missedDirectGrvs.length} GRVs, ` +
+            `${missedInventory.length} inventory deltas (No Firehose), ` +
+            `${missedCashLogs.length} cash logs, ${missedSalespeople.length} staff, ${missedCustomers.length} customers.`
           );
         } catch (e) {
           console.warn('[Termux Hub] Failed to send catchup response:', e.message);
@@ -1284,40 +1489,37 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 11. STRICT SENDER EXCLUSION BROADCAST (ANTI-ECHO)
+      // 11. GENERAL BROADCAST TO OTHER PEERS (DO NOT ECHO BACK TO SENDER)
       // =====================================================================
-      // Forward real sales and non-blind mutations to all other connected devices
-      let forwardedCount = 0;
       wss.clients.forEach((client) => {
         if (client !== ws && client.readyState === WebSocket.OPEN) {
           try {
             client.send(dataStr);
-            forwardedCount++;
           } catch (e) {}
         }
       });
-      if (forwardedCount > 0 && isSale) {
-        console.log(`[Termux Hub] Forwarded Sale #${saleId} to ${forwardedCount} peer till(s).`);
-      }
-    } catch (parseErr) {
-      console.warn('[Termux Hub] Error processing message:', parseErr.message);
+    } catch (err) {
+      console.error('[Termux Hub] Error processing message:', err.message);
     }
   });
 
   ws.on('close', () => {
-    console.log(`[Termux Hub] Client disconnected. Total active clients: ${wss.clients.size}`);
+    console.log(`[Termux Hub] 🔴 POS Terminal disconnected`);
   });
 
   ws.on('error', (err) => {
-    console.warn('[Termux Hub] Socket error:', err.message);
+    console.warn('[Termux Hub] Client WebSocket error:', err.message);
   });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`====================================================`);
-  console.log(` Saimetric Local Hub v3.2 running on ws://0.0.0.0:${PORT}`);
-  console.log(` Portable Hotspot Default IP: ws://192.168.43.1:${PORT}`);
-  console.log(` CommonJS Native Syntax: READY FOR TERMUX NODE.JS`);
-  console.log(` Blind Double-Count Stocktake Vault: ACTIVATED`);
-  console.log(`====================================================`);
+  console.log(`================================================================`);
+  console.log(`🚀 Saimetric POS - Standalone Local Hub (v3.3.0)`);
+  console.log(`📡 WebSocket URL:  ws://0.0.0.0:${PORT}`);
+  console.log(`🌐 HTTP Status:    http://0.0.0.0:${PORT}/health`);
+  console.log(`🏢 Branch ID:      ${hubBranchId} ("${hubBranchName}")`);
+  console.log(`🏢 Tenant ID:      ${hubTenantId}`);
+  console.log(`💾 Data File:      ${DATA_FILE}`);
+  console.log(`⚡ Dual-Sync:      Transactional (Append-Only) & Config (Strict LWW)`);
+  console.log(`================================================================`);
 });

@@ -22,6 +22,13 @@ import {
   onInventoryCreated,
   ingestMeshInventoryItem,
   getRawStoredInventoryItems,
+  getRawStoredSalespeople,
+  getRawStoredCustomers,
+  getAllSalespeople,
+  getCustomers,
+  setStored,
+  STORAGE_KEYS,
+  extractRecordTimestamp,
   pullTenantInventory,
   getCurrentCompanyId,
   getCurrentCompany,
@@ -238,6 +245,8 @@ class MeshSyncManager {
   private hubProcessingTimer: number | null = null;
   private hasPerformedInitialCatchup: boolean = false;
   private lastInitialCatchupTime: number = 0;
+  private isAwaitingDrainAck: boolean = false;
+  private drainAckFallbackTimer: any = null;
 
   // Hub Branch Identity & Roaming Owner Safeguard
   private hubBranchId: string | null = LocalHubConfig.getHubBranchId();
@@ -1199,6 +1208,25 @@ class MeshSyncManager {
             return;
           }
 
+          // 0.2 Flush-Before-Pull Intercept: DRAIN_COMPLETE_ACK
+          if (pType === 'DRAIN_COMPLETE_ACK') {
+            if (this.drainAckFallbackTimer) {
+              clearTimeout(this.drainAckFallbackTimer);
+              this.drainAckFallbackTimer = null;
+            }
+            if (this.isAwaitingDrainAck) {
+              this.isAwaitingDrainAck = false;
+              this.triggerDeltaCatchUpAfterFlush();
+            }
+            return;
+          }
+
+          // 0.3 Server Authority Stamping Intercept: SYNC_ACK
+          if (pType === 'SYNC_ACK') {
+            this.handleSyncAck(parsed);
+            return;
+          }
+
           // Termux WebSocket server stores and auto-replays historical packets on connect.
           // Queue in memory and process in small batches of 10 with 50ms pauses so the UI never freezes.
           if (Array.isArray(parsed)) {
@@ -1356,6 +1384,23 @@ class MeshSyncManager {
 
     // Fast deduplication by packet ID or entity ID
     const pType = packet.type || packet.action || '';
+
+    if (pType === 'DRAIN_COMPLETE_ACK') {
+      if (this.drainAckFallbackTimer) {
+        clearTimeout(this.drainAckFallbackTimer);
+        this.drainAckFallbackTimer = null;
+      }
+      if (this.isAwaitingDrainAck) {
+        this.isAwaitingDrainAck = false;
+        this.triggerDeltaCatchUpAfterFlush();
+      }
+      return;
+    }
+
+    if (pType === 'SYNC_ACK') {
+      this.handleSyncAck(packet);
+      return;
+    }
     const isInvPacket =
       pType === 'inventory' ||
       pType === 'INVENTORY' ||
@@ -1957,18 +2002,8 @@ class MeshSyncManager {
       this.isCloudOnlyMode = false;
       LocalHubConfig.setCloudOnlyMode(false);
 
-      // Now drain only branch-scoped items
+      // Flush-Before-Pull: Drain local changes to Hub first, wait for ACK, then request Delta Catch-Up
       this.drainQueueToLocalHub();
-
-      // Catch-up sync strictly scoped to this branch
-      setTimeout(() => {
-        if (this.isLocalHubConnected && !this.isCloudOnlyMode) {
-          this.hasPerformedInitialCatchup = true;
-          this.lastInitialCatchupTime = Date.now();
-          const lastSync = this.getLastMeshSyncTimestamp();
-          this.requestCatchUpSync(branchId, lastSync, false, true).catch(() => {});
-        }
-      }, 500);
     }
 
     this.evaluateConnectionPriority();
@@ -2271,8 +2306,175 @@ class MeshSyncManager {
       } catch (invErr) {
         console.warn('[MeshSync] Error reconciling inventory to hub:', invErr);
       }
+
+      // 5. Reconcile recently modified staff with Local Hub
+      try {
+        const allStaff = getAllSalespeople();
+        const recentThreshold = Date.now() - 48 * 3600 * 1000;
+        const recentStaff = allStaff.filter((s) => {
+          const t = extractRecordTimestamp(s);
+          return t >= recentThreshold;
+        });
+        for (const staff of recentStaff) {
+          const staffPacket = {
+            type: 'STAFF',
+            action: 'STAFF_SYNC',
+            packet_id: `RECON-STAFF-${staff.id}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: 'ALL',
+            target_branch_id: 'ALL',
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            staff,
+            payload: staff,
+            timestamp: extractRecordTimestamp(staff) || Date.now(),
+            ttl: 5,
+          };
+          try {
+            wsTarget.send(JSON.stringify(staffPacket));
+          } catch (_) {}
+        }
+      } catch (staffErr) {
+        console.warn('[MeshSync] Error reconciling staff to hub:', staffErr);
+      }
+
+      // 6. Reconcile recently modified customers with Local Hub
+      try {
+        const allCust = getCustomers();
+        const recentThreshold = Date.now() - 48 * 3600 * 1000;
+        const recentCust = allCust.filter((c) => {
+          const t = extractRecordTimestamp(c);
+          return t >= recentThreshold;
+        });
+        for (const customer of recentCust) {
+          const cId = customer.customerId || (customer as any).id;
+          const custPacket = {
+            type: 'CUSTOMER',
+            action: 'CUSTOMER_SYNC',
+            packet_id: `RECON-CUST-${cId}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: 'ALL',
+            target_branch_id: 'ALL',
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            customer,
+            payload: customer,
+            timestamp: extractRecordTimestamp(customer) || Date.now(),
+            ttl: 5,
+          };
+          try {
+            wsTarget.send(JSON.stringify(custPacket));
+          } catch (_) {}
+        }
+      } catch (custErr) {
+        console.warn('[MeshSync] Error reconciling customers to hub:', custErr);
+      }
+
+      // 7. Flush-Before-Pull: Signal DRAIN_COMPLETE_PING to Local Hub
+      this.isAwaitingDrainAck = true;
+      const pingPacket = {
+        type: 'DRAIN_COMPLETE_PING',
+        action: 'DRAIN_COMPLETE_PING',
+        deviceId: this.config.deviceId,
+        deviceName: this.config.deviceName,
+        branchId: currentHubBranch,
+        companyId: this.config.companyId,
+        timestamp: Date.now(),
+      };
+      try {
+        wsTarget.send(JSON.stringify(pingPacket));
+        this.addLog(
+          'BROADCAST',
+          `Flush-Before-Pull: Offline changes flushed. Awaiting Hub ACK before requesting delta catch-up...`,
+          this.config.deviceName
+        );
+      } catch (_) {}
+
+      // Fallback timer: If Hub does not send DRAIN_COMPLETE_ACK within 2000ms, proceed with catch-up
+      if (this.drainAckFallbackTimer) clearTimeout(this.drainAckFallbackTimer);
+      this.drainAckFallbackTimer = setTimeout(() => {
+        if (this.isAwaitingDrainAck) {
+          this.isAwaitingDrainAck = false;
+          this.triggerDeltaCatchUpAfterFlush();
+        }
+      }, 2000);
     } catch (e) {
       console.warn('[MeshSync] Error draining queue to local hub:', e);
+    }
+  }
+
+  private triggerDeltaCatchUpAfterFlush() {
+    if (this.isLocalHubConnected && !this.isCloudOnlyMode) {
+      this.hasPerformedInitialCatchup = true;
+      this.lastInitialCatchupTime = Date.now();
+      const branchId = this.hubBranchId || 'ALL';
+      const lastSync = this.getLastMeshSyncTimestamp();
+      this.addLog(
+        'BROADCAST',
+        `Flush-Before-Pull Complete: Local Hub acknowledged flush. Requesting Delta Catch-Up for [${branchId}]...`,
+        this.config.deviceName
+      );
+      this.requestCatchUpSync(branchId, lastSync, false, true).catch(() => {});
+    }
+  }
+
+  private handleSyncAck(packet: any) {
+    if (!packet || !packet.id) return;
+    const entityType = String(packet.entityType || '').toUpperCase();
+    const stampedAt = Number(packet.updatedAt) || Date.now();
+    const lastUpdated = packet.lastUpdated || new Date(stampedAt).toISOString();
+
+    if (entityType === 'INVENTORY') {
+      const all = getRawStoredInventoryItems();
+      const cleanId = String(packet.id).trim().toUpperCase();
+      const idx = all.findIndex((i) => (i.itemId || (i as any).id || '').trim().toUpperCase() === cleanId);
+      if (idx >= 0) {
+        all[idx] = {
+          ...all[idx],
+          updatedAt: stampedAt,
+          hubTimestamp: stampedAt,
+          lastUpdated,
+        };
+        setStored(STORAGE_KEYS.INVENTORY_ITEMS, all);
+      }
+    } else if (entityType === 'STAFF') {
+      const all = getRawStoredSalespeople();
+      const idx = all.findIndex((s) => s.id === packet.id);
+      if (idx >= 0) {
+        all[idx] = {
+          ...all[idx],
+          updatedAt: stampedAt,
+          hubTimestamp: stampedAt,
+          lastUpdated,
+        };
+        setStored(STORAGE_KEYS.SALESPEOPLE, all);
+      }
+    } else if (entityType === 'CUSTOMER') {
+      const all = getRawStoredCustomers();
+      const idx = all.findIndex((c) => (c.customerId || (c as any).id) === packet.id);
+      if (idx >= 0) {
+        all[idx] = {
+          ...all[idx],
+          updatedAt: stampedAt,
+          hubTimestamp: stampedAt,
+          lastUpdated,
+        };
+        setStored(STORAGE_KEYS.CUSTOMERS, all);
+      }
+    } else if (entityType === 'GRV') {
+      const all = getDirectGrvs();
+      const idx = all.findIndex((g) => g.grvNumber === packet.id || g.id === packet.id);
+      if (idx >= 0) {
+        all[idx] = {
+          ...all[idx],
+          updatedAt: stampedAt,
+          hubTimestamp: stampedAt,
+          lastUpdated,
+        };
+        setStored(STORAGE_KEYS.DIRECT_GRVS, all);
+      }
     }
   }
 
@@ -4335,6 +4537,9 @@ class MeshSyncManager {
     if (!staff || !staff.id) return;
     if (staff.fromMesh) return;
 
+    staff.updatedAt = staff.updatedAt || Date.now();
+    staff.lastUpdated = staff.lastUpdated || new Date().toISOString();
+
     const packetId = `STAFF-PKT-${staff.id}-${Date.now()}`;
     this.seenPacketIds.add(packetId);
 
@@ -4353,7 +4558,7 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       staff: sanitizedStaff,
       payload: sanitizedStaff,
-      timestamp: Date.now(),
+      timestamp: staff.updatedAt,
       ttl: 5,
     };
 
@@ -4369,6 +4574,9 @@ class MeshSyncManager {
     if (this.isIngestingFromHub) return;
     if (!customer) return;
     if (customer.fromMesh) return;
+
+    customer.updatedAt = customer.updatedAt || Date.now();
+    customer.lastUpdated = customer.lastUpdated || new Date().toISOString();
 
     const custId = customer.customerId || customer.id || 'C_NEW';
     const packetId = `CUST-PKT-${custId}-${Date.now()}`;
@@ -4386,7 +4594,7 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       customer,
       payload: customer,
-      timestamp: Date.now(),
+      timestamp: customer.updatedAt,
       ttl: 5,
     };
 
@@ -4431,6 +4639,10 @@ class MeshSyncManager {
     if (this.isIngestingFromHub) return;
     if (!item) return;
     if ((item as any).fromMesh) return;
+
+    item.updatedAt = (item as any).updatedAt || Date.now();
+    item.lastUpdated = item.lastUpdated || new Date().toISOString();
+
     const cleanId = (item.itemId || item.id || '').trim();
     const packetId = `ITEM-UPDATE-${cleanId || Date.now()}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
@@ -4466,7 +4678,7 @@ class MeshSyncManager {
       branchOverrides: item.branchOverrides,
       item,
       payload: item,
-      timestamp: Date.now(),
+      timestamp: item.updatedAt,
       ttl: 5,
     };
 

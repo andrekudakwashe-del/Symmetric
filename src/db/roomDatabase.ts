@@ -1867,6 +1867,7 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
     pinHash = hashPin('123456', salt);
   }
 
+  const now = Date.now();
   const merged: Salesperson = {
     ...(existingPerson || {}),
     ...person,
@@ -1876,6 +1877,8 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
     pin_salt: salt,
     active: person.active || existingPerson?.active || 'Y',
     permissions: resolvedPermissions,
+    updatedAt: (person as any).updatedAt || now,
+    lastUpdated: (person as any).lastUpdated || new Date(now).toISOString(),
   };
   // Permanently strip plain-text PIN
   delete (merged as any).pin;
@@ -1921,11 +1924,14 @@ export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Sa
     pinHash = hashPin('123456', salt);
   }
 
+  const now = Date.now();
   const updatedPerson: Salesperson = {
     ...current,
     ...updates,
     pin_hash: pinHash,
     pin_salt: salt,
+    updatedAt: now,
+    lastUpdated: new Date(now).toISOString(),
   };
   delete (updatedPerson as any).pin;
 
@@ -2196,6 +2202,7 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
   const isCreditAllowed = customerData.creditAllowed === true;
   const creditLimit = isCreditAllowed ? Math.max(0, Number(customerData.creditLimit) || 0) : 0;
 
+  const now = Date.now();
   const created: Customer = {
     customerId: nextId,
     name: customerData.name.trim(),
@@ -2215,6 +2222,8 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
     creditGroupId: customerData.creditGroupId,
     creditGroupName: customerData.creditGroupName,
     isCustomLimit: customerData.isCustomLimit,
+    updatedAt: (customerData as any).updatedAt || now,
+    lastUpdated: (customerData as any).lastUpdated || new Date(now).toISOString(),
   };
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.CUSTOMERS, updated);
@@ -5130,13 +5139,16 @@ export const updateCustomerCreditTerms = (
   const newCreditAllowed = updates.creditAllowed !== undefined ? updates.creditAllowed : current.creditAllowed;
   const newCreditLimit = newCreditAllowed ? (updates.creditLimit !== undefined ? updates.creditLimit : current.creditLimit || 0) : 0;
 
+  const now = Date.now();
   const updated: Customer = {
     ...current,
     ...updates,
     creditAllowed: newCreditAllowed,
     creditLimit: newCreditLimit,
     creditApprovedBy: authorizedBy.name,
-    creditApprovalDate: new Date().toISOString(),
+    creditApprovalDate: new Date(now).toISOString(),
+    updatedAt: now,
+    lastUpdated: new Date(now).toISOString(),
   };
   all[idx] = updated;
   setStored(STORAGE_KEYS.CUSTOMERS, all);
@@ -9549,6 +9561,7 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
     stockSingles,
     totalUnits,
     lastUpdated: new Date().toISOString(),
+    updatedAt: Date.now(),
   };
 
   if (index >= 0) {
@@ -9736,6 +9749,33 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
   return normalized;
 };
 
+export const extractRecordTimestamp = (rec: any): number => {
+  if (!rec) return 0;
+  const val =
+    rec.updatedAt ??
+    rec.hubTimestamp ??
+    rec.lastUpdated ??
+    rec.updated_at ??
+    rec.timestamp ??
+    rec.createdAt ??
+    rec.created_at ??
+    rec.date;
+  if (val === undefined || val === null) return 0;
+  if (typeof val === 'number') return val;
+  const tm = new Date(val).getTime();
+  return isNaN(tm) ? 0 : tm;
+};
+
+export const isIncomingRecordNewer = (incoming: any, existing: any): boolean => {
+  if (!existing) return true;
+  if (!incoming) return false;
+  const incomingTime = extractRecordTimestamp(incoming);
+  const existingTime = extractRecordTimestamp(existing);
+  if (!incomingTime && !existingTime) return true;
+  if (!incomingTime && existingTime > 0) return false;
+  return incomingTime >= existingTime;
+};
+
 type InventoryCreationListener = (item: InventoryItem) => void;
 const inventoryCreationListeners: Set<InventoryCreationListener> = new Set();
 
@@ -9817,12 +9857,10 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       Math.abs((existing.costPerCase || 0) - costPerCase) > 0.001;
     const nameChanged = (existing.itemName || '').trim() !== (item.itemName || '').trim();
 
-    // Robust Last-Write-Wins (LWW) check:
+    // Strict Last-Write-Wins (LWW) check:
     // If the local existing record is strictly newer than the incoming packet,
     // NEVER overwrite local data with older data from Hub or peers!
-    const existingTime = existing.lastUpdated ? new Date(existing.lastUpdated).getTime() : 0;
-    const incomingTime = item.lastUpdated ? new Date(item.lastUpdated).getTime() : 0;
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
+    if (!isIncomingRecordNewer(item, existing)) {
       // Local record is newer!
       // If local price differs from the older incoming item, notify mesh to re-broadcast newer local item
       // so the Hub and peer devices update to our latest price.
@@ -10146,17 +10184,26 @@ export const ingestMeshStaff = (staff: Salesperson): boolean => {
     hash = hashPin(rawPin, salt);
   }
 
+  const incomingTime = extractRecordTimestamp(staff);
+  const now = Date.now();
   const normalized: Salesperson = {
     ...staff,
     companyId: compId,
     company_id: compId,
     pin_hash: hash,
     pin_salt: salt,
+    updatedAt: incomingTime || now,
+    lastUpdated: staff.lastUpdated || new Date(incomingTime || now).toISOString(),
   };
   delete (normalized as any).pin;
 
   if (index >= 0) {
     const existing = all[index];
+    // Strict Last-Write-Wins (LWW) check:
+    if (!isIncomingRecordNewer(staff, existing)) {
+      console.log(`[ingestMeshStaff] 🛡️ Stale staff update ignored for ${staff.name} (${staff.id}). Existing timestamp is newer.`);
+      return false;
+    }
     if (
       existing.name === normalized.name &&
       existing.role === normalized.role &&
@@ -10174,6 +10221,10 @@ export const ingestMeshStaff = (staff: Salesperson): boolean => {
   }
   setStored(STORAGE_KEYS.SALESPEOPLE, all);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: normalized }));
+  }
   return true;
 };
 
@@ -10288,14 +10339,23 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
 
   const all = getAllDirectGrvs();
   const idx = all.findIndex((g) => g.grvNumber === grv.grvNumber || g.id === grv.id);
+  const incomingTime = extractRecordTimestamp(grv);
+  const now = Date.now();
   const normalized: DirectGrv = {
     ...grv,
     companyId: compId,
     company_id: compId,
     branchId: brId,
     branch_id: brId,
+    updatedAt: incomingTime || now,
+    lastUpdated: (grv as any).lastUpdated || new Date(incomingTime || now).toISOString(),
   };
   if (idx >= 0) {
+    const existing = all[idx];
+    if (!isIncomingRecordNewer(normalized, existing)) {
+      console.log(`[ingestMeshGRV] 🛡️ Stale GRV update ignored for ${grv.grvNumber}. Existing timestamp is newer.`);
+      return false;
+    }
     all[idx] = { ...all[idx], ...normalized };
   } else {
     all.unshift(normalized);
@@ -10329,13 +10389,29 @@ export const ingestMeshCustomer = (customer: any): boolean => {
       (id && ((c as any).id === id || c.customerId === id)) ||
       (customer.name && c.name && c.name.toLowerCase() === customer.name.toLowerCase())
   );
+  const incomingTime = extractRecordTimestamp(customer);
+  const now = Date.now();
+  const normalized = {
+    ...customer,
+    updatedAt: incomingTime || now,
+    lastUpdated: customer.lastUpdated || new Date(incomingTime || now).toISOString(),
+  };
+
   if (idx >= 0) {
-    all[idx] = { ...all[idx], ...customer };
+    const existing = all[idx];
+    if (!isIncomingRecordNewer(customer, existing)) {
+      console.log(`[ingestMeshCustomer] 🛡️ Stale customer update ignored for ${customer.name || id}. Existing timestamp is newer.`);
+      return false;
+    }
+    all[idx] = { ...all[idx], ...normalized };
   } else {
-    all.unshift(customer);
+    all.unshift(normalized);
   }
   setStored(STORAGE_KEYS.CUSTOMERS, all);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
+  }
   return true;
 };
 
@@ -10406,10 +10482,23 @@ export const ingestMeshGoodsReceived = (entry: any): boolean => {
   const all = getAllGoodsReceived();
   const id = entry.id || entry.reference;
   const idx = all.findIndex((g: any) => (g.id || g.reference) === id);
+  const incomingTime = extractRecordTimestamp(entry);
+  const now = Date.now();
+  const normalized = {
+    ...entry,
+    updatedAt: incomingTime || now,
+    lastUpdated: entry.lastUpdated || new Date(incomingTime || now).toISOString(),
+  };
+
   if (idx >= 0) {
-    all[idx] = { ...all[idx], ...entry };
+    const existing = all[idx];
+    if (!isIncomingRecordNewer(entry, existing)) {
+      console.log(`[ingestMeshGoodsReceived] 🛡️ Stale Goods Received update ignored for ${id}. Existing timestamp is newer.`);
+      return false;
+    }
+    all[idx] = { ...all[idx], ...normalized };
   } else {
-    all.unshift(entry);
+    all.unshift(normalized);
   }
   setStored(STORAGE_KEYS.GOODS_RECEIVED, all);
   notifyListeners();
