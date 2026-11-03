@@ -1023,7 +1023,7 @@ export const initRoomDatabase = () => {
         itemChanged = true;
       }
       let br = item.branch_id || item.branchId;
-      if (!br || br === 'ALL') {
+      if (!br || (key !== STORAGE_KEYS.INVENTORY_ITEMS && br === 'ALL')) {
         br = 'BR-MAIN';
         itemChanged = true;
       }
@@ -8422,7 +8422,8 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
   setStored(STORAGE_KEYS.SYNC_QUEUE, boundedQueue);
 
   // Broadcast database mutation across local P2P WiFi mesh (unless originating from mesh)
-  if (!payload.fromMesh) {
+  // CRITICAL: Stop generic mutations for inventory products so dedicated INVENTORY_ITEM packets are used instead
+  if (!payload.fromMesh && sheetName !== 'InventoryMaster' && sheetName !== 'Products') {
     try {
       const activeBr = getCurrentBranch();
       notifyDatabaseMutation({
@@ -9749,7 +9750,8 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
   if (!item || (!item.itemId && !(item as any).id)) return false;
   const currentCompany = getCurrentCompanyId();
   const compId = item.company_id || (item as any).companyId || currentCompany;
-  if (compId && compId !== currentCompany) {
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
+  if (normTenant(compId) !== normTenant(currentCompany)) {
     return false;
   }
 
@@ -9760,7 +9762,7 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
   const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
   const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
   const isDeleted = deletedList.some(
-    (d) => (d.itemId || '').toUpperCase() === cleanId && (d.companyId || '').toUpperCase() === compId.toUpperCase()
+    (d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === normTenant(compId)
   );
   if (isDeleted) {
     return false;
@@ -9771,7 +9773,7 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
   // Find index by exact ID match (only if names also match or one is missing), or by SKU, or by exact item name
   let idx = allItems.findIndex((i) => {
     const iComp = (i.company_id || (i as any).companyId || currentCompany).trim().toUpperCase();
-    if (iComp !== compId.toUpperCase()) return false;
+    if (normTenant(iComp) !== normTenant(compId)) return false;
     const iName = (i.itemName || '').trim().toLowerCase();
 
     if (item.sku && i.sku && i.sku.toUpperCase() === item.sku.toUpperCase()) return true;
@@ -9815,13 +9817,23 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       Math.abs((existing.costPerCase || 0) - costPerCase) > 0.001;
     const nameChanged = (existing.itemName || '').trim() !== (item.itemName || '').trim();
 
-    // Timestamp check: ONLY skip if existing is newer AND neither price nor name changed (protects against clock skew)
-    if (!priceChanged && !nameChanged && existing.lastUpdated && item.lastUpdated) {
-      const existingTime = new Date(existing.lastUpdated).getTime();
-      const incomingTime = new Date(item.lastUpdated).getTime();
-      if (!isNaN(existingTime) && !isNaN(incomingTime) && existingTime > incomingTime) {
-        return false;
+    // Robust Last-Write-Wins (LWW) check:
+    // If the local existing record is strictly newer than the incoming packet,
+    // NEVER overwrite local data with older data from Hub or peers!
+    const existingTime = existing.lastUpdated ? new Date(existing.lastUpdated).getTime() : 0;
+    const incomingTime = item.lastUpdated ? new Date(item.lastUpdated).getTime() : 0;
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
+      // Local record is newer!
+      // If local price differs from the older incoming item, notify mesh to re-broadcast newer local item
+      // so the Hub and peer devices update to our latest price.
+      if (priceChanged || nameChanged) {
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          window.dispatchEvent(
+            new CustomEvent('saimetric_local_inventory_is_newer', { detail: existing })
+          );
+        }
       }
+      return false;
     }
 
     // Synchronize branchOverrides across all branches so stale overrides NEVER shadow new incoming prices!
@@ -9858,7 +9870,7 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       totalUnits,
       branchOverrides: updatedOverrides,
       packagingVariants: mergedPackagingVariants,
-      lastUpdated: new Date().toISOString(),
+      lastUpdated: item.lastUpdated || new Date().toISOString(),
     };
     allItems[idx] = savedItem;
   } else {
@@ -9926,7 +9938,9 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
 
   notifyListeners();
   if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new Event('saimetric_inventory_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: savedItem }));
+    window.dispatchEvent(new Event('saimetric_products_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: savedItem }));
     window.dispatchEvent(new CustomEvent('mesh-inventory-received', { detail: { item: savedItem } }));
   }

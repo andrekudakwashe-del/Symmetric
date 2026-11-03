@@ -118,7 +118,7 @@ function isMatch(rec, reqComp, reqBranch, isCatalog = false) {
 // Helper: Extract timestamp in milliseconds
 function getTimestamp(rec) {
   if (!rec) return 0;
-  const t = rec.timestamp || rec.updated_at || rec.updatedAt || rec.createdAt || rec.created_at || rec.date;
+  const t = rec.lastUpdated || rec.updatedAt || rec.updated_at || rec.timestamp || rec.createdAt || rec.created_at || rec.date;
   if (!t) return 0;
   const tm = new Date(t).getTime();
   return isNaN(tm) ? 0 : tm;
@@ -986,6 +986,7 @@ wss.on('connection', (ws, req) => {
         pType === 'INVENTORY' ||
         pType === 'INVENTORY_RECORD' ||
         pType === 'INVENTORY_ITEM' ||
+        pType === 'INVENTORY_UPDATE' ||
         pType === 'INVENTORY_BATCH' ||
         sheetName === 'InventoryMaster' ||
         sheetName === 'Products' ||
@@ -1000,12 +1001,27 @@ wss.on('connection', (ws, req) => {
           const exIdx = inventoryStore.findIndex(
             (i) => i.itemId === cleanId || i.id === cleanId || (it.sku && i.sku === it.sku)
           );
-          const stamped = { ...it, itemId: cleanId, id: cleanId, updatedAt: it.lastUpdated || new Date().toISOString() };
+          const stamped = {
+            ...it,
+            itemId: cleanId,
+            id: cleanId,
+            lastUpdated: it.lastUpdated || new Date().toISOString(),
+            updatedAt: it.lastUpdated || new Date().toISOString(),
+          };
           if (exIdx >= 0) {
+            const existingTime = getTimestamp(inventoryStore[exIdx]);
+            const incomingTime = getTimestamp(stamped);
+            if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
+              console.log(
+                `[Termux Hub] ⏭️ Ignored older update for ${cleanId} (existing: ${new Date(existingTime).toISOString()} > incoming: ${new Date(incomingTime).toISOString()})`
+              );
+              continue;
+            }
             inventoryStore[exIdx] = { ...inventoryStore[exIdx], ...stamped };
           } else {
             inventoryStore.push(stamped);
           }
+          console.log(`[Termux Hub] 📦 Updated Inventory Item: ${cleanId} "${it.itemName || ''}" Price: $${it.sellPriceUnit ?? it.price ?? ''}`);
         }
         scheduleSave();
       }
@@ -1213,7 +1229,7 @@ wss.on('connection', (ws, req) => {
 
         const missedSales = salesStore.filter((s) => isMatch(s, reqComp, reqBranch) && getTimestamp(s) >= sinceTime);
         const missedDirectGrvs = directGrvsStore.filter((g) => isMatch(g, reqComp, reqBranch) && getTimestamp(g) >= sinceTime);
-        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch, true) && getTimestamp(i) >= sinceTime);
+        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch, true) && (getTimestamp(i) >= sinceTime || getTimestamp(i) === 0 || !sinceTime || packet.isForced));
         const missedCashLogs = cashLogsStore.filter((c) => isMatch(c, reqComp, reqBranch) && getTimestamp(c) >= sinceTime);
         const missedCashLifts = cashLiftsStore.filter((l) => isMatch(l, reqComp, reqBranch) && getTimestamp(l) >= sinceTime);
         const missedCashMovements = cashMovementsStore.filter((m) => isMatch(m, reqComp, reqBranch) && getTimestamp(m) >= sinceTime);
@@ -1259,7 +1275,7 @@ wss.on('connection', (ws, req) => {
         try {
           ws.send(JSON.stringify(catchupResponse));
           console.log(
-            `[Termux Hub] Replayed catch-up to ${reqDeviceId}: ${missedSales.length} sales, ${missedDirectGrvs.length} GRVs, ${missedSalespeople.length} staff, ${missedCustomers.length} customers, ${casualWorkersStore.length} casuals.`
+            `[Termux Hub] Replayed catch-up to ${reqDeviceId}: ${missedSales.length} sales, ${missedDirectGrvs.length} GRVs, ${missedInventory.length} items, ${missedSalespeople.length} staff, ${missedCustomers.length} customers, ${casualWorkersStore.length} casuals.`
           );
         } catch (e) {
           console.warn('[Termux Hub] Failed to send catchup response:', e.message);

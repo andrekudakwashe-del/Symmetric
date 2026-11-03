@@ -21,6 +21,7 @@ import {
   ingestMeshSale,
   onInventoryCreated,
   ingestMeshInventoryItem,
+  getRawStoredInventoryItems,
   pullTenantInventory,
   getCurrentCompanyId,
   getCurrentCompany,
@@ -492,6 +493,30 @@ class MeshSyncManager {
     }, 150);
   }
 
+  private loadPendingLocalHubQueue(): any[] {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const raw = localStorage.getItem('saimetric_pending_local_hub_queue');
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return parsed;
+        }
+      }
+    } catch {}
+    return [];
+  }
+
+  private savePendingLocalHubQueue() {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(
+          'saimetric_pending_local_hub_queue',
+          JSON.stringify(this.pendingLocalHubQueue.slice(-100))
+        );
+      }
+    } catch {}
+  }
+
   private queueOutgoingLocalHubPacket(packet: any) {
     if (!packet) return;
     // Never queue maintenance packets to local hub
@@ -502,10 +527,23 @@ class MeshSyncManager {
       this.pendingLocalHubQueue.shift();
     }
     this.pendingLocalHubQueue.push(packet);
+    this.savePendingLocalHubQueue();
   }
 
   constructor() {
     this.config = this.loadConfig();
+    this.pendingLocalHubQueue = this.loadPendingLocalHubQueue();
+
+    // Listen for local inventory being newer than incoming stale packet from Hub/peer:
+    if (typeof window !== 'undefined') {
+      window.addEventListener('saimetric_local_inventory_is_newer', ((e: CustomEvent) => {
+        if (e && e.detail && !this.isIngestingFromHub) {
+          setTimeout(() => {
+            this.broadcastInventoryItem(e.detail);
+          }, 200);
+        }
+      }) as EventListener);
+    }
 
     // Pre-populate known and broadcasted invoice IDs from local DB for fast O(1) deduplication
     try {
@@ -1317,22 +1355,34 @@ class MeshSyncManager {
     }
 
     // Fast deduplication by packet ID or entity ID
+    const pType = packet.type || packet.action || '';
+    const isInvPacket =
+      pType === 'inventory' ||
+      pType === 'INVENTORY' ||
+      pType === 'INVENTORY_ITEM' ||
+      pType === 'INVENTORY_UPDATE' ||
+      pType === 'INVENTORY_RECORD' ||
+      packet.type === 'INVENTORY_ITEM' ||
+      packet.type === 'INVENTORY_UPDATE' ||
+      packet.action === 'INVENTORY_UPDATE' ||
+      packet.action === 'INVENTORY_RECORD' ||
+      Boolean(packet.item);
+
+    // Fast deduplication by packet ID or entity ID (never deduplicate inventory updates by static itemId)
     const packetId =
       packet.packet_id ||
-      packet.id ||
+      (!isInvPacket && packet.id) ||
       (packet.sale && packet.sale.id) ||
       (packet.cashLog && packet.cashLog.id) ||
       (packet.movement && (packet.movement.movementId || packet.movement.txnId)) ||
       (packet.grv && packet.grv.id) ||
-      (packet.item && (packet.item.itemId || packet.item.id)) ||
-      (packet.payload && (packet.payload.id || packet.payload.itemId || packet.payload.movementId));
+      (!isInvPacket && packet.payload && (packet.payload.id || packet.payload.movementId));
 
     if (packetId) {
       if (this.seenPacketIds.has(packetId)) return;
       this.seenPacketIds.add(packetId);
     }
 
-    const pType = packet.type || packet.action || '';
     const originName = packet.origin_device_name || packet.originDeviceName || packet.deviceName || 'Peer Terminal';
 
     // 1. SALE RECORD: Ingest directly into Room DB and mark as known to avoid any re-broadcast
@@ -1394,9 +1444,9 @@ class MeshSyncManager {
       return;
     }
 
-    // 2. INVENTORY RECORD: Ingest directly into Room DB (do NOT echo back to Hub)
-    if (pType === 'inventory' || pType === 'INVENTORY_RECORD' || packet.item) {
-      const invItem = packet.item || packet.payload;
+    // 2. INVENTORY RECORD / INVENTORY_ITEM / INVENTORY_UPDATE: Ingest directly into Room DB (do NOT echo back to Hub)
+    if (isInvPacket) {
+      const invItem = packet.item || packet.payload || (packet.itemId ? packet : null);
       if (invItem && (invItem.itemId || invItem.id)) {
         const ingested = ingestMeshInventoryItem({
           ...invItem,
@@ -1405,7 +1455,10 @@ class MeshSyncManager {
           fromMesh: true,
         });
         if (ingested) {
+          // Force UI Refresh: Trigger window.dispatchEvent(new Event('saimetric_inventory_updated')) so POS and Inventory screens re-render instantly
+          window.dispatchEvent(new Event('saimetric_inventory_updated'));
           window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: invItem }));
+          window.dispatchEvent(new Event('saimetric_products_updated'));
           window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: invItem }));
           window.dispatchEvent(
             new CustomEvent('mesh-inventory-received', {
@@ -1416,7 +1469,7 @@ class MeshSyncManager {
           this.notifyPeerSubscribers();
           this.addLog(
             'EPIDEMIC_HOP',
-            `Received Product "${invItem.itemName || invItem.name}" from ${originName} via Local Hub. Inventory updated.`,
+            `Received Product "${invItem.itemName || invItem.name}" (Price: $${(invItem.sellPriceUnit || 0).toFixed(2)}) from ${originName} via Local Hub. Re-rendered instantly.`,
             originName,
             this.config.deviceName
           );
@@ -2045,7 +2098,18 @@ class MeshSyncManager {
             .trim()
             .toUpperCase();
 
-          if (targetBr === currentHubBranch.toUpperCase() || !targetBr) {
+          const isCatalog =
+            p.type === 'inventory' ||
+            p.type === 'INVENTORY' ||
+            p.type === 'INVENTORY_ITEM' ||
+            p.type === 'INVENTORY_UPDATE' ||
+            p.action === 'INVENTORY_RECORD' ||
+            p.action === 'INVENTORY_UPDATE' ||
+            p.type === 'product' ||
+            p.target_branch_id === 'ALL' ||
+            targetBr === 'ALL';
+
+          if (isCatalog || targetBr === currentHubBranch.toUpperCase() || !targetBr) {
             matchingPackets.push(p);
           } else {
             pausedPackets.push(p);
@@ -2053,6 +2117,7 @@ class MeshSyncManager {
         }
 
         this.pendingLocalHubQueue = pausedPackets;
+        this.savePendingLocalHubQueue();
 
         if (matchingPackets.length > 0) {
           this.addLog(
@@ -2170,6 +2235,41 @@ class MeshSyncManager {
             wsTarget.send(JSON.stringify(grvPacket));
           } catch (_) {}
         }
+      }
+
+      // 4. Reconcile recently modified local inventory items with Local Hub store
+      try {
+        const allItems = getRawStoredInventoryItems();
+        const recentThreshold = Date.now() - 48 * 3600 * 1000;
+        const recentItems = allItems.filter((i) => {
+          if (!i || !i.lastUpdated) return false;
+          const t = new Date(i.lastUpdated).getTime();
+          return !isNaN(t) && t >= recentThreshold;
+        });
+        for (const item of recentItems) {
+          const cleanId = (item.itemId || item.id || '').trim();
+          if (!cleanId) continue;
+          const invPacket = {
+            type: 'INVENTORY_ITEM',
+            action: 'INVENTORY_UPDATE',
+            packet_id: `RECON-INV-${cleanId}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: 'ALL',
+            target_branch_id: 'ALL',
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            item,
+            payload: item,
+            timestamp: item.lastUpdated ? new Date(item.lastUpdated).getTime() : Date.now(),
+            ttl: 5,
+          };
+          try {
+            wsTarget.send(JSON.stringify(invPacket));
+          } catch (_) {}
+        }
+      } catch (invErr) {
+        console.warn('[MeshSync] Error reconciling inventory to hub:', invErr);
       }
     } catch (e) {
       console.warn('[MeshSync] Error draining queue to local hub:', e);
@@ -2806,7 +2906,11 @@ class MeshSyncManager {
     const isCatalogPacket =
       topicSuffix === 'inventory' ||
       packet.type === 'inventory' ||
+      packet.type === 'INVENTORY' ||
+      packet.type === 'INVENTORY_ITEM' ||
+      packet.type === 'INVENTORY_UPDATE' ||
       packet.action === 'INVENTORY_RECORD' ||
+      packet.action === 'INVENTORY_UPDATE' ||
       packet.type === 'product' ||
       packet.target_branch_id === 'ALL' ||
       targetBranch === 'ALL';
@@ -2917,7 +3021,11 @@ class MeshSyncManager {
     const isCatalogOrCompanyPacket =
       topic.endsWith('/inventory') ||
       packet.type === 'inventory' ||
+      packet.type === 'INVENTORY' ||
+      packet.type === 'INVENTORY_ITEM' ||
+      packet.type === 'INVENTORY_UPDATE' ||
       packet.action === 'INVENTORY_RECORD' ||
+      packet.action === 'INVENTORY_UPDATE' ||
       packet.type === 'product' ||
       packet.type === 'staff' ||
       packet.action === 'STAFF_SYNC' ||
@@ -2935,8 +3043,19 @@ class MeshSyncManager {
       return;
     }
 
-    // Deduplicate packets
-    const packetId = packet.packet_id || packet.id;
+    // Deduplicate packets (never deduplicate inventory updates by static itemId)
+    const isInventoryPacket =
+      isCatalogOrCompanyPacket &&
+      (topic.endsWith('/inventory') ||
+        packet.type === 'inventory' ||
+        packet.type === 'INVENTORY' ||
+        packet.type === 'INVENTORY_ITEM' ||
+        packet.type === 'INVENTORY_UPDATE' ||
+        packet.action === 'INVENTORY_RECORD' ||
+        packet.action === 'INVENTORY_UPDATE' ||
+        Boolean(packet.item));
+
+    const packetId = packet.packet_id || (!isInventoryPacket && packet.id);
     if (packetId && this.seenPacketIds.has(packetId)) return;
     if (packetId) this.seenPacketIds.add(packetId);
 
@@ -3053,8 +3172,17 @@ class MeshSyncManager {
     }
 
     // 3. INVENTORY RECORD BROADCAST
-    if (topic.endsWith('/inventory') || packet.type === 'inventory' || packet.action === 'INVENTORY_RECORD') {
-      const invItem = packet.item || packet.payload;
+    if (
+      topic.endsWith('/inventory') ||
+      packet.type === 'inventory' ||
+      packet.type === 'INVENTORY' ||
+      packet.type === 'INVENTORY_ITEM' ||
+      packet.type === 'INVENTORY_UPDATE' ||
+      packet.action === 'INVENTORY_RECORD' ||
+      packet.action === 'INVENTORY_UPDATE' ||
+      Boolean(packet.item)
+    ) {
+      const invItem = packet.item || packet.payload || (packet.itemId ? packet : null);
       if (invItem && (invItem.itemId || invItem.id)) {
         const ingested = ingestMeshInventoryItem({
           ...invItem,
@@ -3066,20 +3194,23 @@ class MeshSyncManager {
           playChime();
           this.addLog(
             'EPIDEMIC_HOP',
-            `Received Product "${invItem.itemName || invItem.name}" (${invItem.itemId || invItem.id}) from ${originName}. Local inventory updated!`,
+            `Received Product "${invItem.itemName || invItem.name}" (Price: $${(invItem.sellPriceUnit || 0).toFixed(2)}) from ${originName}. UI updated instantly!`,
             originName,
             this.config.deviceName,
             packet.ttl || 5,
             invItem.itemId
           );
 
+          // Force UI Refresh: Trigger window.dispatchEvent(new Event('saimetric_inventory_updated')) so POS and Inventory screens re-render instantly
+          window.dispatchEvent(new Event('saimetric_inventory_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: invItem }));
+          window.dispatchEvent(new Event('saimetric_products_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: invItem }));
           window.dispatchEvent(
             new CustomEvent('mesh-inventory-received', {
               detail: { item: invItem, originName },
             })
           );
-          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: invItem }));
-          window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: invItem }));
           this.scheduleBatchUiUpdate();
           this.notifyPeerSubscribers();
         }
@@ -3676,6 +3807,22 @@ class MeshSyncManager {
       sinceTimestamp,
       isReciprocal: Boolean(isReciprocal),
       isForced: Boolean(force),
+      requestedTypes: [
+        'inventoryItems',
+        'sales',
+        'directGrvs',
+        'cashLogs',
+        'cashLifts',
+        'cashMovements',
+        'customerChanges',
+        'creditSales',
+        'stockMovements',
+        'expenses',
+        'cashTransfers',
+        'salespeople',
+        'customers',
+      ],
+      includeInventory: true,
       timestamp: Date.now(),
       ttl: 5,
     };
@@ -4039,8 +4186,11 @@ class MeshSyncManager {
           },
         })
       );
+      window.dispatchEvent(new Event('saimetric_sales_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+      window.dispatchEvent(new Event('saimetric_inventory_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      window.dispatchEvent(new Event('saimetric_products_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_products_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
@@ -4282,20 +4432,38 @@ class MeshSyncManager {
     if (!item) return;
     if ((item as any).fromMesh) return;
     const cleanId = (item.itemId || item.id || '').trim();
-    const packetId = `ITEM-PKT-${cleanId || Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const packetId = `ITEM-UPDATE-${cleanId || Date.now()}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
     const packet = {
-      type: 'inventory',
-      action: 'INVENTORY_RECORD',
+      type: 'INVENTORY_ITEM',
+      action: 'INVENTORY_UPDATE',
       packet_id: packetId,
       companyId: this.config.companyId,
-      branchId: item.branch_id || 'ALL',
+      company_id: this.config.companyId,
+      branchId: 'ALL',
+      branch_id: 'ALL',
       branchCode: this.config.branchCode,
       target_branch_id: 'ALL',
       deviceId: this.config.deviceId,
       originDeviceId: this.config.deviceId,
       originDeviceName: this.config.deviceName,
+      itemId: cleanId,
+      itemName: item.itemName,
+      sellPriceUnit: item.sellPriceUnit,
+      sellPriceCase: item.sellPriceCase,
+      costPerUnit: item.costPerUnit,
+      costPerCase: item.costPerCase,
+      unitsPerCase: item.unitsPerCase,
+      canSellAsCase: Boolean(item.canSellAsCase),
+      stockCases: item.stockCases,
+      stockSingles: item.stockSingles,
+      totalUnits: item.totalUnits,
+      category: item.category,
+      sku: item.sku,
+      barcode: item.barcode,
+      packagingVariants: item.packagingVariants || [],
+      branchOverrides: item.branchOverrides,
       item,
       payload: item,
       timestamp: Date.now(),
@@ -4306,11 +4474,11 @@ class MeshSyncManager {
 
     this.addLog(
       'BROADCAST',
-      `Product "${item.itemName}" (${item.itemId}) broadcasted to WiFi mesh (TTL=5)`,
+      `Product "${item.itemName}" Price: $${(item.sellPriceUnit || 0).toFixed(2)} (${cleanId}) broadcasted to Local Hub & mesh (target: ALL)`,
       this.config.deviceName,
       undefined,
       5,
-      item.itemId
+      cleanId
     );
 
     this.notifyPeerSubscribers();

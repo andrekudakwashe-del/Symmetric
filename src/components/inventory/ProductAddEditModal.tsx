@@ -30,6 +30,7 @@ import {
   recalculateItemPackagingRatio,
   recordPriceCostChangeAudit,
 } from '../../db/roomDatabase';
+import { meshSyncService } from '../../services/meshSyncService';
 import { PackagingRatioModal } from './PackagingRatioModal';
 import { cleanNumberInput } from './GoodsReceivedView';
 
@@ -370,6 +371,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
 
     // Direct save
     const saved = saveInventoryItem(candidateItem);
+    meshSyncService.broadcastInventoryItem(saved);
 
     // Audit price & cost changes
     if (isEditing && initialItem) {
@@ -1339,6 +1341,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
               pendingSaveItem.sellPriceUnit
             );
             if (variantItem) {
+              meshSyncService.broadcastInventoryItem(variantItem);
               onSaved(variantItem);
               onClose();
             }
@@ -1355,6 +1358,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
               stockSingles: recalcResult ? recalcResult.newSingles : (pendingSaveItem.totalUnits % newRatio),
               totalUnits: recalcResult ? recalcResult.totalUnits : pendingSaveItem.totalUnits,
             });
+            meshSyncService.broadcastInventoryItem(updated);
             onSaved(updated);
             onClose();
           }}

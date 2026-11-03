@@ -55,6 +55,7 @@ import {
   ensureCategoryExists,
   subscribeRoomDatabase,
 } from '../../db/roomDatabase';
+import { meshSyncService } from '../../services/meshSyncService';
 
 export const getCasePlural = (item?: { casePackageName?: string } | null): string => {
   const name = item?.casePackageName?.trim();
@@ -264,6 +265,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
         return;
       }
       const importRes = importInventoryItems(res.items, 'merge');
+      res.items.forEach((itm) => meshSyncService.broadcastInventoryItem(itm));
       refreshList();
       showToast('success', `Imported ${importRes.added} new items and updated ${importRes.updated} existing items.`);
     };
@@ -389,6 +391,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     };
 
     saveInventoryItem(itemToSave);
+    meshSyncService.broadcastInventoryItem(itemToSave);
     refreshList();
     setShowAddModal(false);
     setEditingItem(null);
@@ -1986,6 +1989,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             setEditingItem(null);
           }}
           onSaved={(savedItem) => {
+            meshSyncService.broadcastInventoryItem(savedItem);
             const freshItems = getInventoryItems();
             setItems(freshItems);
             setSelectedItemVariantId(savedItem.itemId);
