@@ -1421,11 +1421,35 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       const isCatchupReq = pType === 'catchup_request' || pType === 'CATCHUP_REQUEST';
       if (isCatchupReq) {
-        const sinceTimestamp = packet.sinceTimestamp || new Date(Date.now() - 48 * 3600 * 1000).toISOString();
-        const sinceTime = new Date(sinceTimestamp).getTime();
+        let sinceTime = 0;
+        let sinceTimestamp = packet.sinceTimestamp;
+        if (typeof sinceTimestamp === 'number') {
+          sinceTime = sinceTimestamp;
+        } else if (typeof sinceTimestamp === 'string') {
+          const asNum = Number(sinceTimestamp);
+          if (!isNaN(asNum) && asNum > 1000000000000) {
+            sinceTime = asNum;
+          } else {
+            sinceTime = new Date(sinceTimestamp).getTime();
+          }
+        }
+
+        // Guard against 0 or negative timestamps unless explicitly forced
+        if (isNaN(sinceTime) || sinceTime <= 0) {
+          sinceTime = packet.isForced ? 0 : Date.now() - 5 * 60 * 1000;
+          sinceTimestamp = new Date(sinceTime).toISOString();
+        } else {
+          sinceTimestamp = new Date(sinceTime).toISOString();
+        }
+
         const reqDeviceId = packet.originDeviceId || 'unknown';
         const reqComp = (packet.companyId || packet.company_id || 'COMP-001').trim().toUpperCase();
         const reqBranch = (packet.branchId || packet.branchCode || 'BR-MAIN').trim().toUpperCase();
+
+        console.log(
+          `[Termux Hub] 📥 Received CATCHUP_REQUEST from ${reqDeviceId}: ` +
+          `sinceTimestamp="${packet.sinceTimestamp}" parsed to sinceTime=${sinceTime} (${new Date(sinceTime).toISOString()}), isForced=${Boolean(packet.isForced)}`
+        );
 
         // NO FIREHOSE: Send ONLY records where getTimestamp(item) >= sinceTime!
         // Do not dump the entire 501-item catalog unless explicitly forced!

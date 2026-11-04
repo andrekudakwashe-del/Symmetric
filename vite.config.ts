@@ -16,9 +16,9 @@ export default defineConfig(() => {
     },
     server: {
       allowedHosts: true,
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      hmr: process.env.DISABLE_HMR !== 'true',
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // Default Vite HMR without aggressive error overlay reload or polling
+      hmr: process.env.DISABLE_HMR === 'true' ? false : { overlay: false },
+      watch: process.env.DISABLE_HMR === 'true' ? null : { usePolling: false },
     },
     build: {
       chunkSizeWarningLimit: 1200,

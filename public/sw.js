@@ -29,7 +29,8 @@ self.addEventListener('install', (event) => {
           } catch (e) {}
         })
       );
-      await self.skipWaiting();
+      // Notice: Do NOT call self.skipWaiting() here automatically.
+      // The update is applied when the user taps the 'Update' banner in the app.
     })()
   );
 });

@@ -21,6 +21,8 @@ import {
   ingestMeshSale,
   onInventoryCreated,
   ingestMeshInventoryItem,
+  ingestMeshInventoryItemsChunk,
+  recalculateInventoryValuationOnce,
   getRawStoredInventoryItems,
   getRawStoredSalespeople,
   getRawStoredCustomers,
@@ -78,6 +80,7 @@ import {
 } from '../db/roomDatabase';
 import { getMovements, addMovement, onCashMovementCreated, CashMovement } from '../db/cashLedger';
 import { persistentSyncEngine } from './persistentSyncEngine';
+import { getSyncMeta, setSyncMeta } from '../db/indexedDBService';
 import { processSyncQueue } from './googleSheetsSync';
 import { LocalHubConfig, normalizeHubUrl } from '../utils/localHubConfig';
 import {
@@ -87,6 +90,14 @@ import {
 } from '../utils/pinCrypto';
 
 export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE' | 'CLOUD_ONLY';
+
+export interface MeshSyncProgress {
+  isActive: boolean;
+  current: number;
+  total: number;
+  message: string;
+  percentage: number;
+}
 
 // Keys for localStorage persistence
 const PREFS_BRANCH_KEY = 'saimetric_mesh_branch_code';
@@ -247,6 +258,67 @@ class MeshSyncManager {
   private lastInitialCatchupTime: number = 0;
   private isAwaitingDrainAck: boolean = false;
   private drainAckFallbackTimer: any = null;
+
+  // Chunked Ingestion & Async Progress State
+  private syncProgressListeners: Array<(progress: MeshSyncProgress) => void> = [];
+  private currentSyncProgress: MeshSyncProgress = { isActive: false, current: 0, total: 0, message: '', percentage: 0 };
+
+  public subscribeSyncProgress(listener: (progress: MeshSyncProgress) => void): () => void {
+    this.syncProgressListeners.push(listener);
+    try {
+      listener(this.currentSyncProgress);
+    } catch (_) {}
+    return () => {
+      this.syncProgressListeners = this.syncProgressListeners.filter((l) => l !== listener);
+    };
+  }
+
+  public getSyncProgress(): MeshSyncProgress {
+    return this.currentSyncProgress;
+  }
+
+  public updateSyncProgress(current: number, total: number, message?: string): void {
+    const percentage = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
+    const msg = message || `Syncing ${current}/${total} items...`;
+    this.currentSyncProgress = {
+      isActive: current < total,
+      current,
+      total,
+      message: msg,
+      percentage,
+    };
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('saimetric_sync_progress', { detail: this.currentSyncProgress }));
+    }
+    this.syncProgressListeners.forEach((fn) => {
+      try { fn(this.currentSyncProgress); } catch (_) {}
+    });
+  }
+
+  public finishSyncProgress(total: number, message: string = 'Sync Complete'): void {
+    this.currentSyncProgress = {
+      isActive: false,
+      current: total,
+      total,
+      message,
+      percentage: 100,
+    };
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('saimetric_sync_progress', { detail: this.currentSyncProgress }));
+    }
+    this.syncProgressListeners.forEach((fn) => {
+      try { fn(this.currentSyncProgress); } catch (_) {}
+    });
+    setTimeout(() => {
+      this.currentSyncProgress = { isActive: false, current: 0, total: 0, message: '', percentage: 0 };
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(new CustomEvent('saimetric_sync_progress', { detail: this.currentSyncProgress }));
+      }
+      this.syncProgressListeners.forEach((fn) => {
+        try { fn(this.currentSyncProgress); } catch (_) {}
+      });
+    }, 2000);
+  }
 
   // Hub Branch Identity & Roaming Owner Safeguard
   private hubBranchId: string | null = LocalHubConfig.getHubBranchId();
@@ -508,7 +580,17 @@ class MeshSyncManager {
         const raw = localStorage.getItem('saimetric_pending_local_hub_queue');
         if (raw) {
           const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) return parsed;
+          if (Array.isArray(parsed)) {
+            // Filter to ONLY genuine offline user changes (never mesh or catchup packets)
+            return parsed.filter(
+              (p) =>
+                p &&
+                !p.fromMesh &&
+                !p.isOfflineCatchup &&
+                !(p.item && p.item.fromMesh) &&
+                !(p.payload && p.payload.fromMesh)
+            );
+          }
         }
       }
     } catch {}
@@ -528,10 +610,52 @@ class MeshSyncManager {
 
   private queueOutgoingLocalHubPacket(packet: any) {
     if (!packet) return;
+    if (this.isIngestingFromHub) return;
     // Never queue maintenance packets to local hub
-    if (packet.type === 'heartbeat' || packet.type === 'ping' || packet.action === 'HEARTBEAT' || packet.action === 'PING') {
+    if (
+      packet.type === 'heartbeat' ||
+      packet.type === 'ping' ||
+      packet.type === 'catchup_request' ||
+      packet.type === 'catchup_response' ||
+      packet.action === 'HEARTBEAT' ||
+      packet.action === 'PING' ||
+      packet.action === 'CATCHUP_REQUEST' ||
+      packet.action === 'CATCHUP_RESPONSE'
+    ) {
       return;
     }
+    // Never queue packets originating from mesh or catchup
+    if (
+      packet.fromMesh ||
+      packet.isOfflineCatchup ||
+      (packet.item && packet.item.fromMesh) ||
+      (packet.payload && packet.payload.fromMesh)
+    ) {
+      return;
+    }
+
+    // Deduplicate by item ID so the offline queue never contains multiple edits or old versions for the same item
+    const itemId =
+      packet.itemId ||
+      (packet.item && (packet.item.itemId || packet.item.id)) ||
+      (packet.payload && (packet.payload.itemId || packet.payload.id));
+
+    if (itemId) {
+      const cleanId = String(itemId).trim().toUpperCase();
+      const existingIdx = this.pendingLocalHubQueue.findIndex((p) => {
+        const pItemId =
+          p.itemId ||
+          (p.item && (p.item.itemId || p.item.id)) ||
+          (p.payload && (p.payload.itemId || p.payload.id));
+        return pItemId && String(pItemId).trim().toUpperCase() === cleanId;
+      });
+      if (existingIdx >= 0) {
+        this.pendingLocalHubQueue[existingIdx] = packet;
+        this.savePendingLocalHubQueue();
+        return;
+      }
+    }
+
     if (this.pendingLocalHubQueue.length > 100) {
       this.pendingLocalHubQueue.shift();
     }
@@ -542,17 +666,6 @@ class MeshSyncManager {
   constructor() {
     this.config = this.loadConfig();
     this.pendingLocalHubQueue = this.loadPendingLocalHubQueue();
-
-    // Listen for local inventory being newer than incoming stale packet from Hub/peer:
-    if (typeof window !== 'undefined') {
-      window.addEventListener('saimetric_local_inventory_is_newer', ((e: CustomEvent) => {
-        if (e && e.detail && !this.isIngestingFromHub) {
-          setTimeout(() => {
-            this.broadcastInventoryItem(e.detail);
-          }, 200);
-        }
-      }) as EventListener);
-    }
 
     // Pre-populate known and broadcasted invoice IDs from local DB for fast O(1) deduplication
     try {
@@ -1170,13 +1283,13 @@ class MeshSyncManager {
         this.notifyConnectionModeChange();
 
         // Fallback for legacy Hubs without HUB_INFO response:
-        setTimeout(() => {
+        setTimeout(async () => {
           if (this.isLocalHubConnected && !this.hubBranchId && !this.isCloudOnlyMode) {
             this.drainQueueToLocalHub();
             this.hasPerformedInitialCatchup = true;
             this.lastInitialCatchupTime = Date.now();
-            const lastSync = this.getLastMeshSyncTimestamp();
-            this.requestCatchUpSync('ALL', lastSync, false, true).catch(() => {});
+            const lastSync = await this.getLastInventorySyncTimestamp();
+            this.requestCatchUpSync('ALL', lastSync, false, false).catch(() => {});
           }
         }, 2000);
       };
@@ -1493,8 +1606,14 @@ class MeshSyncManager {
     if (isInvPacket) {
       const invItem = packet.item || packet.payload || (packet.itemId ? packet : null);
       if (invItem && (invItem.itemId || invItem.id)) {
+        // Timestamp Authority: Save the Hub's timestamp; do not re-stamp with local time
+        const hubTimestamp = Number(packet.updatedAt || invItem.updatedAt || packet.timestamp || Date.now());
+        const hubLastUpdated = packet.lastUpdated || invItem.lastUpdated || new Date(hubTimestamp).toISOString();
         const ingested = ingestMeshInventoryItem({
           ...invItem,
+          updatedAt: hubTimestamp,
+          hubTimestamp: hubTimestamp,
+          lastUpdated: hubLastUpdated,
           company_id: this.config.companyId,
           branch_id: invItem.branch_id || 'ALL',
           fromMesh: true,
@@ -2272,107 +2391,7 @@ class MeshSyncManager {
         }
       }
 
-      // 4. Reconcile recently modified local inventory items with Local Hub store
-      try {
-        const allItems = getRawStoredInventoryItems();
-        const recentThreshold = Date.now() - 48 * 3600 * 1000;
-        const recentItems = allItems.filter((i) => {
-          if (!i || !i.lastUpdated) return false;
-          const t = new Date(i.lastUpdated).getTime();
-          return !isNaN(t) && t >= recentThreshold;
-        });
-        for (const item of recentItems) {
-          const cleanId = (item.itemId || item.id || '').trim();
-          if (!cleanId) continue;
-          const invPacket = {
-            type: 'INVENTORY_ITEM',
-            action: 'INVENTORY_UPDATE',
-            packet_id: `RECON-INV-${cleanId}-${Date.now()}`,
-            companyId: this.config.companyId,
-            branchId: 'ALL',
-            target_branch_id: 'ALL',
-            deviceId: this.config.deviceId,
-            originDeviceId: this.config.deviceId,
-            originDeviceName: this.config.deviceName,
-            item,
-            payload: item,
-            timestamp: item.lastUpdated ? new Date(item.lastUpdated).getTime() : Date.now(),
-            ttl: 5,
-          };
-          try {
-            wsTarget.send(JSON.stringify(invPacket));
-          } catch (_) {}
-        }
-      } catch (invErr) {
-        console.warn('[MeshSync] Error reconciling inventory to hub:', invErr);
-      }
-
-      // 5. Reconcile recently modified staff with Local Hub
-      try {
-        const allStaff = getAllSalespeople();
-        const recentThreshold = Date.now() - 48 * 3600 * 1000;
-        const recentStaff = allStaff.filter((s) => {
-          const t = extractRecordTimestamp(s);
-          return t >= recentThreshold;
-        });
-        for (const staff of recentStaff) {
-          const staffPacket = {
-            type: 'STAFF',
-            action: 'STAFF_SYNC',
-            packet_id: `RECON-STAFF-${staff.id}-${Date.now()}`,
-            companyId: this.config.companyId,
-            branchId: 'ALL',
-            target_branch_id: 'ALL',
-            deviceId: this.config.deviceId,
-            originDeviceId: this.config.deviceId,
-            originDeviceName: this.config.deviceName,
-            staff,
-            payload: staff,
-            timestamp: extractRecordTimestamp(staff) || Date.now(),
-            ttl: 5,
-          };
-          try {
-            wsTarget.send(JSON.stringify(staffPacket));
-          } catch (_) {}
-        }
-      } catch (staffErr) {
-        console.warn('[MeshSync] Error reconciling staff to hub:', staffErr);
-      }
-
-      // 6. Reconcile recently modified customers with Local Hub
-      try {
-        const allCust = getCustomers();
-        const recentThreshold = Date.now() - 48 * 3600 * 1000;
-        const recentCust = allCust.filter((c) => {
-          const t = extractRecordTimestamp(c);
-          return t >= recentThreshold;
-        });
-        for (const customer of recentCust) {
-          const cId = customer.customerId || (customer as any).id;
-          const custPacket = {
-            type: 'CUSTOMER',
-            action: 'CUSTOMER_SYNC',
-            packet_id: `RECON-CUST-${cId}-${Date.now()}`,
-            companyId: this.config.companyId,
-            branchId: 'ALL',
-            target_branch_id: 'ALL',
-            deviceId: this.config.deviceId,
-            originDeviceId: this.config.deviceId,
-            originDeviceName: this.config.deviceName,
-            customer,
-            payload: customer,
-            timestamp: extractRecordTimestamp(customer) || Date.now(),
-            ttl: 5,
-          };
-          try {
-            wsTarget.send(JSON.stringify(custPacket));
-          } catch (_) {}
-        }
-      } catch (custErr) {
-        console.warn('[MeshSync] Error reconciling customers to hub:', custErr);
-      }
-
-      // 7. Flush-Before-Pull: Signal DRAIN_COMPLETE_PING to Local Hub
+      // 4. Flush-Before-Pull: Signal DRAIN_COMPLETE_PING to Local Hub
       this.isAwaitingDrainAck = true;
       const pingPacket = {
         type: 'DRAIN_COMPLETE_PING',
@@ -2405,18 +2424,18 @@ class MeshSyncManager {
     }
   }
 
-  private triggerDeltaCatchUpAfterFlush() {
+  private async triggerDeltaCatchUpAfterFlush() {
     if (this.isLocalHubConnected && !this.isCloudOnlyMode) {
       this.hasPerformedInitialCatchup = true;
       this.lastInitialCatchupTime = Date.now();
       const branchId = this.hubBranchId || 'ALL';
-      const lastSync = this.getLastMeshSyncTimestamp();
+      const lastSync = await this.getLastInventorySyncTimestamp();
       this.addLog(
         'BROADCAST',
         `Flush-Before-Pull Complete: Local Hub acknowledged flush. Requesting Delta Catch-Up for [${branchId}]...`,
         this.config.deviceName
       );
-      this.requestCatchUpSync(branchId, lastSync, false, true).catch(() => {});
+      this.requestCatchUpSync(branchId, lastSync, false, false).catch(() => {});
     }
   }
 
@@ -3943,21 +3962,113 @@ class MeshSyncManager {
   // BI-DIRECTIONAL P2P DELTA CATCH-UP ENGINE (For returning off-site devices)
   // =========================================================================
 
+  // Persisted sync timestamp key requested: saimetric_last_inventory_sync
+  public static readonly LAST_INVENTORY_SYNC_KEY = 'saimetric_last_inventory_sync';
+
+  public async getLastInventorySyncTimestamp(): Promise<string> {
+    // 1. Try IndexedDB first
+    try {
+      const meta = await getSyncMeta(MeshSyncManager.LAST_INVENTORY_SYNC_KEY);
+      if (meta && meta.lastSyncAt) {
+        return meta.lastSyncAt;
+      }
+      if (meta && meta.lastServerTime) {
+        const num = Number(meta.lastServerTime);
+        if (!isNaN(num) && num > 0) {
+          return new Date(num).toISOString();
+        }
+      }
+    } catch (_) {}
+
+    // 2. Try localStorage saimetric_last_inventory_sync
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const stored = window.localStorage.getItem(MeshSyncManager.LAST_INVENTORY_SYNC_KEY);
+      if (stored) {
+        const num = Number(stored);
+        if (!isNaN(num) && num > 0) {
+          return new Date(num).toISOString();
+        }
+        const parsed = new Date(stored).getTime();
+        if (!isNaN(parsed) && parsed > 0) {
+          return new Date(parsed).toISOString();
+        }
+      }
+    }
+
+    // 3. Fallback to branch-scoped key
+    const branchKey = `saimetric_mesh_last_sync_${this.config.branchId}_${this.config.companyId}`;
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const bStored = window.localStorage.getItem(branchKey);
+      if (bStored) {
+        const parsed = new Date(bStored).getTime();
+        if (!isNaN(parsed) && parsed > 0) {
+          return new Date(parsed).toISOString();
+        }
+      }
+    }
+
+    // 4. Default: NEVER return 0 or 48 hours ago which causes the 501 firehose!
+    // Return 5 minutes ago so only recent mutations are fetched
+    return new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  }
+
+  public async setLastInventorySyncTimestamp(val: number | string): Promise<void> {
+    let numTimestamp: number = Date.now();
+    let isoTimestamp: string = new Date().toISOString();
+
+    if (typeof val === 'number') {
+      numTimestamp = val;
+      isoTimestamp = new Date(val).toISOString();
+    } else if (typeof val === 'string') {
+      const asNum = Number(val);
+      if (!isNaN(asNum) && asNum > 1000000000000) {
+        numTimestamp = asNum;
+        isoTimestamp = new Date(asNum).toISOString();
+      } else {
+        const parsed = new Date(val).getTime();
+        if (!isNaN(parsed) && parsed > 0) {
+          numTimestamp = parsed;
+          isoTimestamp = new Date(parsed).toISOString();
+        }
+      }
+    }
+
+    // 1. Persist in localStorage
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(MeshSyncManager.LAST_INVENTORY_SYNC_KEY, String(numTimestamp));
+      const branchKey = `saimetric_mesh_last_sync_${this.config.branchId}_${this.config.companyId}`;
+      window.localStorage.setItem(branchKey, isoTimestamp);
+    }
+
+    // 2. Persist in IndexedDB
+    try {
+      await setSyncMeta(MeshSyncManager.LAST_INVENTORY_SYNC_KEY, isoTimestamp, String(numTimestamp));
+    } catch (e) {
+      console.warn('[MeshSync] Error storing saimetric_last_inventory_sync in IndexedDB:', e);
+    }
+  }
+
   public getLastMeshSyncTimestamp(): string {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const stored = window.localStorage.getItem(MeshSyncManager.LAST_INVENTORY_SYNC_KEY);
+      if (stored) {
+        const num = Number(stored);
+        if (!isNaN(num) && num > 0) return new Date(num).toISOString();
+        const p = new Date(stored).getTime();
+        if (!isNaN(p) && p > 0) return new Date(p).toISOString();
+      }
+    }
     const key = `saimetric_mesh_last_sync_${this.config.branchId}_${this.config.companyId}`;
     if (typeof window !== 'undefined' && window.localStorage) {
       const stored = window.localStorage.getItem(key);
       if (stored) return stored;
     }
-    // Default to 48 hours ago
-    return new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    // Default to 5 minutes ago instead of 48 hours to prevent 501 firehose
+    return new Date(Date.now() - 5 * 60 * 1000).toISOString();
   }
 
   public setLastMeshSyncTimestamp(isoStr: string) {
-    const key = `saimetric_mesh_last_sync_${this.config.branchId}_${this.config.companyId}`;
-    if (typeof window !== 'undefined' && window.localStorage) {
-      window.localStorage.setItem(key, isoStr);
-    }
+    this.setLastInventorySyncTimestamp(isoStr).catch(() => {});
   }
 
   public checkAndRequestCatchUpIfStale() {
@@ -3992,7 +4103,19 @@ class MeshSyncManager {
       this.connectLocalHub();
     }
 
-    const sinceTimestamp = customSinceIso || (force ? new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString() : this.getLastMeshSyncTimestamp());
+    let sinceTimestamp = customSinceIso;
+    if (!sinceTimestamp) {
+      if (force) {
+        sinceTimestamp = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+      } else {
+        sinceTimestamp = await this.getLastInventorySyncTimestamp();
+      }
+    }
+
+    // 4. Verification: Add a console.log that prints [CatchUp] Requesting items since: [timestamp] immediately before sending the request.
+    console.log(`[CatchUp] Requesting items since: [${sinceTimestamp}]`);
+    console.log(`[CatchUp] Requesting items since: ${sinceTimestamp}`);
+
     const packetId = `CRQ-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
@@ -4215,21 +4338,63 @@ class MeshSyncManager {
     let expensesIngested = 0;
     let accountsIngested = 0;
 
-    // 1. Ingest Sales
-    if (Array.isArray(delta.sales)) {
-      for (const sale of delta.sales) {
-        if (ingestMeshSale({ ...sale, fromMesh: true })) {
-          salesIngested++;
+    const totalInventoryCount = Array.isArray(delta.inventoryItems) ? delta.inventoryItems.length : 0;
+    const totalSalesCount = Array.isArray(delta.sales) ? delta.sales.length : 0;
+    const totalCashLogsCount = Array.isArray(delta.cashLogs) ? delta.cashLogs.length : 0;
+    const totalStockMovesCount = Array.isArray(delta.stockMovements) ? delta.stockMovements.length : 0;
+
+    const totalRecordsToProcess =
+      totalInventoryCount +
+      totalSalesCount +
+      totalCashLogsCount +
+      totalStockMovesCount +
+      (delta.directGrvs?.length || 0) +
+      (delta.expenses?.length || 0);
+
+    let overallProcessed = 0;
+    if (totalRecordsToProcess > 0) {
+      this.updateSyncProgress(0, totalRecordsToProcess, `Syncing 0/${totalRecordsToProcess} items...`);
+    }
+
+    // 1. Chunked Ingestion for Sales (Chunks of 50 + Yield to Browser)
+    if (Array.isArray(delta.sales) && delta.sales.length > 0) {
+      const sales = delta.sales;
+      const CHUNK_SIZE = 50;
+      for (let i = 0; i < sales.length; i += CHUNK_SIZE) {
+        const chunk = sales.slice(i, i + CHUNK_SIZE);
+        for (const sale of chunk) {
+          if (ingestMeshSale({ ...sale, fromMesh: true })) {
+            salesIngested++;
+          }
         }
+        overallProcessed += chunk.length;
+        this.updateSyncProgress(
+          overallProcessed,
+          totalRecordsToProcess,
+          `Syncing ${overallProcessed}/${totalRecordsToProcess} items...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
 
-    // 2. Ingest Cash Logs, Cash Lifts & Cash Movements
-    if (Array.isArray(delta.cashLogs)) {
-      for (const cashLog of delta.cashLogs) {
-        if (ingestMeshCashLog({ ...cashLog, fromMesh: true })) {
-          cashLogsIngested++;
+    // 2. Chunked Ingestion for Cash Logs & Movements (Chunks of 50 + Yield)
+    if (Array.isArray(delta.cashLogs) && delta.cashLogs.length > 0) {
+      const logs = delta.cashLogs;
+      const CHUNK_SIZE = 50;
+      for (let i = 0; i < logs.length; i += CHUNK_SIZE) {
+        const chunk = logs.slice(i, i + CHUNK_SIZE);
+        for (const cashLog of chunk) {
+          if (ingestMeshCashLog({ ...cashLog, fromMesh: true })) {
+            cashLogsIngested++;
+          }
         }
+        overallProcessed += chunk.length;
+        this.updateSyncProgress(
+          overallProcessed,
+          totalRecordsToProcess,
+          `Syncing ${overallProcessed}/${totalRecordsToProcess} items...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
     if (Array.isArray(delta.cashLifts)) {
@@ -4265,18 +4430,31 @@ class MeshSyncManager {
       }
     }
 
-    // 4. Ingest Stock Movements, GRVs & Goods Received Notes
-    if (Array.isArray(delta.stockMovements)) {
-      for (const sm of delta.stockMovements) {
-        if (ingestMeshStockMovement(sm)) {
-          movementsIngested++;
+    // 4. Ingest Stock Movements, GRVs & Goods Received Notes (Chunks of 50)
+    if (Array.isArray(delta.stockMovements) && delta.stockMovements.length > 0) {
+      const movements = delta.stockMovements;
+      const CHUNK_SIZE = 50;
+      for (let i = 0; i < movements.length; i += CHUNK_SIZE) {
+        const chunk = movements.slice(i, i + CHUNK_SIZE);
+        for (const sm of chunk) {
+          if (ingestMeshStockMovement(sm)) {
+            movementsIngested++;
+          }
         }
+        overallProcessed += chunk.length;
+        this.updateSyncProgress(
+          overallProcessed,
+          totalRecordsToProcess,
+          `Syncing ${overallProcessed}/${totalRecordsToProcess} items...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
     if (Array.isArray(delta.directGrvs)) {
       for (const grv of delta.directGrvs) {
         ingestMeshGRV({ ...grv, fromMesh: true });
       }
+      overallProcessed += delta.directGrvs.length;
     }
     if (Array.isArray(delta.goodsReceivedNotes)) {
       for (const grn of delta.goodsReceivedNotes) {
@@ -4295,11 +4473,32 @@ class MeshSyncManager {
       }
     }
 
-    // 6. Ingest updated inventory items
-    if (Array.isArray(delta.inventoryItems)) {
-      for (const item of delta.inventoryItems) {
-        ingestMeshInventoryItem({ ...item, fromMesh: true });
+    // 6. CHUNKED INGESTION FOR INVENTORY ITEMS (Chunks of 50 + 10ms Browser Yield + Single Batch Valuation)
+    if (Array.isArray(delta.inventoryItems) && delta.inventoryItems.length > 0) {
+      const items = delta.inventoryItems;
+      const CHUNK_SIZE = 50;
+      const totalInv = items.length;
+
+      for (let i = 0; i < totalInv; i += CHUNK_SIZE) {
+        const chunk = items.slice(i, i + CHUNK_SIZE);
+        const isLastChunk = i + CHUNK_SIZE >= totalInv;
+
+        // Process chunk of 50 without running intermediate valuation recalculation
+        ingestMeshInventoryItemsChunk(chunk, false);
+
+        overallProcessed += chunk.length;
+        this.updateSyncProgress(
+          overallProcessed,
+          totalRecordsToProcess,
+          `Syncing ${overallProcessed}/${totalRecordsToProcess} items...`
+        );
+
+        // Yield to the browser main thread so the UI can paint and respond to touch events
+        await new Promise((resolve) => setTimeout(resolve, 10));
       }
+
+      // Batch Valuation: Recalculate total valuation ONCE at the end of all chunks
+      recalculateInventoryValuationOnce();
     }
 
     // 7. Ingest Expenses
@@ -4308,6 +4507,7 @@ class MeshSyncManager {
         addExpense({ ...exp, fromMesh: true });
         expensesIngested++;
       }
+      overallProcessed += delta.expenses.length;
     }
 
     // 8. Ingest Cash Accounts & Transfers
@@ -4349,10 +4549,17 @@ class MeshSyncManager {
       }
     }
 
-    // Update last sync cutoff timestamp
-    if (packet.cutoffTimestamp) {
-      this.setLastMeshSyncTimestamp(packet.cutoffTimestamp);
+    // Complete sync progress indicator
+    if (totalRecordsToProcess > 0) {
+      this.finishSyncProgress(totalRecordsToProcess, 'Sync Complete');
     }
+
+    // 3. Update on Success: After the catchup_response is fully ingested, update saimetric_last_inventory_sync to Date.now() (the Hub's cutoffTimestamp)
+    const cutoffVal = packet.cutoffTimestamp ? new Date(packet.cutoffTimestamp).getTime() : Date.now();
+    const validCutoff = !isNaN(cutoffVal) && cutoffVal > 0 ? cutoffVal : Date.now();
+    await this.setLastInventorySyncTimestamp(validCutoff);
+    this.setLastMeshSyncTimestamp(new Date(validCutoff).toISOString());
+    console.log(`[CatchUp] Catch-up delta ingested successfully. Updated saimetric_last_inventory_sync: [${new Date(validCutoff).toISOString()}] (${validCutoff})`);
 
     playChime();
 

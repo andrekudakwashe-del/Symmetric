@@ -4,48 +4,76 @@ import App from './App.tsx';
 import { GlobalErrorBoundary } from './components/common/GlobalErrorBoundary.tsx';
 import './index.css';
 
-// Register Service Worker in production for offline PWA; unregister in development or within iframes to avoid intercepting Vite
+// Service Worker Registration and Smart Update Management
 if ('serviceWorker' in navigator) {
   const isIframe = typeof window !== 'undefined' && window.self !== window.top;
+
   if (import.meta.env.DEV || isIframe) {
+    // DEV MODE:
+    // Ensure Service Worker does NOT auto-reload the page when a new update is found in Dev mode.
+    // It should only log a console message: [SW] New version available.
     navigator.serviceWorker.getRegistrations().then((registrations) => {
       for (const reg of registrations) {
-        reg.unregister().catch(() => {});
+        reg.onupdatefound = () => {
+          const installing = reg.installing;
+          if (installing) {
+            installing.onstatechange = () => {
+              if (installing.state === 'installed') {
+                console.log('[SW] New version available');
+              }
+            };
+          }
+        };
       }
     }).catch(() => {});
   } else {
+    // PRODUCTION MODE (e.g., Vercel deployment):
+    // Smart Update (Update-on-Reload) Pattern
     window.addEventListener('load', () => {
       navigator.serviceWorker
         .register('/sw.js', { scope: '/' })
         .then((reg) => {
           console.log('SAIMETRIC Service Worker active:', reg.scope);
+
+          // If a new worker is already waiting in the background
           if (reg.waiting) {
-            reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+            window.dispatchEvent(
+              new CustomEvent('saimetric_update_ready', {
+                detail: { registration: reg, waitingWorker: reg.waiting },
+              })
+            );
           }
+
+          // 1. Listen for SW Updates: Register the Service Worker. When onupdatefound fires, listen for state === 'installed'.
           reg.onupdatefound = () => {
             const installing = reg.installing;
             if (installing) {
               installing.onstatechange = () => {
                 if (installing.state === 'installed' && navigator.serviceWorker.controller) {
-                  installing.postMessage({ type: 'SKIP_WAITING' });
+                  // 2. Dispatch custom event saimetric_update_ready
+                  window.dispatchEvent(
+                    new CustomEvent('saimetric_update_ready', {
+                      detail: { registration: reg, waitingWorker: installing },
+                    })
+                  );
                 }
               };
             }
           };
 
-          // Periodically check for updates every 15 minutes
+          // 4. Auto-Check: Every 30 minutes, call registration.update() silently to check for new versions
           setInterval(() => {
             if (navigator.onLine) {
               reg.update().catch(() => {});
             }
-          }, 15 * 60 * 1000);
+          }, 30 * 60 * 1000);
         })
         .catch((err) => {
           console.warn('SAIMETRIC Service Worker registration notice:', err);
         });
     });
 
-    // When connection is restored, immediately check for updates
+    // When connection is restored, silently check for updates
     window.addEventListener('online', () => {
       navigator.serviceWorker.getRegistration().then((reg) => {
         if (reg) reg.update().catch(() => {});
@@ -72,4 +100,3 @@ createRoot(document.getElementById('root')!).render(
     </GlobalErrorBoundary>
   </StrictMode>,
 );
-

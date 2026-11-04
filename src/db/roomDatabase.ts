@@ -9861,16 +9861,6 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     // If the local existing record is strictly newer than the incoming packet,
     // NEVER overwrite local data with older data from Hub or peers!
     if (!isIncomingRecordNewer(item, existing)) {
-      // Local record is newer!
-      // If local price differs from the older incoming item, notify mesh to re-broadcast newer local item
-      // so the Hub and peer devices update to our latest price.
-      if (priceChanged || nameChanged) {
-        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-          window.dispatchEvent(
-            new CustomEvent('saimetric_local_inventory_is_newer', { detail: existing })
-          );
-        }
-      }
       return false;
     }
 
@@ -9890,6 +9880,10 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
 
     const mergedPackagingVariants = item.packagingVariants || existing.packagingVariants;
 
+    // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
+    const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : 0));
+    const hubLastUpdated = item.lastUpdated || (hubTimestamp > 0 ? new Date(hubTimestamp).toISOString() : existing.lastUpdated);
+
     savedItem = {
       ...existing,
       ...item,
@@ -9908,7 +9902,9 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       totalUnits,
       branchOverrides: updatedOverrides,
       packagingVariants: mergedPackagingVariants,
-      lastUpdated: item.lastUpdated || new Date().toISOString(),
+      lastUpdated: hubLastUpdated || existing.lastUpdated,
+      updatedAt: hubTimestamp || (existing as any).updatedAt || (existing.lastUpdated ? new Date(existing.lastUpdated).getTime() : 0),
+      hubTimestamp: hubTimestamp || (existing as any).hubTimestamp,
     };
     allItems[idx] = savedItem;
   } else {
@@ -9926,6 +9922,10 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       }
     });
 
+    // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
+    const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : Date.now()));
+    const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
+
     savedItem = {
       ...item,
       itemId: cleanId,
@@ -9942,7 +9942,9 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       stockSingles,
       totalUnits,
       branchOverrides: updatedOverrides,
-      lastUpdated: new Date().toISOString(),
+      lastUpdated: hubLastUpdated,
+      updatedAt: hubTimestamp,
+      hubTimestamp: hubTimestamp,
     };
     allItems.unshift(savedItem);
   }
@@ -9983,6 +9985,208 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     window.dispatchEvent(new CustomEvent('mesh-inventory-received', { detail: { item: savedItem } }));
   }
   return true;
+};
+
+/**
+ * Ingests a chunk of inventory items (e.g. 50 items) in a single batch.
+ * Avoids recalculating valuation or writing to storage after every single item.
+ * Writes to storage once per chunk and triggers full UI refresh / valuation once when isLastChunk is true.
+ */
+export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLastChunk: boolean = false): number => {
+  if (!Array.isArray(itemsChunk) || itemsChunk.length === 0) return 0;
+  const currentCompany = getCurrentCompanyId();
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
+
+  const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+  const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+
+  const allItems = getRawStoredInventoryItems();
+  let ingestedCount = 0;
+  let hasChanges = false;
+
+  for (const item of itemsChunk) {
+    if (!item || (!item.itemId && !(item as any).id)) continue;
+    const compId = item.company_id || (item as any).companyId || currentCompany;
+    if (normTenant(compId) !== normTenant(currentCompany)) continue;
+
+    let cleanId = (item.itemId || (item as any).id || '').trim().toUpperCase();
+    const isDeleted = deletedList.some(
+      (d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === normTenant(compId)
+    );
+    if (isDeleted) continue;
+
+    const incomingName = (item.itemName || (item as any).name || '').trim().toLowerCase();
+
+    // Find index by exact ID match, SKU, or exact item name
+    let idx = allItems.findIndex((i) => {
+      const iComp = (i.company_id || (i as any).companyId || currentCompany).trim().toUpperCase();
+      if (normTenant(iComp) !== normTenant(compId)) return false;
+      const iName = (i.itemName || '').trim().toLowerCase();
+
+      if (item.sku && i.sku && i.sku.toUpperCase() === item.sku.toUpperCase()) return true;
+      if (incomingName && iName && incomingName === iName) return true;
+      if (cleanId && i.itemId && i.itemId.toUpperCase() === cleanId) {
+        if (incomingName && iName && incomingName !== iName) return false;
+        return true;
+      }
+      return false;
+    });
+
+    if (idx < 0) {
+      const idTakenByOther = allItems.some(
+        (i) => (i.company_id || (i as any).companyId) === compId && i.itemId && i.itemId.toUpperCase() === cleanId
+      );
+      if (idTakenByOther) {
+        cleanId = `${cleanId}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+      }
+    }
+
+    const unitsPerCase = Math.max(1, Number(item.unitsPerCase || (item as any).UnitsPerCase) || 1);
+    const costPerCase = Number(item.costPerCase) || 0;
+    const costPerUnit = Number(item.costPerUnit) || (costPerCase > 0 ? costPerCase / unitsPerCase : 0);
+    const sellPriceUnit = Number(item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price ?? (item as any).SellingPrice ?? 0));
+    const sellPriceCase = Number(item.sellPriceCase !== undefined ? item.sellPriceCase : (sellPriceUnit * unitsPerCase));
+    const stockCases = Number(item.stockCases !== undefined ? item.stockCases : 0);
+    const stockSingles = item.stockSingles !== undefined ? Number(item.stockSingles) : 0;
+    const totalUnits = Number(item.totalUnits !== undefined ? item.totalUnits : (stockCases * unitsPerCase + stockSingles));
+
+    if (idx >= 0) {
+      const existing = allItems[idx];
+      // Strict Last-Write-Wins (LWW)
+      if (!isIncomingRecordNewer(item, existing)) {
+        continue;
+      }
+
+      const updatedOverrides = { ...(existing.branchOverrides || {}), ...(item.branchOverrides || {}) };
+      Object.keys(updatedOverrides).forEach((b) => {
+        if (updatedOverrides[b]) {
+          updatedOverrides[b] = {
+            ...updatedOverrides[b],
+            sellPriceUnit,
+            sellPriceCase,
+            costPerUnit,
+            costPerCase,
+          };
+        }
+      });
+
+      const mergedPackagingVariants = item.packagingVariants || existing.packagingVariants;
+
+      // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
+      const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : 0));
+      const hubLastUpdated = item.lastUpdated || (hubTimestamp > 0 ? new Date(hubTimestamp).toISOString() : existing.lastUpdated);
+
+      allItems[idx] = {
+        ...existing,
+        ...item,
+        itemId: cleanId,
+        company_id: compId,
+        companyId: compId,
+        branch_id: item.branch_id || existing.branch_id || 'ALL',
+        branchId: item.branch_id || existing.branchId || 'ALL',
+        unitsPerCase,
+        costPerCase,
+        costPerUnit,
+        sellPriceUnit,
+        sellPriceCase,
+        stockCases,
+        stockSingles,
+        totalUnits,
+        branchOverrides: updatedOverrides,
+        packagingVariants: mergedPackagingVariants,
+        lastUpdated: hubLastUpdated || existing.lastUpdated,
+        updatedAt: hubTimestamp || (existing as any).updatedAt || (existing.lastUpdated ? new Date(existing.lastUpdated).getTime() : 0),
+        hubTimestamp: hubTimestamp || (existing as any).hubTimestamp,
+      };
+      ingestedCount++;
+      hasChanges = true;
+    } else {
+      const updatedOverrides = { ...(item.branchOverrides || {}) };
+      Object.keys(updatedOverrides).forEach((b) => {
+        if (updatedOverrides[b]) {
+          updatedOverrides[b] = {
+            ...updatedOverrides[b],
+            sellPriceUnit,
+            sellPriceCase,
+            costPerUnit,
+            costPerCase,
+          };
+        }
+      });
+
+      // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
+      const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : Date.now()));
+      const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
+
+      const savedItem: InventoryItem = {
+        ...item,
+        itemId: cleanId,
+        company_id: compId,
+        companyId: compId,
+        branch_id: item.branch_id || 'ALL',
+        branchId: item.branch_id || 'ALL',
+        unitsPerCase,
+        costPerCase,
+        costPerUnit,
+        sellPriceUnit,
+        sellPriceCase,
+        stockCases,
+        stockSingles,
+        totalUnits,
+        branchOverrides: updatedOverrides,
+        lastUpdated: hubLastUpdated,
+        updatedAt: hubTimestamp,
+        hubTimestamp: hubTimestamp,
+      };
+      allItems.unshift(savedItem);
+      ingestedCount++;
+      hasChanges = true;
+    }
+  }
+
+  if (hasChanges) {
+    const dedupMap = new Map<string, InventoryItem>();
+    for (const it of allItems) {
+      const itId = (it.itemId || (it as any).id || '').trim().toUpperCase();
+      if (!itId) continue;
+      const itComp = (it.company_id || (it as any).companyId || 'DEFAULT').trim().toUpperCase();
+      const key = `${itId}::${itComp}`;
+      if (!dedupMap.has(key)) {
+        dedupMap.set(key, it);
+      }
+    }
+    const cleanAllItems = Array.from(dedupMap.values());
+    setStored(STORAGE_KEYS.INVENTORY_ITEMS, cleanAllItems);
+
+    try {
+      const prodMap = new Map<string, Product>();
+      cleanAllItems.map((it) => inventoryItemToProduct(it)).forEach((p) => {
+        if (p.id && !prodMap.has(p.id)) {
+          prodMap.set(p.id, p);
+        }
+      });
+      setStored(STORAGE_KEYS.PRODUCTS, Array.from(prodMap.values()));
+    } catch (e) {
+      console.warn('Sync products error in ingestMeshInventoryItemsChunk:', e);
+    }
+  }
+
+  // Only trigger UI render / valuation recalculation on the final chunk
+  if (isLastChunk && hasChanges) {
+    recalculateInventoryValuationOnce();
+  }
+
+  return ingestedCount;
+};
+
+export const recalculateInventoryValuationOnce = () => {
+  notifyListeners();
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new Event('saimetric_inventory_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+    window.dispatchEvent(new Event('saimetric_products_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_products_updated'));
+  }
 };
 
 export const ingestMeshInventoryDelete = (itemId: string, companyId?: string): boolean => {

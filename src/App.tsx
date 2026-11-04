@@ -41,6 +41,7 @@ import { BluetoothPrinterModal } from './components/common/BluetoothPrinterModal
 import { getActiveCartItemCount, subscribeToPOSCart } from './utils/posCartStorage';
 import { historyNavigationService } from './services/historyNavigationService';
 import { OfflineIndicator } from './components/pwa/OfflineIndicator';
+import { SyncProgressIndicator } from './components/common/SyncProgressIndicator';
 import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
 import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield, X } from 'lucide-react';
 import { initializeSystemConfigAndSync } from './services/systemConfig';
@@ -140,6 +141,37 @@ export default function App() {
     toastTimeoutRef.current = setTimeout(() => {
       setToastNotification(null);
     }, durationMs);
+  };
+
+  // Smart Update banner listener (Update-on-Reload pattern for production)
+  const [updateAvailable, setUpdateAvailable] = useState<boolean>(false);
+  const waitingWorkerRef = useRef<ServiceWorker | null>(null);
+
+  useEffect(() => {
+    const handleUpdateReady = (event: Event) => {
+      const customEvent = event as CustomEvent<{ registration?: ServiceWorkerRegistration; waitingWorker?: ServiceWorker }>;
+      if (customEvent.detail?.waitingWorker) {
+        waitingWorkerRef.current = customEvent.detail.waitingWorker;
+      }
+      setUpdateAvailable(true);
+    };
+
+    window.addEventListener('saimetric_update_ready', handleUpdateReady);
+    return () => {
+      window.removeEventListener('saimetric_update_ready', handleUpdateReady);
+    };
+  }, []);
+
+  const handleApplyUpdate = () => {
+    try {
+      if (waitingWorkerRef.current) {
+        waitingWorkerRef.current.postMessage({ type: 'SKIP_WAITING' });
+      }
+    } catch (e) {
+      console.warn('Error signaling SKIP_WAITING to Service Worker:', e);
+    }
+    // Step 3: The Update Action: When the user taps the banner, call window.location.reload()
+    window.location.reload();
   };
 
   // Listen to EOD completion to automatically clear any day-lock notifications and inform user
@@ -434,10 +466,24 @@ export default function App() {
     setActiveTab(tab);
   };
 
+  const smartUpdateBanner = updateAvailable ? (
+    <div
+      onClick={handleApplyUpdate}
+      role="alert"
+      className="fixed top-0 left-0 right-0 z-[10000] bg-gradient-to-r from-indigo-600 via-indigo-500 to-indigo-600 text-white font-bold text-xs sm:text-sm py-2.5 px-4 text-center shadow-xl cursor-pointer hover:bg-indigo-500 active:scale-[0.99] transition-all flex items-center justify-center gap-2 border-b border-indigo-400/40 select-none animate-fadeIn"
+    >
+      <span>🚀 SAIMETRIC v2.0 is ready. Tap to update.</span>
+      <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-white/20 text-white font-black tracking-wider ml-1">
+        Update
+      </span>
+    </div>
+  ) : null;
+
   // If user is not logged in, display the Android Material 3 Login Screen
   if (!currentUser) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans w-full max-w-[100vw] overflow-x-clip">
+        {smartUpdateBanner}
         <AndroidStatusBar
           isOffline={isOfflineMode}
           onToggleOffline={() => setIsOfflineMode(!isOfflineMode)}
@@ -459,6 +505,7 @@ export default function App() {
   if (!isSuperAdmin && subStatus.isExpired) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans w-full max-w-[100vw] overflow-x-clip">
+        {smartUpdateBanner}
         <AndroidStatusBar
           isOffline={isOfflineMode}
           onToggleOffline={() => setIsOfflineMode(!isOfflineMode)}
@@ -478,6 +525,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-[#6A4DFF] selection:text-white relative w-full max-w-[100vw] overflow-x-clip">
+      {smartUpdateBanner}
       {/* 5-minute inactivity countdown warning (< 30s) */}
       {warningSeconds !== null && warningSeconds > 0 && (
         <div className="fixed top-3 left-1/2 -translate-x-1/2 z-50 bg-amber-500 text-slate-950 px-4 py-2 rounded-full shadow-2xl font-black text-xs flex items-center space-x-2 border-2 border-amber-300 animate-bounce">
@@ -1415,8 +1463,9 @@ export default function App() {
         )}
       </Suspense>
 
-      {/* 11. PWA Offline Status Banner */}
+      {/* 11. PWA Offline Status Banner & Mesh Sync Progress */}
       <OfflineIndicator isSimulatedOffline={isOfflineMode} />
+      <SyncProgressIndicator />
     </div>
   );
 }

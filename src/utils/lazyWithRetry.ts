@@ -43,8 +43,8 @@ export function lazyWithRetry<T extends ComponentType<any>>(
       } catch (retryError: any) {
         console.error(`[LazyLoader] Retry failed for ${moduleName || 'module'}:`, retryError?.message);
 
-        // If we haven't forced a reload in this session, reload the page to pick up the fresh assets
-        if (!hasRetriedInSession && typeof window !== 'undefined') {
+        // In Dev mode or when hidden (switching tabs/apps), never auto-reload to avoid disrupting Local Hub sync
+        if (!hasRetriedInSession && typeof window !== 'undefined' && !import.meta.env.DEV && !document.hidden) {
           sessionStorage.setItem(storageKey, 'true');
           window.location.reload();
           // Return a hanging promise while page reloads
