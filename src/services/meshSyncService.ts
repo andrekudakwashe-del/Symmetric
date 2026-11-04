@@ -4848,16 +4848,18 @@ class MeshSyncManager {
     this.notifyPeerSubscribers();
   }
 
-  public broadcastInventoryItem(item: InventoryItem) {
+  public broadcastInventoryItem(item: InventoryItem, explicitTimestamp?: number) {
     if (this.isIngestingFromHub) return;
     if (!item) return;
-    if ((item as any).fromMesh) return;
+    delete (item as any).fromMesh;
 
-    const now = Date.now();
+    const now = explicitTimestamp || Date.now();
     const nowIso = new Date(now).toISOString();
     item.updatedAt = now;
     (item as any).hubTimestamp = now;
     item.lastUpdated = nowIso;
+
+    console.log('[DEBUG] Broadcasting price to Hub:', item.itemName);
 
     const cleanId = (item.itemId || item.id || '').trim();
     const packetId = `ITEM-UPDATE-${cleanId || now}-${now}-${Math.random().toString(36).substring(2, 6)}`;

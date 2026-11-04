@@ -370,8 +370,14 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
     }
 
     // Direct save
-    const saved = saveInventoryItem(candidateItem);
-    meshSyncService.broadcastInventoryItem(saved);
+    const cleanCandidate = { ...candidateItem };
+    delete (cleanCandidate as any).fromMesh;
+    const saved = saveInventoryItem(cleanCandidate);
+    const updatedItem = { ...(saved || cleanCandidate) };
+    delete (updatedItem as any).fromMesh;
+
+    console.log('[DEBUG] Broadcasting price to Hub:', updatedItem.itemName);
+    meshSyncService.broadcastInventoryItem(updatedItem, Date.now());
 
     // Audit price & cost changes
     if (isEditing && initialItem) {
@@ -1341,8 +1347,11 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
               pendingSaveItem.sellPriceUnit
             );
             if (variantItem) {
-              meshSyncService.broadcastInventoryItem(variantItem);
-              onSaved(variantItem);
+              const cleanVar = { ...variantItem };
+              delete (cleanVar as any).fromMesh;
+              console.log('[DEBUG] Broadcasting price to Hub:', cleanVar.itemName);
+              meshSyncService.broadcastInventoryItem(cleanVar, Date.now());
+              onSaved(cleanVar);
               onClose();
             }
           }}
@@ -1358,8 +1367,11 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
               stockSingles: recalcResult ? recalcResult.newSingles : (pendingSaveItem.totalUnits % newRatio),
               totalUnits: recalcResult ? recalcResult.totalUnits : pendingSaveItem.totalUnits,
             });
-            meshSyncService.broadcastInventoryItem(updated);
-            onSaved(updated);
+            const cleanUpdated = { ...(updated || pendingSaveItem) };
+            delete (cleanUpdated as any).fromMesh;
+            console.log('[DEBUG] Broadcasting price to Hub:', cleanUpdated.itemName);
+            meshSyncService.broadcastInventoryItem(cleanUpdated, Date.now());
+            onSaved(cleanUpdated);
             onClose();
           }}
         />

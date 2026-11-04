@@ -9710,7 +9710,9 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
   }
 
   // 2. Notify inventory listeners so meshSyncService broadcasts to peers (only on user action, never from mesh)
-  if (!options?.fromMesh && !(item as any).fromMesh) {
+  const isFromMeshSync = Boolean(options?.fromMesh || (options as any)?.isMeshIngestion);
+  if (!isFromMeshSync) {
+    delete (normalized as any).fromMesh;
     inventoryCreationListeners.forEach((fn) => {
       try {
         fn(normalized);

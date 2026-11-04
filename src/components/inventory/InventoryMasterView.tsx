@@ -408,8 +408,14 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
       description: formData.description?.trim() || '',
     };
 
-    const saved = saveInventoryItem(itemToSave);
-    meshSyncService.broadcastInventoryItem(saved || itemToSave);
+    const cleanItemToSave = { ...itemToSave };
+    delete (cleanItemToSave as any).fromMesh;
+    const saved = saveInventoryItem(cleanItemToSave);
+    const updatedItem = { ...(saved || cleanItemToSave) };
+    delete (updatedItem as any).fromMesh;
+
+    console.log('[DEBUG] Broadcasting price to Hub:', updatedItem.itemName);
+    meshSyncService.broadcastInventoryItem(updatedItem, Date.now());
     refreshList();
     setShowAddModal(false);
     setEditingItem(null);
@@ -2021,7 +2027,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             setEditingItem(null);
           }}
           onSaved={(savedItem) => {
-            meshSyncService.broadcastInventoryItem(savedItem);
+            const updatedItem = { ...savedItem };
+            delete (updatedItem as any).fromMesh;
+            console.log('[DEBUG] Broadcasting price to Hub:', updatedItem.itemName);
+            meshSyncService.broadcastInventoryItem(updatedItem, Date.now());
             const freshItems = getInventoryItems();
             setItems(freshItems);
             setSelectedItemVariantId(savedItem.itemId);
