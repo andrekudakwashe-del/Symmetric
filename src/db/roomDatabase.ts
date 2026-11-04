@@ -9749,21 +9749,27 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
   return normalized;
 };
 
+export const parseTimestampMs = (val: any): number => {
+  if (val === undefined || val === null || val === '') return 0;
+  if (typeof val === 'number') return isNaN(val) ? 0 : val;
+  const asNum = Number(val);
+  if (!isNaN(asNum) && asNum > 1000000000000) return asNum;
+  const tm = new Date(val).getTime();
+  return isNaN(tm) ? 0 : tm;
+};
+
 export const extractRecordTimestamp = (rec: any): number => {
   if (!rec) return 0;
   const val =
-    rec.updatedAt ??
     rec.hubTimestamp ??
+    rec.updatedAt ??
     rec.lastUpdated ??
     rec.updated_at ??
     rec.timestamp ??
     rec.createdAt ??
     rec.created_at ??
     rec.date;
-  if (val === undefined || val === null) return 0;
-  if (typeof val === 'number') return val;
-  const tm = new Date(val).getTime();
-  return isNaN(tm) ? 0 : tm;
+  return parseTimestampMs(val);
 };
 
 export const isIncomingRecordNewer = (incoming: any, existing: any): boolean => {
@@ -9881,8 +9887,8 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const mergedPackagingVariants = item.packagingVariants || existing.packagingVariants;
 
     // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
-    const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : 0));
-    const hubLastUpdated = item.lastUpdated || (hubTimestamp > 0 ? new Date(hubTimestamp).toISOString() : existing.lastUpdated);
+    const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || extractRecordTimestamp(existing) || Date.now();
+    const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
     savedItem = {
       ...existing,
@@ -9923,7 +9929,7 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     });
 
     // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
-    const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : Date.now()));
+    const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
     const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
     savedItem = {
@@ -10073,8 +10079,8 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const mergedPackagingVariants = item.packagingVariants || existing.packagingVariants;
 
       // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
-      const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : 0));
-      const hubLastUpdated = item.lastUpdated || (hubTimestamp > 0 ? new Date(hubTimestamp).toISOString() : existing.lastUpdated);
+      const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || extractRecordTimestamp(existing) || Date.now();
+      const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
       allItems[idx] = {
         ...existing,
@@ -10115,7 +10121,7 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       });
 
       // Timestamp Authority: Save the Hub's timestamp; do NOT re-stamp with local Date.now()
-      const hubTimestamp = Number((item as any).hubTimestamp || item.updatedAt || (item.lastUpdated ? new Date(item.lastUpdated).getTime() : Date.now()));
+      const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
       const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
       const savedItem: InventoryItem = {

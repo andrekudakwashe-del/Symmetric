@@ -1020,12 +1020,12 @@ wss.on('connection', (ws, req) => {
           const incomingTime = getTimestamp(it);
 
           // STRICT LWW:
-          // If incoming update is OLDER than the Hub's existing record, reject it
-          // and send the authoritative Hub data back to the device!
+          // If incoming update is strictly OLDER than the Hub's existing record (with 5s clock skew grace),
+          // reject it and send the authoritative Hub data back to the device!
           if (exIdx >= 0) {
             const existing = inventoryStore[exIdx];
             const existingTime = getTimestamp(existing);
-            if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
+            if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
               console.log(
                 `[Termux Hub] 🛡️ LWW Reject: Stale inventory update for ${cleanId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative data back.`
               );
@@ -1036,6 +1036,9 @@ wss.on('connection', (ws, req) => {
                   itemId: cleanId,
                   item: existing,
                   payload: existing,
+                  updatedAt: existingTime,
+                  hubTimestamp: existingTime,
+                  lastUpdated: existing.lastUpdated || new Date(existingTime).toISOString(),
                   origin_device_id: 'LOCAL_HUB',
                   origin_device_name: 'Termux Local Hub',
                   timestamp: Date.now(),
@@ -1050,7 +1053,7 @@ wss.on('connection', (ws, req) => {
             ...it,
             itemId: cleanId,
             id: cleanId,
-            updatedAt: hubIso,
+            updatedAt: hubNow,
             hubTimestamp: hubNow,
             lastUpdated: hubIso,
           };
@@ -1082,6 +1085,9 @@ wss.on('connection', (ws, req) => {
             itemId: cleanId,
             item: stamped,
             payload: stamped,
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
             origin_device_id: 'LOCAL_HUB',
             origin_device_name: 'Termux Local Hub',
             timestamp: hubNow,

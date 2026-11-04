@@ -30,6 +30,7 @@ import {
   getCustomers,
   setStored,
   STORAGE_KEYS,
+  parseTimestampMs,
   extractRecordTimestamp,
   pullTenantInventory,
   getCurrentCompanyId,
@@ -1607,7 +1608,7 @@ class MeshSyncManager {
       const invItem = packet.item || packet.payload || (packet.itemId ? packet : null);
       if (invItem && (invItem.itemId || invItem.id)) {
         // Timestamp Authority: Save the Hub's timestamp; do not re-stamp with local time
-        const hubTimestamp = Number(packet.updatedAt || invItem.updatedAt || packet.timestamp || Date.now());
+        const hubTimestamp = parseTimestampMs(packet.hubTimestamp ?? packet.updatedAt ?? invItem.hubTimestamp ?? invItem.updatedAt ?? packet.timestamp) || Date.now();
         const hubLastUpdated = packet.lastUpdated || invItem.lastUpdated || new Date(hubTimestamp).toISOString();
         const ingested = ingestMeshInventoryItem({
           ...invItem,
@@ -3405,8 +3406,13 @@ class MeshSyncManager {
     ) {
       const invItem = packet.item || packet.payload || (packet.itemId ? packet : null);
       if (invItem && (invItem.itemId || invItem.id)) {
+        const hubTimestamp = parseTimestampMs(packet.hubTimestamp ?? packet.updatedAt ?? invItem.hubTimestamp ?? invItem.updatedAt ?? packet.timestamp) || Date.now();
+        const hubLastUpdated = packet.lastUpdated || invItem.lastUpdated || new Date(hubTimestamp).toISOString();
         const ingested = ingestMeshInventoryItem({
           ...invItem,
+          updatedAt: hubTimestamp,
+          hubTimestamp: hubTimestamp,
+          lastUpdated: hubLastUpdated,
           company_id: this.config.companyId,
           branch_id: invItem.branch_id || 'ALL',
           fromMesh: true,
@@ -4847,11 +4853,14 @@ class MeshSyncManager {
     if (!item) return;
     if ((item as any).fromMesh) return;
 
-    item.updatedAt = (item as any).updatedAt || Date.now();
-    item.lastUpdated = item.lastUpdated || new Date().toISOString();
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    item.updatedAt = now;
+    (item as any).hubTimestamp = now;
+    item.lastUpdated = nowIso;
 
     const cleanId = (item.itemId || item.id || '').trim();
-    const packetId = `ITEM-UPDATE-${cleanId || Date.now()}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const packetId = `ITEM-UPDATE-${cleanId || now}-${now}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
     const packet = {
@@ -4883,9 +4892,22 @@ class MeshSyncManager {
       barcode: item.barcode,
       packagingVariants: item.packagingVariants || [],
       branchOverrides: item.branchOverrides,
-      item,
-      payload: item,
-      timestamp: item.updatedAt,
+      item: {
+        ...item,
+        updatedAt: now,
+        hubTimestamp: now,
+        lastUpdated: nowIso,
+      },
+      payload: {
+        ...item,
+        updatedAt: now,
+        hubTimestamp: now,
+        lastUpdated: nowIso,
+      },
+      updatedAt: now,
+      hubTimestamp: now,
+      lastUpdated: nowIso,
+      timestamp: now,
       ttl: 5,
     };
 
