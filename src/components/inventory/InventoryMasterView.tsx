@@ -2027,10 +2027,6 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             setEditingItem(null);
           }}
           onSaved={(savedItem) => {
-            const updatedItem = { ...savedItem };
-            delete (updatedItem as any).fromMesh;
-            console.log('[DEBUG] Broadcasting price to Hub:', updatedItem.itemName);
-            meshSyncService.broadcastInventoryItem(updatedItem, Date.now());
             const freshItems = getInventoryItems();
             setItems(freshItems);
             setSelectedItemVariantId(savedItem.itemId);

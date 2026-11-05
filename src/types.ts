@@ -167,6 +167,7 @@ export type StocktakeCountType = any;
 export type StocktakeLineCount = any;
 export type StocktakeSegment = any;
 export type StocktakeSession = any;
+export type StocktakeStatus = any;
 export type StocktakeVerifiedLine = any;
 
 export interface StocktakeZoneAssignment {

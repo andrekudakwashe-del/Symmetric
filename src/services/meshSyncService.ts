@@ -75,6 +75,7 @@ import {
   syncLockdownFromHub,
   claimZoneSlot,
   updateZoneFromHubStatus,
+  ingestStocktakeSessionFromMesh,
   onSaleUpdated,
   onStaffChanged,
   onCustomerChanged,
@@ -259,6 +260,7 @@ class MeshSyncManager {
   private lastInitialCatchupTime: number = 0;
   private isAwaitingDrainAck: boolean = false;
   private drainAckFallbackTimer: any = null;
+  private lastBroadcastByItemId: Map<string, number> = new Map();
 
   // Chunked Ingestion & Async Progress State
   private syncProgressListeners: Array<(progress: MeshSyncProgress) => void> = [];
@@ -1280,6 +1282,21 @@ class MeshSyncManager {
           console.warn('[MeshSync] Error sending PING_HUB:', e);
         }
 
+        // Query active stocktake sessions and segments from Hub
+        try {
+          ws.send(
+            JSON.stringify({
+              type: 'STOCKTAKE_SESSION_LIST_REQUEST',
+              action: 'STOCKTAKE_SESSION_LIST_REQUEST',
+              deviceId: this.config.deviceId,
+              deviceName: this.config.deviceName,
+              timestamp: Date.now(),
+            })
+          );
+        } catch (e) {
+          console.warn('[MeshSync] Error sending STOCKTAKE_SESSION_LIST_REQUEST:', e);
+        }
+
         this.notifyPeerSubscribers(true);
         this.notifyConnectionModeChange();
 
@@ -1831,6 +1848,53 @@ class MeshSyncManager {
     // 10.8 BLIND SUBMISSION ACK
     if (pType === 'STOCKTAKE_ACK_SUBMIT') {
       window.dispatchEvent(new CustomEvent('saimetric_stocktake_ack_submit', { detail: packet }));
+      return;
+    }
+
+    // 10.9 STOCKTAKE SESSION STARTED & DISCOVERY
+    if (pType === 'STOCKTAKE_SESSION_STARTED') {
+      const sId = packet.sessionId || (packet.session && packet.session.sessionId);
+      if (sId) {
+        ingestStocktakeSessionFromMesh({
+          sessionId: sId,
+          sessionName: packet.sessionName || packet.title || packet.session?.title,
+          title: packet.sessionName || packet.title || packet.session?.title,
+          segments: packet.segments || packet.session?.segments || [],
+          startedBy: packet.startedBy || packet.startedByName || packet.session?.createdByName,
+          startedAt: packet.startedAt || packet.timestamp || packet.session?.timestamp,
+          countType: packet.countType || packet.session?.countType,
+          branchId: packet.branchId || packet.session?.branchId,
+          branchName: packet.branchName || packet.session?.branchName,
+          isLockdownActive: packet.isLockdownActive !== undefined ? packet.isLockdownActive : packet.session?.isLockdownActive,
+          notes: packet.notes || packet.session?.notes,
+        });
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        }
+      }
+      return;
+    }
+
+    // 10.10 STOCKTAKE SESSION LIST RESPONSE
+    if (pType === 'STOCKTAKE_SESSION_LIST') {
+      const sessions = packet.sessions || packet.payload?.sessions || [];
+      const segments = packet.segments || packet.payload?.segments || [];
+      if (Array.isArray(sessions) && sessions.length > 0) {
+        sessions.forEach((sess: any) => {
+          if (sess && sess.sessionId) {
+            const sessSegments = Array.isArray(sess.segments) && sess.segments.length > 0
+              ? sess.segments
+              : (Array.isArray(segments) ? segments.filter((sg: any) => sg.sessionId === sess.sessionId) : []);
+            ingestStocktakeSessionFromMesh({
+              ...sess,
+              segments: sessSegments,
+            });
+          }
+        });
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        }
+      }
       return;
     }
 
@@ -4555,6 +4619,24 @@ class MeshSyncManager {
       }
     }
 
+    // 8.2 Ingest Stocktake Sessions & Segments from Catch-up Delta
+    if (Array.isArray(delta.stocktakeSessions) && delta.stocktakeSessions.length > 0) {
+      for (const sess of delta.stocktakeSessions) {
+        if (sess && sess.sessionId) {
+          const sessSegments = Array.isArray(sess.segments) && sess.segments.length > 0
+            ? sess.segments
+            : (Array.isArray(delta.stocktakeSegments) ? delta.stocktakeSegments.filter((sg: any) => sg.sessionId === sess.sessionId) : []);
+          ingestStocktakeSessionFromMesh({
+            ...sess,
+            segments: sessSegments,
+          });
+        }
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+      }
+    }
+
     // Complete sync progress indicator
     if (totalRecordsToProcess > 0) {
       this.finishSyncProgress(totalRecordsToProcess, 'Sync Complete');
@@ -4853,7 +4935,19 @@ class MeshSyncManager {
     if (!item) return;
     delete (item as any).fromMesh;
 
-    const now = explicitTimestamp || Date.now();
+    const cleanId = (item.itemId || item.id || '').trim();
+    const callTime = Date.now();
+    console.log('[DEBUG] broadcastInventoryItem called for:', item.itemId || item.id, 'at:', callTime);
+
+    if (cleanId) {
+      const prev = this.lastBroadcastByItemId.get(cleanId);
+      if (prev && callTime - prev < 500) {
+        return; // Ignore duplicate broadcast within 500ms
+      }
+      this.lastBroadcastByItemId.set(cleanId, callTime);
+    }
+
+    const now = explicitTimestamp || callTime;
     const nowIso = new Date(now).toISOString();
     item.updatedAt = now;
     (item as any).hubTimestamp = now;
@@ -4861,7 +4955,6 @@ class MeshSyncManager {
 
     console.log('[DEBUG] Broadcasting price to Hub:', item.itemName);
 
-    const cleanId = (item.itemId || item.id || '').trim();
     const packetId = `ITEM-UPDATE-${cleanId || now}-${now}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
@@ -5612,6 +5705,46 @@ class MeshSyncManager {
       timestamp: Date.now(),
     };
     this.sendPacketToAllTransports('stocktake/lockdown_broadcast', packet);
+  }
+
+  public broadcastStocktakeSessionStarted(data: {
+    sessionId: string;
+    sessionName: string;
+    segments: any[];
+    startedBy: string;
+    startedAt: string;
+    countType?: string;
+    branchId?: string;
+    branchName?: string;
+    isLockdownActive?: boolean;
+    notes?: string;
+  }): void {
+    const packet = {
+      type: 'STOCKTAKE_SESSION_STARTED',
+      action: 'STOCKTAKE_SESSION_STARTED',
+      sessionId: data.sessionId,
+      sessionName: data.sessionName,
+      title: data.sessionName,
+      segments: data.segments,
+      startedBy: data.startedBy,
+      startedAt: data.startedAt,
+      countType: data.countType,
+      branchId: data.branchId || this.config.branchId,
+      branchName: data.branchName,
+      isLockdownActive: data.isLockdownActive,
+      notes: data.notes,
+      companyId: this.config.companyId,
+      deviceId: this.config.deviceId,
+      deviceName: this.config.deviceName,
+      timestamp: Date.now(),
+    };
+    this.sendPacketToAllTransports('stocktake/session_started', packet);
+    this.addLog(
+      'BROADCAST',
+      `Stocktake session "${data.sessionName}" [${data.sessionId}] started with ${data.segments.length} segment(s). Broadcasted to Hub & peers.`,
+      this.config.deviceName
+    );
+    this.notifyPeerSubscribers();
   }
 }
 

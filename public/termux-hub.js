@@ -63,6 +63,7 @@ let hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1]
   : (process.env.HUB_TENANT_ID || 'COMP-001');
 
 const DATA_FILE = path.join(process.cwd(), 'termux-hub-data.json');
+const BLIND_VAULT_FILE = path.join(process.cwd(), 'hub-blind-vault.json');
 const MAX_STORAGE_BYTES = 2 * 1024 * 1024 * 1024; // 2GB Safety Limit for Termux hardware
 const ROTATION_DAYS = 30; // 30-day rotation for archived historical movements
 
@@ -83,6 +84,8 @@ let cashTransfersStore = [];
 let casualWorkersStore = [];
 let zoneAssignmentsStore = [];
 let branchLockdownsStore = {};
+let stocktakeSessionsStore = [];
+let stocktakeSegmentsStore = [];
 
 // Staff & Customer Master Stores (Synced across multi-device Wi-Fi)
 let salespeopleStore = [];
@@ -92,9 +95,33 @@ let customersStore = [];
 let businessDayClosuresStore = [];
 let electronicSettlementsStore = [];
 
-// Secret holding vault for blind double-counting:
+// Secret holding vault for blind double-counting backed by hub-blind-vault.json:
 // Structure: { [sessionId]: { [zoneId]: { A: null, B: null } } }
-const hubBlindStore = {};
+let hubBlindStore = {};
+
+function loadBlindVault() {
+  try {
+    if (fs.existsSync(BLIND_VAULT_FILE)) {
+      const raw = fs.readFileSync(BLIND_VAULT_FILE, 'utf8');
+      hubBlindStore = JSON.parse(raw) || {};
+      const sessionCount = Object.keys(hubBlindStore).length;
+      console.log(`[Hub] Loaded ${sessionCount} sessions from blind vault.`);
+    } else {
+      hubBlindStore = {};
+    }
+  } catch (e) {
+    console.warn('[Hub] Notice loading blind vault file:', e.message);
+    hubBlindStore = {};
+  }
+}
+
+function saveBlindVault() {
+  try {
+    fs.writeFileSync(BLIND_VAULT_FILE, JSON.stringify(hubBlindStore, null, 2), 'utf8');
+  } catch (e) {
+    console.error('[Hub] Error saving blind vault:', e.message);
+  }
+}
 
 let packetCounter = 0;
 const seenPacketIds = new Set();
@@ -189,9 +216,11 @@ function loadData() {
       if (parsed.branchLockdowns && typeof parsed.branchLockdowns === 'object') {
         branchLockdownsStore = parsed.branchLockdowns;
       }
+      if (Array.isArray(parsed.stocktakeSessions)) stocktakeSessionsStore = parsed.stocktakeSessions;
+      if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
 
       console.log(
-        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${businessDayClosuresStore.length} EOD closures.`
+        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${businessDayClosuresStore.length} EOD closures, ${stocktakeSessionsStore.length} stocktake sessions.`
       );
     }
   } catch (e) {
@@ -232,6 +261,8 @@ function saveData() {
       businessDayClosures: businessDayClosuresStore.slice(0, 365),
       electronicSettlements: electronicSettlementsStore.slice(0, 365),
       branchLockdowns: branchLockdownsStore,
+      stocktakeSessions: stocktakeSessionsStore.slice(0, 500),
+      stocktakeSegments: stocktakeSegmentsStore.slice(0, 2000),
       savedAt: new Date().toISOString(),
     };
 
@@ -249,6 +280,7 @@ function saveData() {
 }
 
 loadData();
+loadBlindVault();
 
 // HTTP server for health checks & ping
 const server = http.createServer((req, res) => {
@@ -545,6 +577,85 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
+      // 0.45 STOCKTAKE SESSION & SEGMENT DISCOVERY
+      // =====================================================================
+      if (pType === 'STOCKTAKE_SESSION_STARTED') {
+        const sess = packet.session || packet;
+        const sessionId = packet.sessionId || sess.sessionId;
+        if (sessionId) {
+          const sIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+          const sessionObj = {
+            sessionId,
+            title: packet.sessionName || packet.title || sess.title || `Session ${sessionId}`,
+            sessionName: packet.sessionName || packet.title || sess.title || `Session ${sessionId}`,
+            segments: Array.isArray(packet.segments) ? packet.segments : (sess.segments || []),
+            startedBy: packet.startedBy || sess.startedBy || 'Manager',
+            startedAt: packet.startedAt || sess.startedAt || new Date().toISOString(),
+            countType: packet.countType || sess.countType || 'DAILY_BLIND',
+            branchId: packet.branchId || sess.branchId || hubBranchId,
+            branchName: packet.branchName || sess.branchName || hubBranchName,
+            isLockdownActive: Boolean(packet.isLockdownActive || sess.isLockdownActive),
+            notes: packet.notes || sess.notes || '',
+            updatedAt: Date.now(),
+          };
+
+          if (sIdx >= 0) {
+            stocktakeSessionsStore[sIdx] = { ...stocktakeSessionsStore[sIdx], ...sessionObj };
+          } else {
+            stocktakeSessionsStore.unshift(sessionObj);
+          }
+
+          if (Array.isArray(sessionObj.segments) && sessionObj.segments.length > 0) {
+            sessionObj.segments.forEach((seg) => {
+              const segId = seg.segmentId || seg.id;
+              const exSegIdx = stocktakeSegmentsStore.findIndex(
+                (s) => s.sessionId === sessionId && (s.segmentId === segId || s.id === segId)
+              );
+              const segObj = { ...seg, sessionId, segmentId: segId };
+              if (exSegIdx >= 0) {
+                stocktakeSegmentsStore[exSegIdx] = { ...stocktakeSegmentsStore[exSegIdx], ...segObj };
+              } else {
+                stocktakeSegmentsStore.push(segObj);
+              }
+            });
+          }
+
+          scheduleSave();
+          console.log(
+            `[Termux Hub] 📋 Started Stocktake Session [${sessionId}] "${sessionObj.sessionName}" with ${(sessionObj.segments || []).length} segments. Saved to disk & broadcasted to peers.`
+          );
+
+          // Broadcast to all other peers
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(dataStr);
+              } catch (e) {}
+            }
+          });
+        }
+        return;
+      }
+
+      if (pType === 'STOCKTAKE_SESSION_LIST_REQUEST') {
+        try {
+          ws.send(
+            JSON.stringify({
+              type: 'STOCKTAKE_SESSION_LIST',
+              action: 'STOCKTAKE_SESSION_LIST',
+              sessions: stocktakeSessionsStore,
+              segments: stocktakeSegmentsStore,
+              timestamp: Date.now(),
+            })
+          );
+          console.log(
+            `[Termux Hub] 📋 Replied to STOCKTAKE_SESSION_LIST_REQUEST with ${stocktakeSessionsStore.length} session(s) and ${stocktakeSegmentsStore.length} segment(s).`
+          );
+        } catch (e) {}
+        return;
+      }
+
+      // =====================================================================
       // 0.5 SELF-SERVICE ZONE CLAIMING
       // =====================================================================
       if (pType === 'STOCKTAKE_ZONE_CLAIM') {
@@ -618,9 +729,8 @@ wss.on('connection', (ws, req) => {
           lines: Array.isArray(lines) ? lines : [],
         };
 
-        console.log(
-          `[Termux Hub] 🤫 Vaulted Team ${slot} count for Zone ${zoneId} (${(lines || []).length} items) by ${staffName}. Broadcast suppressed to protect blind audit.`
-        );
+        saveBlindVault();
+        console.log(`[Hub] Vaulted Team ${slot} count for Zone ${zoneId}. Saved to disk.`);
 
         try {
           const ackPacket = {
@@ -1501,6 +1611,8 @@ wss.on('connection', (ws, req) => {
             salespeople: missedSalespeople,
             customers: missedCustomers,
             businessDayClosures: businessDayClosuresStore,
+            stocktakeSessions: stocktakeSessionsStore,
+            stocktakeSegments: stocktakeSegmentsStore,
           },
         };
 

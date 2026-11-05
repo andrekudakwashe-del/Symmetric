@@ -32,6 +32,7 @@ import {
   deleteStocktakeSession,
   authenticateCasualWorker,
 } from '../../db/roomDatabase';
+import { meshSyncService } from '../../services/meshSyncService';
 import { StocktakeSessionDetailScreen } from './StocktakeSessionDetailScreen';
 
 interface StocktakeHubScreenProps {
@@ -68,6 +69,13 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
 
   useEffect(() => {
     loadSessions();
+    const handleUpdate = () => {
+      loadSessions();
+    };
+    window.addEventListener('saimetric_stocktake_updated', handleUpdate);
+    return () => {
+      window.removeEventListener('saimetric_stocktake_updated', handleUpdate);
+    };
   }, []);
 
   const handleSelectCountType = (type: StocktakeCountType) => {
@@ -128,6 +136,20 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
       segmentNames,
       staffId,
       staffName,
+    });
+
+    // Requirement: When Manager taps 'Start Session', broadcast ONE STOCKTAKE_SESSION_STARTED packet
+    meshSyncService.broadcastStocktakeSessionStarted({
+      sessionId: newSession.sessionId,
+      sessionName: newSession.title,
+      segments: newSession.segments,
+      startedBy: staffName,
+      startedAt: newSession.timestamp,
+      countType: newSession.countType,
+      branchId: newSession.branchId,
+      branchName: newSession.branchName,
+      isLockdownActive: newSession.isLockdownActive,
+      notes: newSession.notes,
     });
 
     loadSessions();
@@ -802,7 +824,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                   type="submit"
                   className="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold shadow-lg"
                 >
-                  Initialize Stocktake
+                  Start Session
                 </button>
               </div>
             </form>

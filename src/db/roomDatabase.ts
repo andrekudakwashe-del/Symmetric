@@ -31,6 +31,7 @@ import {
   StockTxnType,
   StockPromptResponse,
   StocktakeSession,
+  StocktakeStatus,
   StocktakeCountType,
   StocktakeSegment,
   StocktakeLineCount,
@@ -13621,6 +13622,80 @@ export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
   lockdowns[lockdown.branchId] = lockdown;
   setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
   notifyListeners();
+};
+
+export const ingestStocktakeSessionFromMesh = (data: {
+  sessionId: string;
+  sessionName?: string;
+  title?: string;
+  segments?: StocktakeSegment[];
+  startedBy?: string;
+  startedAt?: string;
+  date?: string;
+  countType?: StocktakeCountType;
+  branchId?: string;
+  branchName?: string;
+  isLockdownActive?: boolean;
+  notes?: string;
+  status?: StocktakeStatus;
+  companyId?: string;
+  company_id?: string;
+}): StocktakeSession => {
+  const existing = getStocktakeSessionById(data.sessionId);
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
+
+  const session: StocktakeSession = {
+    sessionId: data.sessionId,
+    title: data.sessionName || data.title || existing?.title || `Stocktake Audit ${data.sessionId}`,
+    date: data.startedAt ? data.startedAt.split('T')[0] : (data.date || existing?.date || new Date().toISOString().split('T')[0]),
+    countType: data.countType || existing?.countType || 'DAILY_BLIND',
+    status: data.status || existing?.status || 'COUNTING',
+    branchId: data.branchId || existing?.branchId || currentBranch,
+    branchName: data.branchName || existing?.branchName || 'Main Central Distribution & Warehouse',
+    isLockdownActive: data.isLockdownActive !== undefined ? Boolean(data.isLockdownActive) : Boolean(existing?.isLockdownActive),
+    createdBy: data.startedBy || existing?.createdBy || 'MANAGER',
+    createdByName: data.startedBy || existing?.createdByName || 'Manager',
+    segments: Array.isArray(data.segments) && data.segments.length > 0 ? data.segments : (existing?.segments || []),
+    consolidatedItems: existing?.consolidatedItems || [],
+    totalSystemUnits: existing?.totalSystemUnits || 0,
+    totalCountedUnits: existing?.totalCountedUnits || 0,
+    varianceUnits: existing?.varianceUnits || 0,
+    varianceCostValue: existing?.varianceCostValue || 0,
+    varianceRetailValue: existing?.varianceRetailValue || 0,
+    notes: data.notes || existing?.notes || '',
+    timestamp: data.startedAt || existing?.timestamp || new Date().toISOString(),
+    synced: true,
+    company_id: data.companyId || data.company_id || existing?.company_id || currentCompany,
+    companyId: data.companyId || data.company_id || existing?.companyId || currentCompany,
+  };
+
+  saveStocktakeSession(session);
+
+  // Initialize zone assignments for each segment if not already present
+  if (Array.isArray(session.segments)) {
+    const assignments = getZoneAssignments(session.sessionId);
+    session.segments.forEach((seg) => {
+      const found = assignments.find((z) => z.zoneId === seg.segmentId);
+      if (!found) {
+        saveZoneAssignment({
+          zoneId: seg.segmentId,
+          zoneName: seg.name,
+          sessionId: session.sessionId,
+          branchId: session.branchId,
+          status: 'AVAILABLE',
+        });
+      }
+    });
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
+  }
+
+  return session;
 };
 
 // ============================================================================
