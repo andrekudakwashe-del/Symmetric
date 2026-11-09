@@ -30,6 +30,7 @@ import {
   getCustomers,
   setStored,
   STORAGE_KEYS,
+  mergeT1Records,
   parseTimestampMs,
   extractRecordTimestamp,
   pullTenantInventory,
@@ -5208,120 +5209,96 @@ class MeshSyncManager {
       this.updateSyncProgress(0, totalRecordsToProcess, `Syncing 0/${totalRecordsToProcess} items...`);
     }
 
-    // 1. Chunked Ingestion for Sales (Chunks of 50 + Yield to Browser)
+    // 1. Ingest Sales (T1 - Append-Only Merge)
     if (Array.isArray(delta.sales) && delta.sales.length > 0) {
-      const sales = delta.sales;
-      const CHUNK_SIZE = 50;
-      for (let i = 0; i < sales.length; i += CHUNK_SIZE) {
-        const chunk = sales.slice(i, i + CHUNK_SIZE);
-        for (const sale of chunk) {
-          if (ingestMeshSale({ ...sale, fromMesh: true })) {
-            salesIngested++;
-          }
-        }
-        overallProcessed += chunk.length;
-        this.updateSyncProgress(
-          overallProcessed,
-          totalRecordsToProcess,
-          `Syncing ${overallProcessed}/${totalRecordsToProcess} items...`
-        );
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      mergeT1Records(STORAGE_KEYS.SALES, delta.sales);
+      salesIngested += delta.sales.length;
+      overallProcessed += delta.sales.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
       }
     }
 
-    // 2. Chunked Ingestion for Cash Logs & Movements (Chunks of 50 + Yield)
+    // 2. Ingest Cash Logs, Lifts & Movements (T1 - Append-Only Merge)
     if (Array.isArray(delta.cashLogs) && delta.cashLogs.length > 0) {
-      const logs = delta.cashLogs;
-      const CHUNK_SIZE = 50;
-      for (let i = 0; i < logs.length; i += CHUNK_SIZE) {
-        const chunk = logs.slice(i, i + CHUNK_SIZE);
-        for (const cashLog of chunk) {
-          if (ingestMeshCashLog({ ...cashLog, fromMesh: true })) {
-            cashLogsIngested++;
-          }
-        }
-        overallProcessed += chunk.length;
-        this.updateSyncProgress(
-          overallProcessed,
-          totalRecordsToProcess,
-          `Syncing ${overallProcessed}/${totalRecordsToProcess} items...`
-        );
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      mergeT1Records(STORAGE_KEYS.CASH_LOGS, delta.cashLogs);
+      cashLogsIngested += delta.cashLogs.length;
+      overallProcessed += delta.cashLogs.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
     }
-    if (Array.isArray(delta.cashLifts)) {
-      for (const lift of delta.cashLifts) {
-        if (ingestMeshCashLift(lift)) {
-          cashLiftsIngested++;
-        }
+    if (Array.isArray(delta.cashLifts) && delta.cashLifts.length > 0) {
+      mergeT1Records(STORAGE_KEYS.CASH_LIFTS, delta.cashLifts);
+      cashLiftsIngested += delta.cashLifts.length;
+      overallProcessed += delta.cashLifts.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
     }
-    if (Array.isArray(delta.cashMovements)) {
-      for (const m of delta.cashMovements) {
-        if (!m || !m.id) continue;
-        const currentMoves = getMovements();
-        if (!currentMoves.some((existing) => existing.id === m.id)) {
-          addMovement({ ...m, fromMesh: true });
-        }
+    if (Array.isArray(delta.cashMovements) && delta.cashMovements.length > 0) {
+      mergeT1Records('saimetric_room_cash_movements', delta.cashMovements);
+      overallProcessed += delta.cashMovements.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
     }
 
-    // 3. Ingest Customer Changes & Credit Sales
-    if (Array.isArray(delta.customerChanges)) {
-      for (const ch of delta.customerChanges) {
-        if (ingestMeshCustomerChange(ch)) {
-          changesIngested++;
-        }
+    // 3. Ingest Customer Changes & Credit Sales (T1 - Append-Only Merge)
+    if (Array.isArray(delta.customerChanges) && delta.customerChanges.length > 0) {
+      mergeT1Records(STORAGE_KEYS.CUSTOMER_CHANGES, delta.customerChanges);
+      changesIngested += delta.customerChanges.length;
+      overallProcessed += delta.customerChanges.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
       }
     }
-    if (Array.isArray(delta.creditSales)) {
-      for (const cs of delta.creditSales) {
-        if (ingestMeshCreditSale(cs)) {
-          changesIngested++;
-        }
+    if (Array.isArray(delta.creditSales) && delta.creditSales.length > 0) {
+      mergeT1Records(STORAGE_KEYS.CREDIT_SALES, delta.creditSales);
+      changesIngested += delta.creditSales.length;
+      overallProcessed += delta.creditSales.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
       }
     }
 
-    // 4. Ingest Stock Movements, GRVs & Goods Received Notes (Chunks of 50)
+    // 4. Ingest Stock Movements, GRVs & Goods Received Notes (T1 - Append-Only Merge)
     if (Array.isArray(delta.stockMovements) && delta.stockMovements.length > 0) {
-      const movements = delta.stockMovements;
-      const CHUNK_SIZE = 50;
-      for (let i = 0; i < movements.length; i += CHUNK_SIZE) {
-        const chunk = movements.slice(i, i + CHUNK_SIZE);
-        for (const sm of chunk) {
-          if (ingestMeshStockMovement(sm)) {
-            movementsIngested++;
-          }
-        }
-        overallProcessed += chunk.length;
-        this.updateSyncProgress(
-          overallProcessed,
-          totalRecordsToProcess,
-          `Syncing ${overallProcessed}/${totalRecordsToProcess} items...`
-        );
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      mergeT1Records(STORAGE_KEYS.STOCK_MOVEMENTS, delta.stockMovements);
+      movementsIngested += delta.stockMovements.length;
+      overallProcessed += delta.stockMovements.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
       }
     }
-    if (Array.isArray(delta.directGrvs)) {
-      for (const grv of delta.directGrvs) {
-        ingestMeshGRV({ ...grv, fromMesh: true });
-      }
+    if (Array.isArray(delta.directGrvs) && delta.directGrvs.length > 0) {
+      mergeT1Records(STORAGE_KEYS.DIRECT_GRVS, delta.directGrvs);
       overallProcessed += delta.directGrvs.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      }
     }
-    if (Array.isArray(delta.goodsReceivedNotes)) {
-      for (const grn of delta.goodsReceivedNotes) {
-        if (ingestMeshGoodsReceived(grn)) {
-          grnIngested++;
-        }
+    if (Array.isArray(delta.goodsReceivedNotes) && delta.goodsReceivedNotes.length > 0) {
+      mergeT1Records(STORAGE_KEYS.GOODS_RECEIVED_NOTES, delta.goodsReceivedNotes);
+      grnIngested += delta.goodsReceivedNotes.length;
+      overallProcessed += delta.goodsReceivedNotes.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
       }
     }
 
-    // 5. Ingest Audit Logs / Supervisor PIN Approvals
-    if (Array.isArray(delta.auditLogs)) {
-      for (const audit of delta.auditLogs) {
-        if (ingestMeshSupervisorApproval(audit)) {
-          auditLogsIngested++;
-        }
+    // 5. Ingest Audit Logs / Supervisor PIN Approvals (T1 - Append-Only Merge)
+    if (Array.isArray(delta.auditLogs) && delta.auditLogs.length > 0) {
+      mergeT1Records(STORAGE_KEYS.AUDIT_LOGS, delta.auditLogs);
+      auditLogsIngested += delta.auditLogs.length;
+      overallProcessed += delta.auditLogs.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_audit_log_updated'));
       }
     }
 
@@ -5353,26 +5330,32 @@ class MeshSyncManager {
       recalculateInventoryValuationOnce();
     }
 
-    // 7. Ingest Expenses
-    if (Array.isArray(delta.expenses)) {
-      for (const exp of delta.expenses) {
-        addExpense({ ...exp, fromMesh: true }, { fromSync: true });
-        expensesIngested++;
-      }
+    // 7. Ingest Expenses (T1 - Append-Only Merge)
+    if (Array.isArray(delta.expenses) && delta.expenses.length > 0) {
+      mergeT1Records(STORAGE_KEYS.EXPENSES, delta.expenses);
+      expensesIngested += delta.expenses.length;
       overallProcessed += delta.expenses.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+      }
     }
 
     // 8. Ingest Cash Accounts & Transfers
-    if (Array.isArray(delta.cashAccounts)) {
+    if (Array.isArray(delta.cashAccounts) && delta.cashAccounts.length > 0) {
       for (const acc of delta.cashAccounts) {
         saveCashAccount(acc, { fromSync: true });
         accountsIngested++;
       }
     }
-    if (Array.isArray(delta.cashTransfers)) {
-      for (const trf of delta.cashTransfers) {
-        saveCashTransfer(trf, { fromSync: true });
-        accountsIngested++;
+    if (Array.isArray(delta.cashTransfers) && delta.cashTransfers.length > 0) {
+      mergeT1Records(STORAGE_KEYS.CASH_TRANSFERS, delta.cashTransfers);
+      accountsIngested += delta.cashTransfers.length;
+      overallProcessed += delta.cashTransfers.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_cash_transfers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
       }
     }
 
@@ -5446,52 +5429,59 @@ class MeshSyncManager {
       }
     }
 
-    // 8.5 Ingest Suppliers from Catch-up Delta (T1)
-    if (Array.isArray(delta.suppliers)) {
-      for (const supp of delta.suppliers) {
-        this.ingestMeshSupplier({ ...supp, fromMesh: true });
-      }
+    // 8.5 Ingest Suppliers from Catch-up Delta (T1 - Append-Only Merge)
+    if (Array.isArray(delta.suppliers) && delta.suppliers.length > 0) {
+      mergeT1Records(STORAGE_KEYS.SUPPLIERS, delta.suppliers);
       overallProcessed += delta.suppliers.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_supplier_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_suppliers_updated'));
+      }
     }
 
-    // 8.6 Ingest Admin Sales from Catch-up Delta (T1)
-    if (Array.isArray(delta.adminSales)) {
-      for (const asEntry of delta.adminSales) {
-        this.ingestMeshAdminSales({ ...asEntry, fromMesh: true });
-      }
+    // 8.6 Ingest Admin Sales from Catch-up Delta (T1 - Append-Only Merge)
+    if (Array.isArray(delta.adminSales) && delta.adminSales.length > 0) {
+      mergeT1Records(STORAGE_KEYS.ADMIN_SALES, delta.adminSales);
       overallProcessed += delta.adminSales.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_admin_sales_updated'));
+      }
     }
 
-    // 8.7 Ingest Cash Counts from Catch-up Delta (T1)
-    if (Array.isArray(delta.cashCounts)) {
-      for (const cc of delta.cashCounts) {
-        this.ingestMeshCashCount({ ...cc, fromMesh: true });
-      }
+    // 8.7 Ingest Cash Counts from Catch-up Delta (T1 - Append-Only Merge)
+    if (Array.isArray(delta.cashCounts) && delta.cashCounts.length > 0) {
+      mergeT1Records(STORAGE_KEYS.CASH_COUNTS, delta.cashCounts);
       overallProcessed += delta.cashCounts.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_cash_counts_updated'));
+      }
     }
 
-    // 8.8 Ingest Vouchers / Supplier Invoices from Catch-up Delta (T1)
-    if (Array.isArray(delta.vouchers)) {
-      for (const v of delta.vouchers) {
-        this.ingestMeshVoucher({ ...v, fromMesh: true });
-      }
+    // 8.8 Ingest Vouchers / Supplier Invoices from Catch-up Delta (T1 - Append-Only Merge)
+    if (Array.isArray(delta.vouchers) && delta.vouchers.length > 0) {
+      mergeT1Records(STORAGE_KEYS.SUPPLIER_INVOICES, delta.vouchers);
       overallProcessed += delta.vouchers.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_vouchers_updated'));
+      }
     }
 
-    // 8.9 Ingest Business Day Closures from Catch-up Delta (T1)
-    if (Array.isArray(delta.businessDayClosures)) {
-      for (const c of delta.businessDayClosures) {
-        this.ingestMeshClosure({ ...c, fromMesh: true });
-      }
+    // 8.9 Ingest Business Day Closures from Catch-up Delta (T1 - Append-Only Merge)
+    if (Array.isArray(delta.businessDayClosures) && delta.businessDayClosures.length > 0) {
+      mergeT1Records(STORAGE_KEYS.BUSINESS_DAY_CLOSURES, delta.businessDayClosures);
       overallProcessed += delta.businessDayClosures.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_closures_updated'));
+      }
     }
 
-    // 8.10 Ingest Electronic Settlements from Catch-up Delta (T1)
-    if (Array.isArray(delta.electronicSettlements)) {
-      for (const s of delta.electronicSettlements) {
-        this.ingestMeshSettlement({ ...s, fromMesh: true });
-      }
+    // 8.10 Ingest Electronic Settlements from Catch-up Delta (T1 - Append-Only Merge)
+    if (Array.isArray(delta.electronicSettlements) && delta.electronicSettlements.length > 0) {
+      mergeT1Records(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, delta.electronicSettlements);
       overallProcessed += delta.electronicSettlements.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_settlements_updated'));
+      }
     }
 
     // 8.11 Ingest Categories from Catch-up Delta (T2)

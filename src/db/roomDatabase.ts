@@ -621,6 +621,66 @@ export function setStored<T>(key: string, value: T, options?: { skipIdbOverwrite
   }
 }
 
+/**
+ * Generic T1 Merge Helper (Append-Only / Upsert by ID)
+ * Prevents catchup arrays or empty deltas from wiping or overwriting local T1 records.
+ * If incomingRecords is empty (length === 0), it does absolutely nothing and avoids touching local storage.
+ */
+export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[] => {
+  // If the delta array is empty (length === 0), do absolutely nothing. Do not touch local storage.
+  if (!incomingRecords || !Array.isArray(incomingRecords) || incomingRecords.length === 0) {
+    return getStored<any[]>(storageKey, []);
+  }
+
+  const existing = getStored<any[]>(storageKey, []);
+  const map = new Map<string, any>();
+
+  const getRecordId = (item: any): string => {
+    if (!item || typeof item !== 'object') return '';
+    return String(
+      item.id ||
+      item.invoice_id ||
+      item.invoiceNumber ||
+      item.supplierId ||
+      item.voucherId ||
+      item.grvId ||
+      item.grnId ||
+      item.liftId ||
+      item.account_id ||
+      item.transfer_id ||
+      item.closure_id ||
+      item.settlement_id ||
+      ''
+    ).trim();
+  };
+
+  // Populate map with existing local records
+  existing.forEach((item, idx) => {
+    const key = getRecordId(item) || `_existing_${idx}`;
+    map.set(key, item);
+  });
+
+  // Iterate over incoming delta: update Map if ID exists (or add if new)
+  incomingRecords.forEach((item) => {
+    if (!item) return;
+    const key = getRecordId(item);
+    if (key) {
+      const prev = map.get(key);
+      map.set(key, prev ? { ...prev, ...item } : item);
+    } else {
+      map.set(`_inc_${Math.random()}`, item);
+    }
+  });
+
+  const merged = Array.from(map.values());
+  setStored(storageKey, merged);
+  notifyListeners();
+
+  console.log(`[Merge] Merged ${incomingRecords.length} incoming records into ${existing.length} local records for ${storageKey}`);
+
+  return merged;
+};
+
 // ==================== MULTI-CURRENCY & EXCHANGE RATES ====================
 export const getMultiCurrencyConfig = (): MultiCurrencyConfig => {
   const stored = getStored<MultiCurrencyConfig | null>(STORAGE_KEYS.EXCHANGE_RATES, null);
