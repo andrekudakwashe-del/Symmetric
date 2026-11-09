@@ -175,7 +175,7 @@ export interface StocktakeZoneAssignment {
   zoneName: string;
   sessionId: string;
   branchId: string;
-  status: 'AVAILABLE' | 'IN_PROGRESS' | 'AWAITING_DOUBLE_COUNT' | 'VARIANCE_FLAGGED' | 'VERIFIED';
+  status: 'AVAILABLE' | 'IN_PROGRESS' | 'AWAITING_DOUBLE_COUNT' | 'VARIANCE_FLAGGED' | 'VERIFIED' | 'VAULTED';
   teamA?: {
     deviceId?: string;
     staffId?: string;
@@ -197,9 +197,11 @@ export interface StocktakeZoneAssignment {
   jointRecount?: {
     proposedBy?: 'A' | 'B';
     proposedByName?: string;
+    proposedAt?: number;
     signedByA: boolean;
     signedByB: boolean;
     resolvedAt?: string;
+    resolvedByName?: string;
     lines: any[];
   };
   count1?: any[];
@@ -435,6 +437,8 @@ export interface CashAccount {
   last_reconciled_at?: string;
   created_at: string;
   updated_at: string;
+  updatedAt?: number;
+  lastUpdated?: string;
 }
 
 export type CashTransferType =

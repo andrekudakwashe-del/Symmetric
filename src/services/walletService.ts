@@ -105,6 +105,61 @@ export const saveWallets = (wallets: Wallet[]) => {
   }
 };
 
+export interface SaveWalletParams {
+  tenderId: string; // 'cash' | 'ecocash' | 'bank_zig' | 'bank_usd' | 'home_safe' (or 'wallet_cash')
+  delta: number;
+  reason: string;
+  saleId?: string;
+  branchId: string;
+  fromMesh?: boolean;
+}
+
+export async function saveWallet(params: SaveWalletParams): Promise<{
+  success: boolean;
+  wallet?: Wallet;
+  error?: string;
+}> {
+  try {
+    const rawId = (params.tenderId || '').trim().toLowerCase();
+    const normalizedId: WalletId = rawId.startsWith('wallet_')
+      ? (rawId as WalletId)
+      : (`wallet_${rawId}` as WalletId);
+
+    const wallets = getWallets();
+    const wallet = wallets.find((w) => w.id === normalizedId);
+    if (!wallet) {
+      return { success: false, error: 'WALLET_NOT_FOUND' };
+    }
+
+    const newBalance = Math.round((wallet.balance + params.delta) * 100) / 100;
+    const upperReason = (params.reason || '').toUpperCase();
+    const isManual = upperReason === 'MANUAL' || upperReason === 'MANUAL_ADJUSTMENT';
+
+    if (newBalance < 0 && !isManual) {
+      return { success: false, error: 'INSUFFICIENT_BALANCE' };
+    }
+
+    wallet.balance = newBalance;
+    wallet.updatedAt = new Date().toISOString();
+    saveWallets(wallets);
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('saimetric_wallet_updated'));
+      window.dispatchEvent(new Event('saimetric_wallets_updated'));
+    }
+
+    // Row 1b-2 will call SyncCore.saveAndSync('wallet', updatedWallet, branchId) here.
+
+    return { success: true, wallet };
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || String(err),
+    };
+  }
+}
+
+
 /**
  * Adjust wallet physical balance
  */

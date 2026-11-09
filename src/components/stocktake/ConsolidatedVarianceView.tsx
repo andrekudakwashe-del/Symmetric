@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Search,
   Filter,
@@ -49,6 +49,15 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
   const [recountSingles, setRecountSingles] = useState<number>(0);
 
   const consolidated = session.consolidatedItems || [];
+  const verifiedSegmentsCount = (session.segments || []).filter((s) => s.status === 'VERIFIED').length;
+  const totalSegmentsCount = (session.segments || []).length;
+
+  // Auto-consolidate on mount if verified segments exist but consolidatedItems is empty
+  useEffect(() => {
+    if ((!session.consolidatedItems || session.consolidatedItems.length === 0) && verifiedSegmentsCount > 0) {
+      onConsolidateAgain();
+    }
+  }, [session.sessionId, session.consolidatedItems?.length, verifiedSegmentsCount, onConsolidateAgain]);
 
   // Filter items
   const q = (searchQuery || '').trim().toLowerCase();
@@ -159,6 +168,45 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
 
   return (
     <div className="space-y-4">
+      {/* Segment Verification Progress Bar & Live Status */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 text-xs">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-blue-500/20 text-blue-400 border border-blue-500/30 flex items-center justify-center font-mono font-bold text-sm shrink-0">
+            {verifiedSegmentsCount}/{totalSegmentsCount}
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="text-white font-bold">Consolidated Progress</span>
+              <span
+                className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                  verifiedSegmentsCount === totalSegmentsCount && totalSegmentsCount > 0
+                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                    : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                }`}
+              >
+                {verifiedSegmentsCount === totalSegmentsCount && totalSegmentsCount > 0
+                  ? 'All Zones Reconciled & Verified'
+                  : `${totalSegmentsCount - verifiedSegmentsCount} Zone(s) Pending Verification`}
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              {verifiedSegmentsCount === totalSegmentsCount && totalSegmentsCount > 0
+                ? 'All physical shelf segments are verified and aggregated. Ready for final supervisor review.'
+                : 'Live partial consolidation aggregating all currently verified shelf segments against system book stock.'}
+            </p>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={onConsolidateAgain}
+          className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-sm active:scale-95"
+        >
+          <RotateCcw className="w-3.5 h-3.5" />
+          <span>Sync & Consolidate Now</span>
+        </button>
+      </div>
+
       {/* Count Type Scope & Committal Banner */}
       <div
         className={`p-4 rounded-xl border flex flex-col md:flex-row items-start md:items-center justify-between gap-3 text-xs ${
@@ -579,8 +627,30 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
 
               {filteredItems.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="py-8 text-center text-slate-400 text-xs">
-                    No items match the current search or filter.
+                  <td colSpan={9} className="py-12 text-center text-slate-400 text-xs">
+                    {consolidated.length === 0 ? (
+                      <div className="max-w-md mx-auto space-y-3">
+                        <AlertTriangle className="w-8 h-8 text-amber-400 mx-auto" />
+                        <div className="font-semibold text-white text-sm">No Consolidated Counts Yet</div>
+                        <p className="text-slate-400 text-xs leading-relaxed">
+                          {verifiedSegmentsCount > 0
+                            ? `${verifiedSegmentsCount} of ${totalSegmentsCount} zone(s) have been verified. Tap below to consolidate their physical counts against book inventory.`
+                            : 'No zones are verified yet. When two counters match or complete a Joint Shelf Recount, verified counts automatically appear here.'}
+                        </p>
+                        {verifiedSegmentsCount > 0 && (
+                          <button
+                            type="button"
+                            onClick={onConsolidateAgain}
+                            className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold inline-flex items-center gap-2 shadow-lg transition active:scale-95"
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                            <span>Consolidate {verifiedSegmentsCount} Verified Zone(s)</span>
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      'No items match the current search or filter.'
+                    )}
                   </td>
                 </tr>
               )}

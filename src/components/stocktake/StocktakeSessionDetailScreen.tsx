@@ -43,6 +43,11 @@ import {
   submitSkuVarianceRecount,
   approveAndCommitStocktake,
   getStocktakeSessionById,
+  getAllStocktakeSessions,
+  getAllStocktakeSegments,
+  saveStocktakeSegment,
+  updateZoneClaim,
+  saveCountSubmission,
   getCustomerGoodsLeftBehind,
   getTemporaryCasuals,
   claimZoneSlot,
@@ -136,20 +141,40 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     e.preventDefault();
     if (!newSegmentName.trim()) return;
 
-    const res = addStocktakeSegment(session.sessionId, {
+    const nextNum = (session.segments?.length || 0) + 1;
+    const segId = `SEG-${String(nextNum).padStart(3, '0')}`;
+    const newSegment: StocktakeSegment = {
+      segmentId: segId,
       name: newSegmentName.trim(),
-      locationCode: newSegmentLocation.trim() || undefined,
-      description: newSegmentDesc.trim() || undefined,
-    });
+      description: newSegmentDesc.trim() || `Segment #${nextNum}`,
+      locationCode: newSegmentLocation.trim() || `LOC-${String(nextNum).padStart(2, '0')}`,
+      status: 'PENDING',
+      count1: [],
+      count2: [],
+      verifiedCounts: [],
+      discrepancyCount: 0,
+      sessionId: session.sessionId,
+    };
 
-    if (res) {
-      refreshSession(res);
-      setShowAddSegmentModal(false);
-      setNewSegmentName('');
-      setNewSegmentLocation('');
-      setNewSegmentDesc('');
-      showToast('New segment added successfully.');
+    console.log('[Stocktake] Segment created locally:', newSegment.segmentId);
+
+    // 1. Save to IndexedDB via roomDatabase.saveStocktakeSegment BEFORE updating React state
+    saveStocktakeSegment(newSegment, session.sessionId);
+
+    // 2. Broadcast to Mesh / Hub
+    meshSyncService.broadcastStocktakeSegmentCreated(session.sessionId, newSegment);
+
+    // 3. Update React state from IndexedDB
+    const refreshed = getStocktakeSessionById(session.sessionId);
+    if (refreshed) {
+      refreshSession(refreshed);
     }
+
+    setShowAddSegmentModal(false);
+    setNewSegmentName('');
+    setNewSegmentLocation('');
+    setNewSegmentDesc('');
+    showToast('New segment added successfully.');
   };
 
   // Delete Segment Handler
@@ -180,21 +205,47 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
         setSession(refreshed);
       }
     };
+    window.addEventListener('saimetric_stocktake_updated', handleHubSync);
     window.addEventListener('saimetric_stocktake_zone_updated', handleHubSync);
     window.addEventListener('saimetric_stocktake_match_verified', handleHubSync);
     window.addEventListener('saimetric_stocktake_variance_alert', handleHubSync);
+    window.addEventListener('saimetric_stocktake_ack_submit', handleHubSync);
     return () => {
+      window.removeEventListener('saimetric_stocktake_updated', handleHubSync);
       window.removeEventListener('saimetric_stocktake_zone_updated', handleHubSync);
       window.removeEventListener('saimetric_stocktake_match_verified', handleHubSync);
       window.removeEventListener('saimetric_stocktake_variance_alert', handleHubSync);
+      window.removeEventListener('saimetric_stocktake_ack_submit', handleHubSync);
     };
   }, [session.sessionId]);
 
   const handleClaimZone = (segment: StocktakeSegment, slot: 'A' | 'B') => {
     const staffId = currentUser?.id || '001';
     const staffName = currentUser?.name || (slot === 'A' ? 'Counter A' : 'Counter B');
-    claimZoneSlot(session.sessionId, segment.segmentId, slot, 'DEV-LOCAL', staffId, staffName, segment.name);
+
+    // 1. Save to IndexedDB via roomDatabase.updateZoneClaim BEFORE updating React state
+    updateZoneClaim(
+      segment.segmentId,
+      slot,
+      {
+        staffId,
+        staffName,
+        deviceId: 'DEV-LOCAL',
+        zoneName: segment.name,
+        sessionId: session.sessionId,
+      },
+      session.sessionId
+    );
+
+    // 2. Broadcast to Mesh / Hub
     meshSyncService.claimStocktakeZone(session.sessionId, segment.segmentId, slot, staffId, staffName, segment.name);
+
+    // 3. Render from IndexedDB
+    const refreshed = getStocktakeSessionById(session.sessionId);
+    if (refreshed) {
+      refreshSession(refreshed);
+    }
+
     showToast(`Claimed ${segment.name} as Team ${slot}!`);
     handleLaunchTerminal(segment, slot);
   };
@@ -209,7 +260,17 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     if (!activeTerminalSegment) return;
 
     try {
-      // 1. Point-to-Point Blind Submission to Local Hub (Suppresses Peer Broadcast)
+      // 1. Save to IndexedDB via roomDatabase.saveCountSubmission BEFORE broadcasting
+      saveCountSubmission(
+        session.sessionId,
+        activeTerminalSegment.segmentId,
+        slot,
+        lines,
+        counterStaffId,
+        counterStaffName
+      );
+
+      // 2. Point-to-Point Blind Submission to Local Hub
       meshSyncService.submitBlindStocktakeCount(
         session.sessionId,
         activeTerminalSegment.segmentId,
@@ -219,27 +280,12 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
         lines
       );
 
-      // 2. Save locally
-      recordBlindSubmissionLocal(
-        session.sessionId,
-        activeTerminalSegment.segmentId,
-        slot,
-        lines,
-        counterStaffId,
-        counterStaffName
-      );
-
-      const result = submitSegmentCount(
-        session.sessionId,
-        activeTerminalSegment.segmentId,
-        slot,
-        lines,
-        counterStaffId,
-        counterStaffName
-      );
-
-      refreshSession(result.session);
-      showToast(result.message);
+      // 3. Refresh from IndexedDB
+      const refreshed = getStocktakeSessionById(session.sessionId);
+      if (refreshed) {
+        refreshSession(refreshed);
+      }
+      showToast(`Count saved to IndexedDB and submitted for Team ${slot}.`);
       setActiveTerminalSegment(null);
     } catch (err: any) {
       alert(err.message || 'Error submitting count.');
@@ -460,7 +506,15 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
           </button>
 
           <button
-            onClick={() => setActiveTab('VARIANCE')}
+            onClick={() => {
+              setActiveTab('VARIANCE');
+              try {
+                if ((session.segments || []).some((s) => s.status === 'VERIFIED')) {
+                  const res = consolidateStocktakeSession(session.sessionId, true);
+                  if (res && res.session) refreshSession(res.session);
+                }
+              } catch {}
+            }}
             className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
               activeTab === 'VARIANCE'
                 ? 'border-blue-500 text-blue-400'
@@ -598,19 +652,72 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
             {/* Segments Cards Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {session.segments.map((seg, segIdx) => {
-                const count1Done = seg.count1 && seg.count1.length > 0;
-                const count2Done = seg.count2 && seg.count2.length > 0;
-                const count1Units = seg.count1?.reduce((acc, l) => acc + l.totalUnits, 0) || 0;
-                const count2Units = seg.count2?.reduce((acc, l) => acc + l.totalUnits, 0) || 0;
-                const verifiedUnits = seg.verifiedCounts?.reduce((acc, l) => acc + l.totalUnits, 0) || 0;
+                const zoneAssignments = getZoneAssignments(session.sessionId);
+                const zone = zoneAssignments.find((z) => z.zoneId === seg.segmentId);
+
+                const isTeamAClaimed = Boolean(
+                  seg.counterAName ||
+                  seg.counterAId ||
+                  zone?.teamA?.claimedAt ||
+                  zone?.teamA?.staffName
+                );
+                const teamAName = seg.counterAName || zone?.teamA?.staffName || 'Counter A';
+
+                const isCount1Submitted = Boolean(
+                  (seg.count1 && seg.count1.length > 0) ||
+                  seg.hasCountA ||
+                  seg.count1Submitted ||
+                  zone?.teamA?.submitted ||
+                  seg.status === 'VERIFIED' ||
+                  seg.status === 'DISCREPANCY_RECOUNT' ||
+                  seg.status === 'AWAITING_DOUBLE_COUNT'
+                );
+
+                const isTeamBClaimed = Boolean(
+                  seg.counterBName ||
+                  seg.counterBId ||
+                  zone?.teamB?.claimedAt ||
+                  zone?.teamB?.staffName
+                );
+                const teamBName = seg.counterBName || zone?.teamB?.staffName || 'Counter B';
+
+                const isCount2Submitted = Boolean(
+                  (seg.count2 && seg.count2.length > 0) ||
+                  seg.hasCountB ||
+                  seg.count2Submitted ||
+                  zone?.teamB?.submitted ||
+                  seg.status === 'VERIFIED' ||
+                  seg.status === 'DISCREPANCY_RECOUNT'
+                );
+
+                const discrepancyList = (seg.discrepancies && seg.discrepancies.length > 0) ? seg.discrepancies : (zone?.discrepancies || []);
+                const discrepancyCount = seg.discrepancyCount || discrepancyList.length || 0;
+
+                const effectiveStatus =
+                  seg.status === 'VERIFIED' || zone?.status === 'VERIFIED'
+                    ? 'VERIFIED'
+                    : (seg.status === 'DISCREPANCY_RECOUNT' || zone?.status === 'VARIANCE_FLAGGED' || discrepancyList.length > 0)
+                    ? 'DISCREPANCY_RECOUNT'
+                    : (isCount1Submitted && isCount2Submitted)
+                    ? 'COMPARING'
+                    : (isCount1Submitted && !isCount2Submitted)
+                    ? 'AWAITING_DOUBLE_COUNT'
+                    : (isTeamAClaimed || isTeamBClaimed)
+                    ? 'COUNTING'
+                    : 'AVAILABLE';
+
+                const count1Units = seg.count1?.reduce((acc: number, l: any) => acc + (Number(l.totalUnits) || 0), 0) || 0;
+                const count2Units = seg.count2?.reduce((acc: number, l: any) => acc + (Number(l.totalUnits) || 0), 0) || 0;
+                const verifiedList = (seg.verifiedCounts && seg.verifiedCounts.length > 0) ? seg.verifiedCounts : (zone?.verifiedCounts || []);
+                const verifiedUnits = verifiedList.reduce((acc: number, l: any) => acc + (Number(l.totalUnits) || 0), 0);
 
                 return (
                   <div
                     key={`${seg.segmentId}-${segIdx}`}
                     className={`bg-slate-900/90 rounded-2xl border p-5 flex flex-col justify-between gap-4 transition shadow-lg ${
-                      seg.status === 'VERIFIED'
+                      effectiveStatus === 'VERIFIED'
                         ? 'border-emerald-500/40 ring-1 ring-emerald-500/20'
-                        : seg.status === 'DISCREPANCY_RECOUNT'
+                        : effectiveStatus === 'DISCREPANCY_RECOUNT'
                         ? 'border-amber-500/50 ring-1 ring-amber-500/20'
                         : 'border-slate-800 hover:border-slate-700'
                     }`}
@@ -632,18 +739,28 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
 
                         <span
                           className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${
-                            seg.status === 'VERIFIED'
+                            effectiveStatus === 'VERIFIED'
                               ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
-                              : seg.status === 'DISCREPANCY_RECOUNT'
+                              : effectiveStatus === 'DISCREPANCY_RECOUNT'
                               ? 'bg-amber-950 text-amber-300 border-amber-800 animate-pulse'
-                              : seg.status === 'COUNTING'
+                              : effectiveStatus === 'AWAITING_DOUBLE_COUNT'
+                              ? 'bg-purple-950 text-purple-300 border-purple-800'
+                              : effectiveStatus === 'COUNTING' || effectiveStatus === 'COMPARING'
                               ? 'bg-blue-950 text-blue-300 border-blue-800'
                               : 'bg-slate-800 text-slate-400 border-slate-700'
                           }`}
                         >
-                          {seg.status === 'DISCREPANCY_RECOUNT'
-                            ? `Recount Needed (${seg.discrepancyCount})`
-                            : seg.status}
+                          {effectiveStatus === 'DISCREPANCY_RECOUNT'
+                            ? `Recount Needed (${discrepancyCount || 1})`
+                            : effectiveStatus === 'AWAITING_DOUBLE_COUNT'
+                            ? 'Awaiting Team B Count'
+                            : effectiveStatus === 'COMPARING'
+                            ? 'Comparing Dual Counts'
+                            : effectiveStatus === 'COUNTING'
+                            ? 'Counting in Progress'
+                            : effectiveStatus === 'VERIFIED'
+                            ? 'VERIFIED'
+                            : 'AVAILABLE'}
                         </span>
                       </div>
 
@@ -652,46 +769,78 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                         {/* Counter A Box */}
                         <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800">
                           <div className="flex items-center justify-between text-xs">
-                            <span className="font-semibold text-blue-400">Count 1 (Group 1)</span>
-                            {count1Done && <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />}
+                            <span className="font-semibold text-blue-400">Count 1 (Team A)</span>
+                            {isCount1Submitted ? (
+                              <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : isTeamAClaimed ? (
+                              <Clock className="w-3.5 h-3.5 text-amber-400" />
+                            ) : null}
                           </div>
                           <div className="text-sm font-bold font-mono text-white mt-1">
-                            {count1Done ? `${count1Units} units` : 'Not Started'}
+                            {count1Units > 0
+                              ? `${count1Units} units`
+                              : isCount1Submitted
+                              ? effectiveStatus === 'VERIFIED' && verifiedUnits > 0
+                                ? `${verifiedUnits} units (Verified)`
+                                : 'Count Submitted (Vaulted)'
+                              : isTeamAClaimed
+                              ? 'Counting in Progress...'
+                              : 'Not Started'}
                           </div>
-                          <div className="text-[11px] text-slate-400 mt-0.5">
-                            {count1Done ? seg.counterAName || 'Counter 1' : 'Awaiting submission'}
+                          <div className="text-[11px] text-slate-400 mt-0.5 truncate">
+                            {isCount1Submitted
+                              ? `Submitted by ${teamAName}`
+                              : isTeamAClaimed
+                              ? `Claimed by ${teamAName}`
+                              : 'Awaiting counter'}
                           </div>
                         </div>
 
                         {/* Counter B Box */}
                         <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800">
                           <div className="flex items-center justify-between text-xs">
-                            <span className="font-semibold text-purple-400">Count 2 (Group 2)</span>
-                            {count2Done && <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />}
+                            <span className="font-semibold text-purple-400">Count 2 (Team B)</span>
+                            {isCount2Submitted ? (
+                              <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : isTeamBClaimed ? (
+                              <Clock className="w-3.5 h-3.5 text-amber-400" />
+                            ) : null}
                           </div>
                           <div className="text-sm font-bold font-mono text-white mt-1">
-                            {count2Done ? `${count2Units} units` : 'Not Started'}
+                            {count2Units > 0
+                              ? `${count2Units} units`
+                              : isCount2Submitted
+                              ? effectiveStatus === 'VERIFIED' && verifiedUnits > 0
+                                ? `${verifiedUnits} units (Verified)`
+                                : 'Count Submitted (Vaulted)'
+                              : isTeamBClaimed
+                              ? 'Counting in Progress...'
+                              : 'Not Started'}
                           </div>
-                          <div className="text-[11px] text-slate-400 mt-0.5">
-                            {count2Done ? seg.counterBName || 'Counter 2' : 'Awaiting submission'}
+                          <div className="text-[11px] text-slate-400 mt-0.5 truncate">
+                            {isCount2Submitted
+                              ? `Submitted by ${teamBName}`
+                              : isTeamBClaimed
+                              ? `Claimed by ${teamBName}`
+                              : 'Awaiting counter'}
                           </div>
                         </div>
                       </div>
 
                       {/* Discrepancy Alert / Verification summary */}
-                      {seg.status === 'DISCREPANCY_RECOUNT' && (
+                      {(effectiveStatus === 'DISCREPANCY_RECOUNT' || discrepancyList.length > 0) && (
                         <div className="mt-3 p-3 rounded-xl bg-amber-950/40 border border-amber-800/60 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
                           <div className="flex items-center gap-2">
                             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
                             <span>
-                              <strong>{seg.discrepancyCount} SKU discrepancy detected</strong>{' '}
+                              <strong>{discrepancyCount || discrepancyList.length || 1} SKU discrepancy detected</strong>{' '}
                               between Count 1 and Count 2.
                             </span>
                           </div>
                           <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              onClick={() => setShowJointRecountModalSegment(seg)}
+                              onClick={() => setShowJointRecountModalSegment({ ...seg, discrepancies: discrepancyList, discrepancyCount })}
                               className="px-3 py-1.5 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white rounded-lg text-xs font-black shadow-md transition flex items-center gap-1.5"
                             >
                               <RotateCcw className="w-3.5 h-3.5" />
@@ -699,7 +848,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                             </button>
                             <button
                               type="button"
-                              onClick={() => setActiveRecountSegment(seg)}
+                              onClick={() => setActiveRecountSegment({ ...seg, discrepancies: discrepancyList, discrepancyCount })}
                               className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold border border-slate-700 transition"
                             >
                               Manual Override
@@ -708,13 +857,13 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                         </div>
                       )}
 
-                      {seg.status === 'VERIFIED' && (
+                      {effectiveStatus === 'VERIFIED' && (
                         <div className="mt-3 p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-xs text-emerald-200 flex items-center justify-between">
                           <div className="flex items-center gap-2">
                             <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
                             <span>
                               Verified Count: <strong>{verifiedUnits} units</strong> across{' '}
-                              {seg.verifiedCounts?.length || 0} SKUs.
+                              {verifiedList.length} SKUs.
                             </span>
                           </div>
                           {seg.recountedAt && (
@@ -731,32 +880,54 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                       <div className="flex flex-wrap items-center gap-2">
                         <button
                           type="button"
-                          onClick={() => (count1Done ? handleLaunchTerminal(seg, 'A') : handleClaimZone(seg, 'A'))}
+                          onClick={() => {
+                            if (isCount1Submitted || isTeamAClaimed) {
+                              handleLaunchTerminal(seg, 'A');
+                            } else {
+                              handleClaimZone(seg, 'A');
+                            }
+                          }}
                           className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
-                            count1Done
+                            isCount1Submitted
                               ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30 hover:bg-blue-600 hover:text-white'
+                              : isTeamAClaimed
+                              ? 'bg-blue-900/40 text-blue-200 border border-blue-700 hover:bg-blue-700 hover:text-white'
                               : 'bg-blue-600 text-white hover:bg-blue-500 shadow-sm'
                           }`}
                         >
                           <UserCheck className="w-3.5 h-3.5" />
-                          {count1Done ? 'Edit Count 1 (Team A)' : 'Claim Zone as Team A'}
+                          {isCount1Submitted
+                            ? 'View/Edit Count 1 (Team A)'
+                            : isTeamAClaimed
+                            ? `Enter Count 1 (${teamAName})`
+                            : 'Claim Zone as Team A'}
                         </button>
 
                         <button
                           type="button"
-                          onClick={() => (count2Done ? handleLaunchTerminal(seg, 'B') : handleClaimZone(seg, 'B'))}
+                          onClick={() => {
+                            if (isCount2Submitted || isTeamBClaimed) {
+                              handleLaunchTerminal(seg, 'B');
+                            } else {
+                              handleClaimZone(seg, 'B');
+                            }
+                          }}
                           className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
-                            count2Done
+                            isCount2Submitted
                               ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600 hover:text-white'
-                              : count1Done
+                              : isTeamBClaimed
+                              ? 'bg-purple-900/40 text-purple-200 border border-purple-700 hover:bg-purple-700 hover:text-white'
+                              : isCount1Submitted
                               ? 'bg-amber-600 text-white hover:bg-amber-500 shadow-sm animate-pulse'
                               : 'bg-purple-600 text-white hover:bg-purple-500 shadow-sm'
                           }`}
                         >
                           <UserCheck className="w-3.5 h-3.5" />
-                          {count2Done
-                            ? 'Edit Count 2 (Team B)'
-                            : count1Done
+                          {isCount2Submitted
+                            ? 'View/Edit Count 2 (Team B)'
+                            : isTeamBClaimed
+                            ? `Enter Count 2 (${teamBName})`
+                            : isCount1Submitted
                             ? 'Claim Double-Count as Team B'
                             : 'Claim as Team B'}
                         </button>

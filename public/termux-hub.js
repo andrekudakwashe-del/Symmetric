@@ -80,6 +80,15 @@ let stockMovementsStore = [];
 let expensesStore = [];
 let cashTransfersStore = [];
 
+// T1 Batch A Stores (Append-Only)
+let suppliersStore = [];
+let adminSalesStore = [];
+let cashCountsStore = [];
+let vouchersStore = [];
+
+// T2 Batch B+C Categories Store
+let categoriesStore = [];
+
 // Stocktake Dedicated Stores
 let casualWorkersStore = [];
 let zoneAssignmentsStore = [];
@@ -90,6 +99,8 @@ let stocktakeSegmentsStore = [];
 // Staff & Customer Master Stores (Synced across multi-device Wi-Fi)
 let salespeopleStore = [];
 let customersStore = [];
+let branchesStore = [];
+let cashAccountsStore = [];
 
 // Business Day Closures & EOD Archives
 let businessDayClosuresStore = [];
@@ -197,6 +208,11 @@ function loadData() {
       if (Array.isArray(parsed.stockMovements)) stockMovementsStore = parsed.stockMovements;
       if (Array.isArray(parsed.expenses)) expensesStore = parsed.expenses;
       if (Array.isArray(parsed.cashTransfers)) cashTransfersStore = parsed.cashTransfers;
+      if (Array.isArray(parsed.suppliers)) suppliersStore = parsed.suppliers;
+      if (Array.isArray(parsed.adminSales)) adminSalesStore = parsed.adminSales;
+      if (Array.isArray(parsed.cashCounts)) cashCountsStore = parsed.cashCounts;
+      if (Array.isArray(parsed.vouchers)) vouchersStore = parsed.vouchers;
+      if (Array.isArray(parsed.categories)) categoriesStore = parsed.categories;
       if (Array.isArray(parsed.casualWorkers)) {
         casualWorkersStore = parsed.casualWorkers.map((cw) => {
           if (cw && cw.pin) delete cw.pin;
@@ -211,6 +227,8 @@ function loadData() {
         });
       }
       if (Array.isArray(parsed.customers)) customersStore = parsed.customers;
+      if (Array.isArray(parsed.branches)) branchesStore = parsed.branches;
+      if (Array.isArray(parsed.cashAccounts)) cashAccountsStore = parsed.cashAccounts;
       if (Array.isArray(parsed.businessDayClosures)) businessDayClosuresStore = parsed.businessDayClosures;
       if (Array.isArray(parsed.electronicSettlements)) electronicSettlementsStore = parsed.electronicSettlements;
       if (parsed.branchLockdowns && typeof parsed.branchLockdowns === 'object') {
@@ -220,7 +238,7 @@ function loadData() {
       if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
 
       console.log(
-        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${businessDayClosuresStore.length} EOD closures, ${stocktakeSessionsStore.length} stocktake sessions.`
+        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${branchesStore.length} branches, ${cashAccountsStore.length} cash accounts, ${suppliersStore.length} suppliers, ${adminSalesStore.length} admin sales, ${cashCountsStore.length} cash counts, ${vouchersStore.length} vouchers, ${businessDayClosuresStore.length} closures, ${electronicSettlementsStore.length} settlements, ${categoriesStore.length} categories.`
       );
     }
   } catch (e) {
@@ -254,10 +272,17 @@ function saveData() {
       stockMovements: stockMovementsStore.slice(0, 2000),
       expenses: expensesStore.slice(0, 1000),
       cashTransfers: cashTransfersStore.slice(0, 1000),
+      suppliers: suppliersStore.slice(0, 2000),
+      adminSales: adminSalesStore.slice(0, 2000),
+      cashCounts: cashCountsStore.slice(0, 2000),
+      vouchers: vouchersStore.slice(0, 2000),
+      categories: categoriesStore,
       casualWorkers: casualWorkersStore.slice(0, 500),
       zoneAssignments: zoneAssignmentsStore.slice(0, 500),
       salespeople: salespeopleStore.slice(0, 1000),
       customers: customersStore.slice(0, 3000),
+      branches: branchesStore.slice(0, 100),
+      cashAccounts: cashAccountsStore.slice(0, 500),
       businessDayClosures: businessDayClosuresStore.slice(0, 365),
       electronicSettlements: electronicSettlementsStore.slice(0, 365),
       branchLockdowns: branchLockdownsStore,
@@ -299,7 +324,7 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         status: 'ok',
         hub: 'Termux-Local-Hub-Saimetric',
-        version: '3.3.0',
+        version: '3.4.0',
         branchId: hubBranchId,
         branchName: hubBranchName,
         tenantId: hubTenantId,
@@ -308,6 +333,8 @@ const server = http.createServer((req, res) => {
         inventoryCount: inventoryStore.length,
         staffCount: salespeopleStore.length,
         customerCount: customersStore.length,
+        branchesCount: branchesStore.length,
+        cashAccountsCount: cashAccountsStore.length,
         uptime: process.uptime(),
       })
     );
@@ -323,9 +350,11 @@ const server = http.createServer((req, res) => {
         branch_name: hubBranchName,
         tenant_id: hubTenantId,
         hub_id: `HUB-${hubBranchId}`,
-        version: '3.3.0',
+        version: '3.4.0',
         totalRecords: salesStore.length + directGrvsStore.length,
         casualWorkersCount: casualWorkersStore.length,
+        branchesCount: branchesStore.length,
+        cashAccountsCount: cashAccountsStore.length,
         timestamp: Date.now(),
       })
     );
@@ -351,7 +380,7 @@ wss.on('connection', (ws, req) => {
       branch_id: hubBranchId,
       branch_name: hubBranchName,
       tenant_id: hubTenantId,
-      version: '3.3.0',
+      version: '3.4.0',
       totalSales: salesStore.length,
       totalInventory: inventoryStore.length,
       message: `Connected to Saimetric Local Hub (${hubBranchName})`,
@@ -388,7 +417,7 @@ wss.on('connection', (ws, req) => {
           branch_name: hubBranchName,
           tenant_id: hubTenantId,
           hub_id: `HUB-${hubBranchId}`,
-          version: '3.3.0',
+          version: '3.4.0',
           totalRecords: salesStore.length + directGrvsStore.length,
           casualWorkersCount: casualWorkersStore.length,
           timestamp: Date.now(),
@@ -423,6 +452,8 @@ wss.on('connection', (ws, req) => {
         branchLockdownsStore = {};
         salespeopleStore = [];
         customersStore = [];
+        branchesStore = [];
+        cashAccountsStore = [];
         businessDayClosuresStore = [];
         electronicSettlementsStore = [];
 
@@ -477,7 +508,7 @@ wss.on('connection', (ws, req) => {
             branch_name: hubBranchName,
             tenant_id: hubTenantId,
             hub_id: `HUB-${hubBranchId}`,
-            version: '3.3.0',
+            version: '3.4.0',
             totalRecords: salesStore.length + directGrvsStore.length,
             casualWorkersCount: casualWorkersStore.length,
             timestamp: Date.now(),
@@ -512,33 +543,84 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 0.3 CASUAL WORKERS PIN SYNC OVER LOCAL HUB
+      // 0.3 CASUAL WORKERS PIN SYNC OVER LOCAL HUB (STRICT LWW)
       // =====================================================================
       if (pType === 'CASUAL_WORKERS_SYNC') {
         const incoming = packet.casualWorkers || payload || packet.casuals;
+        const hubNow = Date.now();
+        const hubIso = new Date().toISOString();
+
         if (Array.isArray(incoming)) {
-          incoming.forEach((cw) => {
-            if (!cw) return;
+          for (const cw of incoming) {
+            if (!cw) continue;
             const cleanCw = { ...cw };
             delete cleanCw.pin; // Never persist raw pin
+            const cwId = cleanCw.id || cleanCw.pin_hash;
+            const incomingTime = getTimestamp(cleanCw) || getTimestamp(packet);
             const exIdx = casualWorkersStore.findIndex((c) => (cw.id && c.id === cw.id) || (cw.pin_hash && c.pin_hash === cw.pin_hash));
+
             if (exIdx >= 0) {
-              casualWorkersStore[exIdx] = { ...casualWorkersStore[exIdx], ...cleanCw };
-            } else {
-              casualWorkersStore.push(cleanCw);
+              const existing = casualWorkersStore[exIdx];
+              const existingTime = getTimestamp(existing);
+              if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+                console.log(
+                  `[Termux Hub] 🛡️ LWW Reject: Stale casual worker update for ${cwId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
+                );
+                try {
+                  ws.send(JSON.stringify({
+                    type: 'CASUAL_WORKERS_SYNC',
+                    action: 'CASUAL_WORKERS_SYNC',
+                    casualWorkers: [existing],
+                    payload: [existing],
+                    updatedAt: existingTime,
+                    hubTimestamp: existingTime,
+                    lastUpdated: existing.lastUpdated || new Date(existingTime).toISOString(),
+                    origin_device_id: 'LOCAL_HUB',
+                    origin_device_name: 'Termux Local Hub',
+                    timestamp: Date.now(),
+                  }));
+                } catch (e) {}
+                continue;
+              }
             }
-          });
+
+            const stamped = {
+              ...cleanCw,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            };
+
+            if (exIdx >= 0) {
+              casualWorkersStore[exIdx] = { ...casualWorkersStore[exIdx], ...stamped };
+            } else {
+              casualWorkersStore.push(stamped);
+            }
+          }
           scheduleSave();
+
+          // Send SYNC_ACK
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'CASUAL_WORKERS',
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
         }
 
-        const sanitizedPacket = { ...packet };
-        if (Array.isArray(sanitizedPacket.casualWorkers)) {
-          sanitizedPacket.casualWorkers = sanitizedPacket.casualWorkers.map((c) => {
-            const copy = { ...c };
-            delete copy.pin;
-            return copy;
-          });
-        }
+        const sanitizedPacket = {
+          type: 'CASUAL_WORKERS_SYNC',
+          action: 'CASUAL_WORKERS_SYNC',
+          casualWorkers: casualWorkersStore,
+          payload: casualWorkersStore,
+          branchId: packet.branchId || hubBranchId,
+          timestamp: hubNow,
+          updatedAt: hubNow,
+        };
         const forwardStr = JSON.stringify(sanitizedPacket);
         wss.clients.forEach((client) => {
           if (client !== ws && client.readyState === WebSocket.OPEN) {
@@ -577,26 +659,64 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 0.45 STOCKTAKE SESSION & SEGMENT DISCOVERY
+      // 0.45 STOCKTAKE SESSION & SEGMENT DISCOVERY (STRICT LWW)
       // =====================================================================
-      if (pType === 'STOCKTAKE_SESSION_STARTED') {
-        const sess = packet.session || packet;
+      const isStocktakeSession =
+        pType === 'STOCKTAKE_SESSION_STARTED' ||
+        pType === 'STOCKTAKE_SESSION_SYNC' ||
+        pType === 'STOCKTAKE_SESSION';
+
+      if (isStocktakeSession) {
+        const sess = packet.session || payload || packet;
         const sessionId = packet.sessionId || sess.sessionId;
         if (sessionId) {
+          const hubNow = Date.now();
+          const hubIso = new Date().toISOString();
           const sIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+          const incomingTime = getTimestamp(sess) || getTimestamp(packet);
+
+          if (sIdx >= 0) {
+            const existing = stocktakeSessionsStore[sIdx];
+            const existingTime = getTimestamp(existing);
+            if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+              console.log(
+                `[Termux Hub] 🛡️ LWW Reject: Stale stocktake session update for ${sessionId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
+              );
+              try {
+                ws.send(JSON.stringify({
+                  type: 'STOCKTAKE_SESSION_STARTED',
+                  action: 'STOCKTAKE_SESSION_STARTED',
+                  sessionId: existing.sessionId,
+                  session: existing,
+                  payload: existing,
+                  updatedAt: existingTime,
+                  hubTimestamp: existingTime,
+                  lastUpdated: existing.lastUpdated || new Date(existingTime).toISOString(),
+                  origin_device_id: 'LOCAL_HUB',
+                  origin_device_name: 'Termux Local Hub',
+                  timestamp: Date.now(),
+                }));
+              } catch (e) {}
+              return;
+            }
+          }
+
           const sessionObj = {
+            ...sess,
             sessionId,
             title: packet.sessionName || packet.title || sess.title || `Session ${sessionId}`,
             sessionName: packet.sessionName || packet.title || sess.title || `Session ${sessionId}`,
             segments: Array.isArray(packet.segments) ? packet.segments : (sess.segments || []),
             startedBy: packet.startedBy || sess.startedBy || 'Manager',
-            startedAt: packet.startedAt || sess.startedAt || new Date().toISOString(),
+            startedAt: packet.startedAt || sess.startedAt || hubIso,
             countType: packet.countType || sess.countType || 'DAILY_BLIND',
             branchId: packet.branchId || sess.branchId || hubBranchId,
             branchName: packet.branchName || sess.branchName || hubBranchName,
             isLockdownActive: Boolean(packet.isLockdownActive || sess.isLockdownActive),
             notes: packet.notes || sess.notes || '',
-            updatedAt: Date.now(),
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
           };
 
           if (sIdx >= 0) {
@@ -622,10 +742,89 @@ wss.on('connection', (ws, req) => {
 
           scheduleSave();
           console.log(
-            `[Termux Hub] 📋 Started Stocktake Session [${sessionId}] "${sessionObj.sessionName}" with ${(sessionObj.segments || []).length} segments. Saved to disk & broadcasted to peers.`
+            `[Termux Hub] 📋 Synced Stocktake Session [${sessionId}] "${sessionObj.sessionName}" with ${(sessionObj.segments || []).length} segments stamped at ${hubIso}.`
           );
 
+          // Send SYNC_ACK
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'STOCKTAKE_SESSION',
+              id: sessionId,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
+
           // Broadcast to all other peers
+          const sessBroadcastStr = JSON.stringify({
+            type: 'STOCKTAKE_SESSION_STARTED',
+            action: 'STOCKTAKE_SESSION_STARTED',
+            sessionId,
+            session: sessionObj,
+            payload: sessionObj,
+            timestamp: hubNow,
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(sessBroadcastStr);
+              } catch (e) {}
+            }
+          });
+        }
+        return;
+      }
+
+      if (pType === 'STOCKTAKE_SEGMENT_CREATED') {
+        const seg = packet.segment || packet;
+        const sessionId = packet.sessionId || seg.sessionId;
+        const segId = seg.segmentId || seg.id;
+        if (segId) {
+          const segObj = { ...seg, sessionId, segmentId: segId };
+          const exSegIdx = stocktakeSegmentsStore.findIndex(
+            (s) => (s.sessionId === sessionId || !sessionId) && (s.segmentId === segId || s.id === segId)
+          );
+          if (exSegIdx >= 0) {
+            stocktakeSegmentsStore[exSegIdx] = { ...stocktakeSegmentsStore[exSegIdx], ...segObj };
+          } else {
+            stocktakeSegmentsStore.push(segObj);
+          }
+
+          if (sessionId) {
+            const sIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+            if (sIdx >= 0) {
+              const currentSess = stocktakeSessionsStore[sIdx];
+              const segList = Array.isArray(currentSess.segments) ? [...currentSess.segments] : [];
+              const exIdx = segList.findIndex((s) => s.segmentId === segId || s.id === segId);
+              if (exIdx >= 0) {
+                segList[exIdx] = { ...segList[exIdx], ...segObj };
+              } else {
+                segList.push(segObj);
+              }
+              currentSess.segments = segList;
+              stocktakeSessionsStore[sIdx] = currentSess;
+            }
+
+            const exZone = zoneAssignmentsStore.find((z) => z.sessionId === sessionId && z.zoneId === segId);
+            if (!exZone) {
+              zoneAssignmentsStore.push({
+                zoneId: segId,
+                zoneName: segObj.name || segObj.title || segId,
+                sessionId,
+                branchId: hubBranchId,
+                status: 'AVAILABLE',
+              });
+            }
+          }
+
+          scheduleSave();
+          console.log(
+            `[Termux Hub] 📋 STOCKTAKE_SEGMENT_CREATED broadcast: Segment [${segId}] in Session [${sessionId || 'N/A'}]. Saved to disk & broadcasted to peers.`
+          );
+
           wss.clients.forEach((client) => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
               try {
@@ -645,11 +844,12 @@ wss.on('connection', (ws, req) => {
               action: 'STOCKTAKE_SESSION_LIST',
               sessions: stocktakeSessionsStore,
               segments: stocktakeSegmentsStore,
+              zoneAssignments: zoneAssignmentsStore,
               timestamp: Date.now(),
             })
           );
           console.log(
-            `[Termux Hub] 📋 Replied to STOCKTAKE_SESSION_LIST_REQUEST with ${stocktakeSessionsStore.length} session(s) and ${stocktakeSegmentsStore.length} segment(s).`
+            `[Termux Hub] 📋 Replied to STOCKTAKE_SESSION_LIST_REQUEST with ${stocktakeSessionsStore.length} session(s), ${stocktakeSegmentsStore.length} segment(s), and ${zoneAssignmentsStore.length} zone assignments.`
           );
         } catch (e) {}
         return;
@@ -659,6 +859,14 @@ wss.on('connection', (ws, req) => {
       // 0.5 SELF-SERVICE ZONE CLAIMING
       // =====================================================================
       if (pType === 'STOCKTAKE_ZONE_CLAIM') {
+        const incomingTime = getTimestamp(packet);
+        const existingZone = zoneAssignmentsStore.find((z) => z.sessionId === packet.sessionId && z.zoneId === packet.zoneId);
+        const existingTime = existingZone ? getTimestamp(existingZone) : 0;
+        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+          console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_ZONE_CLAIM for ${packet.zoneId}`);
+          return;
+        }
+
         const { sessionId, zoneId, slot, deviceId, staffId, staffName } = packet;
         if (sessionId && zoneId && (slot === 'A' || slot === 'B')) {
           let zoneRec = zoneAssignmentsStore.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
@@ -678,6 +886,40 @@ wss.on('connection', (ws, req) => {
             zoneRec.status = zoneRec.teamB?.submitted ? 'AWAITING_DOUBLE_COUNT' : 'IN_PROGRESS';
           } else {
             zoneRec.teamB = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: false };
+          }
+
+          // Authoritatively update session and segment stores on Hub
+          const sessIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+          if (sessIdx >= 0) {
+            const sess = stocktakeSessionsStore[sessIdx];
+            if (Array.isArray(sess.segments)) {
+              const seg = sess.segments.find((s) => (s.segmentId || s.id) === zoneId);
+              if (seg) {
+                if (slot === 'A') {
+                  seg.counterAId = staffId;
+                  seg.counterAName = staffName;
+                  seg.counterATimestamp = new Date().toISOString();
+                } else {
+                  seg.counterBId = staffId;
+                  seg.counterBName = staffName;
+                  seg.counterBTimestamp = new Date().toISOString();
+                }
+                if (seg.status === 'PENDING') seg.status = 'COUNTING';
+              }
+            }
+          }
+
+          const segStoreIdx = stocktakeSegmentsStore.findIndex(
+            (s) => (s.sessionId === sessionId || !s.sessionId) && (s.segmentId === zoneId || s.id === zoneId)
+          );
+          if (segStoreIdx >= 0) {
+            if (slot === 'A') {
+              stocktakeSegmentsStore[segStoreIdx].counterAId = staffId;
+              stocktakeSegmentsStore[segStoreIdx].counterAName = staffName;
+            } else {
+              stocktakeSegmentsStore[segStoreIdx].counterBId = staffId;
+              stocktakeSegmentsStore[segStoreIdx].counterBName = staffName;
+            }
           }
 
           scheduleSave();
@@ -732,6 +974,62 @@ wss.on('connection', (ws, req) => {
         saveBlindVault();
         console.log(`[Hub] Vaulted Team ${slot} count for Zone ${zoneId}. Saved to disk.`);
 
+        // Update zoneAssignmentsStore on Hub
+        let zoneRec = zoneAssignmentsStore.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+        if (!zoneRec) {
+          zoneRec = {
+            zoneId,
+            zoneName: zoneId,
+            sessionId,
+            branchId: hubBranchId,
+            status: slot === 'A' ? 'AWAITING_DOUBLE_COUNT' : 'IN_PROGRESS',
+          };
+          zoneAssignmentsStore.push(zoneRec);
+        }
+
+        if (slot === 'A') {
+          if (!zoneRec.teamA) {
+            zoneRec.teamA = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: true };
+          }
+          zoneRec.teamA.submitted = true;
+          zoneRec.teamA.submittedAt = new Date().toISOString();
+          zoneRec.teamA.lineCount = Array.isArray(lines) ? lines.length : 0;
+          if (!zoneRec.teamB?.submitted) zoneRec.status = 'AWAITING_DOUBLE_COUNT';
+        } else if (slot === 'B') {
+          if (!zoneRec.teamB) {
+            zoneRec.teamB = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: true };
+          }
+          zoneRec.teamB.submitted = true;
+          zoneRec.teamB.submittedAt = new Date().toISOString();
+          zoneRec.teamB.lineCount = Array.isArray(lines) ? lines.length : 0;
+          if (!zoneRec.teamA?.submitted) zoneRec.status = 'IN_PROGRESS';
+        }
+
+        // Authoritatively update session store on Hub
+        const sessIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+        if (sessIdx >= 0) {
+          const sess = stocktakeSessionsStore[sessIdx];
+          if (Array.isArray(sess.segments)) {
+            const seg = sess.segments.find((s) => (s.segmentId || s.id) === zoneId);
+            if (seg) {
+              if (slot === 'A') {
+                seg.hasCountA = true;
+                seg.count1Submitted = true;
+                seg.counterAId = staffId;
+                seg.counterAName = staffName;
+                if (!seg.count2Submitted) seg.status = 'AWAITING_DOUBLE_COUNT';
+              } else if (slot === 'B') {
+                seg.hasCountB = true;
+                seg.count2Submitted = true;
+                seg.counterBId = staffId;
+                seg.counterBName = staffName;
+              }
+            }
+          }
+        }
+
+        scheduleSave();
+
         try {
           const ackPacket = {
             type: 'STOCKTAKE_ACK_SUBMIT',
@@ -750,6 +1048,10 @@ wss.on('connection', (ws, req) => {
           sessionId,
           zoneId,
           slot,
+          staffId,
+          staffName,
+          teamAStaffName: hubBlindStore[sessionId][zoneId].A?.staffName,
+          teamBStaffName: hubBlindStore[sessionId][zoneId].B?.staffName,
           hasCountA: Boolean(hubBlindStore[sessionId][zoneId].A),
           hasCountB: Boolean(hubBlindStore[sessionId][zoneId].B),
           status:
@@ -758,6 +1060,7 @@ wss.on('connection', (ws, req) => {
               : slot === 'A'
               ? 'AWAITING_DOUBLE_COUNT'
               : 'IN_PROGRESS',
+          zone: zoneRec,
           timestamp: Date.now(),
         };
 
@@ -785,23 +1088,37 @@ wss.on('connection', (ws, req) => {
           allKeys.forEach((key) => {
             const itemA = mapA.get(key);
             const itemB = mapB.get(key);
+            const baseItem = itemA || itemB;
+            const upc = Math.max(1, Number(baseItem ? baseItem.unitsPerCase : 1) || 1);
+
             const aCases = Number(itemA ? itemA.cases : 0) || 0;
             const bCases = Number(itemB ? itemB.cases : 0) || 0;
             const aSingles = Number(itemA ? itemA.singles : 0) || 0;
             const bSingles = Number(itemB ? itemB.singles : 0) || 0;
-            const aTot = Number(itemA ? itemA.totalUnits : 0) || 0;
-            const bTot = Number(itemB ? itemB.totalUnits : 0) || 0;
-            const baseItem = itemA || itemB;
 
-            if (itemA && itemB && aCases === bCases && aSingles === bSingles && aTot === bTot) {
+            // Normalized total base units (e.g., 5 cases of 10 = 50 units; 50 singles = 50 units)
+            const aTot = itemA && itemA.totalUnits !== undefined && itemA.totalUnits !== null
+              ? Number(itemA.totalUnits)
+              : (aCases * upc + aSingles);
+            const bTot = itemB && itemB.totalUnits !== undefined && itemB.totalUnits !== null
+              ? Number(itemB.totalUnits)
+              : (bCases * upc + bSingles);
+
+            // If neither team entered any count (0 units), it is not a discrepancy
+            if (aTot === 0 && bTot === 0) {
+              return;
+            }
+
+            // If normalized total units match, the count has BALANCED 100%
+            if (aTot === bTot) {
               verifiedCounts.push({
                 itemId: baseItem.itemId || key,
                 itemName: baseItem.itemName || key,
                 category: baseItem.category,
                 sku: baseItem.sku,
-                unitsPerCase: baseItem.unitsPerCase || 1,
-                cases: aCases,
-                singles: aSingles,
+                unitsPerCase: upc,
+                cases: Math.floor(aTot / upc),
+                singles: aTot % upc,
                 totalUnits: aTot,
                 source: 'MATCHED',
               });
@@ -810,7 +1127,7 @@ wss.on('connection', (ws, req) => {
                 itemId: baseItem.itemId || key,
                 itemName: baseItem.itemName || key,
                 sku: baseItem.sku || key,
-                unitsPerCase: baseItem.unitsPerCase || 1,
+                unitsPerCase: upc,
                 teamACases: aCases,
                 teamASingles: aSingles,
                 teamATotalUnits: aTot,
@@ -824,6 +1141,28 @@ wss.on('connection', (ws, req) => {
 
           if (discrepancies.length === 0) {
             console.log(`[Termux Hub] ✅ Zone ${zoneId} DOUBLE-COUNT MATCHED 100% (${verifiedCounts.length} lines verified).`);
+            if (zoneRec) {
+              zoneRec.status = 'VERIFIED';
+              zoneRec.verifiedCounts = verifiedCounts;
+            }
+            if (sessIdx >= 0) {
+              const sess = stocktakeSessionsStore[sessIdx];
+              if (Array.isArray(sess.segments)) {
+                const seg = sess.segments.find((s) => (s.segmentId || s.id) === zoneId);
+                if (seg) {
+                  seg.status = 'VERIFIED';
+                  seg.verifiedCounts = verifiedCounts;
+                  seg.discrepancyCount = 0;
+                  seg.recount = [];
+                  seg.hasCountA = true;
+                  seg.hasCountB = true;
+                  seg.count1Submitted = true;
+                  seg.count2Submitted = true;
+                }
+              }
+            }
+            scheduleSave();
+
             const verifiedPacket = {
               type: 'STOCKTAKE_MATCH_VERIFIED',
               sessionId,
@@ -831,6 +1170,7 @@ wss.on('connection', (ws, req) => {
               status: 'VERIFIED',
               verifiedCounts,
               verifiedCount: verifiedCounts.length,
+              zone: zoneRec,
               timestamp: Date.now(),
             };
             wss.clients.forEach((client) => {
@@ -842,6 +1182,28 @@ wss.on('connection', (ws, req) => {
             });
           } else {
             console.log(`[Termux Hub] ⚠️ Zone ${zoneId} DISCREPANCY: ${discrepancies.length} variance item(s). Alerting Teams A & B.`);
+            if (zoneRec) {
+              zoneRec.status = 'VARIANCE_FLAGGED';
+              zoneRec.discrepancies = discrepancies;
+            }
+            if (sessIdx >= 0) {
+              const sess = stocktakeSessionsStore[sessIdx];
+              if (Array.isArray(sess.segments)) {
+                const seg = sess.segments.find((s) => (s.segmentId || s.id) === zoneId);
+                if (seg) {
+                  seg.status = 'DISCREPANCY_RECOUNT';
+                  seg.discrepancies = discrepancies;
+                  seg.discrepancyCount = discrepancies.length;
+                  seg.hasCountA = true;
+                  seg.hasCountB = true;
+                  seg.count1Submitted = true;
+                  seg.count2Submitted = true;
+                }
+                sess.status = 'RECOUNTING';
+              }
+            }
+            scheduleSave();
+
             const variancePacket = {
               type: 'STOCKTAKE_VARIANCE_ALERT',
               sessionId,
@@ -851,6 +1213,7 @@ wss.on('connection', (ws, req) => {
               discrepancyCount: discrepancies.length,
               teamAStaffName: subA.staffName,
               teamBStaffName: subB.staffName,
+              zone: zoneRec,
               timestamp: Date.now(),
             };
             wss.clients.forEach((client) => {
@@ -862,6 +1225,174 @@ wss.on('connection', (ws, req) => {
             });
           }
         }
+        return;
+      }
+
+      // 0.49 STOCKTAKE PEER JOINT RECOUNT PROPOSAL
+      if (pType === 'STOCKTAKE_JOINT_PROPOSAL') {
+        const incomingTime = getTimestamp(packet);
+        const existingZone = zoneAssignmentsStore.find((z) => z.zoneId === packet.zoneId && (!packet.sessionId || z.sessionId === packet.sessionId));
+        const existingTime = existingZone?.jointRecount?.proposedAt ? getTimestamp({ updatedAt: existingZone.jointRecount.proposedAt }) : (existingZone ? getTimestamp(existingZone) : 0);
+        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+          console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_JOINT_PROPOSAL for Zone ${packet.zoneId}`);
+          return;
+        }
+
+        const sessionId = packet.sessionId;
+        const zoneId = packet.zoneId;
+        const slot = packet.proposedBySlot || packet.slot || 'A';
+        const staffName = packet.proposedByName || packet.staffName || `Team ${slot}`;
+        const lines = packet.recountLines || packet.lines || [];
+
+        console.log(`[Termux Hub] ✍️ Joint Recount PROPOSAL from Team ${slot} (${staffName}) for Zone ${zoneId} (${lines.length} lines). Forwarding to peers.`);
+
+        let zoneRec = zoneAssignmentsStore.find((z) => z.zoneId === zoneId && (!sessionId || z.sessionId === sessionId));
+        if (!zoneRec) {
+          zoneRec = {
+            zoneId,
+            zoneName: packet.zoneName || `Zone ${zoneId}`,
+            sessionId: sessionId || 'DEFAULT',
+            branchId: packet.branchId || branchId,
+            status: 'VARIANCE_FLAGGED',
+          };
+          zoneAssignmentsStore.push(zoneRec);
+        }
+
+        if (!zoneRec.jointRecount) {
+          zoneRec.jointRecount = {
+            signedByA: false,
+            signedByB: false,
+            lines: [],
+          };
+        }
+
+        zoneRec.jointRecount.lines = lines;
+        zoneRec.jointRecount.proposedBy = slot;
+        zoneRec.jointRecount.proposedByName = staffName;
+        zoneRec.jointRecount.proposedAt = Date.now();
+        if (slot === 'A') zoneRec.jointRecount.signedByA = true;
+        if (slot === 'B') zoneRec.jointRecount.signedByB = true;
+
+        // Sync with stocktakeSessionsStore
+        const sessIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+        if (sessIdx >= 0) {
+          const sess = stocktakeSessionsStore[sessIdx];
+          if (Array.isArray(sess.segments)) {
+            const seg = sess.segments.find((s) => (s.segmentId || s.id) === zoneId);
+            if (seg) {
+              seg.jointRecount = zoneRec.jointRecount;
+            }
+          }
+        }
+
+        scheduleSave();
+
+        // Broadcast proposal packet to all other connected peers
+        const proposalBroadcast = {
+          type: 'STOCKTAKE_JOINT_PROPOSAL',
+          sessionId,
+          zoneId,
+          proposedBySlot: slot,
+          proposedByName: staffName,
+          recountLines: lines,
+          signedByA: zoneRec.jointRecount.signedByA,
+          signedByB: zoneRec.jointRecount.signedByB,
+          zone: zoneRec,
+          timestamp: Date.now(),
+        };
+
+        wss.clients.forEach((client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(JSON.stringify(proposalBroadcast));
+            } catch (e) {}
+          }
+        });
+        return;
+      }
+
+      // 0.50 STOCKTAKE JOINT RECOUNT FINALIZED (DUAL-SIGNATURE COMPLETE)
+      if (pType === 'STOCKTAKE_JOINT_FINALIZED') {
+        const incomingTime = getTimestamp(packet);
+        const existingZone = zoneAssignmentsStore.find((z) => z.zoneId === packet.zoneId && (!packet.sessionId || z.sessionId === packet.sessionId));
+        const existingTime = existingZone?.jointRecount?.resolvedAt ? getTimestamp({ updatedAt: existingZone.jointRecount.resolvedAt }) : (existingZone ? getTimestamp(existingZone) : 0);
+        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+          console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_JOINT_FINALIZED for Zone ${packet.zoneId}`);
+          return;
+        }
+
+        const sessionId = packet.sessionId;
+        const zoneId = packet.zoneId;
+        const resolvedLines = packet.resolvedLines || packet.lines || [];
+        const staffName = packet.resolvedByName || packet.staffName || 'Dual Counters';
+
+        console.log(`[Termux Hub] 🏆 Zone ${zoneId} JOINT RECOUNT FINALIZED & VERIFIED by ${staffName} (${resolvedLines.length} lines).`);
+
+        let zoneRec = zoneAssignmentsStore.find((z) => z.zoneId === zoneId && (!sessionId || z.sessionId === sessionId));
+        if (zoneRec) {
+          zoneRec.status = 'VERIFIED';
+          zoneRec.verifiedCounts = resolvedLines;
+          if (!zoneRec.jointRecount) zoneRec.jointRecount = {};
+          zoneRec.jointRecount.signedByA = true;
+          zoneRec.jointRecount.signedByB = true;
+          zoneRec.jointRecount.resolvedAt = Date.now();
+          zoneRec.jointRecount.resolvedByName = staffName;
+          zoneRec.jointRecount.lines = resolvedLines;
+        }
+
+        const sessIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+        if (sessIdx >= 0) {
+          const sess = stocktakeSessionsStore[sessIdx];
+          if (Array.isArray(sess.segments)) {
+            const seg = sess.segments.find((s) => (s.segmentId || s.id) === zoneId);
+            if (seg) {
+              seg.status = 'VERIFIED';
+              seg.verifiedCounts = resolvedLines;
+              seg.discrepancies = [];
+              seg.discrepancyCount = 0;
+            }
+          }
+        }
+
+        const segIdx = stocktakeSegmentsStore.findIndex((sg) => (sg.segmentId || sg.id) === zoneId);
+        if (segIdx >= 0) {
+          stocktakeSegmentsStore[segIdx].status = 'VERIFIED';
+          stocktakeSegmentsStore[segIdx].verifiedCounts = resolvedLines;
+          stocktakeSegmentsStore[segIdx].discrepancies = [];
+          stocktakeSegmentsStore[segIdx].discrepancyCount = 0;
+        }
+
+        scheduleSave();
+
+        // Broadcast verification & status updates to all peers
+        const verifiedPacket = {
+          type: 'STOCKTAKE_MATCH_VERIFIED',
+          sessionId,
+          zoneId,
+          status: 'VERIFIED',
+          verifiedCounts: resolvedLines,
+          resolvedByName: staffName,
+          source: 'JOINT_RECOUNT',
+          timestamp: Date.now(),
+        };
+
+        const statusPacket = {
+          type: 'STOCKTAKE_ZONE_STATUS_UPDATE',
+          sessionId,
+          zoneId,
+          status: 'VERIFIED',
+          verifiedCounts: resolvedLines,
+          timestamp: Date.now(),
+        };
+
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(JSON.stringify(verifiedPacket));
+              client.send(JSON.stringify(statusPacket));
+            } catch (e) {}
+          }
+        });
         return;
       }
 
@@ -1351,6 +1882,138 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
+      // 9.05 TRANSACTIONAL DATA: SUPPLIERS, ADMIN SALES, CASH COUNTS, VOUCHERS (BATCH A)
+      // =====================================================================
+      const isSupplier = pType === 'SUPPLIER_SYNC' || pType === 'SUPPLIER' || pType === 'supplier' || sheetName === 'Suppliers';
+      if (isSupplier && payload) {
+        const sId = payload.supplierId || payload.id || payload.SupplierID;
+        if (sId) {
+          const exIdx = suppliersStore.findIndex((s) => (s.supplierId || s.id || s.SupplierID) === sId);
+          if (exIdx >= 0) {
+            suppliersStore[exIdx] = { ...suppliersStore[exIdx], ...payload, supplierId: sId };
+          } else {
+            suppliersStore.unshift({ ...payload, supplierId: sId });
+            console.log(`[Termux Hub] 📥 Accepted Supplier [${sId}] (Append-Only)`);
+          }
+          scheduleSave();
+        }
+      }
+
+      const isAdminSale = pType === 'ADMIN_SALES' || pType === 'ADMIN_SALES_SYNC' || pType === 'admin_sales' || sheetName === 'AdminSales';
+      if (isAdminSale && payload) {
+        const asId = payload.id || `AS-${payload.date}-${payload.staffId}`;
+        if (asId) {
+          const exIdx = adminSalesStore.findIndex((a) => a.id === asId);
+          if (exIdx >= 0) {
+            adminSalesStore[exIdx] = { ...adminSalesStore[exIdx], ...payload, id: asId };
+          } else {
+            adminSalesStore.unshift({ ...payload, id: asId });
+            console.log(`[Termux Hub] 📥 Accepted Admin Sale [${asId}] (Append-Only)`);
+          }
+          scheduleSave();
+        }
+      }
+
+      const isCashCount = pType === 'CASH_COUNT' || pType === 'CASH_COUNT_SYNC' || pType === 'cash_count' || sheetName === 'CashCounts';
+      if (isCashCount && payload) {
+        const ccId = payload.id;
+        if (ccId) {
+          const exIdx = cashCountsStore.findIndex((c) => c.id === ccId);
+          if (exIdx >= 0) {
+            cashCountsStore[exIdx] = { ...cashCountsStore[exIdx], ...payload, id: ccId };
+          } else {
+            cashCountsStore.unshift({ ...payload, id: ccId });
+            console.log(`[Termux Hub] 📥 Accepted Cash Count [${ccId}] (Append-Only)`);
+          }
+          scheduleSave();
+        }
+      }
+
+      const isVoucher = pType === 'VOUCHER' || pType === 'VOUCHER_SYNC' || pType === 'voucher' || pType === 'supplier_invoice' || sheetName === 'SupplierInvoices' || sheetName === 'Vouchers';
+      if (isVoucher && payload) {
+        const vId = payload.voucherId || payload.id;
+        if (vId) {
+          const exIdx = vouchersStore.findIndex((v) => (v.voucherId || v.id) === vId);
+          if (exIdx >= 0) {
+            vouchersStore[exIdx] = { ...vouchersStore[exIdx], ...payload, voucherId: vId };
+          } else {
+            vouchersStore.unshift({ ...payload, voucherId: vId });
+            console.log(`[Termux Hub] 📥 Accepted Voucher [${vId}] (Append-Only)`);
+          }
+          scheduleSave();
+        }
+      }
+
+      // =====================================================================
+      // 9.06 TRANSACTIONAL DATA: BUSINESS DAY CLOSURES & SETTLEMENTS (T1 APPEND-ONLY)
+      // =====================================================================
+      const isClosure = pType === 'CLOSURE_SYNC' || pType === 'CLOSURE' || pType === 'closure' || pType === 'EOD' || sheetName === 'BusinessDayClosures' || sheetName === 'Closures';
+      if (isClosure && payload) {
+        const cId = payload.id || `EOD-${payload.date}-${payload.branchId || 'BR-MAIN'}`;
+        if (cId) {
+          const exIdx = businessDayClosuresStore.findIndex((c) => c.id === cId || (c.date === payload.date && c.branchId === payload.branchId));
+          if (exIdx >= 0) {
+            businessDayClosuresStore[exIdx] = { ...businessDayClosuresStore[exIdx], ...payload, id: cId };
+          } else {
+            businessDayClosuresStore.unshift({ ...payload, id: cId });
+            console.log(`[Termux Hub] 📥 Accepted Closure [${cId}] (Append-Only)`);
+          }
+          scheduleSave();
+        }
+      }
+
+      const isSettlement = pType === 'SETTLEMENT_SYNC' || pType === 'SETTLEMENT' || pType === 'settlement' || sheetName === 'ElectronicSettlements' || sheetName === 'Settlements';
+      if (isSettlement && payload) {
+        const sId = payload.id || `SETTLE-${payload.date}-${payload.branchId || 'BR-MAIN'}`;
+        if (sId) {
+          const exIdx = electronicSettlementsStore.findIndex((s) => s.id === sId || (s.date === payload.date && s.branchId === payload.branchId));
+          if (exIdx >= 0) {
+            electronicSettlementsStore[exIdx] = { ...electronicSettlementsStore[exIdx], ...payload, id: sId };
+          } else {
+            electronicSettlementsStore.unshift({ ...payload, id: sId });
+            console.log(`[Termux Hub] 📥 Accepted Electronic Settlement [${sId}] (Append-Only)`);
+          }
+          scheduleSave();
+        }
+      }
+
+      // =====================================================================
+      // 9.07 CONFIGURATION DATA: INVENTORY CATEGORIES (T2 STRICT LWW - 5000MS SKEW)
+      // =====================================================================
+      const isCategory = pType === 'CATEGORY_SYNC' || pType === 'CATEGORIES_SYNC' || pType === 'category' || pType === 'categories' || sheetName === 'Categories';
+      if (isCategory && payload) {
+        const rawCats = Array.isArray(payload) ? payload : (payload.categories || payload.item || payload.data);
+        if (Array.isArray(rawCats)) {
+          const existingTime = Math.max(
+            ...categoriesStore.map((c) => getTimestamp(c)),
+            getTimestamp(categoriesStore),
+            0
+          );
+          const incomingTime = getTimestamp(payload);
+
+          if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+            console.log(
+              `[Termux Hub] 🛡️ LWW Reject: Stale Categories update (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative categories back.`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'CATEGORIES_SYNC',
+                action: 'CATEGORIES_SYNC',
+                categories: categoriesStore,
+                payload: categoriesStore,
+                origin_device_id: 'LOCAL_HUB',
+                hubTimestamp: Date.now(),
+              }));
+            } catch (e) {}
+          } else {
+            categoriesStore = rawCats;
+            console.log(`[Termux Hub] 📥 Accepted Categories update (${rawCats.length} categories, LWW Accepted)`);
+            scheduleSave();
+          }
+        }
+      }
+
+      // =====================================================================
       // 9.1 CONFIGURATION DATA: STAFF & PASSWORDS (STRICT LWW - HUB AUTHORITY)
       // =====================================================================
       const rawStaffObj = packet.staff || (payload && (payload.pin_hash || payload.pin || payload.role) ? payload : null);
@@ -1370,14 +2033,19 @@ wss.on('connection', (ws, req) => {
         if (sIdx >= 0) {
           const existing = salespeopleStore[sIdx];
           const existingTime = getTimestamp(existing);
-          if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
-            console.log(`[Termux Hub] 🛡️ LWW Reject: Stale staff update for ${staffObj.name} (${staffObj.id}). Sending authoritative Hub record back.`);
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+            console.log(
+              `[Termux Hub] 🛡️ LWW Reject: Stale staff update for ${staffObj.name || staffObj.id} (${staffObj.id}) (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
+            );
             try {
               ws.send(JSON.stringify({
                 type: 'STAFF',
                 action: 'STAFF_SYNC',
                 staff: existing,
                 payload: existing,
+                updatedAt: existingTime,
+                hubTimestamp: existingTime,
+                lastUpdated: existing.lastUpdated || new Date(existingTime).toISOString(),
                 origin_device_id: 'LOCAL_HUB',
                 origin_device_name: 'Termux Local Hub',
                 timestamp: Date.now(),
@@ -1388,7 +2056,7 @@ wss.on('connection', (ws, req) => {
         }
 
         if (accepted) {
-          staffObj.updatedAt = hubIso;
+          staffObj.updatedAt = hubNow;
           staffObj.hubTimestamp = hubNow;
           staffObj.lastUpdated = hubIso;
 
@@ -1447,14 +2115,19 @@ wss.on('connection', (ws, req) => {
         if (cIdx >= 0) {
           const existing = customersStore[cIdx];
           const existingTime = getTimestamp(existing);
-          if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime) {
-            console.log(`[Termux Hub] 🛡️ LWW Reject: Stale customer update for ${cId}. Sending authoritative Hub record back.`);
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+            console.log(
+              `[Termux Hub] 🛡️ LWW Reject: Stale customer update for ${cId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
+            );
             try {
               ws.send(JSON.stringify({
                 type: 'CUSTOMER',
                 action: 'CUSTOMER_SYNC',
                 customer: existing,
                 payload: existing,
+                updatedAt: existingTime,
+                hubTimestamp: existingTime,
+                lastUpdated: existing.lastUpdated || new Date(existingTime).toISOString(),
                 origin_device_id: 'LOCAL_HUB',
                 origin_device_name: 'Termux Local Hub',
                 timestamp: Date.now(),
@@ -1465,7 +2138,7 @@ wss.on('connection', (ws, req) => {
         }
 
         if (accepted) {
-          custObj.updatedAt = hubIso;
+          custObj.updatedAt = hubNow;
           custObj.hubTimestamp = hubNow;
           custObj.lastUpdated = hubIso;
 
@@ -1503,6 +2176,182 @@ wss.on('connection', (ws, req) => {
           wss.clients.forEach((client) => {
             if (client !== ws && client.readyState === WebSocket.OPEN) {
               try { client.send(custBroadcastStr); } catch (e) {}
+            }
+          });
+        }
+      }
+
+      // =====================================================================
+      // 9.3 CONFIGURATION DATA: BRANCHES (STRICT LWW)
+      // =====================================================================
+      const rawBranchObj = packet.branch || (payload && (payload.branchId || payload.branch_id || (sheetName && sheetName.toLowerCase() === 'branches')) ? payload : null);
+      const isBranch = pType === 'BRANCH' || pType === 'BRANCH_SYNC' || pType === 'BRANCH_RECORD' || pType === 'branch' || sheetName === 'Branches' || sheetName === 'branches' || !!rawBranchObj;
+      if (isBranch && rawBranchObj && (rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id)) {
+        const bId = rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id;
+        const hubNow = Date.now();
+        const hubIso = new Date().toISOString();
+        const bIdx = branchesStore.findIndex((b) => (b.branchId || b.id || b.branch_id) === bId);
+        const incomingTime = getTimestamp(rawBranchObj);
+        let accepted = true;
+
+        if (bIdx >= 0) {
+          const existing = branchesStore[bIdx];
+          const existingTime = getTimestamp(existing);
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+            console.log(
+              `[Termux Hub] 🛡️ LWW Reject: Stale branch update for ${bId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'BRANCH',
+                action: 'BRANCH_SYNC',
+                branch: existing,
+                payload: existing,
+                updatedAt: existingTime,
+                hubTimestamp: existingTime,
+                lastUpdated: existing.lastUpdated || new Date(existingTime).toISOString(),
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            accepted = false;
+          }
+        }
+
+        if (accepted) {
+          const stamped = {
+            ...rawBranchObj,
+            branchId: bId,
+            id: bId,
+            branch_id: bId,
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
+          };
+
+          if (bIdx >= 0) {
+            branchesStore[bIdx] = { ...branchesStore[bIdx], ...stamped };
+          } else {
+            branchesStore.unshift(stamped);
+          }
+          scheduleSave();
+          console.log(`[Termux Hub] 🏢 Synced Branch: ${stamped.branchName || bId} (${bId}) stamped at ${hubIso}`);
+
+          // Send SYNC_ACK
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'BRANCH',
+              id: bId,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
+
+          // Broadcast updated branch to other peers
+          const branchBroadcastStr = JSON.stringify({
+            type: 'BRANCH',
+            action: 'BRANCH_SYNC',
+            branch: stamped,
+            payload: stamped,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: hubNow,
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try { client.send(branchBroadcastStr); } catch (e) {}
+            }
+          });
+        }
+      }
+
+      // =====================================================================
+      // 9.4 CONFIGURATION DATA: CASH ACCOUNTS (STRICT LWW)
+      // =====================================================================
+      const rawCashAccObj = packet.cashAccount || (payload && (payload.account_id || (sheetName && sheetName.toLowerCase() === 'cashaccounts')) ? payload : null);
+      const isCashAccount = pType === 'CASH_ACCOUNT' || pType === 'CASH_ACCOUNT_SYNC' || pType === 'CASH_ACCOUNT_RECORD' || pType === 'cash_account' || sheetName === 'CashAccounts' || sheetName === 'cash_accounts' || !!rawCashAccObj;
+      if (isCashAccount && rawCashAccObj && (rawCashAccObj.account_id || rawCashAccObj.id)) {
+        const accId = rawCashAccObj.account_id || rawCashAccObj.id;
+        const hubNow = Date.now();
+        const hubIso = new Date().toISOString();
+        const aIdx = cashAccountsStore.findIndex((a) => (a.account_id || a.id) === accId);
+        const incomingTime = getTimestamp(rawCashAccObj);
+        let accepted = true;
+
+        if (aIdx >= 0) {
+          const existing = cashAccountsStore[aIdx];
+          const existingTime = getTimestamp(existing);
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+            console.log(
+              `[Termux Hub] 🛡️ LWW Reject: Stale cash account update for ${accId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'CASH_ACCOUNT',
+                action: 'CASH_ACCOUNT_SYNC',
+                cashAccount: existing,
+                payload: existing,
+                updatedAt: existingTime,
+                hubTimestamp: existingTime,
+                lastUpdated: existing.lastUpdated || new Date(existingTime).toISOString(),
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            accepted = false;
+          }
+        }
+
+        if (accepted) {
+          const stamped = {
+            ...rawCashAccObj,
+            account_id: accId,
+            id: accId,
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
+            updated_at: hubIso,
+          };
+
+          if (aIdx >= 0) {
+            cashAccountsStore[aIdx] = { ...cashAccountsStore[aIdx], ...stamped };
+          } else {
+            cashAccountsStore.unshift(stamped);
+          }
+          scheduleSave();
+          console.log(`[Termux Hub] 💰 Synced Cash Account: ${stamped.account_name || accId} (${accId}) stamped at ${hubIso}`);
+
+          // Send SYNC_ACK
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'CASH_ACCOUNT',
+              id: accId,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
+
+          // Broadcast updated cash account to other peers
+          const accBroadcastStr = JSON.stringify({
+            type: 'CASH_ACCOUNT',
+            action: 'CASH_ACCOUNT_SYNC',
+            cashAccount: stamped,
+            payload: stamped,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: hubNow,
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try { client.send(accBroadcastStr); } catch (e) {}
             }
           });
         }
@@ -1580,8 +2429,14 @@ wss.on('connection', (ws, req) => {
         const missedStockMovements = stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && (getTimestamp(sm) >= sinceTime || packet.isForced));
         const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && (getTimestamp(ex) >= sinceTime || packet.isForced));
         const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, reqBranch) && (getTimestamp(tr) >= sinceTime || packet.isForced));
+        const missedSuppliers = suppliersStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced));
+        const missedAdminSales = adminSalesStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced));
+        const missedCashCounts = cashCountsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced));
+        const missedVouchers = vouchersStore.filter((v) => isMatch(v, reqComp, reqBranch) && (getTimestamp(v) >= sinceTime || packet.isForced));
         const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced));
         const missedCustomers = customersStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced));
+        const missedBranches = branchesStore.filter((b) => isMatch(b, reqComp, reqBranch) && (getTimestamp(b) >= sinceTime || packet.isForced));
+        const missedCashAccounts = cashAccountsStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced));
 
         const catchupResponse = {
           type: 'catchup_response',
@@ -1605,12 +2460,20 @@ wss.on('connection', (ws, req) => {
             stockMovements: missedStockMovements,
             expenses: missedExpenses,
             cashTransfers: missedCashTransfers,
+            suppliers: missedSuppliers,
+            adminSales: missedAdminSales,
+            cashCounts: missedCashCounts,
+            vouchers: missedVouchers,
             casualWorkers: casualWorkersStore,
             zoneAssignments: zoneAssignmentsStore,
             branchLockdowns: branchLockdownsStore,
             salespeople: missedSalespeople,
             customers: missedCustomers,
+            branches: missedBranches,
+            cashAccounts: missedCashAccounts,
             businessDayClosures: businessDayClosuresStore,
+            electronicSettlements: electronicSettlementsStore,
+            categories: categoriesStore,
             stocktakeSessions: stocktakeSessionsStore,
             stocktakeSegments: stocktakeSegmentsStore,
           },
@@ -1622,7 +2485,10 @@ wss.on('connection', (ws, req) => {
             `[Termux Hub] 📤 Dispatched Delta Catch-up to ${reqDeviceId}: ` +
             `${missedSales.length} sales, ${missedDirectGrvs.length} GRVs, ` +
             `${missedInventory.length} inventory deltas (No Firehose), ` +
-            `${missedCashLogs.length} cash logs, ${missedSalespeople.length} staff, ${missedCustomers.length} customers.`
+            `${missedCashLogs.length} cash logs, ${missedSuppliers.length} suppliers, ` +
+            `${missedAdminSales.length} admin sales, ${missedCashCounts.length} cash counts, ` +
+            `${missedVouchers.length} vouchers, ${missedSalespeople.length} staff, ${missedCustomers.length} customers, ` +
+            `${categoriesStore.length} categories.`
           );
         } catch (e) {
           console.warn('[Termux Hub] Failed to send catchup response:', e.message);
@@ -1656,12 +2522,24 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`================================================================`);
-  console.log(`🚀 Saimetric POS - Standalone Local Hub (v3.3.0)`);
+  console.log(`🚀 Saimetric POS - Standalone Local Hub (v3.6.0)`);
   console.log(`📡 WebSocket URL:  ws://0.0.0.0:${PORT}`);
   console.log(`🌐 HTTP Status:    http://0.0.0.0:${PORT}/health`);
   console.log(`🏢 Branch ID:      ${hubBranchId} ("${hubBranchName}")`);
   console.log(`🏢 Tenant ID:      ${hubTenantId}`);
   console.log(`💾 Data File:      ${DATA_FILE}`);
   console.log(`⚡ Dual-Sync:      Transactional (Append-Only) & Config (Strict LWW)`);
+  console.log(`🛡️  Staff LWW handler registered (v3.4.0)`);
+  console.log(`🛡️  Customer LWW handler registered (v3.4.0)`);
+  console.log(`🛡️  Branch LWW handler registered (v3.4.0)`);
+  console.log(`🛡️  Casual Workers LWW handler registered (v3.4.0)`);
+  console.log(`🛡️  Stocktake Session LWW handler registered (v3.4.0)`);
+  console.log(`🛡️  Cash Account LWW handler registered (v3.4.0)`);
+  console.log(`📦 Supplier sync registered (v3.5.0)`);
+  console.log(`📦 Admin Sales sync registered (v3.5.0)`);
+  console.log(`📦 Cash Count sync registered (v3.5.0)`);
+  console.log(`📦 Voucher sync registered (v3.5.0)`);
+  console.log(`📦 Closures & Settlements sync registered (v3.6.0)`);
+  console.log(`📦 Categories sync registered (v3.6.0)`);
   console.log(`================================================================`);
 });

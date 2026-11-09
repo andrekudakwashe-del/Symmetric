@@ -71,10 +71,16 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
     loadSessions();
     const handleUpdate = () => {
       loadSessions();
+      setSelectedSession((prev) => {
+        if (!prev) return null;
+        return getStocktakeSessions().find((s) => s.sessionId === prev.sessionId) || prev;
+      });
     };
     window.addEventListener('saimetric_stocktake_updated', handleUpdate);
+    window.addEventListener('saimetric_stocktake_zone_updated', handleUpdate);
     return () => {
       window.removeEventListener('saimetric_stocktake_updated', handleUpdate);
+      window.removeEventListener('saimetric_stocktake_zone_updated', handleUpdate);
     };
   }, []);
 

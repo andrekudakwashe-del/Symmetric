@@ -16,6 +16,7 @@ import {
   getAllSales,
   getProducts,
   getInventoryItems,
+  getRawStoredInventoryItems,
   getCustomers,
   getCashLogs,
   getExpenses,
@@ -137,7 +138,7 @@ export class RoomBackendAdapter implements IBackendAdapter {
 
       // 2. Inventory
       if (Array.isArray(snapshot.data.inventory)) {
-        const existingInv = getInventoryItems();
+        const existingInv = getRawStoredInventoryItems();
         const nonTenantInv = existingInv.filter((i: any) => i.company_id && i.company_id !== companyId);
         const mappedInv = snapshot.data.inventory.map((i) => ({
           ...i,

@@ -104,7 +104,7 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
         if (pin) {
           payload.pin = pin;
         }
-        updateSalesperson(editingStaffId, payload);
+        updateSalesperson(editingStaffId, payload, { fromSync: false });
       } else {
         addSalesperson({
           name: name.trim(),

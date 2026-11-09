@@ -60,6 +60,47 @@
   - Added timestamp comparison in `isInventory`: if `existingTime > incomingTime`, the older update is ignored and logged.
   - Ensures the highest timestamp price change (e.g. $5) always wins and persists on disk.
 
-## 4. Verification
+## 5. Stocktake Module Cross-Device Sync & Persistence Fixes
+
+### A. Root Cause Analysis
+1. **Missing Ingest Handlers in `meshSyncService.ts`**:
+   - `STOCKTAKE_SEGMENT_CREATED`, `STOCKTAKE_ZONE_CLAIMED`, `STOCKTAKE_ACK_SUBMIT`, `STOCKTAKE_MATCH_VERIFIED`, `STOCKTAKE_VARIANCE_ALERT`, and `STOCKTAKE_ZONE_STATUS_UPDATE` were either falling through to generic unhandled relays or missing authoritative database commits.
+2. **React-Only State Updates in UI Components**:
+   - In `StocktakeSessionDetailScreen.tsx`, adding a segment, claiming a zone, or submitting counts modified in-memory React state before or without saving to IndexedDB, causing state to revert after 30 seconds or on page refresh. Furthermore, segment creation was not broadcasting to the mesh/Hub.
+3. **Branch Mismatch Blocking Stocktake Packets**:
+   - In `meshSyncService.ts`, `isBranchMismatch` was blocking stocktake packets whenever client and Hub branch IDs differed or were unset.
+4. **Missing Hub Handlers for Individual Segments**:
+   - `termux-hub.js` lacked a dedicated handler for `STOCKTAKE_SEGMENT_CREATED` to persist individual segments added after session start.
+
+### B. Implemented Fixes
+1. **Authoritative Stocktake IndexedDB DAOs (`src/db/roomDatabase.ts`)**:
+   - Implemented and exported `saveStocktakeSegment`, `getAllStocktakeSegments`, `updateZoneClaim`, `markZoneVerified`, `markZoneVariance`, and `saveCountSubmission`.
+   - All operations commit to IndexedDB and dispatch `saimetric_stocktake_updated` and `saimetric_stocktake_zone_updated`.
+   - Added exact debug logs:
+     - `[Stocktake] Segment saved to IndexedDB: [segmentId]`
+     - `[Stocktake] Claim saved to IndexedDB: [zoneId] by [staffId]`
+     - `[Stocktake] Count saved to IndexedDB: [zoneId] by Team [A/B]`
+2. **WebSocket Ingest & Broadcast Handlers (`src/services/meshSyncService.ts`)**:
+   - Added `STOCKTAKE_SEGMENT_CREATED` ingest handler calling `saveStocktakeSegment`.
+   - Added `STOCKTAKE_ZONE_CLAIMED` handler calling `updateZoneClaim`.
+   - Added `STOCKTAKE_ACK_SUBMIT` handler updating session/zone status to `'VAULTED'`.
+   - Added `STOCKTAKE_MATCH_VERIFIED` handler calling `markZoneVerified`.
+   - Added `STOCKTAKE_VARIANCE_ALERT` handler calling `markZoneVariance`.
+   - Added `STOCKTAKE_ZONE_STATUS_UPDATE` handler updating zone status in IndexedDB.
+   - Added log for each received packet: `console.log('[Stocktake] Received [packetType] for zone:', zoneId)` and `console.log('[Stocktake] Segment received from Hub:', zoneId)`.
+   - Exempted all stocktake packets from `isBranchMismatch` in `sendPacketToAllTransports`.
+   - Implemented `broadcastStocktakeSegmentCreated()`.
+3. **Component Persistence Before State / Broadcast (`src/components/stocktake/StocktakeSessionDetailScreen.tsx`)**:
+   - `handleAddSegment`: Logs `[Stocktake] Segment created locally: [segmentId]`, saves to IndexedDB via `saveStocktakeSegment` BEFORE updating React state, broadcasts via `broadcastStocktakeSegmentCreated`, and rehydrates state from IndexedDB.
+   - `handleClaimZone`: Saves to IndexedDB via `updateZoneClaim` BEFORE updating React state, broadcasts via `claimStocktakeZone`, and rehydrates from IndexedDB.
+   - `handleSaveCountFromTerminal`: Saves to IndexedDB via `saveCountSubmission` BEFORE broadcasting, submits blind count to Hub, and rehydrates from IndexedDB.
+   - Added listeners for `saimetric_stocktake_updated` and `saimetric_stocktake_ack_submit` to ensure real-time UI updates on all peers.
+4. **Hub Storage & Broadcast (`termux-hub.js` & `public/termux-hub.js`)**:
+   - Added handler for `STOCKTAKE_SEGMENT_CREATED` to update `stocktakeSegmentsStore` and `stocktakeSessionsStore`, schedule disk write, and relay to all connected peers.
+   - Preserved `hub-blind-vault.json` secret count persistence across Hub restarts.
+
+## 6. Verification
 - `tsc --noEmit` (`lint_applet`): Passed with 0 errors.
-- `npm run build` (`compile_applet`): Passed with 0 errors.
+- `vite build` (`compile_applet`): Passed with 0 errors.
+- Dev server restarted and fully operational.
+

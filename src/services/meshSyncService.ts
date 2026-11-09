@@ -39,6 +39,9 @@ import {
   getCurrentBranch,
   getSessionUser,
   getBranches,
+  getAllBranches,
+  getTemporaryCasuals,
+  getAllStocktakeSessions,
   isRecordInBranchScope,
   onDatabaseMutation,
   DatabaseMutationEvent,
@@ -62,8 +65,17 @@ import {
   ingestMeshCashLift,
   ingestMeshGoodsReceived,
   addExpense,
+  addSupplier,
+  saveAdminSalesEntry,
+  saveFinalCashCount,
+  saveSupplierInvoiceVoucher,
+  saveBusinessDayClosure,
+  saveElectronicSettlement,
+  saveCategories,
+  getCategories,
   saveReconciliation,
   saveCashAccount,
+  saveBranch,
   saveCashTransfer,
   getAllExpenses,
   getAllCashAccounts,
@@ -76,9 +88,20 @@ import {
   claimZoneSlot,
   updateZoneFromHubStatus,
   ingestStocktakeSessionFromMesh,
+  saveStocktakeSegment,
+  updateZoneClaim,
+  markZoneVerified,
+  markZoneVariance,
+  saveStocktakeSession,
+  getStocktakeSessionById,
+  saveZoneAssignment,
+  saveZoneAssignmentsBatch,
+  applyJointRecountSignature,
   onSaleUpdated,
   onStaffChanged,
   onCustomerChanged,
+  onBranchChanged,
+  onCashAccountChanged,
 } from '../db/roomDatabase';
 import { getMovements, addMovement, onCashMovementCreated, CashMovement } from '../db/cashLedger';
 import { persistentSyncEngine } from './persistentSyncEngine';
@@ -90,6 +113,32 @@ import {
   generatePinSalt,
   sanitizeUserForExport,
 } from '../utils/pinCrypto';
+import {
+  getLastStaffSync,
+  setLastStaffSync,
+  markStaffSyncComplete,
+  SAIMETRIC_LAST_STAFF_SYNC,
+  getLastBranchSync,
+  setLastBranchSync,
+  markBranchSyncComplete,
+  SAIMETRIC_LAST_BRANCH_SYNC,
+  getLastCustomerSync,
+  setLastCustomerSync,
+  markCustomerSyncComplete,
+  SAIMETRIC_LAST_CUSTOMER_SYNC,
+  getLastCashAccountSync,
+  setLastCashAccountSync,
+  markCashAccountSyncComplete,
+  SAIMETRIC_LAST_CASH_ACCOUNT_SYNC,
+  getLastCasualWorkerSync,
+  setLastCasualWorkerSync,
+  markCasualWorkerSyncComplete,
+  SAIMETRIC_LAST_CASUAL_WORKER_SYNC,
+  getLastStocktakeSessionSync,
+  setLastStocktakeSessionSync,
+  markStocktakeSessionSyncComplete,
+  SAIMETRIC_LAST_STOCKTAKE_SESSION_SYNC,
+} from './sync/highWaterMarks';
 
 export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE' | 'CLOUD_ONLY';
 
@@ -202,6 +251,16 @@ function playChime() {
     }, 500);
   } catch (e) {}
 }
+
+type SyncCoreListener = (envelope: any) => void;
+const syncCoreListeners: Set<SyncCoreListener> = new Set();
+
+export const registerSyncCoreListener = (handler: SyncCoreListener): (() => void) => {
+  syncCoreListeners.add(handler);
+  return () => {
+    syncCoreListeners.delete(handler);
+  };
+};
 
 class MeshSyncManager {
   private config: P2PMeshConfig;
@@ -766,6 +825,16 @@ class MeshSyncManager {
       this.broadcastCustomer(cust);
     });
 
+    // Auto-hook into Branch creation & edits: broadcast to Local Hub & mesh
+    onBranchChanged((branch: any) => {
+      this.broadcastBranch(branch);
+    });
+
+    // Auto-hook into Cash Account creation & edits: broadcast to Local Hub & mesh
+    onCashAccountChanged((account: any) => {
+      this.broadcastCashAccount(account);
+    });
+
     // Auto-hook into Cash Drawer Movements: broadcast in real-time so cash balances across devices
     onCashMovementCreated((movement: CashMovement) => {
       this.broadcastCashMovement(movement);
@@ -777,7 +846,12 @@ class MeshSyncManager {
     });
 
     // Auto-hook into Whole Database Mutation Bus (Branch setup, staff permissions, supervisor approvals, cash log, settings, GRVs)
+    // Row 10 Strategy 1: Listener broadcasts db_mutation packets to WiFi mesh and records in Live Event Ledger,
+    // but DOES NOT call enqueueSync. T1 entities enqueue directly inside their save functions to eliminate reload races.
     onDatabaseMutation((mutation: DatabaseMutationEvent) => {
+      if (mutation.fromSync === true || (mutation as any).payload?.fromSync === true) {
+        return;
+      }
       this.broadcastDatabaseMutation(mutation);
     });
 
@@ -1513,6 +1587,8 @@ class MeshSyncManager {
       return;
     }
 
+    syncCoreListeners.forEach((fn) => { try { fn(packet); } catch {} });
+
     // Fast deduplication by packet ID or entity ID
     const pType = packet.type || packet.action || '';
 
@@ -1532,6 +1608,12 @@ class MeshSyncManager {
       this.handleSyncAck(packet);
       return;
     }
+
+    // Fix E: Clear stuck entries from pendingLocalHubQueue on LWW reject / authoritative Hub push
+    const isFromHubAuthoritative =
+      packet.origin_device_id === 'LOCAL_HUB' ||
+      packet.originDeviceId === 'LOCAL_HUB';
+
     const isInvPacket =
       pType === 'inventory' ||
       pType === 'INVENTORY' ||
@@ -1543,6 +1625,146 @@ class MeshSyncManager {
       packet.action === 'INVENTORY_UPDATE' ||
       packet.action === 'INVENTORY_RECORD' ||
       Boolean(packet.item);
+
+    const isLwwRejectOrHubPush =
+      isFromHubAuthoritative ||
+      packet.entityType === 'branch' ||
+      packet.entityType === 'staff' ||
+      packet.entityType === 'customer' ||
+      packet.entityType === 'cash_account' ||
+      pType === 'BRANCH_SYNC' ||
+      pType === 'BRANCH' ||
+      packet.type === 'BRANCH_SYNC' ||
+      packet.type === 'BRANCH' ||
+      packet.action === 'BRANCH_SYNC' ||
+      packet.action === 'LWW_REJECT' ||
+      packet.status === 'rejected' ||
+      packet.error === 'LWW_STALE' ||
+      (typeof packet.message === 'string' && packet.message.toUpperCase().includes('LWW'));
+
+    if (isLwwRejectOrHubPush) {
+      let entityType = '';
+      let entityId = '';
+
+      if (
+        packet.entityType === 'branch' ||
+        pType === 'branch' ||
+        pType === 'BRANCH' ||
+        pType === 'BRANCH_SYNC' ||
+        pType === 'BRANCH_RECORD' ||
+        packet.type === 'BRANCH_SYNC' ||
+        packet.type === 'BRANCH'
+      ) {
+        entityType = 'Branch';
+        const br = packet.branch || packet.payload || packet;
+        entityId =
+          packet.recordId ||
+          packet.branchId ||
+          packet.branch_id ||
+          packet.id ||
+          packet.entityId ||
+          br.recordId ||
+          br.branchId ||
+          br.id ||
+          br.branch_id ||
+          '';
+      } else if (
+        packet.entityType === 'staff' ||
+        pType === 'staff' ||
+        pType === 'STAFF' ||
+        pType === 'STAFF_SYNC' ||
+        pType === 'STAFF_RECORD' ||
+        packet.type === 'STAFF_SYNC'
+      ) {
+        entityType = 'Staff';
+        const st = packet.staff || packet.payload || packet;
+        entityId =
+          packet.recordId ||
+          packet.staffId ||
+          packet.id ||
+          packet.entityId ||
+          st.recordId ||
+          st.id ||
+          st.staffId ||
+          '';
+      } else if (
+        packet.entityType === 'customer' ||
+        pType === 'customer' ||
+        pType === 'CUSTOMER' ||
+        pType === 'CUSTOMER_SYNC' ||
+        pType === 'CUSTOMER_RECORD' ||
+        packet.type === 'CUSTOMER_SYNC'
+      ) {
+        entityType = 'Customer';
+        const cu = packet.customer || packet.payload || packet;
+        entityId =
+          packet.recordId ||
+          packet.customerId ||
+          packet.id ||
+          packet.entityId ||
+          cu.recordId ||
+          cu.customerId ||
+          cu.id ||
+          '';
+      } else if (
+        packet.entityType === 'cash_account' ||
+        pType === 'cash_account' ||
+        pType === 'CASH_ACCOUNT' ||
+        pType === 'CASH_ACCOUNT_SYNC' ||
+        pType === 'CASH_ACCOUNT_RECORD' ||
+        packet.type === 'CASH_ACCOUNT_SYNC'
+      ) {
+        entityType = 'CashAccount';
+        const ca = packet.cashAccount || packet.payload || packet;
+        entityId =
+          packet.recordId ||
+          packet.account_id ||
+          packet.id ||
+          packet.entityId ||
+          ca.recordId ||
+          ca.account_id ||
+          ca.id ||
+          '';
+      } else if (pType === 'CASUAL_WORKERS_SYNC') {
+        entityType = 'CasualWorker';
+        entityId = 'ALL';
+      } else if (typeof pType === 'string' && pType.startsWith('STOCKTAKE_')) {
+        entityType = 'StocktakeSession';
+        entityId = packet.sessionId || (packet.session && packet.session.sessionId) || '';
+      } else if (isInvPacket) {
+        entityType = 'Inventory';
+        const it = packet.item || packet.payload || packet;
+        entityId = it.itemId || it.id || '';
+      }
+
+      if (entityId) {
+        const cleanTargetId = String(entityId).trim().toUpperCase();
+        const initialLen = this.pendingLocalHubQueue.length;
+        this.pendingLocalHubQueue = this.pendingLocalHubQueue.filter((p) => {
+          const pItemId =
+            p.recordId ||
+            p.itemId ||
+            p.id ||
+            p.branchId ||
+            p.branch_id ||
+            p.sessionId ||
+            (p.item && (p.item.itemId || p.item.id)) ||
+            (p.branch && (p.branch.branchId || p.branch.id || p.branch.branch_id || p.branch.recordId)) ||
+            (p.staff && (p.staff.id || p.staff.staffId || p.staff.recordId)) ||
+            (p.customer && (p.customer.customerId || p.customer.id || p.customer.recordId)) ||
+            (p.cashAccount && (p.cashAccount.account_id || p.cashAccount.id || p.cashAccount.recordId)) ||
+            (p.payload && (p.payload.recordId || p.payload.itemId || p.payload.id || p.payload.branchId || p.payload.branch_id || p.payload.customerId || p.payload.account_id || p.payload.sessionId));
+
+          const matches = pItemId && String(pItemId).trim().toUpperCase() === cleanTargetId;
+          return !matches;
+        });
+
+        if (this.pendingLocalHubQueue.length < initialLen) {
+          this.savePendingLocalHubQueue();
+          console.log(`[Queue] Removed rejected entry: ${entityType} ${entityId} (stale, Hub authoritative)`);
+        }
+      }
+    }
 
     // Fast deduplication by packet ID or entity ID (never deduplicate inventory updates by static itemId)
     const packetId =
@@ -1736,7 +1958,7 @@ class MeshSyncManager {
     if (pType === 'expense' || pType === 'EXPENSE_RECORD') {
       const expense = packet.expense || packet.payload;
       if (expense) {
-        addExpense({ ...expense, fromMesh: true });
+        addExpense({ ...expense, fromMesh: true }, { fromSync: true });
         window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
@@ -1761,7 +1983,11 @@ class MeshSyncManager {
     if (pType === 'staff' || pType === 'STAFF' || pType === 'STAFF_SYNC' || pType === 'STAFF_RECORD') {
       const staff = packet.staff || packet.payload;
       if (staff && staff.id) {
-        ingestMeshStaff({ ...staff, fromMesh: true } as any);
+        const staffTime = extractRecordTimestamp(staff);
+        ingestMeshStaff({ ...staff, fromMesh: true } as any, { fromSync: true });
+        if (staffTime > 0) {
+          setLastStaffSync(Math.max(getLastStaffSync(), staffTime));
+        }
         window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
       }
@@ -1772,8 +1998,103 @@ class MeshSyncManager {
     if (pType === 'customer' || pType === 'CUSTOMER' || pType === 'CUSTOMER_SYNC' || pType === 'CUSTOMER_RECORD') {
       const customer = packet.customer || packet.payload;
       if (customer && (customer.customerId || customer.id)) {
-        ingestMeshCustomer({ ...customer, fromMesh: true });
+        const custTime = extractRecordTimestamp(customer);
+        ingestMeshCustomer({ ...customer, fromMesh: true }, { fromSync: true });
+        if (custTime > 0) {
+          setLastCustomerSync(Math.max(getLastCustomerSync(), custTime));
+        }
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+      }
+      return;
+    }
+
+    // 10.04 BRANCHES
+    if (pType === 'branch' || pType === 'BRANCH' || pType === 'BRANCH_SYNC' || pType === 'BRANCH_RECORD') {
+      const branch = packet.branch || packet.payload;
+      if (branch && (branch.branchId || branch.id)) {
+        const branchTime = extractRecordTimestamp(branch);
+        saveBranch({ ...branch, fromMesh: true }, { fromSync: true });
+        if (branchTime > 0) {
+          setLastBranchSync(Math.max(getLastBranchSync(), branchTime));
+        }
+        window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
+      }
+      return;
+    }
+
+    // 10.05 CASH ACCOUNTS
+    if (pType === 'cash_account' || pType === 'CASH_ACCOUNT' || pType === 'CASH_ACCOUNT_SYNC' || pType === 'CASH_ACCOUNT_RECORD') {
+      const account = packet.cashAccount || packet.payload;
+      if (account && (account.account_id || account.id)) {
+        const accTime = extractRecordTimestamp(account);
+        saveCashAccount({ ...account, fromMesh: true }, { fromSync: true });
+        if (accTime > 0) {
+          setLastCashAccountSync(Math.max(getLastCashAccountSync(), accTime));
+        }
+        window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated'));
+      }
+      return;
+    }
+
+    // 10.06 SUPPLIERS (T1)
+    if (pType === 'supplier' || pType === 'SUPPLIER' || pType === 'SUPPLIER_SYNC' || pType === 'SUPPLIER_RECORD') {
+      const supplier = packet.supplier || packet.payload || packet.item;
+      if (supplier && (supplier.supplierId || supplier.id || supplier.SupplierID)) {
+        this.ingestMeshSupplier({ ...supplier, fromMesh: true });
+      }
+      return;
+    }
+
+    // 10.07 ADMIN SALES (T1)
+    if (pType === 'admin_sales' || pType === 'ADMIN_SALES' || pType === 'ADMIN_SALES_SYNC' || pType === 'ADMIN_SALES_RECORD') {
+      const adminSale = packet.adminSale || packet.payload || packet.item;
+      if (adminSale && (adminSale.id || adminSale.staffId)) {
+        this.ingestMeshAdminSales({ ...adminSale, fromMesh: true });
+      }
+      return;
+    }
+
+    // 10.08 CASH COUNTS (T1)
+    if (pType === 'cash_count' || pType === 'CASH_COUNT' || pType === 'CASH_COUNT_SYNC' || pType === 'CASH_COUNT_RECORD') {
+      const cashCount = packet.cashCount || packet.payload || packet.item;
+      if (cashCount && (cashCount.id || cashCount.staffId)) {
+        this.ingestMeshCashCount({ ...cashCount, fromMesh: true });
+      }
+      return;
+    }
+
+    // 10.09 VOUCHERS / SUPPLIER INVOICES (T1)
+    if (pType === 'voucher' || pType === 'VOUCHER' || pType === 'VOUCHER_SYNC' || pType === 'VOUCHER_RECORD' || pType === 'supplier_invoice' || pType === 'SUPPLIER_INVOICE') {
+      const voucher = packet.voucher || packet.payload || packet.item;
+      if (voucher && (voucher.voucherId || voucher.id)) {
+        this.ingestMeshVoucher({ ...voucher, fromMesh: true });
+      }
+      return;
+    }
+
+    // 10.10 BUSINESS DAY CLOSURES (T1)
+    if (pType === 'closure' || pType === 'CLOSURE' || pType === 'CLOSURE_SYNC' || pType === 'CLOSURE_RECORD' || pType === 'eod' || pType === 'EOD') {
+      const closure = packet.closure || packet.payload || packet.item;
+      if (closure && (closure.id || closure.date)) {
+        this.ingestMeshClosure({ ...closure, fromMesh: true });
+      }
+      return;
+    }
+
+    // 10.11 ELECTRONIC SETTLEMENTS (T1)
+    if (pType === 'settlement' || pType === 'SETTLEMENT' || pType === 'SETTLEMENT_SYNC' || pType === 'SETTLEMENT_RECORD') {
+      const settlement = packet.settlement || packet.payload || packet.item;
+      if (settlement && (settlement.id || settlement.date)) {
+        this.ingestMeshSettlement({ ...settlement, fromMesh: true });
+      }
+      return;
+    }
+
+    // 10.12 INVENTORY CATEGORIES (T2)
+    if (pType === 'category' || pType === 'CATEGORY' || pType === 'CATEGORY_SYNC' || pType === 'CATEGORIES_SYNC' || pType === 'categories' || pType === 'CATEGORIES') {
+      const cats = packet.categories || packet.category || packet.payload || packet.item;
+      if (cats) {
+        this.ingestMeshCategories(cats);
       }
       return;
     }
@@ -1782,7 +2103,7 @@ class MeshSyncManager {
     if (pType === 'CASUAL_WORKERS_SYNC') {
       const casuals = packet.casualWorkers || packet.payload || packet.casuals;
       if (Array.isArray(casuals)) {
-        syncCasualWorkersFromHub(casuals);
+        syncCasualWorkersFromHub(casuals, { fromSync: true });
         window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
       }
       return;
@@ -1801,53 +2122,138 @@ class MeshSyncManager {
       return;
     }
 
+    // 10.25 STOCKTAKE SEGMENT CREATED
+    if (pType === 'STOCKTAKE_SEGMENT_CREATED') {
+      const seg = packet.segment || packet;
+      const zoneId = seg.segmentId || seg.id || packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_SEGMENT_CREATED for zone:', zoneId);
+      console.log('[Stocktake] Segment received from Hub:', zoneId);
+      saveStocktakeSegment(seg, packet.sessionId || seg.sessionId);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      }
+      return;
+    }
+
     // 10.3 STOCKTAKE ZONE CLAIMED
     if (pType === 'STOCKTAKE_ZONE_CLAIMED') {
-      claimZoneSlot(
-        packet.sessionId,
-        packet.zoneId,
-        packet.slot,
-        packet.deviceId,
-        packet.staffId,
-        packet.staffName,
-        packet.zone?.zoneName
-      );
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      const zoneId = packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_ZONE_CLAIMED for zone:', zoneId);
+      const claim = {
+        staffId: packet.staffId,
+        staffName: packet.staffName,
+        deviceId: packet.deviceId,
+        zoneName: packet.zone?.zoneName || packet.zoneName,
+        sessionId: packet.sessionId,
+      };
+      updateZoneClaim(zoneId, packet.slot, claim, packet.sessionId);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      }
       return;
     }
 
     // 10.4 STOCKTAKE ZONE STATUS UPDATE (BLIND VAULT)
     if (pType === 'STOCKTAKE_ZONE_STATUS_UPDATE') {
-      updateZoneFromHubStatus(packet.sessionId, packet.zoneId, packet.status);
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      const zoneId = packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_ZONE_STATUS_UPDATE for zone:', zoneId);
+      if (packet.sessionId && zoneId) {
+        updateZoneFromHubStatus(packet.sessionId, zoneId, packet.status, undefined, undefined, {
+          hasCountA: packet.hasCountA,
+          hasCountB: packet.hasCountB,
+          teamAStaffName: packet.teamAStaffName,
+          teamBStaffName: packet.teamBStaffName,
+        });
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      }
       return;
     }
 
     // 10.5 STOCKTAKE MATCH VERIFIED
     if (pType === 'STOCKTAKE_MATCH_VERIFIED') {
-      updateZoneFromHubStatus(packet.sessionId, packet.zoneId, 'VERIFIED', undefined, packet.verifiedCounts);
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: packet }));
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      const zoneId = packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_MATCH_VERIFIED for zone:', zoneId);
+      markZoneVerified(zoneId, packet.verifiedCounts || [], packet.sessionId);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: packet }));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      }
       return;
     }
 
     // 10.6 STOCKTAKE VARIANCE ALERT
     if (pType === 'STOCKTAKE_VARIANCE_ALERT') {
-      updateZoneFromHubStatus(packet.sessionId, packet.zoneId, 'VARIANCE_FLAGGED', packet.discrepancies);
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_variance_alert', { detail: packet }));
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      const zoneId = packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_VARIANCE_ALERT for zone:', zoneId);
+      markZoneVariance(zoneId, packet.discrepancies || [], packet.sessionId);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_variance_alert', { detail: packet }));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      }
       return;
     }
 
     // 10.7 PEER DUAL-SIGNATURE JOINT PROPOSAL
     if (pType === 'STOCKTAKE_JOINT_PROPOSAL') {
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_joint_proposal', { detail: packet }));
+      const zoneId = packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_JOINT_PROPOSAL for zone:', zoneId, 'from slot:', packet.proposedBySlot);
+      applyJointRecountSignature(
+        packet.sessionId,
+        zoneId,
+        packet.proposedBySlot || 'A',
+        packet.proposedByName || 'Peer Counter',
+        packet.recountLines || []
+      );
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_joint_proposal', { detail: packet }));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+      }
+      return;
+    }
+
+    // 10.75 PEER DUAL-SIGNATURE JOINT FINALIZED
+    if (pType === 'STOCKTAKE_JOINT_FINALIZED') {
+      const zoneId = packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_JOINT_FINALIZED for zone:', zoneId);
+      applyJointRecountSignature(
+        packet.sessionId,
+        zoneId,
+        'BOTH',
+        packet.resolvedByName || 'Dual Counters',
+        packet.resolvedLines || []
+      );
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: { zoneId, verifiedCounts: packet.resolvedLines } }));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: { zoneId, status: 'VERIFIED' } }));
+      }
       return;
     }
 
     // 10.8 BLIND SUBMISSION ACK
     if (pType === 'STOCKTAKE_ACK_SUBMIT') {
-      window.dispatchEvent(new CustomEvent('saimetric_stocktake_ack_submit', { detail: packet }));
+      const zoneId = packet.zoneId;
+      console.log('[Stocktake] Received STOCKTAKE_ACK_SUBMIT for zone:', zoneId);
+      if (packet.sessionId && zoneId) {
+        updateZoneFromHubStatus(packet.sessionId, zoneId, 'VAULTED');
+        const sess = getStocktakeSessionById(packet.sessionId);
+        if (sess) {
+          sess.status = 'VAULTED';
+          saveStocktakeSession(sess);
+        }
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_ack_submit', { detail: packet }));
+      }
       return;
     }
 
@@ -1879,6 +2285,12 @@ class MeshSyncManager {
     if (pType === 'STOCKTAKE_SESSION_LIST') {
       const sessions = packet.sessions || packet.payload?.sessions || [];
       const segments = packet.segments || packet.payload?.segments || [];
+      const zoneAssignments = packet.zoneAssignments || packet.payload?.zoneAssignments || [];
+
+      if (Array.isArray(zoneAssignments) && zoneAssignments.length > 0) {
+        saveZoneAssignmentsBatch(zoneAssignments.filter((z: any) => z && z.sessionId && z.zoneId));
+      }
+
       if (Array.isArray(sessions) && sessions.length > 0) {
         sessions.forEach((sess: any) => {
           if (sess && sess.sessionId) {
@@ -2456,7 +2868,109 @@ class MeshSyncManager {
         }
       }
 
-      // 4. Flush-Before-Pull: Signal DRAIN_COMPLETE_PING to Local Hub
+      // 4. Staff Delta Sync on reconnect (replaces Staff Firehose with high-water-mark deltas)
+      const lastStaffSync = getLastStaffSync();
+      const allStaff = getAllSalespeople();
+      console.log('[HWM] Filtering staff. HWM:', lastStaffSync, 'Total records:', allStaff.length);
+      const filteredStaff = lastStaffSync === 0
+        ? allStaff
+        : allStaff.filter((s: any) => parseTimestampMs(s.updatedAt || s.lastUpdated || s.lastActive) > lastStaffSync);
+
+      console.log(`[Staff] Delta sync on reconnect: ${filteredStaff.length} of ${allStaff.length} staff broadcast (since ${new Date(lastStaffSync).toISOString()})`);
+
+      for (const st of filteredStaff) {
+        this.broadcastStaff(st);
+      }
+      if (lastStaffSync === 0 && allStaff.length > 0) {
+        setLastStaffSync(Date.now());
+      }
+
+      // 4.1 Branch Delta Sync on reconnect
+      const lastBranchSync = getLastBranchSync();
+      const allBranches = getAllBranches();
+      console.log('[HWM] Filtering branch. HWM:', lastBranchSync, 'Total records:', allBranches.length);
+      const filteredBranches = lastBranchSync === 0
+        ? allBranches
+        : allBranches.filter((b: any) => parseTimestampMs(b.updatedAt || b.lastUpdated || (b as any).updated_at) > lastBranchSync);
+
+      console.log(`[Branch] Delta sync on reconnect: ${filteredBranches.length} of ${allBranches.length} branches broadcast (since ${new Date(lastBranchSync).toISOString()})`);
+
+      for (const br of filteredBranches) {
+        this.broadcastBranch(br);
+      }
+      if (lastBranchSync === 0 && allBranches.length > 0) {
+        setLastBranchSync(Date.now());
+      }
+
+      // 4.2 Customer Delta Sync on reconnect
+      const lastCustomerSync = getLastCustomerSync();
+      const allCustomers = getCustomers();
+      console.log('[HWM] Filtering customer. HWM:', lastCustomerSync, 'Total records:', allCustomers.length);
+      const filteredCustomers = lastCustomerSync === 0
+        ? allCustomers
+        : allCustomers.filter((c: any) => parseTimestampMs(c.updatedAt || c.lastUpdated || (c as any).updated_at) > lastCustomerSync);
+
+      console.log(`[Customer] Delta sync on reconnect: ${filteredCustomers.length} of ${allCustomers.length} customers broadcast (since ${new Date(lastCustomerSync).toISOString()})`);
+
+      for (const cust of filteredCustomers) {
+        this.broadcastCustomer(cust);
+      }
+      if (lastCustomerSync === 0 && allCustomers.length > 0) {
+        setLastCustomerSync(Date.now());
+      }
+
+      // 4.3 Cash Account Delta Sync on reconnect
+      const lastCashAccountSync = getLastCashAccountSync();
+      const allCashAccounts = getAllCashAccounts();
+      console.log('[HWM] Filtering cash account. HWM:', lastCashAccountSync, 'Total records:', allCashAccounts.length);
+      const filteredCashAccounts = lastCashAccountSync === 0
+        ? allCashAccounts
+        : allCashAccounts.filter((a: any) => parseTimestampMs(a.updatedAt || a.lastUpdated || (a as any).updated_at) > lastCashAccountSync);
+
+      console.log(`[CashAccount] Delta sync on reconnect: ${filteredCashAccounts.length} of ${allCashAccounts.length} cash accounts broadcast (since ${new Date(lastCashAccountSync).toISOString()})`);
+
+      for (const acc of filteredCashAccounts) {
+        this.broadcastCashAccount(acc);
+      }
+      if (lastCashAccountSync === 0 && allCashAccounts.length > 0) {
+        setLastCashAccountSync(Date.now());
+      }
+
+      // 4.4 Casual Workers Delta Sync on reconnect
+      const lastCasualWorkerSync = getLastCasualWorkerSync();
+      const allCasuals = getTemporaryCasuals();
+      console.log('[HWM] Filtering casual worker. HWM:', lastCasualWorkerSync, 'Total records:', allCasuals.length);
+      const filteredCasuals = lastCasualWorkerSync === 0
+        ? allCasuals
+        : allCasuals.filter((cw: any) => parseTimestampMs(cw.updatedAt || cw.lastUpdated || (cw as any).updated_at) > lastCasualWorkerSync);
+
+      console.log(`[CasualWorker] Delta sync on reconnect: ${filteredCasuals.length} of ${allCasuals.length} casual workers broadcast (since ${new Date(lastCasualWorkerSync).toISOString()})`);
+
+      if (filteredCasuals.length > 0) {
+        this.broadcastCasualWorkers(filteredCasuals);
+      }
+      if (lastCasualWorkerSync === 0 && allCasuals.length > 0) {
+        setLastCasualWorkerSync(Date.now());
+      }
+
+      // 4.5 Stocktake Session Delta Sync on reconnect
+      const lastStocktakeSync = getLastStocktakeSessionSync();
+      const allSessions = getAllStocktakeSessions();
+      console.log('[HWM] Filtering stocktake session. HWM:', lastStocktakeSync, 'Total records:', allSessions.length);
+      const filteredSessions = lastStocktakeSync === 0
+        ? allSessions
+        : allSessions.filter((s: any) => parseTimestampMs(s.updatedAt || s.lastUpdated || (s as any).updated_at) > lastStocktakeSync);
+
+      console.log(`[StocktakeSession] Delta sync on reconnect: ${filteredSessions.length} of ${allSessions.length} stocktake sessions broadcast (since ${new Date(lastStocktakeSync).toISOString()})`);
+
+      for (const sess of filteredSessions) {
+        this.broadcastStocktakeSessionStarted(sess);
+      }
+      if (lastStocktakeSync === 0 && allSessions.length > 0) {
+        setLastStocktakeSessionSync(Date.now());
+      }
+
+      // 5. Flush-Before-Pull: Signal DRAIN_COMPLETE_PING to Local Hub
       this.isAwaitingDrainAck = true;
       const pingPacket = {
         type: 'DRAIN_COMPLETE_PING',
@@ -3201,8 +3715,14 @@ class MeshSyncManager {
       packet.target_branch_id === 'ALL' ||
       targetBranch === 'ALL';
 
+    const isStocktakePacket =
+      topicSuffix.startsWith('stocktake') ||
+      (typeof packet.type === 'string' && packet.type.startsWith('STOCKTAKE_')) ||
+      (typeof packet.action === 'string' && packet.action.startsWith('STOCKTAKE_'));
+
     const isBranchMismatch =
       !isCatalogPacket &&
+      !isStocktakePacket &&
       Boolean(this.hubBranchId) &&
       this.hubBranchId !== 'UNASSIGNED' &&
       Boolean(targetBranch) &&
@@ -3531,7 +4051,11 @@ class MeshSyncManager {
     if (topic.endsWith('/staff_permission') || packet.type === 'staff_permission' || packet.action === 'STAFF_PERMISSION_RECORD') {
       const staff: Salesperson = packet.staff || packet.payload;
       if (staff && staff.id) {
-        const ingested = ingestMeshStaff({ ...staff, fromMesh: true } as any);
+        const staffTime = extractRecordTimestamp(staff);
+        const ingested = ingestMeshStaff({ ...staff, fromMesh: true } as any, { fromSync: true });
+        if (staffTime > 0) {
+          setLastStaffSync(Math.max(getLastStaffSync(), staffTime));
+        }
         if (ingested) {
           playChime();
           this.addLog(
@@ -3675,7 +4199,7 @@ class MeshSyncManager {
     if (topic.endsWith('/expense') || packet.type === 'expense' || packet.action === 'EXPENSE_RECORD') {
       const expense = packet.expense || packet.payload;
       if (expense) {
-        addExpense({ ...expense, fromMesh: true });
+        addExpense({ ...expense, fromMesh: true }, { fromSync: true });
         this.addLog('EPIDEMIC_HOP', `Expense synced from ${originName}: $${expense.amount} (${expense.category})`, originName, this.config.deviceName);
         window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -3692,6 +4216,12 @@ class MeshSyncManager {
           this.addLog('EPIDEMIC_HOP', `Branch Settings updated from ${originName}. Synced locally!`, originName, this.config.deviceName);
         }
       }
+      return;
+    }
+
+    // 9.5 STOCKTAKE PACKETS (MQTT, WebRTC, BroadcastChannel)
+    if (topic.includes('stocktake') || (typeof packet.type === 'string' && packet.type.startsWith('STOCKTAKE_')) || (typeof packet.action === 'string' && packet.action.startsWith('STOCKTAKE_'))) {
+      this.processSingleLocalHubPacket(packet);
       return;
     }
 
@@ -3807,12 +4337,32 @@ class MeshSyncManager {
         break;
       case 'branch':
         didIngest = ingestMeshBranch({ ...payload, fromMesh: true });
+        if (didIngest) {
+          window.dispatchEvent(new Event('saimetric_branches_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_branches_updated', { detail: payload }));
+          this.addLog('EPIDEMIC_HOP', `Branch [${payload.branchId || payload.id}] updated from ${originName}`, originName, this.config.deviceName);
+        }
         break;
-      case 'staff':
-        didIngest = ingestMeshStaff({ ...payload, fromMesh: true });
+      case 'staff': {
+        const pTime = extractRecordTimestamp(payload);
+        didIngest = ingestMeshStaff({ ...payload, fromMesh: true }, { fromSync: true });
+        if (pTime > 0) {
+          setLastStaffSync(Math.max(getLastStaffSync(), pTime));
+        }
+        if (didIngest) {
+          window.dispatchEvent(new Event('saimetric_staff_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: payload }));
+          this.addLog('EPIDEMIC_HOP', `Staff [${payload.id}] updated from ${originName}`, originName, this.config.deviceName);
+        }
         break;
+      }
       case 'supervisor_approval':
         didIngest = ingestMeshSupervisorApproval({ ...payload, fromMesh: true });
+        if (didIngest) {
+          window.dispatchEvent(new Event('saimetric_audit_log_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_audit_log_updated', { detail: payload }));
+          this.addLog('EPIDEMIC_HOP', `Audit Log / Supervisor Approval from ${originName}`, originName, this.config.deviceName);
+        }
         break;
       case 'cash_log':
         didIngest = ingestMeshCashLog({ ...payload, fromMesh: true });
@@ -3856,7 +4406,7 @@ class MeshSyncManager {
             window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
           }
         } else {
-          didIngest = ingestMeshCustomer({ ...payload, fromMesh: true });
+          didIngest = ingestMeshCustomer({ ...payload, fromMesh: true }, { fromSync: true });
           if (didIngest) {
             window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
           }
@@ -3881,7 +4431,7 @@ class MeshSyncManager {
         }
         break;
       case 'expense':
-        addExpense({ ...payload, fromMesh: true });
+        addExpense({ ...payload, fromMesh: true }, { fromSync: true });
         didIngest = true;
         window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -3889,20 +4439,65 @@ class MeshSyncManager {
       case 'reconciliation':
         saveReconciliation(payload);
         didIngest = true;
+        window.dispatchEvent(new Event('saimetric_reconciliations_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_reconciliations_updated', { detail: payload }));
+        this.addLog('EPIDEMIC_HOP', `Reconciliation [${payload.id || payload.date}] updated from ${originName}`, originName, this.config.deviceName);
         break;
       case 'setting':
         didIngest = ingestMeshSettings(payload);
+        if (didIngest) {
+          window.dispatchEvent(new Event('saimetric_settings_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_settings_updated', { detail: payload }));
+          this.addLog('EPIDEMIC_HOP', `System Settings updated from ${originName}`, originName, this.config.deviceName);
+        }
         break;
       case 'cash_account':
-        saveCashAccount(payload);
+        saveCashAccount(payload, { fromSync: true });
         didIngest = true;
+        window.dispatchEvent(new Event('saimetric_cash_accounts_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: payload }));
         window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
+        this.addLog('EPIDEMIC_HOP', `Cash Account [${payload.account_id || payload.id}] updated from ${originName}`, originName, this.config.deviceName);
         break;
       case 'cash_transfer':
-        saveCashTransfer(payload);
+        saveCashTransfer(payload, { fromSync: true });
         didIngest = true;
+        window.dispatchEvent(new Event('saimetric_cash_transfers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated', { detail: payload }));
         window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        this.addLog('EPIDEMIC_HOP', `Cash Transfer [${payload.id}] received from ${originName}`, originName, this.config.deviceName);
+        break;
+      case 'supplier':
+        didIngest = this.ingestMeshSupplier(payload);
+        break;
+      case 'admin_sales':
+        didIngest = this.ingestMeshAdminSales(payload);
+        break;
+      case 'cash_count':
+        didIngest = this.ingestMeshCashCount(payload);
+        break;
+      case 'voucher':
+        didIngest = this.ingestMeshVoucher(payload);
+        break;
+      case 'closure':
+        didIngest = this.ingestMeshClosure(payload);
+        break;
+      case 'settlement':
+        didIngest = this.ingestMeshSettlement(payload);
+        break;
+      case 'category':
+        didIngest = this.ingestMeshCategories(payload);
+        break;
+      case 'stocktake_session':
+        if (payload && (payload.sessionId || payload.id)) {
+          ingestStocktakeSessionFromMesh({
+            ...payload,
+            sessionId: payload.sessionId || payload.id,
+          });
+          didIngest = true;
+          this.addLog('EPIDEMIC_HOP', `Stocktake Session [${payload.sessionId || payload.id}] updated from ${originName}`, originName, this.config.deviceName);
+        }
         break;
       default:
         if (sheet === 'Sales' || payload.invoiceNumber) {
@@ -3933,7 +4528,7 @@ class MeshSyncManager {
             window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
           }
         } else if (sheet === 'Expenses' || payload.vendorOrCustomer) {
-          addExpense({ ...payload, fromMesh: true });
+          addExpense({ ...payload, fromMesh: true }, { fromSync: true });
           didIngest = true;
           window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         }
@@ -3946,6 +4541,181 @@ class MeshSyncManager {
       originName,
       this.config.deviceName
     );
+  }
+
+  // =========================================================================
+  // T1 INGESTORS: SUPPLIERS, ADMIN SALES, CASH COUNTS, VOUCHERS (BATCH A)
+  // =========================================================================
+
+  public ingestMeshSupplier(payload: any): boolean {
+    if (!payload || (!payload.supplierId && !payload.id && !payload.SupplierID)) return false;
+    try {
+      const supp = {
+        ...payload,
+        supplierId: payload.supplierId || payload.id || payload.SupplierID,
+        name: payload.name || payload.Name || '',
+        category: payload.category || payload.Category,
+        phone: payload.phone || payload.Phone,
+        address: payload.address || payload.Address,
+        city: payload.city || payload.City,
+        paymentTerms: payload.paymentTerms || payload.PaymentTerms,
+        taxNumber: payload.taxNumber || payload.TaxNumber,
+      };
+      addSupplier(supp, { fromSync: true });
+      window.dispatchEvent(new Event('saimetric_suppliers_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_suppliers_updated', { detail: supp }));
+      return true;
+    } catch (e) {
+      console.warn('[MeshSyncService] ingestMeshSupplier error:', e);
+      return false;
+    }
+  }
+
+  public ingestMeshAdminSales(payload: any): boolean {
+    if (!payload || (!payload.id && !payload.staffId)) return false;
+    try {
+      const entry = saveAdminSalesEntry(
+        payload.date || new Date().toISOString().split('T')[0],
+        payload.staffId || 'ADMIN',
+        payload.staffName || 'Admin Sales',
+        Number(payload.salesAmount || payload.amount || 0),
+        payload.notes || '',
+        {
+          fromSync: true,
+          id: payload.id,
+          timestamp: payload.timestamp,
+          company_id: payload.company_id || payload.companyId,
+          branch_id: payload.branch_id || payload.branchId,
+        }
+      );
+      window.dispatchEvent(new Event('saimetric_admin_sales_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_admin_sales_updated', { detail: entry }));
+      return true;
+    } catch (e) {
+      console.warn('[MeshSyncService] ingestMeshAdminSales error:', e);
+      return false;
+    }
+  }
+
+  public ingestMeshCashCount(payload: any): boolean {
+    if (!payload || (!payload.id && !payload.staffId)) return false;
+    try {
+      const res = saveFinalCashCount(
+        {
+          id: payload.id,
+          timestamp: payload.timestamp,
+          staffId: payload.staffId,
+          staffName: payload.staffName || 'Staff',
+          denominations: payload.denominations || {},
+          finalCashOutTotal: Number(payload.finalCashOutTotal || payload.total || 0),
+          notes: payload.notes || '',
+          date: payload.date,
+          branchId: payload.branchId || payload.branch_id,
+          branch_id: payload.branch_id || payload.branchId,
+          companyId: payload.companyId || payload.company_id,
+          company_id: payload.company_id || payload.companyId,
+        },
+        { fromSync: true }
+      );
+      window.dispatchEvent(new Event('saimetric_cash_counts_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_counts_updated', { detail: res.countRecord }));
+      return true;
+    } catch (e) {
+      console.warn('[MeshSyncService] ingestMeshCashCount error:', e);
+      return false;
+    }
+  }
+
+  public ingestMeshVoucher(payload: any): boolean {
+    if (!payload || (!payload.voucherId && !payload.id)) return false;
+    try {
+      const voucher = saveSupplierInvoiceVoucher(
+        {
+          ...payload,
+          voucherId: payload.voucherId || payload.id,
+        },
+        { fromSync: true }
+      );
+      window.dispatchEvent(new Event('saimetric_vouchers_updated'));
+      window.dispatchEvent(new Event('saimetric_supplier_invoices_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_vouchers_updated', { detail: voucher }));
+      return true;
+    } catch (e) {
+      console.warn('[MeshSyncService] ingestMeshVoucher error:', e);
+      return false;
+    }
+  }
+
+  // =========================================================================
+  // T1 & T2 INGESTORS: CLOSURES, SETTLEMENTS, CATEGORIES (BATCH B+C)
+  // =========================================================================
+
+  public ingestMeshClosure(payload: any): boolean {
+    if (!payload || (!payload.id && !payload.date)) return false;
+    try {
+      const res = saveBusinessDayClosure(
+        {
+          ...payload,
+          id: payload.id || `EOD-${payload.date}-${payload.branchId || 'BR-MAIN'}`,
+        },
+        { fromSync: true }
+      );
+      window.dispatchEvent(new Event('saimetric_closures_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_closures_updated', { detail: res.closure }));
+      return true;
+    } catch (e) {
+      console.warn('[MeshSyncService] ingestMeshClosure error:', e);
+      return false;
+    }
+  }
+
+  public ingestMeshSettlement(payload: any): boolean {
+    if (!payload || (!payload.id && !payload.date)) return false;
+    try {
+      saveElectronicSettlement(
+        {
+          ...payload,
+          id: payload.id || `SETTLE-${payload.date}-${payload.branchId || 'BR-MAIN'}`,
+        },
+        { fromSync: true }
+      );
+      window.dispatchEvent(new Event('saimetric_settlements_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_settlements_updated', { detail: payload }));
+      return true;
+    } catch (e) {
+      console.warn('[MeshSyncService] ingestMeshSettlement error:', e);
+      return false;
+    }
+  }
+
+  public ingestMeshCategories(payload: any): boolean {
+    const rawCategories = Array.isArray(payload) ? payload : (payload?.categories || payload?.item || payload?.data);
+    if (!Array.isArray(rawCategories)) return false;
+
+    // T2 LWW Guard (5000ms skew tolerance)
+    const existingCats = getCategories();
+    const existingTime = Math.max(
+      ...existingCats.map((c: any) => parseTimestampMs(c.updatedAt || c.lastUpdated || c.timestamp || 0)),
+      0
+    );
+    const incomingTime = parseTimestampMs(payload?.updatedAt || payload?.lastUpdated || payload?.hubTimestamp || 0);
+
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      console.warn(
+        `[LWW Client] 🛡️ Rejected stale categories update (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+      );
+      return false;
+    }
+
+    try {
+      saveCategories(rawCategories, { fromSync: true });
+      window.dispatchEvent(new Event('saimetric_categories_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_categories_updated', { detail: rawCategories }));
+      return true;
+    } catch (e) {
+      console.warn('[MeshSyncService] ingestMeshCategories error:', e);
+      return false;
+    }
   }
 
   // =========================================================================
@@ -4139,6 +4909,18 @@ class MeshSyncManager {
 
   public setLastMeshSyncTimestamp(isoStr: string) {
     this.setLastInventorySyncTimestamp(isoStr).catch(() => {});
+  }
+
+  public getLastStaffSync(): number {
+    return getLastStaffSync();
+  }
+
+  public setLastStaffSync(ts: number): void {
+    setLastStaffSync(ts);
+  }
+
+  public markStaffSyncComplete(hubCutoffTs: number): void {
+    markStaffSyncComplete(hubCutoffTs);
   }
 
   public checkAndRequestCatchUpIfStale() {
@@ -4574,7 +5356,7 @@ class MeshSyncManager {
     // 7. Ingest Expenses
     if (Array.isArray(delta.expenses)) {
       for (const exp of delta.expenses) {
-        addExpense({ ...exp, fromMesh: true });
+        addExpense({ ...exp, fromMesh: true }, { fromSync: true });
         expensesIngested++;
       }
       overallProcessed += delta.expenses.length;
@@ -4583,13 +5365,13 @@ class MeshSyncManager {
     // 8. Ingest Cash Accounts & Transfers
     if (Array.isArray(delta.cashAccounts)) {
       for (const acc of delta.cashAccounts) {
-        saveCashAccount(acc);
+        saveCashAccount(acc, { fromSync: true });
         accountsIngested++;
       }
     }
     if (Array.isArray(delta.cashTransfers)) {
       for (const trf of delta.cashTransfers) {
-        saveCashTransfer(trf);
+        saveCashTransfer(trf, { fromSync: true });
         accountsIngested++;
       }
     }
@@ -4598,7 +5380,7 @@ class MeshSyncManager {
     let staffIngested = 0;
     if (Array.isArray(delta.salespeople)) {
       for (const st of delta.salespeople) {
-        if (ingestMeshStaff({ ...st, fromMesh: true })) {
+        if (ingestMeshStaff({ ...st, fromMesh: true }, { fromSync: true })) {
           staffIngested++;
         }
       }
@@ -4610,7 +5392,7 @@ class MeshSyncManager {
     let custIngested = 0;
     if (Array.isArray(delta.customers)) {
       for (const cust of delta.customers) {
-        if (ingestMeshCustomer({ ...cust, fromMesh: true })) {
+        if (ingestMeshCustomer({ ...cust, fromMesh: true }, { fromSync: true })) {
           custIngested++;
         }
       }
@@ -4619,7 +5401,14 @@ class MeshSyncManager {
       }
     }
 
-    // 8.2 Ingest Stocktake Sessions & Segments from Catch-up Delta
+    // 8.2 Ingest Stocktake Sessions, Segments & Zone Assignments from Catch-up Delta
+    if (Array.isArray(delta.zoneAssignments) && delta.zoneAssignments.length > 0) {
+      const validZones = delta.zoneAssignments.filter((z: any) => z && z.sessionId && z.zoneId);
+      if (validZones.length > 0) {
+        saveZoneAssignmentsBatch(validZones);
+      }
+    }
+
     if (Array.isArray(delta.stocktakeSessions) && delta.stocktakeSessions.length > 0) {
       for (const sess of delta.stocktakeSessions) {
         if (sess && sess.sessionId) {
@@ -4637,6 +5426,80 @@ class MeshSyncManager {
       }
     }
 
+    // 8.3 Ingest Branches from Catch-up Delta
+    let branchesIngested = 0;
+    if (Array.isArray(delta.branches)) {
+      for (const br of delta.branches) {
+        saveBranch({ ...br, fromMesh: true }, { fromSync: true });
+        branchesIngested++;
+      }
+      if (branchesIngested > 0 && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
+      }
+    }
+
+    // 8.4 Ingest Casual Workers from Catch-up Delta
+    if (Array.isArray(delta.casualWorkers)) {
+      syncCasualWorkersFromHub(delta.casualWorkers, { fromSync: true });
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+      }
+    }
+
+    // 8.5 Ingest Suppliers from Catch-up Delta (T1)
+    if (Array.isArray(delta.suppliers)) {
+      for (const supp of delta.suppliers) {
+        this.ingestMeshSupplier({ ...supp, fromMesh: true });
+      }
+      overallProcessed += delta.suppliers.length;
+    }
+
+    // 8.6 Ingest Admin Sales from Catch-up Delta (T1)
+    if (Array.isArray(delta.adminSales)) {
+      for (const asEntry of delta.adminSales) {
+        this.ingestMeshAdminSales({ ...asEntry, fromMesh: true });
+      }
+      overallProcessed += delta.adminSales.length;
+    }
+
+    // 8.7 Ingest Cash Counts from Catch-up Delta (T1)
+    if (Array.isArray(delta.cashCounts)) {
+      for (const cc of delta.cashCounts) {
+        this.ingestMeshCashCount({ ...cc, fromMesh: true });
+      }
+      overallProcessed += delta.cashCounts.length;
+    }
+
+    // 8.8 Ingest Vouchers / Supplier Invoices from Catch-up Delta (T1)
+    if (Array.isArray(delta.vouchers)) {
+      for (const v of delta.vouchers) {
+        this.ingestMeshVoucher({ ...v, fromMesh: true });
+      }
+      overallProcessed += delta.vouchers.length;
+    }
+
+    // 8.9 Ingest Business Day Closures from Catch-up Delta (T1)
+    if (Array.isArray(delta.businessDayClosures)) {
+      for (const c of delta.businessDayClosures) {
+        this.ingestMeshClosure({ ...c, fromMesh: true });
+      }
+      overallProcessed += delta.businessDayClosures.length;
+    }
+
+    // 8.10 Ingest Electronic Settlements from Catch-up Delta (T1)
+    if (Array.isArray(delta.electronicSettlements)) {
+      for (const s of delta.electronicSettlements) {
+        this.ingestMeshSettlement({ ...s, fromMesh: true });
+      }
+      overallProcessed += delta.electronicSettlements.length;
+    }
+
+    // 8.11 Ingest Categories from Catch-up Delta (T2)
+    if (Array.isArray(delta.categories)) {
+      this.ingestMeshCategories(delta.categories);
+      overallProcessed += delta.categories.length;
+    }
+
     // Complete sync progress indicator
     if (totalRecordsToProcess > 0) {
       this.finishSyncProgress(totalRecordsToProcess, 'Sync Complete');
@@ -4647,7 +5510,13 @@ class MeshSyncManager {
     const validCutoff = !isNaN(cutoffVal) && cutoffVal > 0 ? cutoffVal : Date.now();
     await this.setLastInventorySyncTimestamp(validCutoff);
     this.setLastMeshSyncTimestamp(new Date(validCutoff).toISOString());
-    console.log(`[CatchUp] Catch-up delta ingested successfully. Updated saimetric_last_inventory_sync: [${new Date(validCutoff).toISOString()}] (${validCutoff})`);
+    markStaffSyncComplete(validCutoff);
+    markBranchSyncComplete(validCutoff);
+    markCustomerSyncComplete(validCutoff);
+    markCashAccountSyncComplete(validCutoff);
+    markCasualWorkerSyncComplete(validCutoff);
+    markStocktakeSessionSyncComplete(validCutoff);
+    console.log(`[CatchUp] Catch-up delta ingested successfully. Updated saimetric_last_inventory_sync & all 6 T2 HWMs: [${new Date(validCutoff).toISOString()}] (${validCutoff})`);
 
     playChime();
 
@@ -4830,7 +5699,7 @@ class MeshSyncManager {
   public broadcastStaff(staff: any) {
     if (this.isIngestingFromHub) return;
     if (!staff || !staff.id) return;
-    if (staff.fromMesh) return;
+    if (staff.fromMesh || staff.fromSync) return;
 
     staff.updatedAt = staff.updatedAt || Date.now();
     staff.lastUpdated = staff.lastUpdated || new Date().toISOString();
@@ -4840,6 +5709,15 @@ class MeshSyncManager {
 
     // CRITICAL SECURITY: Never broadcast raw plain-text PIN across network/Hub
     const sanitizedStaff = sanitizeUserForExport(staff);
+    const effectiveHash = staff.pin_hash || (sanitizedStaff as any).pin_hash || '';
+    const effectivePassword = staff.password || effectiveHash || '';
+    const staffPayload = {
+      ...sanitizedStaff,
+      pin_hash: effectiveHash,
+      password: effectivePassword,
+      updatedAt: staff.updatedAt,
+      lastUpdated: staff.lastUpdated,
+    };
 
     const packet = {
       type: 'staff',
@@ -4847,13 +5725,17 @@ class MeshSyncManager {
       packet_id: packetId,
       companyId: this.config.companyId,
       branchId: this.config.branchId,
+      target_branch_id: 'ALL',
       branchCode: this.config.branchCode,
       deviceId: this.config.deviceId,
       originDeviceId: this.config.deviceId,
       originDeviceName: this.config.deviceName,
-      staff: sanitizedStaff,
-      payload: sanitizedStaff,
+      staff: staffPayload,
+      payload: staffPayload,
+      pin_hash: effectiveHash,
+      password: effectivePassword,
       timestamp: staff.updatedAt,
+      updatedAt: staff.updatedAt,
       ttl: 5,
     };
 
@@ -4868,7 +5750,7 @@ class MeshSyncManager {
   public broadcastCustomer(customer: any) {
     if (this.isIngestingFromHub) return;
     if (!customer) return;
-    if (customer.fromMesh) return;
+    if (customer.fromMesh || (customer as any).fromSync) return;
 
     customer.updatedAt = customer.updatedAt || Date.now();
     customer.lastUpdated = customer.lastUpdated || new Date().toISOString();
@@ -4890,11 +5772,86 @@ class MeshSyncManager {
       customer,
       payload: customer,
       timestamp: customer.updatedAt,
+      updatedAt: customer.updatedAt,
       ttl: 5,
     };
 
     this.sendPacketToAllTransports('customer', packet);
     this.addLog('BROADCAST', `Customer account ${customer.name} (${custId}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast a branch creation or edit to peers & Hub
+   */
+  public broadcastBranch(branch: any) {
+    if (this.isIngestingFromHub) return;
+    if (!branch) return;
+    if (branch.fromMesh || (branch as any).fromSync) return;
+
+    const bId = branch.branchId || branch.id || (branch as any).branch_id || 'BR-MAIN';
+    branch.updatedAt = branch.updatedAt || Date.now();
+    branch.lastUpdated = branch.lastUpdated || new Date().toISOString();
+
+    const packetId = `BRANCH-PKT-${bId}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'branch',
+      action: 'BRANCH_SYNC',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: bId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      branch,
+      payload: branch,
+      timestamp: branch.updatedAt,
+      updatedAt: branch.updatedAt,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('branch', packet);
+    this.addLog('BROADCAST', `Branch [${branch.branchName || bId}] broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast a cash account creation or edit to peers & Hub
+   */
+  public broadcastCashAccount(account: any) {
+    if (this.isIngestingFromHub) return;
+    if (!account) return;
+    if (account.fromMesh || (account as any).fromSync) return;
+
+    const accId = account.account_id || account.id || 'ACC_UNKNOWN';
+    account.updatedAt = account.updatedAt || Date.now();
+    account.lastUpdated = account.lastUpdated || new Date().toISOString();
+
+    const packetId = `CASHACC-PKT-${accId}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'cash_account',
+      action: 'CASH_ACCOUNT_SYNC',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: account.branch_id || this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      cashAccount: account,
+      payload: account,
+      timestamp: account.updatedAt,
+      updatedAt: account.updatedAt,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('cash_account', packet);
+    this.addLog('BROADCAST', `Cash Account [${account.account_name || accId}] broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 
@@ -5024,6 +5981,34 @@ class MeshSyncManager {
 
   public broadcastDatabaseMutation(mutation: DatabaseMutationEvent) {
     if (this.isIngestingFromHub) return;
+    if (mutation.fromSync === true || (mutation as any).payload?.fromSync === true) return;
+
+    // Fix B: Suppress duplicate db_mutation network broadcasts for the 6 T2 entities
+    // Dedicated broadcast handlers already broadcast these with LWW timestamps.
+    const rawTarget = String(mutation.sheetName || mutation.entityType || '').toLowerCase().trim();
+    const isT2Entity =
+      rawTarget === 'salespeople' ||
+      rawTarget === 'users' ||
+      rawTarget === 'staff' ||
+      rawTarget === 'branches' ||
+      rawTarget === 'branch' ||
+      rawTarget === 'customers' ||
+      rawTarget === 'customer' ||
+      rawTarget === 'cashaccounts' ||
+      rawTarget === 'cash_accounts' ||
+      rawTarget === 'cash_account' ||
+      rawTarget === 'temporary_casuals' ||
+      rawTarget === 'temporary_casual_accounts' ||
+      rawTarget === 'casual_workers' ||
+      rawTarget === 'casual_worker' ||
+      rawTarget === 'stocktake_sessions' ||
+      rawTarget === 'stocktake_session' ||
+      rawTarget === 'stocktake';
+
+    if (isT2Entity) {
+      return;
+    }
+
     const packetId = `MUT-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
@@ -5669,21 +6654,30 @@ class MeshSyncManager {
 
   public broadcastCasualWorkers(casuals: any[]): void {
     // CRITICAL SECURITY: Ensure only pin_hash and pin_salt are transmitted over Local Hub
+    let maxUpdatedAt = 0;
     const sanitized = Array.isArray(casuals)
       ? casuals.map((c) => {
           const salt = c.pin_salt || generatePinSalt();
           const hash = c.pin_hash || (c.pin ? hashPin(c.pin, salt) : hashPin('1234', salt));
-          const copy = { ...c, pin_hash: hash, pin_salt: salt };
+          const cUp = typeof c.updatedAt === 'number' && c.updatedAt > 0
+            ? c.updatedAt
+            : (c.updatedAt ? new Date(c.updatedAt).getTime() : (c.createdAt ? new Date(c.createdAt).getTime() : Date.now()));
+          if (cUp > maxUpdatedAt) maxUpdatedAt = cUp;
+          const copy = { ...c, pin_hash: hash, pin_salt: salt, updatedAt: cUp, lastUpdated: c.lastUpdated || new Date(cUp).toISOString() };
           delete copy.pin;
           return copy;
         })
       : [];
 
+    const now = maxUpdatedAt || Date.now();
     const packet = {
       type: 'CASUAL_WORKERS_SYNC',
+      action: 'CASUAL_WORKERS_SYNC',
       casualWorkers: sanitized,
+      payload: sanitized,
       branchId: this.config.branchId,
-      timestamp: Date.now(),
+      timestamp: now,
+      updatedAt: now,
     };
     this.sendPacketToAllTransports('stocktake/casual_workers_sync', packet);
   }
@@ -5718,7 +6712,12 @@ class MeshSyncManager {
     branchName?: string;
     isLockdownActive?: boolean;
     notes?: string;
+    updatedAt?: number | string;
   }): void {
+    const recUpdatedAt = typeof (data as any).updatedAt === 'number' && (data as any).updatedAt > 0
+      ? (data as any).updatedAt
+      : ((data as any).updatedAt ? new Date((data as any).updatedAt).getTime() : (data.startedAt ? new Date(data.startedAt).getTime() : Date.now()));
+
     const packet = {
       type: 'STOCKTAKE_SESSION_STARTED',
       action: 'STOCKTAKE_SESSION_STARTED',
@@ -5736,7 +6735,8 @@ class MeshSyncManager {
       companyId: this.config.companyId,
       deviceId: this.config.deviceId,
       deviceName: this.config.deviceName,
-      timestamp: Date.now(),
+      timestamp: recUpdatedAt,
+      updatedAt: recUpdatedAt,
     };
     this.sendPacketToAllTransports('stocktake/session_started', packet);
     this.addLog(
@@ -5746,8 +6746,100 @@ class MeshSyncManager {
     );
     this.notifyPeerSubscribers();
   }
+
+  public broadcastStocktakeSegmentCreated(sessionId: string, segment: any): void {
+    const packet = {
+      type: 'STOCKTAKE_SEGMENT_CREATED',
+      action: 'STOCKTAKE_SEGMENT_CREATED',
+      sessionId,
+      segment,
+      branchId: this.config.branchId,
+      companyId: this.config.companyId,
+      deviceId: this.config.deviceId,
+      deviceName: this.config.deviceName,
+      timestamp: Date.now(),
+    };
+    this.sendPacketToAllTransports('stocktake/segment_created', packet);
+    this.addLog(
+      'BROADCAST',
+      `Stocktake segment "${segment.name || segment.segmentId}" [${segment.segmentId}] created. Broadcasted to Hub & peers.`,
+      this.config.deviceName
+    );
+    this.notifyPeerSubscribers();
+  }
+
+  public sendSyncEnvelope(envelope: any): boolean {
+    const wsTarget = this.localHubWs || this.directWsClient;
+    if (wsTarget && wsTarget.readyState === WebSocket.OPEN) {
+      try {
+        wsTarget.send(JSON.stringify(envelope));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  public async drainOfflineQueue(): Promise<void> {
+    await this.drainQueueToLocalHub();
+  }
+
+  public disconnect(intentional: boolean = false): void {
+    if (intentional) {
+      if (this.localHubWs) {
+        this.localHubWs.onclose = null;
+        try {
+          this.localHubWs.close();
+        } catch {}
+        this.localHubWs = null;
+      }
+      if (this.directWsClient) {
+        this.directWsClient.onclose = null;
+        try {
+          this.directWsClient.close();
+        } catch {}
+        this.directWsClient = null;
+      }
+      this.isLocalHubConnected = false;
+      if (this.localHubReconnectTimer) {
+        clearTimeout(this.localHubReconnectTimer);
+        this.localHubReconnectTimer = null;
+      }
+      this.notifyConnectionModeChange();
+    } else {
+      this.handleLocalHubLost('LocalHubAdapter disconnect');
+    }
+  }
 }
 
 export const meshSyncService = new MeshSyncManager();
 export { generateInvoiceNumber, getNextInvoiceId };
+export {
+  getLastStaffSync,
+  setLastStaffSync,
+  markStaffSyncComplete,
+  SAIMETRIC_LAST_STAFF_SYNC,
+  getLastBranchSync,
+  setLastBranchSync,
+  markBranchSyncComplete,
+  SAIMETRIC_LAST_BRANCH_SYNC,
+  getLastCustomerSync,
+  setLastCustomerSync,
+  markCustomerSyncComplete,
+  SAIMETRIC_LAST_CUSTOMER_SYNC,
+  getLastCashAccountSync,
+  setLastCashAccountSync,
+  markCashAccountSyncComplete,
+  SAIMETRIC_LAST_CASH_ACCOUNT_SYNC,
+  getLastCasualWorkerSync,
+  setLastCasualWorkerSync,
+  markCasualWorkerSyncComplete,
+  SAIMETRIC_LAST_CASUAL_WORKER_SYNC,
+  getLastStocktakeSessionSync,
+  setLastStocktakeSessionSync,
+  markStocktakeSessionSyncComplete,
+  SAIMETRIC_LAST_STOCKTAKE_SESSION_SYNC,
+};
+
 

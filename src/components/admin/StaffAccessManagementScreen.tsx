@@ -474,7 +474,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
         if (formPin) {
           staffPayload.pin = formPin;
         }
-        updateSalesperson(editingStaff.id, staffPayload);
+        updateSalesperson(editingStaff.id, staffPayload, { fromSync: false });
 
         updateStaffBranchAssignments(editingStaff.id, finalAssignments);
 

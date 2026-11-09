@@ -131,6 +131,7 @@ import {
   approveGRN,
 } from '../services/grnService';
 import { landedCostService } from '../services/landedCostService';
+import { saveWallet, SaveWalletParams } from '../services/walletService';
 import { LandedCostItem } from '../types';
 import { resolveItemCost } from '../utils/costResolver';
 import { toDateStringSafe, safeDateSlice, isSameDaySafe } from '../utils/dateUtils';
@@ -205,6 +206,7 @@ export const STORAGE_KEYS = {
   STOCKTAKE_ZONE_ASSIGNMENTS: 'saimetric_room_stocktake_zone_assignments',
   BUSINESS_DAY_CLOSURES: 'saimetric_room_business_day_closures',
   ELECTRONIC_SETTLEMENTS: 'saimetric_room_electronic_settlements',
+  WALLET_RECOVERY_QUEUE: 'saimetric_room_wallet_recovery_queue',
 };
 
 export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
@@ -977,26 +979,50 @@ export const initRoomDatabase = () => {
   const allInvStore = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
   const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
   const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
-  const deletedSet = new Set(deletedList.map((d) => `${(d.itemId || '').toUpperCase()}::${(d.companyId || '').toUpperCase()}`));
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
 
   const dedupedInvMap = new Map<string, InventoryItem>();
   for (const item of allInvStore) {
-    if (!item.itemId) continue;
-    const cleanId = item.itemId.trim().toUpperCase();
-    const comp = (item.company_id || (item as any).companyId || 'COMP-001').trim().toUpperCase();
+    const rawId = (item.itemId || (item as any).id || '').trim();
+    if (!rawId) continue;
+    item.itemId = rawId;
+    (item as any).id = rawId;
+    const cleanId = rawId.toUpperCase();
+    const comp = normTenant(item.company_id || (item as any).companyId);
     const key = `${cleanId}::${comp}`;
-    // Never restore items that were deleted by user/synced deletion
-    if (deletedSet.has(key)) continue;
+
+    // Only drop if deletion record exists and is newer than item updatedAt
+    const delRecord = deletedList.find((d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === comp);
+    if (delRecord && delRecord.deletedAt) {
+      const itemTime = extractRecordTimestamp(item);
+      const delTime = parseTimestampMs(delRecord.deletedAt);
+      if (delTime >= itemTime) {
+        continue;
+      }
+    }
+
     if (!dedupedInvMap.has(key)) {
       dedupedInvMap.set(key, item);
     }
   }
   for (const initItem of INITIAL_INVENTORY_ITEMS) {
-    if (!initItem.itemId) continue;
-    const cleanId = initItem.itemId.trim().toUpperCase();
-    const comp = (initItem.company_id || (initItem as any).companyId || 'COMP-001').trim().toUpperCase();
+    const rawId = (initItem.itemId || (initItem as any).id || '').trim();
+    if (!rawId) continue;
+    initItem.itemId = rawId;
+    (initItem as any).id = rawId;
+    const cleanId = rawId.toUpperCase();
+    const comp = normTenant(initItem.company_id || (initItem as any).companyId);
     const key = `${cleanId}::${comp}`;
-    if (deletedSet.has(key)) continue;
+
+    const delRecord = deletedList.find((d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === comp);
+    if (delRecord && delRecord.deletedAt) {
+      const initTime = extractRecordTimestamp(initItem);
+      const delTime = parseTimestampMs(delRecord.deletedAt);
+      if (delTime >= initTime) {
+        continue;
+      }
+    }
+
     if (!dedupedInvMap.has(key)) {
       dedupedInvMap.set(key, initItem);
     }
@@ -1113,6 +1139,15 @@ export const initRoomDatabase = () => {
 
   // Execute one-time boot migration to hash & salt all staff & casual worker PINs
   runPinHashingMigration();
+
+  // Process any pending wallet recovery queue entries on boot and start periodic 60s background processor
+  processWalletRecoveryQueue().catch(() => {});
+  if (typeof window !== 'undefined' && !(window as any).__walletRecoveryIntervalStarted) {
+    (window as any).__walletRecoveryIntervalStarted = true;
+    window.setInterval(() => {
+      processWalletRecoveryQueue().catch(() => {});
+    }, 60000);
+  }
 };
 
 /**
@@ -1830,7 +1865,10 @@ export const getOwnerDefaultPermissions = () => ({
   canManageStocktake: true,
 });
 
-export const saveSalesperson = (person: Salesperson): Salesperson => {
+export const saveSalesperson = (
+  person: Salesperson,
+  options?: { fromSync?: boolean; silent?: boolean }
+): Salesperson => {
   const all = getRawStoredSalespeople();
   const compId = person.companyId || person.company_id || getCurrentCompanyId();
   const normalizedEmail = (person.email || '').trim().toLowerCase();
@@ -1875,11 +1913,12 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
     companyId: compId,
     company_id: compId,
     pin_hash: pinHash,
+    password: (person as any).password || (existingPerson as any)?.password || pinHash,
     pin_salt: salt,
     active: person.active || existingPerson?.active || 'Y',
     permissions: resolvedPermissions,
-    updatedAt: (person as any).updatedAt || now,
-    lastUpdated: (person as any).lastUpdated || new Date(now).toISOString(),
+    updatedAt: options?.fromSync ? ((person as any).updatedAt || now) : now,
+    lastUpdated: options?.fromSync ? ((person as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
   };
   // Permanently strip plain-text PIN
   delete (merged as any).pin;
@@ -1887,7 +1926,9 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
   if (index >= 0) {
     all[index] = { ...all[index], ...merged };
     setStored(STORAGE_KEYS.SALESPEOPLE, all);
-    notifyStaffChanged(all[index]);
+    if (!options?.fromSync) {
+      notifyStaffChanged(all[index]);
+    }
     notifyListeners();
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: all[index] }));
@@ -1897,7 +1938,9 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
   } else {
     const updated = [...all, merged];
     setStored(STORAGE_KEYS.SALESPEOPLE, updated);
-    notifyStaffChanged(merged);
+    if (!options?.fromSync) {
+      notifyStaffChanged(merged);
+    }
     notifyListeners();
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: merged }));
@@ -1907,7 +1950,11 @@ export const saveSalesperson = (person: Salesperson): Salesperson => {
   }
 };
 
-export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Salesperson | null => {
+export const updateSalesperson = (
+  id: string,
+  updates: Partial<Salesperson>,
+  options?: { fromSync?: boolean; silent?: boolean }
+): Salesperson | null => {
   const all = getRawStoredSalespeople();
   const index = all.findIndex((s) => s.id === id);
   if (index === -1) return null;
@@ -1930,9 +1977,10 @@ export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Sa
     ...current,
     ...updates,
     pin_hash: pinHash,
+    password: (updates as any).password || (current as any)?.password || pinHash,
     pin_salt: salt,
-    updatedAt: now,
-    lastUpdated: new Date(now).toISOString(),
+    updatedAt: options?.fromSync ? ((updates as any).updatedAt || now) : now,
+    lastUpdated: options?.fromSync ? ((updates as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
   };
   delete (updatedPerson as any).pin;
 
@@ -1945,15 +1993,19 @@ export const updateSalesperson = (id: string, updates: Partial<Salesperson>): Sa
     setSessionUser(updatedPerson);
   }
 
-  notifyStaffChanged(updatedPerson);
+  if (!options?.fromSync) {
+    notifyStaffChanged(updatedPerson);
+  }
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: updatedPerson }));
     window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: updatedPerson }));
   }
 
-  enqueueSync('Salespeople', 'UPDATE', sanitizeUserForExport(updatedPerson));
-  enqueueSync('users', 'UPDATE', sanitizeUserForExport(updatedPerson));
+  if (!options?.fromSync) {
+    enqueueSync('Salespeople', 'UPDATE', sanitizeUserForExport(updatedPerson));
+    enqueueSync('users', 'UPDATE', sanitizeUserForExport(updatedPerson));
+  }
   return updatedPerson;
 };
 
@@ -2191,7 +2243,19 @@ export const getNextCustomerId = (): string => {
   return `C${String(next).padStart(3, '0')}`;
 };
 
-export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'createdDate'> & { customerId?: string; createdDate?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string }): Customer => {
+export const addCustomer = (
+  customerData: Omit<Customer, 'customerId' | 'createdDate'> & {
+    customerId?: string;
+    createdDate?: string;
+    company_id?: string;
+    companyId?: string;
+    branch_id?: string;
+    branchId?: string;
+    updatedAt?: number;
+    lastUpdated?: string;
+  },
+  options?: { fromSync?: boolean; silent?: boolean }
+): Customer => {
   const all = getRawStoredCustomers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -2223,8 +2287,8 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
     creditGroupId: customerData.creditGroupId,
     creditGroupName: customerData.creditGroupName,
     isCustomLimit: customerData.isCustomLimit,
-    updatedAt: (customerData as any).updatedAt || now,
-    lastUpdated: (customerData as any).lastUpdated || new Date(now).toISOString(),
+    updatedAt: options?.fromSync ? ((customerData as any).updatedAt || now) : now,
+    lastUpdated: options?.fromSync ? ((customerData as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
   };
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.CUSTOMERS, updated);
@@ -2244,16 +2308,18 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
     });
   }
 
-  enqueueSync('Customers', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    CustomerID: created.customerId,
-    Name: created.name,
-    Phone: created.phone,
-    Address: created.address,
-    CreatedDate: created.createdDate,
-    CreatedBy: created.createdBy,
-  });
+  if (!options?.fromSync) {
+    enqueueSync('Customers', 'INSERT', {
+      company_id: compId,
+      branch_id: brId,
+      CustomerID: created.customerId,
+      Name: created.name,
+      Phone: created.phone,
+      Address: created.address,
+      CreatedDate: created.createdDate,
+      CreatedBy: created.createdBy,
+    });
+  }
 
   notifyCustomerChanged(created);
   notifyListeners();
@@ -2262,6 +2328,38 @@ export const addCustomer = (customerData: Omit<Customer, 'customerId' | 'created
   }
 
   return created;
+};
+
+export const saveCustomer = (
+  customer: Customer,
+  options?: { fromSync?: boolean; silent?: boolean }
+): Customer => {
+  const all = getRawStoredCustomers();
+  const id = customer.customerId || (customer as any).id;
+  const now = Date.now();
+  const normalized: Customer = {
+    ...customer,
+    customerId: id,
+    updatedAt: options?.fromSync ? ((customer as any).updatedAt || now) : now,
+    lastUpdated: options?.fromSync ? ((customer as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
+  };
+  const idx = all.findIndex((c) => (c.customerId || (c as any).id) === id);
+  let updatedList: Customer[];
+  if (idx >= 0) {
+    updatedList = [...all];
+    updatedList[idx] = normalized;
+  } else {
+    updatedList = [normalized, ...all];
+  }
+  setStored(STORAGE_KEYS.CUSTOMERS, updatedList);
+  if (!options?.fromSync) {
+    notifyCustomerChanged(normalized);
+  }
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
+  }
+  return normalized;
 };
 
 export const ensureCustomerExists = (
@@ -2410,23 +2508,25 @@ export const getNextSupplierId = (): string => {
 export const addSupplier = (
   supplierData: Omit<Supplier, 'supplierId' | 'createdDate' | 'status'> & {
     supplierId?: string;
+    id?: string;
     createdDate?: string;
     status?: 'Active' | 'Inactive';
     company_id?: string;
     companyId?: string;
     branch_id?: string;
     branchId?: string;
-  }
+  },
+  options?: { fromSync?: boolean }
 ): Supplier => {
   const all = getRawStoredSuppliers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const nextId = supplierData.supplierId || getNextSupplierId();
+  const nextId = supplierData.supplierId || supplierData.id || getNextSupplierId();
   const compId = supplierData.company_id || supplierData.companyId || currentCompany;
   const brId = supplierData.branch_id || supplierData.branchId || currentBranch;
   const created: Supplier = {
     supplierId: nextId,
-    name: supplierData.name.trim(),
+    name: (supplierData.name || '').trim(),
     category: supplierData.category?.trim() || 'Groceries & FMCG',
     contactPerson: supplierData.contactPerson?.trim() || '',
     phone: supplierData.phone?.trim() || '',
@@ -2444,21 +2544,56 @@ export const addSupplier = (
     branch_id: brId,
     branchId: brId,
   };
-  const updated = [created, ...all];
+
+  const existingIdx = all.findIndex((s) => s.supplierId === nextId);
+  let updated: Supplier[];
+  if (existingIdx >= 0) {
+    updated = [...all];
+    updated[existingIdx] = { ...all[existingIdx], ...created };
+  } else {
+    updated = [created, ...all];
+  }
   setStored(STORAGE_KEYS.SUPPLIERS, updated);
 
-  enqueueSync('Suppliers', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    SupplierID: created.supplierId,
-    Name: created.name,
-    Category: created.category,
-    Phone: created.phone,
-    Address: created.address,
-    City: created.city,
-    PaymentTerms: created.paymentTerms,
-    TaxNumber: created.taxNumber,
-  });
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('Suppliers', existingIdx >= 0 ? 'UPDATE' : 'INSERT', {
+        id: created.supplierId,
+        supplierId: created.supplierId,
+        SupplierID: created.supplierId,
+        company_id: compId,
+        branch_id: brId,
+        name: created.name,
+        Name: created.name,
+        category: created.category,
+        Category: created.category,
+        contactPerson: created.contactPerson,
+        phone: created.phone,
+        Phone: created.phone,
+        email: created.email,
+        address: created.address,
+        Address: created.address,
+        city: created.city,
+        City: created.city,
+        paymentTerms: created.paymentTerms,
+        PaymentTerms: created.paymentTerms,
+        taxNumber: created.taxNumber,
+        TaxNumber: created.taxNumber,
+        accountNumber: created.accountNumber,
+        status: created.status,
+        createdDate: created.createdDate,
+        notes: created.notes,
+      });
+    } catch (e) {
+      console.warn('[addSupplier] enqueueSync error:', e);
+    }
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_suppliers_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_suppliers_updated', { detail: created }));
+  }
 
   return created;
 };
@@ -2687,8 +2822,9 @@ export const isRecordInBranchScope = (
   const cleanTarget = (targetBranchId || '').toLowerCase().trim();
   const cleanRecord = (recordBranchId || '').toLowerCase().trim();
 
-  // Direct match
-  if (cleanRecord && cleanRecord === cleanTarget) return true;
+  // Direct match or universal scope
+  if (!cleanRecord || cleanRecord === 'all') return true;
+  if (cleanRecord === cleanTarget) return true;
 
   // Expand active branch aliases
   const targetAliases = new Set<string>([cleanTarget]);
@@ -2738,8 +2874,8 @@ export const isRecordInBranchScope = (
     return false;
   }
 
-  // Record has no branch assigned: fallback to main branch only
-  return isTargetMain;
+  // Record has no branch assigned: universal to all branches
+  return true;
 };
 
 export const saveBranch = (
@@ -2750,6 +2886,7 @@ export const saveBranch = (
   const currentCompany = getCurrentCompanyId();
   const compId = branch.company_id || branch.companyId || currentCompany;
   const id = branch.branchId || branch.id || (branch as any).branch_id || 'BR-MAIN';
+  const now = Date.now();
   const normalized: Branch = {
     ...branch,
     branchId: id,
@@ -2757,6 +2894,8 @@ export const saveBranch = (
     branch_id: id,
     company_id: compId,
     companyId: compId,
+    updatedAt: options?.fromSync ? ((branch as any).updatedAt || now) : now,
+    lastUpdated: options?.fromSync ? ((branch as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
   };
 
   // If saved explicitly by user, remove from deletion tombstone
@@ -2783,9 +2922,14 @@ export const saveBranch = (
   }
   setStored(STORAGE_KEYS.BRANCHES, updated);
 
-  // Prevent infinite feedback loop: Only enqueue sync if this did not originate from sync
+  // Prevent infinite feedback loop: Only enqueue sync and notify if this did not originate from sync
   if (!options?.fromSync) {
     enqueueSync('branches', index >= 0 ? 'UPDATE' : 'INSERT', normalized);
+    notifyBranchChanged(normalized);
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_branches_updated', { detail: normalized }));
   }
 
   if (!options?.silent) {
@@ -2830,9 +2974,9 @@ export const inventoryItemToProduct = (item: InventoryItem, targetBranch?: strin
   const effectiveReorderCases = override?.reorderLevelCases !== undefined ? override.reorderLevelCases : item.reorderLevelCases;
 
   return {
-    id: item.itemId,
-    name: item.itemName,
-    sku: item.sku || item.itemId,
+    id: item.itemId || (item as any).id || '',
+    name: item.itemName || (item as any).name || 'Unnamed Product',
+    sku: item.sku || item.itemId || (item as any).id || '',
     category: item.category || 'General',
     price: effectiveSellPriceUnit,
     costPrice: effectiveCostPerUnit,
@@ -3566,7 +3710,10 @@ export const getNextCashLogId = (): string => {
   return `CL-${String(next).padStart(3, '0')}`;
 };
 
-export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string; skipSync?: boolean; fromMesh?: boolean }): CashLogEntry => {
+export const addCashLog = (
+  entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string; skipSync?: boolean; fromMesh?: boolean },
+  options?: { fromSync?: boolean }
+): CashLogEntry => {
   const all = getRawStoredCashLogs();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -3602,7 +3749,8 @@ export const addCashLog = (entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: s
   setStored(STORAGE_KEYS.CASH_LOGS, updated);
 
   // Only enqueue write to cloud if this action originated locally (not from mesh peer sync)
-  if (!entry.skipSync && !entry.fromMesh) {
+  if (!entry.skipSync && !entry.fromMesh && !options?.fromSync) {
+    console.log(`[Row10] Direct enqueue: CashLog ${newEntry.id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('CashLog', 'INSERT', {
       company_id: compId,
       branch_id: brId,
@@ -4296,24 +4444,32 @@ export const getCashCounts = (): CashCountRecord[] => {
   return getAllCashCounts();
 };
 
-export const saveFinalCashCount = (data: {
-  staffId: string;
-  staffName: string;
-  denominations: Record<string, number>;
-  finalCashOutTotal: number;
-  notes?: string;
-  date?: string;
-  branchId?: string;
-  branch_id?: string;
-}): { countRecord: CashCountRecord; cashLogRecord: CashLogEntry | null } => {
-  const now = new Date();
+export const saveFinalCashCount = (
+  data: {
+    id?: string;
+    timestamp?: string;
+    staffId: string;
+    staffName: string;
+    denominations: Record<string, number>;
+    finalCashOutTotal: number;
+    notes?: string;
+    date?: string;
+    branchId?: string;
+    branch_id?: string;
+    companyId?: string;
+    company_id?: string;
+  },
+  options?: { fromSync?: boolean }
+): { countRecord: CashCountRecord; cashLogRecord: CashLogEntry | null } => {
+  const now = data.timestamp ? new Date(data.timestamp) : new Date();
   const dateStr = data.date || getTodayDateString();
   const currentCounts = getRawStoredCashCounts();
-  const currentCompany = getCurrentCompanyId();
+  const currentCompany = data.companyId || data.company_id || getCurrentCompanyId();
   const currentBranch = data.branchId || data.branch_id || getCurrentBranchId();
 
   const existingCountIndex = currentCounts.findIndex(
     (c) => {
+      if (data.id && c.id === data.id) return true;
       const compId = (c as any).company_id || (c as any).companyId || 'COMP-001';
       const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
       return compId === currentCompany && brId === currentBranch && c.staffId === data.staffId && c.date === dateStr;
@@ -4327,6 +4483,7 @@ export const saveFinalCashCount = (data: {
     const existing = currentCounts[existingCountIndex];
     countRecord = {
       ...existing,
+      id: data.id || existing.id,
       timestamp: now.toISOString(),
       staffName: data.staffName,
       denominations: data.denominations,
@@ -4343,7 +4500,7 @@ export const saveFinalCashCount = (data: {
     setStored(STORAGE_KEYS.CASH_COUNTS, updatedCounts);
   } else {
     // New cash count record partitioned by branch
-    const countId = `CNT-${Date.now()}`;
+    const countId = data.id || `CNT-${Date.now()}`;
     countRecord = {
       id: countId,
       timestamp: now.toISOString(),
@@ -4415,6 +4572,20 @@ export const saveFinalCashCount = (data: {
       company_id: currentCompany,
       branch_id: currentBranch,
     });
+  }
+
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('CashCounts' as any, existingCountIndex >= 0 ? 'UPDATE' : 'INSERT', countRecord);
+    } catch (e) {
+      console.warn('[saveFinalCashCount] enqueueSync error:', e);
+    }
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_cash_counts_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_counts_updated', { detail: countRecord }));
   }
 
   return { countRecord, cashLogRecord: null };
@@ -4761,7 +4932,8 @@ export const getNextCreditSaleId = (): string => {
 };
 
 export const addCreditSale = (
-  entry: Omit<CreditSaleEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string }
+  entry: Omit<CreditSaleEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string; fromMesh?: boolean },
+  options?: { fromSync?: boolean }
 ): CreditSaleEntry => {
   const all = getAllCreditSales();
   const currentCompany = getCurrentCompanyId();
@@ -4780,24 +4952,27 @@ export const addCreditSale = (
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.CREDIT_SALES, updated);
 
-  enqueueSync('CreditSales', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    Timestamp: created.timestamp,
-    CreditID: created.id,
-    Date: created.date,
-    StaffID: created.staffId,
-    StaffName: created.staffName,
-    CustomerID: created.customerId || '',
-    CustomerName: created.customerName,
-    Amount: created.amount,
-    In: created.in || 0,
-    Out: created.out || created.amount,
-    ItemDescription: created.itemDescription,
-    DueDate: created.dueDate || '',
-    Notes: created.notes || '',
-    Status: created.status,
-  });
+  if (!options?.fromSync && !(entry as any).fromMesh) {
+    console.log(`[Row10] Direct enqueue: CreditSales ${created.id} (fromSync=${options?.fromSync ?? false})`);
+    enqueueSync('CreditSales', 'INSERT', {
+      company_id: compId,
+      branch_id: brId,
+      Timestamp: created.timestamp,
+      CreditID: created.id,
+      Date: created.date,
+      StaffID: created.staffId,
+      StaffName: created.staffName,
+      CustomerID: created.customerId || '',
+      CustomerName: created.customerName,
+      Amount: created.amount,
+      In: created.in || 0,
+      Out: created.out || created.amount,
+      ItemDescription: created.itemDescription,
+      DueDate: created.dueDate || '',
+      Notes: created.notes || '',
+      Status: created.status,
+    });
+  }
 
   // If cash was repaid (In > 0), record cash movement if not already recorded (e.g., upfront deposit at POS)
   if (created.in && created.in > 0) {
@@ -5623,6 +5798,42 @@ export const notifyCustomerChanged = (customer: any) => {
   });
 };
 
+export type BranchChangeListener = (branch: Branch) => void;
+const branchChangeListeners: Set<BranchChangeListener> = new Set();
+export const onBranchChanged = (listener: BranchChangeListener) => {
+  branchChangeListeners.add(listener);
+  return () => {
+    branchChangeListeners.delete(listener);
+  };
+};
+export const notifyBranchChanged = (branch: Branch) => {
+  branchChangeListeners.forEach((fn) => {
+    try {
+      fn(branch);
+    } catch (e) {
+      console.error('branchChangeListener error:', e);
+    }
+  });
+};
+
+export type CashAccountChangeListener = (account: CashAccount) => void;
+const cashAccountChangeListeners: Set<CashAccountChangeListener> = new Set();
+export const onCashAccountChanged = (listener: CashAccountChangeListener) => {
+  cashAccountChangeListeners.add(listener);
+  return () => {
+    cashAccountChangeListeners.delete(listener);
+  };
+};
+export const notifyCashAccountChanged = (account: CashAccount) => {
+  cashAccountChangeListeners.forEach((fn) => {
+    try {
+      fn(account);
+    } catch (e) {
+      console.error('cashAccountChangeListener error:', e);
+    }
+  });
+};
+
 export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   if (!sale || !sale.id) return false;
 
@@ -5999,6 +6210,109 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: normalized }));
   }
   return true;
+};
+
+// --- Wallet Crash Recovery Queue ---
+export interface WalletRecoveryEntry {
+  id: string;
+  tenderId: string;
+  delta: number;
+  reason: string;
+  saleId?: string;
+  branchId: string;
+  attempts: number;
+  lastAttemptAt?: string;
+  lastError?: string;
+  deadLetter?: boolean;
+  createdAt: string;
+}
+
+export const enqueueWalletRecovery = (entry: {
+  tenderId: string;
+  delta: number;
+  reason: string;
+  saleId?: string;
+  branchId: string;
+  error?: string;
+}): void => {
+  try {
+    const queue = getStored<WalletRecoveryEntry[]>(STORAGE_KEYS.WALLET_RECOVERY_QUEUE, []);
+    const newEntry: WalletRecoveryEntry = {
+      id: `wrec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      tenderId: entry.tenderId,
+      delta: entry.delta,
+      reason: entry.reason,
+      saleId: entry.saleId,
+      branchId: entry.branchId,
+      attempts: 0,
+      lastError: entry.error,
+      createdAt: new Date().toISOString(),
+    };
+    queue.push(newEntry);
+    setStored(STORAGE_KEYS.WALLET_RECOVERY_QUEUE, queue);
+  } catch (err) {
+    console.error('[WalletRecovery] Failed to enqueue wallet recovery item:', err);
+  }
+};
+
+let isProcessingWalletRecovery = false;
+
+export const processWalletRecoveryQueue = async (): Promise<void> => {
+  if (isProcessingWalletRecovery) return;
+  isProcessingWalletRecovery = true;
+  try {
+    const queue = getStored<WalletRecoveryEntry[]>(STORAGE_KEYS.WALLET_RECOVERY_QUEUE, []);
+    if (!queue || queue.length === 0) {
+      return;
+    }
+
+    const updatedQueue: WalletRecoveryEntry[] = [];
+    for (const item of queue) {
+      if (item.deadLetter) {
+        updatedQueue.push(item);
+        continue;
+      }
+
+      try {
+        const res = await saveWallet({
+          tenderId: item.tenderId,
+          delta: item.delta,
+          reason: item.reason,
+          saleId: item.saleId,
+          branchId: item.branchId,
+        });
+
+        if (res.success) {
+          // Successfully applied, discard from queue
+          continue;
+        } else {
+          item.attempts = (item.attempts || 0) + 1;
+          item.lastAttemptAt = new Date().toISOString();
+          item.lastError = res.error;
+          if (item.attempts >= 5) {
+            item.deadLetter = true;
+            console.warn('[WalletRecovery] Max attempts (5) reached for entry, marked deadLetter:', item.id);
+          }
+          updatedQueue.push(item);
+        }
+      } catch (err: any) {
+        item.attempts = (item.attempts || 0) + 1;
+        item.lastAttemptAt = new Date().toISOString();
+        item.lastError = err?.message || String(err);
+        if (item.attempts >= 5) {
+          item.deadLetter = true;
+          console.warn('[WalletRecovery] Max attempts (5) reached after error, marked deadLetter:', item.id);
+        }
+        updatedQueue.push(item);
+      }
+    }
+
+    setStored(STORAGE_KEYS.WALLET_RECOVERY_QUEUE, updatedQueue);
+  } catch (queueErr) {
+    console.error('[WalletRecovery] Error processing wallet recovery queue:', queueErr);
+  } finally {
+    isProcessingWalletRecovery = false;
+  }
 };
 
 export const addSale = (
@@ -6440,63 +6754,100 @@ export const addSale = (
     Status: created.status,
   });
 
-  // Credit appropriate wallet (EcoCash -> EcoCash Wallet, ZiG -> ZiG Bank Wallet, Cash -> Till Drawer Wallet)
-  try {
-    const payMethod = created.paymentMethod || 'Cash';
-    const cur = created.currency || 'USD';
-    let targetWalletKey = 'wallet_cash';
-    let targetAmount = created.total;
+  // Credit appropriate wallet via discrete saveWallet (with crash recovery queue)
+  const walletPayMethod = created.paymentMethod || 'Cash';
+  const walletCur = created.currency || 'USD';
+  let targetWalletKey = 'wallet_cash';
+  let targetAmount = created.total;
 
-    const isEco = payMethod.toLowerCase().includes('eco') || cur.toLowerCase().includes('eco');
-    const isZiG = payMethod.toLowerCase().includes('zig') || cur.toLowerCase().includes('zig');
+  const isWalletEco = walletPayMethod.toLowerCase().includes('eco') || walletCur.toLowerCase().includes('eco');
+  const isWalletZiG = walletPayMethod.toLowerCase().includes('zig') || walletCur.toLowerCase().includes('zig');
 
-    if (isEco) {
-      targetWalletKey = 'wallet_ecocash';
-      // In Zimbabwe EcoCash, company receives actual electronic amount transferred (including gross for cash withdrawals)
-      const rate = Number(created.exchangeRate) || 1.05;
-      const saleInCur = Number(created.totalInCurrency) || (Number(created.total || 0) * rate);
-      const withdrawalInCur = Number(created.cashWithdrawalInCurrency) || (Number(created.cashWithdrawalAmount || 0) * rate);
-      targetAmount =
-        Number(created.totalChargedInCurrency) ||
-        Math.round((saleInCur + withdrawalInCur) * 100) / 100;
-    } else if (isZiG) {
-      targetWalletKey = 'wallet_bank_zig';
-      const rate = Number(created.exchangeRate) || 26.5;
-      const saleInCur = Number(created.totalInCurrency) || (Number(created.total || 0) * rate);
-      const withdrawalInCur = Number(created.cashWithdrawalInCurrency) || (Number(created.cashWithdrawalAmount || 0) * rate);
-      targetAmount =
-        Number(created.totalChargedInCurrency) ||
-        Math.round((saleInCur + withdrawalInCur) * 100) / 100;
-    } else if (payMethod === 'Card' || payMethod === 'Bank Transfer') {
-      targetWalletKey = 'wallet_bank_usd';
+  if (isWalletEco) {
+    targetWalletKey = 'wallet_ecocash';
+    // In Zimbabwe EcoCash, company receives actual electronic amount transferred (including gross for cash withdrawals)
+    const rate = Number(created.exchangeRate) || 1.05;
+    const saleInCur = Number(created.totalInCurrency) || (Number(created.total || 0) * rate);
+    const withdrawalInCur = Number(created.cashWithdrawalInCurrency) || (Number(created.cashWithdrawalAmount || 0) * rate);
+    targetAmount =
+      Number(created.totalChargedInCurrency) ||
+      Math.round((saleInCur + withdrawalInCur) * 100) / 100;
+  } else if (isWalletZiG) {
+    targetWalletKey = 'wallet_bank_zig';
+    const rate = Number(created.exchangeRate) || 26.5;
+    const saleInCur = Number(created.totalInCurrency) || (Number(created.total || 0) * rate);
+    const withdrawalInCur = Number(created.cashWithdrawalInCurrency) || (Number(created.cashWithdrawalAmount || 0) * rate);
+    targetAmount =
+      Number(created.totalChargedInCurrency) ||
+      Math.round((saleInCur + withdrawalInCur) * 100) / 100;
+  } else if (walletPayMethod === 'Card' || walletPayMethod === 'Bank Transfer') {
+    targetWalletKey = 'wallet_bank_usd';
+  }
+
+  saveWallet({
+    tenderId: targetWalletKey,
+    delta: targetAmount,
+    reason: 'POS_SALE',
+    saleId: created.id,
+    branchId: brId,
+    fromMesh: saleData.fromMesh,
+  }).then((res) => {
+    if (!res.success) {
+      console.error('[Wallet] saveWallet failed for sale', created.id, res.error);
+      enqueueWalletRecovery({
+        tenderId: targetWalletKey,
+        delta: targetAmount,
+        reason: 'POS_SALE',
+        saleId: created.id,
+        branchId: brId,
+        error: res.error,
+      });
     }
+  }).catch((err) => {
+    console.error('[Wallet] saveWallet failed for sale', created.id, err);
+    enqueueWalletRecovery({
+      tenderId: targetWalletKey,
+      delta: targetAmount,
+      reason: 'POS_SALE',
+      saleId: created.id,
+      branchId: brId,
+      error: err?.message || String(err),
+    });
+  });
 
-    const currentWallets = getStored<any[]>('saimetric_wallets', []);
-    if (currentWallets && currentWallets.length > 0) {
-      // 1. Credit destination wallet
-      const idx = currentWallets.findIndex((w) => w.id === targetWalletKey);
-      if (idx !== -1) {
-        currentWallets[idx].balance = Math.round((currentWallets[idx].balance + targetAmount) * 100) / 100;
-        currentWallets[idx].updatedAt = new Date().toISOString();
+  // If electronic sale with cash withdrawal, deduct physical USD cash from Till Cash Drawer!
+  if ((isWalletEco || isWalletZiG) && created.cashWithdrawalAmount && Number(created.cashWithdrawalAmount) > 0) {
+    const withdrawalDelta = -Number(created.cashWithdrawalAmount);
+    saveWallet({
+      tenderId: 'wallet_cash',
+      delta: withdrawalDelta,
+      reason: 'POS_CASH_WITHDRAWAL',
+      saleId: created.id,
+      branchId: brId,
+      fromMesh: saleData.fromMesh,
+    }).then((res) => {
+      if (!res.success) {
+        console.error('[Wallet] saveWallet failed for sale cash withdrawal', created.id, res.error);
+        enqueueWalletRecovery({
+          tenderId: 'wallet_cash',
+          delta: withdrawalDelta,
+          reason: 'POS_CASH_WITHDRAWAL',
+          saleId: created.id,
+          branchId: brId,
+          error: res.error,
+        });
       }
-
-      // 2. If electronic sale with cash withdrawal, deduct physical USD cash from Till Cash Drawer!
-      if ((isEco || isZiG) && created.cashWithdrawalAmount && Number(created.cashWithdrawalAmount) > 0) {
-        const cashIdx = currentWallets.findIndex((w) => w.id === 'wallet_cash');
-        if (cashIdx !== -1) {
-          currentWallets[cashIdx].balance =
-            Math.round((currentWallets[cashIdx].balance - Number(created.cashWithdrawalAmount)) * 100) / 100;
-          currentWallets[cashIdx].updatedAt = new Date().toISOString();
-        }
-      }
-
-      setStored('saimetric_wallets', currentWallets);
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(new Event('saimetric_wallets_updated'));
-      }
-    }
-  } catch (err) {
-    console.error('Wallet update on sale error:', err);
+    }).catch((err) => {
+      console.error('[Wallet] saveWallet failed for sale cash withdrawal', created.id, err);
+      enqueueWalletRecovery({
+        tenderId: 'wallet_cash',
+        delta: withdrawalDelta,
+        reason: 'POS_CASH_WITHDRAWAL',
+        saleId: created.id,
+        branchId: brId,
+        error: err?.message || String(err),
+      });
+    });
   }
 
   // Notify listeners so meshSyncService broadcasts the sale in real time
@@ -7139,7 +7490,9 @@ export const addExpense = (
     approvedBy?: string;
     approvedByName?: string;
     approvalTimestamp?: string;
-  }
+    fromMesh?: boolean;
+  },
+  options?: { fromSync?: boolean }
 ): ExpenseEntry => {
   const all = getAllExpenses();
   const currentCompany = getCurrentCompanyId();
@@ -7183,7 +7536,8 @@ export const addExpense = (
       reference: created.id,
       company_id: compId,
       branch_id: brId,
-    });
+      skipSync: !!options?.fromSync || !!expenseData.fromMesh,
+    }, options);
   }
 
   notifyListeners();
@@ -7193,22 +7547,25 @@ export const addExpense = (
   }
 
   // Save to Sheet "Expenses"
-  enqueueSync('Expenses', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    Timestamp: created.timestamp,
-    ExpenseID: created.id,
-    Date: created.date,
-    Category: created.category,
-    VendorOrCustomer: created.vendorOrCustomer || '',
-    Amount: created.amount,
-    PaymentMethod: created.paymentMethod,
-    StaffID: created.staffId,
-    StaffName: created.staffName,
-    Description: created.description,
-    ReceiptRef: created.receiptRef || '',
-    Status: created.status,
-  });
+  if (!options?.fromSync && !expenseData.fromMesh) {
+    console.log(`[Row10] Direct enqueue: Expenses ${created.id} (fromSync=${options?.fromSync ?? false})`);
+    enqueueSync('Expenses', 'INSERT', {
+      company_id: compId,
+      branch_id: brId,
+      Timestamp: created.timestamp,
+      ExpenseID: created.id,
+      Date: created.date,
+      Category: created.category,
+      VendorOrCustomer: created.vendorOrCustomer || '',
+      Amount: created.amount,
+      PaymentMethod: created.paymentMethod,
+      StaffID: created.staffId,
+      StaffName: created.staffName,
+      Description: created.description,
+      ReceiptRef: created.receiptRef || '',
+      Status: created.status,
+    });
+  }
 
   return created;
 };
@@ -7475,14 +7832,16 @@ export const saveAdminSalesEntry = (
   staffId: string,
   staffName: string,
   salesAmount: number,
-  notes?: string
+  notes?: string,
+  options?: { fromSync?: boolean; id?: string; timestamp?: string; company_id?: string; branch_id?: string }
 ): AdminSalesEntry => {
   const all = getAllAdminSales();
-  const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
-  const id = `AS-${date}-${staffId}`;
-  const now = new Date().toISOString();
+  const currentCompany = options?.company_id || getCurrentCompanyId();
+  const currentBranch = options?.branch_id || getCurrentBranchId();
+  const id = options?.id || `AS-${date}-${staffId}`;
+  const now = options?.timestamp || new Date().toISOString();
   const existingIdx = all.findIndex((s) => {
+    if (s.id && s.id === id) return true;
     const compId = (s as any).company_id || (s as any).companyId || 'COMP-001';
     return compId === currentCompany && s.staffId === staffId && s.date === date;
   });
@@ -7511,6 +7870,21 @@ export const saveAdminSalesEntry = (
   }
 
   setStored(STORAGE_KEYS.ADMIN_SALES, updated);
+
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('AdminSales' as any, existingIdx >= 0 ? 'UPDATE' : 'INSERT', entry);
+    } catch (e) {
+      console.warn('[saveAdminSalesEntry] enqueueSync error:', e);
+    }
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_admin_sales_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_admin_sales_updated', { detail: entry }));
+  }
+
   return entry;
 };
 
@@ -8452,6 +8826,7 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
         payload: enhancedPayload,
         timestamp: newItem.timestamp,
         clientRequestId,
+        fromSync: Boolean((payload as any).fromSync || (enhancedPayload as any).fromSync || (payload as any).fromMesh),
       } as any);
     } catch (e) {
       console.warn('[enqueueSync] Mutation broadcast error:', e);
@@ -9348,8 +9723,11 @@ export const getRawStoredInventoryItems = (): InventoryItem[] => {
   const raw = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
   const map = new Map<string, InventoryItem>();
   for (const item of raw) {
-    if (!item.itemId) continue;
-    const cleanId = item.itemId.trim().toUpperCase();
+    const rawId = (item.itemId || (item as any).id || '').trim();
+    if (!rawId) continue;
+    item.itemId = rawId;
+    (item as any).id = rawId;
+    const cleanId = rawId.toUpperCase();
     const comp = (item.company_id || (item as any).companyId || 'DEFAULT').trim().toUpperCase();
     const key = `${cleanId}::${comp}`;
     if (!map.has(key)) {
@@ -9366,10 +9744,11 @@ export const getAllInventoryItems = (branchId?: string): InventoryItem[] => {
   if (!currentBranch || currentBranch === 'ALL') {
     return raw;
   }
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
   const branches = getBranches();
   return raw.filter((item) => {
     const compId = item.company_id || (item as any).companyId;
-    if (compId && currentCompany && currentCompany !== 'COMP-MASTER' && compId !== currentCompany && compId !== 'COMP-MASTER') {
+    if (compId && currentCompany && normTenant(compId) !== normTenant(currentCompany)) {
       return false;
     }
     // 1. Branch catalog assignment (e.g. Grocery store vs Hardware store)
@@ -9387,13 +9766,14 @@ export const getInventoryItems = (): InventoryItem[] => {
   const sessionUser = getSessionUser();
   const all = getAllInventoryItems(currentBranch);
   const branches = getBranches();
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
   let list: InventoryItem[];
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
     list = all;
   } else {
     list = all.filter((item) => {
       const compId = item.company_id || (item as any).companyId;
-      const matchesCompany = !compId ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (compId === currentCompany);
+      const matchesCompany = normTenant(compId) === normTenant(currentCompany);
       if (!matchesCompany) return false;
 
       // 1. Branch catalog assignment (e.g. Grocery store vs Hardware store)
@@ -9808,39 +10188,44 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
   let cleanId = (item.itemId || (item as any).id || '').trim().toUpperCase();
 
   // If item was previously deleted on this company, do not re-insert or resurrect
+  // UNLESS the incoming item is strictly newer than the deletion tombstone
   const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
   const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
-  const isDeleted = deletedList.some(
+  const itemTime = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || 0;
+  const delRecord = deletedList.find(
     (d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === normTenant(compId)
   );
-  if (isDeleted) {
-    return false;
+  if (delRecord && delRecord.deletedAt) {
+    const delTime = parseTimestampMs(delRecord.deletedAt);
+    if (delTime >= itemTime) {
+      return false;
+    }
   }
 
-  const incomingName = (item.itemName || (item as any).name || '').trim().toLowerCase();
-
-  // Find index by exact ID match (only if names also match or one is missing), or by SKU, or by exact item name
+  // Find index by exact ID match first
   let idx = allItems.findIndex((i) => {
     const iComp = (i.company_id || (i as any).companyId || currentCompany).trim().toUpperCase();
     if (normTenant(iComp) !== normTenant(compId)) return false;
-    const iName = (i.itemName || '').trim().toLowerCase();
-
-    if (item.sku && i.sku && i.sku.toUpperCase() === item.sku.toUpperCase()) return true;
-    if (incomingName && iName && incomingName === iName) return true;
-    if (cleanId && i.itemId && i.itemId.toUpperCase() === cleanId) {
-      if (incomingName && iName && incomingName !== iName) return false;
-      return true;
-    }
-    return false;
+    const iId = (i.itemId || (i as any).id || '').trim().toUpperCase();
+    return cleanId && iId && cleanId === iId;
   });
 
-  // If there's an ID conflict with a completely different product, generate a distinct ID so both survive
-  if (idx < 0) {
-    const idTakenByOther = allItems.some(
-      (i) => (i.company_id || (i as any).companyId) === compId && i.itemId && i.itemId.toUpperCase() === cleanId
-    );
-    if (idTakenByOther) {
-      cleanId = `${cleanId}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+  // If not found by ID, match by SKU if SKU is valid and distinct (at least 4 chars)
+  if (idx < 0 && item.sku) {
+    const cleanSku = item.sku.trim().toUpperCase();
+    if (cleanSku.length >= 4 && cleanSku !== 'N/A' && cleanSku !== 'NONE') {
+      const skuIdx = allItems.findIndex((i) => {
+        const iComp = (i.company_id || (i as any).companyId || currentCompany).trim().toUpperCase();
+        if (normTenant(iComp) !== normTenant(compId)) return false;
+        return i.sku && i.sku.trim().toUpperCase() === cleanSku;
+      });
+      if (skuIdx >= 0) {
+        const matched = allItems[skuIdx];
+        const mId = (matched.itemId || (matched as any).id || '').trim().toUpperCase();
+        if (!mId || mId === cleanId) {
+          idx = skuIdx;
+        }
+      }
     }
   }
 
@@ -9857,14 +10242,17 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
 
   if (idx >= 0) {
     const existing = allItems[idx];
+    const targetItemId = existing.itemId || cleanId;
 
-    // Check if price or name or cost has changed:
-    const priceChanged =
-      Math.abs((existing.sellPriceUnit || 0) - sellPriceUnit) > 0.001 ||
-      Math.abs((existing.sellPriceCase || 0) - sellPriceCase) > 0.001 ||
-      Math.abs((existing.costPerUnit || 0) - costPerUnit) > 0.001 ||
-      Math.abs((existing.costPerCase || 0) - costPerCase) > 0.001;
-    const nameChanged = (existing.itemName || '').trim() !== (item.itemName || '').trim();
+    // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+    const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
+    const incomingTime = parseTimestampMs(item.updatedAt || item.lastUpdated || (item as any).hubTimestamp);
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      console.warn(
+        `[LWW Client] 🛡️ Rejected stale inventory update for ${targetItemId} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+      );
+      return false;
+    }
 
     // Strict Last-Write-Wins (LWW) check:
     // If the local existing record is strictly newer than the incoming packet,
@@ -9896,7 +10284,8 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     savedItem = {
       ...existing,
       ...item,
-      itemId: cleanId,
+      itemId: targetItemId,
+      id: targetItemId,
       company_id: compId,
       companyId: compId,
       branch_id: item.branch_id || existing.branch_id || 'ALL',
@@ -9938,6 +10327,7 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     savedItem = {
       ...item,
       itemId: cleanId,
+      id: cleanId,
       company_id: compId,
       companyId: compId,
       branch_id: item.branch_id || 'ALL',
@@ -9963,7 +10353,7 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
   for (const it of allItems) {
     const itId = (it.itemId || (it as any).id || '').trim().toUpperCase();
     if (!itId) continue;
-    const itComp = (it.company_id || (it as any).companyId || 'DEFAULT').trim().toUpperCase();
+    const itComp = normTenant(it.company_id || (it as any).companyId || currentCompany);
     const key = `${itId}::${itComp}`;
     if (!dedupMap.has(key)) {
       dedupMap.set(key, it);
@@ -10019,34 +10409,39 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
     if (normTenant(compId) !== normTenant(currentCompany)) continue;
 
     let cleanId = (item.itemId || (item as any).id || '').trim().toUpperCase();
-    const isDeleted = deletedList.some(
+    const itemTime = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || 0;
+    const delRecord = deletedList.find(
       (d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === normTenant(compId)
     );
-    if (isDeleted) continue;
+    if (delRecord && delRecord.deletedAt) {
+      const delTime = parseTimestampMs(delRecord.deletedAt);
+      if (delTime >= itemTime) continue;
+    }
 
-    const incomingName = (item.itemName || (item as any).name || '').trim().toLowerCase();
-
-    // Find index by exact ID match, SKU, or exact item name
+    // Find index by exact ID match first
     let idx = allItems.findIndex((i) => {
       const iComp = (i.company_id || (i as any).companyId || currentCompany).trim().toUpperCase();
       if (normTenant(iComp) !== normTenant(compId)) return false;
-      const iName = (i.itemName || '').trim().toLowerCase();
-
-      if (item.sku && i.sku && i.sku.toUpperCase() === item.sku.toUpperCase()) return true;
-      if (incomingName && iName && incomingName === iName) return true;
-      if (cleanId && i.itemId && i.itemId.toUpperCase() === cleanId) {
-        if (incomingName && iName && incomingName !== iName) return false;
-        return true;
-      }
-      return false;
+      const iId = (i.itemId || (i as any).id || '').trim().toUpperCase();
+      return cleanId && iId && cleanId === iId;
     });
 
-    if (idx < 0) {
-      const idTakenByOther = allItems.some(
-        (i) => (i.company_id || (i as any).companyId) === compId && i.itemId && i.itemId.toUpperCase() === cleanId
-      );
-      if (idTakenByOther) {
-        cleanId = `${cleanId}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+    // If not found by ID, match by SKU if SKU is valid and distinct (at least 4 chars)
+    if (idx < 0 && item.sku) {
+      const cleanSku = item.sku.trim().toUpperCase();
+      if (cleanSku.length >= 4 && cleanSku !== 'N/A' && cleanSku !== 'NONE') {
+        const skuIdx = allItems.findIndex((i) => {
+          const iComp = (i.company_id || (i as any).companyId || currentCompany).trim().toUpperCase();
+          if (normTenant(iComp) !== normTenant(compId)) return false;
+          return i.sku && i.sku.trim().toUpperCase() === cleanSku;
+        });
+        if (skuIdx >= 0) {
+          const matched = allItems[skuIdx];
+          const mId = (matched.itemId || (matched as any).id || '').trim().toUpperCase();
+          if (!mId || mId === cleanId) {
+            idx = skuIdx;
+          }
+        }
       }
     }
 
@@ -10061,6 +10456,17 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
 
     if (idx >= 0) {
       const existing = allItems[idx];
+      const targetItemId = existing.itemId || cleanId;
+      // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+      const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
+      const incomingTime = parseTimestampMs(item.updatedAt || item.lastUpdated || (item as any).hubTimestamp);
+      if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+        console.warn(
+          `[LWW Client] 🛡️ Rejected stale inventory update for ${targetItemId} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+        );
+        continue;
+      }
+
       // Strict Last-Write-Wins (LWW)
       if (!isIncomingRecordNewer(item, existing)) {
         continue;
@@ -10088,7 +10494,8 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       allItems[idx] = {
         ...existing,
         ...item,
-        itemId: cleanId,
+        itemId: targetItemId,
+        id: targetItemId,
         company_id: compId,
         companyId: compId,
         branch_id: item.branch_id || existing.branch_id || 'ALL',
@@ -10130,6 +10537,7 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const savedItem: InventoryItem = {
         ...item,
         itemId: cleanId,
+        id: cleanId,
         company_id: compId,
         companyId: compId,
         branch_id: item.branch_id || 'ALL',
@@ -10158,7 +10566,7 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
     for (const it of allItems) {
       const itId = (it.itemId || (it as any).id || '').trim().toUpperCase();
       if (!itId) continue;
-      const itComp = (it.company_id || (it as any).companyId || 'DEFAULT').trim().toUpperCase();
+      const itComp = normTenant(it.company_id || (it as any).companyId || currentCompany);
       const key = `${itId}::${itComp}`;
       if (!dedupMap.has(key)) {
         dedupMap.set(key, it);
@@ -10266,6 +10674,14 @@ export type DatabaseEntityType =
   | 'customer'
   | 'grv'
   | 'reconciliation'
+  | 'supplier'
+  | 'admin_sales'
+  | 'cash_count'
+  | 'voucher'
+  | 'closure'
+  | 'settlement'
+  | 'category'
+  | 'stocktake_session'
   | 'other';
 
 export interface DatabaseMutationEvent {
@@ -10280,6 +10696,7 @@ export interface DatabaseMutationEvent {
   payload: any;
   timestamp: number;
   clientRequestId?: string;
+  fromSync?: boolean;
 }
 
 export function resolveEntityType(sheetName: string): DatabaseEntityType {
@@ -10308,6 +10725,25 @@ export function resolveEntityType(sheetName: string): DatabaseEntityType {
     case 'Reconciliations':
     case 'EOD':
       return 'reconciliation';
+    case 'Suppliers':
+      return 'supplier';
+    case 'AdminSales':
+      return 'admin_sales';
+    case 'CashCounts':
+      return 'cash_count';
+    case 'SupplierInvoices':
+    case 'Vouchers':
+      return 'voucher';
+    case 'BusinessDayClosures':
+    case 'Closures':
+      return 'closure';
+    case 'ElectronicSettlements':
+    case 'Settlements':
+      return 'settlement';
+    case 'Categories':
+      return 'category';
+    case 'StocktakeSessions':
+      return 'stocktake_session';
     case 'SHEETS_CONFIG':
     case 'Settings':
       return 'setting';
@@ -10359,6 +10795,17 @@ export const ingestMeshBranch = (branch: Branch): boolean => {
   let updated: Branch[];
   if (index >= 0) {
     const existing = branches[index];
+
+    // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+    const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
+    const incomingTime = parseTimestampMs(branch.updatedAt || branch.lastUpdated || (branch as any).hubTimestamp);
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      console.warn(
+        `[LWW Client] 🛡️ Rejected stale branch update for ${id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+      );
+      return false;
+    }
+
     if (
       existing.name === normalized.name &&
       existing.code === normalized.code &&
@@ -10377,7 +10824,10 @@ export const ingestMeshBranch = (branch: Branch): boolean => {
   return true;
 };
 
-export const ingestMeshStaff = (staff: Salesperson): boolean => {
+export const ingestMeshStaff = (
+  staff: Salesperson,
+  options?: { fromSync?: boolean }
+): boolean => {
   if (!staff || !staff.id) return false;
   const currentCompany = getCurrentCompanyId();
   const compId = (staff.company_id || staff.companyId || currentCompany).trim().toUpperCase();
@@ -10388,12 +10838,11 @@ export const ingestMeshStaff = (staff: Salesperson): boolean => {
   const all = getAllSalespeople();
   const index = all.findIndex((s) => s.id === staff.id);
 
-  // Ensure SHA-256 hash and salt are present
-  let salt = staff.pin_salt;
-  let hash = staff.pin_hash;
-  if (!hash || !salt) {
-    salt = generatePinSalt();
-    const rawPin = staff.pin ? String(staff.pin).trim() : '123456';
+  // Explicitly copy pin_hash / password from incoming packet
+  let salt = (staff as any).pin_salt || generatePinSalt();
+  let hash = (staff as any).pin_hash || (staff as any).password;
+  if (!hash) {
+    const rawPin = (staff as any).pin ? String((staff as any).pin).trim() : '123456';
     hash = hashPin(rawPin, salt);
   }
 
@@ -10404,40 +10853,37 @@ export const ingestMeshStaff = (staff: Salesperson): boolean => {
     companyId: compId,
     company_id: compId,
     pin_hash: hash,
+    password: (staff as any).password || hash,
     pin_salt: salt,
     updatedAt: incomingTime || now,
     lastUpdated: staff.lastUpdated || new Date(incomingTime || now).toISOString(),
-  };
+  } as any;
   delete (normalized as any).pin;
 
   if (index >= 0) {
     const existing = all[index];
-    // Strict Last-Write-Wins (LWW) check:
+    // Strict Last-Write-Wins (LWW) check (5000ms skew tolerance):
+    const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
+    const incomingTime = parseTimestampMs(staff.updatedAt || staff.lastUpdated || (staff as any).hubTimestamp);
+
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      console.warn(
+        `[LWW Client] 🛡️ Rejected stale staff update for ${staff.name || staff.id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+      );
+      return false;
+    }
+
     if (!isIncomingRecordNewer(staff, existing)) {
       console.log(`[ingestMeshStaff] 🛡️ Stale staff update ignored for ${staff.name} (${staff.id}). Existing timestamp is newer.`);
       return false;
     }
-    if (
-      existing.name === normalized.name &&
-      existing.role === normalized.role &&
-      existing.pin_hash === normalized.pin_hash &&
-      existing.pin_salt === normalized.pin_salt &&
-      existing.active === normalized.active &&
-      JSON.stringify(existing.permissions) === JSON.stringify(normalized.permissions) &&
-      JSON.stringify(existing.branchAssignments) === JSON.stringify(normalized.branchAssignments)
-    ) {
-      return false;
-    }
-    all[index] = { ...existing, ...normalized };
-  } else {
-    all.unshift(normalized);
+    // Explicitly copy pin_hash / password into local record
+    existing.pin_hash = hash;
+    (existing as any).password = (staff as any).password || hash;
+    if (salt) existing.pin_salt = salt;
   }
-  setStored(STORAGE_KEYS.SALESPEOPLE, all);
-  notifyListeners();
-  if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated', { detail: normalized }));
-    window.dispatchEvent(new CustomEvent('saimetric_staff_updated', { detail: normalized }));
-  }
+
+  saveSalesperson(normalized, { fromSync: true });
   return true;
 };
 
@@ -10589,7 +11035,10 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
   return true;
 };
 
-export const ingestMeshCustomer = (customer: any): boolean => {
+export const ingestMeshCustomer = (
+  customer: any,
+  options?: { fromSync?: boolean }
+): boolean => {
   if (!customer) return false;
   const currentCompany = getCurrentCompanyId();
   const compId = (customer.company_id || customer.companyId || currentCompany).trim().toUpperCase();
@@ -10612,6 +11061,15 @@ export const ingestMeshCustomer = (customer: any): boolean => {
 
   if (idx >= 0) {
     const existing = all[idx];
+    // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+    const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      console.warn(
+        `[LWW Client] 🛡️ Rejected stale customer update for ${customer.name || id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+      );
+      return false;
+    }
+
     if (!isIncomingRecordNewer(customer, existing)) {
       console.log(`[ingestMeshCustomer] 🛡️ Stale customer update ignored for ${customer.name || id}. Existing timestamp is newer.`);
       return false;
@@ -10920,49 +11378,37 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
     if (res.ok) {
       const data = await res.json();
       if (data && data.success && Array.isArray(data.items)) {
-        const localAll = getAllInventoryItems();
+        const localAll = getRawStoredInventoryItems();
+        const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
         let changed = false;
 
         for (const remote of data.items) {
           let rId = (remote.itemId || remote.id || '').trim().toUpperCase();
           if (!rId) continue;
-          const remoteName = (remote.itemName || remote.name || '').trim().toLowerCase();
 
           const idx = localAll.findIndex((i) => {
             const iComp = i.company_id || (i as any).companyId || compId;
-            if (iComp !== compId) return false;
-            const iName = (i.itemName || '').trim().toLowerCase();
-
-            if (remote.sku && i.sku && i.sku.toUpperCase() === remote.sku.toUpperCase()) return true;
-            if (remoteName && iName && remoteName === iName) return true;
-            if (i.itemId && i.itemId.toUpperCase() === rId) {
-              if (remoteName && iName && remoteName !== iName) return false;
-              return true;
-            }
-            return false;
+            if (normTenant(iComp) !== normTenant(compId)) return false;
+            const iId = (i.itemId || (i as any).id || '').trim().toUpperCase();
+            return rId && iId && rId === iId;
           });
 
           if (idx >= 0) {
             const local = localAll[idx];
             if (!local.lastUpdated || (remote.lastUpdated && remote.lastUpdated >= local.lastUpdated)) {
-              localAll[idx] = { ...local, ...remote };
+              localAll[idx] = { ...local, ...remote, itemId: local.itemId || rId, id: local.itemId || rId };
               updated++;
               changed = true;
             }
           } else {
-            // Check if ID is taken by a different item
-            const idTaken = localAll.some((i) => (i.company_id || (i as any).companyId) === compId && i.itemId && i.itemId.toUpperCase() === rId);
-            if (idTaken) {
-              rId = `${rId}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
-            }
-
             localAll.unshift({
               ...remote,
               itemId: rId,
+              id: rId,
               company_id: compId,
               companyId: compId,
-              branch_id: remote.branch_id || getCurrentBranchId(),
-              branchId: remote.branch_id || getCurrentBranchId(),
+              branch_id: remote.branch_id || 'ALL',
+              branchId: remote.branch_id || 'ALL',
             });
             added++;
             changed = true;
@@ -11754,14 +12200,15 @@ export const getProductAuditTrail = (itemId: string): StockMovementEntry[] => {
 
 export const deleteInventoryItem = (itemId: string): boolean => {
   const currentCompany = getCurrentCompanyId();
-  const allItems = getAllInventoryItems();
+  const allItems = getRawStoredInventoryItems();
   const cleanId = (itemId || '').trim().toUpperCase();
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
 
   // 1. Record deleted item tombstone with company and timestamp so offline peer devices know it was deleted
   const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
   const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
   const existsInDeleted = deletedList.some(
-    (d) => (d.itemId || '').toUpperCase() === cleanId && (d.companyId || '').toUpperCase() === currentCompany.toUpperCase()
+    (d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === normTenant(currentCompany)
   );
   if (!existsInDeleted) {
     const updatedDeleted = [
@@ -11774,7 +12221,7 @@ export const deleteInventoryItem = (itemId: string): boolean => {
   // 2. Remove from active inventory store
   const filtered = allItems.filter((i) => {
     const compId = (i.company_id || (i as any).companyId || 'COMP-001').toUpperCase();
-    if (compId === currentCompany.toUpperCase() && (i.itemId || '').trim().toUpperCase() === cleanId) {
+    if (normTenant(compId) === normTenant(currentCompany) && (i.itemId || (i as any).id || '').trim().toUpperCase() === cleanId) {
       return false;
     }
     return true;
@@ -11845,22 +12292,44 @@ export const getSupplierInvoiceVoucherById = (voucherId: string): SupplierInvoic
   );
 };
 
-export const saveSupplierInvoiceVoucher = (voucher: SupplierInvoiceVoucher): SupplierInvoiceVoucher => {
+export const saveSupplierInvoiceVoucher = (
+  voucher: SupplierInvoiceVoucher,
+  options?: { fromSync?: boolean }
+): SupplierInvoiceVoucher => {
   const all = getRawStoredSupplierInvoiceVouchers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = voucher.company_id || voucher.companyId || currentCompany;
   const brId = voucher.branchId || voucher.branch_id || currentBranch;
+  const id = voucher.voucherId || (voucher as any).id;
   const normalized: SupplierInvoiceVoucher = {
     ...voucher,
+    voucherId: id,
     company_id: compId,
     companyId: compId,
     branch_id: brId,
     branchId: brId,
   };
+  const exists = all.some((v) => v.voucherId === normalized.voucherId);
   const filtered = all.filter((v) => v.voucherId !== normalized.voucherId);
   const updated = [normalized, ...filtered];
   setStored(STORAGE_KEYS.SUPPLIER_INVOICES, updated);
+
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('SupplierInvoices' as any, exists ? 'UPDATE' : 'INSERT', normalized);
+    } catch (e) {
+      console.warn('[saveSupplierInvoiceVoucher] enqueueSync error:', e);
+    }
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_vouchers_updated'));
+    window.dispatchEvent(new Event('saimetric_supplier_invoices_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_vouchers_updated', { detail: normalized }));
+  }
+
   return normalized;
 };
 
@@ -12655,7 +13124,10 @@ export const getGoodsReceived = (): GoodsReceivedEntry[] => {
   return getAllGoodsReceived();
 };
 
-export const addGoodsReceived = (entry: GoodsReceivedEntry): GoodsReceivedEntry => {
+export const addGoodsReceived = (
+  entry: GoodsReceivedEntry,
+  options?: { fromSync?: boolean }
+): GoodsReceivedEntry => {
   const all = getRawStoredGoodsReceived();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -12671,23 +13143,26 @@ export const addGoodsReceived = (entry: GoodsReceivedEntry): GoodsReceivedEntry 
   all.unshift(normalized);
   setStored(STORAGE_KEYS.GOODS_RECEIVED, all);
 
-  enqueueSync('GoodsReceived', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    Timestamp: normalized.timestamp,
-    GRNID: normalized.grnId,
-    InvoiceNo: normalized.invoiceNo,
-    Date: normalized.date,
-    Supplier: normalized.supplier,
-    ItemID: normalized.itemId,
-    ItemName: normalized.itemName,
-    ReceivedCases: normalized.receivedCases,
-    ReceivedSingles: normalized.receivedSingles,
-    CostPerCase: normalized.costPerCase,
-    CostPerUnit: normalized.costPerUnit,
-    LineTotal: normalized.lineTotal,
-    StaffID: normalized.staffId,
-  });
+  if (!options?.fromSync && !(entry as any).fromMesh) {
+    console.log(`[Row10] Direct enqueue: GoodsReceived ${normalized.grnId || normalized.id} (fromSync=${options?.fromSync ?? false})`);
+    enqueueSync('GoodsReceived', 'INSERT', {
+      company_id: compId,
+      branch_id: brId,
+      Timestamp: normalized.timestamp,
+      GRNID: normalized.grnId,
+      InvoiceNo: normalized.invoiceNo,
+      Date: normalized.date,
+      Supplier: normalized.supplier,
+      ItemID: normalized.itemId,
+      ItemName: normalized.itemName,
+      ReceivedCases: normalized.receivedCases,
+      ReceivedSingles: normalized.receivedSingles,
+      CostPerCase: normalized.costPerCase,
+      CostPerUnit: normalized.costPerUnit,
+      LineTotal: normalized.lineTotal,
+      StaffID: normalized.staffId,
+    });
+  }
 
   return normalized;
 };
@@ -12752,7 +13227,10 @@ export const getStockMovements = (): StockMovementEntry[] => {
   return getAllStockMovements();
 };
 
-export const addStockMovement = (entry: StockMovementEntry): StockMovementEntry => {
+export const addStockMovement = (
+  entry: StockMovementEntry,
+  options?: { fromSync?: boolean }
+): StockMovementEntry => {
   const list = getStored<StockMovementEntry[]>(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS);
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -12773,6 +13251,12 @@ export const addStockMovement = (entry: StockMovementEntry): StockMovementEntry 
   } as any;
   list.unshift(normalized);
   setStored(STORAGE_KEYS.STOCK_MOVEMENTS, list);
+
+  if (!options?.fromSync && !(entry as any).fromMesh) {
+    console.log(`[Row10] Direct enqueue: StockMovements ${normalized.movementId || (normalized as any).txnId} (fromSync=${options?.fromSync ?? false})`);
+    enqueueSync('StockMovements' as any, 'INSERT', normalized);
+  }
+
   notifyListeners();
   return normalized;
 };
@@ -12862,8 +13346,28 @@ export const getCategories = (): import('../types').InventoryCategory[] => {
   }));
 };
 
-export const saveCategories = (categories: import('../types').InventoryCategory[]): void => {
+export const saveCategories = (
+  categories: import('../types').InventoryCategory[],
+  options?: { fromSync?: boolean }
+): void => {
   setStored('saimetric_room_categories', categories);
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('Categories' as any, 'UPDATE', {
+        categories,
+        updatedAt: Date.now(),
+        lastUpdated: new Date().toISOString(),
+        company_id: getCurrentCompanyId(),
+      });
+    } catch (e) {
+      console.warn('[saveCategories] enqueueSync error:', e);
+    }
+  }
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_categories_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_categories_updated', { detail: categories }));
+  }
 };
 
 export const ensureCategoryExists = (categoryName: string): void => {
@@ -13420,18 +13924,24 @@ export const getStocktakeSessionById = (sessionId: string): StocktakeSession | u
   return sessions.find((s) => s.sessionId.toUpperCase() === sessionId.toUpperCase());
 };
 
-export const saveStocktakeSession = (session: StocktakeSession): StocktakeSession => {
+export const saveStocktakeSession = (
+  session: StocktakeSession,
+  options?: { fromSync?: boolean }
+): StocktakeSession => {
   const sessions = getRawStoredStocktakeSessions();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = (session as any).company_id || (session as any).companyId || currentCompany;
   const brId = (session as any).branch_id || (session as any).branchId || currentBranch;
+  const now = Date.now();
   const normalized: StocktakeSession = {
     ...session,
     company_id: compId,
     companyId: compId,
     branch_id: brId,
     branchId: brId,
+    updatedAt: options?.fromSync ? ((session as any).updatedAt || now) : now,
+    lastUpdated: options?.fromSync ? ((session as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
   } as any;
   const index = sessions.findIndex((s) => s.sessionId.toUpperCase() === session.sessionId.toUpperCase());
   if (index >= 0) {
@@ -13440,6 +13950,17 @@ export const saveStocktakeSession = (session: StocktakeSession): StocktakeSessio
     sessions.unshift(normalized);
   }
   setStored(STORAGE_KEYS.STOCKTAKE_SESSIONS, sessions);
+  notifyListeners();
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('StocktakeSessions' as any, index >= 0 ? 'UPDATE' : 'INSERT', normalized);
+    } catch (e) {
+      console.warn('[saveStocktakeSession] enqueueSync error:', e);
+    }
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_updated', { detail: normalized }));
+  }
   return normalized;
 };
 
@@ -13549,21 +14070,54 @@ export const addTemporaryCasual = (
   const salt = (casual as any).pin_salt || generatePinSalt();
   const rawPin = (casual as any).pin ? String((casual as any).pin).trim() : '1234';
   const pinHash = (casual as any).pin_hash || hashPin(rawPin, salt);
+  const now = Date.now();
 
   const created: TemporaryCasualAccount = {
     ...casual,
     id: `CAS-${Date.now().toString().slice(-4)}`,
     pin_hash: pinHash,
     pin_salt: salt,
-    createdAt: new Date().toISOString(),
+    createdAt: (casual as any).createdAt || new Date(now).toISOString(),
+    updatedAt: now,
+    lastUpdated: new Date(now).toISOString(),
     active: true,
-  } as TemporaryCasualAccount;
+  } as unknown as TemporaryCasualAccount;
   delete (created as any).pin;
 
   const updated = [...all, created];
   setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updated);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated', { detail: created }));
+  }
   return created;
+};
+
+export const saveTemporaryCasualAccount = (
+  casual: TemporaryCasualAccount,
+  options?: { fromSync?: boolean; silent?: boolean }
+): TemporaryCasualAccount => {
+  const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  const now = Date.now();
+  const normalized: TemporaryCasualAccount = {
+    ...casual,
+    updatedAt: options?.fromSync ? ((casual as any).updatedAt || now) : now,
+    lastUpdated: options?.fromSync ? ((casual as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
+  };
+  const idx = all.findIndex((c) => c.id === casual.id);
+  let updated: TemporaryCasualAccount[];
+  if (idx >= 0) {
+    updated = [...all];
+    updated[idx] = normalized;
+  } else {
+    updated = [...all, normalized];
+  }
+  setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updated);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated', { detail: normalized }));
+  }
+  return normalized;
 };
 
 export const deleteTemporaryCasual = (id: string): boolean => {
@@ -13595,7 +14149,10 @@ export const authenticateCasualWorker = (pin: string): TemporaryCasualAccount | 
   );
 };
 
-export const syncCasualWorkersFromHub = (casuals: TemporaryCasualAccount[]): void => {
+export const syncCasualWorkersFromHub = (
+  casuals: TemporaryCasualAccount[],
+  options?: { fromSync?: boolean }
+): void => {
   if (!Array.isArray(casuals)) return;
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
   const map = new Map<string, TemporaryCasualAccount>();
@@ -13608,7 +14165,26 @@ export const syncCasualWorkersFromHub = (casuals: TemporaryCasualAccount[]): voi
       const sanitized = sanitizeUserForExport(c);
       const key = sanitized.id || (sanitized as any).pin_hash;
       if (key) {
-        map.set(key, { ...map.get(key), ...sanitized });
+        const existing = map.get(key);
+        const incomingTime = extractRecordTimestamp(sanitized);
+        const existingTime = existing ? extractRecordTimestamp(existing) : 0;
+
+        // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+        if (existing && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+          console.warn(
+            `[LWW Client] 🛡️ Rejected stale casual_worker update for ${sanitized.name || key} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+          );
+          return;
+        }
+
+        if (!existing || incomingTime >= existingTime) {
+          map.set(key, {
+            ...existing,
+            ...sanitized,
+            updatedAt: incomingTime || (sanitized as any).updatedAt || Date.now(),
+            lastUpdated: (sanitized as any).lastUpdated || new Date(incomingTime || Date.now()).toISOString(),
+          });
+        }
       }
     }
   });
@@ -13640,10 +14216,144 @@ export const ingestStocktakeSessionFromMesh = (data: {
   status?: StocktakeStatus;
   companyId?: string;
   company_id?: string;
+  consolidatedItems?: StocktakeConsolidatedItem[];
+  totalSystemUnits?: number;
+  totalCountedUnits?: number;
+  varianceUnits?: number;
+  varianceCostValue?: number;
+  varianceRetailValue?: number;
 }): StocktakeSession => {
   const existing = getStocktakeSessionById(data.sessionId);
+  if (existing) {
+    const existingTime = parseTimestampMs((existing as any).updatedAt || (existing as any).lastUpdated || existing.timestamp);
+    const incomingTime = parseTimestampMs((data as any).updatedAt || (data as any).lastUpdated || data.startedAt || (data as any).timestamp);
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      console.warn(
+        `[LWW Client] 🛡️ Rejected stale stocktake_session update for ${data.sessionId} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+      );
+      return existing;
+    }
+  }
+
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
+
+  // Merge incoming segments with existing segments to preserve local counts, claims, and verified lines
+  let mergedSegments: StocktakeSegment[] = [];
+  const existingAssignments = getZoneAssignments(data.sessionId);
+
+  if (Array.isArray(data.segments) && data.segments.length > 0) {
+    mergedSegments = data.segments.map((incomingSeg: any) => {
+      const segId = incomingSeg.segmentId || incomingSeg.id;
+      const localSeg = existing?.segments?.find((s: any) => (s.segmentId || s.id) === segId);
+      const zone = existingAssignments.find((z) => z.zoneId === segId);
+
+      const hasCountA = Boolean(
+        incomingSeg.hasCountA ||
+        localSeg?.hasCountA ||
+        (localSeg?.count1 && localSeg.count1.length > 0) ||
+        zone?.teamA?.submitted
+      );
+      const hasCountB = Boolean(
+        incomingSeg.hasCountB ||
+        localSeg?.hasCountB ||
+        (localSeg?.count2 && localSeg.count2.length > 0) ||
+        zone?.teamB?.submitted
+      );
+
+      const counterAName = incomingSeg.counterAName || localSeg?.counterAName || zone?.teamA?.staffName;
+      const counterAId = incomingSeg.counterAId || localSeg?.counterAId || zone?.teamA?.staffId;
+      const counterBName = incomingSeg.counterBName || localSeg?.counterBName || zone?.teamB?.staffName;
+      const counterBId = incomingSeg.counterBId || localSeg?.counterBId || zone?.teamB?.staffId;
+
+      const verifiedCounts =
+        (incomingSeg.verifiedCounts && incomingSeg.verifiedCounts.length > 0)
+          ? incomingSeg.verifiedCounts
+          : (localSeg?.verifiedCounts && localSeg.verifiedCounts.length > 0)
+          ? localSeg.verifiedCounts
+          : (zone?.verifiedCounts || []);
+
+      const discrepancies =
+        (incomingSeg.discrepancies && incomingSeg.discrepancies.length > 0)
+          ? incomingSeg.discrepancies
+          : (localSeg?.discrepancies && localSeg.discrepancies.length > 0)
+          ? localSeg.discrepancies
+          : (zone?.discrepancies || []);
+
+      const discrepancyCount =
+        incomingSeg.discrepancyCount !== undefined
+          ? incomingSeg.discrepancyCount
+          : localSeg?.discrepancyCount !== undefined
+          ? localSeg.discrepancyCount
+          : discrepancies.length;
+
+      let status = incomingSeg.status || localSeg?.status || zone?.status || 'PENDING';
+      if (verifiedCounts.length > 0 && discrepancies.length === 0) {
+        status = 'VERIFIED';
+      } else if (discrepancies.length > 0) {
+        status = 'DISCREPANCY_RECOUNT';
+      } else if (hasCountA && hasCountB) {
+        status = 'COUNTING';
+      } else if (hasCountA && !hasCountB) {
+        status = 'AWAITING_DOUBLE_COUNT';
+      } else if (counterAName || counterBName) {
+        status = 'COUNTING';
+      }
+
+      return {
+        ...(localSeg || {}),
+        ...incomingSeg,
+        segmentId: segId,
+        sessionId: data.sessionId,
+        counterAId,
+        counterAName,
+        counterBId,
+        counterBName,
+        hasCountA,
+        hasCountB,
+        count1Submitted: hasCountA,
+        count2Submitted: hasCountB,
+        count1: (localSeg?.count1 && localSeg.count1.length > 0) ? localSeg.count1 : (incomingSeg.count1 || []),
+        count2: (localSeg?.count2 && localSeg.count2.length > 0) ? localSeg.count2 : (incomingSeg.count2 || []),
+        verifiedCounts,
+        discrepancies,
+        discrepancyCount,
+        status,
+      };
+    });
+  } else {
+    mergedSegments = existing?.segments || [];
+  }
+
+  const consolidatedItems =
+    (data as any).consolidatedItems && (data as any).consolidatedItems.length > 0
+      ? (data as any).consolidatedItems
+      : (existing?.consolidatedItems || []);
+
+  const totalSystemUnits =
+    (data as any).totalSystemUnits !== undefined
+      ? Number((data as any).totalSystemUnits)
+      : (existing?.totalSystemUnits || 0);
+
+  const totalCountedUnits =
+    (data as any).totalCountedUnits !== undefined
+      ? Number((data as any).totalCountedUnits)
+      : (existing?.totalCountedUnits || 0);
+
+  const varianceUnits =
+    (data as any).varianceUnits !== undefined
+      ? Number((data as any).varianceUnits)
+      : (existing?.varianceUnits || 0);
+
+  const varianceCostValue =
+    (data as any).varianceCostValue !== undefined
+      ? Number((data as any).varianceCostValue)
+      : (existing?.varianceCostValue || 0);
+
+  const varianceRetailValue =
+    (data as any).varianceRetailValue !== undefined
+      ? Number((data as any).varianceRetailValue)
+      : (existing?.varianceRetailValue || 0);
 
   const session: StocktakeSession = {
     sessionId: data.sessionId,
@@ -13656,13 +14366,13 @@ export const ingestStocktakeSessionFromMesh = (data: {
     isLockdownActive: data.isLockdownActive !== undefined ? Boolean(data.isLockdownActive) : Boolean(existing?.isLockdownActive),
     createdBy: data.startedBy || existing?.createdBy || 'MANAGER',
     createdByName: data.startedBy || existing?.createdByName || 'Manager',
-    segments: Array.isArray(data.segments) && data.segments.length > 0 ? data.segments : (existing?.segments || []),
-    consolidatedItems: existing?.consolidatedItems || [],
-    totalSystemUnits: existing?.totalSystemUnits || 0,
-    totalCountedUnits: existing?.totalCountedUnits || 0,
-    varianceUnits: existing?.varianceUnits || 0,
-    varianceCostValue: existing?.varianceCostValue || 0,
-    varianceRetailValue: existing?.varianceRetailValue || 0,
+    segments: mergedSegments,
+    consolidatedItems,
+    totalSystemUnits,
+    totalCountedUnits,
+    varianceUnits,
+    varianceCostValue,
+    varianceRetailValue,
     notes: data.notes || existing?.notes || '',
     timestamp: data.startedAt || existing?.timestamp || new Date().toISOString(),
     synced: true,
@@ -13670,15 +14380,16 @@ export const ingestStocktakeSessionFromMesh = (data: {
     companyId: data.companyId || data.company_id || existing?.companyId || currentCompany,
   };
 
-  saveStocktakeSession(session);
+  saveStocktakeSession(session, { fromSync: true });
 
-  // Initialize zone assignments for each segment if not already present
-  if (Array.isArray(session.segments)) {
+  // Initialize zone assignments in a single batch for each segment if not already present
+  if (Array.isArray(session.segments) && session.segments.length > 0) {
     const assignments = getZoneAssignments(session.sessionId);
+    const toAdd: StocktakeZoneAssignment[] = [];
     session.segments.forEach((seg) => {
       const found = assignments.find((z) => z.zoneId === seg.segmentId);
       if (!found) {
-        saveZoneAssignment({
+        toAdd.push({
           zoneId: seg.segmentId,
           zoneName: seg.name,
           sessionId: session.sessionId,
@@ -13687,6 +14398,9 @@ export const ingestStocktakeSessionFromMesh = (data: {
         });
       }
     });
+    if (toAdd.length > 0) {
+      saveZoneAssignmentsBatch(toAdd);
+    }
   }
 
   notifyListeners();
@@ -13696,6 +14410,242 @@ export const ingestStocktakeSessionFromMesh = (data: {
   }
 
   return session;
+};
+
+// ============================================================================
+// AUTHORITATIVE STOCKTAKE INDEXEDDB DAO IMPLEMENTATIONS
+// ============================================================================
+export const saveStocktakeSegment = (segment: any, sessionId?: string): any => {
+  const segId = segment.segmentId || segment.id || (typeof segment === 'string' ? segment : '');
+  if (!segId) return segment;
+
+  const targetSessionId =
+    sessionId ||
+    segment.sessionId ||
+    (getStocktakeSessions().find((s) => s.segments?.some((sg) => (sg.segmentId || sg.id) === segId))?.sessionId) ||
+    getStocktakeSessions()[0]?.sessionId ||
+    '';
+
+  if (targetSessionId) {
+    const session = getStocktakeSessionById(targetSessionId);
+    if (session) {
+      if (!Array.isArray(session.segments)) {
+        session.segments = [];
+      }
+      const exIdx = session.segments.findIndex((s: any) => (s.segmentId || s.id) === segId);
+      const normalizedSegment = {
+        ...segment,
+        segmentId: segId,
+        sessionId: targetSessionId,
+      };
+
+      if (exIdx >= 0) {
+        session.segments[exIdx] = { ...session.segments[exIdx], ...normalizedSegment };
+      } else {
+        session.segments.push(normalizedSegment);
+      }
+      saveStocktakeSession(session);
+    }
+  }
+
+  // Ensure corresponding zone assignment in IndexedDB store
+  try {
+    const currentBranch = getCurrentBranchId();
+    const assignments = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+    let zone = assignments.find((z) => (z.sessionId === targetSessionId || !targetSessionId) && z.zoneId === segId);
+    if (!zone) {
+      zone = {
+        zoneId: segId,
+        zoneName: segment.name || segId,
+        sessionId: targetSessionId,
+        branchId: currentBranch,
+        status: 'AVAILABLE',
+      };
+      assignments.push(zone);
+    } else {
+      if (segment.name) zone.zoneName = segment.name;
+    }
+    setStored(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, assignments);
+  } catch (err) {
+    console.warn('[Storage] Error ensuring zone assignment for segment:', err);
+  }
+
+  console.log('[Stocktake] Segment saved to IndexedDB:', segId);
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
+  }
+
+  return segment;
+};
+
+export const getAllStocktakeSegments = (sessionId?: string): StocktakeSegment[] => {
+  if (sessionId) {
+    const session = getStocktakeSessionById(sessionId);
+    return session?.segments || [];
+  }
+  const sessions = getStocktakeSessions();
+  const allSegs: StocktakeSegment[] = [];
+  sessions.forEach((s) => {
+    if (Array.isArray(s.segments)) {
+      allSegs.push(...s.segments);
+    }
+  });
+  return allSegs;
+};
+
+export const updateZoneClaim = (
+  zoneId: string,
+  slot: 'A' | 'B',
+  claim: { staffId: string; staffName: string; deviceId?: string; zoneName?: string; sessionId?: string } | any,
+  sessionId?: string
+): StocktakeZoneAssignment => {
+  const staffId = claim.staffId || '001';
+  const staffName = claim.staffName || (slot === 'A' ? 'Counter A' : 'Counter B');
+  const deviceId = claim.deviceId || 'DEV-LOCAL';
+  const zoneName = claim.zoneName || zoneId;
+
+  const targetSessionId =
+    sessionId ||
+    claim.sessionId ||
+    (getStocktakeSessions().find((s) => s.segments?.some((sg) => (sg.segmentId || sg.id) === zoneId))?.sessionId) ||
+    getStocktakeSessions()[0]?.sessionId ||
+    '';
+
+  const zone = claimZoneSlot(targetSessionId, zoneId, slot, deviceId, staffId, staffName, zoneName);
+
+  if (targetSessionId) {
+    const session = getStocktakeSessionById(targetSessionId);
+    if (session && Array.isArray(session.segments)) {
+      const seg = session.segments.find((s: any) => (s.segmentId || s.id) === zoneId);
+      if (seg) {
+        if (slot === 'A') {
+          seg.counterAId = staffId;
+          seg.counterAName = staffName;
+          seg.counterATimestamp = new Date().toISOString();
+        } else {
+          seg.counterBId = staffId;
+          seg.counterBName = staffName;
+          seg.counterBTimestamp = new Date().toISOString();
+        }
+        saveStocktakeSession(session);
+      }
+    }
+  }
+
+  console.log('[Stocktake] Claim saved to IndexedDB:', zoneId, 'by', staffId);
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
+  }
+
+  return zone;
+};
+
+export const markZoneVerified = (
+  zoneId: string,
+  verifiedCounts: StocktakeVerifiedLine[],
+  sessionId?: string
+): StocktakeZoneAssignment | null => {
+  const targetSessionId =
+    sessionId ||
+    (getStocktakeSessions().find((s) => s.segments?.some((sg) => (sg.segmentId || sg.id) === zoneId))?.sessionId) ||
+    getStocktakeSessions()[0]?.sessionId ||
+    '';
+
+  const zone = updateZoneFromHubStatus(targetSessionId, zoneId, 'VERIFIED', undefined, verifiedCounts);
+
+  if (targetSessionId) {
+    const session = getStocktakeSessionById(targetSessionId);
+    if (session && Array.isArray(session.segments)) {
+      const seg = session.segments.find((s: any) => (s.segmentId || s.id) === zoneId);
+      if (seg) {
+        seg.status = 'VERIFIED';
+        seg.verifiedCounts = verifiedCounts;
+        seg.discrepancyCount = 0;
+        seg.recount = [];
+        saveStocktakeSession(session);
+        try {
+          consolidateStocktakeSession(targetSessionId, true);
+        } catch {}
+      }
+    }
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: { zoneId, verifiedCounts } }));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
+  }
+
+  return zone;
+};
+
+export const markZoneVariance = (
+  zoneId: string,
+  discrepancies: StocktakeVarianceItem[],
+  sessionId?: string
+): StocktakeZoneAssignment | null => {
+  const targetSessionId =
+    sessionId ||
+    (getStocktakeSessions().find((s) => s.segments?.some((sg) => (sg.segmentId || sg.id) === zoneId))?.sessionId) ||
+    getStocktakeSessions()[0]?.sessionId ||
+    '';
+
+  const zone = updateZoneFromHubStatus(targetSessionId, zoneId, 'VARIANCE_FLAGGED', discrepancies);
+
+  if (targetSessionId) {
+    const session = getStocktakeSessionById(targetSessionId);
+    if (session && Array.isArray(session.segments)) {
+      const seg = session.segments.find((s: any) => (s.segmentId || s.id) === zoneId);
+      if (seg) {
+        seg.status = 'DISCREPANCY_RECOUNT';
+        seg.discrepancies = discrepancies;
+        seg.discrepancyCount = (discrepancies || []).length;
+        saveStocktakeSession(session);
+      }
+    }
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_variance_alert', { detail: { zoneId, discrepancies } }));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
+  }
+
+  return zone;
+};
+
+export const saveCountSubmission = (
+  sessionId: string,
+  zoneId: string,
+  slot: 'A' | 'B',
+  lines: StocktakeLineCount[],
+  staffId: string,
+  staffName: string
+): any => {
+  recordBlindSubmissionLocal(sessionId, zoneId, slot, lines, staffId, staffName);
+  try {
+    submitSegmentCount(sessionId, zoneId, slot, lines, staffId, staffName);
+  } catch (e) {
+    console.warn('[Stocktake] Local submitSegmentCount soft error:', e);
+  }
+
+  console.log('[Stocktake] Count saved to IndexedDB:', zoneId, 'by Team', slot);
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
+  }
+
+  return { success: true };
 };
 
 // ============================================================================
@@ -13717,6 +14667,29 @@ export const saveZoneAssignment = (zone: StocktakeZoneAssignment): void => {
   }
   setStored(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, all);
   notifyListeners();
+};
+
+export const saveZoneAssignmentsBatch = (zones: StocktakeZoneAssignment[]): void => {
+  if (!zones || zones.length === 0) return;
+  const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  let changed = false;
+  zones.forEach((zone) => {
+    if (!zone || !zone.sessionId || !zone.zoneId) return;
+    const idx = all.findIndex((z) => z.sessionId === zone.sessionId && z.zoneId === zone.zoneId);
+    if (idx >= 0) {
+      all[idx] = { ...all[idx], ...zone };
+    } else {
+      all.push(zone);
+    }
+    changed = true;
+  });
+  if (changed) {
+    setStored(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, all);
+    notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
+    }
+  }
 };
 
 export const claimZoneSlot = (
@@ -13820,7 +14793,13 @@ export const updateZoneFromHubStatus = (
   zoneId: string,
   status: StocktakeZoneAssignment['status'],
   discrepancies?: StocktakeVarianceItem[],
-  verifiedCounts?: StocktakeVerifiedLine[]
+  verifiedCounts?: StocktakeVerifiedLine[],
+  options?: {
+    hasCountA?: boolean;
+    hasCountB?: boolean;
+    teamAStaffName?: string;
+    teamBStaffName?: string;
+  }
 ): StocktakeZoneAssignment | null => {
   const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
   let zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
@@ -13839,20 +14818,78 @@ export const updateZoneFromHubStatus = (
   if (discrepancies) zone.discrepancies = discrepancies;
   if (verifiedCounts) zone.verifiedCounts = verifiedCounts;
 
+  if (options) {
+    if (options.hasCountA) {
+      if (!zone.teamA) zone.teamA = { staffId: '002', staffName: options.teamAStaffName || 'Counter A', submitted: true };
+      zone.teamA.submitted = true;
+    }
+    if (options.hasCountB) {
+      if (!zone.teamB) zone.teamB = { staffId: '003', staffName: options.teamBStaffName || 'Counter B', submitted: true };
+      zone.teamB.submitted = true;
+    }
+    if (options.teamAStaffName) {
+      if (!zone.teamA) zone.teamA = { staffId: '002', staffName: options.teamAStaffName, submitted: false };
+      zone.teamA.staffName = options.teamAStaffName;
+    }
+    if (options.teamBStaffName) {
+      if (!zone.teamB) zone.teamB = { staffId: '003', staffName: options.teamBStaffName, submitted: false };
+      zone.teamB.staffName = options.teamBStaffName;
+    }
+  }
+
   saveZoneAssignment(zone);
+
+  // Synchronize session.segments
+  if (sessionId) {
+    const session = getStocktakeSessionById(sessionId);
+    if (session && Array.isArray(session.segments)) {
+      const seg = session.segments.find((s: any) => (s.segmentId || s.id) === zoneId);
+      if (seg) {
+        seg.status = status;
+        if (discrepancies) {
+          seg.discrepancies = discrepancies;
+          seg.discrepancyCount = discrepancies.length;
+        }
+        if (verifiedCounts) {
+          seg.verifiedCounts = verifiedCounts;
+        }
+        if (options?.hasCountA) {
+          seg.hasCountA = true;
+          seg.count1Submitted = true;
+        }
+        if (options?.hasCountB) {
+          seg.hasCountB = true;
+          seg.count2Submitted = true;
+        }
+        if (options?.teamAStaffName) seg.counterAName = options.teamAStaffName;
+        if (options?.teamBStaffName) seg.counterBName = options.teamBStaffName;
+        saveStocktakeSession(session);
+      }
+    }
+  }
+
   return zone;
 };
 
 export const applyJointRecountSignature = (
   sessionId: string,
   zoneId: string,
-  slot: 'A' | 'B',
+  slot: 'A' | 'B' | 'BOTH',
   staffName: string,
   lines?: StocktakeLineCount[]
 ): { zone: StocktakeZoneAssignment; isComplete: boolean } => {
   const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
-  let zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
-  if (!zone) throw new Error(`Zone ${zoneId} not found.`);
+  let zone = all.find((z) => (!sessionId || z.sessionId === sessionId) && z.zoneId === zoneId);
+  if (!zone) {
+    zone = {
+      zoneId,
+      zoneName: `Zone ${zoneId}`,
+      sessionId: sessionId || 'DEFAULT',
+      branchId: 'BR-MAIN',
+      status: 'VARIANCE_FLAGGED',
+    };
+    all.push(zone);
+  }
 
   if (!zone.jointRecount) {
     zone.jointRecount = {
@@ -13864,31 +14901,71 @@ export const applyJointRecountSignature = (
 
   if (lines && lines.length > 0) {
     zone.jointRecount.lines = lines;
-    zone.jointRecount.proposedBy = slot;
+    zone.jointRecount.proposedBy = slot === 'BOTH' ? 'A' : slot;
     zone.jointRecount.proposedByName = staffName;
+    zone.jointRecount.proposedAt = Date.now();
   }
 
   if (slot === 'A') zone.jointRecount.signedByA = true;
   if (slot === 'B') zone.jointRecount.signedByB = true;
+  if (slot === 'BOTH') {
+    zone.jointRecount.signedByA = true;
+    zone.jointRecount.signedByB = true;
+  }
 
   const isComplete = Boolean(zone.jointRecount.signedByA && zone.jointRecount.signedByB);
   if (isComplete) {
     zone.status = 'VERIFIED';
     zone.jointRecount.resolvedAt = new Date().toISOString();
-    zone.verifiedCounts = (zone.jointRecount.lines || []).map((l: any) => ({
-      itemId: l.itemId,
-      itemName: l.itemName,
-      category: l.category,
-      sku: l.sku,
-      unitsPerCase: l.unitsPerCase || 1,
-      cases: l.cases || 0,
-      singles: l.singles || 0,
-      totalUnits: l.totalUnits || 0,
-      source: 'JOINT_RECOUNT',
-    }));
+    zone.jointRecount.resolvedByName = staffName;
+    zone.verifiedCounts = (zone.jointRecount.lines || []).map((l: any) => {
+      const upc = Math.max(1, Number(l.unitsPerCase || 1));
+      const tot = (l.totalUnits !== undefined && l.totalUnits !== null)
+        ? Number(l.totalUnits)
+        : (Number(l.cases || 0) * upc + Number(l.singles || 0));
+      return {
+        itemId: l.itemId,
+        itemName: l.itemName,
+        category: l.category,
+        sku: l.sku,
+        unitsPerCase: upc,
+        cases: Math.floor(tot / upc),
+        singles: tot % upc,
+        totalUnits: tot,
+        source: 'JOINT_RECOUNT',
+      };
+    });
+
+    // Also update session segment in roomDatabase
+    const targetSessionId = sessionId || zone.sessionId;
+    if (targetSessionId) {
+      const session = getStocktakeSessionById(targetSessionId);
+      if (session && Array.isArray(session.segments)) {
+        const seg = session.segments.find((s: any) => (s.segmentId || s.id) === zoneId);
+        if (seg) {
+          seg.status = 'VERIFIED';
+          seg.verifiedCounts = zone.verifiedCounts;
+          seg.discrepancies = [];
+          seg.discrepancyCount = 0;
+          seg.recount = [];
+          seg.jointRecount = zone.jointRecount;
+          saveStocktakeSession(session);
+          try {
+            consolidateStocktakeSession(targetSessionId, true);
+          } catch {}
+        }
+      }
+    }
   }
 
   saveZoneAssignment(zone);
+
+  if (isComplete && typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: { zoneId, verifiedCounts: zone.verifiedCounts } }));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: { zoneId, status: 'VERIFIED' } }));
+  }
+
   return { zone, isComplete };
 };
 
@@ -14158,26 +15235,35 @@ export const submitSegmentCount = (
     allItemIds.forEach((itemId) => {
       const itemA = mapA.get(itemId);
       const itemB = mapB.get(itemId);
-
-      const aTotal = itemA?.totalUnits || 0;
-      const bTotal = itemB?.totalUnits || 0;
-      const aCases = itemA?.cases || 0;
-      const bCases = itemB?.cases || 0;
-      const aSingles = itemA?.singles || 0;
-      const bSingles = itemB?.singles || 0;
-
       const baseItem = itemA || itemB!;
+      const upc = Math.max(1, Number(baseItem?.unitsPerCase || 1));
 
-      if (aTotal === bTotal && aCases === bCases && aSingles === bSingles && itemA && itemB) {
-        // MATCHED! Both Counter A and B agree exactly
+      const aCases = Number(itemA?.cases || 0);
+      const bCases = Number(itemB?.cases || 0);
+      const aSingles = Number(itemA?.singles || 0);
+      const bSingles = Number(itemB?.singles || 0);
+      const aTotal = (itemA?.totalUnits !== undefined && itemA.totalUnits !== null)
+        ? Number(itemA.totalUnits)
+        : (aCases * upc + aSingles);
+      const bTotal = (itemB?.totalUnits !== undefined && itemB.totalUnits !== null)
+        ? Number(itemB.totalUnits)
+        : (bCases * upc + bSingles);
+
+      // If both counted 0 units, not a discrepancy
+      if (aTotal === 0 && bTotal === 0) {
+        return;
+      }
+
+      if (aTotal === bTotal) {
+        // MATCHED! Both Counter A and B agree in normalized total base units (e.g. 5 cases of 10 vs 50 units)
         matchedVerified.push({
           itemId: baseItem.itemId,
           itemName: baseItem.itemName,
           category: baseItem.category,
           sku: baseItem.sku,
-          unitsPerCase: baseItem.unitsPerCase,
-          cases: aCases,
-          singles: aSingles,
+          unitsPerCase: upc,
+          cases: Math.floor(aTotal / upc),
+          singles: aTotal % upc,
           totalUnits: aTotal,
           source: 'MATCHED',
           count1TotalUnits: aTotal,
@@ -14192,10 +15278,17 @@ export const submitSegmentCount = (
           category: baseItem.category,
           sku: baseItem.sku,
           barcode: baseItem.barcode,
-          unitsPerCase: baseItem.unitsPerCase,
-          cases: aCases, // seeded with A as starting point
+          unitsPerCase: upc,
+          cases: aCases,
           singles: aSingles,
           totalUnits: aTotal,
+          teamACases: aCases,
+          teamASingles: aSingles,
+          teamATotalUnits: aTotal,
+          teamBCases: bCases,
+          teamBSingles: bSingles,
+          teamBTotalUnits: bTotal,
+          differenceUnits: Math.abs(aTotal - bTotal),
         });
       }
     });
@@ -14339,21 +15432,32 @@ export const resolveSegmentRecount = (
  * - Updates status to 'CONSOLIDATED'
  */
 export const consolidateStocktakeSession = (
-  sessionId: string
+  sessionId: string,
+  allowPartial: boolean = true
 ): { success: boolean; message: string; session: StocktakeSession } => {
   const session = getStocktakeSessionById(sessionId);
   if (!session) throw new Error(`Stocktake session ${sessionId} not found.`);
 
-  const unverifiedSegments = session.segments.filter((s) => s.status !== 'VERIFIED');
-  if (unverifiedSegments.length > 0) {
+  const verifiedSegments = (session.segments || []).filter((s) => s.status === 'VERIFIED');
+  const unverifiedSegments = (session.segments || []).filter((s) => s.status !== 'VERIFIED');
+
+  if (verifiedSegments.length === 0) {
     return {
       success: false,
-      message: `Cannot consolidate: ${unverifiedSegments.length} segment(s) are not verified yet (${unverifiedSegments.map((s) => s.name).join(', ')}). Please verify all segment counts first.`,
+      message: `Cannot consolidate: none of the ${session.segments.length} segment(s) are verified yet. Please balance or verify at least one segment first.`,
       session,
     };
   }
 
-  // 1. Aggregate physical counts across segments
+  if (!allowPartial && unverifiedSegments.length > 0) {
+    return {
+      success: false,
+      message: `Cannot finalize full consolidation: ${unverifiedSegments.length} segment(s) are not verified yet (${unverifiedSegments.map((s) => s.name).join(', ')}). Please verify all segment counts first.`,
+      session,
+    };
+  }
+
+  // 1. Aggregate physical counts across ALL VERIFIED segments
   interface SkuConsolidationAccumulator {
     itemId: string;
     itemName: string;
@@ -14374,8 +15478,8 @@ export const consolidateStocktakeSession = (
 
   const skuMap = new Map<string, SkuConsolidationAccumulator>();
 
-  session.segments.forEach((seg) => {
-    seg.verifiedCounts.forEach((line) => {
+  verifiedSegments.forEach((seg) => {
+    (seg.verifiedCounts || []).forEach((line: any) => {
       const key = line.itemId.toUpperCase();
       let acc = skuMap.get(key);
       if (!acc) {
@@ -14462,9 +15566,9 @@ export const consolidateStocktakeSession = (
     const systemCostValue = systemTotalUnits * costPerUnit;
     const systemRetailValue = systemTotalUnits * sellPriceUnit;
 
-    const countedCases = accum.countedCases;
-    const countedSingles = accum.countedSingles;
-    const countedTotalUnits = (countedCases * unitsPerCase) + countedSingles;
+    const countedTotalUnits = accum.countedTotalUnits;
+    const countedCases = Math.floor(countedTotalUnits / unitsPerCase);
+    const countedSingles = countedTotalUnits % unitsPerCase;
     const countedCostValue = countedTotalUnits * costPerUnit;
     const countedRetailValue = countedTotalUnits * sellPriceUnit;
 
@@ -14548,8 +15652,11 @@ export const consolidateStocktakeSession = (
   session.totalCountedUnits = totalCountedUnits;
   session.varianceUnits = totalVarianceUnits;
   session.varianceCostValue = totalVarianceCostValue;
-  session.varianceRetailValue = totalVarianceRetailValue;
-  session.status = 'CONSOLIDATED';
+  if (unverifiedSegments.length === 0) {
+    session.status = 'CONSOLIDATED';
+  } else if (!session.status || session.status === 'DRAFT' || session.status === 'SCHEDULED') {
+    session.status = 'IN_PROGRESS';
+  }
 
   saveStocktakeSession(session);
 
@@ -15829,7 +16936,10 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
   });
 };
 
-export const saveDirectGrv = (grv: DirectGrv): DirectGrv => {
+export const saveDirectGrv = (
+  grv: DirectGrv,
+  options?: { fromSync?: boolean }
+): DirectGrv => {
   const list = getAllDirectGrvs();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -15875,7 +16985,10 @@ export const saveDirectGrv = (grv: DirectGrv): DirectGrv => {
     amount: grv.totalCost,
   });
 
-  enqueueSync('Direct_GRV', 'INSERT', normalized);
+  if (!options?.fromSync && !(grv as any).fromMesh) {
+    console.log(`[Row10] Direct enqueue: Direct_GRV ${normalized.grvNumber || normalized.id} (fromSync=${options?.fromSync ?? false})`);
+    enqueueSync('Direct_GRV', 'INSERT', normalized);
+  }
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -16354,10 +17467,14 @@ export const setAllCashAccounts = (accounts: CashAccount[]): void => {
   notifyListeners();
 };
 
-export const saveCashAccount = (account: CashAccount): CashAccount => {
+export const saveCashAccount = (
+  account: CashAccount,
+  options?: { fromSync?: boolean; silent?: boolean }
+): CashAccount => {
   const all = getRawStoredCashAccounts();
   const currentCompany = getCurrentCompanyId();
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
 
   // Find index by exact account_id OR by matching type + branch alias (to prevent duplicate accounts)
   let index = all.findIndex((a) => a.account_id === account.account_id);
@@ -16369,15 +17486,37 @@ export const saveCashAccount = (account: CashAccount): CashAccount => {
     );
   }
 
+  const effectiveUpdatedAt = options?.fromSync
+    ? ((account as any).updatedAt || ((account as any).updated_at ? new Date((account as any).updated_at).getTime() : nowMs))
+    : nowMs;
+  const effectiveLastUpdated = options?.fromSync
+    ? ((account as any).lastUpdated || (account as any).updated_at || new Date(effectiveUpdatedAt).toISOString())
+    : nowIso;
+
   const toSave: CashAccount = {
     ...account,
     company_id: account.company_id || currentCompany,
-    updated_at: now,
-    created_at: (index >= 0 && all[index]?.created_at) ? all[index].created_at : (account.created_at || now),
+    updated_at: effectiveLastUpdated,
+    updatedAt: effectiveUpdatedAt,
+    lastUpdated: effectiveLastUpdated,
+    created_at: (index >= 0 && all[index]?.created_at) ? all[index].created_at : (account.created_at || nowIso),
   };
 
   let updated: CashAccount[];
   if (index >= 0) {
+    const existing = all[index];
+    if (options?.fromSync) {
+      // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+      const existingTime = parseTimestampMs(existing.updatedAt || (existing as any).lastUpdated || existing.updated_at || (existing as any).hubTimestamp);
+      const incomingTime = parseTimestampMs((account as any).updatedAt || (account as any).lastUpdated || (account as any).updated_at || (account as any).hubTimestamp);
+      if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+        console.warn(
+          `[LWW Client] 🛡️ Rejected stale cash_account update for ${account.account_id || account.account_name} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+        );
+        return existing;
+      }
+    }
+
     updated = [...all];
     updated[index] = toSave;
     // Also synchronize any other duplicate/alias accounts of the same type and branch so balances never diverge
@@ -16388,7 +17527,9 @@ export const saveCashAccount = (account: CashAccount): CashAccount => {
         return {
           ...a,
           current_balance: toSave.current_balance,
-          updated_at: now,
+          updated_at: effectiveLastUpdated,
+          updatedAt: effectiveUpdatedAt,
+          lastUpdated: effectiveLastUpdated,
         };
       }
       return a;
@@ -16398,8 +17539,14 @@ export const saveCashAccount = (account: CashAccount): CashAccount => {
   }
 
   setStored(STORAGE_KEYS.CASH_ACCOUNTS, updated);
-  enqueueSync('CashAccounts' as any, index >= 0 ? 'UPDATE' : 'INSERT', toSave);
+  if (!options?.fromSync) {
+    enqueueSync('CashAccounts' as any, index >= 0 ? 'UPDATE' : 'INSERT', toSave);
+    notifyCashAccountChanged(toSave);
+  }
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: toSave }));
+  }
   return toSave;
 };
 
@@ -16426,7 +17573,10 @@ export const getCashTransfers = (branchId?: string): CashTransfer[] => {
   return getAllCashTransfers(branchId);
 };
 
-export const saveCashTransfer = (transfer: CashTransfer): CashTransfer => {
+export const saveCashTransfer = (
+  transfer: CashTransfer,
+  options?: { fromSync?: boolean }
+): CashTransfer => {
   const all = getRawStoredCashTransfers();
   const currentCompany = getCurrentCompanyId();
   const index = all.findIndex((t) => t.transfer_id === transfer.transfer_id);
@@ -16446,7 +17596,10 @@ export const saveCashTransfer = (transfer: CashTransfer): CashTransfer => {
   }
 
   setStored(STORAGE_KEYS.CASH_TRANSFERS, updated);
-  enqueueSync('CashTransfers' as any, index >= 0 ? 'UPDATE' : 'INSERT', toSave);
+  if (!options?.fromSync && !(transfer as any).fromMesh) {
+    console.log(`[Row10] Direct enqueue: CashTransfers ${toSave.transfer_id} (fromSync=${options?.fromSync ?? false})`);
+    enqueueSync('CashTransfers' as any, index >= 0 ? 'UPDATE' : 'INSERT', toSave);
+  }
   notifyListeners();
   return toSave;
 };
@@ -16585,7 +17738,10 @@ export const isBusinessDayClosed = (date: string, branchId?: string): boolean =>
   return !!closure && closure.status === 'CLOSED';
 };
 
-export const saveBusinessDayClosure = (closureData: BusinessDayClosure): { success: boolean; message: string; closure: BusinessDayClosure } => {
+export const saveBusinessDayClosure = (
+  closureData: BusinessDayClosure,
+  options?: { fromSync?: boolean }
+): { success: boolean; message: string; closure: BusinessDayClosure } => {
   const all = getRawStoredBusinessDayClosures();
   const existingIdx = all.findIndex((c) => c.id === closureData.id || (c.date === closureData.date && c.branchId === closureData.branchId));
   let updated: BusinessDayClosure[];
@@ -16596,9 +17752,19 @@ export const saveBusinessDayClosure = (closureData: BusinessDayClosure): { succe
     updated = [closureData, ...all];
   }
   setStored(STORAGE_KEYS.BUSINESS_DAY_CLOSURES, updated);
-  enqueueSync('BusinessDayClosures' as any, existingIdx >= 0 ? 'UPDATE' : 'INSERT', closureData);
+
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('BusinessDayClosures' as any, existingIdx >= 0 ? 'UPDATE' : 'INSERT', closureData);
+    } catch (e) {
+      console.warn('[saveBusinessDayClosure] enqueueSync error:', e);
+    }
+  }
+
   notifyListeners();
   if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_closures_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_closures_updated', { detail: closureData }));
     window.dispatchEvent(new CustomEvent('saimetric_eod_completed', { detail: closureData }));
     window.dispatchEvent(new CustomEvent('saimetric_business_day_updated', { detail: closureData }));
   }
@@ -16618,7 +17784,10 @@ export const getElectronicSettlementForDate = (date: string, branchId?: string):
   return found || null;
 };
 
-export const saveElectronicSettlement = (record: ElectronicSettlementRecord): void => {
+export const saveElectronicSettlement = (
+  record: ElectronicSettlementRecord,
+  options?: { fromSync?: boolean }
+): void => {
   const settlements = getStored<ElectronicSettlementRecord[]>(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, []);
   const list = Array.isArray(settlements) ? settlements : [];
   const idx = list.findIndex((s) => s.id === record.id || (s.date === record.date && s.branchId === record.branchId));
@@ -16630,8 +17799,19 @@ export const saveElectronicSettlement = (record: ElectronicSettlementRecord): vo
     updated = [record, ...list];
   }
   setStored(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, updated);
+
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('ElectronicSettlements' as any, idx >= 0 ? 'UPDATE' : 'INSERT', record);
+    } catch (e) {
+      console.warn('[saveElectronicSettlement] enqueueSync error:', e);
+    }
+  }
+
   notifyListeners();
   if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_settlements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_settlements_updated', { detail: record }));
     window.dispatchEvent(new CustomEvent('saimetric_electronic_settlement_updated', { detail: record }));
   }
 };

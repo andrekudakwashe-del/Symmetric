@@ -24,6 +24,10 @@ import {
   Shield,
   Phone,
   Sparkles,
+  ChevronDown,
+  ChevronUp,
+  Check,
+  RefreshCw,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -89,8 +93,47 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   const [lines, setLines] = useState<StocktakeLineCount[]>([]);
   const [savedSuccess, setSavedSuccess] = useState(false);
 
+  // Auto-save draft state
+  const [lastDraftSavedAt, setLastDraftSavedAt] = useState<number | null>(null);
+  const [draftRestoredMessage, setDraftRestoredMessage] = useState<string | null>(null);
+
+  // Collapsible top header (sticky search stays frozen at top; extra header section collapses to maximize screen)
+  const [isHeaderExpanded, setIsHeaderExpanded] = useState<boolean>(true);
+
   const isDailyBlind = session.countType === 'DAILY_BLIND';
   const isSpotCheck = session.countType === 'SPOT_CHECK';
+
+  // Helper to get local draft key
+  const getDraftKey = (slot: 'A' | 'B') =>
+    `saimetric_stocktake_draft_${session.sessionId}_${segment.segmentId}_${slot}`;
+
+  // Helper to persist draft continuously
+  const saveDraftLocally = (linesToSave: StocktakeLineCount[], slot: 'A' | 'B') => {
+    try {
+      const payload = {
+        sessionId: session.sessionId,
+        segmentId: segment.segmentId,
+        slot,
+        counterStaffId,
+        counterStaffName,
+        counterPhone,
+        lines: linesToSave,
+        updatedAt: Date.now(),
+      };
+      localStorage.setItem(getDraftKey(slot), JSON.stringify(payload));
+      setLastDraftSavedAt(Date.now());
+    } catch (e) {
+      console.warn('[Stocktake Draft] Auto-save failed:', e);
+    }
+  };
+
+  // Helper to clear draft once officially submitted
+  const clearDraftLocally = (slot: 'A' | 'B') => {
+    try {
+      localStorage.removeItem(getDraftKey(slot));
+      setLastDraftSavedAt(null);
+    } catch (e) {}
+  };
 
   // Fast-moving checklist item IDs
   const fastMovingItemIds = useMemo(() => {
@@ -105,34 +148,102 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     return map;
   }, [inventoryList]);
 
-  // Load catalog products and initialize lines
+  // Load catalog products and initialize lines with Draft Protection
   useEffect(() => {
     const items = getInventoryItems();
     setInventoryList(items);
 
-    const existing = counterSlot === 'A' ? segment.count1 : segment.count2;
-    if (existing && existing.length > 0) {
-      setLines(JSON.parse(JSON.stringify(existing)));
-    } else {
-      // Pre-seed catalog items with 0 counts
-      const initialLines: StocktakeLineCount[] = items.map((itm) => ({
-        itemId: itm.itemId,
-        itemName: itm.itemName,
-        category: itm.category || 'General',
-        sku: itm.sku || itm.itemId,
-        barcode: itm.barcode,
-        unitsPerCase: itm.unitsPerCase || 1,
-        cases: 0,
-        singles: 0,
-        totalUnits: 0,
-      }));
-      setLines(initialLines);
+    // 1. Check if a local auto-saved draft exists first (prevents lost counts if user pressed back or browser closed)
+    let loadedFromDraft = false;
+    try {
+      const rawDraft = localStorage.getItem(getDraftKey(counterSlot));
+      if (rawDraft) {
+        const parsed = JSON.parse(rawDraft);
+        if (parsed && Array.isArray(parsed.lines) && parsed.lines.length > 0) {
+          const hasCount = parsed.lines.some((l: any) => (l.totalUnits && l.totalUnits > 0) || l.wasCounted);
+          if (hasCount) {
+            setLines(parsed.lines);
+            if (parsed.counterStaffName) setCounterStaffName(parsed.counterStaffName);
+            if (parsed.counterStaffId) setCounterStaffId(parsed.counterStaffId);
+            if (parsed.counterPhone) setCounterPhone(parsed.counterPhone);
+            setLastDraftSavedAt(parsed.updatedAt || Date.now());
+            const countedCount = parsed.lines.filter((l: any) => l.totalUnits > 0 || l.wasCounted).length;
+            setDraftRestoredMessage(
+              `Draft Restored: Recovered ${countedCount} in-progress count item(s) from auto-save (${new Date(
+                parsed.updatedAt || Date.now()
+              ).toLocaleTimeString()}).`
+            );
+            setTimeout(() => setDraftRestoredMessage(null), 6000);
+            loadedFromDraft = true;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[Draft] Failed to read draft:', e);
     }
-  }, [segment, counterSlot]);
+
+    if (!loadedFromDraft) {
+      const existing = counterSlot === 'A' ? segment.count1 : segment.count2;
+      if (existing && existing.length > 0) {
+        setLines(JSON.parse(JSON.stringify(existing)));
+      } else {
+        // Pre-seed catalog items with 0 counts
+        const initialLines: StocktakeLineCount[] = items.map((itm) => ({
+          itemId: itm.itemId,
+          itemName: itm.itemName,
+          category: itm.category || 'General',
+          sku: itm.sku || itm.itemId,
+          barcode: itm.barcode,
+          unitsPerCase: itm.unitsPerCase || 1,
+          cases: 0,
+          singles: 0,
+          totalUnits: 0,
+        }));
+        setLines(initialLines);
+      }
+    }
+  }, [segment, counterSlot, session.sessionId]);
+
+  // Collapse upper header on scroll down to give counter maximum vertical screen space
+  useEffect(() => {
+    let lastScrollY = window.scrollY;
+    const onScroll = () => {
+      const currentY = window.scrollY;
+      if (currentY > 80 && currentY > lastScrollY) {
+        // User is scrolling down: collapse top header so frozen search panel gets full focus
+        setIsHeaderExpanded(false);
+      }
+      lastScrollY = currentY;
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
 
   // Handle counter slot change
   const handleSlotChange = (newSlot: 'A' | 'B') => {
     setCounterSlot(newSlot);
+    // Check if new slot has an existing draft
+    try {
+      const rawDraft = localStorage.getItem(getDraftKey(newSlot));
+      if (rawDraft) {
+        const parsed = JSON.parse(rawDraft);
+        if (parsed && Array.isArray(parsed.lines) && parsed.lines.length > 0) {
+          const hasCount = parsed.lines.some((l: any) => (l.totalUnits && l.totalUnits > 0) || l.wasCounted);
+          if (hasCount) {
+            setLines(parsed.lines);
+            setLastDraftSavedAt(parsed.updatedAt || Date.now());
+            setDraftRestoredMessage(
+              `Loaded auto-saved draft for Count ${newSlot} (${new Date(
+                parsed.updatedAt || Date.now()
+              ).toLocaleTimeString()}).`
+            );
+            setTimeout(() => setDraftRestoredMessage(null), 5000);
+            return;
+          }
+        }
+      }
+    } catch {}
+
     const existing = newSlot === 'A' ? segment.count1 : segment.count2;
     if (existing && existing.length > 0) {
       setLines(JSON.parse(JSON.stringify(existing)));
@@ -180,7 +291,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     }
   };
 
-  // Update line quantity with Active Freeze snapshot
+  // Update line quantity with Active Freeze snapshot AND AUTO-SAVE DRAFT IMMEDIATELY
   const updateQuantity = (
     itemId: string,
     casesDelta: number,
@@ -188,11 +299,10 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     exactCases?: number,
     exactSingles?: number
   ) => {
-    // If Daily Blind or Weekly Active Count: capture live freeze snapshot on line change
     const freezeSnapshot = captureLiveInventoryFreeze(itemId, session.branchId);
 
-    setLines((prev) =>
-      prev.map((l) => {
+    setLines((prev) => {
+      const updated = prev.map((l) => {
         if (l.itemId.toUpperCase() === itemId.toUpperCase()) {
           const upc = Math.max(1, l.unitsPerCase || 1);
           let newCases = exactCases !== undefined ? exactCases : Math.max(0, l.cases + casesDelta);
@@ -219,8 +329,13 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
           };
         }
         return l;
-      })
-    );
+      });
+
+      // Auto-save draft to local storage so count is NEVER lost on back press or refresh
+      saveDraftLocally(updated, counterSlot);
+
+      return updated;
+    });
   };
 
   // Filtered list
@@ -251,191 +366,239 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     onSaveCount(counterSlot, lines, counterStaffId, counterStaffName);
+    // Clear draft after successful broadcast submission
+    clearDraftLocally(counterSlot);
     setSavedSuccess(true);
     setTimeout(() => setSavedSuccess(false), 3000);
   };
 
   return (
     <div className="bg-slate-900 text-slate-100 min-h-screen flex flex-col">
-      {/* Header Bar */}
-      <header className="bg-slate-800/90 border-b border-slate-700/80 px-4 py-3 sticky top-0 z-30 backdrop-blur">
-        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
+      {/* RESTORED DRAFT BANNER NOTIFICATION */}
+      {draftRestoredMessage && (
+        <div className="bg-blue-900/90 text-blue-100 border-b border-blue-600 px-4 py-2.5 text-xs font-semibold flex items-center justify-between z-50 animate-fadeIn">
+          <div className="flex items-center gap-2">
+            <RefreshCw className="w-4 h-4 text-blue-300 animate-spin-slow" />
+            <span>{draftRestoredMessage}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setDraftRestoredMessage(null)}
+            className="text-blue-300 hover:text-white text-xs underline"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* FROZEN STICKY TOP BAR: Pinned at top with Search & Primary Actions */}
+      <div className="sticky top-0 z-40 bg-slate-900/95 border-b border-slate-700/90 backdrop-blur-md shadow-xl transition-all">
+        {/* Row 1: Frozen Search + Core Actions (Always Visible on Screen) */}
+        <div className="max-w-7xl mx-auto px-3 sm:px-4 py-2 flex flex-wrap items-center justify-between gap-2">
+          {/* Left: Back & Location Identifier */}
+          <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={onBack}
-              className="p-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-300 transition"
-              title="Return to Session Overview"
+              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
+              title="Return to Session Overview (Draft is auto-saved)"
             >
-              <ArrowLeft className="w-5 h-5" />
+              <ArrowLeft className="w-4 h-4" />
             </button>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-wider text-blue-400 bg-blue-950/80 border border-blue-800/60 px-2 py-0.5 rounded">
-                  {segment.locationCode || segment.segmentId}
-                </span>
-                <h1 className="text-base font-bold text-white tracking-tight">{segment.name}</h1>
-                {isDailyBlind && (
-                  <span className="text-[10px] bg-amber-950/90 text-amber-300 border border-amber-800 px-2 py-0.5 rounded-full font-bold flex items-center gap-1">
-                    <Clock className="w-3 h-3" /> Daily Active Trading Freeze
-                  </span>
-                )}
-                {isSpotCheck && (
-                  <span className="text-[10px] bg-emerald-950/90 text-emerald-300 border border-emerald-800 px-2 py-0.5 rounded-full font-bold flex items-center gap-1">
-                    <Eye className="w-3 h-3" /> Non-Blind Spot Check
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-slate-400">
-                Session: {session.title} ({session.sessionId})
-              </p>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] font-mono font-bold uppercase text-blue-400 bg-blue-950/90 border border-blue-800/80 px-2 py-0.5 rounded">
+                {segment.locationCode || segment.segmentId}
+              </span>
+              <span className="text-xs font-bold text-white max-w-[140px] sm:max-w-[200px] truncate">
+                {segment.name}
+              </span>
+              <span
+                className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                  counterSlot === 'A'
+                    ? 'bg-blue-900/80 text-blue-300 border border-blue-700'
+                    : 'bg-purple-900/80 text-purple-300 border border-purple-700'
+                }`}
+              >
+                Team {counterSlot}
+              </span>
             </div>
           </div>
 
-          {/* Counter Switcher & Casual Worker Badge */}
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Casual Switcher */}
-            <button
-              type="button"
-              onClick={() => setShowCasualPinModal(true)}
-              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 flex items-center gap-1.5 transition"
-              title="Login with Casual Worker 4-Digit PIN"
-            >
-              <KeyRound className="w-3.5 h-3.5 text-amber-400" />
-              {activeCasual ? (
-                <span>
-                  Casual: <strong>{activeCasual.name}</strong>
-                </span>
-              ) : (
-                <span>Casual PIN Login</span>
-              )}
-            </button>
-
-            {/* Counter Slot Switcher */}
-            <div className="flex items-center gap-1 bg-slate-950/80 p-1 rounded-xl border border-slate-700/80">
+          {/* Center: Frozen Search Box (Sticky & Always Accessible) */}
+          <div className="flex-1 min-w-[200px] max-w-xl relative">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search products by SKU, name, or barcode..."
+              className="w-full pl-9 pr-8 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-inner"
+            />
+            {searchQuery && (
               <button
                 type="button"
-                onClick={() => handleSlotChange('A')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
-                  counterSlot === 'A'
-                    ? 'bg-blue-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
+                onClick={() => setSearchQuery('')}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs font-bold"
               >
-                <UserCheck className="w-3.5 h-3.5" />
-                Count 1 (Group 1)
+                ✕
               </button>
-              <button
-                type="button"
-                onClick={() => handleSlotChange('B')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
-                  counterSlot === 'B'
-                    ? 'bg-purple-600 text-white shadow-sm'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <UserCheck className="w-3.5 h-3.5" />
-                Count 2 (Group 2)
-              </button>
-            </div>
+            )}
+          </div>
 
+          {/* Right: Auto-Save Status, Save Button, and Dropdown Header Toggle */}
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Live Auto-Save Indicator */}
+            {lastDraftSavedAt && (
+              <div
+                className="hidden md:flex items-center gap-1.5 text-[11px] text-emerald-300 bg-emerald-950/60 border border-emerald-800/50 px-2 py-0.5 rounded"
+                title="Every line count is auto-saved as a local draft continuously"
+              >
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                <span>Draft Saved {new Date(lastDraftSavedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+              </div>
+            )}
+
+            {/* Save Count Submit Button */}
             <button
               type="button"
               onClick={handleSubmit}
-              className={`px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition ${
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-md transition ${
                 counterSlot === 'A'
-                  ? 'bg-blue-600 hover:bg-blue-500 text-white'
-                  : 'bg-purple-600 hover:bg-purple-500 text-white'
+                  ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/30'
+                  : 'bg-purple-600 hover:bg-purple-500 text-white shadow-purple-900/30'
               }`}
             >
-              <Save className="w-4 h-4" />
-              Save Count {counterSlot}
+              <Save className="w-3.5 h-3.5" />
+              <span>Save Count {counterSlot}</span>
             </button>
-          </div>
-        </div>
-      </header>
 
-      {/* Mode Guidance Alert */}
-      {isDailyBlind && (
-        <div className="bg-amber-950/40 border-b border-amber-800/60 px-4 py-2 text-xs text-amber-200 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Zap className="w-4 h-4 text-amber-400 shrink-0" />
-            <span>
-              <strong>Active Trading Line-by-Line Freeze:</strong> Tills are actively selling while you count. The system takes a live inventory snapshot the second you key in or change any line, freezing the on-hand stock and logging variance at count time!
-            </span>
-          </div>
-          <span className="text-[11px] font-mono text-amber-300">Live Freeze Armed</span>
-        </div>
-      )}
-
-      {isSpotCheck && (
-        <div className="bg-emerald-950/40 border-b border-emerald-800/60 px-4 py-2 text-xs text-emerald-200 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Eye className="w-4 h-4 text-emerald-400 shrink-0" />
-            <span>
-              <strong>Supervisor Non-Blind Spot Check:</strong> Live system stock-on-hand is visible beside your count input for quick on-the-spot verification and discrepancy resolution.
-            </span>
-          </div>
-          <span className="text-[11px] font-mono text-emerald-300">Visible Mode</span>
-        </div>
-      )}
-
-      {/* Search & Filter Toolbar */}
-      <div className="bg-slate-800/60 border-b border-slate-700/60 px-4 py-2.5">
-        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2 flex-1 min-w-[240px]">
-            <div className="relative flex-1">
-              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search products by SKU, name, or barcode..."
-                className="w-full pl-9 pr-3 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
-              />
-            </div>
-
-            <select
-              value={selectedCategory}
-              onChange={(e) => setSelectedCategory(e.target.value)}
-              className="px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
-            >
-              {categories.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-
+            {/* Dropdown Toggle: Lets user collapse/expand the top section for more screen space */}
             <button
               type="button"
-              onClick={() => setOnlyFastMovers(!onlyFastMovers)}
-              className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
-                onlyFastMovers
-                  ? 'bg-amber-600 text-white shadow-sm'
-                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-              }`}
+              onClick={() => setIsHeaderExpanded(!isHeaderExpanded)}
+              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition flex items-center gap-1"
+              title={isHeaderExpanded ? 'Hide top controls to maximize counting screen' : 'Show top controls & category filters'}
             >
-              <Zap className="w-3.5 h-3.5" />
-              Fast Movers ({fastMovingItemIds.size})
+              {isHeaderExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+              <span className="hidden sm:inline text-[10px] font-medium text-slate-400">
+                {isHeaderExpanded ? 'Collapse' : 'Details'}
+              </span>
             </button>
           </div>
-
-          {/* Quick Counter Info */}
-          <div className="text-xs text-slate-400 flex items-center gap-3">
-            <span>
-              Counter:{' '}
-              <strong className="text-slate-200">{counterStaffName}</strong>
-              {counterPhone && <span className="text-[11px] text-slate-400"> ({counterPhone})</span>}
-            </span>
-            <span>•</span>
-            <span>
-              Counted:{' '}
-              <strong className="text-emerald-400 font-mono">
-                {countedItemsCount}/{lines.length}
-              </strong>
-            </span>
-          </div>
         </div>
+
+        {/* Collapsible Panel: Expands on request or at top; tucks away on scroll to maximize counting area */}
+        {isHeaderExpanded && (
+          <div className="border-t border-slate-800/90 bg-slate-900/90 px-3 sm:px-4 py-2.5 space-y-2 animate-fadeIn">
+            {/* Metadata & Controls Row */}
+            <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2.5 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Casual PIN login */}
+                <button
+                  type="button"
+                  onClick={() => setShowCasualPinModal(true)}
+                  className="px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 flex items-center gap-1.5 transition"
+                  title="Login with Casual Worker 4-Digit PIN"
+                >
+                  <KeyRound className="w-3.5 h-3.5 text-amber-400" />
+                  {activeCasual ? (
+                    <span>Casual: <strong>{activeCasual.name}</strong></span>
+                  ) : (
+                    <span>Casual PIN Login</span>
+                  )}
+                </button>
+
+                {/* Counter Slot Switcher */}
+                <div className="flex items-center gap-0.5 bg-slate-950 p-0.5 rounded-lg border border-slate-700">
+                  <button
+                    type="button"
+                    onClick={() => handleSlotChange('A')}
+                    className={`px-2.5 py-1 rounded text-xs font-bold transition ${
+                      counterSlot === 'A'
+                        ? 'bg-blue-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Count 1 (Team A)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSlotChange('B')}
+                    className={`px-2.5 py-1 rounded text-xs font-bold transition ${
+                      counterSlot === 'B'
+                        ? 'bg-purple-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Count 2 (Team B)
+                  </button>
+                </div>
+
+                {/* Category Filter */}
+                <select
+                  value={selectedCategory}
+                  onChange={(e) => setSelectedCategory(e.target.value)}
+                  className="px-2 py-1 bg-slate-950 border border-slate-700 rounded-md text-xs text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  {categories.map((c) => (
+                    <option key={c} value={c}>
+                      {c === 'ALL' ? 'All Categories' : c}
+                    </option>
+                  ))}
+                </select>
+
+                {/* Fast Movers Button */}
+                <button
+                  type="button"
+                  onClick={() => setOnlyFastMovers(!onlyFastMovers)}
+                  className={`px-2.5 py-1 rounded-md text-xs font-semibold flex items-center gap-1 transition ${
+                    onlyFastMovers
+                      ? 'bg-amber-600 text-white shadow-xs'
+                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  <Zap className="w-3 h-3" />
+                  Fast Movers ({fastMovingItemIds.size})
+                </button>
+              </div>
+
+              {/* Progress & Counter Info */}
+              <div className="flex items-center gap-3 text-slate-400 font-mono text-[11px]">
+                <span>
+                  Counter: <strong className="text-white">{counterStaffName}</strong>
+                </span>
+                <span>•</span>
+                <span>
+                  Counted:{' '}
+                  <strong className="text-emerald-400 font-bold">
+                    {countedItemsCount}/{lines.length}
+                  </strong>{' '}
+                  SKUs ({totalCountedUnits} units)
+                </span>
+              </div>
+            </div>
+
+            {/* Mode alerts if applicable */}
+            {isDailyBlind && (
+              <div className="max-w-7xl mx-auto bg-amber-950/30 border border-amber-800/40 px-3 py-1.5 rounded-lg text-xs text-amber-200 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span>
+                    <strong>Active Trading Freeze Active:</strong> System logs live SOH and variance at count time as tills sell.
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono text-amber-300">Armed</span>
+              </div>
+            )}
+            {isSpotCheck && (
+              <div className="max-w-7xl mx-auto bg-emerald-950/30 border border-emerald-800/40 px-3 py-1.5 rounded-lg text-xs text-emerald-200 flex items-center gap-2">
+                <Eye className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>
+                  <strong>Spot Check Mode:</strong> Live system stock is shown beside your physical count input for immediate verification.
+                </span>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {savedSuccess && (
@@ -444,6 +607,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
           Counter {counterSlot} count successfully saved to system!
         </div>
       )}
+
 
       {/* Main Counting Matrix */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-4">
@@ -640,11 +804,16 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                     {/* Total Calculated Units & Quick Reset */}
                     <div className="flex items-center gap-3 bg-slate-950/90 px-3.5 py-2.5 rounded-lg border border-slate-700/60 min-w-[140px] justify-between">
                       <div>
-                        <div className="text-[10px] uppercase font-semibold text-slate-400">Total Count</div>
+                        <div className="text-[10px] uppercase font-semibold text-slate-400">Total Base Units</div>
                         <div className="text-base font-extrabold font-mono text-emerald-400">
                           {line.totalUnits}{' '}
                           <span className="text-xs font-normal text-slate-400">units</span>
                         </div>
+                        {line.cases > 0 && (
+                          <div className="text-[10px] font-mono text-slate-400">
+                            {line.cases} cs × {upc} + {line.singles} ea
+                          </div>
+                        )}
                       </div>
                       {line.totalUnits > 0 && (
                         <button
