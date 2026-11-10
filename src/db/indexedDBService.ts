@@ -56,10 +56,18 @@ export interface TenantContextRecord {
 }
 
 export const IDB_NAME = 'saimetric_cash_db';
-export const CURRENT_IDB_SCHEMA_VERSION = 5; // Incremented for fixedMonthlyCosts store
+export const CURRENT_IDB_SCHEMA_VERSION = 6; // Incremented for deleted_records tombstone store
 export const CURRENT_SAAS_SCHEMA_VERSION = 1; // Master SaaS schema version from backend
 
 export const IDB_STORES: Record<string, StoreDefinition> = {
+  deleted_records: {
+    keyPath: 'id',
+    indexes: [
+      { name: 'entityType', keyPath: 'entityType', options: { unique: false } },
+      { name: 'deletedAt', keyPath: 'deletedAt', options: { unique: false } },
+      { name: 'company_id', keyPath: 'company_id', options: { unique: false } },
+    ],
+  },
   fixedMonthlyCosts: {
     keyPath: 'uuid',
     indexes: [

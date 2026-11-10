@@ -16,6 +16,7 @@ import {
   getAllSales,
   addSale,
   getSyncQueue,
+  getSheetsConfig,
   purgeSyncedRecords,
   onSaleCreated,
   ingestMeshSale,
@@ -31,6 +32,9 @@ import {
   setStored,
   STORAGE_KEYS,
   mergeT1Records,
+  applyTombstone,
+  recordTombstone,
+  getTombstones,
   parseTimestampMs,
   extractRecordTimestamp,
   pullTenantInventory,
@@ -261,6 +265,43 @@ export const registerSyncCoreListener = (handler: SyncCoreListener): (() => void
   return () => {
     syncCoreListeners.delete(handler);
   };
+};
+
+let _cloudSyncPaused = false;
+
+export const pauseCloudSync = () => {
+  try {
+    const comp = getCurrentCompany();
+    if (comp?.sync_strategy === 'CLOUD_ONLY') {
+      console.log('[Sync Strategy] Tenant configured as CLOUD_ONLY. Direct cloud sync remains active.');
+      return;
+    }
+  } catch {}
+  _cloudSyncPaused = true;
+  persistentSyncEngine.pauseOutboundSync();
+  console.log('[Edge Gateway] 🛑 Local Hub WebSocket active. Direct cloud sync (App Scripts/Supabase) paused to prevent sync wars.');
+};
+
+export const resumeCloudSync = () => {
+  try {
+    const comp = getCurrentCompany();
+    if (comp?.sync_strategy === 'HUB_ONLY') {
+      console.log('[Sync Strategy] Tenant configured as HUB_ONLY. Direct cloud sync remains paused.');
+      return;
+    }
+  } catch {}
+  _cloudSyncPaused = false;
+  persistentSyncEngine.resumeOutboundSync();
+  console.log('[Edge Gateway] 🟢 Local Hub WebSocket disconnected. Direct cloud sync resumed.');
+};
+
+export const isCloudSyncPaused = (): boolean => {
+  try {
+    const comp = getCurrentCompany();
+    if (comp?.sync_strategy === 'CLOUD_ONLY') return false;
+    if (comp?.sync_strategy === 'HUB_ONLY') return true;
+  } catch {}
+  return _cloudSyncPaused || (typeof meshSyncService !== 'undefined' && meshSyncService.isLocalHubActive());
 };
 
 class MeshSyncManager {
@@ -1334,6 +1375,9 @@ class MeshSyncManager {
         this.lastHubPongReceivedAt = Date.now();
         this.evaluateConnectionPriority();
 
+        // Edge Gateway: Suspend direct cloud sync while connected to Local Hub
+        pauseCloudSync();
+
         this.addLog(
           'DISCOVERY',
           `Local WebSocket Hub CONNECTED: ${hubUrl} (0% Internet Required). Performing pre-auth identity handshake...`,
@@ -1344,12 +1388,16 @@ class MeshSyncManager {
         // Requirement 1: Pre-Auth Lobby & Handshake
         // Immediately query the Hub's branch identity before draining or catch-up
         try {
+          const cfg = getSheetsConfig();
+          const cloudUrl = cfg?.deploymentUrl || '';
           ws.send(
             JSON.stringify({
               type: 'PING_HUB',
               action: 'PING_HUB',
               deviceId: this.config.deviceId,
               deviceName: this.config.deviceName,
+              cloudSyncUrl: cloudUrl,
+              cloudUrl: cloudUrl,
               timestamp: Date.now(),
             })
           );
@@ -1466,6 +1514,7 @@ class MeshSyncManager {
       };
 
       ws.onclose = () => {
+        resumeCloudSync();
         this.handleLocalHubLost('Local Hub WebSocket closed');
       };
     } catch (err: any) {
@@ -1607,6 +1656,50 @@ class MeshSyncManager {
 
     if (pType === 'SYNC_ACK') {
       this.handleSyncAck(packet);
+      return;
+    }
+
+    if (pType === 'T1_CLOUD_SYNC_ACK') {
+      const entityId = packet.id;
+      const entityType = packet.entityType;
+      console.log(`[PWA Sync] ☁️ Received T1_CLOUD_SYNC_ACK for ${entityType} #${entityId}`);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_cloud_sync_ack', { detail: { entityType, id: entityId } }));
+      }
+      return;
+    }
+
+    if (pType === 'TOMBSTONE_SYNC') {
+      const tomb = packet.tombstone || packet.payload || packet;
+      if (tomb && tomb.entityId && tomb.entityType) {
+        applyTombstone(tomb);
+      }
+      return;
+    }
+
+    if (pType === 'INVENTORY_SNAPSHOT_RESPONSE') {
+      const items = packet.items || packet.payload;
+      if (Array.isArray(items)) {
+        for (const it of items) {
+          ingestMeshInventoryItem({ ...it, fromMesh: true });
+        }
+        recalculateInventoryValuationOnce();
+        console.log(`[Snapshot Heartbeat] 📸 Ingested authoritative inventory snapshot of ${items.length} items`);
+      }
+      return;
+    }
+
+    if (pType === 'HISTORICAL_T1_RESPONSE') {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_historical_response', { detail: packet }));
+      }
+      return;
+    }
+
+    if (pType === 'FINANCIAL_REPORT_RESPONSE') {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_financial_report_response', { detail: packet }));
+      }
       return;
     }
 
@@ -2370,6 +2463,7 @@ class MeshSyncManager {
   }
 
   private handleLocalHubLost(reason: string) {
+    resumeCloudSync();
     if (this.localHubHeartbeatTimer) {
       clearInterval(this.localHubHeartbeatTimer);
       this.localHubHeartbeatTimer = null;
@@ -3612,12 +3706,22 @@ class MeshSyncManager {
   // =========================================================================
   // HEARTBEAT & PEER DISCOVERY
   // =========================================================================
+  private snapshotHeartbeatTimer: number | null = null;
+
   private startHeartbeatLoop() {
     if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
     this.sendHeartbeat();
     this.heartbeatInterval = window.setInterval(() => {
       this.sendHeartbeat();
     }, 18000);
+
+    // 10-Minute Authoritative T2 Inventory Snapshot Heartbeat from Local Hub
+    if (this.snapshotHeartbeatTimer) clearInterval(this.snapshotHeartbeatTimer);
+    this.snapshotHeartbeatTimer = window.setInterval(() => {
+      if (this.isLocalHubActive()) {
+        this.requestInventorySnapshot();
+      }
+    }, 10 * 60 * 1000);
   }
 
   private startPruneLoop() {
@@ -4848,9 +4952,8 @@ class MeshSyncManager {
       }
     }
 
-    // 4. Default: NEVER return 0 or 48 hours ago which causes the 501 firehose!
-    // Return 5 minutes ago so only recent mutations are fetched
-    return new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    // 4. Default: Return 0 when uninitialized so initial sync fetches everything accurately
+    return '0';
   }
 
   public async setLastInventorySyncTimestamp(val: number | string): Promise<void> {
@@ -5490,6 +5593,16 @@ class MeshSyncManager {
       overallProcessed += delta.categories.length;
     }
 
+    // 8.12 Apply Tombstones (Soft Deletes) from Catch-up Delta
+    if (Array.isArray(delta.tombstones) && delta.tombstones.length > 0) {
+      for (const tomb of delta.tombstones) {
+        if (tomb && tomb.entityId && tomb.entityType) {
+          applyTombstone(tomb);
+        }
+      }
+      overallProcessed += delta.tombstones.length;
+    }
+
     // Complete sync progress indicator
     if (totalRecordsToProcess > 0) {
       this.finishSyncProgress(totalRecordsToProcess, 'Sync Complete');
@@ -5697,14 +5810,16 @@ class MeshSyncManager {
     const packetId = `STAFF-PKT-${staff.id}-${Date.now()}`;
     this.seenPacketIds.add(packetId);
 
-    // CRITICAL SECURITY: Never broadcast raw plain-text PIN across network/Hub
+    // Ensure password and credentials integrity across LAN / Hub
     const sanitizedStaff = sanitizeUserForExport(staff);
     const effectiveHash = staff.pin_hash || (sanitizedStaff as any).pin_hash || '';
-    const effectivePassword = staff.password || effectiveHash || '';
+    const effectivePassword = staff.password || (sanitizedStaff as any).password || effectiveHash || '';
+    const effectivePin = staff.pin || (sanitizedStaff as any).pin || '';
     const staffPayload = {
       ...sanitizedStaff,
-      pin_hash: effectiveHash,
+      pin: effectivePin,
       password: effectivePassword,
+      pin_hash: effectiveHash,
       updatedAt: staff.updatedAt,
       lastUpdated: staff.lastUpdated,
     };
@@ -5722,8 +5837,9 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       staff: staffPayload,
       payload: staffPayload,
-      pin_hash: effectiveHash,
+      pin: effectivePin,
       password: effectivePassword,
+      pin_hash: effectiveHash,
       timestamp: staff.updatedAt,
       updatedAt: staff.updatedAt,
       ttl: 5,
@@ -5927,8 +6043,9 @@ class MeshSyncManager {
       unitsPerCase: item.unitsPerCase,
       canSellAsCase: Boolean(item.canSellAsCase),
       stockCases: item.stockCases,
-      stockSingles: item.stockSingles,
-      totalUnits: item.totalUnits,
+      stockSingles: Number(item.stockSingles !== undefined ? item.stockSingles : item.totalUnits || 0),
+      totalUnits: Number(item.totalUnits || 0),
+      snapshotTimestamp: now,
       category: item.category,
       sku: item.sku,
       barcode: item.barcode,
@@ -5936,12 +6053,18 @@ class MeshSyncManager {
       branchOverrides: item.branchOverrides,
       item: {
         ...item,
+        totalUnits: Number(item.totalUnits || 0),
+        stockSingles: Number(item.stockSingles !== undefined ? item.stockSingles : item.totalUnits || 0),
+        snapshotTimestamp: now,
         updatedAt: now,
         hubTimestamp: now,
         lastUpdated: nowIso,
       },
       payload: {
         ...item,
+        totalUnits: Number(item.totalUnits || 0),
+        stockSingles: Number(item.stockSingles !== undefined ? item.stockSingles : item.totalUnits || 0),
+        snapshotTimestamp: now,
         updatedAt: now,
         hubTimestamp: now,
         lastUpdated: nowIso,
@@ -5968,6 +6091,183 @@ class MeshSyncManager {
   }
 
   public broadcastInventoryUpdate = (item: InventoryItem) => this.broadcastInventoryItem(item);
+
+  /**
+   * Broadcasts a tombstone (soft delete) to the Hub and peers
+   */
+  public broadcastTombstone(entityType: string, entityId: string) {
+    if (this.isIngestingFromHub || !entityType || !entityId) return;
+    const cleanId = String(entityId).trim();
+    const cleanType = String(entityType).trim().toLowerCase();
+    const now = Date.now();
+    const packetId = `TOMB-PKT-${cleanType}-${cleanId}-${now}`;
+    this.seenPacketIds.add(packetId);
+
+    const tombstone = {
+      id: `TOMB-${cleanType}-${cleanId}`,
+      entityType: cleanType,
+      entityId: cleanId,
+      isDeleted: true,
+      deletedAt: now,
+      deletedAtIso: new Date(now).toISOString(),
+      company_id: this.config.companyId,
+      branch_id: this.config.branchId,
+    };
+
+    const packet = {
+      type: 'TOMBSTONE_SYNC',
+      action: 'TOMBSTONE_SYNC',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      target_branch_id: 'ALL',
+      entityType: 'tombstone',
+      tombstone,
+      payload: tombstone,
+      origin_device_id: this.config.deviceId,
+      origin_device_name: this.config.deviceName,
+      timestamp: now,
+    };
+
+    this.sendPacketToAllTransports('tombstone', packet);
+    this.addLog('BROADCAST', `Soft deleted ${cleanType} #${cleanId} broadcasted to Hub & peers`, this.config.deviceName, undefined, 5, cleanId);
+  }
+
+  /**
+   * Resets all T2 Catalog High Water Marks to 0 to force complete catalog re-sync
+   */
+  public async resetCatalogHwmToZero(): Promise<void> {
+    await this.setLastInventorySyncTimestamp(0);
+    this.setLastMeshSyncTimestamp('0');
+    setLastStaffSync(0);
+    setLastBranchSync(0);
+    setLastCustomerSync(0);
+    setLastCashAccountSync(0);
+    setLastCasualWorkerSync(0);
+    setLastStocktakeSessionSync(0);
+    console.log('[Sync Manager] Reset all T2 Catalog HWMs to 0.');
+    await this.requestCatchUpSync('ALL', '0', false, true);
+  }
+
+  /**
+   * Resets T1 Transaction High Water Mark back to a chosen date to catch up transactions
+   */
+  public async resetTransactionHwm(dateStr: string): Promise<void> {
+    const timestampMs = dateStr ? new Date(dateStr).getTime() : 0;
+    const targetIso = !isNaN(timestampMs) && timestampMs > 0 ? new Date(timestampMs).toISOString() : new Date(0).toISOString();
+    console.log(`[Sync Manager] Force Transaction Sync starting from ${targetIso}`);
+    await this.requestCatchUpSync('ALL', targetIso, false, true);
+  }
+
+  /**
+   * Requests an authoritative T2 Inventory Snapshot from the Hub
+   */
+  public requestInventorySnapshot() {
+    if (!this.localHubWs || this.localHubWs.readyState !== WebSocket.OPEN) return;
+    const pkt = {
+      type: 'INVENTORY_SNAPSHOT_REQUEST',
+      action: 'INVENTORY_SNAPSHOT_REQUEST',
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      originDeviceId: this.config.deviceId,
+      timestamp: Date.now(),
+    };
+    try {
+      this.localHubWs.send(JSON.stringify(pkt));
+      console.log('[Snapshot Heartbeat] 📸 Requested 10-minute T2 Inventory Snapshot from Local Hub');
+    } catch {}
+  }
+
+  /**
+   * Fetches historical T1 transactions on-demand from the Hub without saving to local IndexedDB
+   */
+  public async fetchHistoricalT1(targetEntity: string, startDate?: string, endDate?: string): Promise<any[]> {
+    if (!this.localHubWs || this.localHubWs.readyState !== WebSocket.OPEN) {
+      throw new Error('Local Hub is not connected. Historical fetch requires active Hub connection.');
+    }
+    const requestId = `HIST-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const pkt = {
+      type: 'FETCH_HISTORICAL_T1',
+      action: 'FETCH_HISTORICAL_T1',
+      requestId,
+      targetEntity,
+      startDate: startDate || new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(),
+      endDate: endDate || new Date().toISOString(),
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      originDeviceId: this.config.deviceId,
+      timestamp: Date.now(),
+    };
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        window.removeEventListener('saimetric_historical_response' as any, listener);
+        reject(new Error('Historical fetch timed out after 10s'));
+      }, 10000);
+
+      const listener = (event: any) => {
+        if (event.detail && event.detail.requestId === requestId) {
+          clearTimeout(timeout);
+          window.removeEventListener('saimetric_historical_response' as any, listener);
+          resolve(event.detail.records || []);
+        }
+      };
+
+      window.addEventListener('saimetric_historical_response' as any, listener);
+      try {
+        this.localHubWs!.send(JSON.stringify(pkt));
+      } catch (err) {
+        clearTimeout(timeout);
+        window.removeEventListener('saimetric_historical_response' as any, listener);
+        reject(err);
+      }
+    });
+  }
+
+  /**
+   * Requests server-side aggregated financial report from the Local Hub
+   */
+  public async fetchFinancialReport(startDate?: string, endDate?: string): Promise<any> {
+    if (!this.localHubWs || this.localHubWs.readyState !== WebSocket.OPEN) {
+      throw new Error('Local Hub is not connected. Server-side report requires active Hub connection.');
+    }
+    const requestId = `RPT-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const pkt = {
+      type: 'GET_FINANCIAL_REPORT',
+      action: 'GET_FINANCIAL_REPORT',
+      requestId,
+      startDate: startDate || new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(),
+      endDate: endDate || new Date().toISOString(),
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      originDeviceId: this.config.deviceId,
+      timestamp: Date.now(),
+    };
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        window.removeEventListener('saimetric_financial_report_response' as any, listener);
+        reject(new Error('Financial report request timed out after 10s'));
+      }, 10000);
+
+      const listener = (event: any) => {
+        if (event.detail && event.detail.requestId === requestId) {
+          clearTimeout(timeout);
+          window.removeEventListener('saimetric_financial_report_response' as any, listener);
+          resolve(event.detail.report || null);
+        }
+      };
+
+      window.addEventListener('saimetric_financial_report_response' as any, listener);
+      try {
+        this.localHubWs!.send(JSON.stringify(pkt));
+      } catch (err) {
+        clearTimeout(timeout);
+        window.removeEventListener('saimetric_financial_report_response' as any, listener);
+        reject(err);
+      }
+    });
+  }
 
   public broadcastDatabaseMutation(mutation: DatabaseMutationEvent) {
     if (this.isIngestingFromHub) return;
@@ -6792,6 +7092,7 @@ class MeshSyncManager {
         this.directWsClient = null;
       }
       this.isLocalHubConnected = false;
+      resumeCloudSync();
       if (this.localHubReconnectTimer) {
         clearTimeout(this.localHubReconnectTimer);
         this.localHubReconnectTimer = null;

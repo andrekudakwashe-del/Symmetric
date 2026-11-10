@@ -546,6 +546,11 @@ export const processSyncQueue = async (
     errors: [],
   };
 
+  if (persistentSyncEngine.isSyncPaused()) {
+    console.log('[GoogleSheetsSync] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping processSyncQueue.');
+    return result;
+  }
+
   if (queue.length === 0) {
     updateSheetsConfig({ lastSyncTimestamp: new Date().toISOString() });
     return result;

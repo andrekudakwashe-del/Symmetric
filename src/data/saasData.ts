@@ -37,6 +37,7 @@ export interface Company {
   custom_max_staff?: number;
   backend_type?: BackendType;
   backend_config?: TenantBackendConfig;
+  sync_strategy?: 'CLOUD_ONLY' | 'HUB_ONLY' | 'HUB_CLOUD';
 }
 
 export interface SaaSBranch {

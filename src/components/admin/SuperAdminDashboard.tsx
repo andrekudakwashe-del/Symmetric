@@ -115,6 +115,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
   const [newOwnerName, setNewOwnerName] = useState('');
   const [newPlan, setNewPlan] = useState<'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE'>('PROFESSIONAL');
+  const [newSyncStrategy, setNewSyncStrategy] = useState<'CLOUD_ONLY' | 'HUB_ONLY' | 'HUB_CLOUD'>('HUB_CLOUD');
 
   // Payment Confirmation Modal State
   const [paymentPlan, setPaymentPlan] = useState<'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE'>('PROFESSIONAL');
@@ -127,6 +128,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   const [pkgModalPackageId, setPkgModalPackageId] = useState<string>('pkg_professional');
   const [pkgModalCustomBranches, setPkgModalCustomBranches] = useState<number>(3);
   const [pkgModalCustomStaff, setPkgModalCustomStaff] = useState<number>(10);
+  const [pkgModalSyncStrategy, setPkgModalSyncStrategy] = useState<'CLOUD_ONLY' | 'HUB_ONLY' | 'HUB_CLOUD'>('HUB_CLOUD');
 
   // Master Sheet Sync & Tabs State
   const [isSyncingWithMaster, setIsSyncingWithMaster] = useState(false);
@@ -488,6 +490,7 @@ function setupMasterSheets() {
       package_id: newPlan === 'ENTERPRISE' ? 'pkg_enterprise' : newPlan === 'PROFESSIONAL' ? 'pkg_professional' : 'pkg_starter',
       custom_max_branches: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 3 : 1,
       custom_max_staff: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 15 : 5,
+      sync_strategy: newSyncStrategy,
       next_billing_date: new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
       offline_activation_code: `SAI-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
       trial_days_remaining: 14,
@@ -518,6 +521,7 @@ function setupMasterSheets() {
 
     setPkgModalCustomBranches(comp.custom_max_branches !== undefined ? comp.custom_max_branches : defaultBranches);
     setPkgModalCustomStaff(comp.custom_max_staff !== undefined ? comp.custom_max_staff : defaultStaff);
+    setPkgModalSyncStrategy(comp.sync_strategy || 'HUB_CLOUD');
   };
 
   const handleSaveTenantPkgConfig = (e: React.FormEvent) => {
@@ -531,6 +535,7 @@ function setupMasterSheets() {
       plan: pkgModalPlan,
       customMaxBranches: branches,
       customMaxStaff: staff,
+      syncStrategy: pkgModalSyncStrategy,
     });
 
     if (success) {
@@ -2021,6 +2026,19 @@ function setupMasterSheets() {
                 </select>
               </div>
 
+              <div>
+                <label className="text-xs font-bold text-slate-300">Sync Strategy</label>
+                <select
+                  value={newSyncStrategy}
+                  onChange={(e) => setNewSyncStrategy(e.target.value as any)}
+                  className="w-full bg-slate-950 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-amber-500 mt-1"
+                >
+                  <option value="HUB_CLOUD">HUB_CLOUD (Edge Gateway + Cloud Bridge)</option>
+                  <option value="HUB_ONLY">HUB_ONLY (Local Offline Hub Only)</option>
+                  <option value="CLOUD_ONLY">CLOUD_ONLY (Direct Cloud Sync Only)</option>
+                </select>
+              </div>
+
               <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300">
                 ⭐ New tenant will be registered with a 14-day free trial. You can confirm their payment anytime right from this dashboard.
               </div>
@@ -2532,6 +2550,22 @@ function setupMasterSheets() {
                     {pkgModalPlan === 'ENTERPRISE' ? 'Enterprise includes 999 (Unlimited)' : 'Maximum user logins allowed'}
                   </span>
                 </div>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-300 block mb-1">Sync Strategy</label>
+                <select
+                  value={pkgModalSyncStrategy}
+                  onChange={(e) => setPkgModalSyncStrategy(e.target.value as any)}
+                  className="w-full bg-slate-950 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs"
+                >
+                  <option value="HUB_CLOUD">HUB_CLOUD (Edge Gateway + Cloud Bridge)</option>
+                  <option value="HUB_ONLY">HUB_ONLY (Local Offline Hub Only)</option>
+                  <option value="CLOUD_ONLY">CLOUD_ONLY (Direct Cloud Sync Only)</option>
+                </select>
+                <span className="text-[10px] text-slate-400 block mt-0.5">
+                  Controls whether terminals route transactions through Termux Local Hub, directly to Cloud, or in hybrid mode.
+                </span>
               </div>
 
               <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200">

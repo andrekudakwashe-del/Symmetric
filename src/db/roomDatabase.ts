@@ -207,6 +207,74 @@ export const STORAGE_KEYS = {
   BUSINESS_DAY_CLOSURES: 'saimetric_room_business_day_closures',
   ELECTRONIC_SETTLEMENTS: 'saimetric_room_electronic_settlements',
   WALLET_RECOVERY_QUEUE: 'saimetric_room_wallet_recovery_queue',
+  DELETED_RECORDS: 'saimetric_deleted_records',
+};
+
+/**
+ * Universal RFC4122 v4 UUID Generator
+ * Uses native crypto.randomUUID() when available with high-entropy fallback
+ */
+export const generateUUID = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
+
+export interface TombstoneRecord {
+  id: string;
+  entityType: string;
+  entityId: string;
+  isDeleted: true;
+  deletedAt: number;
+  deletedAtIso: string;
+  company_id?: string;
+  branch_id?: string;
+}
+
+export const getTombstones = (): TombstoneRecord[] => {
+  return getStored<TombstoneRecord[]>(STORAGE_KEYS.DELETED_RECORDS, []);
+};
+
+export const recordTombstone = (
+  entityType: string,
+  entityId: string,
+  options?: { fromSync?: boolean }
+): TombstoneRecord => {
+  const all = getTombstones();
+  const cleanId = String(entityId || '').trim();
+  const cleanType = String(entityType || '').trim().toLowerCase();
+  const now = Date.now();
+  const tombstoneId = `TOMB-${cleanType}-${cleanId}`;
+
+  const existingIdx = all.findIndex((t) => t.id === tombstoneId || (t.entityType === cleanType && t.entityId === cleanId));
+  const record: TombstoneRecord = {
+    id: tombstoneId,
+    entityType: cleanType,
+    entityId: cleanId,
+    isDeleted: true,
+    deletedAt: now,
+    deletedAtIso: new Date(now).toISOString(),
+    company_id: getCurrentCompanyId(),
+    branch_id: getCurrentBranchId(),
+  };
+
+  if (existingIdx >= 0) {
+    all[existingIdx] = record;
+  } else {
+    all.unshift(record);
+  }
+  setStored(STORAGE_KEYS.DELETED_RECORDS, all);
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_tombstone_updated', { detail: record }));
+  }
+
+  return record;
 };
 
 export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
@@ -1827,25 +1895,14 @@ export const getSalespeopleForCompany = (companyId?: string): Salesperson[] => {
 };
 
 export const getNextSalespersonId = (): string => {
-  const list = getRawStoredSalespeople();
-  const numericIds = (Array.isArray(list) ? list : [])
-    .map((s) => {
-      if (!s) return NaN;
-      const rawId = s.id || (s as any).staffId || (s as any).user_id || '';
-      const match = String(rawId).match(/\d+/);
-      return match ? parseInt(match[0], 10) : NaN;
-    })
-    .filter((n) => !isNaN(n));
-  const max = numericIds.length > 0 ? Math.max(...numericIds) : 0;
-  const next = max + 1;
-  return String(next).padStart(3, '0');
+  return generateUUID();
 };
 
 export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }): Salesperson => {
   const all = getRawStoredSalespeople();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const newId = person.id || getNextSalespersonId();
+  const newId = person.id || generateUUID();
   const compId = person.companyId || person.company_id || currentCompany;
   const brId = person.branchId || person.branch_id || currentBranch;
 
@@ -1956,8 +2013,8 @@ export const saveSalesperson = (
 
   // Secure One-Way PIN Hashing (SHA-256 with Salt)
   const salt = person.pin_salt || existingPerson?.pin_salt || generatePinSalt();
-  let pinHash = person.pin_hash || existingPerson?.pin_hash;
-  if (person.pin) {
+  let pinHash = (options?.fromSync && person.pin_hash) ? person.pin_hash : (person.pin_hash || existingPerson?.pin_hash);
+  if (person.pin && !options?.fromSync) {
     const rawPin = String(person.pin).trim();
     if (rawPin) {
       pinHash = hashPin(rawPin, salt);
@@ -1973,7 +2030,7 @@ export const saveSalesperson = (
     companyId: compId,
     company_id: compId,
     pin_hash: pinHash,
-    password: (person as any).password || (existingPerson as any)?.password || pinHash,
+    password: options?.fromSync ? ((person as any).password || pinHash) : ((person as any).password || (existingPerson as any)?.password || pinHash),
     pin_salt: salt,
     active: person.active || existingPerson?.active || 'Y',
     permissions: resolvedPermissions,
@@ -2289,18 +2346,7 @@ export const getCustomers = (): Customer[] => {
 };
 
 export const getNextCustomerId = (): string => {
-  const list = getRawStoredCustomers();
-  const numericParts = (Array.isArray(list) ? list : [])
-    .map((c) => {
-      if (!c) return null;
-      const rawId = c.customerId || (c as any).id || (c as any).CustomerID || '';
-      const match = String(rawId).match(/^C?(\d+)$/i);
-      return match ? parseInt(match[1], 10) : null;
-    })
-    .filter((n): n is number => n !== null);
-  const max = numericParts.length > 0 ? Math.max(...numericParts) : 0;
-  const next = max + 1;
-  return `C${String(next).padStart(3, '0')}`;
+  return generateUUID();
 };
 
 export const addCustomer = (
@@ -2319,7 +2365,7 @@ export const addCustomer = (
   const all = getRawStoredCustomers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const nextId = customerData.customerId || getNextCustomerId();
+  const nextId = customerData.customerId || generateUUID();
   const compId = customerData.company_id || customerData.companyId || currentCompany;
   const brId = customerData.branch_id || customerData.branchId || currentBranch;
   
@@ -2551,18 +2597,7 @@ export const getSupplierById = (supplierId: string): Supplier | undefined => {
 };
 
 export const getNextSupplierId = (): string => {
-  const list = getRawStoredSuppliers();
-  const numericParts = (Array.isArray(list) ? list : [])
-    .map((s) => {
-      if (!s) return null;
-      const rawId = s.supplierId || (s as any).id || (s as any).SupplierID || '';
-      const match = String(rawId).match(/^SUP-?(\d+)$/i);
-      return match ? parseInt(match[1], 10) : null;
-    })
-    .filter((n): n is number => n !== null);
-  const max = numericParts.length > 0 ? Math.max(...numericParts) : 0;
-  const next = max + 1;
-  return `SUP-${String(next).padStart(3, '0')}`;
+  return generateUUID();
 };
 
 export const addSupplier = (
@@ -2581,7 +2616,7 @@ export const addSupplier = (
   const all = getRawStoredSuppliers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const nextId = supplierData.supplierId || supplierData.id || getNextSupplierId();
+  const nextId = supplierData.supplierId || supplierData.id || generateUUID();
   const compId = supplierData.company_id || supplierData.companyId || currentCompany;
   const brId = supplierData.branch_id || supplierData.branchId || currentBranch;
   const created: Supplier = {
@@ -2677,8 +2712,93 @@ export const deleteSupplier = (supplierId: string): boolean => {
   const filtered = all.filter((s) => s.supplierId !== supplierId);
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.SUPPLIERS, filtered);
+  recordTombstone('supplier', supplierId);
   enqueueSync('Suppliers', 'DELETE', { supplierId, company_id: getCurrentCompanyId() });
   return true;
+};
+
+export const deleteCustomer = (customerId: string, options?: { fromSync?: boolean }): boolean => {
+  const all = getRawStoredCustomers();
+  const cleanId = String(customerId || '').trim();
+  const filtered = all.filter((c) => c.customerId !== cleanId && c.id !== cleanId);
+  if (filtered.length === all.length) return false;
+  setStored(STORAGE_KEYS.CUSTOMERS, filtered);
+  recordTombstone('customer', cleanId, options);
+  if (!options?.fromSync) {
+    enqueueSync('Customers', 'DELETE', { customerId: cleanId, company_id: getCurrentCompanyId() });
+  }
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+  }
+  return true;
+};
+
+export const deleteSalesperson = (id: string, options?: { fromSync?: boolean }): boolean => {
+  const all = getRawStoredSalespeople();
+  const cleanId = String(id || '').trim();
+  const filtered = all.filter((s) => s.id !== cleanId);
+  if (filtered.length === all.length) return false;
+  setStored(STORAGE_KEYS.SALESPEOPLE, filtered);
+  recordTombstone('staff', cleanId, options);
+  if (!options?.fromSync) {
+    enqueueSync('Salespeople', 'DELETE', { id: cleanId, company_id: getCurrentCompanyId() });
+  }
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
+  }
+  return true;
+};
+
+export const applyTombstone = (tombstone: { entityType: string; entityId: string; deletedAt?: number }): boolean => {
+  if (!tombstone || !tombstone.entityId || !tombstone.entityType) return false;
+  const cleanId = String(tombstone.entityId).trim();
+  const cleanType = String(tombstone.entityType).trim().toLowerCase();
+
+  recordTombstone(cleanType, cleanId, { fromSync: true });
+
+  if (cleanType === 'inventory' || cleanType === 'product') {
+    const allItems = getRawStoredInventoryItems();
+    const filtered = allItems.filter(i => (i.itemId || (i as any).id || '').trim().toUpperCase() !== cleanId.toUpperCase());
+    if (filtered.length !== allItems.length) {
+      setStored(STORAGE_KEYS.INVENTORY_ITEMS, filtered);
+      try {
+        setStored(STORAGE_KEYS.PRODUCTS, filtered.map(item => inventoryItemToProduct(item)));
+      } catch {}
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_inventory_updated'));
+        window.dispatchEvent(new Event('saimetric_products_updated'));
+      }
+      return true;
+    }
+  } else if (cleanType === 'customer') {
+    return deleteCustomer(cleanId, { fromSync: true });
+  } else if (cleanType === 'staff') {
+    return deleteSalesperson(cleanId, { fromSync: true });
+  } else if (cleanType === 'supplier') {
+    const all = getRawStoredSuppliers();
+    const filtered = all.filter(s => s.supplierId !== cleanId && (s as any).id !== cleanId);
+    if (filtered.length !== all.length) {
+      setStored(STORAGE_KEYS.SUPPLIERS, filtered);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_supplier_updated'));
+      }
+      return true;
+    }
+  } else if (cleanType === 'branch') {
+    const all = getAllBranches();
+    const filtered = all.filter(b => b.branchId !== cleanId && b.id !== cleanId);
+    if (filtered.length !== all.length) {
+      setStored(STORAGE_KEYS.BRANCHES, filtered);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
+      }
+      return true;
+    }
+  }
+  return false;
 };
 
 export const getSupplierInvoices = (supplierNameOrId: string): SupplierInvoiceVoucher[] => {
@@ -2999,6 +3119,7 @@ export const saveBranch = (
 
 export const deleteBranch = (branchId: string): boolean => {
   // 1. Add to permanent deleted tombstones
+  recordTombstone('branch', branchId);
   const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
   if (!deletedList.includes(branchId)) {
     setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, [...deletedList, branchId]);
@@ -7524,18 +7645,7 @@ export const getExpenses = (): ExpenseEntry[] => {
 };
 
 export const getNextExpenseId = (): string => {
-  const list = getAllExpenses();
-  const numbers = (Array.isArray(list) ? list : [])
-    .map((e) => {
-      if (!e) return null;
-      const rawId = e.id || (e as any).expenseId || (e as any).ExpenseID || '';
-      const match = String(rawId).match(/^EXP-(\d+)$/i);
-      return match ? parseInt(match[1], 10) : null;
-    })
-    .filter((n): n is number => n !== null);
-  const max = numbers.length > 0 ? Math.max(...numbers) : 0;
-  const next = max + 1;
-  return `EXP-${String(next).padStart(3, '0')}`;
+  return generateUUID();
 };
 
 export const addExpense = (
@@ -7561,7 +7671,7 @@ export const addExpense = (
   const isSupervisor = isSupervisorOrAbove(sessionUser?.role);
   const compId = expenseData.company_id || expenseData.companyId || currentCompany;
   const brId = expenseData.branch_id || expenseData.branchId || currentBranch;
-  const expId = expenseData.id || getNextExpenseId();
+  const expId = expenseData.id || generateUUID();
 
   const initialStatus = expenseData.status || (isSupervisor ? 'approved' : 'pending_supervisor');
 
@@ -9951,7 +10061,12 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
   const compId = item.company_id || (item as any).companyId || currentCompany || 'COMP-001';
   const brId = item.branch_id || (item as any).branchId || currentBranch || 'BR-MAIN';
 
-  const cleanItemId = (item.itemId || '').trim().toUpperCase();
+  const rawItemId = (item.itemId || (item as any).id || '').trim();
+  const resolvedItemId = rawItemId || generateUUID();
+  item.itemId = resolvedItemId;
+  (item as any).id = resolvedItemId;
+
+  const cleanItemId = resolvedItemId.toUpperCase();
   const cleanSku = (item.sku || '').trim().toUpperCase();
 
   const index = allItems.findIndex((i) => {
@@ -12265,6 +12380,7 @@ export const deleteInventoryItem = (itemId: string): boolean => {
   const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
 
   // 1. Record deleted item tombstone with company and timestamp so offline peer devices know it was deleted
+  recordTombstone('inventory', cleanId);
   const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
   const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
   const existsInDeleted = deletedList.some(

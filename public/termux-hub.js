@@ -62,6 +62,141 @@ let hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1]
   ? process.argv[tenantIdArgIdx + 1]
   : (process.env.HUB_TENANT_ID || 'COMP-001');
 
+// Edge Gateway Cloud Bridge configuration (App Scripts / Supabase forwarding)
+const cloudUrlArgIdx = process.argv.indexOf('--cloud-url');
+let cloudSyncUrl = cloudUrlArgIdx !== -1 && process.argv[cloudUrlArgIdx + 1]
+  ? process.argv[cloudUrlArgIdx + 1]
+  : (process.env.CLOUD_SYNC_URL || process.env.VITE_GOOGLE_APPS_SCRIPT_URL || '');
+
+/**
+ * Edge Gateway Cloud Bridge:
+ * Forwards accepted master records (Staff, Customers) to cloud endpoint in background.
+ * Fire-and-forget with error catching so offline hubs never crash or block.
+ */
+function pushToCloud(entityType, record) {
+  if (!cloudSyncUrl || !record) return;
+  try {
+    const isT1 = entityType === 'SALE' || entityType === 'GRV' || entityType === 'CASH_LOG' || entityType === 'EXPENSE';
+    const postData = JSON.stringify({
+      action: entityType === 'STAFF' ? 'sync_staff_member' : (entityType === 'CUSTOMER' ? 'sync_customer' : (entityType === 'SALE' ? 'sync_sale' : 'sync_entity')),
+      company_id: hubTenantId,
+      branch_id: hubBranchId,
+      entityType,
+      record,
+      payload: record,
+      timestamp: Date.now(),
+    });
+
+    const markCloudSyncedAndAck = () => {
+      record.isCloudSynced = true;
+      scheduleSave();
+      if (isT1) {
+        const ackStr = JSON.stringify({
+          type: 'T1_CLOUD_SYNC_ACK',
+          action: 'T1_CLOUD_SYNC_ACK',
+          entityType,
+          id: record.id || record.invoice_id || record.grvNumber,
+          isCloudSynced: true,
+          origin_device_id: 'LOCAL_HUB',
+          timestamp: Date.now(),
+        });
+        wss.clients.forEach((c) => {
+          if (c.readyState === WebSocket.OPEN) {
+            try { c.send(ackStr); } catch (e) {}
+          }
+        });
+      }
+    };
+
+    if (typeof fetch === 'function') {
+      fetch(cloudSyncUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: postData,
+      }).then((res) => {
+        if (!res.ok) {
+          console.log(`[Edge Gateway] Cloud bridge HTTP ${res.status} for ${entityType}`);
+        } else {
+          console.log(`[Edge Gateway] ☁️ Pushed ${entityType} (${record.id || record.customerId || record.name}) to Cloud Bridge`);
+          markCloudSyncedAndAck();
+        }
+      }).catch((err) => {
+        console.log(`[Edge Gateway] Cloud bridge notice for ${entityType}: ${err.message}`);
+      });
+    } else {
+      const isHttps = cloudSyncUrl.startsWith('https:');
+      const client = isHttps ? require('https') : require('http');
+      const url = new URL(cloudSyncUrl);
+      const req = client.request({
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname + (url.search || ''),
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+        },
+      }, (res) => {
+        console.log(`[Edge Gateway] ☁️ Pushed ${entityType} to Cloud Bridge (${res.statusCode})`);
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          markCloudSyncedAndAck();
+        }
+      });
+      req.on('error', (e) => {
+        console.log(`[Edge Gateway] Cloud bridge network notice for ${entityType}: ${e.message}`);
+      });
+      req.write(postData);
+      req.end();
+    }
+  } catch (err) {
+    console.log(`[Edge Gateway] Cloud push notice: ${err.message}`);
+  }
+}
+
+/**
+ * Broadcasts an authoritative T2 Inventory Snapshot to all connected peers
+ */
+function broadcastInventorySnapshot(item) {
+  if (!item) return;
+  const snapTime = Date.now();
+  item.snapshotTimestamp = snapTime;
+  item.updatedAt = snapTime;
+  item.hubTimestamp = snapTime;
+  item.lastUpdated = new Date(snapTime).toISOString();
+  scheduleSave();
+
+  const pktStr = JSON.stringify({
+    type: 'INVENTORY_UPDATE',
+    action: 'INVENTORY_UPDATE',
+    entityType: 'INVENTORY',
+    itemId: item.itemId || item.id,
+    item: {
+      ...item,
+      totalUnits: Number(item.totalUnits || 0),
+      stockSingles: Number(item.stockSingles !== undefined ? item.stockSingles : item.totalUnits || 0),
+      snapshotTimestamp: snapTime,
+    },
+    payload: {
+      ...item,
+      totalUnits: Number(item.totalUnits || 0),
+      stockSingles: Number(item.stockSingles !== undefined ? item.stockSingles : item.totalUnits || 0),
+      snapshotTimestamp: snapTime,
+    },
+    snapshotTimestamp: snapTime,
+    totalUnits: Number(item.totalUnits || 0),
+    stockSingles: Number(item.stockSingles !== undefined ? item.stockSingles : item.totalUnits || 0),
+    origin_device_id: 'LOCAL_HUB',
+    origin_device_name: 'Termux Local Hub',
+    timestamp: snapTime,
+  });
+
+  wss.clients.forEach((c) => {
+    if (c.readyState === WebSocket.OPEN) {
+      try { c.send(pktStr); } catch (e) {}
+    }
+  });
+}
+
 const DATA_FILE = path.join(process.cwd(), 'termux-hub-data.json');
 const BLIND_VAULT_FILE = path.join(process.cwd(), 'hub-blind-vault.json');
 const MAX_STORAGE_BYTES = 2 * 1024 * 1024 * 1024; // 2GB Safety Limit for Termux hardware
@@ -101,6 +236,9 @@ let salespeopleStore = [];
 let customersStore = [];
 let branchesStore = [];
 let cashAccountsStore = [];
+
+// Tombstones Store (Soft Deletes across multi-device Wi-Fi)
+let tombstonesStore = [];
 
 // Business Day Closures & EOD Archives
 let businessDayClosuresStore = [];
@@ -174,18 +312,32 @@ function getTimestamp(rec) {
 }
 
 // 30-Day Disk Rotation & 2GB CCTV Safety Trim
+// Safe Pruning: ONLY delete records older than ROTATION_DAYS AND isCloudSynced === true!
 function pruneOldRecords() {
   const cutoffTime = Date.now() - (ROTATION_DAYS * 24 * 60 * 60 * 1000);
-  salesStore = salesStore.filter((s) => getTimestamp(s) >= cutoffTime || !s.date);
-  directGrvsStore = directGrvsStore.filter((g) => getTimestamp(g) >= cutoffTime || !g.date);
-  cashMovementsStore = cashMovementsStore.filter((m) => getTimestamp(m) >= cutoffTime || !m.date);
-  cashLogsStore = cashLogsStore.filter((l) => getTimestamp(l) >= cutoffTime || !l.date);
-  cashLiftsStore = cashLiftsStore.filter((l) => getTimestamp(l) >= cutoffTime || !l.date);
-  customerChangesStore = customerChangesStore.filter((c) => getTimestamp(c) >= cutoffTime || !c.date);
-  creditSalesStore = creditSalesStore.filter((cs) => getTimestamp(cs) >= cutoffTime || !cs.date);
-  stockMovementsStore = stockMovementsStore.filter((sm) => getTimestamp(sm) >= cutoffTime || !sm.date);
-  expensesStore = expensesStore.filter((e) => getTimestamp(e) >= cutoffTime || !e.date);
-  cashTransfersStore = cashTransfersStore.filter((t) => getTimestamp(t) >= cutoffTime || !t.date);
+  const shouldRetain = (rec) => {
+    const isOld = getTimestamp(rec) < cutoffTime && Boolean(rec.date);
+    if (!isOld) return true; // Retain recent records
+    // If old, only prune if confirmed synced to cloud!
+    return rec.isCloudSynced !== true;
+  };
+
+  salesStore = salesStore.filter(shouldRetain);
+  directGrvsStore = directGrvsStore.filter(shouldRetain);
+  cashMovementsStore = cashMovementsStore.filter(shouldRetain);
+  cashLogsStore = cashLogsStore.filter(shouldRetain);
+  cashLiftsStore = cashLiftsStore.filter(shouldRetain);
+  customerChangesStore = customerChangesStore.filter(shouldRetain);
+  creditSalesStore = creditSalesStore.filter(shouldRetain);
+  stockMovementsStore = stockMovementsStore.filter(shouldRetain);
+  expensesStore = expensesStore.filter(shouldRetain);
+  cashTransfersStore = cashTransfersStore.filter(shouldRetain);
+  suppliersStore = suppliersStore.filter(shouldRetain);
+  adminSalesStore = adminSalesStore.filter(shouldRetain);
+  cashCountsStore = cashCountsStore.filter(shouldRetain);
+  vouchersStore = vouchersStore.filter(shouldRetain);
+  businessDayClosuresStore = businessDayClosuresStore.filter(shouldRetain);
+  electronicSettlementsStore = electronicSettlementsStore.filter(shouldRetain);
 }
 
 // Load persistent data if exists
@@ -236,9 +388,10 @@ function loadData() {
       }
       if (Array.isArray(parsed.stocktakeSessions)) stocktakeSessionsStore = parsed.stocktakeSessions;
       if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
+      if (Array.isArray(parsed.tombstones)) tombstonesStore = parsed.tombstones;
 
       console.log(
-        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${branchesStore.length} branches, ${cashAccountsStore.length} cash accounts, ${suppliersStore.length} suppliers, ${adminSalesStore.length} admin sales, ${cashCountsStore.length} cash counts, ${vouchersStore.length} vouchers, ${businessDayClosuresStore.length} closures, ${electronicSettlementsStore.length} settlements, ${categoriesStore.length} categories.`
+        `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${branchesStore.length} branches, ${cashAccountsStore.length} cash accounts, ${suppliersStore.length} suppliers, ${adminSalesStore.length} admin sales, ${cashCountsStore.length} cash counts, ${vouchersStore.length} vouchers, ${businessDayClosuresStore.length} closures, ${electronicSettlementsStore.length} settlements, ${categoriesStore.length} categories, ${tombstonesStore.length} tombstones.`
       );
     }
   } catch (e) {
@@ -288,14 +441,26 @@ function saveData() {
       branchLockdowns: branchLockdownsStore,
       stocktakeSessions: stocktakeSessionsStore.slice(0, 500),
       stocktakeSegments: stocktakeSegmentsStore.slice(0, 2000),
+      tombstones: tombstonesStore.slice(0, 5000),
       savedAt: new Date().toISOString(),
     };
 
     const serialized = JSON.stringify(payload, null, 2);
-    if (Buffer.byteLength(serialized, 'utf8') > MAX_STORAGE_BYTES) {
-      console.warn(`[Termux Hub] Warning: Hub data exceeds 2GB limit. Trimming oldest records...`);
-      salesStore = salesStore.slice(0, 2500);
-      directGrvsStore = directGrvsStore.slice(0, 500);
+    const byteSize = Buffer.byteLength(serialized, 'utf8');
+    if (byteSize > MAX_STORAGE_BYTES) {
+      // 2GB Guard: Check if unsynced records exist. NEVER delete unsynced records to save space!
+      const hasUnsynced =
+        salesStore.some((s) => s.isCloudSynced !== true) ||
+        directGrvsStore.some((g) => g.isCloudSynced !== true) ||
+        expensesStore.some((e) => e.isCloudSynced !== true);
+      if (hasUnsynced) {
+        console.error(`[Termux Hub] ❌ CRITICAL: Hub storage (${(byteSize / (1024 * 1024 * 1024)).toFixed(2)} GB) exceeds 2GB limit, but unsynced transactions are present. Cannot prune unsynced records!`);
+        throw new Error('Termux Hub storage capacity reached (2GB) with un-synced cloud transactions. Please restore cloud connectivity.');
+      } else {
+        console.warn(`[Termux Hub] Warning: Hub data exceeds 2GB limit. Trimming already-synced oldest records...`);
+        salesStore = salesStore.filter((s) => s.isCloudSynced !== true).concat(salesStore.filter((s) => s.isCloudSynced === true).slice(0, 2500));
+        directGrvsStore = directGrvsStore.filter((g) => g.isCloudSynced !== true).concat(directGrvsStore.filter((g) => g.isCloudSynced === true).slice(0, 500));
+      }
     }
 
     fs.writeFileSync(DATA_FILE, serialized, 'utf8');
@@ -405,6 +570,10 @@ wss.on('connection', (ws, req) => {
       const payload = packet.payload || packet.data || packet.item;
       const sheetName = packet.sheetName || packet.sheet;
       const entityType = packet.entityType || packet.entity;
+
+      if (packet.cloudSyncUrl || packet.cloudUrl) {
+        cloudSyncUrl = packet.cloudSyncUrl || packet.cloudUrl;
+      }
 
       // =====================================================================
       // 0. PRE-AUTH LOBBY & HUB IDENTITY HANDSHAKE
@@ -1470,6 +1639,7 @@ wss.on('connection', (ws, req) => {
 
               inventoryStore[invIdx].totalUnits = newUnits;
               inventoryStore[invIdx].stockSingles = newUnits;
+              broadcastInventorySnapshot(inventoryStore[invIdx]);
             }
           }
         }
@@ -1486,6 +1656,7 @@ wss.on('connection', (ws, req) => {
                 const retUnits = Number((cur + Number(ex.returnedItem.quantity || 1)).toFixed(3));
                 inventoryStore[retIdx].totalUnits = retUnits;
                 inventoryStore[retIdx].stockSingles = retUnits;
+                broadcastInventorySnapshot(inventoryStore[retIdx]);
                 console.log(`[Termux Hub] Restocked returned exchange item: +${ex.returnedItem.quantity}x ${ex.returnedItem.name}`);
               }
             }
@@ -1496,6 +1667,7 @@ wss.on('connection', (ws, req) => {
                 const repUnits = Number((cur - Number(ex.replacementItem.quantity || 1)).toFixed(3));
                 inventoryStore[repIdx].totalUnits = repUnits;
                 inventoryStore[repIdx].stockSingles = repUnits;
+                broadcastInventorySnapshot(inventoryStore[repIdx]);
                 console.log(`[Termux Hub] Depleted replacement exchange item: -${ex.replacementItem.quantity}x ${ex.replacementItem.name}`);
               }
             }
@@ -1596,8 +1768,9 @@ wss.on('connection', (ws, req) => {
                 inventoryStore[invIdx].stockSingles = inventoryStore[invIdx].totalUnits;
                 if (item.costPrice) inventoryStore[invIdx].costPrice = item.costPrice;
                 if (item.costPerCase) inventoryStore[invIdx].costPerCase = item.costPerCase;
+                broadcastInventorySnapshot(inventoryStore[invIdx]);
               } else {
-                inventoryStore.push({
+                const newInvRecord = {
                   id: cleanId,
                   itemId: cleanId,
                   itemName: item.productName || cleanId,
@@ -1611,7 +1784,9 @@ wss.on('connection', (ws, req) => {
                   updatedAt: new Date().toISOString(),
                   hubTimestamp: Date.now(),
                   lastUpdated: new Date().toISOString(),
-                });
+                };
+                inventoryStore.push(newInvRecord);
+                broadcastInventorySnapshot(newInvRecord);
               }
             }
           }
@@ -2096,6 +2271,9 @@ wss.on('connection', (ws, req) => {
               try { client.send(staffBroadcastStr); } catch (e) {}
             }
           });
+
+          // Edge Gateway: Background HTTP push to Cloud Bridge (App Scripts / Supabase)
+          pushToCloud('STAFF', staffObj);
         }
       }
 
@@ -2178,6 +2356,9 @@ wss.on('connection', (ws, req) => {
               try { client.send(custBroadcastStr); } catch (e) {}
             }
           });
+
+          // Edge Gateway: Background HTTP push to Cloud Bridge (App Scripts / Supabase)
+          pushToCloud('CUSTOMER', custObj);
         }
       }
 
@@ -2382,13 +2563,207 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
+      // 9.4 TOMBSTONES / SOFT DELETES (STRICT ROUTING & SYNC)
+      // =====================================================================
+      const isTombstone = pType === 'TOMBSTONE_SYNC' || pType === 'tombstone' || entityType === 'tombstone';
+      if (isTombstone) {
+        const tombObj = packet.tombstone || payload || packet;
+        if (tombObj && tombObj.entityId && tombObj.entityType) {
+          const tId = tombObj.id || `TOMB-${tombObj.entityType}-${tombObj.entityId}`;
+          const exIdx = tombstonesStore.findIndex((t) => t.id === tId || (t.entityType === tombObj.entityType && t.entityId === tombObj.entityId));
+          const stampedTomb = {
+            ...tombObj,
+            id: tId,
+            isDeleted: true,
+            deletedAt: tombObj.deletedAt || Date.now(),
+            hubTimestamp: Date.now(),
+          };
+
+          if (exIdx >= 0) {
+            tombstonesStore[exIdx] = stampedTomb;
+          } else {
+            tombstonesStore.unshift(stampedTomb);
+          }
+          scheduleSave();
+          console.log(`[Termux Hub] 🪦 Recorded Tombstone for ${tombObj.entityType} #${tombObj.entityId}`);
+
+          // Broadcast tombstone to other connected peers
+          const tombcast = JSON.stringify({
+            type: 'TOMBSTONE_SYNC',
+            action: 'TOMBSTONE_SYNC',
+            entityType: 'tombstone',
+            tombstone: stampedTomb,
+            payload: stampedTomb,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: Date.now(),
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try { client.send(tombcast); } catch (e) {}
+            }
+          });
+          return;
+        }
+      }
+
+      // =====================================================================
+      // 9.5 INVENTORY SNAPSHOT REQUEST (ON-DEMAND HEARTBEAT)
+      // =====================================================================
+      const isSnapReq = pType === 'INVENTORY_SNAPSHOT_REQUEST' || pType === 'GET_INVENTORY_SNAPSHOT';
+      if (isSnapReq) {
+        const reqComp = (packet.companyId || packet.company_id || 'COMP-001').trim().toUpperCase();
+        const reqBranch = (packet.branchId || packet.branchCode || 'BR-MAIN').trim().toUpperCase();
+        const items = inventoryStore
+          .filter((i) => isMatch(i, reqComp, reqBranch, true))
+          .map((i) => ({
+            ...i,
+            totalUnits: Number(i.totalUnits || 0),
+            stockSingles: Number(i.stockSingles !== undefined ? i.stockSingles : i.totalUnits || 0),
+            snapshotTimestamp: i.snapshotTimestamp || getTimestamp(i) || Date.now(),
+          }));
+
+        try {
+          ws.send(JSON.stringify({
+            type: 'INVENTORY_SNAPSHOT_RESPONSE',
+            action: 'INVENTORY_SNAPSHOT_RESPONSE',
+            items,
+            count: items.length,
+            snapshotTimestamp: Date.now(),
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: Date.now(),
+          }));
+          console.log(`[Termux Hub] 📸 Dispatched full inventory snapshot (${items.length} items) to peer`);
+        } catch (e) {}
+        return;
+      }
+
+      // =====================================================================
+      // 9.6 FETCH HISTORICAL T1 ON-DEMAND (WITHOUT POPULATING CLIENT IDB)
+      // =====================================================================
+      const isHistoricalFetch = pType === 'FETCH_HISTORICAL_T1' || pType === 'GET_HISTORICAL_T1';
+      if (isHistoricalFetch) {
+        const reqComp = (packet.companyId || packet.company_id || 'COMP-001').trim().toUpperCase();
+        const reqBranch = (packet.branchId || packet.branchCode || 'BR-MAIN').trim().toUpperCase();
+        const targetEntity = String(packet.targetEntity || packet.entity || 'sales').toLowerCase();
+        const startDate = packet.startDate ? new Date(packet.startDate).getTime() : 0;
+        const endDate = packet.endDate ? new Date(packet.endDate).getTime() : Date.now();
+
+        let results = [];
+        if (targetEntity.includes('sale')) {
+          results = salesStore.filter((s) => isMatch(s, reqComp, reqBranch) && getTimestamp(s) >= startDate && getTimestamp(s) <= endDate);
+        } else if (targetEntity.includes('grv')) {
+          results = directGrvsStore.filter((g) => isMatch(g, reqComp, reqBranch) && getTimestamp(g) >= startDate && getTimestamp(g) <= endDate);
+        } else if (targetEntity.includes('expense')) {
+          results = expensesStore.filter((e) => isMatch(e, reqComp, reqBranch) && getTimestamp(e) >= startDate && getTimestamp(e) <= endDate);
+        } else if (targetEntity.includes('cash')) {
+          results = cashLogsStore.filter((c) => isMatch(c, reqComp, reqBranch) && getTimestamp(c) >= startDate && getTimestamp(c) <= endDate);
+        }
+
+        try {
+          ws.send(JSON.stringify({
+            type: 'HISTORICAL_T1_RESPONSE',
+            action: 'HISTORICAL_T1_RESPONSE',
+            requestId: packet.requestId || packet.packet_id,
+            targetEntity,
+            records: results,
+            count: results.length,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: Date.now(),
+          }));
+          console.log(`[Termux Hub] 📜 Dispatched ${results.length} historical ${targetEntity} records for query [${packet.startDate} -> ${packet.endDate}]`);
+        } catch (e) {}
+        return;
+      }
+
+      // =====================================================================
+      // 9.7 SERVER-SIDE FINANCIAL REPORT AGGREGATION
+      // =====================================================================
+      const isFinReportReq = pType === 'GET_FINANCIAL_REPORT' || pType === 'FINANCIAL_REPORT_REQUEST';
+      if (isFinReportReq) {
+        const reqComp = (packet.companyId || packet.company_id || 'COMP-001').trim().toUpperCase();
+        const reqBranch = (packet.branchId || packet.branchCode || 'BR-MAIN').trim().toUpperCase();
+        const startDate = packet.startDate ? new Date(packet.startDate).getTime() : 0;
+        const endDate = packet.endDate ? new Date(packet.endDate).getTime() : Date.now();
+
+        const filteredSales = salesStore.filter(
+          (s) => isMatch(s, reqComp, reqBranch) && s.status !== 'Voided' && getTimestamp(s) >= startDate && getTimestamp(s) <= endDate
+        );
+        const filteredExpenses = expensesStore.filter(
+          (e) => isMatch(e, reqComp, reqBranch) && getTimestamp(e) >= startDate && getTimestamp(e) <= endDate
+        );
+
+        let totalRevenue = 0;
+        let totalCogs = 0;
+        let invoiceCount = filteredSales.length;
+
+        for (const s of filteredSales) {
+          totalRevenue += Number(s.total || s.total_amount || 0);
+          if (Array.isArray(s.items)) {
+            for (const it of s.items) {
+              const qty = Number(it.quantity || 0);
+              const cost = Number(it.costPrice || it.costPerUnit || 0);
+              totalCogs += qty * cost;
+            }
+          }
+        }
+
+        let totalExpenses = 0;
+        for (const exp of filteredExpenses) {
+          totalExpenses += Number(exp.amount || 0);
+        }
+
+        const grossProfit = Number((totalRevenue - totalCogs).toFixed(2));
+        const netProfit = Number((grossProfit - totalExpenses).toFixed(2));
+        const grossMargin = totalRevenue > 0 ? Number(((grossProfit / totalRevenue) * 100).toFixed(2)) : 0;
+        const netMargin = totalRevenue > 0 ? Number(((netProfit / totalRevenue) * 100).toFixed(2)) : 0;
+
+        try {
+          ws.send(JSON.stringify({
+            type: 'FINANCIAL_REPORT_RESPONSE',
+            action: 'FINANCIAL_REPORT_RESPONSE',
+            requestId: packet.requestId || packet.packet_id,
+            report: {
+              startDate: packet.startDate,
+              endDate: packet.endDate,
+              invoiceCount,
+              totalRevenue: Number(totalRevenue.toFixed(2)),
+              totalCogs: Number(totalCogs.toFixed(2)),
+              grossProfit,
+              grossMarginPercentage: grossMargin,
+              totalExpenses: Number(totalExpenses.toFixed(2)),
+              netProfit,
+              netMarginPercentage: netMargin,
+              generatedAt: new Date().toISOString(),
+            },
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: Date.now(),
+          }));
+          console.log(`[Termux Hub] 📊 Computed server-side financial report: Revenue=$${totalRevenue.toFixed(2)}, Net Profit=$${netProfit.toFixed(2)}`);
+        } catch (e) {}
+        return;
+      }
+
+      // =====================================================================
       // 10. DELTA CATCH-UP RESPONSE (NO FIREHOSE - ONLY updatedAt >= sinceTime)
       // =====================================================================
       const isCatchupReq = pType === 'catchup_request' || pType === 'CATCHUP_REQUEST';
       if (isCatchupReq) {
         let sinceTime = 0;
         let sinceTimestamp = packet.sinceTimestamp;
-        if (typeof sinceTimestamp === 'number') {
+        const isExplicitZero =
+          sinceTimestamp === 0 ||
+          sinceTimestamp === '0' ||
+          sinceTimestamp === '1970-01-01T00:00:00.000Z' ||
+          sinceTimestamp === '1970-01-01T00:00:00Z';
+
+        if (isExplicitZero || packet.isForced) {
+          sinceTime = 0;
+          sinceTimestamp = '1970-01-01T00:00:00.000Z';
+        } else if (typeof sinceTimestamp === 'number') {
           sinceTime = sinceTimestamp;
         } else if (typeof sinceTimestamp === 'string') {
           const asNum = Number(sinceTimestamp);
@@ -2399,11 +2774,11 @@ wss.on('connection', (ws, req) => {
           }
         }
 
-        // Guard against 0 or negative timestamps unless explicitly forced
-        if (isNaN(sinceTime) || sinceTime <= 0) {
-          sinceTime = packet.isForced ? 0 : Date.now() - 5 * 60 * 1000;
+        // Guard against NaN or negative timestamps; default to 5m only if completely invalid/missing
+        if (isNaN(sinceTime) || (sinceTime <= 0 && !isExplicitZero && !packet.isForced)) {
+          sinceTime = Date.now() - 5 * 60 * 1000;
           sinceTimestamp = new Date(sinceTime).toISOString();
-        } else {
+        } else if (!isExplicitZero) {
           sinceTimestamp = new Date(sinceTime).toISOString();
         }
 
@@ -2418,25 +2793,26 @@ wss.on('connection', (ws, req) => {
 
         // NO FIREHOSE: Send ONLY records where getTimestamp(item) >= sinceTime!
         // Do not dump the entire 501-item catalog unless explicitly forced!
-        const missedSales = salesStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced));
-        const missedDirectGrvs = directGrvsStore.filter((g) => isMatch(g, reqComp, reqBranch) && (getTimestamp(g) >= sinceTime || packet.isForced));
-        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch, true) && (getTimestamp(i) >= sinceTime || packet.isForced));
-        const missedCashLogs = cashLogsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced));
-        const missedCashLifts = cashLiftsStore.filter((l) => isMatch(l, reqComp, reqBranch) && (getTimestamp(l) >= sinceTime || packet.isForced));
-        const missedCashMovements = cashMovementsStore.filter((m) => isMatch(m, reqComp, reqBranch) && (getTimestamp(m) >= sinceTime || packet.isForced));
-        const missedCustomerChanges = customerChangesStore.filter((ch) => isMatch(ch, reqComp, reqBranch) && (getTimestamp(ch) >= sinceTime || packet.isForced));
-        const missedCreditSales = creditSalesStore.filter((cs) => isMatch(cs, reqComp, reqBranch) && (getTimestamp(cs) >= sinceTime || packet.isForced));
-        const missedStockMovements = stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && (getTimestamp(sm) >= sinceTime || packet.isForced));
-        const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && (getTimestamp(ex) >= sinceTime || packet.isForced));
-        const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, reqBranch) && (getTimestamp(tr) >= sinceTime || packet.isForced));
-        const missedSuppliers = suppliersStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced));
-        const missedAdminSales = adminSalesStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced));
-        const missedCashCounts = cashCountsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced));
-        const missedVouchers = vouchersStore.filter((v) => isMatch(v, reqComp, reqBranch) && (getTimestamp(v) >= sinceTime || packet.isForced));
-        const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced));
-        const missedCustomers = customersStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced));
-        const missedBranches = branchesStore.filter((b) => isMatch(b, reqComp, reqBranch) && (getTimestamp(b) >= sinceTime || packet.isForced));
-        const missedCashAccounts = cashAccountsStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced));
+        const missedSales = salesStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedDirectGrvs = directGrvsStore.filter((g) => isMatch(g, reqComp, reqBranch) && (getTimestamp(g) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedInventory = inventoryStore.filter((i) => isMatch(i, reqComp, reqBranch, true) && (getTimestamp(i) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCashLogs = cashLogsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCashLifts = cashLiftsStore.filter((l) => isMatch(l, reqComp, reqBranch) && (getTimestamp(l) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCashMovements = cashMovementsStore.filter((m) => isMatch(m, reqComp, reqBranch) && (getTimestamp(m) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCustomerChanges = customerChangesStore.filter((ch) => isMatch(ch, reqComp, reqBranch) && (getTimestamp(ch) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCreditSales = creditSalesStore.filter((cs) => isMatch(cs, reqComp, reqBranch) && (getTimestamp(cs) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedStockMovements = stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && (getTimestamp(sm) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && (getTimestamp(ex) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, reqBranch) && (getTimestamp(tr) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedSuppliers = suppliersStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedAdminSales = adminSalesStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCashCounts = cashCountsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedVouchers = vouchersStore.filter((v) => isMatch(v, reqComp, reqBranch) && (getTimestamp(v) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCustomers = customersStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedBranches = branchesStore.filter((b) => isMatch(b, reqComp, reqBranch) && (getTimestamp(b) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedCashAccounts = cashAccountsStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedTombstones = tombstonesStore.filter((t) => isMatch(t, reqComp, reqBranch) && (getTimestamp(t) >= sinceTime || packet.isForced || isExplicitZero));
 
         const catchupResponse = {
           type: 'catchup_response',
@@ -2476,6 +2852,7 @@ wss.on('connection', (ws, req) => {
             categories: categoriesStore,
             stocktakeSessions: stocktakeSessionsStore,
             stocktakeSegments: stocktakeSegmentsStore,
+            tombstones: missedTombstones,
           },
         };
 

@@ -771,6 +771,7 @@ export function assignCompanyPackage(
     customMaxBranches?: number;
     customMaxStaff?: number;
     plan?: 'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE';
+    syncStrategy?: 'CLOUD_ONLY' | 'HUB_ONLY' | 'HUB_CLOUD';
   }
 ): boolean {
   const targetPackage = getPackageById(packageId);
@@ -808,6 +809,7 @@ export function assignCompanyPackage(
     ...( { package_id: targetPackage.id } as any ),
     custom_max_branches: maxBranches,
     custom_max_staff: maxStaff,
+    ...(overrides?.syncStrategy ? { sync_strategy: overrides.syncStrategy } : {}),
   };
 
   saveCompany(updated);

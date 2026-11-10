@@ -84,6 +84,21 @@ class PersistentSyncEngine {
   private itemsSyncedListeners: Set<(receipt: { postedClientRequestIds: string[]; postedIds: string[]; sheetName: string }) => void> = new Set();
   private lastBackgroundTime = 0;
   private isInitialized = false;
+  private isOutboundSyncPaused = false;
+
+  public pauseOutboundSync(): void {
+    this.isOutboundSyncPaused = true;
+    console.log('[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway).');
+  }
+
+  public resumeOutboundSync(): void {
+    this.isOutboundSyncPaused = false;
+    console.log('[PersistentSyncEngine] 🟢 Outbound cloud sync resumed.');
+  }
+
+  public isSyncPaused(): boolean {
+    return this.isOutboundSyncPaused;
+  }
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -350,6 +365,11 @@ class PersistentSyncEngine {
    * Drains pending items with tenant isolation and high-speed batching for high volume items.
    */
   public async drainSyncQueue(companyId?: string): Promise<{ processed: number; succeeded: number; failed: number }> {
+    if (this.isOutboundSyncPaused) {
+      console.log('[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping drainSyncQueue.');
+      return { processed: 0, succeeded: 0, failed: 0 };
+    }
+
     const activeCompId = companyId || getCurrentCompanyId();
 
     if (this.activeCompanyDrains.has(activeCompId)) {
@@ -687,6 +707,11 @@ class PersistentSyncEngine {
    * Calls get_users_since(lastSyncAt) and get_branches_since(lastSyncAt).
    */
   public async performDeltaSync(): Promise<{ usersCount: number; branchesCount: number }> {
+    if (this.isOutboundSyncPaused) {
+      console.log('[PersistentSyncEngine] 🛑 Cloud delta sync suspended (Local Hub is Edge Gateway). Skipping performDeltaSync.');
+      return { usersCount: 0, branchesCount: 0 };
+    }
+
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       return { usersCount: 0, branchesCount: 0 };
     }
@@ -1176,3 +1201,6 @@ export const drainSyncQueue = () => persistentSyncEngine.drainSyncQueue();
 export const getSyncQueueStats = () => persistentSyncEngine.getQueueStats();
 export const isTenantTrialExpired = (ctx: any) => persistentSyncEngine.isTenantTrialExpired(ctx);
 export const assertTenantCanWrite = (act: string) => persistentSyncEngine.assertTenantCanWrite(act);
+export const pauseCloudSyncEngine = () => persistentSyncEngine.pauseOutboundSync();
+export const resumeCloudSyncEngine = () => persistentSyncEngine.resumeOutboundSync();
+export const isCloudSyncEnginePaused = () => persistentSyncEngine.isSyncPaused();
