@@ -275,6 +275,88 @@ function saveBlindVault() {
 let packetCounter = 0;
 const seenPacketIds = new Set();
 
+/**
+ * Strict Schema Validation for Branches:
+ * Rejects records that have customer fields (creditLimit, outstandingDebt, customerId, currentBalance, maxCreditReceiptCount, isCustomLimit)
+ * or staff fields (pin_hash, pin_salt, pin, role, permissions, branchAssignments, email).
+ */
+function isValidBranchRecord(rec) {
+  if (!rec || typeof rec !== 'object') return false;
+  // Reject if contains customer fields
+  if (
+    rec.creditLimit !== undefined ||
+    rec.outstandingDebt !== undefined ||
+    rec.customerId !== undefined ||
+    rec.currentBalance !== undefined ||
+    rec.maxCreditReceiptCount !== undefined ||
+    rec.isCustomLimit !== undefined ||
+    rec.creditGroupId !== undefined ||
+    rec.creditGroupName !== undefined ||
+    rec.debt !== undefined
+  ) {
+    return false;
+  }
+  // Reject if contains staff fields
+  if (
+    rec.pin_hash !== undefined ||
+    rec.pin_salt !== undefined ||
+    rec.pin !== undefined ||
+    rec.role !== undefined ||
+    rec.permissions !== undefined ||
+    rec.branchAssignments !== undefined
+  ) {
+    return false;
+  }
+  // Reject if contains supplier fields
+  if (
+    rec.supplierId !== undefined ||
+    rec.SupplierID !== undefined ||
+    rec.contactPerson !== undefined ||
+    rec.paymentTerms !== undefined ||
+    rec.taxNumber !== undefined ||
+    rec.accountNumber !== undefined ||
+    rec.bankAccount !== undefined ||
+    rec.bankName !== undefined ||
+    (rec.category !== undefined && typeof rec.category === 'string' && !rec.code && !rec.location)
+  ) {
+    return false;
+  }
+  // Reject if contains inventory / product fields
+  if (
+    rec.itemId !== undefined ||
+    rec.costPrice !== undefined ||
+    rec.costPerUnit !== undefined ||
+    rec.sellPriceUnit !== undefined ||
+    rec.totalUnits !== undefined ||
+    rec.stockSingles !== undefined ||
+    rec.stockCases !== undefined ||
+    rec.unitsPerCase !== undefined ||
+    rec.barcode !== undefined ||
+    rec.sku !== undefined
+  ) {
+    return false;
+  }
+  // Must have an identifier and not be empty
+  const bId = rec.branchId || rec.id || rec.branch_id;
+  return Boolean(bId);
+}
+
+function isValidStaffRecord(rec) {
+  if (!rec || typeof rec !== 'object') return false;
+  if (rec.customerId !== undefined || rec.creditLimit !== undefined || rec.supplierId !== undefined) {
+    return false;
+  }
+  return Boolean(rec.id || rec.staffId || rec.pin_hash || rec.role);
+}
+
+function isValidCustomerRecord(rec) {
+  if (!rec || typeof rec !== 'object') return false;
+  if (rec.pin_hash !== undefined || rec.pin_salt !== undefined || rec.role !== undefined || rec.supplierId !== undefined) {
+    return false;
+  }
+  return Boolean(rec.customerId || rec.id || rec.name || rec.creditLimit !== undefined);
+}
+
 // Helper: Match record by tenant and branch
 function isMatch(rec, reqComp, reqBranch, isCatalog = false) {
   if (!rec) return false;
@@ -378,8 +460,16 @@ function loadData() {
           return sp;
         });
       }
-      if (Array.isArray(parsed.customers)) customersStore = parsed.customers;
-      if (Array.isArray(parsed.branches)) branchesStore = parsed.branches;
+      if (Array.isArray(parsed.customers)) customersStore = parsed.customers.filter(isValidCustomerRecord);
+      if (Array.isArray(parsed.branches)) {
+        branchesStore = parsed.branches.filter((b) => {
+          const valid = isValidBranchRecord(b);
+          if (!valid) {
+            console.warn(`[Termux Hub] 🧹 Purged contaminated non-branch record from Hub memory/disk: ${b.name || b.branchName || b.branchId || b.id}`);
+          }
+          return valid;
+        });
+      }
       if (Array.isArray(parsed.cashAccounts)) cashAccountsStore = parsed.cashAccounts;
       if (Array.isArray(parsed.businessDayClosures)) businessDayClosuresStore = parsed.businessDayClosures;
       if (Array.isArray(parsed.electronicSettlements)) electronicSettlementsStore = parsed.electronicSettlements;
@@ -2059,15 +2149,25 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 9.05 TRANSACTIONAL DATA: SUPPLIERS, ADMIN SALES, CASH COUNTS, VOUCHERS (BATCH A)
       // =====================================================================
-      const isSupplier = pType === 'SUPPLIER_SYNC' || pType === 'SUPPLIER' || pType === 'supplier' || sheetName === 'Suppliers';
-      if (isSupplier && payload) {
-        const sId = payload.supplierId || payload.id || payload.SupplierID;
+      const isSupplier =
+        pType === 'SUPPLIER_SYNC' ||
+        pType === 'SUPPLIER' ||
+        pType === 'supplier' ||
+        pType === 'SUPPLIER_RECORD' ||
+        sheetName === 'Suppliers' ||
+        sheetName === 'suppliers' ||
+        entityType === 'supplier' ||
+        entityType === 'Suppliers' ||
+        Boolean(packet.supplier);
+      const suppObj = packet.supplier || payload;
+      if (isSupplier && suppObj) {
+        const sId = suppObj.supplierId || suppObj.id || suppObj.SupplierID;
         if (sId) {
           const exIdx = suppliersStore.findIndex((s) => (s.supplierId || s.id || s.SupplierID) === sId);
           if (exIdx >= 0) {
-            suppliersStore[exIdx] = { ...suppliersStore[exIdx], ...payload, supplierId: sId };
+            suppliersStore[exIdx] = { ...suppliersStore[exIdx], ...suppObj, supplierId: sId };
           } else {
-            suppliersStore.unshift({ ...payload, supplierId: sId });
+            suppliersStore.unshift({ ...suppObj, supplierId: sId });
             console.log(`[Termux Hub] 📥 Accepted Supplier [${sId}] (Append-Only)`);
           }
           scheduleSave();
@@ -2363,10 +2463,25 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 9.3 CONFIGURATION DATA: BRANCHES (STRICT LWW)
+      // 9.3 CONFIGURATION DATA: BRANCHES (STRICT LWW & STRICT TYPE ROUTING)
       // =====================================================================
-      const rawBranchObj = packet.branch || (payload && (payload.branchId || payload.branch_id || (sheetName && sheetName.toLowerCase() === 'branches')) ? payload : null);
-      const isBranch = pType === 'BRANCH' || pType === 'BRANCH_SYNC' || pType === 'BRANCH_RECORD' || pType === 'branch' || sheetName === 'Branches' || sheetName === 'branches' || !!rawBranchObj;
+      const rawBranchObj = packet.branch || ((entityType === 'branch' || sheetName === 'Branches' || sheetName === 'branches') ? payload : null);
+      const isExplicitBranchType =
+        pType === 'BRANCH' ||
+        pType === 'BRANCH_SYNC' ||
+        pType === 'BRANCH_RECORD' ||
+        pType === 'branch' ||
+        entityType === 'branch' ||
+        sheetName === 'Branches' ||
+        sheetName === 'branches' ||
+        packet.type === 'BRANCH_SYNC' ||
+        packet.type === 'BRANCH' ||
+        packet.action === 'BRANCH_SYNC' ||
+        Boolean(packet.branch);
+
+      const isValidBranchSchema = isValidBranchRecord(rawBranchObj);
+      const isBranch = isExplicitBranchType && isValidBranchSchema;
+
       if (isBranch && rawBranchObj && (rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id)) {
         const bId = rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id;
         const hubNow = Date.now();
@@ -2808,9 +2923,19 @@ wss.on('connection', (ws, req) => {
         const missedAdminSales = adminSalesStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced || isExplicitZero));
         const missedCashCounts = cashCountsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced || isExplicitZero));
         const missedVouchers = vouchersStore.filter((v) => isMatch(v, reqComp, reqBranch) && (getTimestamp(v) >= sinceTime || packet.isForced || isExplicitZero));
-        const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced || isExplicitZero));
+        let isStaffExplicitZero = isExplicitZero;
+        let staffSinceTime = sinceTime;
+        if (packet.staffSinceTime !== undefined) {
+          staffSinceTime = Number(packet.staffSinceTime) || 0;
+          if (staffSinceTime === 0) isStaffExplicitZero = true;
+        } else if (packet.staffSinceTimestamp === '1970-01-01T00:00:00.000Z') {
+          staffSinceTime = 0;
+          isStaffExplicitZero = true;
+        }
+
+        const missedSalespeople = salespeopleStore.filter((s) => isMatch(s, reqComp, 'ALL') && (getTimestamp(s) >= staffSinceTime || packet.isForced || isExplicitZero || isStaffExplicitZero));
         const missedCustomers = customersStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced || isExplicitZero));
-        const missedBranches = branchesStore.filter((b) => isMatch(b, reqComp, reqBranch) && (getTimestamp(b) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedBranches = branchesStore.filter((b) => isValidBranchRecord(b) && isMatch(b, reqComp, reqBranch) && (getTimestamp(b) >= sinceTime || packet.isForced || isExplicitZero));
         const missedCashAccounts = cashAccountsStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced || isExplicitZero));
         const missedTombstones = tombstonesStore.filter((t) => isMatch(t, reqComp, reqBranch) && (getTimestamp(t) >= sinceTime || packet.isForced || isExplicitZero));
 

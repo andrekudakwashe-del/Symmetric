@@ -1070,6 +1070,7 @@ export const initRoomDatabase = () => {
   }
 
   // Ensure initial branches for demo companies exist only if not previously deleted
+  sanitizeBranchesTable();
   const branchList = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
   const existingBranchIds = new Set(branchList.map((b) => b.branchId));
   const deletedBranchSet = new Set(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
@@ -1821,11 +1822,12 @@ export const getRawStoredSalespeople = (): Salesperson[] => {
 
 export const getAllSalespeople = (branchId?: string): Salesperson[] => {
   const raw = getRawStoredSalespeople();
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
   if (branchId) {
     const currentCompany = getCurrentCompanyId();
     return raw.filter((s) => {
       const sComp = s.companyId || s.company_id;
-      const compMatches = !sComp ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (sComp === currentCompany);
+      const compMatches = normTenant(sComp) === normTenant(currentCompany);
       if (!compMatches) return false;
       const sBranch = s.branchId || s.branch_id;
       return isRecordInBranchScope(sBranch, branchId, undefined, currentCompany, sComp);
@@ -1840,10 +1842,11 @@ export const getSalespeople = (): Salesperson[] => {
   const all = getRawStoredSalespeople();
   const seenIds = new Set<string>();
   const result: Salesperson[] = [];
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
 
   for (const s of all) {
     const sComp = s.companyId || s.company_id;
-    const matchesComp = !sComp ? (currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER') : (sComp === currentCompany);
+    const matchesComp = normTenant(sComp) === normTenant(currentCompany);
     if (!matchesComp) continue;
 
     // Strict branch isolation with fallback for main branch aliases (1 and BR-MAIN) and unassigned/offline staff:
@@ -1885,12 +1888,10 @@ export const getSalespeople = (): Salesperson[] => {
 export const getSalespeopleForCompany = (companyId?: string): Salesperson[] => {
   const targetCompany = companyId || getCurrentCompanyId();
   const all = getRawStoredSalespeople();
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
   return all.filter((s) => {
     const sComp = s.companyId || s.company_id;
-    if (!sComp) {
-      return targetCompany === 'COMP-001' || targetCompany === 'COMP-MASTER';
-    }
-    return sComp === targetCompany;
+    return normTenant(sComp) === normTenant(targetCompany);
   });
 };
 
@@ -2250,13 +2251,16 @@ export const isStaffAssignedToBranch = (staff: Salesperson, branchId: string): b
   if (staff.role === 'OWNER' || staff.role === 'SUPER_ADMIN') {
     return true; // Owner has an account across the company, but must select which branch to log in to
   }
+  if (!branchId || branchId === 'ALL') {
+    return true;
+  }
   const isTargetMain = branchId === '1' || branchId === 'BR-MAIN';
   if (staff.branchAssignments && Array.isArray(staff.branchAssignments) && staff.branchAssignments.length > 0) {
     return staff.branchAssignments.some((b) => b.branchId === branchId || (isTargetMain && (b.branchId === '1' || b.branchId === 'BR-MAIN')));
   }
   const assigned = staff.branchId || staff.branch_id;
   if (!assigned) {
-    return isTargetMain;
+    return true; // Unassigned staff can log in to main branch or any store branch
   }
   if (assigned === 'ALL' || assigned === branchId) {
     return true;
@@ -2832,8 +2836,109 @@ export const getSupplierStats = (
 
 // ==================== BRANCH DAO ====================
 
+/**
+ * Strict Schema Validation for Branches:
+ * Rejects records that contain customer fields (creditLimit, outstandingDebt, customerId, currentBalance, maxCreditReceiptCount, isCustomLimit, creditGroupId, creditGroupName)
+ * or staff fields (pin_hash, pin_salt, pin, role, permissions, branchAssignments, email)
+ * or supplier fields (supplierId, SupplierID, contactPerson, paymentTerms).
+ * CRITICAL: Does NOT use ID prefixes (like BR-) because tenants might use custom IDs (HQ, STORE-1).
+ */
+export const isValidBranchRecord = (rec: any): boolean => {
+  if (!rec || typeof rec !== 'object') return false;
+
+  // Reject customer fields
+  if (
+    rec.creditLimit !== undefined ||
+    rec.outstandingDebt !== undefined ||
+    rec.customerId !== undefined ||
+    rec.currentBalance !== undefined ||
+    rec.maxCreditReceiptCount !== undefined ||
+    rec.isCustomLimit !== undefined ||
+    rec.creditGroupId !== undefined ||
+    rec.creditGroupName !== undefined ||
+    rec.debt !== undefined
+  ) {
+    return false;
+  }
+
+  // Reject staff fields
+  if (
+    rec.pin_hash !== undefined ||
+    rec.pin_salt !== undefined ||
+    rec.pin !== undefined ||
+    rec.role !== undefined ||
+    rec.permissions !== undefined ||
+    rec.branchAssignments !== undefined
+  ) {
+    return false;
+  }
+
+  // Reject supplier fields
+  if (
+    rec.supplierId !== undefined ||
+    rec.SupplierID !== undefined ||
+    rec.contactPerson !== undefined ||
+    rec.paymentTerms !== undefined ||
+    rec.taxNumber !== undefined ||
+    rec.accountNumber !== undefined ||
+    rec.bankAccount !== undefined ||
+    rec.bankName !== undefined ||
+    (rec.category !== undefined && typeof rec.category === 'string' && !rec.code && !rec.location)
+  ) {
+    return false;
+  }
+
+  // Reject inventory / product fields
+  if (
+    rec.itemId !== undefined ||
+    rec.costPrice !== undefined ||
+    rec.costPerUnit !== undefined ||
+    rec.sellPriceUnit !== undefined ||
+    rec.totalUnits !== undefined ||
+    rec.stockSingles !== undefined ||
+    rec.stockCases !== undefined ||
+    rec.unitsPerCase !== undefined ||
+    rec.barcode !== undefined ||
+    rec.sku !== undefined
+  ) {
+    return false;
+  }
+
+  // Must have an identifier
+  const bId = rec.branchId || rec.id || rec.branch_id;
+  return Boolean(bId);
+};
+
+/**
+ * Startup branch sanitizer that scans the local Branches table and purges any
+ * contaminated record containing customer or staff fields.
+ */
+export const sanitizeBranchesTable = (): void => {
+  const stored = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
+  const clean: Branch[] = [];
+  let purgedCount = 0;
+
+  for (const b of stored) {
+    if (isValidBranchRecord(b)) {
+      clean.push(b);
+    } else {
+      purgedCount++;
+      console.warn(`[Branch Sanitizer] 🧹 Purged cross-contaminated non-branch record from local Branches table:`, b.name || (b as any).branchName || b.branchId || b.id);
+    }
+  }
+
+  if (purgedCount > 0 || clean.length !== stored.length) {
+    console.log(`[Branch Sanitizer] Removed ${purgedCount} cross-contaminated records from Branches table.`);
+    setStored(STORAGE_KEYS.BRANCHES, clean);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
+    }
+  }
+};
+
 // Clean duplicate branch entries without deleting genuine secondary or tertiary branches
 export const cleanPhantomBranchDuplicates = (): void => {
+  sanitizeBranchesTable();
   const stored = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
   const deletedRegistry = new Set<string>(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
 
@@ -2846,20 +2951,34 @@ export const cleanPhantomBranchDuplicates = (): void => {
     }
   }
 
-  // Deduplicate only duplicate branch IDs
+  // Deduplicate only duplicate branch IDs and discard invalid schemas
   const seenIds = new Set<string>();
   const keptBranches: Branch[] = [];
   let hadDuplicates = false;
 
   for (const b of stored) {
-    const bId = (b.branchId || b.id || (b as any).branch_id || '').trim().toLowerCase();
-    if (!bId) continue;
+    if (!isValidBranchRecord(b)) {
+      hadDuplicates = true;
+      continue;
+    }
+    const rawId = (b.branchId || b.id || (b as any).branch_id || '').trim();
+    if (!rawId) continue;
+    const isMainAlias = rawId === '1' || rawId.toLowerCase() === 'br-main';
+    const canonicalId = isMainAlias ? 'BR-MAIN' : rawId;
+    const bId = canonicalId.toLowerCase();
     if (seenIds.has(bId)) {
       hadDuplicates = true;
       continue;
     }
     seenIds.add(bId);
-    keptBranches.push(b);
+    keptBranches.push({
+      ...b,
+      branchId: canonicalId,
+      id: canonicalId,
+      branch_id: canonicalId,
+      name: isMainAlias ? (b.name || 'Head Office - Main Central Distribution & Warehouse') : b.name,
+      code: isMainAlias ? (b.code || 'HQ-01') : b.code,
+    });
   }
 
   if (hadDuplicates || registryChanged) {
@@ -2881,21 +3000,29 @@ export const getAllBranches = (): Branch[] => {
   let hadDuplicates = false;
 
   for (const b of stored) {
-    const id = b.branchId || b.id || (b as any).branch_id;
-    if (!id) continue;
+    if (!isValidBranchRecord(b)) {
+      hadDuplicates = true;
+      continue;
+    }
+    const rawId = (b.branchId || b.id || (b as any).branch_id || '').trim();
+    if (!rawId) continue;
+    const isMainAlias = rawId === '1' || rawId.toLowerCase() === 'br-main';
+    const id = isMainAlias ? 'BR-MAIN' : rawId;
     // Discard any permanently deleted branch
-    if (deletedIds.has(id)) {
+    if (deletedIds.has(id) || deletedIds.has(rawId)) {
       hadDuplicates = true;
       continue;
     }
-    if (seenIds.has(id)) {
+    if (seenIds.has(id.toLowerCase())) {
       hadDuplicates = true;
       continue;
     }
-    seenIds.add(id);
-    const branchName = b.name || (b as any).branch_name || (b as any).branchName || 'Main Branch';
+    seenIds.add(id.toLowerCase());
+    const branchName = isMainAlias
+      ? (b.name || 'Head Office - Main Central Distribution & Warehouse')
+      : (b.name || (b as any).branch_name || (b as any).branchName || 'Main Branch');
     const branchAddress = b.location || (b as any).address || (b as any).branch_address || '4th Street Commercial Center, Harare';
-    const branchCode = b.code || (b as any).branch_code || 'HQ-01';
+    const branchCode = isMainAlias ? (b.code || 'HQ-01') : (b.code || (b as any).branch_code || 'HQ-01');
     const compId = b.company_id || b.companyId || 'COMP-001';
 
     deduplicated.push({
@@ -2914,9 +3041,11 @@ export const getAllBranches = (): Branch[] => {
 
   // Ensure initial seed branches are included only if not explicitly deleted
   for (const initB of INITIAL_BRANCHES) {
-    const id = initB.branchId || initB.id;
-    if (!seenIds.has(id) && !deletedIds.has(id)) {
-      seenIds.add(id);
+    const rawId = (initB.branchId || initB.id || '').trim();
+    const isMainAlias = rawId === '1' || rawId.toLowerCase() === 'br-main';
+    const id = isMainAlias ? 'BR-MAIN' : rawId;
+    if (!seenIds.has(id.toLowerCase()) && !deletedIds.has(id) && !deletedIds.has(rawId)) {
+      seenIds.add(id.toLowerCase());
       const branchName = initB.name || (initB as any).branch_name || 'Main Branch';
       const branchAddress = initB.location || (initB as any).address || '4th Street Commercial Center, Harare';
       deduplicated.push({
@@ -3062,6 +3191,10 @@ export const saveBranch = (
   branch: Branch,
   options?: { fromSync?: boolean; silent?: boolean }
 ): void => {
+  if (!isValidBranchRecord(branch)) {
+    console.warn('[saveBranch] 🛑 Blocked saving invalid branch record (contains customer, staff, supplier, or product fields):', branch);
+    return;
+  }
   const branches = getAllBranches();
   const currentCompany = getCurrentCompanyId();
   const compId = branch.company_id || branch.companyId || currentCompany;
@@ -10948,7 +11081,10 @@ export const notifyDatabaseMutation = (event: DatabaseMutationEvent) => {
 };
 
 export const ingestMeshBranch = (branch: Branch): boolean => {
-  if (!branch) return false;
+  if (!branch || !isValidBranchRecord(branch)) {
+    console.warn('[ingestMeshBranch] 🛑 Discarded non-branch record (contains customer, staff, supplier, or product fields):', branch);
+    return false;
+  }
   const currentCompany = getCurrentCompanyId();
   const compId = (branch.company_id || branch.companyId || currentCompany).trim().toUpperCase();
   if (compId && compId !== currentCompany.trim().toUpperCase()) {
@@ -11006,16 +11142,18 @@ export const ingestMeshStaff = (
   if (!staff || !staff.id) return false;
   const currentCompany = getCurrentCompanyId();
   const compId = (staff.company_id || staff.companyId || currentCompany).trim().toUpperCase();
-  if (compId && compId !== currentCompany.trim().toUpperCase()) {
+  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
+  if (compId && normTenant(compId) !== normTenant(currentCompany)) {
     console.warn(`[ingestMeshStaff] Discarded staff for other tenant: ${compId} vs ${currentCompany}`);
     return false;
   }
   const all = getAllSalespeople();
   const index = all.findIndex((s) => s.id === staff.id);
+  const existing = index >= 0 ? all[index] : undefined;
 
-  // Explicitly copy pin_hash / password from incoming packet
-  let salt = (staff as any).pin_salt || generatePinSalt();
-  let hash = (staff as any).pin_hash || (staff as any).password;
+  // Explicitly copy pin_hash / password from incoming packet or preserve existing credentials
+  let salt = (staff as any).pin_salt || existing?.pin_salt || generatePinSalt();
+  let hash = (staff as any).pin_hash || (staff as any).password || existing?.pin_hash || (existing as any)?.password;
   if (!hash) {
     const rawPin = (staff as any).pin ? String((staff as any).pin).trim() : '123456';
     hash = hashPin(rawPin, salt);
@@ -11035,8 +11173,7 @@ export const ingestMeshStaff = (
   } as any;
   delete (normalized as any).pin;
 
-  if (index >= 0) {
-    const existing = all[index];
+  if (existing) {
     // Strict Last-Write-Wins (LWW) check (5000ms skew tolerance):
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
     const incomingTime = parseTimestampMs(staff.updatedAt || staff.lastUpdated || (staff as any).hubTimestamp);
@@ -11048,10 +11185,6 @@ export const ingestMeshStaff = (
       return false;
     }
 
-    if (!isIncomingRecordNewer(staff, existing)) {
-      console.log(`[ingestMeshStaff] 🛡️ Stale staff update ignored for ${staff.name} (${staff.id}). Existing timestamp is newer.`);
-      return false;
-    }
     // Explicitly copy pin_hash / password into local record
     existing.pin_hash = hash;
     (existing as any).password = (staff as any).password || hash;

@@ -1,5 +1,5 @@
 // Utility for retrieving, downloading, and copying the latest Termux Hub script
-// Provides 100% offline fallback and Blob download generation
+// Provides 100% offline fallback, Blob download generation, and Termux Heredoc formatting
 
 export const TERMUX_HUB_VERSION = 'v3.2';
 export const TERMUX_HUB_FILENAME = 'termux-hub.js';
@@ -8,7 +8,22 @@ export const TERMUX_HUB_PORT = 8080;
 let cachedScript: string | null = null;
 
 /**
- * Fetches the termux-hub.js source code from the local server or public assets.
+ * Wraps JavaScript source code into the bash heredoc format:
+ * cat << 'EOF' > termux-hub.js
+ * ...
+ * EOF
+ * This allows single-tap pasting directly into Android Termux without syntax errors.
+ */
+export function formatAsTermuxHeredoc(code: string): string {
+  const clean = (code || '').trim();
+  if (clean.startsWith("cat << 'EOF' > termux-hub.js") || clean.startsWith('cat << "EOF" > termux-hub.js')) {
+    return clean;
+  }
+  return `cat << 'EOF' > termux-hub.js\n${clean}\nEOF\n`;
+}
+
+/**
+ * Fetches the raw termux-hub.js source code from the local server or public assets.
  * Caches in memory for instant subsequent access.
  */
 export async function getTermuxHubCode(): Promise<string> {
@@ -31,6 +46,14 @@ export async function getTermuxHubCode(): Promise<string> {
 
   // If fetch failed, return empty string or error
   return cachedScript || '';
+}
+
+/**
+ * Returns the Termux Hub script wrapped in the cat << 'EOF' > termux-hub.js heredoc format.
+ */
+export async function getTermuxHubHeredocCode(): Promise<string> {
+  const raw = await getTermuxHubCode();
+  return formatAsTermuxHeredoc(raw);
 }
 
 /**
@@ -68,21 +91,25 @@ export async function downloadTermuxHubFile(): Promise<boolean> {
 }
 
 /**
- * Copies the entire termux-hub.js code to clipboard.
+ * Copies the termux-hub.js code to clipboard in cat << 'EOF' > termux-hub.js format by default.
  * Uses navigator.clipboard with fallback to textarea selection.
  */
-export async function copyTermuxHubCodeToClipboard(): Promise<{ success: boolean; lineCount: number; byteSize: number }> {
+export async function copyTermuxHubCodeToClipboard(
+  asHeredoc: boolean = true
+): Promise<{ success: boolean; lineCount: number; byteSize: number }> {
   try {
-    const code = await getTermuxHubCode();
-    if (!code) {
+    const raw = await getTermuxHubCode();
+    if (!raw) {
       throw new Error('Termux script code could not be loaded.');
     }
 
+    const codeToCopy = asHeredoc ? formatAsTermuxHeredoc(raw) : raw;
+
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(code);
+      await navigator.clipboard.writeText(codeToCopy);
     } else {
       const textarea = document.createElement('textarea');
-      textarea.value = code;
+      textarea.value = codeToCopy;
       textarea.style.position = 'fixed';
       textarea.style.opacity = '0';
       document.body.appendChild(textarea);
@@ -91,8 +118,8 @@ export async function copyTermuxHubCodeToClipboard(): Promise<{ success: boolean
       document.body.removeChild(textarea);
     }
 
-    const lineCount = code.split('\n').length;
-    const byteSize = new Blob([code]).size;
+    const lineCount = codeToCopy.split('\n').length;
+    const byteSize = new Blob([codeToCopy]).size;
     return { success: true, lineCount, byteSize };
   } catch (e) {
     console.error('[Termux Hub] Error copying code to clipboard:', e);

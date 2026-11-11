@@ -34,6 +34,7 @@ import { meshSyncService, MeshConnectionMode } from '../../services/meshSyncServ
 import { OfflineQRCode } from '../common/OfflineQRCode';
 import {
   getTermuxHubCode,
+  getTermuxHubHeredocCode,
   downloadTermuxHubFile,
   copyTermuxHubCodeToClipboard,
   TERMUX_HUB_VERSION,
@@ -114,7 +115,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
       setHubBranchName(LocalHubConfig.getHubBranchName());
     });
 
-    getTermuxHubCode().then((code) => {
+    getTermuxHubHeredocCode().then((code) => {
       if (code) setScriptCode(code);
     });
 
@@ -241,10 +242,10 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
   const handleCopyFullScript = async () => {
     setIsLoadingScript(true);
     try {
-      const res = await copyTermuxHubCodeToClipboard();
+      const res = await copyTermuxHubCodeToClipboard(true);
       if (res.success) {
         setScriptCopied(true);
-        setSaveSuccessNotice(`Copied all ${res.lineCount.toLocaleString()} lines (${(res.byteSize / 1024).toFixed(1)} KB) to clipboard!`);
+        setSaveSuccessNotice(`Copied in Termux 'cat << EOF' format! Ready to paste into Termux (${res.lineCount.toLocaleString()} lines).`);
         setTimeout(() => setScriptCopied(false), 3500);
         setTimeout(() => setSaveSuccessNotice(null), 5000);
       }
@@ -403,7 +404,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                 setActiveTab('code');
                 stopCamera();
                 if (!scriptCode) {
-                  getTermuxHubCode().then((c) => setScriptCode(c));
+                  getTermuxHubHeredocCode().then((c) => setScriptCode(c));
                 }
               }}
               className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1.5 relative ${
@@ -765,7 +766,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                 onClick={() => {
                   setActiveTab('code');
                   if (!scriptCode) {
-                    getTermuxHubCode().then((c) => setScriptCode(c));
+                    getTermuxHubHeredocCode().then((c) => setScriptCode(c));
                   }
                 }}
                 className="w-full text-[11px] font-bold text-center text-indigo-400 hover:text-indigo-300 py-1 transition cursor-pointer flex items-center justify-center gap-1"
@@ -840,7 +841,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                   className="w-full py-3 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 active:scale-98 text-slate-200 border border-slate-700 text-xs font-black flex items-center justify-center gap-2 shadow transition cursor-pointer disabled:opacity-50"
                 >
                   {scriptCopied ? <CheckCheck className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-slate-300" />}
-                  <span>{scriptCopied ? 'Code Copied to Clipboard!' : 'Copy Entire Script (1,275 lines)'}</span>
+                  <span>{scriptCopied ? "Copied in cat << 'EOF' format!" : "Copy Code (cat << 'EOF' format)"}</span>
                 </button>
               </div>
             </div>
@@ -930,7 +931,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                 </div>
                 <div className="flex gap-2">
                   <span className="w-5 h-5 rounded-full bg-slate-800 text-indigo-300 font-bold flex items-center justify-center shrink-0 text-[10px]">2</span>
-                  <p><strong className="text-slate-200">Download or Paste Code:</strong> Tap <em>Download termux-hub.js</em> above, or copy code and run <code>cat &lt;&lt; 'EOF' &gt; termux-hub.js</code>, paste, and type <code>EOF</code>.</p>
+                  <p><strong className="text-slate-200">Paste in Termux:</strong> Tap <em>Copy Code (cat &lt;&lt; 'EOF' format)</em> above or below, paste directly into Termux terminal, and hit Enter. The file <code>termux-hub.js</code> will be written automatically!</p>
                 </div>
                 <div className="flex gap-2">
                   <span className="w-5 h-5 rounded-full bg-slate-800 text-indigo-300 font-bold flex items-center justify-center shrink-0 text-[10px]">3</span>
@@ -948,7 +949,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               <div className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-slate-900 border-b border-slate-800 gap-2">
                 <div className="flex items-center gap-2">
                   <Code2 className="w-4 h-4 text-indigo-400" />
-                  <span className="text-xs font-bold text-white">Source Code: termux-hub.js</span>
+                  <span className="text-xs font-bold text-white">Termux Code: cat &lt;&lt; 'EOF' &gt; termux-hub.js</span>
                   <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400">
                     {scriptCode ? `${scriptCode.split('\n').length} lines` : 'Loading...'}
                   </span>
@@ -973,7 +974,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                     className="text-xs font-bold px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition flex items-center gap-1.5 cursor-pointer shrink-0"
                   >
                     {scriptCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                    <span>{scriptCopied ? 'Copied' : 'Copy All'}</span>
+                    <span>{scriptCopied ? 'Copied' : "Copy (cat << 'EOF')"}</span>
                   </button>
                 </div>
               </div>

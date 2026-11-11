@@ -10,6 +10,7 @@ import {
 } from '../../types';
 import {
   getSalespeople,
+  getSalespeopleForCompany,
   addSalesperson,
   updateSalesperson,
   toggleSalespersonActive,
@@ -286,7 +287,8 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
   );
 
   const loadData = () => {
-    setSalespeople(getSalespeople());
+    const curComp = getCurrentCompanyId();
+    setSalespeople(getSalespeopleForCompany(curComp));
     setBranches(getBranches());
   };
 
@@ -301,12 +303,19 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
       setPackageVersion((v) => v + 1);
       loadData();
     };
+    const handleStaffSync = () => {
+      loadData();
+    };
     window.addEventListener('saas_packages_updated', handlePkgUpdate);
     window.addEventListener('saas_company_updated', handlePkgUpdate);
+    window.addEventListener('saimetric_salespeople_updated', handleStaffSync);
+    window.addEventListener('saimetric_staff_updated', handleStaffSync);
     return () => {
       unsubscribe();
       window.removeEventListener('saas_packages_updated', handlePkgUpdate);
       window.removeEventListener('saas_company_updated', handlePkgUpdate);
+      window.removeEventListener('saimetric_salespeople_updated', handleStaffSync);
+      window.removeEventListener('saimetric_staff_updated', handleStaffSync);
     };
   }, []);
 

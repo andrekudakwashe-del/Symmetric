@@ -51,6 +51,7 @@ import {
   onDatabaseMutation,
   DatabaseMutationEvent,
   resolveEntityType,
+  isValidBranchRecord,
   ingestMeshBranch,
   ingestMeshStaff,
   ingestMeshSupervisorApproval,
@@ -2102,10 +2103,10 @@ class MeshSyncManager {
       return;
     }
 
-    // 10.04 BRANCHES
+    // 10.04 BRANCHES (STRICT TYPE & SCHEMA VALIDATION)
     if (pType === 'branch' || pType === 'BRANCH' || pType === 'BRANCH_SYNC' || pType === 'BRANCH_RECORD') {
-      const branch = packet.branch || packet.payload;
-      if (branch && (branch.branchId || branch.id)) {
+      const branch = packet.branch || ((packet.entityType === 'branch' || !packet.entityType) ? packet.payload : null);
+      if (branch && isValidBranchRecord(branch) && (branch.branchId || branch.id)) {
         const branchTime = extractRecordTimestamp(branch);
         saveBranch({ ...branch, fromMesh: true }, { fromSync: true });
         if (branchTime > 0) {
@@ -2976,7 +2977,7 @@ class MeshSyncManager {
       for (const st of filteredStaff) {
         this.broadcastStaff(st);
       }
-      if (lastStaffSync === 0 && allStaff.length > 0) {
+      if (lastStaffSync > 0) {
         setLastStaffSync(Date.now());
       }
 
@@ -4137,7 +4138,7 @@ class MeshSyncManager {
     // 4. BRANCH SETUP BROADCAST
     if (topic.endsWith('/branch_setup') || packet.type === 'branch_setup' || packet.action === 'BRANCH_SETUP_RECORD') {
       const branch: Branch = packet.branch || packet.payload;
-      if (branch) {
+      if (branch && isValidBranchRecord(branch)) {
         const ingested = ingestMeshBranch({ ...branch, fromMesh: true } as any);
         if (ingested) {
           playChime();
@@ -4441,11 +4442,13 @@ class MeshSyncManager {
         }
         break;
       case 'branch':
-        didIngest = ingestMeshBranch({ ...payload, fromMesh: true });
-        if (didIngest) {
-          window.dispatchEvent(new Event('saimetric_branches_updated'));
-          window.dispatchEvent(new CustomEvent('saimetric_branches_updated', { detail: payload }));
-          this.addLog('EPIDEMIC_HOP', `Branch [${payload.branchId || payload.id}] updated from ${originName}`, originName, this.config.deviceName);
+        if (isValidBranchRecord(payload)) {
+          didIngest = ingestMeshBranch({ ...payload, fromMesh: true });
+          if (didIngest) {
+            window.dispatchEvent(new Event('saimetric_branches_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_branches_updated', { detail: payload }));
+            this.addLog('EPIDEMIC_HOP', `Branch [${payload.branchId || payload.id}] updated from ${originName}`, originName, this.config.deviceName);
+          }
         }
         break;
       case 'staff': {
@@ -5075,6 +5078,10 @@ class MeshSyncManager {
     const packetId = `CRQ-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
+    const staffHwm = this.getLastStaffSync();
+    const isStaffExplicitZero = staffHwm === 0 || force;
+    const staffSinceTimestamp = isStaffExplicitZero ? '1970-01-01T00:00:00.000Z' : new Date(staffHwm).toISOString();
+
     const packet = {
       type: 'catchup_request',
       action: 'CATCHUP_REQUEST',
@@ -5086,6 +5093,8 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       targetDeviceId: targetPeerId || 'ALL',
       sinceTimestamp,
+      staffSinceTime: staffHwm,
+      staffSinceTimestamp,
       isReciprocal: Boolean(isReciprocal),
       isForced: Boolean(force),
       requestedTypes: [
@@ -5516,8 +5525,10 @@ class MeshSyncManager {
     let branchesIngested = 0;
     if (Array.isArray(delta.branches)) {
       for (const br of delta.branches) {
-        saveBranch({ ...br, fromMesh: true }, { fromSync: true });
-        branchesIngested++;
+        if (isValidBranchRecord(br)) {
+          saveBranch({ ...br, fromMesh: true }, { fromSync: true });
+          branchesIngested++;
+        }
       }
       if (branchesIngested > 0 && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));

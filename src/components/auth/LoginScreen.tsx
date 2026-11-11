@@ -192,8 +192,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       handleHubIdentity();
     });
 
+    const handleStaffUpdate = () => {
+      setStaffVersion((v) => v + 1);
+    };
+
     window.addEventListener('saimetric_hub_identity_updated', handleHubIdentity);
     window.addEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
+    window.addEventListener('saimetric_salespeople_updated', handleStaffUpdate);
+    window.addEventListener('saimetric_staff_updated', handleStaffUpdate);
 
     return () => {
       unsub();
@@ -201,8 +207,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       unsubConfig();
       window.removeEventListener('saimetric_hub_identity_updated', handleHubIdentity);
       window.removeEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
+      window.removeEventListener('saimetric_salespeople_updated', handleStaffUpdate);
+      window.removeEventListener('saimetric_staff_updated', handleStaffUpdate);
     };
   }, []);
+
+  const [staffVersion, setStaffVersion] = useState<number>(0);
 
   // Hub Branch Identity & Roaming Owner Safeguard
   const [hubBranchId, setHubBranchId] = useState<string | null>(() => LocalHubConfig.getHubBranchId());
@@ -257,25 +267,38 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
   const [selectedStaffId, setSelectedStaffId] = useState<string | null>(null);
 
-  // Get branches strictly for this company only, deduplicating any duplicate IDs
+  // Get branches strictly for this company only, deduplicating any duplicate IDs and aliases
   const companyBranches = useMemo(() => {
     const list = getBranchesForCompany(selectedCompanyId);
     const seen = new Set<string>();
     const unique: Branch[] = [];
     for (const b of list) {
-      const id = b.branchId || b.id || (b as any).branch_id;
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      unique.push(b);
+      const rawId = (b.branchId || b.id || (b as any).branch_id || '').trim();
+      if (!rawId) continue;
+      const isMainAlias = rawId === '1' || rawId.toLowerCase() === 'br-main';
+      const canonicalId = isMainAlias ? 'BR-MAIN' : rawId;
+      if (seen.has(canonicalId.toLowerCase())) continue;
+      seen.add(canonicalId.toLowerCase());
+      unique.push({
+        ...b,
+        branchId: canonicalId,
+        id: canonicalId,
+        branch_id: canonicalId,
+        name: isMainAlias ? (b.name || 'Head Office - Main Central Distribution & Warehouse') : b.name,
+      });
     }
     return unique;
   }, [selectedCompanyId, companies]);
 
-  // Ensure selectedBranchId points to a valid branch within companyBranches
+  // Ensure selectedBranchId points to a valid branch within companyBranches, preferring Local Hub branch
   useEffect(() => {
     if (companyBranches.length > 0) {
       const validIds = companyBranches.map((b) => b.branchId || b.id || (b as any).branch_id);
-      if (!validIds.includes(selectedBranchId) || selectedBranchId === 'ALL') {
+      const curHub = LocalHubConfig.getHubBranchId();
+      const canonicalHub = curHub === '1' ? 'BR-MAIN' : curHub;
+      if (canonicalHub && validIds.includes(canonicalHub) && selectedBranchId !== canonicalHub) {
+        setSelectedBranchId(canonicalHub);
+      } else if (!validIds.includes(selectedBranchId) || selectedBranchId === 'ALL') {
         const firstId = validIds[0];
         if (selectedBranchId !== firstId) {
           setSelectedBranchId(firstId);
@@ -288,22 +311,24 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const companyStaff = useMemo(() => {
     const all = getActiveStaffForCompany(selectedCompanyId);
     const filtered = all.filter((s) => isStaffAssignedToBranch(s, selectedBranchId));
+    // Graceful fallback: If filtered branch assignment is empty but company accounts exist, do not lock out
+    const staffToUse = filtered.length > 0 ? filtered : all;
     const seen = new Set<string>();
     const unique: Salesperson[] = [];
-    for (const s of filtered) {
+    for (const s of staffToUse) {
       if (seen.has(s.id)) continue;
       seen.add(s.id);
       // Map staff role to their explicit role for this selected branch
       const branchRole = getStaffRoleInBranch(s, selectedBranchId);
       unique.push({
         ...s,
-        role: branchRole,
+        role: branchRole || s.role,
         branchId: selectedBranchId,
         branch_id: selectedBranchId,
       });
     }
     return unique;
-  }, [selectedCompanyId, selectedBranchId, companies]);
+  }, [selectedCompanyId, selectedBranchId, companies, staffVersion]);
 
   const selectedStaff = useMemo(() => {
     if (selectedStaffId) {

@@ -8,7 +8,31 @@ export class LocalHubAdapter implements SyncAdapter {
 
   async broadcast(envelope: SyncEnvelope): Promise<BroadcastResult> {
     try {
-      const isSent = meshSyncService.sendSyncEnvelope(envelope);
+      let packetToSend: any = envelope;
+      if (envelope.entityType === 'staff' || envelope.entityType === 'salespeople') {
+        const staffData: any = envelope.data || {};
+        const effectivePinHash = staffData.pin_hash || staffData.password || '';
+        packetToSend = {
+          type: 'STAFF_SYNC',
+          action: 'STAFF_SYNC',
+          entityType: 'staff',
+          packet_id: envelope.packetId,
+          packetId: envelope.packetId,
+          companyId: staffData.company_id || staffData.companyId || 'COMP-001',
+          branchId: staffData.branch_id || staffData.branchId || 'BR-MAIN',
+          target_branch_id: envelope.targetBranchId || 'ALL',
+          originDeviceId: envelope.originDeviceId,
+          staff: staffData,
+          payload: staffData,
+          pin_hash: effectivePinHash,
+          password: effectivePinHash,
+          updatedAt: envelope.updatedAt,
+          timestamp: envelope.updatedAt,
+          ...envelope,
+          data: staffData,
+        };
+      }
+      const isSent = meshSyncService.sendSyncEnvelope(packetToSend);
       if (!isSent) {
         return {
           success: false,

@@ -47,6 +47,7 @@ import {
   saveBranch,
   saveSalesperson,
   getSalespeople,
+  getAllSalespeople,
   getBranches,
   pullTenantInventory,
   pullTenantSales,
@@ -539,6 +540,10 @@ class PersistentSyncEngine {
    * Pushes a single item. Calculates exponential backoff on failure.
    */
   public async pushSingleItem(item: PersistentSyncItem): Promise<boolean> {
+    if (this.isOutboundSyncPaused) {
+      console.log(`[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping pushSingleItem for ${item.id} (${item.sheetName}).`);
+      return false;
+    }
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       return false;
     }
@@ -734,17 +739,21 @@ class PersistentSyncEngine {
 
       if (usersRes && usersRes.success && Array.isArray(usersRes.users)) {
         for (const u of usersRes.users) {
+          const staffId = u.id || u.user_id;
+          const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
+          const pinHash = u.pin_hash || existingStaff?.pin_hash;
+          const pinSalt = u.pin_salt || existingStaff?.pin_salt;
           const userPerson: Salesperson = {
-            id: u.id || u.user_id,
+            id: staffId,
             name: u.full_name || u.name || 'Staff',
             email: u.email || '',
             role: (u.role || 'CASHIER').toUpperCase() as any,
-            ...(u.pin_hash ? { pin_hash: u.pin_hash, pin_salt: u.pin_salt } : { pin: String(u.pin || '1234') }),
+            ...(pinHash ? { pin_hash: pinHash, pin_salt: pinSalt } : { pin: String(u.pin || '1234') }),
             active: (u.is_active !== false && u.active !== 'N' && u.active !== false) ? 'Y' : 'N',
             companyId: u.company_id || companyId,
             branchId: u.branch_id || 'BR-MAIN',
           };
-          saveSalesperson(userPerson);
+          saveSalesperson(userPerson, { fromSync: true });
           usersCount++;
         }
         const serverTime = usersRes.server_time || new Date().toISOString();
@@ -791,6 +800,10 @@ class PersistentSyncEngine {
   }
 
   public async forceRefreshStaff(): Promise<number> {
+    if (this.isOutboundSyncPaused) {
+      console.log('[PersistentSyncEngine] 🛑 Cloud staff refresh suspended (Local Hub is Edge Gateway). Skipping forceRefreshStaff.');
+      return 0;
+    }
     const currentCompany = getCurrentCompany();
     const res = await this.fetchServerAction('get_users_since', {
       company_id: currentCompany.company_id,
@@ -799,16 +812,20 @@ class PersistentSyncEngine {
     let count = 0;
     if (res && res.success && Array.isArray(res.users)) {
       for (const u of res.users) {
+        const staffId = u.id || u.user_id;
+        const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
+        const pinHash = u.pin_hash || existingStaff?.pin_hash;
+        const pinSalt = u.pin_salt || existingStaff?.pin_salt;
         saveSalesperson({
-          id: u.id || u.user_id,
+          id: staffId,
           name: u.full_name || u.name || 'Staff',
           email: u.email || '',
           role: (u.role || 'CASHIER').toUpperCase() as any,
-          ...(u.pin_hash ? { pin_hash: u.pin_hash, pin_salt: u.pin_salt } : { pin: String(u.pin || '1234') }),
+          ...(pinHash ? { pin_hash: pinHash, pin_salt: pinSalt } : { pin: String(u.pin || '1234') }),
           active: (u.is_active !== false && u.active !== 'N' && u.active !== false) ? 'Y' : 'N',
           companyId: u.company_id || currentCompany.company_id,
           branchId: u.branch_id || 'BR-MAIN',
-        });
+        }, { fromSync: true });
         count++;
       }
       const serverTime = res.server_time || new Date().toISOString();
