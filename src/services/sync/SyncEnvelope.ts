@@ -13,3 +13,98 @@ export interface SyncEnvelope<T = any> {
   targetBranchId: string;
   class: EntityClass;           // determines LWW vs append-only
 }
+
+export type ReconPacketType =
+  | 'RECON_SWEEP_TRIGGER'
+  | 'SYNC_SNAPSHOT_REQUEST'
+  | 'SYNC_SNAPSHOT_RESPONSE'
+  | 'SYNC_ID_DIGEST_REQUEST'
+  | 'SYNC_ID_DIGEST_RESPONSE'
+  | 'RECON_BACKFILL_PAYLOAD'
+  | 'HUB_CLOUD_BROADCAST';
+
+export interface EntitySnapshot {
+  entityType: string;
+  startDate?: string;
+  endDate?: string;
+  count: number;
+  totalSum: number;
+  idHash: string;
+  generatedAt: number;
+}
+
+export interface SyncSnapshotRequestPacket {
+  type: 'SYNC_SNAPSHOT_REQUEST';
+  sweepId: string;
+  entityType: string;
+  startDate?: string;
+  endDate?: string;
+  hubTimestamp: number;
+  originDeviceId: string;
+}
+
+export interface SyncSnapshotResponsePacket {
+  type: 'SYNC_SNAPSHOT_RESPONSE';
+  sweepId: string;
+  entityType: string;
+  snapshot: EntitySnapshot;
+  deviceId: string;
+  timestamp: number;
+}
+
+export interface TransactionDigestItem {
+  id: string;
+  total?: number;
+  status?: string;
+  timestamp?: number;
+  updatedAt?: number;
+}
+
+export interface TransactionsDigestResult {
+  entityType: string;
+  startDate?: string;
+  endDate?: string;
+  items: TransactionDigestItem[];
+  count: number;
+  totalSum: number;
+  generatedAt: number;
+}
+
+export interface ReconSweepTriggerPacket {
+  type: 'RECON_SWEEP_TRIGGER';
+  sweepId: string;
+  targetEntities: string[];
+  dateRange?: { start?: string; end?: string };
+  hubTimestamp: number;
+  originDeviceId: string;
+}
+
+export interface SyncIdDigestRequestPacket {
+  type: 'SYNC_ID_DIGEST_REQUEST';
+  sweepId: string;
+  entityType: string;
+  startDate?: string;
+  endDate?: string;
+  hubTimestamp: number;
+  originDeviceId: string;
+}
+
+export interface SyncIdDigestResponsePacket {
+  type: 'SYNC_ID_DIGEST_RESPONSE';
+  sweepId: string;
+  entityType: string;
+  digest: TransactionsDigestResult;
+  deviceId: string;
+  timestamp: number;
+}
+
+export interface ReconBackfillPayloadPacket {
+  type: 'RECON_BACKFILL_PAYLOAD';
+  sweepId: string;
+  entityType: string;
+  records: any[];
+  chunkIndex: number;
+  totalChunks: number;
+  hubTimestamp: number;
+  originDeviceId: string;
+}

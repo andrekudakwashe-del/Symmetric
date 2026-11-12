@@ -68,6 +68,20 @@ let cloudSyncUrl = cloudUrlArgIdx !== -1 && process.argv[cloudUrlArgIdx + 1]
   ? process.argv[cloudUrlArgIdx + 1]
   : (process.env.CLOUD_SYNC_URL || process.env.VITE_GOOGLE_APPS_SCRIPT_URL || '');
 
+// Edge-to-Cloud Supabase configuration
+const supabaseUrlArgIdx = process.argv.indexOf('--supabase-url');
+let supabaseUrl = supabaseUrlArgIdx !== -1 && process.argv[supabaseUrlArgIdx + 1]
+  ? process.argv[supabaseUrlArgIdx + 1]
+  : (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '');
+
+const supabaseKeyArgIdx = process.argv.indexOf('--supabase-key');
+let supabaseKey = supabaseKeyArgIdx !== -1 && process.argv[supabaseKeyArgIdx + 1]
+  ? process.argv[supabaseKeyArgIdx + 1]
+  : (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || '');
+
+// High-Water Mark for Edge-to-Cloud Hub-to-Supabase Sync
+let lastCloudSyncTimestamp = 0;
+
 /**
  * Edge Gateway Cloud Bridge:
  * Forwards accepted master records (Staff, Customers) to cloud endpoint in background.
@@ -433,6 +447,7 @@ function loadData() {
       if (parsed.hubBranchId) hubBranchId = parsed.hubBranchId;
       if (parsed.hubBranchName) hubBranchName = parsed.hubBranchName;
       if (parsed.hubTenantId) hubTenantId = parsed.hubTenantId;
+      if (parsed.lastCloudSyncTimestamp) lastCloudSyncTimestamp = Number(parsed.lastCloudSyncTimestamp) || 0;
       if (Array.isArray(parsed.sales)) salesStore = parsed.sales;
       if (Array.isArray(parsed.inventory)) inventoryStore = parsed.inventory;
       if (Array.isArray(parsed.directGrvs)) directGrvsStore = parsed.directGrvs;
@@ -507,6 +522,7 @@ function saveData() {
       hubBranchId,
       hubBranchName,
       hubTenantId,
+      lastCloudSyncTimestamp,
       sales: salesStore.slice(0, 5000),
       inventory: inventoryStore,
       directGrvs: directGrvsStore.slice(0, 1000),
@@ -623,12 +639,402 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
+// =====================================================================
+// AUTOMATED RECONCILIATION ENGINE HELPERS (PHASE 2)
+// =====================================================================
+
+function getStoreByEntityType(norm) {
+  switch (norm) {
+    case 'sales':
+    case 'sale':
+      return salesStore;
+    case 'customer_changes':
+    case 'customer_change':
+      return customerChangesStore;
+    case 'credit_sales':
+    case 'credit_sale':
+      return creditSalesStore;
+    case 'cash_logs':
+    case 'cash_log':
+      return cashLogsStore;
+    case 'stock_movements':
+    case 'stock_movement':
+      return stockMovementsStore;
+    case 'direct_grvs':
+    case 'direct_grv':
+    case 'grv':
+      return directGrvsStore;
+    case 'expenses':
+    case 'expense':
+      return expensesStore;
+    case 'inventory':
+    case 'inventory_item':
+    case 'products':
+      return inventoryStore;
+    case 'customers':
+    case 'customer':
+      return customersStore;
+    case 'staff':
+    case 'salespeople':
+    case 'users':
+      return salespeopleStore;
+    default:
+      return [];
+  }
+}
+
+function getEntityId(rec, norm) {
+  if (!rec) return null;
+  switch (norm) {
+    case 'sales':
+    case 'sale':
+      return rec.id || rec.invoice_id || rec.invoiceId;
+    case 'customer_changes':
+    case 'customer_change':
+      return rec.id || rec.changeId;
+    case 'credit_sales':
+    case 'credit_sale':
+      return rec.id || rec.creditId;
+    case 'cash_logs':
+    case 'cash_log':
+      return rec.id || (rec.date && rec.timestamp ? `${rec.date}_${rec.timestamp}` : null);
+    case 'stock_movements':
+    case 'stock_movement':
+      return rec.id || rec.txnId || rec.movementId;
+    case 'direct_grvs':
+    case 'direct_grv':
+    case 'grv':
+      return rec.id || rec.grvId || rec.reference;
+    case 'expenses':
+    case 'expense':
+      return rec.id;
+    case 'inventory':
+    case 'inventory_item':
+    case 'products':
+      return rec.itemId || rec.id;
+    case 'customers':
+    case 'customer':
+      return rec.customerId || rec.id;
+    case 'staff':
+    case 'salespeople':
+    case 'users':
+      return rec.id;
+    default:
+      return rec.id;
+  }
+}
+
+function getRecordTimestamp(rec) {
+  if (!rec) return 0;
+  const val = rec.updatedAt || rec.lastUpdated || rec.hubTimestamp || rec.timestamp || rec.date || rec.createdAt;
+  if (typeof val === 'number') return val;
+  if (!val) return 0;
+  const parsed = new Date(val).getTime();
+  return isNaN(parsed) ? 0 : parsed;
+}
+
+function getRecordTotal(rec, norm) {
+  if (!rec) return 0;
+  switch (norm) {
+    case 'sales':
+    case 'sale':
+      return rec.status === 'Voided' || rec.status === 'Refunded' ? 0 : (Number(rec.total) || 0);
+    case 'customer_changes':
+    case 'customer_change':
+      return (Number(rec.in) || 0) - (Number(rec.out) || 0);
+    case 'credit_sales':
+    case 'credit_sale':
+      return Number(rec.amount || rec.out) || 0;
+    case 'cash_logs':
+    case 'cash_log':
+      return (Number(rec.in) || 0) - (Number(rec.out) || 0);
+    case 'stock_movements':
+    case 'stock_movement':
+      return Number(rec.quantity || rec.qty) || 0;
+    case 'direct_grvs':
+    case 'direct_grv':
+    case 'grv':
+      return Number(rec.totalAmount || rec.total) || 0;
+    case 'expenses':
+    case 'expense':
+      return Number(rec.amount) || 0;
+    case 'inventory':
+    case 'inventory_item':
+    case 'products':
+      return Number(rec.totalUnits || rec.stockSingles) || 0;
+    case 'customers':
+    case 'customer':
+      return Number(rec.creditLimit) || 0;
+    default:
+      return 0;
+  }
+}
+
+function computeIdsChecksum(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) return '00000000';
+  const sorted = [...ids].sort();
+  let hash = 0x811c9dc5;
+  for (const id of sorted) {
+    const str = String(id);
+    for (let i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    hash ^= 124; // '|'
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function computeHubSnapshot(entityType, startDate, endDate) {
+  const norm = String(entityType || '').toLowerCase().trim();
+  const startTime = startDate ? new Date(startDate).getTime() : 0;
+  const endTime = endDate ? new Date(endDate).getTime() : Infinity;
+  const inRange = (t) => {
+    if (!t || isNaN(t) || t <= 0) return true;
+    return t >= startTime && t <= endTime;
+  };
+
+  const store = getStoreByEntityType(norm);
+  let count = 0;
+  let totalSum = 0;
+  const ids = [];
+
+  for (const rec of store) {
+    if (!rec) continue;
+    const id = getEntityId(rec, norm);
+    if (!id) continue;
+    const t = getRecordTimestamp(rec);
+    if (inRange(t)) {
+      count++;
+      totalSum += getRecordTotal(rec, norm);
+      ids.push(String(id));
+    }
+  }
+
+  const idHash = computeIdsChecksum(ids);
+
+  return {
+    entityType: norm,
+    startDate,
+    endDate,
+    count,
+    totalSum: Number(totalSum.toFixed(2)),
+    idHash,
+    generatedAt: Date.now(),
+  };
+}
+
+function computeHubDigest(entityType, startDate, endDate) {
+  const norm = String(entityType || '').toLowerCase().trim();
+  const startTime = startDate ? new Date(startDate).getTime() : 0;
+  const endTime = endDate ? new Date(endDate).getTime() : Infinity;
+  const inRange = (t) => {
+    if (!t || isNaN(t) || t <= 0) return true;
+    return t >= startTime && t <= endTime;
+  };
+
+  const items = [];
+  let totalSum = 0;
+  const store = getStoreByEntityType(norm);
+
+  for (const rec of store) {
+    if (!rec) continue;
+    const id = getEntityId(rec, norm);
+    if (!id) continue;
+    const t = getRecordTimestamp(rec);
+    if (inRange(t)) {
+      const total = getRecordTotal(rec, norm);
+      totalSum += total;
+      items.push({
+        id: String(id),
+        total,
+        status: rec.status,
+        timestamp: t,
+        updatedAt: (rec.updatedAt || rec.lastUpdated) ? getRecordTimestamp(rec) : undefined,
+      });
+    }
+  }
+
+  return {
+    entityType: norm,
+    startDate,
+    endDate,
+    items,
+    count: items.length,
+    totalSum,
+    generatedAt: Date.now(),
+  };
+}
+
+function computeDigestDiff(clientDigest, entityType) {
+  if (!clientDigest || !Array.isArray(clientDigest.items)) {
+    return [];
+  }
+  const norm = String(entityType || clientDigest.entityType || '').toLowerCase().trim();
+  const startTime = clientDigest.startDate ? new Date(clientDigest.startDate).getTime() : 0;
+  const endTime = clientDigest.endDate ? new Date(clientDigest.endDate).getTime() : Infinity;
+
+  const inRange = (t) => {
+    if (!t || isNaN(t) || t <= 0) return true;
+    return t >= startTime && t <= endTime;
+  };
+
+  const clientMap = new Map();
+  for (const item of clientDigest.items) {
+    if (item && item.id != null) {
+      clientMap.set(String(item.id).trim(), item);
+    }
+  }
+
+  const isT2 = norm === 'inventory' || norm === 'inventory_item' || norm === 'products' ||
+               norm === 'customers' || norm === 'customer' ||
+               norm === 'staff' || norm === 'salespeople' || norm === 'users';
+
+  const store = getStoreByEntityType(norm);
+  const missingOrOutdated = [];
+
+  for (const rec of store) {
+    if (!rec) continue;
+    const id = getEntityId(rec, norm);
+    if (!id) continue;
+    const cleanId = String(id).trim();
+    const hubRecTime = getRecordTimestamp(rec);
+
+    if (!inRange(hubRecTime)) continue;
+
+    const clientItem = clientMap.get(cleanId);
+
+    if (!clientItem) {
+      // Missing completely on client
+      missingOrOutdated.push(rec);
+    } else if (isT2) {
+      // T2 LWW check with 5000ms threshold
+      const hubUpdated = getRecordTimestamp(rec);
+      const clientUpdated = clientItem.updatedAt || clientItem.timestamp || 0;
+      if (hubUpdated - clientUpdated > 5000) {
+        missingOrOutdated.push(rec);
+      }
+    } else if (norm === 'sales' || norm === 'sale') {
+      // T1 check: status discrepancy (e.g. Voided/Refunded on Hub)
+      if (rec.status && clientItem.status && rec.status !== clientItem.status) {
+        missingOrOutdated.push(rec);
+      }
+    }
+  }
+
+  return missingOrOutdated;
+}
+
+function streamReconBackfill(ws, sweepId, entityType, missingRecords) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!missingRecords || missingRecords.length === 0) {
+    console.log(`[Termux Hub] 🧹 No missing records found for "${entityType}" (sweep: ${sweepId}). In sync!`);
+    return;
+  }
+
+  const CHUNK_SIZE = 25;
+  const totalChunks = Math.ceil(missingRecords.length / CHUNK_SIZE);
+  console.log(`[Termux Hub] 🚀 Streaming backfill for "${entityType}": ${missingRecords.length} records in ${totalChunks} chunk(s) (sweep: ${sweepId})`);
+
+  let currentChunk = 0;
+  function sendNextChunk() {
+    if (ws.readyState !== WebSocket.OPEN || currentChunk >= totalChunks) {
+      if (currentChunk >= totalChunks) {
+        console.log(`[Termux Hub] ✅ Completed backfill streaming for "${entityType}" (sweep: ${sweepId})`);
+      }
+      return;
+    }
+
+    const start = currentChunk * CHUNK_SIZE;
+    const chunkRecords = missingRecords.slice(start, start + CHUNK_SIZE);
+    const packet = {
+      type: 'RECON_BACKFILL_PAYLOAD',
+      action: 'RECON_BACKFILL_PAYLOAD',
+      sweepId,
+      entityType,
+      records: chunkRecords.map((r) => {
+        if (typeof r === 'object' && r !== null) {
+          return { ...r, hubTimestamp: Date.now() };
+        }
+        return r;
+      }),
+      chunkIndex: currentChunk,
+      totalChunks,
+      hubTimestamp: Date.now(),
+      originDeviceId: `HUB-${hubBranchId}`,
+      branchId: hubBranchId,
+    };
+
+    try {
+      ws.send(JSON.stringify(packet));
+    } catch (err) {
+      console.warn(`[Termux Hub] Error sending backfill chunk ${currentChunk + 1}/${totalChunks}:`, err.message);
+      return;
+    }
+
+    currentChunk++;
+    if (currentChunk < totalChunks) {
+      setTimeout(sendNextChunk, 15);
+    } else {
+      console.log(`[Termux Hub] ✅ Completed backfill streaming for "${entityType}" (sweep: ${sweepId})`);
+    }
+  }
+
+  sendNextChunk();
+}
+
+function triggerClientReconSweep(clientWs) {
+  if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
+  const sweepId = `sweep-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  const triggerPacket = {
+    type: 'RECON_SWEEP_TRIGGER',
+    sweepId,
+    targetEntities: [
+      'sales',
+      'customer_changes',
+      'credit_sales',
+      'cash_logs',
+      'stock_movements',
+      'direct_grvs',
+      'expenses',
+      'inventory',
+      'customers',
+      'staff',
+    ],
+    isSod: Boolean(isSod),
+    useSnapshotFirst: true,
+    hubTimestamp: Date.now(),
+    originDeviceId: `HUB-${hubBranchId}`,
+  };
+  try {
+    clientWs.send(JSON.stringify(triggerPacket));
+    console.log(`[Termux Hub] 🧹 Sent RECON_SWEEP_TRIGGER (${sweepId}${isSod ? ' [SOD Start of Day]' : ''}) to POS terminal`);
+  } catch (err) {
+    console.warn('[Termux Hub] Failed to send RECON_SWEEP_TRIGGER:', err.message);
+  }
+}
+
+function triggerAllClientsReconSweep() {
+  console.log(`[Termux Hub] 🧹 Starting 30-min background reconciliation sweep across connected terminals...`);
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      triggerClientReconSweep(client, false);
+    }
+  });
+}
+
+// Terminal connection and activity tracking for Start-of-Day (SOD) sweeps
+const terminalLastActivity = new Map();
+
 // WebSocket Server
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
   const remoteIp = req.socket.remoteAddress;
   console.log(`[Termux Hub] 🟢 POS Terminal connected from ${remoteIp}`);
+
+  let terminalDeviceId = null;
 
   // Send immediate greeting with branch identity
   try {
@@ -639,14 +1045,31 @@ wss.on('connection', (ws, req) => {
       branch_id: hubBranchId,
       branch_name: hubBranchName,
       tenant_id: hubTenantId,
-      version: '3.4.0',
+      version: '3.7.0',
       totalSales: salesStore.length,
       totalInventory: inventoryStore.length,
+      lastCloudSyncTimestamp,
       message: `Connected to Saimetric Local Hub (${hubBranchName})`,
       timestamp: Date.now(),
     };
     ws.send(JSON.stringify(greeting));
   } catch (e) {}
+
+  // 3.5s delayed automatic background reconciliation sweep trigger upon connection
+  setTimeout(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      if (terminalDeviceId) {
+        const lastSeen = terminalLastActivity.get(terminalDeviceId) || 0;
+        const gapMs = Date.now() - lastSeen;
+        if (lastSeen > 0 && gapMs > 4 * 60 * 60 * 1000) {
+          console.log(`[Termux Hub] 🌅 SOD (Start of Day) gap > 4h detected for terminal "${terminalDeviceId}" (${(gapMs / 3600000).toFixed(1)} hrs). Triggering SOD sweep!`);
+          triggerClientReconSweep(ws, true);
+          return;
+        }
+      }
+      triggerClientReconSweep(ws, false);
+    }
+  }, 3500);
 
   ws.on('message', (message) => {
     try {
@@ -667,6 +1090,124 @@ wss.on('connection', (ws, req) => {
 
       if (packet.cloudSyncUrl || packet.cloudUrl) {
         cloudSyncUrl = packet.cloudSyncUrl || packet.cloudUrl;
+      }
+
+      const devId = packet.deviceId || packet.origin_device_id || packet.originDeviceId;
+      if (devId) {
+        terminalDeviceId = devId;
+        terminalLastActivity.set(devId, Date.now());
+      }
+
+      if (packet.supabaseUrl) supabaseUrl = packet.supabaseUrl;
+      if (packet.supabaseKey) supabaseKey = packet.supabaseKey;
+      if (packet.cloudConfig) {
+        if (packet.cloudConfig.supabaseUrl) supabaseUrl = packet.cloudConfig.supabaseUrl;
+        if (packet.cloudConfig.supabaseKey) supabaseKey = packet.cloudConfig.supabaseKey;
+      }
+
+      // =====================================================================
+      // AUTOMATED RECONCILIATION & DRIFT PREVENTION (Phase 2 & 3 Sweep Engine)
+      // =====================================================================
+      if (pType === 'SYNC_SNAPSHOT_RESPONSE') {
+        const sweepId = packet.sweepId || `sweep-${Date.now()}`;
+        const entity = packet.entityType || packet.snapshot?.entityType;
+        const clientSnap = packet.snapshot || packet.payload;
+
+        if (clientSnap && entity) {
+          const hubSnap = computeHubSnapshot(entity, clientSnap.startDate, clientSnap.endDate);
+          const countMatch = clientSnap.count === hubSnap.count;
+          const sumMatch = Math.abs((Number(clientSnap.totalSum) || 0) - (Number(hubSnap.totalSum) || 0)) < 0.01;
+          const hashMatch = String(clientSnap.idHash || '').trim() === String(hubSnap.idHash || '').trim();
+
+          if (countMatch && sumMatch && hashMatch) {
+            console.log(`[Termux Hub] ⚡ SNAPSHOT MATCH for "${entity}" (count=${hubSnap.count}, sum=${hubSnap.totalSum}, hash=${hubSnap.idHash})! Terminal and Hub in sync (0 bytes diff).`);
+          } else {
+            console.log(`[Termux Hub] ⚠️ SNAPSHOT MISMATCH for "${entity}"! Client: (count=${clientSnap.count}, sum=${clientSnap.totalSum}, hash=${clientSnap.idHash}) vs Hub: (count=${hubSnap.count}, sum=${hubSnap.totalSum}, hash=${hubSnap.idHash}). Requesting granular ID digest...`);
+            // Mismatch: Hub sends SYNC_ID_DIGEST_REQUEST so Phase 1 & 2 ID diff takes over
+            const reqPacket = {
+              type: 'SYNC_ID_DIGEST_REQUEST',
+              action: 'SYNC_ID_DIGEST_REQUEST',
+              sweepId,
+              entityType: entity,
+              startDate: clientSnap.startDate,
+              endDate: clientSnap.endDate,
+              hubTimestamp: Date.now(),
+              originDeviceId: `HUB-${hubBranchId}`,
+            };
+            try {
+              ws.send(JSON.stringify(reqPacket));
+            } catch (err) {
+              console.warn('[Termux Hub] Failed to send SYNC_ID_DIGEST_REQUEST:', err.message);
+            }
+          }
+        }
+        return;
+      }
+
+      if (pType === 'SYNC_ID_DIGEST_RESPONSE') {
+        const sweepId = packet.sweepId || `sweep-${Date.now()}`;
+        const entity = packet.entityType || packet.digest?.entityType;
+        const digest = packet.digest || packet.payload;
+        console.log(`[Termux Hub] 📥 Received SYNC_ID_DIGEST_RESPONSE for entity "${entity}" (${digest?.count || 0} items, sweep: ${sweepId})`);
+
+        if (digest && entity) {
+          const missingOrOutdated = computeDigestDiff(digest, entity);
+          if (missingOrOutdated.length > 0) {
+            console.log(`[Termux Hub] 🔍 computeDigestDiff found ${missingOrOutdated.length} diff record(s) for "${entity}" to push to client`);
+            streamReconBackfill(ws, sweepId, entity, missingOrOutdated);
+          } else {
+            console.log(`[Termux Hub] ✅ Client and Hub are fully reconciled for "${entity}" (0 diffs)`);
+          }
+        }
+        return;
+      }
+
+      if (pType === 'SYNC_ID_DIGEST_REQUEST') {
+        const sweepId = packet.sweepId || `sweep-${Date.now()}`;
+        const entity = packet.entityType;
+        console.log(`[Termux Hub] 📥 Received SYNC_ID_DIGEST_REQUEST for entity "${entity}" (sweep: ${sweepId})`);
+        if (entity) {
+          const hubDigest = computeHubDigest(entity, packet.startDate, packet.endDate);
+          const responsePacket = {
+            type: 'SYNC_ID_DIGEST_RESPONSE',
+            action: 'SYNC_ID_DIGEST_RESPONSE',
+            sweepId,
+            entityType: entity,
+            digest: hubDigest,
+            deviceId: `HUB-${hubBranchId}`,
+            timestamp: Date.now(),
+          };
+          try {
+            ws.send(JSON.stringify(responsePacket));
+            console.log(`[Termux Hub] 📤 Sent Hub digest for "${entity}" (${hubDigest.count} items) to client`);
+          } catch (err) {
+            console.warn('[Termux Hub] Failed to send SYNC_ID_DIGEST_RESPONSE:', err.message);
+          }
+        }
+        return;
+      }
+
+      if (pType === 'RECON_SWEEP_TRIGGER') {
+        const sweepId = packet.sweepId || `sweep-${Date.now()}`;
+        const targetEntities = Array.isArray(packet.targetEntities)
+          ? packet.targetEntities
+          : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'staff'];
+        console.log(`[Termux Hub] 🧹 Client requested RECON_SWEEP_TRIGGER for entities: ${targetEntities.join(', ')}`);
+        for (const ent of targetEntities) {
+          const reqPacket = {
+            type: 'SYNC_ID_DIGEST_REQUEST',
+            sweepId,
+            entityType: ent,
+            startDate: packet.dateRange?.start,
+            endDate: packet.dateRange?.end,
+            hubTimestamp: Date.now(),
+            originDeviceId: `HUB-${hubBranchId}`,
+          };
+          try {
+            ws.send(JSON.stringify(reqPacket));
+          } catch (e) {}
+        }
+        return;
       }
 
       // =====================================================================
@@ -3163,5 +3704,159 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`📦 Voucher sync registered (v3.5.0)`);
   console.log(`📦 Closures & Settlements sync registered (v3.6.0)`);
   console.log(`📦 Categories sync registered (v3.6.0)`);
+  console.log(`🧹 Automated Reconciliation Sweep Engine active (30m interval + connection trigger)`);
+  console.log(`☁️  Edge-to-Cloud (Hub to Supabase) Bridge active (v3.7.0)`);
   console.log(`================================================================`);
 });
+
+// Automatic 30-minute background reconciliation sweep across all connected POS terminals
+const RECON_SWEEP_INTERVAL_MS = 30 * 60 * 1000;
+setInterval(() => {
+  triggerAllClientsReconSweep();
+}, RECON_SWEEP_INTERVAL_MS);
+
+/**
+ * Edge-to-Cloud Bridge (Hub to Supabase Reconciliation):
+ * 1. Queries Supabase: SELECT * FROM [table] WHERE updated_at > lastCloudSyncTimestamp
+ * 2. Merges pulled records into local stores (LWW for T2, ID-dedup for T1)
+ * 3. Pushes local records with isCloudSynced: false up to Supabase using UPSERT
+ * 4. Broadcasts newly pulled records to connected PWAs via WebSocket
+ */
+async function syncEdgeToCloudSupabase() {
+  if (!supabaseUrl || !supabaseKey) {
+    return;
+  }
+
+  const cleanBase = supabaseUrl.replace(/\/+$/, '');
+  const headers = {
+    apikey: supabaseKey,
+    Authorization: `Bearer ${supabaseKey}`,
+    'Content-Type': 'application/json',
+  };
+
+  const tablesToSync = [
+    { name: 'sales', entityType: 'sales', isT2: false, store: salesStore },
+    { name: 'customer_changes', entityType: 'customer_changes', isT2: false, store: customerChangesStore },
+    { name: 'credit_sales', entityType: 'credit_sales', isT2: false, store: creditSalesStore },
+    { name: 'cash_logs', entityType: 'cash_logs', isT2: false, store: cashLogsStore },
+    { name: 'stock_movements', entityType: 'stock_movements', isT2: false, store: stockMovementsStore },
+    { name: 'direct_grvs', entityType: 'direct_grvs', isT2: false, store: directGrvsStore },
+    { name: 'expenses', entityType: 'expenses', isT2: false, store: expensesStore },
+    { name: 'inventory', entityType: 'inventory', isT2: true, store: inventoryStore },
+    { name: 'customers', entityType: 'customers', isT2: true, store: customersStore },
+    { name: 'staff', entityType: 'staff', isT2: true, store: salespeopleStore },
+  ];
+
+  const newlyPulledRecords = [];
+
+  for (const t of tablesToSync) {
+    try {
+      // 1. Hub Cloud Pull (WHERE updated_at > lastCloudSyncTimestamp)
+      const queryTime = lastCloudSyncTimestamp > 0
+        ? new Date(lastCloudSyncTimestamp).toISOString()
+        : new Date(0).toISOString();
+      const pullUrl = `${cleanBase}/rest/v1/${t.name}?updated_at=gt.${queryTime}&order=updated_at.asc&limit=250`;
+
+      if (typeof fetch === 'function') {
+        const res = await fetch(pullUrl, { method: 'GET', headers });
+        if (res.ok) {
+          const cloudRecords = await res.json();
+          if (Array.isArray(cloudRecords) && cloudRecords.length > 0) {
+            console.log(`[Edge-to-Cloud] ☁️ Pulled ${cloudRecords.length} record(s) from Supabase table '${t.name}'`);
+            for (const cRec of cloudRecords) {
+              const recId = getEntityId(cRec, t.entityType);
+              if (!recId) continue;
+              const cleanId = String(recId).trim();
+
+              if (!t.isT2) {
+                // T1: ID Deduplication
+                const existingIdx = t.store.findIndex((s) => String(getEntityId(s, t.entityType)).trim() === cleanId);
+                if (existingIdx === -1) {
+                  cRec.isCloudSynced = true;
+                  t.store.push(cRec);
+                  newlyPulledRecords.push(cRec);
+                } else if (t.entityType === 'sales' && cRec.status && t.store[existingIdx].status !== cRec.status) {
+                  t.store[existingIdx].status = cRec.status;
+                  t.store[existingIdx].isCloudSynced = true;
+                  newlyPulledRecords.push(t.store[existingIdx]);
+                }
+              } else {
+                // T2: 5000ms LWW
+                const cloudUpdated = getRecordTimestamp(cRec);
+                const existingIdx = t.store.findIndex((s) => String(getEntityId(s, t.entityType)).trim() === cleanId);
+                if (existingIdx === -1) {
+                  cRec.isCloudSynced = true;
+                  t.store.push(cRec);
+                  newlyPulledRecords.push(cRec);
+                } else {
+                  const localUpdated = getRecordTimestamp(t.store[existingIdx]);
+                  if (cloudUpdated - localUpdated > 5000) {
+                    cRec.isCloudSynced = true;
+                    t.store[existingIdx] = cRec;
+                    newlyPulledRecords.push(cRec);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 2. Hub Cloud Push (local records with isCloudSynced: false using UPSERT)
+      const unsynced = t.store.filter((r) => r && r.isCloudSynced !== true);
+      if (unsynced.length > 0 && typeof fetch === 'function') {
+        const batchToPush = unsynced.slice(0, 50);
+        const pushUrl = `${cleanBase}/rest/v1/${t.name}`;
+        const pushRes = await fetch(pushUrl, {
+          method: 'POST',
+          headers: {
+            ...headers,
+            Prefer: 'resolution=merge-duplicates',
+          },
+          body: JSON.stringify(batchToPush),
+        });
+
+        if (pushRes.ok || pushRes.status === 201) {
+          batchToPush.forEach((r) => { r.isCloudSynced = true; });
+          console.log(`[Edge-to-Cloud] 🚀 Pushed and upserted ${batchToPush.length} record(s) to Supabase table '${t.name}'`);
+        }
+      }
+    } catch (tblErr) {
+      console.warn(`[Edge-to-Cloud] Notice syncing table '${t.name}':`, tblErr.message);
+    }
+  }
+
+  // Update HWM and schedule local save
+  lastCloudSyncTimestamp = Date.now();
+  scheduleSave();
+
+  // 3. Downstream Broadcast: Broadcast newly pulled records to connected PWAs
+  if (newlyPulledRecords.length > 0) {
+    console.log(`[Edge-to-Cloud] 📡 Broadcasting ${newlyPulledRecords.length} newly pulled cloud record(s) to connected terminals...`);
+    const broadcastPkt = {
+      type: 'HUB_CLOUD_BROADCAST',
+      action: 'HUB_CLOUD_BROADCAST',
+      records: newlyPulledRecords,
+      hubTimestamp: Date.now(),
+      branchId: hubBranchId,
+      count: newlyPulledRecords.length,
+    };
+
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        try {
+          client.send(JSON.stringify(broadcastPkt));
+        } catch (e) {}
+      }
+    });
+  }
+}
+
+// Edge-to-Cloud Sync: Every 10 minutes (and 10s after startup)
+setTimeout(() => { syncEdgeToCloudSupabase(); }, 10000);
+const CLOUD_SYNC_INTERVAL_MS = 10 * 60 * 1000;
+setInterval(() => {
+  syncEdgeToCloudSupabase();
+}, CLOUD_SYNC_INTERVAL_MS);
+
+

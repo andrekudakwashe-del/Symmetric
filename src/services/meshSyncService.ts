@@ -32,6 +32,8 @@ import {
   setStored,
   STORAGE_KEYS,
   mergeT1Records,
+  isPosActiveCheckout,
+  getTransactionsDigest,
   applyTombstone,
   recordTombstone,
   getTombstones,
@@ -146,6 +148,81 @@ import {
   markStocktakeSessionSyncComplete,
   SAIMETRIC_LAST_STOCKTAKE_SESSION_SYNC,
 } from './sync/highWaterMarks';
+import { EntitySnapshot } from './sync/SyncEnvelope';
+
+export { isPosActiveCheckout };
+
+/**
+ * 32-bit FNV-1a Checksum over sorted array of IDs
+ */
+export const computeIdsChecksum = (ids: string[]): string => {
+  if (!Array.isArray(ids) || ids.length === 0) return '00000000';
+  const sorted = [...ids].sort();
+  let hash = 0x811c9dc5;
+  for (const id of sorted) {
+    const str = String(id);
+    for (let i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    hash ^= 124; // '|'
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+};
+
+/**
+ * Generates compact aggregate snapshot for an entity type: count, totalSum, and idHash
+ */
+export const generateEntitySnapshot = (
+  entityType: string,
+  startDate?: string,
+  endDate?: string
+): EntitySnapshot => {
+  const digest = getTransactionsDigest(entityType, startDate, endDate);
+  const ids = digest.items.map((it) => String(it.id));
+  const idHash = computeIdsChecksum(ids);
+
+  return {
+    entityType: digest.entityType,
+    startDate,
+    endDate,
+    count: digest.count,
+    totalSum: Number(digest.totalSum.toFixed(2)),
+    idHash,
+    generatedAt: Date.now(),
+  };
+};
+
+export type PackageSyncMode =
+  | 'CLOUD_ONLY_SUPABASE'
+  | 'CLOUD_ONLY_APPSCRIPTS'
+  | 'HUB_ONLY'
+  | 'HUB_CLOUD';
+
+export const getPackageSyncMode = (): PackageSyncMode => {
+  try {
+    const comp = getCurrentCompany();
+    const strategy = comp?.sync_strategy || 'HUB_CLOUD';
+    const backendType =
+      comp?.backend_type ||
+      comp?.backend_config?.backendType ||
+      (comp?.sheet_id ? 'sheets_appscript' : 'room');
+
+    if (strategy === 'CLOUD_ONLY') {
+      if (backendType === 'supabase') {
+        return 'CLOUD_ONLY_SUPABASE';
+      }
+      return 'CLOUD_ONLY_APPSCRIPTS';
+    }
+    if (strategy === 'HUB_ONLY') {
+      return 'HUB_ONLY';
+    }
+    return 'HUB_CLOUD';
+  } catch {
+    return 'HUB_CLOUD';
+  }
+};
 
 export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE' | 'CLOUD_ONLY';
 
@@ -364,6 +441,7 @@ class MeshSyncManager {
   private isAwaitingDrainAck: boolean = false;
   private drainAckFallbackTimer: any = null;
   private lastBroadcastByItemId: Map<string, number> = new Map();
+  private autoHealIntervalTimer: number | null = null;
 
   // Chunked Ingestion & Async Progress State
   private syncProgressListeners: Array<(progress: MeshSyncProgress) => void> = [];
@@ -788,6 +866,7 @@ class MeshSyncManager {
     this.initBroadcastChannel();
     this.initVirtualMeshDefault();
     this.startOpportunisticCloudSyncTimer();
+    this.configurePackageAwareAutoHeal();
 
     // Subscribe to LocalHubConfig changes (URL changes or Force Local Hub toggles)
     LocalHubConfig.subscribe(() => {
@@ -1483,6 +1562,28 @@ class MeshSyncManager {
             return;
           }
 
+          // 0.4 Automated Background Reconciliation (Phase 3)
+          if (pType === 'RECON_SWEEP_TRIGGER') {
+            this.handleReconSweepTrigger(parsed);
+            return;
+          }
+          if (pType === 'SYNC_SNAPSHOT_REQUEST') {
+            this.handleSyncSnapshotRequest(parsed);
+            return;
+          }
+          if (pType === 'SYNC_ID_DIGEST_REQUEST') {
+            this.handleSyncIdDigestRequest(parsed);
+            return;
+          }
+          if (pType === 'RECON_BACKFILL_PAYLOAD') {
+            this.handleIncomingReconBackfill(parsed);
+            return;
+          }
+          if (pType === 'HUB_CLOUD_BROADCAST') {
+            this.handleHubCloudBroadcast(parsed);
+            return;
+          }
+
           // Termux WebSocket server stores and auto-replays historical packets on connect.
           // Queue in memory and process in small batches of 10 with 50ms pauses so the UI never freezes.
           if (Array.isArray(parsed)) {
@@ -1702,6 +1803,28 @@ class MeshSyncManager {
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_financial_report_response', { detail: packet }));
       }
+      return;
+    }
+
+    // Automated Background Reconciliation (Phase 3)
+    if (pType === 'RECON_SWEEP_TRIGGER') {
+      this.handleReconSweepTrigger(packet);
+      return;
+    }
+    if (pType === 'SYNC_SNAPSHOT_REQUEST') {
+      this.handleSyncSnapshotRequest(packet);
+      return;
+    }
+    if (pType === 'SYNC_ID_DIGEST_REQUEST') {
+      this.handleSyncIdDigestRequest(packet);
+      return;
+    }
+    if (pType === 'RECON_BACKFILL_PAYLOAD') {
+      this.handleIncomingReconBackfill(packet);
+      return;
+    }
+    if (pType === 'HUB_CLOUD_BROADCAST') {
+      this.handleHubCloudBroadcast(packet);
       return;
     }
 
@@ -3260,6 +3383,297 @@ class MeshSyncManager {
     return () => {
       this.connectionModeListeners = this.connectionModeListeners.filter((fn) => fn !== listener);
     };
+  }
+
+  // =========================================================================
+  // AUTOMATED RECONCILIATION & AUTO-HEAL ENGINE (PHASE 3)
+  // =========================================================================
+
+  public configurePackageAwareAutoHeal(): void {
+    if (this.autoHealIntervalTimer !== null) {
+      clearInterval(this.autoHealIntervalTimer);
+      this.autoHealIntervalTimer = null;
+    }
+
+    const mode = getPackageSyncMode();
+    console.log(`[Package Routing] 📦 Configuring Auto-Heal for mode: ${mode}`);
+
+    if (mode === 'CLOUD_ONLY_SUPABASE') {
+      // Constraint 1: Disable 30-min auto-heal interval entirely. Rely on Supabase native delta pulls.
+      console.log('[Package Routing] ⚡ CLOUD_ONLY_SUPABASE: 30-min auto-heal sweep disabled. Native delta pulls active.');
+      return;
+    }
+
+    if (mode === 'CLOUD_ONLY_APPSCRIPTS') {
+      // Constraint 2: Throttle to every 4 hours to prevent Google API rate limits.
+      const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+      console.log('[Package Routing] ⏳ CLOUD_ONLY_APPSCRIPTS: Auto-heal throttled to every 4 hours.');
+      this.autoHealIntervalTimer = window.setInterval(() => {
+        this.runClientAutoHealSweep();
+      }, FOUR_HOURS_MS);
+      return;
+    }
+
+    // Constraint 3: HUB_ONLY or HUB_CLOUD allows fast 30-minute interval against Local Hub ONLY.
+    const THIRTY_MINS_MS = 30 * 60 * 1000;
+    console.log(`[Package Routing] 🚀 ${mode}: Fast 30-minute auto-heal enabled against Local Hub.`);
+    this.autoHealIntervalTimer = window.setInterval(() => {
+      this.runClientAutoHealSweep();
+    }, THIRTY_MINS_MS);
+  }
+
+  public runClientAutoHealSweep(): void {
+    const mode = getPackageSyncMode();
+    if (mode === 'CLOUD_ONLY_SUPABASE') return;
+
+    // POS Busy Check: If cart is active in checkout, defer sweep by 60s
+    if (isPosActiveCheckout()) {
+      console.log('[Auto-Heal] 🛒 POS active checkout. Deferring scheduled auto-heal sweep by 60s.');
+      setTimeout(() => this.runClientAutoHealSweep(), 60000);
+      return;
+    }
+
+    if (mode === 'HUB_ONLY' || mode === 'HUB_CLOUD') {
+      // CRITICAL: Must ONLY run snapshot sweep against Local Hub. PWA Supabase adapter is disabled.
+      if (!this.localHubWs || this.localHubWs.readyState !== WebSocket.OPEN) {
+        console.log('[Auto-Heal] Local Hub not connected. Deferring Hub sweep.');
+        return;
+      }
+      const sweepId = `client-sweep-${Date.now()}`;
+      const trigger = {
+        type: 'RECON_SWEEP_TRIGGER',
+        action: 'RECON_SWEEP_TRIGGER',
+        sweepId,
+        targetEntities: [
+          'sales',
+          'customer_changes',
+          'credit_sales',
+          'cash_logs',
+          'stock_movements',
+          'direct_grvs',
+          'expenses',
+          'inventory',
+          'customers',
+          'staff',
+        ],
+        hubTimestamp: Date.now(),
+        originDeviceId: this.config.deviceId,
+      };
+      try {
+        this.localHubWs.send(JSON.stringify(trigger));
+        console.log(`[Auto-Heal] 🧹 Dispatched snapshot sweep trigger (${sweepId}) to Local Hub.`);
+      } catch (err: any) {
+        console.warn('[Auto-Heal] Error dispatching sweep trigger to Local Hub:', err?.message);
+      }
+    } else if (mode === 'CLOUD_ONLY_APPSCRIPTS') {
+      console.log('[Auto-Heal] ☁️ Running 4-hour throttled Cloud sweep for App Scripts.');
+      processSyncQueue().catch(() => {});
+    }
+  }
+
+  public handleReconSweepTrigger(packet: any): void {
+    const sweepId = packet.sweepId || `sweep-${Date.now()}`;
+    const targetEntities: string[] = Array.isArray(packet.targetEntities)
+      ? packet.targetEntities
+      : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'staff'];
+
+    // POS Busy Check: If cashier is ringing sales, defer sweep by 60s
+    if (isPosActiveCheckout()) {
+      console.log(`[Recon Sweep] 🛒 POS terminal is active in checkout. Deferring sweep (${sweepId}) by 60s.`);
+      setTimeout(() => {
+        this.handleReconSweepTrigger(packet);
+      }, 60000);
+      return;
+    }
+
+    console.log(`[Recon Sweep] 🚀 Processing snapshot sweep (${sweepId}) for ${targetEntities.length} entities...`);
+
+    for (const ent of targetEntities) {
+      try {
+        const snapshot = generateEntitySnapshot(ent, packet.dateRange?.start, packet.dateRange?.end);
+        const snapPacket = {
+          type: 'SYNC_SNAPSHOT_RESPONSE',
+          action: 'SYNC_SNAPSHOT_RESPONSE',
+          sweepId,
+          entityType: ent,
+          snapshot,
+          deviceId: this.config.deviceId,
+          timestamp: Date.now(),
+        };
+
+        if (this.localHubWs && this.localHubWs.readyState === WebSocket.OPEN) {
+          this.localHubWs.send(JSON.stringify(snapPacket));
+        }
+      } catch (err: any) {
+        console.warn(`[Recon Sweep] Error generating snapshot for ${ent}:`, err?.message);
+      }
+    }
+  }
+
+  public handleSyncSnapshotRequest(packet: any): void {
+    const sweepId = packet.sweepId || `sweep-${Date.now()}`;
+    const entity = packet.entityType;
+    if (!entity) return;
+
+    if (isPosActiveCheckout()) {
+      console.log(`[Recon Sweep] 🛒 POS active checkout. Deferring snapshot request for ${entity} by 60s.`);
+      setTimeout(() => this.handleSyncSnapshotRequest(packet), 60000);
+      return;
+    }
+
+    try {
+      const snapshot = generateEntitySnapshot(entity, packet.startDate, packet.endDate);
+      const snapPacket = {
+        type: 'SYNC_SNAPSHOT_RESPONSE',
+        action: 'SYNC_SNAPSHOT_RESPONSE',
+        sweepId,
+        entityType: entity,
+        snapshot,
+        deviceId: this.config.deviceId,
+        timestamp: Date.now(),
+      };
+      if (this.localHubWs && this.localHubWs.readyState === WebSocket.OPEN) {
+        this.localHubWs.send(JSON.stringify(snapPacket));
+      }
+    } catch (err: any) {
+      console.warn(`[Recon Sweep] Error responding to snapshot request for ${entity}:`, err?.message);
+    }
+  }
+
+  public handleSyncIdDigestRequest(packet: any): void {
+    const sweepId = packet.sweepId || `sweep-${Date.now()}`;
+    const entity = packet.entityType;
+    if (!entity) return;
+
+    if (isPosActiveCheckout()) {
+      console.log(`[Recon Sweep] 🛒 POS active checkout. Deferring ID digest request for ${entity} by 60s.`);
+      setTimeout(() => this.handleSyncIdDigestRequest(packet), 60000);
+      return;
+    }
+
+    try {
+      const digest = getTransactionsDigest(entity, packet.startDate, packet.endDate);
+      const responsePacket = {
+        type: 'SYNC_ID_DIGEST_RESPONSE',
+        action: 'SYNC_ID_DIGEST_RESPONSE',
+        sweepId,
+        entityType: entity,
+        digest,
+        deviceId: this.config.deviceId,
+        timestamp: Date.now(),
+      };
+
+      if (this.localHubWs && this.localHubWs.readyState === WebSocket.OPEN) {
+        this.localHubWs.send(JSON.stringify(responsePacket));
+        console.log(`[Recon Sweep] 📤 Sent granular ID digest for "${entity}" (${digest.count} items) to Hub`);
+      }
+    } catch (err: any) {
+      console.warn(`[Recon Sweep] Error responding to ID digest request for ${entity}:`, err?.message);
+    }
+  }
+
+  public handleIncomingReconBackfill(packet: any): void {
+    if (!packet) return;
+    const sweepId = packet.sweepId || 'unknown';
+    const entityType = String(packet.entityType || '').toLowerCase().trim();
+    const records = packet.records;
+    if (!Array.isArray(records) || records.length === 0) return;
+
+    if (isPosActiveCheckout()) {
+      console.log(`[Auto-Heal] 🛒 POS active checkout. Deferring backfill ingestion (${records.length} records) by 60s.`);
+      setTimeout(() => {
+        this.handleIncomingReconBackfill(packet);
+      }, 60000);
+      return;
+    }
+
+    console.log(`[Auto-Heal] 📥 Ingesting backfill for "${entityType}": chunk ${packet.chunkIndex ?? 0}/${packet.totalChunks ?? 1} (${records.length} records, sweep: ${sweepId})`);
+
+    const CHUNK_SIZE = 25;
+    const totalBatches = Math.ceil(records.length / CHUNK_SIZE);
+    let currentBatch = 0;
+
+    const processNextBatch = () => {
+      if (currentBatch >= totalBatches) {
+        this.dispatchSilentReconUiEvent(entityType);
+        return;
+      }
+
+      const start = currentBatch * CHUNK_SIZE;
+      const batchRecords = records.slice(start, start + CHUNK_SIZE);
+
+      if (entityType === 'sales' || entityType === 'sale') {
+        mergeT1Records(STORAGE_KEYS.SALES, batchRecords);
+      } else if (entityType === 'customer_changes' || entityType === 'customer_change') {
+        mergeT1Records(STORAGE_KEYS.CUSTOMER_CHANGES, batchRecords);
+      } else if (entityType === 'credit_sales' || entityType === 'credit_sale') {
+        mergeT1Records(STORAGE_KEYS.CREDIT_SALES, batchRecords);
+      } else if (entityType === 'cash_logs' || entityType === 'cash_log') {
+        mergeT1Records(STORAGE_KEYS.CASH_LOGS, batchRecords);
+      } else if (entityType === 'stock_movements' || entityType === 'stock_movement') {
+        mergeT1Records(STORAGE_KEYS.STOCK_MOVEMENTS, batchRecords);
+      } else if (entityType === 'direct_grvs' || entityType === 'direct_grv' || entityType === 'grv') {
+        mergeT1Records(STORAGE_KEYS.DIRECT_GRVS, batchRecords);
+      } else if (entityType === 'expenses' || entityType === 'expense') {
+        mergeT1Records(STORAGE_KEYS.EXPENSES, batchRecords);
+      } else if (entityType === 'inventory' || entityType === 'inventory_item' || entityType === 'products') {
+        for (const item of batchRecords) {
+          ingestMeshInventoryItem({ ...item, fromMesh: true });
+        }
+      } else if (entityType === 'customers' || entityType === 'customer') {
+        for (const cust of batchRecords) {
+          ingestMeshCustomer({ ...cust, fromMesh: true }, { fromSync: true });
+        }
+      } else if (entityType === 'staff' || entityType === 'salespeople' || entityType === 'users') {
+        for (const sp of batchRecords) {
+          ingestMeshStaff({ ...sp, fromMesh: true } as any, { fromSync: true });
+        }
+      }
+
+      currentBatch++;
+      if (currentBatch < totalBatches) {
+        setTimeout(processNextBatch, 15);
+      } else {
+        this.dispatchSilentReconUiEvent(entityType);
+      }
+    };
+
+    processNextBatch();
+  }
+
+  private dispatchSilentReconUiEvent(entityType: string): void {
+    if (typeof window === 'undefined') return;
+    const norm = entityType.toLowerCase().trim();
+    if (norm === 'sales' || norm === 'sale') {
+      window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+    } else if (norm === 'customer_changes' || norm === 'customer_change') {
+      window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated'));
+    } else if (norm === 'credit_sales' || norm === 'credit_sale') {
+      window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated'));
+    } else if (norm === 'cash_logs' || norm === 'cash_log') {
+      window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    } else if (norm === 'stock_movements' || norm === 'direct_grvs' || norm === 'inventory') {
+      window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+    } else if (norm === 'expenses' || norm === 'expense') {
+      window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    } else if (norm === 'customers' || norm === 'customer') {
+      window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+    } else if (norm === 'staff' || norm === 'salespeople' || norm === 'users') {
+      window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+    }
+  }
+
+  public handleHubCloudBroadcast(packet: any): void {
+    if (!packet || !Array.isArray(packet.records)) return;
+    console.log(`[Auto-Heal] ☁️ Hub broadcasted ${packet.records.length} upstream cloud record(s) to this terminal.`);
+    this.handleIncomingReconBackfill({
+      sweepId: `cloud-broadcast-${Date.now()}`,
+      entityType: packet.entityType || 'sales',
+      records: packet.records,
+      chunkIndex: 0,
+      totalChunks: 1,
+    });
   }
 
   public onScanSuccess(decodedText: string): void {

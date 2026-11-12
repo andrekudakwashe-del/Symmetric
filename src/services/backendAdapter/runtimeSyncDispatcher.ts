@@ -274,6 +274,22 @@ export class RuntimeSyncDispatcherService {
     companyId: string,
     startTime: number
   ): Promise<RuntimeDispatchResult> {
+    try {
+      const compRaw = localStorage.getItem('saimetric_room_company') || localStorage.getItem('saimetric_company');
+      if (compRaw) {
+        const comp = JSON.parse(compRaw);
+        if (comp?.sync_strategy === 'HUB_CLOUD' || comp?.sync_strategy === 'HUB_ONLY') {
+          return {
+            success: true,
+            backendType: 'supabase',
+            recordsProcessed: 1,
+            latencyMs: Date.now() - startTime,
+            message: 'Direct Supabase PWA dispatch disabled (HUB_CLOUD/HUB_ONLY isolation enforced).',
+          };
+        }
+      }
+    } catch {}
+
     const { projectUrl, anonKey, serviceRoleKey } = config.supabase;
 
     if (!projectUrl) {

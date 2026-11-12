@@ -16,6 +16,17 @@ export class SupabaseBackendAdapter implements IBackendAdapter {
   readonly description = 'Relational PostgreSQL database with enterprise row-level security (RLS), real-time replication, and high-throughput SQL analytics.';
 
   isConfigured(config: TenantBackendConfig): boolean {
+    try {
+      const compRaw = localStorage.getItem('saimetric_room_company') || localStorage.getItem('saimetric_company');
+      if (compRaw) {
+        const comp = JSON.parse(compRaw);
+        if (comp?.sync_strategy === 'HUB_CLOUD' || comp?.sync_strategy === 'HUB_ONLY') {
+          // PWA's Supabase adapter is completely disabled in HUB_CLOUD / HUB_ONLY.
+          // The Local Hub serves as the Edge Gateway to Supabase.
+          return false;
+        }
+      }
+    } catch {}
     const sb = config.supabase;
     return !!(sb && sb.projectUrl && sb.projectUrl.startsWith('http') && sb.anonKey && sb.anonKey.trim().length > 10);
   }

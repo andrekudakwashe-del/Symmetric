@@ -11773,6 +11773,249 @@ export const ingestMeshGoodsReceived = (entry: any): boolean => {
   return true;
 };
 
+export const isPosActiveCheckout = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  try {
+    const raw = localStorage.getItem('pos_cart_drafts');
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    const items = Array.isArray(parsed) ? parsed : parsed?.cart || parsed?.items;
+    return Array.isArray(items) && items.length > 0;
+  } catch (e) {
+    return false;
+  }
+};
+
+export const getTransactionsDigest = (
+  entityType: string,
+  startDate?: string,
+  endDate?: string
+): {
+  entityType: string;
+  startDate?: string;
+  endDate?: string;
+  items: Array<{
+    id: string;
+    total?: number;
+    status?: string;
+    timestamp?: number;
+    updatedAt?: number;
+  }>;
+  count: number;
+  totalSum: number;
+  generatedAt: number;
+} => {
+  const norm = String(entityType || '').toLowerCase().trim();
+  const startTime = startDate ? new Date(startDate).getTime() : 0;
+  const endTime = endDate ? new Date(endDate).getTime() : Infinity;
+
+  const inRange = (timeMs?: number) => {
+    if (!timeMs || isNaN(timeMs) || timeMs <= 0) return true;
+    return timeMs >= startTime && timeMs <= endTime;
+  };
+
+  const items: Array<{
+    id: string;
+    total?: number;
+    status?: string;
+    timestamp?: number;
+    updatedAt?: number;
+  }> = [];
+  let totalSum = 0;
+
+  // 1. Sales (T1)
+  if (norm === 'sales' || norm === 'sale') {
+    const rawSales = getRawStoredSales();
+    for (const s of rawSales) {
+      if (!s || !s.id) continue;
+      const t = parseTimestampMs(s.timestamp || s.updatedAt || s.date);
+      if (inRange(t)) {
+        const amt = Number(s.total) || 0;
+        if (s.status !== 'Voided' && s.status !== 'Refunded') {
+          totalSum += amt;
+        }
+        items.push({
+          id: s.id,
+          total: amt,
+          status: s.status || 'Completed',
+          timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 2. Customer Changes (T1)
+  else if (norm === 'customer_changes' || norm === 'customer_change') {
+    const rawChanges = getAllCustomerChanges();
+    for (const c of rawChanges) {
+      const id = c.id || c.changeId;
+      if (!id) continue;
+      const t = parseTimestampMs(c.timestamp || c.date);
+      if (inRange(t)) {
+        const net = (Number(c.in) || 0) - (Number(c.out) || 0);
+        totalSum += net;
+        items.push({
+          id,
+          total: net,
+          timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 3. Credit Sales (T1)
+  else if (norm === 'credit_sales' || norm === 'credit_sale') {
+    const rawCredits = getAllCreditSales();
+    for (const c of rawCredits) {
+      const id = c.id || c.creditId;
+      if (!id) continue;
+      const t = parseTimestampMs(c.timestamp || c.date);
+      if (inRange(t)) {
+        const amt = Number(c.amount || c.out) || 0;
+        totalSum += amt;
+        items.push({
+          id,
+          total: amt,
+          status: c.status || 'Pending',
+          timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 4. Cash Logs (T1)
+  else if (norm === 'cash_logs' || norm === 'cash_log') {
+    const rawLogs = getAllCashLogs();
+    for (const c of rawLogs) {
+      const id = c.id || `${c.date}_${c.timestamp}`;
+      if (!id) continue;
+      const t = parseTimestampMs(c.timestamp || c.date);
+      if (inRange(t)) {
+        const net = (Number(c.in) || 0) - (Number(c.out) || 0);
+        totalSum += net;
+        items.push({
+          id,
+          total: net,
+          timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 5. Stock Movements (T1)
+  else if (norm === 'stock_movements' || norm === 'stock_movement') {
+    const rawMoves = getStockMovements();
+    for (const m of rawMoves) {
+      const id = m.id || m.txnId || m.movementId;
+      if (!id) continue;
+      const t = parseTimestampMs(m.timestamp || m.date);
+      if (inRange(t)) {
+        const qty = Number(m.quantity || m.qty) || 0;
+        totalSum += qty;
+        items.push({
+          id,
+          total: qty,
+          timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 6. Direct GRVs (T1)
+  else if (norm === 'direct_grvs' || norm === 'direct_grv' || norm === 'grv') {
+    const rawGrvs = getDirectGrvs();
+    for (const g of rawGrvs) {
+      const id = g.id || g.grvId || g.reference;
+      if (!id) continue;
+      const t = parseTimestampMs(g.timestamp || g.date);
+      if (inRange(t)) {
+        const amt = Number(g.totalAmount || g.total) || 0;
+        totalSum += amt;
+        items.push({
+          id,
+          total: amt,
+          timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 7. Expenses (T1)
+  else if (norm === 'expenses' || norm === 'expense') {
+    const rawExp = getAllExpenses();
+    for (const e of rawExp) {
+      if (!e || !e.id) continue;
+      const t = parseTimestampMs(e.timestamp || e.date);
+      if (inRange(t)) {
+        const amt = Number(e.amount) || 0;
+        totalSum += amt;
+        items.push({
+          id: e.id,
+          total: amt,
+          timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 8. Inventory Catalog (T2)
+  else if (norm === 'inventory' || norm === 'inventory_item' || norm === 'products') {
+    const rawInv = getAllInventoryItems();
+    for (const i of rawInv) {
+      const id = i.itemId || i.id;
+      if (!id) continue;
+      const up = parseTimestampMs(i.updatedAt || i.lastUpdated);
+      const units = Number(i.totalUnits || i.stockSingles) || 0;
+      totalSum += units;
+      items.push({
+        id,
+        total: units,
+        updatedAt: up,
+      });
+    }
+  }
+
+  // 9. Customers (T2)
+  else if (norm === 'customers' || norm === 'customer') {
+    const rawCust = getCustomers();
+    for (const c of rawCust) {
+      const id = c.customerId || c.id;
+      if (!id) continue;
+      const up = parseTimestampMs(c.updatedAt || c.lastUpdated);
+      const limit = Number(c.creditLimit) || 0;
+      totalSum += limit;
+      items.push({
+        id,
+        total: limit,
+        updatedAt: up,
+      });
+    }
+  }
+
+  // 10. Staff (T2)
+  else if (norm === 'staff' || norm === 'salespeople' || norm === 'users') {
+    const rawStaff = getAllSalespeople();
+    for (const s of rawStaff) {
+      if (!s || !s.id) continue;
+      const up = parseTimestampMs(s.updatedAt || s.lastUpdated);
+      items.push({
+        id: s.id,
+        updatedAt: up,
+      });
+    }
+  }
+
+  return {
+    entityType: norm,
+    startDate,
+    endDate,
+    items,
+    count: items.length,
+    totalSum: Math.round(totalSum * 100) / 100,
+    generatedAt: Date.now(),
+  };
+};
+
 export const getDeltaRecordsSince = (sinceIsoTimestamp: string) => {
   const sinceTime = new Date(sinceIsoTimestamp).getTime();
   const filterByTime = (records: any[]) => {
