@@ -1,6 +1,0 @@
-{
-  "summary": "Document root cause diagnosis and fix for prices reverting to default $3 on reconnecting to the Local Hub or refreshing apps.",
-  "updatedAt": "2026-11-03T13:32:29.274515658Z",
-  "requestFeedback": true,
-  "userFacing": true
-}

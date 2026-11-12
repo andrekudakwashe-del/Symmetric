@@ -167,12 +167,21 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     setManualNotes('');
   };
 
-  // Subscribe to real-time database updates
+  // Subscribe to real-time database updates and window events
   useEffect(() => {
-    const unsub = subscribeToDatabase(() => {
+    const handleRefresh = () => {
       setReportData(getCustomerCreditReport());
-    });
-    return () => unsub();
+    };
+    const unsub = subscribeToDatabase(handleRefresh);
+    window.addEventListener('saimetric_credit_sales_updated', handleRefresh);
+    window.addEventListener('saimetric_customers_updated', handleRefresh);
+    window.addEventListener('saimetric_sales_updated', handleRefresh);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_credit_sales_updated', handleRefresh);
+      window.removeEventListener('saimetric_customers_updated', handleRefresh);
+      window.removeEventListener('saimetric_sales_updated', handleRefresh);
+    };
   }, []);
 
   const { items, summary } = reportData;

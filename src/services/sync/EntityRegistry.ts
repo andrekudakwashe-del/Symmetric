@@ -32,8 +32,8 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     requiresBroadcast: true,
     requiresIngest: true,
     requiresHubLWW: false,
-    uiEventName: 'saimetric_customers_updated',
-    description: 'Audit log of customer profile modifications',
+    uiEventName: 'saimetric_customer_changes_updated',
+    description: 'Audit log of customer change funds held or paid out',
   },
   // AUDIT-NOTE: Row 10 (Systemic indirect mutation broadcast L1)
   credit_sale: {
@@ -341,6 +341,16 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     requiresHubLWW: true,
     uiEventName: 'saimetric_suppliers_updated',
     description: 'Vendor / supplier directory record',
+  },
+  credit_group: {
+    entityType: 'credit_group',
+    class: 'T2',
+    appendOnly: false,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: true,
+    uiEventName: 'saimetric_credit_groups_updated',
+    description: 'Customer credit group tiers and limits',
   },
   // AUDIT-NOTE: Row 3 (Hub LWW L5) & Row 15 (Stocktake session list chunking L7)
   stocktake_session: {

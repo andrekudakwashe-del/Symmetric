@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { Salesperson, ActiveTab } from '../../types';
 import {
   getSales,
@@ -62,6 +62,19 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
   const cashCounts = getCashCounts();
   const reconciliations = getReconciliations();
   const syncQueue = getSyncQueue();
+
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const handleSyncUpdate = () => setTick((t) => t + 1);
+    window.addEventListener('saimetric_customer_changes_updated', handleSyncUpdate);
+    window.addEventListener('saimetric_credit_sales_updated', handleSyncUpdate);
+    window.addEventListener('saimetric_sales_updated', handleSyncUpdate);
+    return () => {
+      window.removeEventListener('saimetric_customer_changes_updated', handleSyncUpdate);
+      window.removeEventListener('saimetric_credit_sales_updated', handleSyncUpdate);
+      window.removeEventListener('saimetric_sales_updated', handleSyncUpdate);
+    };
+  }, []);
 
   const todayStr = new Date().toISOString().split('T')[0];
 

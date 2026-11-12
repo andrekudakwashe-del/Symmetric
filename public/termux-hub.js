@@ -211,6 +211,7 @@ let cashLiftsStore = [];
 let cashLogsStore = [];
 let customerChangesStore = [];
 let creditSalesStore = [];
+let creditGroupsStore = [];
 let stockMovementsStore = [];
 let expensesStore = [];
 let cashTransfersStore = [];
@@ -411,6 +412,7 @@ function pruneOldRecords() {
   cashLiftsStore = cashLiftsStore.filter(shouldRetain);
   customerChangesStore = customerChangesStore.filter(shouldRetain);
   creditSalesStore = creditSalesStore.filter(shouldRetain);
+  creditGroupsStore = creditGroupsStore.filter(shouldRetain);
   stockMovementsStore = stockMovementsStore.filter(shouldRetain);
   expensesStore = expensesStore.filter(shouldRetain);
   cashTransfersStore = cashTransfersStore.filter(shouldRetain);
@@ -439,6 +441,7 @@ function loadData() {
       if (Array.isArray(parsed.cashLogs)) cashLogsStore = parsed.cashLogs;
       if (Array.isArray(parsed.customerChanges)) customerChangesStore = parsed.customerChanges;
       if (Array.isArray(parsed.creditSales)) creditSalesStore = parsed.creditSales;
+      if (Array.isArray(parsed.creditGroups)) creditGroupsStore = parsed.creditGroups;
       if (Array.isArray(parsed.stockMovements)) stockMovementsStore = parsed.stockMovements;
       if (Array.isArray(parsed.expenses)) expensesStore = parsed.expenses;
       if (Array.isArray(parsed.cashTransfers)) cashTransfersStore = parsed.cashTransfers;
@@ -512,6 +515,7 @@ function saveData() {
       cashLogs: cashLogsStore.slice(0, 2000),
       customerChanges: customerChangesStore.slice(0, 2000),
       creditSales: creditSalesStore.slice(0, 2000),
+      creditGroups: creditGroupsStore,
       stockMovements: stockMovementsStore.slice(0, 2000),
       expenses: expensesStore.slice(0, 1000),
       cashTransfers: cashTransfersStore.slice(0, 1000),
@@ -703,6 +707,7 @@ wss.on('connection', (ws, req) => {
         cashLogsStore = [];
         customerChangesStore = [];
         creditSalesStore = [];
+        creditGroupsStore = [];
         stockMovementsStore = [];
         expensesStore = [];
         cashTransfersStore = [];
@@ -1764,6 +1769,76 @@ wss.on('connection', (ws, req) => {
           }
         }
 
+        // =====================================================================
+        // 1.1 POS PARENT-CHILD EXTRACTION (CUSTOMER CHANGE & CREDIT SALES)
+        // =====================================================================
+        const amountToLeaveBehind =
+          saleObj?.changeAmountLeftBehind !== undefined
+            ? Number(saleObj.changeAmountLeftBehind)
+            : (Number(saleObj?.changeDue) || 0);
+
+        if (saleObj && saleObj.changeLeftBehind && amountToLeaveBehind > 0) {
+          const chgId = `CHG-${saleId}`;
+          const existingChgIdx = customerChangesStore.findIndex(
+            (c) => c.id === chgId || c.changeId === chgId || c.reference === saleId || (c.notes && c.notes.includes(saleId))
+          );
+          if (existingChgIdx < 0) {
+            const chgEntry = {
+              id: chgId,
+              changeId: chgId,
+              timestamp: saleObj.timestamp || new Date().toISOString(),
+              date: saleObj.date || (saleObj.timestamp ? saleObj.timestamp.split('T')[0] : new Date().toISOString().split('T')[0]),
+              staffId: saleObj.staffId || '001',
+              staffName: saleObj.staffName || 'Cashier',
+              customerId: saleObj.customerId || '',
+              customerName: saleObj.customerName || 'Customer',
+              company_id: saleObj.company_id || saleObj.companyId || hubTenantId,
+              branch_id: saleObj.branch_id || saleObj.branchId || hubBranchId,
+              in: amountToLeaveBehind,
+              out: 0,
+              notes: `Change left behind (${amountToLeaveBehind.toFixed(2)}) from POS Invoice #${saleId}`,
+              reference: saleId,
+            };
+            customerChangesStore.unshift(chgEntry);
+            console.log(`[Termux Hub] 📥 Extracted Child Customer Change [${chgId}] from Sale #${saleId} ($${amountToLeaveBehind})`);
+          }
+        }
+
+        if (saleObj && (saleObj.paymentMethod === 'Credit' || (saleObj.creditAmount && Number(saleObj.creditAmount) > 0))) {
+          const crdId = `CR-${saleId}`;
+          const existingCrdIdx = creditSalesStore.findIndex(
+            (c) => c.id === crdId || c.creditId === crdId || (c.notes && c.notes.includes(saleId))
+          );
+          if (existingCrdIdx < 0) {
+            const deposit = Number(saleObj.creditDeposit) || 0;
+            const totalCreditAmount =
+              saleObj.creditAmount !== undefined && Number(saleObj.creditAmount) > 0
+                ? Number(saleObj.creditAmount)
+                : Number(saleObj.total || 0);
+            const crdEntry = {
+              id: crdId,
+              creditId: crdId,
+              timestamp: saleObj.timestamp || new Date().toISOString(),
+              date: saleObj.date || (saleObj.timestamp ? saleObj.timestamp.split('T')[0] : new Date().toISOString().split('T')[0]),
+              staffId: saleObj.staffId || '001',
+              staffName: saleObj.staffName || 'Staff',
+              customerId: saleObj.customerId || '',
+              customerName: saleObj.customerName || 'Customer',
+              company_id: saleObj.company_id || saleObj.companyId || hubTenantId,
+              branch_id: saleObj.branch_id || saleObj.branchId || hubBranchId,
+              amount: totalCreditAmount,
+              out: totalCreditAmount,
+              in: deposit,
+              itemDescription: saleObj.itemsSummary || 'POS Goods on Credit',
+              dueDate: saleObj.creditDueDate || '',
+              notes: `POS Credit Sale Invoice #${saleId}${deposit > 0 ? ` (${deposit.toFixed(2)} deposit paid)` : ''}`,
+              status: deposit >= totalCreditAmount && totalCreditAmount > 0 ? 'Paid' : (deposit > 0 ? 'Partial' : 'Pending'),
+            };
+            creditSalesStore.unshift(crdEntry);
+            console.log(`[Termux Hub] 📥 Extracted Child Credit Sale [${crdId}] from Sale #${saleId} ($${totalCreditAmount})`);
+          }
+        }
+
         scheduleSave();
 
         // Send point-to-point SYNC_RECEIPT ACK directly back to the sending device (non-legacy only)
@@ -2084,24 +2159,68 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 7. TRANSACTIONAL DATA: CUSTOMER CHANGE & CREDIT SALES (APPEND-ONLY)
       // =====================================================================
-      if ((pType === 'CUSTOMER_CHANGE' || sheetName === 'CustomerChange') && payload && payload.changeId) {
-        const exIdx = customerChangesStore.findIndex((c) => c.changeId === payload.changeId || c.id === payload.changeId);
+      const isCustomerChangePacket =
+        pType === 'CUSTOMER_CHANGE' ||
+        pType === 'CUSTOMER_CHANGE_SYNC' ||
+        pType === 'customer_change' ||
+        sheetName === 'CustomerChange' ||
+        packet.entityType === 'customer_change';
+      const changeId = payload ? (payload.changeId || payload.id) : null;
+
+      if (isCustomerChangePacket && payload && changeId) {
+        const normChange = { ...payload, id: changeId, changeId };
+        const exIdx = customerChangesStore.findIndex((c) => c.changeId === changeId || c.id === changeId);
         if (exIdx >= 0) {
-          customerChangesStore[exIdx] = { ...customerChangesStore[exIdx], ...payload };
+          customerChangesStore[exIdx] = { ...customerChangesStore[exIdx], ...normChange };
         } else {
-          customerChangesStore.unshift(payload);
-          console.log(`[Termux Hub] 📥 Accepted Customer Change [${payload.changeId}] (Append-Only)`);
+          customerChangesStore.unshift(normChange);
+          console.log(`[Termux Hub] 📥 Accepted Customer Change [${changeId}] (Append-Only)`);
         }
         scheduleSave();
       }
 
-      if ((pType === 'CREDIT_SALE' || sheetName === 'CreditSales') && payload && payload.creditId) {
-        const exIdx = creditSalesStore.findIndex((c) => c.creditId === payload.creditId || c.id === payload.creditId);
+      const isCreditSalePacket =
+        pType === 'CREDIT_SALE' ||
+        pType === 'CREDIT_SALE_SYNC' ||
+        pType === 'credit_sale' ||
+        sheetName === 'CreditSales' ||
+        packet.entityType === 'credit_sale';
+      const creditId = payload ? (payload.creditId || payload.id) : null;
+
+      if (isCreditSalePacket && payload && creditId) {
+        const normCredit = { ...payload, id: creditId, creditId };
+        const exIdx = creditSalesStore.findIndex((c) => c.creditId === creditId || c.id === creditId);
         if (exIdx >= 0) {
-          creditSalesStore[exIdx] = { ...creditSalesStore[exIdx], ...payload };
+          creditSalesStore[exIdx] = { ...creditSalesStore[exIdx], ...normCredit };
         } else {
-          creditSalesStore.unshift(payload);
-          console.log(`[Termux Hub] 📥 Accepted Credit Sale [${payload.creditId}] (Append-Only)`);
+          creditSalesStore.unshift(normCredit);
+          console.log(`[Termux Hub] 📥 Accepted Credit Sale [${creditId}] (Append-Only)`);
+        }
+        scheduleSave();
+      }
+
+      // =====================================================================
+      // 7.1 CONFIGURATION DATA: CREDIT GROUPS (T2 - LWW WITH 5000ms TOLERANCE)
+      // =====================================================================
+      const isCreditGroupPacket =
+        pType === 'CREDIT_GROUP_SYNC' ||
+        pType === 'credit_group' ||
+        sheetName === 'CreditGroups' ||
+        packet.entityType === 'credit_group';
+      const groupId = payload ? (payload.id || payload.groupId) : null;
+
+      if (isCreditGroupPacket && payload && groupId) {
+        const exIdx = creditGroupsStore.findIndex((g) => g.id === groupId || g.groupId === groupId);
+        const incomingTime = getTimestamp(payload) || Date.now();
+        if (exIdx >= 0) {
+          const existingTime = getTimestamp(creditGroupsStore[exIdx]) || 0;
+          if (incomingTime >= existingTime - 5000) {
+            creditGroupsStore[exIdx] = { ...creditGroupsStore[exIdx], ...payload, id: groupId };
+            console.log(`[Termux Hub] 🔄 Updated Credit Group [${groupId}] via LWW`);
+          }
+        } else {
+          creditGroupsStore.push({ ...payload, id: groupId });
+          console.log(`[Termux Hub] 📥 Added new Credit Group [${groupId}]`);
         }
         scheduleSave();
       }
@@ -2975,6 +3094,7 @@ wss.on('connection', (ws, req) => {
             businessDayClosures: businessDayClosuresStore,
             electronicSettlements: electronicSettlementsStore,
             categories: categoriesStore,
+            creditGroups: creditGroupsStore,
             stocktakeSessions: stocktakeSessionsStore,
             stocktakeSegments: stocktakeSegmentsStore,
             tombstones: missedTombstones,

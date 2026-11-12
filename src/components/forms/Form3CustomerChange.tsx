@@ -380,15 +380,24 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
     address: '',
   });
 
-  // Subscribe to DB updates
+  // Subscribe to DB updates and sync events
   useEffect(() => {
-    const unsub = subscribeToDatabase(() => {
+    const handleRefresh = () => {
       setCustomers(getCustomers());
       setSalespeople(getSalespeople());
       setHistoryChangeLogs(getCustomerChanges());
       setHistoryCreditLogs(getCreditSales());
-    });
-    return () => unsub();
+    };
+    const unsub = subscribeToDatabase(handleRefresh);
+    window.addEventListener('saimetric_customer_changes_updated', handleRefresh);
+    window.addEventListener('saimetric_credit_sales_updated', handleRefresh);
+    window.addEventListener('saimetric_customers_updated', handleRefresh);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_customer_changes_updated', handleRefresh);
+      window.removeEventListener('saimetric_credit_sales_updated', handleRefresh);
+      window.removeEventListener('saimetric_customers_updated', handleRefresh);
+    };
   }, []);
 
   // Synchronize selected staff to active branch

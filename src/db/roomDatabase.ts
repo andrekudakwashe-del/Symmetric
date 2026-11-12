@@ -4944,7 +4944,8 @@ export const getNextCustomerChangeId = (): string => {
 };
 
 export const addCustomerChange = (
-  entry: Omit<CustomerChangeEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string }
+  entry: Omit<CustomerChangeEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string },
+  options?: { fromSync?: boolean }
 ): CustomerChangeEntry => {
   const all = getAllCustomerChanges();
   const currentCompany = getCurrentCompanyId();
@@ -4963,20 +4964,36 @@ export const addCustomerChange = (
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.CUSTOMER_CHANGES, updated);
 
-  enqueueSync('CustomerChange', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    Timestamp: created.timestamp,
-    Date: created.date,
-    StaffID: created.staffId,
-    StaffName: created.staffName,
-    CustomerID: created.customerId || '',
-    CustomerName: created.customerName,
-    In: created.in,
-    Out: created.out,
-    Notes: created.notes || '',
-    Reference: created.reference || created.id,
-  });
+  if (!options?.fromSync) {
+    enqueueSync('CustomerChange', 'INSERT', {
+      company_id: compId,
+      branch_id: brId,
+      Timestamp: created.timestamp,
+      Date: created.date,
+      StaffID: created.staffId,
+      StaffName: created.staffName,
+      CustomerID: created.customerId || '',
+      CustomerName: created.customerName,
+      In: created.in,
+      Out: created.out,
+      Notes: created.notes || '',
+      Reference: created.reference || created.id,
+    });
+
+    notifyDatabaseMutation({
+      mutationId: `MUT-CHG-${created.id}-${Date.now()}`,
+      sheetName: 'CustomerChange',
+      action: 'INSERT',
+      companyId: compId,
+      branchId: brId,
+      branchCode: getCurrentBranch()?.code || brId,
+      entityType: 'customer',
+      recordId: created.id,
+      payload: created,
+      fromSync: false,
+      timestamp: Date.now(),
+    });
+  }
 
   // Ensure cashMovements has change_received (In) or change_paid (Out) if not already recorded
   const shiftId = getShiftId(created.staffId, created.date);
@@ -5027,6 +5044,10 @@ export const addCustomerChange = (
   }
 
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: created }));
+  }
   return created;
 };
 
@@ -5286,6 +5307,19 @@ export const addCreditSale = (
       Notes: created.notes || '',
       Status: created.status,
     });
+    notifyDatabaseMutation({
+      mutationId: `MUT-CRD-${created.id}-${Date.now()}`,
+      sheetName: 'CreditSales',
+      action: 'INSERT',
+      companyId: compId,
+      branchId: brId,
+      branchCode: getCurrentBranch()?.code || brId,
+      entityType: 'customer',
+      recordId: created.id,
+      payload: created,
+      fromSync: false,
+      timestamp: Date.now(),
+    });
   }
 
   // If cash was repaid (In > 0), record cash movement if not already recorded (e.g., upfront deposit at POS)
@@ -5321,6 +5355,10 @@ export const addCreditSale = (
   }
 
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: created }));
+  }
   return created;
 };
 
@@ -5390,12 +5428,58 @@ export const getCreditGroups = (): CreditGroup[] => {
   return getStored<CreditGroup[]>(STORAGE_KEYS.CREDIT_GROUPS, DEFAULT_CREDIT_GROUPS);
 };
 
-export const saveCreditGroup = (group: CreditGroup): void => {
+export const saveCreditGroup = (group: CreditGroup, options?: { fromSync?: boolean }): void => {
   const current = getCreditGroups();
-  const idx = current.findIndex((g) => g.id === group.id);
-  const updated = idx >= 0 ? current.map((g) => (g.id === group.id ? group : g)) : [...current, group];
+  const now = Date.now();
+  const normalized: CreditGroup = {
+    ...group,
+    updatedAt: (group as any).updatedAt || now,
+    lastUpdated: (group as any).lastUpdated || new Date(now).toISOString(),
+  };
+  const idx = current.findIndex((g) => g.id === normalized.id);
+  const updated = idx >= 0 ? current.map((g) => (g.id === normalized.id ? normalized : g)) : [...current, normalized];
   setStored(STORAGE_KEYS.CREDIT_GROUPS, updated);
   notifyListeners();
+
+  if (!options?.fromSync) {
+    notifyDatabaseMutation({
+      mutationId: `MUT-CGRP-${normalized.id}-${now}`,
+      sheetName: 'CreditGroups',
+      action: 'UPDATE',
+      companyId: getCurrentCompanyId(),
+      branchId: getCurrentBranchId(),
+      branchCode: getCurrentBranch()?.code || getCurrentBranchId(),
+      entityType: 'credit_group',
+      recordId: normalized.id,
+      payload: normalized,
+      fromSync: false,
+      timestamp: now,
+    });
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_credit_groups_updated', { detail: normalized }));
+  }
+};
+
+export const ingestMeshCreditGroup = (group: CreditGroup): boolean => {
+  if (!group || !group.id) return false;
+  const current = getCreditGroups();
+  const idx = current.findIndex((g) => g.id === group.id);
+  const incomingTime = extractRecordTimestamp(group) || Date.now();
+
+  if (idx >= 0) {
+    const existing = current[idx];
+    const existingTime = extractRecordTimestamp(existing) || 0;
+    // 5000ms LWW Defense-in-depth
+    if (incomingTime < existingTime - 5000) {
+      console.warn(`[ingestMeshCreditGroup] ⏳ Dropping stale credit group update for ${group.name} (${group.id})`);
+      return false;
+    }
+  }
+
+  saveCreditGroup(group, { fromSync: true });
+  return true;
 };
 
 export const getStandardGroupLimit = (): number => {
@@ -5658,7 +5742,11 @@ export const updateCustomerCreditTerms = (
   });
 
   enqueueSync('Customers', 'UPDATE', updated);
+  notifyCustomerChanged(updated);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: { customer: updated } }));
+  }
   return updated;
 };
 
@@ -6517,11 +6605,150 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     }
   }
 
+  // Parent-Child Extraction for Mesh Peers:
+  // 1. Customer store credit deduction used on POS
+  if (normalized.customerCreditUsed && normalized.customerCreditUsed > 0) {
+    const existingUsage = getAllCustomerChanges().find(
+      (c) => c.reference === normalized.id && c.out === normalized.customerCreditUsed
+    );
+    if (!existingUsage) {
+      addCustomerChange(
+        {
+          timestamp: normalized.timestamp,
+          date: normalized.date,
+          staffId: normalized.staffId,
+          staffName: normalized.staffName,
+          customerId: normalized.customerId,
+          customerName: normalized.customerName,
+          company_id: normalized.company_id,
+          companyId: normalized.company_id,
+          branch_id: normalized.branch_id,
+          branchId: normalized.branch_id,
+          in: 0,
+          out: normalized.customerCreditUsed,
+          notes: `Applied customer credit/change fund to POS Invoice #${normalized.id}`,
+          reference: normalized.id,
+        },
+        { fromSync: true }
+      );
+    }
+  }
+
+  // 2. Customer change left behind extraction
+  const amountToLeaveBehind =
+    normalized.changeAmountLeftBehind !== undefined
+      ? Number(normalized.changeAmountLeftBehind)
+      : (normalized.changeDue || 0);
+
+  if (normalized.changeLeftBehind && amountToLeaveBehind > 0) {
+    const existingChange = getAllCustomerChanges().find(
+      (c) => c.reference === normalized.id || (c.notes && c.notes.includes(normalized.id))
+    );
+    if (!existingChange) {
+      addCustomerChange(
+        {
+          timestamp: normalized.timestamp,
+          date: normalized.date,
+          staffId: normalized.staffId,
+          staffName: normalized.staffName,
+          customerId: normalized.customerId,
+          customerName: normalized.customerName,
+          company_id: normalized.company_id,
+          companyId: normalized.company_id,
+          branch_id: normalized.branch_id,
+          branchId: normalized.branch_id,
+          in: amountToLeaveBehind,
+          out: 0,
+          notes: `Change left behind (${amountToLeaveBehind.toFixed(2)}) from POS Invoice #${normalized.id}`,
+          reference: normalized.id,
+        },
+        { fromSync: true }
+      );
+
+      addCustomerLedgerEntry({
+        customerId: normalized.customerId || '',
+        customerName: normalized.customerName,
+        date: normalized.date,
+        timestamp: normalized.timestamp,
+        type: 'change_liability',
+        amount: amountToLeaveBehind,
+        sourceRef: normalized.id,
+        sourceModule: 'POS',
+        notes: `Change left behind from POS Invoice #${normalized.id}`,
+        staffId: normalized.staffId,
+        staffName: normalized.staffName,
+      });
+    }
+  }
+
+  // 3. Credit sale child ledger extraction
+  if (normalized.paymentMethod === 'Credit' || (normalized.creditAmount && Number(normalized.creditAmount) > 0)) {
+    const existingCredit = getAllCreditSales().find(
+      (c) => c.notes?.includes(normalized.id) || (c as any).reference === normalized.id
+    );
+    if (!existingCredit) {
+      const deposit = Number(normalized.creditDeposit) || 0;
+      const totalCreditAmount =
+        normalized.creditAmount !== undefined && Number(normalized.creditAmount) > 0
+          ? Number(normalized.creditAmount)
+          : normalized.total;
+      const creditStatus: 'Paid' | 'Partial' | 'Pending' =
+        deposit >= totalCreditAmount && totalCreditAmount > 0
+          ? 'Paid'
+          : deposit > 0
+          ? 'Partial'
+          : 'Pending';
+
+      addCreditSale(
+        {
+          timestamp: normalized.timestamp,
+          date: normalized.date,
+          staffId: normalized.staffId,
+          staffName: normalized.staffName,
+          customerId: normalized.customerId,
+          customerName: normalized.customerName,
+          company_id: normalized.company_id,
+          companyId: normalized.company_id,
+          branch_id: normalized.branch_id,
+          branchId: normalized.branch_id,
+          amount: totalCreditAmount,
+          out: totalCreditAmount,
+          in: deposit,
+          itemDescription: normalized.itemsSummary || 'POS Goods on Credit',
+          dueDate: normalized.creditDueDate || '',
+          notes: `POS Credit Sale Invoice #${normalized.id}${deposit > 0 ? ` (${deposit.toFixed(2)} deposit paid)` : ''}`,
+          status: creditStatus,
+        },
+        { fromSync: true }
+      );
+
+      const creditRemainder = Math.max(0, totalCreditAmount - deposit);
+      if (creditRemainder > 0) {
+        addCustomerLedgerEntry({
+          customerId: normalized.customerId || '',
+          customerName: normalized.customerName,
+          date: normalized.date,
+          timestamp: normalized.timestamp,
+          type: 'credit_extended',
+          amount: creditRemainder,
+          sourceRef: normalized.id,
+          sourceModule: 'POS',
+          notes: `Credit receivable for Invoice #${normalized.id} (Total: $${totalCreditAmount.toFixed(2)}, Upfront deposit: $${deposit.toFixed(2)})`,
+          staffId: normalized.staffId,
+          staffName: normalized.staffName,
+        });
+      }
+    }
+  }
+
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: normalized }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: normalized }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
   }
   return true;
 };
@@ -9791,7 +10018,9 @@ export const settleCustomerChangePayout = (
   notes?: string
 ): CustomerChangeEntry => {
   const todayStr = new Date().toISOString().split('T')[0];
-  return addCustomerChange({
+  const uniqueId = `CHG-PAYOUT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  const created = addCustomerChange({
+    id: uniqueId,
     timestamp: new Date().toISOString(),
     date: todayStr,
     staffId,
@@ -9802,6 +10031,24 @@ export const settleCustomerChangePayout = (
     out: amountOut,
     notes: notes || `Settlement payout of customer change balance ($${amountOut.toFixed(2)})`,
   });
+
+  try {
+    addCustomerLedgerEntry({
+      customerId: customerId || '',
+      customerName: customerName.trim(),
+      date: todayStr,
+      timestamp: new Date().toISOString(),
+      type: 'change_paid',
+      amount: amountOut,
+      sourceRef: created.id,
+      sourceModule: 'Form3Change',
+      notes: notes || `Settlement payout of customer change balance ($${amountOut.toFixed(2)})`,
+      staffId,
+      staffName,
+    });
+  } catch (err) {}
+
+  return created;
 };
 
 /**
@@ -9816,7 +10063,9 @@ export const recordCustomerCreditPayment = (
   notes?: string
 ): CreditSaleEntry => {
   const todayStr = new Date().toISOString().split('T')[0];
-  return addCreditSale({
+  const uniqueId = `CRD-PAYMENT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  const created = addCreditSale({
+    id: uniqueId,
     timestamp: new Date().toISOString(),
     date: todayStr,
     staffId,
@@ -9830,6 +10079,24 @@ export const recordCustomerCreditPayment = (
     notes: notes || `Customer debt repayment received ($${amountRepaid.toFixed(2)})`,
     status: 'Paid',
   });
+
+  try {
+    addCustomerLedgerEntry({
+      customerId: customerId || '',
+      customerName: customerName.trim(),
+      date: todayStr,
+      timestamp: new Date().toISOString(),
+      type: 'credit_repaid',
+      amount: amountRepaid,
+      sourceRef: created.id,
+      sourceModule: 'Form3Credit',
+      notes: notes || `Customer debt repayment received ($${amountRepaid.toFixed(2)})`,
+      staffId,
+      staffName,
+    });
+  } catch (err) {}
+
+  return created;
 };
 
 /**
@@ -10989,6 +11256,7 @@ export type DatabaseEntityType =
   | 'closure'
   | 'settlement'
   | 'category'
+  | 'credit_group'
   | 'stocktake_session'
   | 'other';
 
@@ -11027,6 +11295,8 @@ export function resolveEntityType(sheetName: string): DatabaseEntityType {
     case 'CustomerChange':
     case 'CreditSales':
       return 'customer';
+    case 'CreditGroups':
+      return 'credit_group';
     case 'Direct_GRV':
     case 'GoodsReceived':
       return 'grv';
@@ -11416,20 +11686,36 @@ export const ingestMeshSettings = (settingsPayload: any): boolean => {
 };
 
 export const ingestMeshCustomerChange = (entry: any): boolean => {
-  if (!entry || !entry.id) return false;
+  if (!entry) return false;
+  const id = entry.id || entry.changeId;
+  if (!id) return false;
   const all = getCustomerChanges();
-  if (all.some((c) => c.id === entry.id)) return false;
-  setStored(STORAGE_KEYS.CUSTOMER_CHANGES, [entry, ...all]);
+  if (all.some((c) => c.id === id || (entry.changeId && c.id === entry.changeId))) return false;
+  const normalized = { ...entry, id, changeId: id };
+  setStored(STORAGE_KEYS.CUSTOMER_CHANGES, [normalized, ...all]);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+  }
   return true;
 };
 
 export const ingestMeshCreditSale = (entry: any): boolean => {
-  if (!entry || !entry.id) return false;
+  if (!entry) return false;
+  const id = entry.id || entry.creditId;
+  if (!id) return false;
   const all = getCreditSales();
-  if (all.some((c) => c.id === entry.id)) return false;
-  setStored(STORAGE_KEYS.CREDIT_SALES, [entry, ...all]);
+  if (all.some((c) => c.id === id || (entry.creditId && c.id === entry.creditId))) return false;
+  const normalized = { ...entry, id, creditId: id };
+  setStored(STORAGE_KEYS.CREDIT_SALES, [normalized, ...all]);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+  }
   return true;
 };
 

@@ -56,6 +56,8 @@ export interface CreditGroup {
   createdAt?: string;
   createdBy?: string;
   isDefault?: boolean;
+  updatedAt?: number;
+  lastUpdated?: string;
 }
 export type CustomerChangeEntry = any;
 export type CustomerChangeReportItem = any;

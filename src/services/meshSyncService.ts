@@ -67,6 +67,7 @@ import {
   getDeltaRecordsSince,
   ingestMeshCustomerChange,
   ingestMeshCreditSale,
+  ingestMeshCreditGroup,
   ingestMeshStockMovement,
   ingestMeshCashLift,
   ingestMeshGoodsReceived,
@@ -1995,10 +1996,11 @@ class MeshSyncManager {
     }
 
     // 5. CUSTOMER CHANGE
-    if (pType === 'customer_change' || pType === 'CUSTOMER_CHANGE_RECORD') {
+    if (pType === 'customer_change' || pType === 'CUSTOMER_CHANGE_RECORD' || pType === 'CUSTOMER_CHANGE' || pType === 'CUSTOMER_CHANGE_SYNC') {
       const change = packet.change || packet.payload;
       if (change) {
         ingestMeshCustomerChange(change);
+        window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: change }));
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
@@ -2006,12 +2008,23 @@ class MeshSyncManager {
     }
 
     // 6. CREDIT SALE
-    if (pType === 'credit_sale' || pType === 'CREDIT_SALE_RECORD') {
+    if (pType === 'credit_sale' || pType === 'CREDIT_SALE_RECORD' || pType === 'CREDIT_SALE' || pType === 'CREDIT_SALE_SYNC') {
       const credit = packet.credit || packet.payload;
       if (credit) {
         ingestMeshCreditSale(credit);
+        window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: credit }));
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+      }
+      return;
+    }
+
+    // 6.1 CREDIT GROUP
+    if (pType === 'credit_group' || pType === 'CREDIT_GROUP_SYNC') {
+      const group = packet.group || packet.payload;
+      if (group) {
+        ingestMeshCreditGroup(group);
+        window.dispatchEvent(new CustomEvent('saimetric_credit_groups_updated', { detail: group }));
       }
       return;
     }
@@ -4227,12 +4240,13 @@ class MeshSyncManager {
     }
 
     // 7c. CUSTOMER CHANGE (FORM 3) BROADCAST
-    if (topic.endsWith('/customer_change') || packet.type === 'customer_change' || packet.action === 'CUSTOMER_CHANGE_RECORD') {
+    if (topic.endsWith('/customer_change') || packet.type === 'customer_change' || packet.action === 'CUSTOMER_CHANGE_RECORD' || packet.type === 'CUSTOMER_CHANGE' || packet.type === 'CUSTOMER_CHANGE_SYNC') {
       const change = packet.change || packet.payload;
       if (change) {
         if (ingestMeshCustomerChange(change)) {
           playChime();
           this.addLog('EPIDEMIC_HOP', `Customer Change voucher synced from ${originName}: ${change.customerName} ($${change.amount || change.in || change.out || 0})`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: change }));
           window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
           window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         }
@@ -4241,14 +4255,28 @@ class MeshSyncManager {
     }
 
     // 7d. CREDIT SALE (FORM 3) BROADCAST
-    if (topic.endsWith('/credit_sale') || packet.type === 'credit_sale' || packet.action === 'CREDIT_SALE_RECORD') {
+    if (topic.endsWith('/credit_sale') || packet.type === 'credit_sale' || packet.action === 'CREDIT_SALE_RECORD' || packet.type === 'CREDIT_SALE' || packet.type === 'CREDIT_SALE_SYNC') {
       const credit = packet.credit || packet.payload;
       if (credit) {
         if (ingestMeshCreditSale(credit)) {
           playChime();
           this.addLog('EPIDEMIC_HOP', `Credit Sale synced from ${originName}: ${credit.customerName} ($${credit.amount})`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: credit }));
           window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
           window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+      }
+      return;
+    }
+
+    // 7d.1 CREDIT GROUP BROADCAST
+    if (topic.endsWith('/credit_group') || packet.type === 'credit_group' || packet.type === 'CREDIT_GROUP_SYNC') {
+      const group = packet.group || packet.payload;
+      if (group) {
+        if (ingestMeshCreditGroup(group)) {
+          playChime();
+          this.addLog('EPIDEMIC_HOP', `Credit Group synced from ${originName}: ${group.name} ($${group.groupLimit})`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_credit_groups_updated', { detail: group }));
         }
       }
       return;
@@ -4503,6 +4531,7 @@ class MeshSyncManager {
           didIngest = ingestMeshCustomerChange(payload);
           if (didIngest) {
             playChime();
+            window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: payload }));
             window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
             window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
           }
@@ -4510,6 +4539,7 @@ class MeshSyncManager {
           didIngest = ingestMeshCreditSale(payload);
           if (didIngest) {
             playChime();
+            window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: payload }));
             window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
             window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
           }
@@ -4518,6 +4548,13 @@ class MeshSyncManager {
           if (didIngest) {
             window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
           }
+        }
+        break;
+      case 'credit_group':
+        didIngest = ingestMeshCreditGroup(payload);
+        if (didIngest) {
+          playChime();
+          window.dispatchEvent(new CustomEvent('saimetric_credit_groups_updated', { detail: payload }));
         }
         break;
       case 'grv':
@@ -5367,6 +5404,7 @@ class MeshSyncManager {
       overallProcessed += delta.customerChanges.length;
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated'));
       }
     }
     if (Array.isArray(delta.creditSales) && delta.creditSales.length > 0) {
@@ -5375,6 +5413,7 @@ class MeshSyncManager {
       overallProcessed += delta.creditSales.length;
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated'));
       }
     }
 
@@ -5493,6 +5532,15 @@ class MeshSyncManager {
       }
       if (custIngested > 0 && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+      }
+    }
+
+    if (Array.isArray((delta as any).creditGroups) && (delta as any).creditGroups.length > 0) {
+      for (const group of (delta as any).creditGroups) {
+        ingestMeshCreditGroup(group);
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_credit_groups_updated'));
       }
     }
 
@@ -5895,6 +5943,74 @@ class MeshSyncManager {
 
     this.sendPacketToAllTransports('customer', packet);
     this.addLog('BROADCAST', `Customer account ${customer.name} (${custId}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast customer change entry (Form 3) to peers & Hub
+   */
+  public broadcastCustomerChange(change: any) {
+    if (this.isIngestingFromHub) return;
+    if (!change) return;
+    if (change.fromMesh || change.fromSync) return;
+
+    const id = change.id || change.changeId || `CHG-${Date.now()}`;
+    const packetId = `CHG-PKT-${id}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'customer_change',
+      action: 'CUSTOMER_CHANGE_RECORD',
+      entityType: 'customer_change',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      change,
+      payload: change,
+      timestamp: Date.now(),
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('customer_change', packet);
+    this.addLog('BROADCAST', `Customer change voucher for ${change.customerName} ($${change.in || change.out || 0}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast customer credit sale / debt payment (Form 3) to peers & Hub
+   */
+  public broadcastCreditSale(credit: any) {
+    if (this.isIngestingFromHub) return;
+    if (!credit) return;
+    if (credit.fromMesh || credit.fromSync) return;
+
+    const id = credit.id || credit.creditId || `CR-${Date.now()}`;
+    const packetId = `CRD-PKT-${id}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'credit_sale',
+      action: 'CREDIT_SALE_RECORD',
+      entityType: 'credit_sale',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      credit,
+      payload: credit,
+      timestamp: Date.now(),
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('credit_sale', packet);
+    this.addLog('BROADCAST', `Credit transaction for ${credit.customerName} ($${credit.amount || credit.in || credit.out || 0}) broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 

@@ -158,12 +158,21 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
     setManualInvoiceRef('');
   };
 
-  // Subscribe to real-time database updates
+  // Subscribe to real-time database updates and window events
   useEffect(() => {
-    const unsub = subscribeToDatabase(() => {
+    const handleRefresh = () => {
       setReportData(getCustomerChangeReport());
-    });
-    return () => unsub();
+    };
+    const unsub = subscribeToDatabase(handleRefresh);
+    window.addEventListener('saimetric_customer_changes_updated', handleRefresh);
+    window.addEventListener('saimetric_customers_updated', handleRefresh);
+    window.addEventListener('saimetric_sales_updated', handleRefresh);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_customer_changes_updated', handleRefresh);
+      window.removeEventListener('saimetric_customers_updated', handleRefresh);
+      window.removeEventListener('saimetric_sales_updated', handleRefresh);
+    };
   }, []);
 
   const { items, summary } = reportData;
