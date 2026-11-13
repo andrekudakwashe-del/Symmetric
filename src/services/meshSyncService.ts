@@ -3695,8 +3695,12 @@ class MeshSyncManager {
   public async handleReconPushBackfillRequest(packet: any): Promise<void> {
     if (!packet) return;
     const sweepId = packet.sweepId || 'unknown';
-    const entityType = String(packet.entityType || 'sales').toLowerCase().trim();
-    const missingIds: string[] = Array.isArray(packet.missingIds) ? packet.missingIds : [];
+    const entityType = String(packet.entityType || packet.entity || 'sales').toLowerCase().trim();
+    const missingIds: string[] = Array.isArray(packet.missingIds)
+      ? packet.missingIds
+      : Array.isArray(packet.ids)
+      ? packet.ids
+      : [];
     if (missingIds.length === 0) return;
 
     if (isPosActiveCheckout()) {
@@ -3747,8 +3751,10 @@ class MeshSyncManager {
           pushedCount++;
         }
       } else if (entityType === 'customer_changes' || entityType === 'customer_change') {
-        const rec = getRawStoredCustomerChanges().find(
-          (c) => String(c.id || c.changeId || '').trim().toUpperCase() === cleanUpper
+        const rec = getRawStoredCustomerChanges().find((c) =>
+          [c.id, (c as any).changeId].some(
+            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+          )
         );
         if (rec) {
           this.reconPushedTimestamps.set(dedupeKey, Date.now());
@@ -3756,12 +3762,14 @@ class MeshSyncManager {
           delete cleanRec.fromMesh;
           delete cleanRec.fromSync;
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastCustomerChange(cleanRec);
+          this.broadcastCustomerChange(cleanRec, { isReconPush: true });
           pushedCount++;
         }
       } else if (entityType === 'credit_sales' || entityType === 'credit_sale') {
-        const rec = getRawStoredCreditSales().find(
-          (c) => String(c.id || c.creditId || '').trim().toUpperCase() === cleanUpper
+        const rec = getRawStoredCreditSales().find((c) =>
+          [c.id, (c as any).creditId, (c as any).creditSaleId].some(
+            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+          )
         );
         if (rec) {
           this.reconPushedTimestamps.set(dedupeKey, Date.now());
@@ -3769,7 +3777,7 @@ class MeshSyncManager {
           delete cleanRec.fromMesh;
           delete cleanRec.fromSync;
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastCreditSale(cleanRec);
+          this.broadcastCreditSale(cleanRec, { isReconPush: true });
           pushedCount++;
         }
       } else if (entityType === 'cash_logs' || entityType === 'cash_log') {
@@ -3886,12 +3894,14 @@ class MeshSyncManager {
           this.reconPushedTimestamps.set(dedupeKey, Date.now());
           const cleanRec: any = { ...rec };
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastInventoryItem(cleanRec, extractRecordTimestamp(cleanRec) || Date.now());
+          this.broadcastInventoryItem(cleanRec, extractRecordTimestamp(cleanRec) || Date.now(), { isReconPush: true });
           pushedCount++;
         }
       } else if (entityType === 'customers' || entityType === 'customer') {
-        const rec = getRawStoredCustomers().find(
-          (c) => String(c.customerId || (c as any).id || '').trim().toUpperCase() === cleanUpper
+        const rec = getRawStoredCustomers().find((c) =>
+          [c.customerId, (c as any).id].some(
+            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+          )
         );
         if (rec) {
           this.reconPushedTimestamps.set(dedupeKey, Date.now());
@@ -3899,7 +3909,7 @@ class MeshSyncManager {
           delete cleanRec.fromMesh;
           delete cleanRec.fromSync;
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastCustomer(cleanRec);
+          this.broadcastCustomer(cleanRec, { isReconPush: true });
           pushedCount++;
         }
       } else if (entityType === 'staff' || entityType === 'salespeople' || entityType === 'users') {
@@ -3912,7 +3922,7 @@ class MeshSyncManager {
           delete cleanRec.fromMesh;
           delete cleanRec.fromSync;
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastStaff(cleanRec);
+          this.broadcastStaff(cleanRec, { isReconPush: true });
           pushedCount++;
         }
       }
@@ -4449,8 +4459,8 @@ class MeshSyncManager {
   private sendPacketToAllTransports(topicSuffix: string, packet: any) {
     // ABSOLUTE STRICT INGEST GUARD:
     // Inside ingest mode from the Local Hub, the client MUST NEVER broadcast
-    // or re-transmit packets back out. Drop immediately.
-    if (this.isIngestingFromHub) {
+    // or re-transmit packets back out unless explicitly requested by Hub recon push.
+    if (this.isIngestingFromHub && !packet?.isReconPush) {
       return;
     }
 
@@ -4513,7 +4523,7 @@ class MeshSyncManager {
 
     const allowLocalHubSend =
       !isMaintenance &&
-      !this.isIngestingFromHub &&
+      (!this.isIngestingFromHub || Boolean(packet?.isReconPush)) &&
       !this.isCloudOnlyMode &&
       !isBranchMismatch;
 
@@ -6536,10 +6546,11 @@ class MeshSyncManager {
   /**
    * Broadcast a staff account (Till Operator, Manager, Casual) creation or edit to peers & Hub
    */
-  public broadcastStaff(staff: any) {
-    if (this.isIngestingFromHub) return;
+  public broadcastStaff(staff: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
     if (!staff || !staff.id) return;
-    if (staff.fromMesh || staff.fromSync) return;
+    if (!isReconPush && (staff.fromMesh || staff.fromSync)) return;
 
     staff.updatedAt = staff.updatedAt || Date.now();
     staff.lastUpdated = staff.lastUpdated || new Date().toISOString();
@@ -6577,6 +6588,7 @@ class MeshSyncManager {
       pin: effectivePin,
       password: effectivePassword,
       pin_hash: effectiveHash,
+      isReconPush,
       timestamp: staff.updatedAt,
       updatedAt: staff.updatedAt,
       ttl: 5,
@@ -6590,10 +6602,11 @@ class MeshSyncManager {
   /**
    * Broadcast a customer profile creation or credit limit update to peers & Hub
    */
-  public broadcastCustomer(customer: any) {
-    if (this.isIngestingFromHub) return;
+  public broadcastCustomer(customer: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
     if (!customer) return;
-    if (customer.fromMesh || (customer as any).fromSync) return;
+    if (!isReconPush && (customer.fromMesh || (customer as any).fromSync)) return;
 
     customer.updatedAt = customer.updatedAt || Date.now();
     customer.lastUpdated = customer.lastUpdated || new Date().toISOString();
@@ -6614,6 +6627,7 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       customer,
       payload: customer,
+      isReconPush,
       timestamp: customer.updatedAt,
       updatedAt: customer.updatedAt,
       ttl: 5,
@@ -6627,10 +6641,11 @@ class MeshSyncManager {
   /**
    * Broadcast customer change entry (Form 3) to peers & Hub
    */
-  public broadcastCustomerChange(change: any) {
-    if (this.isIngestingFromHub) return;
+  public broadcastCustomerChange(change: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
     if (!change) return;
-    if (change.fromMesh || change.fromSync) return;
+    if (!isReconPush && (change.fromMesh || change.fromSync)) return;
 
     const id = change.id || change.changeId || `CHG-${Date.now()}`;
     const packetId = `CHG-PKT-${id}-${Date.now()}`;
@@ -6649,6 +6664,7 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       change,
       payload: change,
+      isReconPush,
       timestamp: Date.now(),
       ttl: 5,
     };
@@ -6661,10 +6677,11 @@ class MeshSyncManager {
   /**
    * Broadcast customer credit sale / debt payment (Form 3) to peers & Hub
    */
-  public broadcastCreditSale(credit: any) {
-    if (this.isIngestingFromHub) return;
+  public broadcastCreditSale(credit: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
     if (!credit) return;
-    if (credit.fromMesh || credit.fromSync) return;
+    if (!isReconPush && (credit.fromMesh || credit.fromSync)) return;
 
     const id = credit.id || credit.creditId || `CR-${Date.now()}`;
     const packetId = `CRD-PKT-${id}-${Date.now()}`;
@@ -6683,6 +6700,7 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       credit,
       payload: credit,
+      isReconPush,
       timestamp: Date.now(),
       ttl: 5,
     };
@@ -6798,8 +6816,9 @@ class MeshSyncManager {
     this.notifyPeerSubscribers();
   }
 
-  public broadcastInventoryItem(item: InventoryItem, explicitTimestamp?: number) {
-    if (this.isIngestingFromHub) return;
+  public broadcastInventoryItem(item: InventoryItem, explicitTimestamp?: number, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
     if (!item) return;
     delete (item as any).fromMesh;
 
@@ -6807,7 +6826,7 @@ class MeshSyncManager {
     const callTime = Date.now();
     console.log('[DEBUG] broadcastInventoryItem called for:', item.itemId || item.id, 'at:', callTime);
 
-    if (cleanId) {
+    if (cleanId && !isReconPush) {
       const prev = this.lastBroadcastByItemId.get(cleanId);
       if (prev && callTime - prev < 500) {
         return; // Ignore duplicate broadcast within 500ms
@@ -6856,6 +6875,7 @@ class MeshSyncManager {
       barcode: item.barcode,
       packagingVariants: item.packagingVariants || [],
       branchOverrides: item.branchOverrides,
+      isReconPush,
       item: {
         ...item,
         totalUnits: Number(item.totalUnits || 0),
