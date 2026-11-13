@@ -14,6 +14,7 @@ import mqtt, { MqttClient } from 'mqtt';
 import {
   getSales,
   getAllSales,
+  getSaleById,
   addSale,
   getSyncQueue,
   getSheetsConfig,
@@ -61,6 +62,12 @@ import {
   ingestMeshCustomer,
   ingestMeshGRV,
   getDirectGrvs,
+  getRawStoredDirectGrvs,
+  getRawStoredCustomerChanges,
+  getRawStoredCreditSales,
+  getRawStoredCashLogs,
+  getRawStoredStockMovements,
+  getRawStoredExpenses,
   ingestMeshInventoryDelete,
   getDeletedInventoryItems,
   ingestMeshSettings,
@@ -442,6 +449,7 @@ class MeshSyncManager {
   private drainAckFallbackTimer: any = null;
   private lastBroadcastByItemId: Map<string, number> = new Map();
   private autoHealIntervalTimer: number | null = null;
+  private reconPushedTimestamps: Map<string, number> = new Map();
 
   // Chunked Ingestion & Async Progress State
   private syncProgressListeners: Array<(progress: MeshSyncProgress) => void> = [];
@@ -1579,6 +1587,10 @@ class MeshSyncManager {
             this.handleIncomingReconBackfill(parsed);
             return;
           }
+          if (pType === 'RECON_PUSH_BACKFILL_REQUEST') {
+            this.handleReconPushBackfillRequest(parsed);
+            return;
+          }
           if (pType === 'HUB_CLOUD_BROADCAST') {
             this.handleHubCloudBroadcast(parsed);
             return;
@@ -1821,6 +1833,10 @@ class MeshSyncManager {
     }
     if (pType === 'RECON_BACKFILL_PAYLOAD') {
       this.handleIncomingReconBackfill(packet);
+      return;
+    }
+    if (pType === 'RECON_PUSH_BACKFILL_REQUEST') {
+      this.handleReconPushBackfillRequest(packet);
       return;
     }
     if (pType === 'HUB_CLOUD_BROADCAST') {
@@ -3676,6 +3692,239 @@ class MeshSyncManager {
     });
   }
 
+  public async handleReconPushBackfillRequest(packet: any): Promise<void> {
+    if (!packet) return;
+    const sweepId = packet.sweepId || 'unknown';
+    const entityType = String(packet.entityType || 'sales').toLowerCase().trim();
+    const missingIds: string[] = Array.isArray(packet.missingIds) ? packet.missingIds : [];
+    if (missingIds.length === 0) return;
+
+    if (isPosActiveCheckout()) {
+      console.log(`[Auto-Heal] 🛒 POS active checkout. Deferring push backfill (${missingIds.length} IDs) by 60s.`);
+      setTimeout(() => {
+        this.handleReconPushBackfillRequest(packet);
+      }, 60000);
+      return;
+    }
+
+    const now = Date.now();
+    // Prune loop-guard entries older than 60s
+    for (const [key, ts] of Array.from(this.reconPushedTimestamps.entries())) {
+      if (now - ts > 60000) {
+        this.reconPushedTimestamps.delete(key);
+      }
+    }
+
+    console.log(`[Auto-Heal] 📤 Hub requested ${missingIds.length} missing "${entityType}" record(s) (sweep: ${sweepId})`);
+
+    let pushedCount = 0;
+    for (let i = 0; i < missingIds.length; i++) {
+      const rawId = missingIds[i];
+      if (!rawId) continue;
+      const cleanId = String(rawId).trim();
+      const cleanUpper = cleanId.toUpperCase();
+      const dedupeKey = `${entityType}:${cleanUpper}`;
+
+      // Prevent infinite recon push loops within a 60s cooldown window
+      const lastPushed = this.reconPushedTimestamps.get(dedupeKey);
+      if (lastPushed && Date.now() - lastPushed < 60000) {
+        continue;
+      }
+
+      if (entityType === 'sales' || entityType === 'sale') {
+        const sale = getSaleById(cleanId);
+        if (sale) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const payloadSale: SaleInvoice = {
+            ...sale,
+            ...(typeof (sale as any).isCloudSynced === 'boolean'
+              ? { isCloudSynced: (sale as any).isCloudSynced }
+              : (sale as any).synced
+              ? { isCloudSynced: true }
+              : {}),
+          };
+          await this.broadcastSale(payloadSale, { isReconPush: true });
+          pushedCount++;
+        }
+      } else if (entityType === 'customer_changes' || entityType === 'customer_change') {
+        const rec = getRawStoredCustomerChanges().find(
+          (c) => String(c.id || c.changeId || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          delete cleanRec.fromMesh;
+          delete cleanRec.fromSync;
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.broadcastCustomerChange(cleanRec);
+          pushedCount++;
+        }
+      } else if (entityType === 'credit_sales' || entityType === 'credit_sale') {
+        const rec = getRawStoredCreditSales().find(
+          (c) => String(c.id || c.creditId || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          delete cleanRec.fromMesh;
+          delete cleanRec.fromSync;
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.broadcastCreditSale(cleanRec);
+          pushedCount++;
+        }
+      } else if (entityType === 'cash_logs' || entityType === 'cash_log') {
+        const rec = getRawStoredCashLogs().find(
+          (c) => String(c.id || `${c.date}_${c.timestamp}` || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.sendPacketToAllTransports('cash_log', {
+            type: 'CASH_LOG',
+            action: 'CASH_LOG_RECORD',
+            entityType: 'cash_log',
+            packet_id: `CL-RECON-${cleanId}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: this.config.branchId,
+            branchCode: this.config.branchCode,
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            cashLog: cleanRec,
+            payload: cleanRec,
+            isReconPush: true,
+            timestamp: Date.now(),
+            ttl: 5,
+          });
+          pushedCount++;
+        }
+      } else if (entityType === 'stock_movements' || entityType === 'stock_movement') {
+        const rec = getRawStoredStockMovements().find(
+          (m: any) => String(m.id || m.txnId || m.movementId || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.sendPacketToAllTransports('stock_movement', {
+            type: 'STOCK_MOVEMENT',
+            action: 'STOCK_MOVEMENT_RECORD',
+            entityType: 'stock_movement',
+            packet_id: `SM-RECON-${cleanId}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: this.config.branchId,
+            branchCode: this.config.branchCode,
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            payload: cleanRec,
+            isReconPush: true,
+            timestamp: Date.now(),
+            ttl: 5,
+          });
+          pushedCount++;
+        }
+      } else if (entityType === 'direct_grvs' || entityType === 'direct_grv' || entityType === 'grv') {
+        const rec = getRawStoredDirectGrvs().find(
+          (g: any) => String(g.id || g.grvId || g.grvNumber || g.reference || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.sendPacketToAllTransports('direct_grv', {
+            type: 'DIRECT_GRV',
+            action: 'GRV_RECORD',
+            entityType: 'grv',
+            packet_id: `GRV-RECON-${cleanId}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: this.config.branchId,
+            branchCode: this.config.branchCode,
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            directGrv: cleanRec,
+            payload: cleanRec,
+            isReconPush: true,
+            timestamp: Date.now(),
+            ttl: 5,
+          });
+          pushedCount++;
+        }
+      } else if (entityType === 'expenses' || entityType === 'expense') {
+        const rec = getRawStoredExpenses().find(
+          (e) => String(e.id || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.sendPacketToAllTransports('expense', {
+            type: 'EXPENSE',
+            action: 'EXPENSE_RECORD',
+            entityType: 'expense',
+            packet_id: `EXP-RECON-${cleanId}-${Date.now()}`,
+            companyId: this.config.companyId,
+            branchId: this.config.branchId,
+            branchCode: this.config.branchCode,
+            deviceId: this.config.deviceId,
+            originDeviceId: this.config.deviceId,
+            originDeviceName: this.config.deviceName,
+            payload: cleanRec,
+            isReconPush: true,
+            timestamp: Date.now(),
+            ttl: 5,
+          });
+          pushedCount++;
+        }
+      } else if (entityType === 'inventory' || entityType === 'inventory_item' || entityType === 'products') {
+        const rec = getRawStoredInventoryItems().find(
+          (it) => String(it.itemId || (it as any).id || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.broadcastInventoryItem(cleanRec, extractRecordTimestamp(cleanRec) || Date.now());
+          pushedCount++;
+        }
+      } else if (entityType === 'customers' || entityType === 'customer') {
+        const rec = getRawStoredCustomers().find(
+          (c) => String(c.customerId || (c as any).id || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          delete cleanRec.fromMesh;
+          delete cleanRec.fromSync;
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.broadcastCustomer(cleanRec);
+          pushedCount++;
+        }
+      } else if (entityType === 'staff' || entityType === 'salespeople' || entityType === 'users') {
+        const rec = getRawStoredSalespeople().find(
+          (s) => String(s.id || '').trim().toUpperCase() === cleanUpper
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          delete cleanRec.fromMesh;
+          delete cleanRec.fromSync;
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.broadcastStaff(cleanRec);
+          pushedCount++;
+        }
+      }
+
+      if ((i + 1) % 25 === 0) {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+    }
+
+    console.log(`[Auto-Heal] ✅ Pushed ${pushedCount}/${missingIds.length} missing "${entityType}" record(s) to Hub (sweep: ${sweepId})`);
+  }
+
   public onScanSuccess(decodedText: string): void {
     const trimmed = (decodedText || '').trim();
     if (!trimmed) return;
@@ -5251,7 +5500,7 @@ class MeshSyncManager {
     const rawCategories = Array.isArray(payload) ? payload : (payload?.categories || payload?.item || payload?.data);
     if (!Array.isArray(rawCategories)) return false;
 
-    // T2 LWW Guard (5000ms skew tolerance)
+    // T2 LWW Guard (60000ms skew tolerance)
     const existingCats = getCategories();
     const existingTime = Math.max(
       ...existingCats.map((c: any) => parseTimestampMs(c.updatedAt || c.lastUpdated || c.timestamp || 0)),
@@ -5259,7 +5508,7 @@ class MeshSyncManager {
     );
     const incomingTime = parseTimestampMs(payload?.updatedAt || payload?.lastUpdated || payload?.hubTimestamp || 0);
 
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
         `[LWW Client] 🛡️ Rejected stale categories update (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
@@ -6159,27 +6408,30 @@ class MeshSyncManager {
    * If an invoice ID already exists, do not send it to the Hub again.
    * ONLY sends the specific packet for the current action.
    */
-  public async broadcastSale(sale: SaleInvoice) {
-    if (this.isIngestingFromHub) return;
+  public async broadcastSale(sale: SaleInvoice, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
     if (!sale || !sale.id) return;
 
-    // Check if already broadcasted by this device
-    if (this.broadcastedInvoiceIds.has(sale.id)) {
+    // Check if already broadcasted by this device (bypassed for explicit Hub recon push backfill)
+    if (!isReconPush && this.broadcastedInvoiceIds.has(sale.id)) {
       return;
     }
 
-    // Do not re-broadcast sales received from peers/mesh
-    if ((sale as any).fromMesh) {
+    // Do not re-broadcast sales received from peers/mesh (unless explicitly requested by Hub recon backfill)
+    if (!isReconPush && (sale as any).fromMesh) {
       return;
     }
 
     // Check local database: if this invoice already exists in stored sales from mesh
-    const storedSales = getAllSales();
-    const existing = storedSales.find((s) => s.id === sale.id);
-    if (existing && (existing as any).fromMesh) {
-      this.broadcastedInvoiceIds.add(sale.id);
-      this.knownSaleIds.add(sale.id);
-      return;
+    if (!isReconPush) {
+      const storedSales = getAllSales();
+      const existing = storedSales.find((s) => s.id === sale.id);
+      if (existing && (existing as any).fromMesh) {
+        this.broadcastedInvoiceIds.add(sale.id);
+        this.knownSaleIds.add(sale.id);
+        return;
+      }
     }
 
     // Mark as broadcasted so we never send it to the Hub again
@@ -6187,8 +6439,8 @@ class MeshSyncManager {
     this.knownSaleIds.add(sale.id);
 
     // Safeguard 1: Register in pendingSaleAcks to await {"type": "SYNC_RECEIPT", "invoice_id": "..."}
-    // Requirement 4: Legacy INV- sales must NOT trigger Watchdog retries
-    if (!/^INV-/i.test(sale.id)) {
+    // Requirement 4: Legacy INV- sales & recon backfill pushes must NOT trigger Watchdog retries
+    if (!isReconPush && !/^INV-/i.test(sale.id)) {
       this.pendingSaleAcks.set(sale.id, {
         sale,
         sentAt: Date.now(),
@@ -6201,6 +6453,17 @@ class MeshSyncManager {
     const packetId = `SALE-PKT-${sale.id}-${Date.now()}`;
     this.seenPacketIds.add(packetId);
 
+    const salePayload = isReconPush
+      ? (() => {
+          const copy: any = { ...sale };
+          delete copy.fromMesh;
+          if (copy.synced || copy.isCloudSynced) {
+            copy.isCloudSynced = true;
+          }
+          return copy;
+        })()
+      : sale;
+
     const packet = {
       type: 'sale',
       action: 'SALE_RECORD',
@@ -6211,7 +6474,8 @@ class MeshSyncManager {
       deviceId: this.config.deviceId,
       originDeviceId: this.config.deviceId,
       originDeviceName: this.config.deviceName,
-      sale,
+      sale: salePayload,
+      isReconPush,
       timestamp: Date.now(),
       ttl: 5,
     };

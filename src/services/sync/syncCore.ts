@@ -75,7 +75,7 @@ export class SyncCore {
           envelope.hubTimestamp ?? envelope.updatedAt
         );
 
-        if (existingTs - incomingTs > 5000) {
+        if (existingTs - incomingTs > 60000) {
           return { accepted: false, reason: 'STALE_T2' };
         }
       }

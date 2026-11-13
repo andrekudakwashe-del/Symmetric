@@ -21,6 +21,7 @@ export type ReconPacketType =
   | 'SYNC_ID_DIGEST_REQUEST'
   | 'SYNC_ID_DIGEST_RESPONSE'
   | 'RECON_BACKFILL_PAYLOAD'
+  | 'RECON_PUSH_BACKFILL_REQUEST'
   | 'HUB_CLOUD_BROADCAST';
 
 export interface EntitySnapshot {
@@ -108,3 +109,13 @@ export interface ReconBackfillPayloadPacket {
   hubTimestamp: number;
   originDeviceId: string;
 }
+
+export interface ReconPushBackfillRequestPacket {
+  type: 'RECON_PUSH_BACKFILL_REQUEST';
+  sweepId?: string;
+  entityType: string;
+  missingIds: string[];
+  hubTimestamp?: number;
+  originDeviceId?: string;
+}
+

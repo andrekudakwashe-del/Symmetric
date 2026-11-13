@@ -909,10 +909,10 @@ function computeDigestDiff(clientDigest, entityType) {
       // Missing completely on client
       missingOrOutdated.push(rec);
     } else if (isT2) {
-      // T2 LWW check with 5000ms threshold
+      // T2 LWW check with 60000ms threshold
       const hubUpdated = getRecordTimestamp(rec);
       const clientUpdated = clientItem.updatedAt || clientItem.timestamp || 0;
-      if (hubUpdated - clientUpdated > 5000) {
+      if (hubUpdated - clientUpdated > 60000) {
         missingOrOutdated.push(rec);
       }
     } else if (norm === 'sales' || norm === 'sale') {
@@ -924,6 +924,42 @@ function computeDigestDiff(clientDigest, entityType) {
   }
 
   return missingOrOutdated;
+}
+
+function computeClientMissingOnHub(clientDigest, entityType) {
+  if (!clientDigest || !Array.isArray(clientDigest.items)) {
+    return [];
+  }
+  const norm = String(entityType || clientDigest.entityType || '').toLowerCase().trim();
+  const isT2 = norm === 'inventory' || norm === 'inventory_item' || norm === 'products' ||
+               norm === 'customers' || norm === 'customer' ||
+               norm === 'staff' || norm === 'salespeople' || norm === 'users';
+
+  const store = getStoreByEntityType(norm);
+  const hubMap = new Map();
+  for (const rec of store) {
+    if (!rec) continue;
+    const id = getEntityId(rec, norm);
+    if (!id) continue;
+    hubMap.set(String(id).trim(), rec);
+  }
+
+  const missingOnHubIds = [];
+  for (const item of clientDigest.items) {
+    if (!item || item.id == null) continue;
+    const cleanId = String(item.id).trim();
+    const hubRec = hubMap.get(cleanId);
+    if (!hubRec) {
+      missingOnHubIds.push(cleanId);
+    } else if (isT2) {
+      const hubUpdated = getRecordTimestamp(hubRec);
+      const clientUpdated = item.updatedAt || item.timestamp || 0;
+      if (clientUpdated - hubUpdated > 60000) {
+        missingOnHubIds.push(cleanId);
+      }
+    }
+  }
+  return missingOnHubIds;
 }
 
 function streamReconBackfill(ws, sweepId, entityType, missingRecords) {
@@ -984,7 +1020,7 @@ function streamReconBackfill(ws, sweepId, entityType, missingRecords) {
   sendNextChunk();
 }
 
-function triggerClientReconSweep(clientWs) {
+function triggerClientReconSweep(clientWs, isSod = false) {
   if (!clientWs || clientWs.readyState !== WebSocket.OPEN) return;
   const sweepId = `sweep-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   const triggerPacket = {
@@ -1155,7 +1191,27 @@ wss.on('connection', (ws, req) => {
           if (missingOrOutdated.length > 0) {
             console.log(`[Termux Hub] 🔍 computeDigestDiff found ${missingOrOutdated.length} diff record(s) for "${entity}" to push to client`);
             streamReconBackfill(ws, sweepId, entity, missingOrOutdated);
-          } else {
+          }
+
+          const clientMissingOnHub = computeClientMissingOnHub(digest, entity);
+          if (clientMissingOnHub.length > 0) {
+            console.log(`[Termux Hub] 📥 Detected ${clientMissingOnHub.length} record(s) for "${entity}" on client missing/newer than Hub. Sending RECON_PUSH_BACKFILL_REQUEST.`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'RECON_PUSH_BACKFILL_REQUEST',
+                action: 'RECON_PUSH_BACKFILL_REQUEST',
+                sweepId,
+                entityType: entity,
+                missingIds: clientMissingOnHub,
+                hubTimestamp: Date.now(),
+                originDeviceId: `HUB-${hubBranchId}`,
+              }));
+            } catch (err) {
+              console.warn('[Termux Hub] Failed to send RECON_PUSH_BACKFILL_REQUEST:', err.message);
+            }
+          }
+
+          if (missingOrOutdated.length === 0 && clientMissingOnHub.length === 0) {
             console.log(`[Termux Hub] ✅ Client and Hub are fully reconciled for "${entity}" (0 diffs)`);
           }
         }
@@ -1367,7 +1423,7 @@ wss.on('connection', (ws, req) => {
             if (exIdx >= 0) {
               const existing = casualWorkersStore[exIdx];
               const existingTime = getTimestamp(existing);
-              if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+              if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
                 console.log(
                   `[Termux Hub] 🛡️ LWW Reject: Stale casual worker update for ${cwId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
                 );
@@ -1483,7 +1539,7 @@ wss.on('connection', (ws, req) => {
           if (sIdx >= 0) {
             const existing = stocktakeSessionsStore[sIdx];
             const existingTime = getTimestamp(existing);
-            if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+            if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
               console.log(
                 `[Termux Hub] 🛡️ LWW Reject: Stale stocktake session update for ${sessionId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
               );
@@ -1667,7 +1723,7 @@ wss.on('connection', (ws, req) => {
         const incomingTime = getTimestamp(packet);
         const existingZone = zoneAssignmentsStore.find((z) => z.sessionId === packet.sessionId && z.zoneId === packet.zoneId);
         const existingTime = existingZone ? getTimestamp(existingZone) : 0;
-        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
           console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_ZONE_CLAIM for ${packet.zoneId}`);
           return;
         }
@@ -2038,7 +2094,7 @@ wss.on('connection', (ws, req) => {
         const incomingTime = getTimestamp(packet);
         const existingZone = zoneAssignmentsStore.find((z) => z.zoneId === packet.zoneId && (!packet.sessionId || z.sessionId === packet.sessionId));
         const existingTime = existingZone?.jointRecount?.proposedAt ? getTimestamp({ updatedAt: existingZone.jointRecount.proposedAt }) : (existingZone ? getTimestamp(existingZone) : 0);
-        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
           console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_JOINT_PROPOSAL for Zone ${packet.zoneId}`);
           return;
         }
@@ -2057,7 +2113,7 @@ wss.on('connection', (ws, req) => {
             zoneId,
             zoneName: packet.zoneName || `Zone ${zoneId}`,
             sessionId: sessionId || 'DEFAULT',
-            branchId: packet.branchId || branchId,
+            branchId: packet.branchId || hubBranchId,
             status: 'VARIANCE_FLAGGED',
           };
           zoneAssignmentsStore.push(zoneRec);
@@ -2121,7 +2177,7 @@ wss.on('connection', (ws, req) => {
         const incomingTime = getTimestamp(packet);
         const existingZone = zoneAssignmentsStore.find((z) => z.zoneId === packet.zoneId && (!packet.sessionId || z.sessionId === packet.sessionId));
         const existingTime = existingZone?.jointRecount?.resolvedAt ? getTimestamp({ updatedAt: existingZone.jointRecount.resolvedAt }) : (existingZone ? getTimestamp(existingZone) : 0);
-        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+        if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
           console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_JOINT_FINALIZED for Zone ${packet.zoneId}`);
           return;
         }
@@ -2542,12 +2598,12 @@ wss.on('connection', (ws, req) => {
           const incomingTime = getTimestamp(it);
 
           // STRICT LWW:
-          // If incoming update is strictly OLDER than the Hub's existing record (with 5s clock skew grace),
+          // If incoming update is strictly OLDER than the Hub's existing record (with 60s clock skew grace),
           // reject it and send the authoritative Hub data back to the device!
           if (exIdx >= 0) {
             const existing = inventoryStore[exIdx];
             const existingTime = getTimestamp(existing);
-            if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+            if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
               console.log(
                 `[Termux Hub] 🛡️ LWW Reject: Stale inventory update for ${cleanId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative data back.`
               );
@@ -2741,7 +2797,7 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 7.1 CONFIGURATION DATA: CREDIT GROUPS (T2 - LWW WITH 5000ms TOLERANCE)
+      // 7.1 CONFIGURATION DATA: CREDIT GROUPS (T2 - LWW WITH 60000ms TOLERANCE)
       // =====================================================================
       const isCreditGroupPacket =
         pType === 'CREDIT_GROUP_SYNC' ||
@@ -2755,7 +2811,7 @@ wss.on('connection', (ws, req) => {
         const incomingTime = getTimestamp(payload) || Date.now();
         if (exIdx >= 0) {
           const existingTime = getTimestamp(creditGroupsStore[exIdx]) || 0;
-          if (incomingTime >= existingTime - 5000) {
+          if (incomingTime >= existingTime - 60000) {
             creditGroupsStore[exIdx] = { ...creditGroupsStore[exIdx], ...payload, id: groupId };
             console.log(`[Termux Hub] 🔄 Updated Credit Group [${groupId}] via LWW`);
           }
@@ -2913,7 +2969,7 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 9.07 CONFIGURATION DATA: INVENTORY CATEGORIES (T2 STRICT LWW - 5000MS SKEW)
+      // 9.07 CONFIGURATION DATA: INVENTORY CATEGORIES (T2 STRICT LWW - 60000MS SKEW)
       // =====================================================================
       const isCategory = pType === 'CATEGORY_SYNC' || pType === 'CATEGORIES_SYNC' || pType === 'category' || pType === 'categories' || sheetName === 'Categories';
       if (isCategory && payload) {
@@ -2926,7 +2982,7 @@ wss.on('connection', (ws, req) => {
           );
           const incomingTime = getTimestamp(payload);
 
-          if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+          if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
             console.log(
               `[Termux Hub] 🛡️ LWW Reject: Stale Categories update (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative categories back.`
             );
@@ -2968,7 +3024,7 @@ wss.on('connection', (ws, req) => {
         if (sIdx >= 0) {
           const existing = salespeopleStore[sIdx];
           const existingTime = getTimestamp(existing);
-          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
             console.log(
               `[Termux Hub] 🛡️ LWW Reject: Stale staff update for ${staffObj.name || staffObj.id} (${staffObj.id}) (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
             );
@@ -3053,7 +3109,7 @@ wss.on('connection', (ws, req) => {
         if (cIdx >= 0) {
           const existing = customersStore[cIdx];
           const existingTime = getTimestamp(existing);
-          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
             console.log(
               `[Termux Hub] 🛡️ LWW Reject: Stale customer update for ${cId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
             );
@@ -3153,7 +3209,7 @@ wss.on('connection', (ws, req) => {
         if (bIdx >= 0) {
           const existing = branchesStore[bIdx];
           const existingTime = getTimestamp(existing);
-          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
             console.log(
               `[Termux Hub] 🛡️ LWW Reject: Stale branch update for ${bId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
             );
@@ -3241,7 +3297,7 @@ wss.on('connection', (ws, req) => {
         if (aIdx >= 0) {
           const existing = cashAccountsStore[aIdx];
           const existingTime = getTimestamp(existing);
-          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 5000)) {
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
             console.log(
               `[Termux Hub] 🛡️ LWW Reject: Stale cash account update for ${accId} (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()}). Sending authoritative Hub record back.`
             );
@@ -3781,7 +3837,7 @@ async function syncEdgeToCloudSupabase() {
                   newlyPulledRecords.push(t.store[existingIdx]);
                 }
               } else {
-                // T2: 5000ms LWW
+                // T2: 60000ms LWW
                 const cloudUpdated = getRecordTimestamp(cRec);
                 const existingIdx = t.store.findIndex((s) => String(getEntityId(s, t.entityType)).trim() === cleanId);
                 if (existingIdx === -1) {
@@ -3790,7 +3846,7 @@ async function syncEdgeToCloudSupabase() {
                   newlyPulledRecords.push(cRec);
                 } else {
                   const localUpdated = getRecordTimestamp(t.store[existingIdx]);
-                  if (cloudUpdated - localUpdated > 5000) {
+                  if (cloudUpdated - localUpdated > 60000) {
                     cRec.isCloudSynced = true;
                     t.store[existingIdx] = cRec;
                     newlyPulledRecords.push(cRec);

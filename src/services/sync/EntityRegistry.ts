@@ -321,6 +321,16 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     uiEventName: 'saimetric_recon_backfill_received',
     description: 'Hub stream of missing drift records to client',
   },
+  recon_push_backfill_request: {
+    entityType: 'recon_push_backfill_request',
+    class: 'T1',
+    appendOnly: false,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: false,
+    uiEventName: 'saimetric_recon_push_requested',
+    description: 'Hub request for client to push missing drift records to Hub',
+  },
 
   // ==========================================================================
   // T2 CONFIGURATION (Last-write-wins mutable records)

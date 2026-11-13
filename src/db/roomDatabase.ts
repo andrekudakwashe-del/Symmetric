@@ -5471,8 +5471,8 @@ export const ingestMeshCreditGroup = (group: CreditGroup): boolean => {
   if (idx >= 0) {
     const existing = current[idx];
     const existingTime = extractRecordTimestamp(existing) || 0;
-    // 5000ms LWW Defense-in-depth
-    if (incomingTime < existingTime - 5000) {
+    // 60000ms LWW Defense-in-depth
+    if (incomingTime < existingTime - 60000) {
       console.warn(`[ingestMeshCreditGroup] ⏳ Dropping stale credit group update for ${group.name} (${group.id})`);
       return false;
     }
@@ -5986,6 +5986,17 @@ export const saveDailyCreditSalesSheet = (
 // ==================== SALES / INVOICE DAO (FORM 3) ====================
 export const getRawStoredSales = (): SaleInvoice[] => {
   return getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
+};
+
+export const getSaleById = (id: string): SaleInvoice | undefined => {
+  const clean = String(id || '').trim().toUpperCase();
+  if (!clean) return undefined;
+  return getRawStoredSales().find(
+    (s) =>
+      ((s.id || (s as any).invoice_id || (s as any).invoiceId || '') as string)
+        .trim()
+        .toUpperCase() === clean
+  );
 };
 
 export const getAllSales = (branchId?: string): SaleInvoice[] => {
@@ -10819,10 +10830,10 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const existing = allItems[idx];
     const targetItemId = existing.itemId || cleanId;
 
-    // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+    // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
     const incomingTime = parseTimestampMs(item.updatedAt || item.lastUpdated || (item as any).hubTimestamp);
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
         `[LWW Client] 🛡️ Rejected stale inventory update for ${targetItemId} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
@@ -11032,10 +11043,10 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
     if (idx >= 0) {
       const existing = allItems[idx];
       const targetItemId = existing.itemId || cleanId;
-      // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+      // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
       const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
       const incomingTime = parseTimestampMs(item.updatedAt || item.lastUpdated || (item as any).hubTimestamp);
-      if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
         console.warn(
           `[LWW Client] 🛡️ Rejected stale inventory update for ${targetItemId} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
         );
@@ -11377,10 +11388,10 @@ export const ingestMeshBranch = (branch: Branch): boolean => {
   if (index >= 0) {
     const existing = branches[index];
 
-    // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+    // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
     const incomingTime = parseTimestampMs(branch.updatedAt || branch.lastUpdated || (branch as any).hubTimestamp);
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
         `[LWW Client] 🛡️ Rejected stale branch update for ${id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
@@ -11444,11 +11455,11 @@ export const ingestMeshStaff = (
   delete (normalized as any).pin;
 
   if (existing) {
-    // Strict Last-Write-Wins (LWW) check (5000ms skew tolerance):
+    // Strict Last-Write-Wins (LWW) check (60000ms skew tolerance):
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
     const incomingTime = parseTimestampMs(staff.updatedAt || staff.lastUpdated || (staff as any).hubTimestamp);
 
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
         `[LWW Client] 🛡️ Rejected stale staff update for ${staff.name || staff.id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
@@ -11639,9 +11650,9 @@ export const ingestMeshCustomer = (
 
   if (idx >= 0) {
     const existing = all[idx];
-    // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+    // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
         `[LWW Client] 🛡️ Rejected stale customer update for ${customer.name || id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
@@ -15007,8 +15018,8 @@ export const syncCasualWorkersFromHub = (
         const incomingTime = extractRecordTimestamp(sanitized);
         const existingTime = existing ? extractRecordTimestamp(existing) : 0;
 
-        // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
-        if (existing && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+        // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
+        if (existing && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
           console.warn(
             `[LWW Client] 🛡️ Rejected stale casual_worker update for ${sanitized.name || key} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
           );
@@ -15065,7 +15076,7 @@ export const ingestStocktakeSessionFromMesh = (data: {
   if (existing) {
     const existingTime = parseTimestampMs((existing as any).updatedAt || (existing as any).lastUpdated || existing.timestamp);
     const incomingTime = parseTimestampMs((data as any).updatedAt || (data as any).lastUpdated || data.startedAt || (data as any).timestamp);
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
         `[LWW Client] 🛡️ Rejected stale stocktake_session update for ${data.sessionId} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
@@ -18344,10 +18355,10 @@ export const saveCashAccount = (
   if (index >= 0) {
     const existing = all[index];
     if (options?.fromSync) {
-      // Client-Side LWW Defense-in-Depth (5000ms skew tolerance)
+      // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
       const existingTime = parseTimestampMs(existing.updatedAt || (existing as any).lastUpdated || existing.updated_at || (existing as any).hubTimestamp);
       const incomingTime = parseTimestampMs((account as any).updatedAt || (account as any).lastUpdated || (account as any).updated_at || (account as any).hubTimestamp);
-      if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 5000) {
+      if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
         console.warn(
           `[LWW Client] 🛡️ Rejected stale cash_account update for ${account.account_id || account.account_name} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
         );
