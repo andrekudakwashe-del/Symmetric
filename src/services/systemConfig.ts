@@ -156,9 +156,11 @@ export async function pushAllLocalTenantsToCloud(
       }
       if (data && Array.isArray(data.users)) {
         data.users.forEach((su: any) => {
+          const cloudStaff = su;
+          console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
           const uComp = su.company_id || su.companyId;
           if (uComp) {
-            saveSalesperson({
+            const savedStaff = saveSalesperson({
               id: su.id || su.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
               name: su.name || su.full_name || 'Staff Member',
               role: (su.role || 'OWNER').toUpperCase() as any,
@@ -172,6 +174,14 @@ export async function pushAllLocalTenantsToCloud(
               branch_id: su.branch_id || su.branchId || 'BR-MAIN',
               permissions: getOwnerDefaultPermissions(),
             });
+            console.log(
+              '[STAFF TRACE] 7. Saved to DB. New Pin:',
+              savedStaff.pin_hash,
+              'New Branches:',
+              (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+              'Role:',
+              savedStaff.role
+            );
           }
         });
       }
@@ -249,9 +259,11 @@ export async function initializeSystemConfigAndSync(): Promise<{
         }
         if (serverData && Array.isArray(serverData.users)) {
           serverData.users.forEach((su: any) => {
+            const cloudStaff = su;
+            console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
             const uComp = su.company_id || su.companyId;
             if (uComp) {
-              saveSalesperson({
+              const savedStaff = saveSalesperson({
                 id: su.id || su.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
                 name: su.name || su.full_name || 'Staff Member',
                 role: (su.role || 'OWNER').toUpperCase() as any,
@@ -265,6 +277,14 @@ export async function initializeSystemConfigAndSync(): Promise<{
                 branch_id: su.branch_id || su.branchId || 'BR-MAIN',
                 permissions: getOwnerDefaultPermissions(),
               });
+              console.log(
+                '[STAFF TRACE] 7. Saved to DB. New Pin:',
+                savedStaff.pin_hash,
+                'New Branches:',
+                (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+                'Role:',
+                savedStaff.role
+              );
             }
           });
         }

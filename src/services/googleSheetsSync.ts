@@ -314,6 +314,12 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
   const targetComp = getCompanies().find((c) => c.company_id === companyId) || currentComp;
   const tenantBackendConfig = getTenantBackendConfig(targetComp);
 
+  if (item.sheetName === 'Salespeople' || item.sheetName === 'users') {
+    const activeStrategy = (targetComp as any)?.sync_strategy || 'HUB_CLOUD';
+    const isLocalHubActive = () => persistentSyncEngine.isSyncPaused();
+    console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', isLocalHubActive());
+  }
+
   if (
     tenantBackendConfig.backendType === 'firebase' ||
     tenantBackendConfig.backendType === 'supabase' ||
@@ -358,6 +364,11 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
     },
     timestamp: new Date().toISOString(),
   };
+
+  if (item.sheetName === 'Salespeople' || item.sheetName === 'users') {
+    const staffObj = payloadData.data;
+    console.log('[STAFF TRACE] 4. AppScripts Outbound:', JSON.stringify(staffObj));
+  }
 
   // 1. Try server-side proxy route (/api/sheets/sync-row) - bypasses browser CORS!
   try {
@@ -2251,9 +2262,11 @@ export const fetchCompaniesFromMasterSheet = async (
     // Cross-device user synchronization: Save remote staff & owner users into room database
     if (remoteUsers.length > 0) {
       remoteUsers.forEach((u) => {
+        const cloudStaff = u;
+        console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
         const uComp = u.company_id || u.companyId;
         if (uComp) {
-          saveSalesperson({
+          const savedStaff = saveSalesperson({
             id: u.id || u.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
             name: u.name || u.full_name || 'Staff Member',
             role: (u.role || 'OWNER').toUpperCase() as any,
@@ -2267,6 +2280,14 @@ export const fetchCompaniesFromMasterSheet = async (
             branch_id: u.branch_id || u.branchId || 'BR-MAIN',
             permissions: getOwnerDefaultPermissions(),
           });
+          console.log(
+            '[STAFF TRACE] 7. Saved to DB. New Pin:',
+            savedStaff.pin_hash,
+            'New Branches:',
+            (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+            'Role:',
+            savedStaff.role
+          );
         }
       });
     }

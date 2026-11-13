@@ -483,6 +483,16 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
         if (formPin) {
           staffPayload.pin = formPin;
         }
+        console.log(
+          '[STAFF TRACE] 1. UI Save. Target Object:',
+          JSON.stringify({
+            id: editingStaff.id,
+            name: staffPayload.name,
+            role: staffPayload.role,
+            pin_hash: staffPayload.pin_hash || editingStaff.pin_hash,
+            assignedBranchIds: finalAssignments.map((a) => a.branchId),
+          })
+        );
         updateSalesperson(editingStaff.id, staffPayload, { fromSync: false });
 
         updateStaffBranchAssignments(editingStaff.id, finalAssignments);
@@ -519,6 +529,16 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
         }
 
         const newId = getNextSalespersonId();
+        console.log(
+          '[STAFF TRACE] 1. UI Save. Target Object:',
+          JSON.stringify({
+            id: newId,
+            name: formName.trim(),
+            role: formRole,
+            pin_hash: undefined,
+            assignedBranchIds: finalAssignments.map((a) => a.branchId),
+          })
+        );
         addSalesperson({
           id: newId,
           name: formName.trim(),

@@ -28,6 +28,12 @@ export class RuntimeSyncDispatcherService {
     const company = getCompanies().find((c) => c.company_id === companyId) || getCurrentCompany();
     const config = getTenantBackendConfig(company);
 
+    if (item.sheetName === 'Salespeople' || item.sheetName === 'users' || item.action === 'upsert_staff') {
+      const activeStrategy = company?.sync_strategy || 'HUB_CLOUD';
+      const isLocalHubActive = () => config.backendType === 'room';
+      console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', isLocalHubActive(), 'backendType:', config.backendType);
+    }
+
     // Phase D: Circuit Breaker Inspection
     if (config.backendType !== 'room' && !circuitBreakerFailover.shouldAllowRemoteCall(companyId, config.backendType)) {
       return {

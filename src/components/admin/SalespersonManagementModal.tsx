@@ -104,8 +104,29 @@ export const SalespersonManagementModal: React.FC<SalespersonManagementModalProp
         if (pin) {
           payload.pin = pin;
         }
+        const existingStaff = salespeople.find((s) => s.id === editingStaffId);
+        console.log(
+          '[STAFF TRACE] 1. UI Save. Target Object:',
+          JSON.stringify({
+            id: editingStaffId,
+            name: payload.name,
+            role: payload.role,
+            pin_hash: payload.pin_hash || existingStaff?.pin_hash,
+            assignedBranchIds: existingStaff?.branchAssignments?.map((b) => b.branchId) || [],
+          })
+        );
         updateSalesperson(editingStaffId, payload, { fromSync: false });
       } else {
+        console.log(
+          '[STAFF TRACE] 1. UI Save. Target Object:',
+          JSON.stringify({
+            id: undefined,
+            name: name.trim(),
+            role,
+            pin_hash: undefined,
+            assignedBranchIds: [],
+          })
+        );
         addSalesperson({
           name: name.trim(),
           pin,

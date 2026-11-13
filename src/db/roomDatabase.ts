@@ -9336,6 +9336,11 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
     ...payload,
   };
 
+  if (sheetName === 'Salespeople' || sheetName === 'users') {
+    const staffObj = enhancedPayload;
+    console.log('[STAFF TRACE] 4. AppScripts Outbound:', JSON.stringify(staffObj));
+  }
+
   const newItem: SyncQueueItem = {
     id: `sync_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     sheetName,
@@ -11431,6 +11436,8 @@ export const ingestMeshStaff = (
   const all = getAllSalespeople();
   const index = all.findIndex((s) => s.id === staff.id);
   const existing = index >= 0 ? all[index] : undefined;
+  const incoming = staff;
+  console.log('[STAFF TRACE] 5. LocalHub Ingest. Incoming:', JSON.stringify(incoming), 'Existing:', JSON.stringify(existing));
 
   // Explicitly copy pin_hash / password from incoming packet or preserve existing credentials
   let salt = (staff as any).pin_salt || existing?.pin_salt || generatePinSalt();
@@ -11472,7 +11479,15 @@ export const ingestMeshStaff = (
     if (salt) existing.pin_salt = salt;
   }
 
-  saveSalesperson(normalized, { fromSync: true });
+  const savedStaff = saveSalesperson(normalized, { fromSync: true });
+  console.log(
+    '[STAFF TRACE] 7. Saved to DB. New Pin:',
+    savedStaff.pin_hash,
+    'New Branches:',
+    (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+    'Role:',
+    savedStaff.role
+  );
   return true;
 };
 

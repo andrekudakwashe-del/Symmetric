@@ -540,6 +540,11 @@ class PersistentSyncEngine {
    * Pushes a single item. Calculates exponential backoff on failure.
    */
   public async pushSingleItem(item: PersistentSyncItem): Promise<boolean> {
+    if (item.action === 'upsert_staff' || item.sheetName === 'Salespeople' || item.sheetName === 'users') {
+      const activeStrategy = getCurrentCompany()?.sync_strategy || 'HUB_CLOUD';
+      const isLocalHubActive = () => this.isOutboundSyncPaused;
+      console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', isLocalHubActive());
+    }
     if (this.isOutboundSyncPaused) {
       console.log(`[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping pushSingleItem for ${item.id} (${item.sheetName}).`);
       return false;
@@ -648,6 +653,11 @@ class PersistentSyncEngine {
       ...item.payload,
     };
 
+    if (item.action === 'upsert_staff' || item.sheetName === 'Salespeople' || item.sheetName === 'users') {
+      const staffObj = item.payload;
+      console.log('[STAFF TRACE] 4. AppScripts Outbound:', JSON.stringify(staffObj));
+    }
+
     // 1. Try server-side proxy route (/api/sheets/sync-row) - bypasses browser CORS!
     if (targetUrl && targetUrl.startsWith('http')) {
       try {
@@ -739,6 +749,8 @@ class PersistentSyncEngine {
 
       if (usersRes && usersRes.success && Array.isArray(usersRes.users)) {
         for (const u of usersRes.users) {
+          const cloudStaff = u;
+          console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
           const staffId = u.id || u.user_id;
           const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
           const pinHash = u.pin_hash || existingStaff?.pin_hash;
@@ -753,7 +765,15 @@ class PersistentSyncEngine {
             companyId: u.company_id || companyId,
             branchId: u.branch_id || 'BR-MAIN',
           };
-          saveSalesperson(userPerson, { fromSync: true });
+          const savedStaff = saveSalesperson(userPerson, { fromSync: true });
+          console.log(
+            '[STAFF TRACE] 7. Saved to DB. New Pin:',
+            savedStaff.pin_hash,
+            'New Branches:',
+            (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+            'Role:',
+            savedStaff.role
+          );
           usersCount++;
         }
         const serverTime = usersRes.server_time || new Date().toISOString();
@@ -812,11 +832,13 @@ class PersistentSyncEngine {
     let count = 0;
     if (res && res.success && Array.isArray(res.users)) {
       for (const u of res.users) {
+        const cloudStaff = u;
+        console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
         const staffId = u.id || u.user_id;
         const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
         const pinHash = u.pin_hash || existingStaff?.pin_hash;
         const pinSalt = u.pin_salt || existingStaff?.pin_salt;
-        saveSalesperson({
+        const savedStaff = saveSalesperson({
           id: staffId,
           name: u.full_name || u.name || 'Staff',
           email: u.email || '',
@@ -826,6 +848,14 @@ class PersistentSyncEngine {
           companyId: u.company_id || currentCompany.company_id,
           branchId: u.branch_id || 'BR-MAIN',
         }, { fromSync: true });
+        console.log(
+          '[STAFF TRACE] 7. Saved to DB. New Pin:',
+          savedStaff.pin_hash,
+          'New Branches:',
+          (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+          'Role:',
+          savedStaff.role
+        );
         count++;
       }
       const serverTime = res.server_time || new Date().toISOString();

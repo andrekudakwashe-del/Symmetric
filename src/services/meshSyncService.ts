@@ -948,6 +948,8 @@ class MeshSyncManager {
 
     // Auto-hook into Staff creation & edits: broadcast to Local Hub & mesh
     onStaffChanged((staff: Salesperson) => {
+      const activeStrategy = getPackageSyncMode();
+      console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', this.isLocalHubActive());
       this.broadcastStaff(staff);
     });
 
@@ -6594,6 +6596,8 @@ class MeshSyncManager {
       ttl: 5,
     };
 
+    const payload = packet;
+    console.log('[STAFF TRACE] 3. LocalHub Outbound:', JSON.stringify(payload.staff || payload));
     this.sendPacketToAllTransports('staff', packet);
     this.addLog('BROADCAST', `Staff account ${staff.name} (${staff.id} - ${staff.role}) broadcasted to WiFi mesh (PIN protected)`, this.config.deviceName);
     this.notifyPeerSubscribers();
