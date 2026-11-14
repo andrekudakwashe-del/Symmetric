@@ -203,6 +203,8 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     window.addEventListener('mesh-inventory-received', handleDataRefreshEvent);
     window.addEventListener('mesh-catchup-completed', handleDataRefreshEvent);
     window.addEventListener('saimetric_customers_updated', handleDataRefreshEvent);
+    window.addEventListener('saimetric_exchange_rates_updated', handleDataRefreshEvent);
+    window.addEventListener('saimetric_settings_updated', handleDataRefreshEvent);
 
     return () => {
       unsubscribe();
@@ -211,6 +213,8 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       window.removeEventListener('mesh-inventory-received', handleDataRefreshEvent);
       window.removeEventListener('mesh-catchup-completed', handleDataRefreshEvent);
       window.removeEventListener('saimetric_customers_updated', handleDataRefreshEvent);
+      window.removeEventListener('saimetric_exchange_rates_updated', handleDataRefreshEvent);
+      window.removeEventListener('saimetric_settings_updated', handleDataRefreshEvent);
     };
   }, []);
 

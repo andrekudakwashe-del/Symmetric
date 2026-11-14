@@ -30,10 +30,6 @@ import {
   verifySalespersonPin,
 } from '../../db/roomDatabase';
 import {
-  computeDrawerBalance,
-  getShiftId,
-} from '../../db/cashLedger';
-import {
   getBranchSafeAccount,
   getClerkFloatAccount,
 } from '../../services/cashCustodyService';
@@ -132,15 +128,6 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
     return breakdown.reduce((sum, item) => sum + item.qty, 0);
   }, [breakdown]);
 
-  const liveDrawerBalance = useMemo(() => {
-    const sId = getShiftId(cashier.id, activeDate);
-    return computeDrawerBalance(sId);
-  }, [cashier.id, activeDate, isOpen, completedRecord]);
-
-  const isOverage = totalAmount > liveDrawerBalance;
-  const overageDiff = Math.max(0, Math.round((totalAmount - liveDrawerBalance) * 100) / 100);
-  const remainingTillCash = Math.max(0, liveDrawerBalance - totalAmount);
-
   // Handlers for steppers
   const handleQtyChange = (denom: number, val: string | number) => {
     const parsed = typeof val === 'number' ? val : parseInt(val, 10);
@@ -196,14 +183,6 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
       return;
     }
 
-    // Live Drawer Balance validation - with configurable overage tolerance for cashiers with overs
-    const sId = getShiftId(cashier.id, activeDate);
-    const liveBalance = computeDrawerBalance(sId);
-    if (totalAmount > liveBalance && !govConfig.allowOverageLifts) {
-      setErrorMsg(`Counted lift amount ($${totalAmount.toFixed(2)}) exceeds live drawer balance ($${liveBalance.toFixed(2)}). Cash lift is blocked. (Enable "Allow Overage Lifts" in Cash Governance Settings to permit).`);
-      return;
-    }
-
     // 2. Cashier PIN verification
     const isLean = govConfig.governanceMode === 'LEAN';
     const trimmedCashierPin = cashierPin.trim();
@@ -255,7 +234,7 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
         totalAmount,
         denominations: denomRecord,
         reason: customNotes.trim() ? `${reason} - ${customNotes.trim()}` : reason,
-        notes: isOverage ? `Cashier Overage (+${overageDiff.toFixed(2)}). Deposited to ${destAcc.account_name}. ${customNotes.trim()}` : `Deposited to ${destAcc.account_name}. ${customNotes.trim()}`.trim(),
+        notes: `Deposited to ${destAcc.account_name}. ${customNotes.trim()}`.trim(),
         date: activeDate,
         destinationAccountId: destAcc.account_id,
       });
@@ -556,24 +535,6 @@ export const CashLiftModal: React.FC<CashLiftModalProps> = ({
                   </div>
                 </div>
               </div>
-
-              {/* Cashier Overage Alert if Counted Lift exceeds Live Book Balance */}
-              {isOverage && (
-                <div className="p-3 bg-amber-950/40 border border-amber-500/50 rounded-2xl flex items-start space-x-3 text-amber-200">
-                  <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-                  <div className="text-xs space-y-1">
-                    <div className="font-bold flex items-center space-x-2">
-                      <span>Cashier Overage Detected: +${overageDiff.toFixed(2)}</span>
-                      <span className="px-1.5 py-0.5 bg-amber-500/20 text-amber-300 rounded text-[10px] font-mono">
-                        Overs Allowed
-                      </span>
-                    </div>
-                    <p className="text-slate-300 text-[11px] leading-relaxed">
-                      Counted lift (${totalAmount.toFixed(2)}) exceeds drawer book balance (${liveDrawerBalance.toFixed(2)}). Retail cashiers frequently experience overs from tips, customer change donations, or unrecorded surplus. This will be safely recorded in the audit trail without blocking the lift.
-                    </p>
-                  </div>
-                </div>
-              )}
 
               {/* Custody Chain Destination Account Selection */}
               <div className="p-3 bg-slate-900/80 border border-slate-800 rounded-2xl space-y-2">

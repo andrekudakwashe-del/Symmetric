@@ -292,7 +292,7 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
       allowCashWithdrawal: true,
       maxWithdrawalRule: 'EQUAL_TO_SALE',
       customPercent: 100,
-      updatedAt: new Date().toISOString(),
+      updatedAt: '1970-01-01T00:00:00.000Z',
       updatedBy: 'System Default',
     },
     EcoCash: {
@@ -305,7 +305,7 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
       allowCashWithdrawal: true,
       maxWithdrawalRule: 'EQUAL_TO_SALE',
       customPercent: 100,
-      updatedAt: new Date().toISOString(),
+      updatedAt: '1970-01-01T00:00:00.000Z',
       updatedBy: 'System Default',
     },
     ZAR: {
@@ -318,7 +318,7 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
       allowCashWithdrawal: true,
       maxWithdrawalRule: 'EQUAL_TO_SALE',
       customPercent: 100,
-      updatedAt: new Date().toISOString(),
+      updatedAt: '1970-01-01T00:00:00.000Z',
       updatedBy: 'System Default',
     },
     BWP: {
@@ -331,7 +331,7 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
       allowCashWithdrawal: false,
       maxWithdrawalRule: 'EQUAL_TO_SALE',
       customPercent: 100,
-      updatedAt: new Date().toISOString(),
+      updatedAt: '1970-01-01T00:00:00.000Z',
       updatedBy: 'System Default',
     },
     EUR: {
@@ -344,7 +344,7 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
       allowCashWithdrawal: false,
       maxWithdrawalRule: 'EQUAL_TO_SALE',
       customPercent: 100,
-      updatedAt: new Date().toISOString(),
+      updatedAt: '1970-01-01T00:00:00.000Z',
       updatedBy: 'System Default',
     },
     GBP: {
@@ -357,7 +357,7 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
       allowCashWithdrawal: false,
       maxWithdrawalRule: 'EQUAL_TO_SALE',
       customPercent: 100,
-      updatedAt: new Date().toISOString(),
+      updatedAt: '1970-01-01T00:00:00.000Z',
       updatedBy: 'System Default',
     },
   },
@@ -366,7 +366,10 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
     maxWithdrawalRule: 'EQUAL_TO_SALE',
     customPercent: 100,
   },
-  lastUpdated: new Date().toISOString(),
+  updatedAt: 0,
+  lastUpdated: '1970-01-01T00:00:00.000Z',
+  updatedBy: 'System Default',
+  isSystemDefault: true,
 };
 
 type Listener = () => void;
@@ -730,33 +733,116 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
     map.set(key, item);
   });
 
-  // Iterate over incoming delta: update Map if ID exists (or add if new)
+  // Iterate over incoming delta: update Map if ID exists (or add if new), enforcing monotonic finalized status
+  const isFinalApprovalStatus = (s: any): boolean => {
+    const u = String(s || '').trim().toUpperCase();
+    return u === 'APPROVED' || u === 'REJECTED' || u === 'VOIDED' || u === 'REFUNDED';
+  };
+  const isPendingApprovalStatus = (s: any): boolean => {
+    const u = String(s || '').trim().toUpperCase();
+    return u === 'PENDING' || u === 'PENDING_APPROVAL' || u === 'PENDING_SUPERVISOR';
+  };
+  const isFinalMobileStatus = (s: any): boolean => {
+    const u = String(s || '').trim().toUpperCase();
+    return u === 'VERIFIED' || u === 'FLAGGED';
+  };
+
   incomingRecords.forEach((item) => {
     if (!item) return;
     const key = getRecordId(item);
     if (key) {
       const prev = map.get(key);
-      map.set(key, prev ? { ...prev, ...item } : item);
+      if (!prev) {
+        map.set(key, item);
+        return;
+      }
+      const mergedItem = { ...prev, ...item };
+      // Protect finalized approval/void statuses from being downgraded by stale pending records
+      if (isFinalApprovalStatus(prev.status) && (!item.status || isPendingApprovalStatus(item.status))) {
+        mergedItem.status = prev.status;
+        if (prev.approvedBy !== undefined) mergedItem.approvedBy = prev.approvedBy;
+        if (prev.approvedByName !== undefined) mergedItem.approvedByName = prev.approvedByName;
+        if (prev.approvedAt !== undefined) mergedItem.approvedAt = prev.approvedAt;
+        if (prev.approvalTimestamp !== undefined) mergedItem.approvalTimestamp = prev.approvalTimestamp;
+        if (prev.approvedByStaffId !== undefined) mergedItem.approvedByStaffId = prev.approvedByStaffId;
+        if (prev.approvedByStaffName !== undefined) mergedItem.approvedByStaffName = prev.approvedByStaffName;
+        if (prev.rejectedReason !== undefined) mergedItem.rejectedReason = prev.rejectedReason;
+      }
+      // Protect finalized mobile verification status from being downgraded by stale PENDING/unset records
+      if (isFinalMobileStatus(prev.mobileVerificationStatus) && !isFinalMobileStatus(item.mobileVerificationStatus)) {
+        mergedItem.mobileVerificationStatus = prev.mobileVerificationStatus;
+        mergedItem.mobileVerifiedAmountInCurrency = prev.mobileVerifiedAmountInCurrency;
+        mergedItem.mobileExpectedAmountInCurrency = prev.mobileExpectedAmountInCurrency;
+        mergedItem.mobileVerifiedRef = prev.mobileVerifiedRef;
+        mergedItem.mobileVerifiedBy = prev.mobileVerifiedBy;
+        mergedItem.mobileVerifiedByName = prev.mobileVerifiedByName;
+        mergedItem.mobileVerifiedAt = prev.mobileVerifiedAt;
+        mergedItem.mobileDisputeReason = prev.mobileDisputeReason;
+        mergedItem.mobileDisputeResolution = prev.mobileDisputeResolution;
+        mergedItem.mobileShortfallUsd = prev.mobileShortfallUsd;
+      }
+      map.set(key, mergedItem);
     } else {
       map.set(`_inc_${Math.random()}`, item);
     }
   });
 
-  const merged = Array.from(map.values());
+  const mergedRaw = Array.from(map.values());
+  const merged =
+    storageKey === STORAGE_KEYS.CASH_LOGS
+      ? deduplicateCashLogs(mergedRaw.map((r) => normalizeCashLogRecord(r)))
+      : mergedRaw;
   setStored(storageKey, merged);
   notifyListeners();
 
-  console.log(`[Merge] Merged ${incomingRecords.length} incoming records into ${existing.length} local records for ${storageKey}`);
+  console.log(`[Merge] Merged ${incomingRecords.length} incoming records into ${existing.length} local records for ${storageKey} (final: ${merged.length})`);
 
   return merged;
 };
 
 // ==================== MULTI-CURRENCY & EXCHANGE RATES ====================
+export type MultiCurrencyChangeListener = (config: MultiCurrencyConfig) => void;
+const multiCurrencyListeners: Set<MultiCurrencyChangeListener> = new Set();
+
+export const onMultiCurrencyChanged = (listener: MultiCurrencyChangeListener) => {
+  multiCurrencyListeners.add(listener);
+  return () => {
+    multiCurrencyListeners.delete(listener);
+  };
+};
+
+export const notifyMultiCurrencyChanged = (config: MultiCurrencyConfig) => {
+  multiCurrencyListeners.forEach((fn) => {
+    try {
+      fn(config);
+    } catch (e) {
+      console.error('multiCurrencyListener error:', e);
+    }
+  });
+};
+
+export const getMultiCurrencyUpdatedAt = (cfg?: MultiCurrencyConfig | null): number => {
+  if (!cfg || cfg.isSystemDefault === true) return 0;
+  if (typeof cfg.updatedAt === 'number' && !isNaN(cfg.updatedAt) && cfg.updatedAt > 0) {
+    return cfg.updatedAt;
+  }
+  const hasExplicitUserEdit =
+    (cfg.updatedBy && cfg.updatedBy !== 'System Default') ||
+    Object.values(cfg.rates || {}).some((r: any) => r && r.updatedBy && r.updatedBy !== 'System Default');
+  if (!hasExplicitUserEdit && cfg.updatedAt === undefined) {
+    return 0;
+  }
+  const parsed = parseTimestampMs(cfg.updatedAt || cfg.lastUpdated || (cfg as any).updated_at);
+  return parsed > 0 ? parsed : 0;
+};
+
 export const getMultiCurrencyConfig = (): MultiCurrencyConfig => {
   const stored = getStored<MultiCurrencyConfig | null>(STORAGE_KEYS.EXCHANGE_RATES, null);
   if (!stored) {
     return DEFAULT_MULTI_CURRENCY_CONFIG;
   }
+  const effectiveUpdatedAt = getMultiCurrencyUpdatedAt(stored);
+  const isDefault = stored.isSystemDefault === true || effectiveUpdatedAt === 0;
   return {
     ...DEFAULT_MULTI_CURRENCY_CONFIG,
     ...stored,
@@ -769,6 +855,8 @@ export const getMultiCurrencyConfig = (): MultiCurrencyConfig => {
       ...DEFAULT_MULTI_CURRENCY_CONFIG.cashWithdrawalPolicy,
       ...(stored.cashWithdrawalPolicy || {}),
     },
+    updatedAt: effectiveUpdatedAt,
+    isSystemDefault: isDefault,
   };
 };
 
@@ -825,10 +913,14 @@ export const getCurrencyRate = (code: string): number => {
 
 export const saveMultiCurrencyConfig = (
   config: Partial<MultiCurrencyConfig>,
-  updatedBy?: string
+  updatedBy?: string,
+  options?: { fromSync?: boolean; updatedAt?: number }
 ): MultiCurrencyConfig => {
   const current = getMultiCurrencyConfig();
-  const now = new Date().toISOString();
+  const nowMs = options?.updatedAt && options.updatedAt > 0 ? options.updatedAt : Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const currentCompId = (config as any).companyId || (config as any).company_id || getCurrentCompanyId();
+  const effectiveUpdater = updatedBy || (config as any).updatedBy || current.updatedBy || 'Owner';
 
   // Merge any incoming rates dynamically while preserving existing ones
   const mergedRates: Record<string, any> = {
@@ -840,13 +932,14 @@ export const saveMultiCurrencyConfig = (
     Object.keys(config.rates).forEach((key) => {
       const incoming = config.rates![key];
       if (incoming) {
+        const rateNum = incoming.rateToBase !== undefined ? incoming.rateToBase : incoming.rateToUsd;
         mergedRates[key] = {
           ...(current.rates[key] || {}),
           ...incoming,
-          rateToBase: incoming.rateToBase !== undefined ? incoming.rateToBase : incoming.rateToUsd,
-          rateToUsd: incoming.rateToBase !== undefined ? incoming.rateToBase : incoming.rateToUsd,
-          updatedAt: now,
-          updatedBy: updatedBy || incoming.updatedBy || current.rates[key]?.updatedBy || 'Owner',
+          rateToBase: rateNum,
+          rateToUsd: rateNum,
+          updatedAt: options?.fromSync && incoming.updatedAt ? incoming.updatedAt : nowIso,
+          updatedBy: options?.fromSync && incoming.updatedBy ? incoming.updatedBy : effectiveUpdater,
         };
       }
     });
@@ -855,16 +948,127 @@ export const saveMultiCurrencyConfig = (
   const merged: MultiCurrencyConfig = {
     ...current,
     ...config,
-    baseCurrency: config.baseCurrency || current.baseCurrency || 'USD',
+    companyId: currentCompId,
+    baseCurrency: (config.baseCurrency || current.baseCurrency || 'USD').toUpperCase(),
     rates: mergedRates,
     cashWithdrawalPolicy: {
       ...current.cashWithdrawalPolicy,
       ...(config.cashWithdrawalPolicy || {}),
     },
-    lastUpdated: now,
+    updatedAt: nowMs,
+    lastUpdated: options?.fromSync && (config as any).lastUpdated ? (config as any).lastUpdated : nowIso,
+    updatedBy: effectiveUpdater,
+    isSystemDefault: false,
   };
   setStored(STORAGE_KEYS.EXCHANGE_RATES, merged);
+
+  if (!options?.fromSync) {
+    notifyMultiCurrencyChanged(merged);
+    enqueueSync('Settings' as any, 'UPDATE', {
+      id: 'MULTI_CURRENCY_CONFIG',
+      settingType: 'MULTI_CURRENCY',
+      company_id: currentCompId,
+      exchangeRates: merged,
+      updatedAt: nowMs,
+      lastUpdated: merged.lastUpdated,
+      fromMesh: true, // Prevent duplicate db_mutation packet; MULTI_CURRENCY_SYNC handles mesh/Hub
+    });
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_exchange_rates_updated', { detail: merged }));
+    window.dispatchEvent(new CustomEvent('saimetric_settings_updated', { detail: { exchangeRates: merged } }));
+  }
   return merged;
+};
+
+export const ingestMeshMultiCurrencyConfig = (
+  incomingConfig: any,
+  incomingUpdatedAt?: number
+): boolean => {
+  if (!incomingConfig || typeof incomingConfig !== 'object' || !incomingConfig.rates) {
+    return false;
+  }
+
+  const currentCompany = getCurrentCompanyId().trim().toUpperCase();
+  const incomingComp = String(incomingConfig.companyId || incomingConfig.company_id || '').trim().toUpperCase();
+  const normTenant = (c: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' ? 'COMP-001' : c);
+  if (incomingComp && currentCompany && normTenant(incomingComp) !== normTenant(currentCompany)) {
+    return false;
+  }
+
+  const existing = getMultiCurrencyConfig();
+  const existingTime = getMultiCurrencyUpdatedAt(existing);
+  const parsedIncomingTime =
+    typeof incomingUpdatedAt === 'number' && !isNaN(incomingUpdatedAt) && incomingUpdatedAt > 0
+      ? incomingUpdatedAt
+      : getMultiCurrencyUpdatedAt(incomingConfig);
+
+  // T2 LWW Defense-in-Depth (60000ms skew tolerance)
+  if (existingTime > 0 && (parsedIncomingTime === 0 || existingTime > parsedIncomingTime + 60000)) {
+    console.warn(
+      `[LWW Client] 🛡️ Rejected stale multi-currency config (Local: ${new Date(existingTime).toISOString()} > Incoming: ${parsedIncomingTime > 0 ? new Date(parsedIncomingTime).toISOString() : '0'})`
+    );
+    return false;
+  }
+
+  // Skip no-op replays with identical timestamp & payload
+  if (
+    existingTime > 0 &&
+    parsedIncomingTime === existingTime &&
+    existing.baseCurrency === (incomingConfig.baseCurrency || 'USD').toUpperCase() &&
+    JSON.stringify(existing.rates) === JSON.stringify({ ...DEFAULT_MULTI_CURRENCY_CONFIG.rates, ...(incomingConfig.rates || {}) }) &&
+    JSON.stringify(existing.cashWithdrawalPolicy) === JSON.stringify({ ...DEFAULT_MULTI_CURRENCY_CONFIG.cashWithdrawalPolicy, ...(incomingConfig.cashWithdrawalPolicy || {}) })
+  ) {
+    return false;
+  }
+
+  const effectiveTs = parsedIncomingTime > 0 ? parsedIncomingTime : Date.now();
+  const effectiveIso = incomingConfig.lastUpdated || new Date(effectiveTs).toISOString();
+
+  const normalizedRates: Record<string, any> = {
+    ...DEFAULT_MULTI_CURRENCY_CONFIG.rates,
+    ...(incomingConfig.rates || {}),
+  };
+
+  Object.keys(normalizedRates).forEach((key) => {
+    const r = normalizedRates[key];
+    if (r) {
+      const rateNum = Number(r.rateToBase !== undefined ? r.rateToBase : r.rateToUsd || 0);
+      normalizedRates[key] = {
+        ...r,
+        currency: r.currency || r.code || key,
+        code: r.code || r.currency || key,
+        rateToBase: rateNum,
+        rateToUsd: rateNum,
+      };
+    }
+  });
+
+  const normalized: MultiCurrencyConfig = {
+    ...DEFAULT_MULTI_CURRENCY_CONFIG,
+    ...incomingConfig,
+    companyId: incomingConfig.companyId || incomingConfig.company_id || getCurrentCompanyId(),
+    baseCurrency: (incomingConfig.baseCurrency || existing.baseCurrency || 'USD').toUpperCase(),
+    rates: normalizedRates,
+    cashWithdrawalPolicy: {
+      ...DEFAULT_MULTI_CURRENCY_CONFIG.cashWithdrawalPolicy,
+      ...(incomingConfig.cashWithdrawalPolicy || {}),
+    },
+    updatedAt: effectiveTs,
+    lastUpdated: effectiveIso,
+    updatedBy: incomingConfig.updatedBy || 'Remote Owner',
+    isSystemDefault: false,
+  };
+
+  setStored(STORAGE_KEYS.EXCHANGE_RATES, normalized);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_exchange_rates_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_settings_updated', { detail: { exchangeRates: normalized } }));
+  }
+  return true;
 };
 
 export const calculateMaxCashWithdrawalUsd = (saleAmountUsd: number, currency: AppCurrency): number => {
@@ -1460,11 +1664,51 @@ export const cleanupDuplicateAuditAndMovementRecords = (): void => {
  */
 export const healMultiCurrencySalesAndMovements = (): void => {
   try {
+    // Step 0: Collapse any pre-existing duplicate EcoCash / ZiG CashLog and CashMovement records
+    const rawLogsBefore = getRawStoredCashLogs();
+    const dedupedLogs = deduplicateCashLogs(rawLogsBefore);
+    let healed = false;
+    if (dedupedLogs.length !== rawLogsBefore.length) {
+      setStored(STORAGE_KEYS.CASH_LOGS, dedupedLogs);
+      healed = true;
+      console.log(`[healMultiCurrencySalesAndMovements] 🧹 Collapsed ${rawLogsBefore.length - dedupedLogs.length} duplicate CashLog entries`);
+    }
+
+    const rawMovsBefore = getAllMovements();
+    const seenPosMovKeys = new Set<string>();
+    let removedMovsCount = 0;
+    for (const m of rawMovsBefore) {
+      if (
+        m &&
+        m.id &&
+        m.status !== 'rejected' &&
+        m.sourceRef &&
+        (m.type === 'ecocash_cash_out' ||
+          m.type === 'zig_cash_out' ||
+          m.type === 'ecocash_sale' ||
+          m.type === 'zig_sale')
+      ) {
+        const key = `${m.branch_id || 'BR-MAIN'}::${m.shiftId || ''}::${m.type}::${String(m.sourceRef).trim().toUpperCase()}`;
+        if (seenPosMovKeys.has(key)) {
+          deleteMovement(m.id);
+          removedMovsCount++;
+          healed = true;
+          continue;
+        }
+        seenPosMovKeys.add(key);
+      }
+    }
+    if (removedMovsCount > 0) {
+      console.log(`[healMultiCurrencySalesAndMovements] 🧹 Collapsed ${removedMovsCount} duplicate multi-currency movements`);
+    }
+
     const allSales = getAllSales();
     const allMovements = getAllMovements();
     const allCashLogs = getAllCashLogs();
     const existingMovKeys = new Set(allMovements.map((m) => `${m.sourceRef}_${m.type}`));
-    let healed = false;
+    const existingSemanticKeys = new Set(
+      allCashLogs.map((c) => getCashLogSemanticKey(c)).filter((k): k is string => Boolean(k))
+    );
 
     for (const sale of allSales) {
       if (!sale || !sale.id) continue;
@@ -1489,6 +1733,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
       const cur: 'ZiG' | 'EcoCash' | undefined = isZig ? 'ZiG' : isEco ? 'EcoCash' : undefined;
       if (!cur) continue;
 
+      const curBucket = cur === 'ZiG' ? 'ZIG' : 'ECOCASH';
       const saleMovType = cur === 'ZiG' ? 'zig_sale' : 'ecocash_sale';
       const saleKey = `${sale.id}_${saleMovType}`;
       if (!existingMovKeys.has(saleKey)) {
@@ -1514,12 +1759,15 @@ export const healMultiCurrencySalesAndMovements = (): void => {
       }
 
       // Auto-heal CashLog for non-cash sale if missing in Form 2
-      const hasSaleCashLog = allCashLogs.some(
-        (c) =>
-          c.reference === sale.id &&
-          !c.isWithdrawal &&
-          (c.currency === cur || c.line === cur || (c.category && c.category.includes(cur)))
-      );
+      const saleSemanticKey = `NCSALE::${String(sale.id).trim().toUpperCase()}::${curBucket}`;
+      const hasSaleCashLog =
+        existingSemanticKeys.has(saleSemanticKey) ||
+        allCashLogs.some(
+          (c) =>
+            (c.id === `CL-SALE-${sale.id}` || extractCashLogRef(c) === sale.id) &&
+            !isCashLogWithdrawal(c) &&
+            (c.currency === cur || c.line === cur || (c.category && c.category.includes(cur)))
+        );
       if (!hasSaleCashLog && Number(sale.total) > 0) {
         const currencyConfig = getMultiCurrencyConfig();
         const rate =
@@ -1528,6 +1776,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
           (cur === 'ZiG' ? 26.5 : 27.0);
         const curAmount = sale.totalInCurrency || (Number(sale.total) * rate);
         addCashLog({
+          id: `CL-SALE-${sale.id}`,
           timestamp: sale.timestamp,
           date: sale.date,
           staffId: sale.staffId,
@@ -1547,7 +1796,9 @@ export const healMultiCurrencySalesAndMovements = (): void => {
           isWithdrawal: false,
           reference: sale.id,
           notes: `Electronic ${cur} Payment: ${curAmount.toFixed(2)} ${cur}. Deducted as $${Number(sale.total).toFixed(2)} USD in Form 2.`,
+          skipSync: Boolean((sale as any).fromMesh),
         });
+        existingSemanticKeys.add(saleSemanticKey);
         healed = true;
       }
 
@@ -1577,11 +1828,14 @@ export const healMultiCurrencySalesAndMovements = (): void => {
         }
 
         // Auto-heal CashLog for withdrawal if missing in Form 2
-        const hasWithdrawalCashLog = allCashLogs.some(
-          (c) =>
-            c.reference === sale.id &&
-            (c.isWithdrawal || c.category?.toLowerCase().includes('withdrawal') || c.line?.toLowerCase().includes('withdrawal'))
-        );
+        const wdrSemanticKey = `WDR::${String(sale.id).trim().toUpperCase()}::${curBucket}`;
+        const hasWithdrawalCashLog =
+          existingSemanticKeys.has(wdrSemanticKey) ||
+          allCashLogs.some(
+            (c) =>
+              (c.id === `CL-WDR-${sale.id}` || extractCashLogRef(c) === sale.id) &&
+              isCashLogWithdrawal(c)
+          );
         if (!hasWithdrawalCashLog) {
           const currencyConfig = getMultiCurrencyConfig();
           const rate =
@@ -1591,6 +1845,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
           const wUsd = Number(sale.cashWithdrawalAmount);
           const wInCur = sale.cashWithdrawalInCurrency || (wUsd * rate);
           addCashLog({
+            id: `CL-WDR-${sale.id}`,
             timestamp: sale.timestamp,
             date: sale.date,
             staffId: sale.staffId,
@@ -1610,7 +1865,9 @@ export const healMultiCurrencySalesAndMovements = (): void => {
             isWithdrawal: true,
             reference: sale.id,
             notes: `Cash Out Payout to Customer: Swiped in ${cur}. Cashier handed $${wUsd.toFixed(2)} USD cash from till.`,
+            skipSync: Boolean((sale as any).fromMesh),
           });
+          existingSemanticKeys.add(wdrSemanticKey);
           healed = true;
         }
       }
@@ -4039,12 +4296,146 @@ export const clearParkedSales = (): void => {
 };
 
 // ==================== CASH LOG DAO (FORM 2 & FORM 1) ====================
+export const extractCashLogRef = (log: any): string => {
+  if (!log || typeof log !== 'object') return '';
+  const direct = String(log.reference || log.Reference || '').trim();
+  if (direct) return direct;
+  const text = `${log.description || log.Description || ''} ${log.notes || ''}`;
+  const hashMatch = text.match(/#([A-Za-z0-9_-]+)/);
+  if (hashMatch && hashMatch[1]) return hashMatch[1].trim();
+  return '';
+};
+
+export const isCashLogWithdrawal = (log: any): boolean => {
+  if (!log || typeof log !== 'object') return false;
+  if (log.isWithdrawal === true || log.isWithdrawal === 'true') return true;
+  const line = String(log.line || log.Line || '').toLowerCase();
+  const cat = String(log.category || '').toLowerCase();
+  const desc = String(log.description || log.Description || '').toLowerCase();
+  return (
+    line.includes('withdrawal') ||
+    cat.includes('withdrawal') ||
+    desc.includes('withdrawal') ||
+    desc.includes('cash-out')
+  );
+};
+
+export const getCashLogCurrencyBucket = (log: any): string => {
+  if (!log || typeof log !== 'object') return '';
+  const cur = String(log.currency || '').toLowerCase();
+  const line = String(log.line || log.Line || '').toLowerCase();
+  const cat = String(log.category || '').toLowerCase();
+  const desc = String(log.description || log.Description || '').toLowerCase();
+  if (cur.includes('eco') || line.includes('eco') || cat.includes('eco') || desc.includes('ecocash')) {
+    return 'ECOCASH';
+  }
+  if (cur.includes('zig') || line.includes('zig') || cat.includes('zig') || desc.includes('zig')) {
+    return 'ZIG';
+  }
+  const rawCur = String(log.currency || '').trim().toUpperCase();
+  if (rawCur && rawCur !== 'USD') return rawCur;
+  return '';
+};
+
+export const getCashLogSemanticKey = (log: any): string | null => {
+  const ref = extractCashLogRef(log).toUpperCase();
+  if (!ref) return null;
+  const curBucket = getCashLogCurrencyBucket(log);
+  const isW = isCashLogWithdrawal(log);
+  if (!curBucket && !isW) return null;
+  return `${isW ? 'WDR' : 'NCSALE'}::${ref}::${curBucket || 'FX'}`;
+};
+
+export const normalizeCashLogRecord = (entry: any): any => {
+  if (!entry || typeof entry !== 'object') return entry;
+  const line = entry.line ?? entry.Line ?? '';
+  const description = entry.description ?? entry.Description ?? '';
+  const reference = extractCashLogRef(entry) || undefined;
+  const isWithdrawal = isCashLogWithdrawal({ ...entry, line, description });
+  const curBucket = getCashLogCurrencyBucket({ ...entry, line, description });
+  const currency = entry.currency || (curBucket === 'ECOCASH' ? 'EcoCash' : curBucket === 'ZIG' ? 'ZiG' : undefined);
+  return {
+    ...entry,
+    id: entry.id || entry.cashLogId,
+    timestamp: entry.timestamp ?? entry.Timestamp ?? new Date().toISOString(),
+    date: entry.date ?? entry.Date ?? toDateStringSafe(entry.timestamp ?? entry.Timestamp) ?? getTodayDateString(),
+    staffId: entry.staffId ?? entry.StaffID ?? entry.staff_id ?? '',
+    staffName: entry.staffName ?? entry.StaffName ?? entry.staff_name ?? '',
+    line,
+    description,
+    in: entry.in !== undefined ? Number(entry.in) || 0 : Number(entry.In) || 0,
+    out: entry.out !== undefined ? Number(entry.out) || 0 : Number(entry.Out) || 0,
+    ...(reference ? { reference } : {}),
+    ...(currency ? { currency } : {}),
+    ...(isWithdrawal || entry.isWithdrawal !== undefined ? { isWithdrawal } : {}),
+    category: entry.category || (isWithdrawal && currency ? `${currency} Cash Withdrawal` : line),
+  };
+};
+
+export const deduplicateCashLogs = (logs: CashLogEntry[]): CashLogEntry[] => {
+  if (!Array.isArray(logs)) return [];
+  const scoreLog = (l: any): number => {
+    let score = 0;
+    const idStr = String(l?.id || '');
+    if (idStr.startsWith('CL-WDR-') || idStr.startsWith('CL-SALE-')) score += 100;
+    if (l?.reference) score += 10;
+    if (l?.currency) score += 5;
+    if (typeof l?.isWithdrawal === 'boolean') score += 5;
+    if (l?.synced) score += 2;
+    if (l?.notes) score += 2;
+    return score;
+  };
+
+  const result: CashLogEntry[] = [];
+  const byIdIndex = new Map<string, number>();
+  const bySemanticIndex = new Map<string, number>();
+
+  for (const rawItem of logs) {
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const item = normalizeCashLogRecord(rawItem);
+    const idKey = item.id ? String(item.id).trim() : '';
+    const comp = String(item.company_id || item.companyId || 'COMP-001').trim().toUpperCase();
+    const br = String(item.branch_id || item.branchId || 'BR-MAIN').trim().toUpperCase();
+    const semRaw = getCashLogSemanticKey(item);
+    const semKey = semRaw ? `${comp}::${br}::${semRaw}` : null;
+
+    if (idKey && byIdIndex.has(idKey)) {
+      const idx = byIdIndex.get(idKey)!;
+      if (scoreLog(item) > scoreLog(result[idx])) {
+        result[idx] = { ...result[idx], ...item, synced: Boolean(result[idx].synced || item.synced) };
+      }
+      continue;
+    }
+
+    if (semKey && bySemanticIndex.has(semKey)) {
+      const idx = bySemanticIndex.get(semKey)!;
+      const existing = result[idx];
+      if (scoreLog(item) > scoreLog(existing)) {
+        const merged = { ...existing, ...item, synced: Boolean(existing.synced || item.synced) };
+        result[idx] = merged;
+        if (merged.id) byIdIndex.set(String(merged.id).trim(), idx);
+      } else {
+        result[idx] = { ...item, ...existing, synced: Boolean(existing.synced || item.synced) };
+      }
+      continue;
+    }
+
+    const nextIdx = result.length;
+    result.push(item);
+    if (idKey) byIdIndex.set(idKey, nextIdx);
+    if (semKey) bySemanticIndex.set(semKey, nextIdx);
+  }
+
+  return result;
+};
+
 export const getRawStoredCashLogs = (): CashLogEntry[] => {
   const logs = getStored<CashLogEntry[]>(STORAGE_KEYS.CASH_LOGS, INITIAL_CASH_LOGS);
   if (!Array.isArray(logs)) return [];
 
-  // Auto-heal duplicate IDs if any exist in stored state
+  // Auto-heal duplicate IDs or duplicate multi-currency semantic entries if any exist in stored state
   const seenIds = new Set<string>();
+  const seenSemantic = new Set<string>();
   let hasDuplicates = false;
   const numbers = logs
     .map((c) => {
@@ -4054,7 +4445,7 @@ export const getRawStoredCashLogs = (): CashLogEntry[] => {
     .filter((n): n is number => n !== null);
   let nextCounter = (numbers.length > 0 ? Math.max(...numbers) : 0) + 1;
 
-  const sanitized = logs.map((item) => {
+  const idSanitized = logs.map((item) => {
     if (!item || !item.id || seenIds.has(item.id)) {
       hasDuplicates = true;
       const newId = `CL-${String(nextCounter++).padStart(3, '0')}`;
@@ -4062,8 +4453,21 @@ export const getRawStoredCashLogs = (): CashLogEntry[] => {
       return { ...item, id: newId };
     }
     seenIds.add(item.id);
+    const sem = getCashLogSemanticKey(item);
+    if (sem) {
+      const comp = String((item as any).company_id || (item as any).companyId || 'COMP-001').trim().toUpperCase();
+      const br = String((item as any).branch_id || (item as any).branchId || 'BR-MAIN').trim().toUpperCase();
+      const scopedSem = `${comp}::${br}::${sem}`;
+      if (seenSemantic.has(scopedSem)) {
+        hasDuplicates = true;
+      } else {
+        seenSemantic.add(scopedSem);
+      }
+    }
     return item;
   });
+
+  const sanitized = hasDuplicates ? deduplicateCashLogs(idSanitized) : idSanitized;
 
   if (hasDuplicates) {
     try {
@@ -4112,30 +4516,42 @@ export const addCashLog = (
   options?: { fromSync?: boolean }
 ): CashLogEntry => {
   const all = getRawStoredCashLogs();
+  const normInput = normalizeCashLogRecord(entry);
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const compId = entry.company_id || entry.companyId || currentCompany;
-  const brId = entry.branch_id || entry.branchId || currentBranch;
+  const compId = normInput.company_id || normInput.companyId || currentCompany;
+  const brId = normInput.branch_id || normInput.branchId || currentBranch;
 
-  // Anti-duplication check: if cash log already exists with this ID or reference, return it
-  if (entry.id) {
-    const existingById = all.find((c) => c.id === entry.id);
+  // Anti-duplication check: if cash log already exists with this ID or semantic key/reference, return it
+  if (normInput.id) {
+    const existingById = all.find((c) => c.id === normInput.id);
     if (existingById) return existingById;
   }
-  if (entry.reference) {
+  const incomingSemKey = getCashLogSemanticKey(normInput);
+  if (incomingSemKey) {
+    const compUp = String(compId).trim().toUpperCase();
+    const brUp = String(brId).trim().toUpperCase();
+    const existingBySem = all.find((c) => {
+      const cComp = String(c.company_id || (c as any).companyId || currentCompany).trim().toUpperCase();
+      const cBr = String((c as any).branch_id || (c as any).branchId || currentBranch).trim().toUpperCase();
+      return cComp === compUp && cBr === brUp && getCashLogSemanticKey(c) === incomingSemKey;
+    });
+    if (existingBySem) return existingBySem;
+  }
+  if (normInput.reference) {
     const existingByRef = all.find(
       (c) =>
-        c.reference === entry.reference &&
-        c.line === entry.line &&
-        c.date === entry.date &&
-        (!!c.isWithdrawal === !!entry.isWithdrawal)
+        c.reference === normInput.reference &&
+        c.line === normInput.line &&
+        c.date === normInput.date &&
+        (isCashLogWithdrawal(c) === isCashLogWithdrawal(normInput))
     );
     if (existingByRef) return existingByRef;
   }
 
   const newEntry: CashLogEntry = {
-    ...entry,
-    id: entry.id || getNextCashLogId(),
+    ...normInput,
+    id: normInput.id || getNextCashLogId(),
     synced: false,
     company_id: compId,
     companyId: compId,
@@ -4189,8 +4605,26 @@ export const addCashLog = (
   if (!entry.skipSync && !entry.fromMesh && !options?.fromSync) {
     console.log(`[Row10] Direct enqueue: CashLog ${newEntry.id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('CashLog', 'INSERT', {
+      id: newEntry.id,
       company_id: compId,
+      companyId: compId,
       branch_id: brId,
+      branchId: brId,
+      timestamp: newEntry.timestamp,
+      date: newEntry.date,
+      staffId: newEntry.staffId,
+      staffName: newEntry.staffName,
+      line: newEntry.line,
+      description: newEntry.description,
+      in: newEntry.in,
+      out: newEntry.out,
+      reference: newEntry.reference || '',
+      category: newEntry.category,
+      currency: newEntry.currency,
+      exchangeRate: newEntry.exchangeRate,
+      currencyAmount: newEntry.currencyAmount,
+      isWithdrawal: newEntry.isWithdrawal,
+      notes: newEntry.notes,
       Timestamp: newEntry.timestamp,
       Date: newEntry.date,
       StaffID: newEntry.staffId,
@@ -4333,6 +4767,8 @@ export const saveDailyCashLogSheet = (
         l.reference?.startsWith('LIFT-') ||
         l.category?.includes('Cash Lift') ||
         l.category?.includes('Supervisor Pick-Up') ||
+        l.id?.startsWith('CL-SALE-') ||
+        l.id?.startsWith('CL-WDR-') ||
         l.reference?.startsWith('SALE-') ||
         l.reference?.startsWith('INV-'))
   );
@@ -4515,52 +4951,77 @@ export const saveDailyCashLogSheet = (
       (lowerLine.includes('withdrawal') || lowerDesc.includes('withdrawal') || lowerDesc.includes('cash out'))
     ) {
       if (entry.out > 0) {
-        addMovement({
-          shiftId,
-          staffId,
-          date,
-          timestamp: newEntry.timestamp,
-          type: 'ecocash_cash_out',
-          amount: entry.out,
-          currency: 'USD',
-          direction: 'out',
-          affectsDrawer: true,
-          status: 'approved',
-          sourceModule: 'form2',
-          sourceRef: newEntry.id,
-          notes: entry.description,
-          company_id: currentCompany,
-          branch_id: currentBranch,
-        });
+        const refToUse = entry.reference || newEntry.id;
+        const alreadyHasEcoOut = getAllMovements().some(
+          (m) => matchesShift(m, shiftId, currentBranch) && m.type === 'ecocash_cash_out' && m.sourceRef === refToUse
+        );
+        if (!alreadyHasEcoOut) {
+          addMovement({
+            shiftId,
+            staffId,
+            date,
+            timestamp: newEntry.timestamp,
+            type: 'ecocash_cash_out',
+            amount: entry.out,
+            currency: 'USD',
+            direction: 'out',
+            affectsDrawer: true,
+            status: 'approved',
+            sourceModule: 'form2',
+            sourceRef: refToUse,
+            notes: entry.description,
+            company_id: currentCompany,
+            branch_id: currentBranch,
+          });
+        }
       }
     } else if (
       (lowerLine.includes('zig') || lowerDesc.includes('zig')) &&
       (lowerLine.includes('withdrawal') || lowerDesc.includes('withdrawal') || lowerDesc.includes('cash out'))
     ) {
       if (entry.out > 0) {
-        addMovement({
-          shiftId,
-          staffId,
-          date,
-          timestamp: newEntry.timestamp,
-          type: 'zig_cash_out',
-          amount: entry.out,
-          currency: 'USD',
-          direction: 'out',
-          affectsDrawer: true,
-          status: 'approved',
-          sourceModule: 'form2',
-          sourceRef: newEntry.id,
-          notes: entry.description,
-          company_id: currentCompany,
-          branch_id: currentBranch,
-        });
+        const refToUse = entry.reference || newEntry.id;
+        const alreadyHasZigOut = getAllMovements().some(
+          (m) => matchesShift(m, shiftId, currentBranch) && m.type === 'zig_cash_out' && m.sourceRef === refToUse
+        );
+        if (!alreadyHasZigOut) {
+          addMovement({
+            shiftId,
+            staffId,
+            date,
+            timestamp: newEntry.timestamp,
+            type: 'zig_cash_out',
+            amount: entry.out,
+            currency: 'USD',
+            direction: 'out',
+            affectsDrawer: true,
+            status: 'approved',
+            sourceModule: 'form2',
+            sourceRef: refToUse,
+            notes: entry.description,
+            company_id: currentCompany,
+            branch_id: currentBranch,
+          });
+        }
       }
     }
 
     enqueueSync('CashLog', 'INSERT', {
+      id: newEntry.id,
       company_id: currentCompany,
+      companyId: currentCompany,
       branch_id: currentBranch,
+      branchId: currentBranch,
+      timestamp: newEntry.timestamp,
+      date: newEntry.date,
+      staffId: newEntry.staffId,
+      staffName: newEntry.staffName,
+      line: newEntry.line,
+      description: newEntry.description,
+      in: newEntry.in,
+      out: newEntry.out,
+      reference: newEntry.reference || '',
+      category: newEntry.category,
       Timestamp: newEntry.timestamp,
       Date: newEntry.date,
       StaffID: newEntry.staffId,
@@ -4569,6 +5030,7 @@ export const saveDailyCashLogSheet = (
       Description: newEntry.description,
       In: newEntry.in,
       Out: newEntry.out,
+      Reference: newEntry.reference || '',
     });
   });
 
@@ -4669,7 +5131,7 @@ export const addCashLift = (data: {
       });
     } else {
       throw new Error(
-        `Cannot lift $${data.totalAmount.toFixed(2)}. Amount exceeds available drawer balance of $${currentBal.toFixed(2)}. (Enable "Allow Overage Lifts" in Cash Governance Settings to permit).`
+        `Cash lift of $${data.totalAmount.toFixed(2)} exceeds the authorized cash governance limit. Enable "Allow Overage Lifts" in Cash Governance Settings to permit blind lifts.`
       );
     }
   }
@@ -6374,17 +6836,273 @@ export const notifyCashAccountChanged = (account: CashAccount) => {
   });
 };
 
+export type ExpenseChangeListener = (expense: ExpenseEntry) => void;
+const expenseChangeListeners: Set<ExpenseChangeListener> = new Set();
+export const onExpenseChanged = (listener: ExpenseChangeListener) => {
+  expenseChangeListeners.add(listener);
+  return () => {
+    expenseChangeListeners.delete(listener);
+  };
+};
+export const notifyExpenseChanged = (expense: ExpenseEntry) => {
+  expenseChangeListeners.forEach((fn) => {
+    try {
+      fn(expense);
+    } catch (e) {
+      console.error('expenseChangeListener error:', e);
+    }
+  });
+};
+
+export type DirectGrvChangeListener = (grv: DirectGrv) => void;
+const directGrvChangeListeners: Set<DirectGrvChangeListener> = new Set();
+export const onDirectGrvChanged = (listener: DirectGrvChangeListener) => {
+  directGrvChangeListeners.add(listener);
+  return () => {
+    directGrvChangeListeners.delete(listener);
+  };
+};
+export const notifyDirectGrvChanged = (grv: DirectGrv) => {
+  directGrvChangeListeners.forEach((fn) => {
+    try {
+      fn(grv);
+    } catch (e) {
+      console.error('directGrvChangeListener error:', e);
+    }
+  });
+};
+
+export const getMobileMoneySaleKind = (sale: any): 'EcoCash' | 'ZiG' | null => {
+  if (!sale) return null;
+  const meth = String(sale.paymentMethod || '').trim().toLowerCase();
+  const cur = String(sale.currency || '').trim().toLowerCase();
+  if (meth === 'cash' || meth === 'credit' || meth === 'card' || meth === 'bank transfer') {
+    if (cur.includes('zig')) return 'ZiG';
+    if (cur.includes('eco')) return 'EcoCash';
+    return null;
+  }
+  if (cur.includes('eco') || meth.includes('eco')) return 'EcoCash';
+  if (cur.includes('zig') || meth.includes('zig')) return 'ZiG';
+  return null;
+};
+
+/**
+ * Idempotently applies local cashMovements, CashLogs, and Wallet adjustments when a
+ * mobile money sale is VERIFIED with a shortfall or FLAGGED as fake (charged to cashier shortage).
+ */
+export const applyMobileMoneyVerificationLedgerEffects = (
+  sale: SaleInvoice,
+  options?: { fromMesh?: boolean }
+) => {
+  if (!sale || !sale.id) return;
+  const curKind = getMobileMoneySaleKind(sale);
+  if (!curKind) return;
+
+  const compId = sale.company_id || sale.companyId || getCurrentCompanyId();
+  const brId = sale.branch_id || sale.branchId || getCurrentBranchId();
+  const shiftDate = sale.date || (sale.timestamp ? String(sale.timestamp).split('T')[0] : getTodayDateString());
+  const shiftId = getShiftId(sale.staffId || '001', shiftDate, brId);
+  const nowIso = sale.mobileVerifiedAt || new Date().toISOString();
+  const rate =
+    Number(sale.exchangeRate) ||
+    (curKind === 'ZiG'
+      ? (getMultiCurrencyConfig().rates['ZiG']?.rateToUsd || 26.5)
+      : (getMultiCurrencyConfig().rates['EcoCash']?.rateToUsd || 1.05));
+  const saleUsd = Number(sale.total) || 0;
+  const withdrawalUsd = Number(sale.cashWithdrawalAmount) || 0;
+  const grossInCur =
+    Number(sale.totalChargedInCurrency) ||
+    Math.round((saleUsd + withdrawalUsd) * rate * 100) / 100;
+
+  if (sale.mobileVerificationStatus === 'FLAGGED' && sale.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE') {
+    const allMovements = getMovements();
+    const alreadyApplied = allMovements.some((m) => m.sourceRef === `${sale.id}-FAKE-SHORTAGE`);
+    const shiftHasMovements = allMovements.some((m) => matchesShift(m, shiftId));
+
+    // 1. Reject electronic sale & electronic cash-out movements so cash-out exemption is reversed
+    allMovements.forEach((m) => {
+      if (
+        m.sourceRef === sale.id &&
+        (m.type === 'ecocash_sale' ||
+          m.type === 'zig_sale' ||
+          m.type === 'ecocash_cash_out' ||
+          m.type === 'zig_cash_out') &&
+        m.status !== 'rejected'
+      ) {
+        updateMovement(m.id, {
+          status: 'rejected',
+          affectsDrawer: false,
+          notes: `${m.notes || ''} [FLAGGED FAKE ${curKind} -> CHARGED TO CASHIER SHORTAGE: ${sale.mobileDisputeReason || 'Unverified'}]`.trim(),
+        });
+      }
+    });
+
+    // 2. Neutralize Form 2 CashLogs non-cash exemptions while keeping full audit text
+    const logs = getCashLogs();
+    let logsUpdatedBefore = false;
+    logs.forEach((l) => {
+      const matchesSaleRef =
+        l.id === `CL-SALE-${sale.id}` ||
+        l.id === `CL-WDR-${sale.id}` ||
+        (l.reference === sale.id &&
+          ((l as any).isFlaggedMobileReversal ||
+            String(l.line || '').toLowerCase().includes('eco') ||
+            String(l.line || '').toLowerCase().includes('zig')));
+      if (matchesSaleRef) {
+        if ((l as any).isFlaggedMobileReversal) {
+          logsUpdatedBefore = true;
+        } else if ((Number(l.out) || 0) > 0 || (Number(l.in) || 0) > 0) {
+          updateCashLog(l.id, {
+            out: 0,
+            in: 0,
+            isFlaggedMobileReversal: true,
+            description: `[FLAGGED FAKE - CHARGED SHORTAGE] ${l.description}`,
+            notes: `${l.notes ? l.notes + ' | ' : ''}Flagged fake ${curKind} by ${sale.mobileVerifiedByName || 'Supervisor'}: ${sale.mobileDisputeReason || ''}. Charged to cashier till shortage.`,
+          } as any);
+        }
+      }
+    });
+
+    // 3. Add canonical cash_sale movement for goods total so expectedCash rises by saleUsd (+ withdrawalUsd restored)
+    if (!alreadyApplied && saleUsd > 0 && shiftHasMovements) {
+      addMovement({
+        shiftId,
+        staffId: sale.staffId,
+        date: shiftDate,
+        timestamp: nowIso,
+        type: 'cash_sale',
+        amount: saleUsd,
+        currency: 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'Form4',
+        sourceRef: `${sale.id}-FAKE-SHORTAGE`,
+        notes: `Flagged Fake ${curKind} #${sale.id} -> Keep Sale & Charge Cashier Shortage ($${saleUsd.toFixed(2)} goods + $${withdrawalUsd.toFixed(2)} cash-out reversed)`,
+        approvedBy: sale.mobileVerifiedBy,
+        approvedByName: sale.mobileVerifiedByName,
+        company_id: compId,
+        branch_id: brId,
+        fromMesh: options?.fromMesh,
+      });
+    }
+
+    // 4. Reverse unverified electronic balance from merchant wallet
+    if (!alreadyApplied && !logsUpdatedBefore && grossInCur > 0) {
+      const targetWalletKey = curKind === 'ZiG' ? 'wallet_bank_zig' : 'wallet_ecocash';
+      saveWallet({
+        tenderId: targetWalletKey,
+        delta: -grossInCur,
+        reason: 'MOBILE_MONEY_FLAGGED_REVERSAL',
+        saleId: `${sale.id}-FAKE`,
+        branchId: brId,
+        fromMesh: options?.fromMesh,
+      }).catch(() => {});
+    }
+    return;
+  }
+
+  if (
+    sale.mobileVerificationStatus === 'VERIFIED' &&
+    sale.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE' &&
+    (Number(sale.mobileShortfallUsd) || 0) > 0.009
+  ) {
+    const shortfallUsd = Math.round((Number(sale.mobileShortfallUsd) || 0) * 100) / 100;
+    const cashOutReduction = Math.min(shortfallUsd, withdrawalUsd);
+    const goodsShortfall = Math.max(0, Math.round((shortfallUsd - cashOutReduction) * 100) / 100);
+    const expectedCur = Number(sale.mobileExpectedAmountInCurrency) || grossInCur;
+    const verifiedCur = Number(sale.mobileVerifiedAmountInCurrency) ?? expectedCur;
+    const shortfallInCur = Math.max(0, Math.round((expectedCur - verifiedCur) * 100) / 100);
+
+    const allMovements = getMovements();
+    const alreadyApplied = allMovements.some(
+      (m) => m.sourceRef === `${sale.id}-SHORTFALL` || (m.sourceRef === sale.id && (m as any).shortfallAdjusted)
+    );
+    if (alreadyApplied) return;
+
+    const shiftHasMovements = allMovements.some((m) => matchesShift(m, shiftId));
+
+    if (cashOutReduction > 0) {
+      allMovements.forEach((m) => {
+        if (m.sourceRef === sale.id && (m.type === 'ecocash_cash_out' || m.type === 'zig_cash_out')) {
+          const newAmt = Math.max(0, Math.round(((Number(m.amount) || 0) - cashOutReduction) * 100) / 100);
+          updateMovement(m.id, {
+            amount: newAmt,
+            shortfallAdjusted: true,
+            notes: `${m.notes || ''} [Verified Short-Paid: -$${cashOutReduction.toFixed(2)} shortfall charged to cashier]`.trim(),
+          } as any);
+        }
+      });
+      const wdrLog = getCashLogs().find((l) => l.id === `CL-WDR-${sale.id}`);
+      if (wdrLog) {
+        updateCashLog(wdrLog.id, {
+          out: Math.max(0, Math.round((withdrawalUsd - cashOutReduction) * 100) / 100),
+          notes: `${wdrLog.notes || ''} | Shortfall $${cashOutReduction.toFixed(2)} charged to cashier`,
+        });
+      }
+    }
+
+    if (goodsShortfall > 0 && shiftHasMovements) {
+      allMovements.forEach((m) => {
+        if (m.sourceRef === sale.id && (m.type === 'ecocash_sale' || m.type === 'zig_sale')) {
+          const newAmt = Math.max(0, Math.round(((Number(m.amount) || 0) - goodsShortfall) * 100) / 100);
+          updateMovement(m.id, {
+            amount: newAmt,
+            shortfallAdjusted: true,
+          } as any);
+        }
+      });
+      addMovement({
+        shiftId,
+        staffId: sale.staffId,
+        date: shiftDate,
+        timestamp: nowIso,
+        type: 'cash_sale',
+        amount: goodsShortfall,
+        currency: 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'Form4',
+        sourceRef: `${sale.id}-SHORTFALL`,
+        notes: `${curKind} Short-Paid #${sale.id} -> Shortfall $${goodsShortfall.toFixed(2)} USD charged to cashier till`,
+        approvedBy: sale.mobileVerifiedBy,
+        approvedByName: sale.mobileVerifiedByName,
+        company_id: compId,
+        branch_id: brId,
+        fromMesh: options?.fromMesh,
+      });
+    } else if (cashOutReduction > 0 && !shiftHasMovements) {
+      // No movements exist for legacy shift; Form 4 legacy loop uses mobileShortfallUsd directly
+    }
+
+    if (shortfallInCur > 0) {
+      const targetWalletKey = curKind === 'ZiG' ? 'wallet_bank_zig' : 'wallet_ecocash';
+      saveWallet({
+        tenderId: targetWalletKey,
+        delta: -shortfallInCur,
+        reason: 'MOBILE_MONEY_SHORTFALL_ADJUST',
+        saleId: `${sale.id}-SHORT`,
+        branchId: brId,
+        fromMesh: options?.fromMesh,
+      }).catch(() => {});
+    }
+  }
+};
+
 export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   if (!sale || !sale.id) return false;
 
   const isSaleUpdate =
     sale.status === 'Refunded' ||
     sale.status === 'Voided' ||
+    sale.mobileVerificationStatus === 'VERIFIED' ||
+    sale.mobileVerificationStatus === 'FLAGGED' ||
     Boolean(sale.hasExchanges) ||
     Boolean((sale as any).isUpdate);
 
   // Ultra-fast O(1) in-memory deduplication check for brand new sales:
-  // Updates (refunds, voids, exchanges) bypass this check
+  // Updates (refunds, voids, exchanges, mobile verification) bypass this check
   initSeenSaleIds();
   if (!isSaleUpdate && inMemorySeenSaleIds.has(sale.id)) {
     return false;
@@ -6437,12 +7155,27 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     const incomingExchangeCount = Array.isArray(sale.exchanges) ? sale.exchanges.length : 0;
     const hasNewExchanges = incomingExchangeCount > existingExchangeCount;
 
-    if (!isRefundTransition && !isVoidTransition && !hasNewExchanges) {
+    const existingMobFinal =
+      existing.mobileVerificationStatus === 'VERIFIED' || existing.mobileVerificationStatus === 'FLAGGED';
+    const incomingMobFinal =
+      sale.mobileVerificationStatus === 'VERIFIED' || sale.mobileVerificationStatus === 'FLAGGED';
+    const isMobileVerifyTransition =
+      sale.mobileVerificationStatus === 'VERIFIED' && existing.mobileVerificationStatus !== 'VERIFIED';
+    const isMobileFlagTransition =
+      sale.mobileVerificationStatus === 'FLAGGED' && existing.mobileVerificationStatus !== 'FLAGGED';
+
+    if (
+      !isRefundTransition &&
+      !isVoidTransition &&
+      !hasNewExchanges &&
+      !isMobileVerifyTransition &&
+      !isMobileFlagTransition
+    ) {
       // Nothing changed on this sale; safe duplicate drop
       return false;
     }
 
-    // APPLY UPDATE:
+    // APPLY UPDATE (preserving finalized mobile verification if incoming lacks it):
     const updatedSale: SaleInvoice = {
       ...existing,
       ...sale,
@@ -6458,10 +7191,61 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
       exchanges: sale.exchanges || existing.exchanges,
       hasExchanges: sale.hasExchanges ?? existing.hasExchanges,
       netTotal: sale.netTotal ?? existing.netTotal,
+      mobileVerificationStatus:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileVerificationStatus
+          : (sale.mobileVerificationStatus || existing.mobileVerificationStatus),
+      mobileVerifiedAmountInCurrency:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileVerifiedAmountInCurrency
+          : (sale.mobileVerifiedAmountInCurrency ?? existing.mobileVerifiedAmountInCurrency),
+      mobileExpectedAmountInCurrency:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileExpectedAmountInCurrency
+          : (sale.mobileExpectedAmountInCurrency ?? existing.mobileExpectedAmountInCurrency),
+      mobileVerifiedRef:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileVerifiedRef
+          : (sale.mobileVerifiedRef || existing.mobileVerifiedRef),
+      mobileVerifiedBy:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileVerifiedBy
+          : (sale.mobileVerifiedBy || existing.mobileVerifiedBy),
+      mobileVerifiedByName:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileVerifiedByName
+          : (sale.mobileVerifiedByName || existing.mobileVerifiedByName),
+      mobileVerifiedAt:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileVerifiedAt
+          : (sale.mobileVerifiedAt || existing.mobileVerifiedAt),
+      mobileDisputeReason:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileDisputeReason
+          : (sale.mobileDisputeReason || existing.mobileDisputeReason),
+      mobileDisputeResolution:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileDisputeResolution
+          : (sale.mobileDisputeResolution || existing.mobileDisputeResolution),
+      mobileShortfallUsd:
+        existingMobFinal && !incomingMobFinal
+          ? existing.mobileShortfallUsd
+          : (sale.mobileShortfallUsd ?? existing.mobileShortfallUsd),
     };
 
     list[existingIdx] = updatedSale;
     setStored(STORAGE_KEYS.SALES, list);
+
+    if (isMobileVerifyTransition || isMobileFlagTransition) {
+      applyMobileMoneyVerificationLedgerEffects(updatedSale, { fromMesh: true });
+      notifyListeners();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: updatedSale }));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_wallets_updated'));
+      }
+    }
 
     // 1. If transitioned to Refunded:
     if (isRefundTransition) {
@@ -6701,9 +7485,54 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
   }
 
   // Non-cash electronic sale (ZiG / EcoCash) ledger synchronization for mesh peer terminals
-  const meshSaleCur = (normalized.currency as 'ZiG' | 'EcoCash') ||
-    (normalized.paymentMethod === 'ZiG' ? 'ZiG' : (normalized.paymentMethod === 'EcoCash' || normalized.paymentMethod === 'EcoCash/Mobile') ? 'EcoCash' : undefined);
+  const isMeshEco =
+    normalized.currency === 'EcoCash' ||
+    normalized.currency === 'ECO' ||
+    normalized.currency === 'ECOCASH' ||
+    (typeof normalized.currency === 'string' && normalized.currency.toLowerCase().includes('eco')) ||
+    normalized.paymentMethod === 'EcoCash' ||
+    normalized.paymentMethod === 'EcoCash/Mobile' ||
+    (typeof normalized.paymentMethod === 'string' && normalized.paymentMethod.toLowerCase().includes('eco'));
+  const isMeshZig =
+    normalized.currency === 'ZiG' ||
+    normalized.currency === 'ZIG' ||
+    normalized.paymentMethod === 'ZiG' ||
+    normalized.paymentMethod === 'ZIG' ||
+    (typeof normalized.paymentMethod === 'string' && normalized.paymentMethod.toLowerCase().includes('zig'));
+  const meshSaleCur = isMeshZig ? 'ZiG' : isMeshEco ? 'EcoCash' : (normalized.currency && normalized.currency !== 'USD' ? normalized.currency : undefined);
   if (meshSaleCur) {
+    const currencyConfig = getMultiCurrencyConfig();
+    const rate =
+      normalized.exchangeRate ||
+      currencyConfig.rates[meshSaleCur]?.rateToUsd ||
+      (meshSaleCur === 'ZiG' ? 26.5 : 27.0);
+    const curAmount = normalized.totalInCurrency || (Number(normalized.total) * rate);
+
+    addCashLog({
+      id: `CL-SALE-${normalized.id}`,
+      timestamp: normalized.timestamp,
+      date: normalized.date,
+      staffId: normalized.staffId,
+      staffName: normalized.staffName,
+      companyId: normalized.company_id,
+      company_id: normalized.company_id,
+      branchId: normalized.branch_id,
+      branch_id: normalized.branch_id,
+      line: meshSaleCur,
+      description: `${meshSaleCur} Sale #${normalized.id} (${curAmount.toFixed(2)} ${meshSaleCur} @ ${rate.toFixed(2)}) - ${normalized.customerName || 'Customer'}`,
+      in: 0,
+      out: Number(normalized.total) || 0,
+      category: `${meshSaleCur} Non-Cash Sale Deduction`,
+      currency: meshSaleCur,
+      exchangeRate: rate,
+      currencyAmount: curAmount,
+      isWithdrawal: false,
+      reference: normalized.id,
+      notes: `Electronic ${meshSaleCur} Payment: ${curAmount.toFixed(2)} ${meshSaleCur}. Deducted as $${Number(normalized.total || 0).toFixed(2)} USD in Form 2.`,
+      fromMesh: true,
+      skipSync: true,
+    });
+
     addMovement({
       shiftId: getShiftId(normalized.staffId, normalized.date, normalized.branch_id),
       staffId: normalized.staffId,
@@ -6720,16 +7549,45 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
       notes: `${meshSaleCur} Mesh electronic non-cash sale #${normalized.id}`,
       company_id: normalized.company_id,
       branch_id: normalized.branch_id,
+      fromMesh: true,
     });
 
     if (normalized.cashWithdrawalAmount && Number(normalized.cashWithdrawalAmount) > 0) {
+      const wUsd = Number(normalized.cashWithdrawalAmount);
+      const wInCur = normalized.cashWithdrawalInCurrency || (wUsd * rate);
+
+      addCashLog({
+        id: `CL-WDR-${normalized.id}`,
+        timestamp: normalized.timestamp,
+        date: normalized.date,
+        staffId: normalized.staffId,
+        staffName: normalized.staffName,
+        companyId: normalized.company_id,
+        company_id: normalized.company_id,
+        branchId: normalized.branch_id,
+        branch_id: normalized.branch_id,
+        line: `${meshSaleCur} Withdrawal`,
+        description: `${meshSaleCur} Cash-Out Payout #${normalized.id} ($${wUsd.toFixed(2)} USD / ${wInCur.toFixed(2)} ${meshSaleCur})`,
+        in: 0,
+        out: wUsd,
+        category: `${meshSaleCur} Cash Withdrawal`,
+        currency: meshSaleCur,
+        exchangeRate: rate,
+        currencyAmount: wInCur,
+        isWithdrawal: true,
+        reference: normalized.id,
+        notes: `Cash Out Payout to Customer: Swiped in ${meshSaleCur}. Cashier handed $${wUsd.toFixed(2)} USD cash from till.`,
+        fromMesh: true,
+        skipSync: true,
+      });
+
       addMovement({
         shiftId: getShiftId(normalized.staffId, normalized.date, normalized.branch_id),
         staffId: normalized.staffId,
         date: normalized.date,
         timestamp: normalized.timestamp,
         type: meshSaleCur === 'ZiG' ? 'zig_cash_out' : 'ecocash_cash_out',
-        amount: Number(normalized.cashWithdrawalAmount),
+        amount: wUsd,
         currency: 'USD',
         direction: 'out',
         affectsDrawer: true,
@@ -6739,6 +7597,7 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
         notes: `${meshSaleCur} Mesh Cash-Out #${normalized.id}`,
         company_id: normalized.company_id,
         branch_id: normalized.branch_id,
+        fromMesh: true,
       });
     }
   }
@@ -7034,6 +7893,13 @@ export const addSale = (
       })
     : [];
 
+  const isMobileMoneyNewSale =
+    saleData.status !== 'Voided' &&
+    saleData.status !== 'Refunded' &&
+    Boolean(getMobileMoneySaleKind(saleData));
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
   const created: SaleInvoice = {
     ...saleData,
     items: snapshottedItems,
@@ -7045,6 +7911,11 @@ export const addSale = (
     branch_id: brId,
     branchId: brId,
     branchName: saleData.branchName || matchedBranch?.name || 'Main Branch',
+    mobileVerificationStatus: isMobileMoneyNewSale
+      ? ((saleData as any).mobileVerificationStatus || 'PENDING')
+      : (saleData as any).mobileVerificationStatus,
+    updatedAt: (saleData as any).updatedAt || nowMs,
+    lastUpdated: (saleData as any).lastUpdated || nowIso,
   };
   const updated = [created, ...all.filter((s) => s.id !== invId)];
   setStored(STORAGE_KEYS.SALES, updated);
@@ -7322,6 +8193,7 @@ export const addSale = (
 
     // 5a. Deduct non-cash sale in Form 2 as base currency (USD) so cashier balances
     addCashLog({
+      id: `CL-SALE-${created.id}`,
       timestamp: created.timestamp,
       date: created.date,
       staffId: created.staffId,
@@ -7373,6 +8245,7 @@ export const addSale = (
       const refNote = popRef ? ` | Ref/POP: ${popRef}` : '';
 
       addCashLog({
+        id: `CL-WDR-${created.id}`,
         timestamp: created.timestamp,
         date: created.date,
         staffId: created.staffId,
@@ -7730,6 +8603,184 @@ export const voidSaleInvoice = (params: {
   }
 
   return { success: true, message: `Invoice #${invoice.id} voided successfully.`, invoice };
+};
+
+export const verifyMobileMoneySale = (params: {
+  saleId: string;
+  supervisor: Salesperson;
+  referenceCode: string;
+  verifiedAmountInCurrency: number;
+  chargeShortfallToCashier?: boolean;
+}): { success: boolean; message: string; sale?: SaleInvoice; shortfallUsd?: number } => {
+  const ref = String(params.referenceCode || '').trim();
+  if (!ref) {
+    return { success: false, message: 'Mobile money Confirmation / Reference Code is required to verify.' };
+  }
+
+  const allSales = getRawStoredSales();
+  const idx = allSales.findIndex((s) => s.id === params.saleId);
+  if (idx === -1) {
+    return { success: false, message: `Sale #${params.saleId} not found.` };
+  }
+
+  const sale = allSales[idx];
+  const curKind = getMobileMoneySaleKind(sale) || (sale.currency || sale.paymentMethod || 'EcoCash');
+  const rate =
+    Number(sale.exchangeRate) ||
+    (curKind === 'ZiG'
+      ? (getMultiCurrencyConfig().rates['ZiG']?.rateToUsd || 26.5)
+      : (getMultiCurrencyConfig().rates['EcoCash']?.rateToUsd || 1.05));
+  const saleUsd = Number(sale.total) || 0;
+  const withdrawalUsd = Number(sale.cashWithdrawalAmount) || 0;
+  const expectedAmountInCurrency =
+    Number(sale.totalChargedInCurrency) ||
+    Math.round(((saleUsd + withdrawalUsd) * rate) * 100) / 100;
+  const verifiedAmt = Math.max(0, Number(params.verifiedAmountInCurrency) || 0);
+  const shortfallInCurrency = Math.max(0, Math.round((expectedAmountInCurrency - verifiedAmt) * 100) / 100);
+  const chargeShortfall = params.chargeShortfallToCashier !== false && shortfallInCurrency > 0.009;
+  const shortfallUsd = shortfallInCurrency > 0.009 ? Math.round((shortfallInCurrency / rate) * 100) / 100 : 0;
+
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const updatedSale: SaleInvoice = {
+    ...sale,
+    mobileVerificationStatus: 'VERIFIED',
+    mobileExpectedAmountInCurrency: expectedAmountInCurrency,
+    mobileVerifiedAmountInCurrency: verifiedAmt,
+    mobileVerifiedRef: ref,
+    proofOfPaymentRef: sale.proofOfPaymentRef || ref,
+    paymentReference: sale.paymentReference || ref,
+    mobileVerifiedBy: params.supervisor.id,
+    mobileVerifiedByName: params.supervisor.name,
+    mobileVerifiedAt: nowIso,
+    mobileDisputeResolution: shortfallUsd > 0 ? (chargeShortfall ? 'CHARGED_TO_CASHIER_SHORTAGE' : 'SHORT_PAID_ACCEPTED') : undefined,
+    mobileShortfallUsd: shortfallUsd > 0 ? shortfallUsd : 0,
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
+  };
+
+  allSales[idx] = updatedSale;
+  setStored(STORAGE_KEYS.SALES, allSales);
+
+  applyMobileMoneyVerificationLedgerEffects(updatedSale);
+
+  addAuditLog({
+    action: shortfallUsd > 0 ? 'MOBILE_MONEY_SHORT_PAID' : 'MOBILE_MONEY_VERIFIED',
+    severity: shortfallUsd > 0 ? 'WARNING' : 'INFO',
+    staffId: params.supervisor.id,
+    staffName: params.supervisor.name,
+    staffRole: params.supervisor.role || 'SUPERVISOR',
+    details:
+      shortfallUsd > 0
+        ? `Verified ${curKind} Sale #${sale.id} (Ref: ${ref}). Received ${verifiedAmt.toFixed(2)} of ${expectedAmountInCurrency.toFixed(2)} ${curKind}. Shortfall $${shortfallUsd.toFixed(2)} USD ${chargeShortfall ? 'charged to cashier shortage' : 'accepted'}.`
+        : `Verified ${curKind} Sale #${sale.id} (Ref: ${ref}). Confirmed ${verifiedAmt.toFixed(2)} ${curKind} received (Goods $${saleUsd.toFixed(2)} + Cash-Out $${withdrawalUsd.toFixed(2)}).`,
+    referenceId: sale.id,
+    amount: saleUsd + withdrawalUsd,
+  });
+
+  enqueueSync('Sales', 'UPDATE', updatedSale);
+  notifySaleUpdated(updatedSale);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: updatedSale }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_wallets_updated'));
+  }
+
+  return {
+    success: true,
+    message:
+      shortfallUsd > 0
+        ? `${curKind} #${sale.id} verified as short-paid ($${shortfallUsd.toFixed(2)} USD charged to cashier till).`
+        : `${curKind} #${sale.id} verified (${verifiedAmt.toFixed(2)} ${curKind}, Ref: ${ref}).`,
+    sale: updatedSale,
+    shortfallUsd,
+  };
+};
+
+export const flagFakeMobileMoneySale = (params: {
+  saleId: string;
+  supervisor: Salesperson;
+  reason: string;
+}): { success: boolean; message: string; sale?: SaleInvoice; shortageAmountUsd?: number } => {
+  const reason = String(params.reason || '').trim();
+  if (!reason) {
+    return { success: false, message: 'A reason is required to flag an unverified mobile money transaction.' };
+  }
+
+  const allSales = getRawStoredSales();
+  const idx = allSales.findIndex((s) => s.id === params.saleId);
+  if (idx === -1) {
+    return { success: false, message: `Sale #${params.saleId} not found.` };
+  }
+
+  const sale = allSales[idx];
+  const curKind = getMobileMoneySaleKind(sale) || (sale.currency || sale.paymentMethod || 'EcoCash');
+  const rate =
+    Number(sale.exchangeRate) ||
+    (curKind === 'ZiG'
+      ? (getMultiCurrencyConfig().rates['ZiG']?.rateToUsd || 26.5)
+      : (getMultiCurrencyConfig().rates['EcoCash']?.rateToUsd || 1.05));
+  const saleUsd = Number(sale.total) || 0;
+  const withdrawalUsd = Number(sale.cashWithdrawalAmount) || 0;
+  const totalChargeUsd = Math.round((saleUsd + withdrawalUsd) * 100) / 100;
+  const expectedAmountInCurrency =
+    Number(sale.totalChargedInCurrency) ||
+    Math.round(((saleUsd + withdrawalUsd) * rate) * 100) / 100;
+
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  // Keep Sale Completed (stock remains deducted); charge unpaid gross USD to cashier shortage
+  const updatedSale: SaleInvoice = {
+    ...sale,
+    status: sale.status === 'Voided' || sale.status === 'Refunded' ? sale.status : 'Completed',
+    mobileVerificationStatus: 'FLAGGED',
+    mobileExpectedAmountInCurrency: expectedAmountInCurrency,
+    mobileVerifiedAmountInCurrency: 0,
+    mobileVerifiedBy: params.supervisor.id,
+    mobileVerifiedByName: params.supervisor.name,
+    mobileVerifiedAt: nowIso,
+    mobileDisputeReason: reason,
+    mobileDisputeResolution: 'CHARGED_TO_CASHIER_SHORTAGE',
+    mobileShortfallUsd: totalChargeUsd,
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
+  };
+
+  allSales[idx] = updatedSale;
+  setStored(STORAGE_KEYS.SALES, allSales);
+
+  applyMobileMoneyVerificationLedgerEffects(updatedSale);
+
+  addAuditLog({
+    action: 'MOBILE_MONEY_FLAGGED_FAKE',
+    severity: 'SECURITY',
+    staffId: params.supervisor.id,
+    staffName: params.supervisor.name,
+    staffRole: params.supervisor.role || 'SUPERVISOR',
+    details: `Flagged Fake/Unreceived ${curKind} Sale #${sale.id} by ${sale.staffName} (${expectedAmountInCurrency.toFixed(2)} ${curKind}). Kept sale completed & charged $${totalChargeUsd.toFixed(2)} USD ($${saleUsd.toFixed(2)} goods + $${withdrawalUsd.toFixed(2)} cash-out) to cashier till shortage. Reason: ${reason}`,
+    referenceId: sale.id,
+    amount: totalChargeUsd,
+  });
+
+  enqueueSync('Sales', 'UPDATE', updatedSale);
+  notifySaleUpdated(updatedSale);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: updatedSale }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_wallets_updated'));
+  }
+
+  return {
+    success: true,
+    message: `Flagged #${sale.id}: Sale kept completed and $${totalChargeUsd.toFixed(2)} USD charged to ${sale.staffName}'s till shortage.`,
+    sale: updatedSale,
+    shortageAmountUsd: totalChargeUsd,
+  };
 };
 
 
@@ -8159,10 +9210,12 @@ export const addExpense = (
     approvedByName?: string;
     approvalTimestamp?: string;
     fromMesh?: boolean;
+    updatedAt?: number;
+    lastUpdated?: string;
   },
   options?: { fromSync?: boolean }
 ): ExpenseEntry => {
-  const all = getAllExpenses();
+  const rawAll = getRawStoredExpenses();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const sessionUser = getSessionUser();
@@ -8170,6 +9223,110 @@ export const addExpense = (
   const compId = expenseData.company_id || expenseData.companyId || currentCompany;
   const brId = expenseData.branch_id || expenseData.branchId || currentBranch;
   const expId = expenseData.id || generateUUID();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  const existingIdx = rawAll.findIndex((e) => e.id === expId);
+  const existing = existingIdx >= 0 ? rawAll[existingIdx] : null;
+
+  const isStatusFinal = (st?: string) => st === 'approved' || st === 'rejected';
+  const isStatusPending = (st?: string) =>
+    !st || st === 'pending' || st === 'pending_supervisor' || st === 'pending_approval';
+
+  if (existing) {
+    // Protect finalized status against stale pending packets
+    const preserveExistingFinal = isStatusFinal(existing.status) && isStatusPending(expenseData.status);
+    const merged: ExpenseEntry = {
+      ...existing,
+      ...expenseData,
+      id: expId,
+      status: preserveExistingFinal ? existing.status : (expenseData.status || existing.status),
+      approvedBy: preserveExistingFinal ? existing.approvedBy : (expenseData.approvedBy || existing.approvedBy),
+      approvedByName: preserveExistingFinal
+        ? existing.approvedByName
+        : (expenseData.approvedByName || existing.approvedByName),
+      approvalTimestamp: preserveExistingFinal
+        ? existing.approvalTimestamp
+        : (expenseData.approvalTimestamp || existing.approvalTimestamp),
+      company_id: compId,
+      companyId: compId,
+      branch_id: brId,
+      branchId: brId,
+      updatedAt: expenseData.updatedAt || nowMs,
+      lastUpdated: expenseData.lastUpdated || nowIso,
+    };
+    rawAll[existingIdx] = merged;
+    setStored(STORAGE_KEYS.EXPENSES, rawAll);
+
+    // If synced rejection for a Cash expense arrived from peer, apply local cash reversal idempotently
+    const isNewlyRejectedFromMesh =
+      (options?.fromSync || expenseData.fromMesh) &&
+      merged.status === 'rejected' &&
+      existing.status !== 'rejected' &&
+      (merged.paymentMethod === 'Cash' || !merged.paymentMethod);
+    if (isNewlyRejectedFromMesh) {
+      const shiftDate = merged.date || nowIso.split('T')[0];
+      const targetStaffId = merged.staffId || '001';
+      const targetStaffName = merged.staffName || 'Cashier';
+      const hasRevLog = getCashLogs().some(
+        (l) => l.reference === merged.id && String(l.description || '').startsWith('REVERSAL:')
+      );
+      if (!hasRevLog) {
+        addCashLog(
+          {
+            timestamp: nowIso,
+            date: shiftDate,
+            staffId: targetStaffId,
+            staffName: targetStaffName,
+            line: 'Expenses',
+            description: `REVERSAL: Expense #${merged.id} returned to drawer by ${merged.approvedByName || 'Supervisor'}`,
+            in: merged.amount,
+            out: 0,
+            category: 'Expense Reversal',
+            reference: merged.id,
+            company_id: compId,
+            branch_id: brId,
+            fromMesh: true,
+            skipSync: true,
+          },
+          { fromSync: true }
+        );
+      }
+      const hasRevMov = getMovements().some(
+        (m) => m.type === 'expense_reversal' && m.sourceRef === merged.id
+      );
+      if (!hasRevMov) {
+        addMovement({
+          shiftId: getShiftId(targetStaffId, shiftDate, brId),
+          staffId: targetStaffId,
+          date: shiftDate,
+          timestamp: nowIso,
+          type: 'expense_reversal',
+          amount: merged.amount,
+          currency: 'USD',
+          direction: 'in',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form2',
+          sourceRef: merged.id,
+          notes: `Peer Expense #${merged.id} rejected - $${merged.amount.toFixed(2)} returned to till`,
+          approvedBy: merged.approvedBy,
+          approvedByName: merged.approvedByName,
+          company_id: compId,
+          branch_id: brId,
+          fromMesh: true,
+        });
+      }
+    }
+
+    notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: merged }));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: merged }));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    }
+    return merged;
+  }
 
   const initialStatus = expenseData.status || (isSupervisor ? 'approved' : 'pending_supervisor');
 
@@ -8180,32 +9337,37 @@ export const addExpense = (
     status: initialStatus,
     approvedBy: expenseData.approvedBy || (initialStatus === 'approved' ? (sessionUser?.id || '001') : undefined),
     approvedByName: expenseData.approvedByName || (initialStatus === 'approved' ? (sessionUser?.name || 'Supervisor') : undefined),
-    approvalTimestamp: expenseData.approvalTimestamp || (initialStatus === 'approved' ? new Date().toISOString() : undefined),
+    approvalTimestamp: expenseData.approvalTimestamp || (initialStatus === 'approved' ? nowIso : undefined),
     company_id: compId,
     companyId: compId,
     branch_id: brId,
     branchId: brId,
+    updatedAt: expenseData.updatedAt || nowMs,
+    lastUpdated: expenseData.lastUpdated || nowIso,
   };
-  const updated = [created, ...all];
+  const updated = [created, ...rawAll];
   setStored(STORAGE_KEYS.EXPENSES, updated);
 
   // If cash expense, add to CashLog
   if (expenseData.paymentMethod === 'Cash' && expenseData.recordCashLog !== false) {
-    addCashLog({
-      timestamp: created.timestamp,
-      date: created.date,
-      staffId: created.staffId,
-      staffName: created.staffName,
-      line: 'Expenses',
-      description: `Expense #${created.id} [${created.status === 'approved' ? 'Approved' : 'Pending Approval'}] - ${created.category}: ${created.description}`,
-      in: 0,
-      out: created.amount,
-      category: created.category,
-      reference: created.id,
-      company_id: compId,
-      branch_id: brId,
-      skipSync: !!options?.fromSync || !!expenseData.fromMesh,
-    }, options);
+    const hasLog = getCashLogs().some((l) => l.reference === created.id && (Number(l.out) || 0) > 0);
+    if (!hasLog) {
+      addCashLog({
+        timestamp: created.timestamp,
+        date: created.date,
+        staffId: created.staffId,
+        staffName: created.staffName,
+        line: 'Expenses',
+        description: `Expense #${created.id} [${created.status === 'approved' ? 'Approved' : 'Pending Approval'}] - ${created.category}: ${created.description}`,
+        in: 0,
+        out: created.amount,
+        category: created.category,
+        reference: created.id,
+        company_id: compId,
+        branch_id: brId,
+        skipSync: !!options?.fromSync || !!expenseData.fromMesh,
+      }, options);
+    }
   }
 
   notifyListeners();
@@ -8214,7 +9376,7 @@ export const addExpense = (
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: created }));
   }
 
-  // Save to Sheet "Expenses"
+  // Save to Sheet "Expenses" & broadcast to Local Hub / Mesh
   if (!options?.fromSync && !expenseData.fromMesh) {
     console.log(`[Row10] Direct enqueue: Expenses ${created.id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('Expenses', 'INSERT', {
@@ -8233,6 +9395,7 @@ export const addExpense = (
       ReceiptRef: created.receiptRef || '',
       Status: created.status,
     });
+    notifyExpenseChanged(created);
   }
 
   return created;
@@ -8269,21 +9432,34 @@ export const getExpensesForStaffAndDate = (staffId: string, date: string): Expen
 };
 
 export const approveExpense = (expenseId: string, supervisor: Salesperson): boolean => {
-  const all = getAllExpenses();
+  const all = getRawStoredExpenses();
   const idx = all.findIndex((e) => e.id === expenseId);
   if (idx === -1) return false;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   all[idx] = {
     ...all[idx],
     status: 'approved',
     approvedBy: supervisor.id,
     approvedByName: supervisor.name,
-    approvalTimestamp: new Date().toISOString(),
+    approvalTimestamp: nowIso,
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
   };
   setStored(STORAGE_KEYS.EXPENSES, all);
+  const exp = all[idx];
+  enqueueSync('Expenses', 'UPDATE', {
+    ...exp,
+    ExpenseID: exp.id,
+    Status: exp.status,
+    ApprovedBy: supervisor.name,
+    ApprovalTimestamp: nowIso,
+  });
+  notifyExpenseChanged(exp);
   notifyListeners();
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: all[idx] }));
-    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: all[idx] }));
+    window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: exp }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: exp }));
   }
   return true;
 };
@@ -8293,18 +9469,21 @@ export const rejectExpense = (
   supervisor: Salesperson,
   reason: string = 'Returned to cashier drawer for re-entry'
 ): boolean => {
-  const all = getAllExpenses();
+  const all = getRawStoredExpenses();
   const idx = all.findIndex((e) => e.id === expenseId);
   if (idx === -1) return false;
   const exp = all[idx];
 
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   all[idx] = {
     ...exp,
     status: 'rejected',
     approvedBy: supervisor.id,
     approvedByName: supervisor.name,
     approvalTimestamp: now,
+    updatedAt: nowMs,
+    lastUpdated: now,
     notes: `${exp.notes ? exp.notes + ' • ' : ''}Rejected by ${supervisor.name}: ${reason}`,
   };
   setStored(STORAGE_KEYS.EXPENSES, all);
@@ -8351,21 +9530,32 @@ export const rejectExpense = (
     });
   }
 
+  const updatedExp = all[idx];
+  enqueueSync('Expenses', 'UPDATE', {
+    ...updatedExp,
+    ExpenseID: updatedExp.id,
+    Status: updatedExp.status,
+    ApprovedBy: supervisor.name,
+    ApprovalTimestamp: now,
+  });
+  notifyExpenseChanged(updatedExp);
   notifyListeners();
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: all[idx] }));
-    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: all[idx] }));
+    window.dispatchEvent(new CustomEvent('saimetric_expenses_updated', { detail: updatedExp }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: updatedExp }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
   }
   return true;
 };
 
 export const approveAllExpensesForStaffAndDate = (staffId: string, date: string, supervisor: Salesperson): number => {
-  const all = getAllExpenses();
+  const all = getRawStoredExpenses();
   let count = 0;
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   const targetStaffId = String(staffId || '').trim().toLowerCase();
   const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
+  const newlyApproved: ExpenseEntry[] = [];
 
   const updated = all.map((e) => {
     const isDateMatch = isSameDaySafe(e.date, e.timestamp, date);
@@ -8373,21 +9563,35 @@ export const approveAllExpensesForStaffAndDate = (staffId: string, date: string,
     const normExpStaff = expStaffId.replace(/^usr-|^staff-|^0+/, '');
     const isStaffMatch = !targetStaffId || targetStaffId === 'all' || expStaffId === targetStaffId || (normTarget && normExpStaff === normTarget);
 
-    if (isDateMatch && isStaffMatch && e.status !== 'approved') {
+    if (isDateMatch && isStaffMatch && e.status !== 'approved' && e.status !== 'rejected') {
       count++;
-      return {
+      const next = {
         ...e,
         status: 'approved',
         approvedBy: supervisor.id,
         approvedByName: supervisor.name,
         approvalTimestamp: now,
+        updatedAt: nowMs,
+        lastUpdated: now,
       };
+      newlyApproved.push(next);
+      return next;
     }
     return e;
   });
 
   if (count > 0) {
     setStored(STORAGE_KEYS.EXPENSES, updated);
+    newlyApproved.forEach((exp) => {
+      enqueueSync('Expenses', 'UPDATE', {
+        ...exp,
+        ExpenseID: exp.id,
+        Status: exp.status,
+        ApprovedBy: supervisor.name,
+        ApprovalTimestamp: now,
+      });
+      notifyExpenseChanged(exp);
+    });
     notifyListeners();
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
@@ -8661,6 +9865,28 @@ export const calculateForm4 = (
   const staffSales = getSalesForStaffAndDate(staffId, date, staffName);
   const systemSalesTotal = staffSales.reduce((sum, s) => sum + (s.total || 0), 0);
 
+  const getMobileSaleGoodsAdjustment = (s: SaleInvoice): { isFlaggedShortage: boolean; goodsShortfallUsd: number; wdrReductionUsd: number } => {
+    if (s.mobileVerificationStatus === 'FLAGGED' && s.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE') {
+      return {
+        isFlaggedShortage: true,
+        goodsShortfallUsd: Number(s.total) || 0,
+        wdrReductionUsd: Number(s.cashWithdrawalAmount) || 0,
+      };
+    }
+    if (
+      s.mobileVerificationStatus === 'VERIFIED' &&
+      s.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE' &&
+      (Number(s.mobileShortfallUsd) || 0) > 0.009
+    ) {
+      const shortfall = Number(s.mobileShortfallUsd) || 0;
+      const wdr = Number(s.cashWithdrawalAmount) || 0;
+      const wdrRed = Math.min(shortfall, wdr);
+      const goodsShort = Math.max(0, Math.round((shortfall - wdrRed) * 100) / 100);
+      return { isFlaggedShortage: false, goodsShortfallUsd: goodsShort, wdrReductionUsd: wdrRed };
+    }
+    return { isFlaggedShortage: false, goodsShortfallUsd: 0, wdrReductionUsd: 0 };
+  };
+
   const ecocashSales = staffSales
     .filter(
       (s) =>
@@ -8674,7 +9900,11 @@ export const calculateForm4 = (
         ((s.paymentMethod?.toLowerCase().includes('eco') || s.currency?.toLowerCase().includes('eco')) &&
           s.paymentMethod !== 'Cash')
     )
-    .reduce((sum, s) => sum + (s.total || 0), 0);
+    .reduce((sum, s) => {
+      const adj = getMobileSaleGoodsAdjustment(s);
+      if (adj.isFlaggedShortage) return sum;
+      return sum + Math.max(0, (s.total || 0) - adj.goodsShortfallUsd);
+    }, 0);
   const zigSales = staffSales
     .filter(
       (s) =>
@@ -8685,7 +9915,11 @@ export const calculateForm4 = (
         ((s.paymentMethod?.toLowerCase().includes('zig') || s.currency?.toLowerCase().includes('zig')) &&
           s.paymentMethod !== 'Cash')
     )
-    .reduce((sum, s) => sum + (s.total || 0), 0);
+    .reduce((sum, s) => {
+      const adj = getMobileSaleGoodsAdjustment(s);
+      if (adj.isFlaggedShortage) return sum;
+      return sum + Math.max(0, (s.total || 0) - adj.goodsShortfallUsd);
+    }, 0);
 
   const effectiveEcoSales = Math.max(ecocashSales, breakdown.ecocashSales || 0);
   const effectiveZigSales = Math.max(zigSales, breakdown.zigSales || 0);
@@ -9029,6 +10263,7 @@ export const calculateForm4 = (
   const expenses = expensesFromLogs + dbExpensesNotLogged;
 
   // EcoCash & ZiG & Dynamic Multi-Currency Cash-Outs / Withdrawals (Physical Cash OUT from till)
+  const dedupedForm2Logs = deduplicateCashLogs(form2Logs);
   const activeCurrenciesList = getActiveCurrencies();
   const currencyWithdrawalsMap: Record<string, number> = {};
   const currencySalesMap: Record<string, number> = {};
@@ -9039,8 +10274,8 @@ export const calculateForm4 = (
     const lowerCode = code.toLowerCase();
     const lowerName = name.toLowerCase();
 
-    // Withdrawals recorded in Form 2 logs
-    const logWithdrawals = form2Logs
+    // Withdrawals recorded in Form 2 logs (deduplicated by semantic sale reference)
+    const logWithdrawals = dedupedForm2Logs
       .filter((l) => {
         if ((l.out || 0) <= 0) return false;
         const line = (l.line || '').toLowerCase();
@@ -9052,18 +10287,14 @@ export const calculateForm4 = (
           line.includes(lowerCode) ||
           cat.includes(lowerCode) ||
           desc.includes(lowerCode) ||
-          desc.includes(lowerName);
-        const isW =
-          l.isWithdrawal ||
-          line.includes('withdrawal') ||
-          cat.includes('withdrawal') ||
-          desc.includes('cash-out') ||
-          desc.includes('withdrawal');
-        return matchesCurr && isW;
+          desc.includes(lowerName) ||
+          (lowerCode.includes('eco') && getCashLogCurrencyBucket(l) === 'ECOCASH') ||
+          (lowerCode.includes('zig') && getCashLogCurrencyBucket(l) === 'ZIG');
+        return matchesCurr && isCashLogWithdrawal(l);
       })
       .reduce((sum, l) => sum + (l.out || 0), 0);
 
-    // Withdrawals from POS Sales transactions
+    // Withdrawals from POS Sales transactions (excluding flagged fake mobile money claims)
     const salesWithdrawals = staffSales
       .filter((s) => {
         const sMeth = (s.paymentMethod || '').toLowerCase();
@@ -9071,7 +10302,11 @@ export const calculateForm4 = (
         const matchesCurr = sMeth === lowerCode || sCurr === lowerCode || sCurr === lowerName;
         return matchesCurr && s.cashWithdrawalAmount && Number(s.cashWithdrawalAmount) > 0;
       })
-      .reduce((sum, s) => sum + Number(s.cashWithdrawalAmount), 0);
+      .reduce((sum, s) => {
+        const adj = getMobileSaleGoodsAdjustment(s);
+        if (adj.isFlaggedShortage) return sum;
+        return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
+      }, 0);
 
     const totalCurrWithdrawal = Math.max(logWithdrawals, salesWithdrawals);
     currencyWithdrawalsMap[code] = totalCurrWithdrawal;
@@ -9083,30 +10318,21 @@ export const calculateForm4 = (
         const sCurr = (s.currency || '').toLowerCase();
         return (sMeth === lowerCode || sCurr === lowerCode || sCurr === lowerName) && (s.total || 0) > 0;
       })
-      .reduce((sum, s) => sum + (s.total || 0), 0);
+      .reduce((sum, s) => {
+        const adj = getMobileSaleGoodsAdjustment(s);
+        if (adj.isFlaggedShortage) return sum;
+        return sum + Math.max(0, (s.total || 0) - adj.goodsShortfallUsd);
+      }, 0);
     currencySalesMap[code] = currSales;
   });
 
-  // Ensure EcoCash and ZiG backward compatibility
-  const ecoWithdrawalLogs = form2Logs
+  // Ensure EcoCash and ZiG backward compatibility (deduplicated by semantic key)
+  const ecoWithdrawalLogs = dedupedForm2Logs
     .filter(
       (l) =>
         (l.out || 0) > 0 &&
-        (l.currency === 'EcoCash' ||
-          l.currency === 'ECO' ||
-          l.currency === 'ECOCASH' ||
-          l.line === 'EcoCash' ||
-          l.line === 'EcoCash Withdrawal' ||
-          l.line === 'ecocashWithdrawal' ||
-          l.line?.toLowerCase().includes('eco') ||
-          l.description?.toLowerCase().includes('ecocash') ||
-          l.description?.toLowerCase().includes('eco')) &&
-        (l.isWithdrawal ||
-          l.line === 'ecocashWithdrawal' ||
-          l.line === 'EcoCash Withdrawal' ||
-          l.category?.toLowerCase().includes('withdrawal') ||
-          l.description?.toLowerCase().includes('cash-out') ||
-          l.description?.toLowerCase().includes('withdrawal'))
+        getCashLogCurrencyBucket(l) === 'ECOCASH' &&
+        isCashLogWithdrawal(l)
     )
     .reduce((sum, l) => sum + (l.out || 0), 0);
 
@@ -9125,25 +10351,22 @@ export const calculateForm4 = (
         s.cashWithdrawalAmount &&
         Number(s.cashWithdrawalAmount) > 0
     )
-    .reduce((sum, s) => sum + Number(s.cashWithdrawalAmount), 0);
+    .reduce((sum, s) => {
+      const adj = getMobileSaleGoodsAdjustment(s);
+      if (adj.isFlaggedShortage) return sum;
+      return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
+    }, 0);
   const ecocashWithdrawal = Math.max(
     currencyWithdrawalsMap['EcoCash'] || currencyWithdrawalsMap['ECO'] || currencyWithdrawalsMap['ECOCASH'] || 0,
     Math.max(ecoWithdrawalLogs, ecoWithdrawalSales)
   );
 
-  const zigWithdrawalLogs = form2Logs
+  const zigWithdrawalLogs = dedupedForm2Logs
     .filter(
       (l) =>
         (l.out || 0) > 0 &&
-        (l.currency === 'ZiG' ||
-          l.line === 'ZiG' ||
-          l.line === 'zigWithdrawal' ||
-          l.description?.toLowerCase().includes('zig')) &&
-        (l.isWithdrawal ||
-          l.line === 'zigWithdrawal' ||
-          l.category?.toLowerCase().includes('withdrawal') ||
-          l.description?.toLowerCase().includes('cash-out') ||
-          l.description?.toLowerCase().includes('withdrawal'))
+        getCashLogCurrencyBucket(l) === 'ZIG' &&
+        isCashLogWithdrawal(l)
     )
     .reduce((sum, l) => sum + (l.out || 0), 0);
 
@@ -9154,7 +10377,11 @@ export const calculateForm4 = (
         s.cashWithdrawalAmount &&
         Number(s.cashWithdrawalAmount) > 0
     )
-    .reduce((sum, s) => sum + Number(s.cashWithdrawalAmount), 0);
+    .reduce((sum, s) => {
+      const adj = getMobileSaleGoodsAdjustment(s);
+      if (adj.isFlaggedShortage) return sum;
+      return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
+    }, 0);
   const zigWithdrawal = Math.max(
     currencyWithdrawalsMap['ZiG'] || currencyWithdrawalsMap['ZIG'] || 0,
     Math.max(zigWithdrawalLogs, zigWithdrawalSales)
@@ -9165,10 +10392,12 @@ export const calculateForm4 = (
   currencyWithdrawalsMap['ZiG'] = zigWithdrawal;
   const totalMultiCurrencyWithdrawals = Object.values(currencyWithdrawalsMap).reduce((sum, v) => sum + v, 0);
 
-  // Base cash sales from POS (less any store credit applied from non-cash credits)
-  let cashSales = staffSales
-    .filter((s) => s.paymentMethod === 'Cash' || (!s.paymentMethod && (!s.currency || s.currency === 'USD')))
-    .reduce((sum, s) => sum + Math.max(0, (s.total || 0) - (s.customerCreditUsed || 0)), 0);
+  // Base cash sales from POS (less any store credit applied) + unverified/short-paid mobile money goods charged to cashier shortage
+  let cashSales =
+    staffSales
+      .filter((s) => s.paymentMethod === 'Cash' || (!s.paymentMethod && (!s.currency || s.currency === 'USD')))
+      .reduce((sum, s) => sum + Math.max(0, (s.total || 0) - (s.customerCreditUsed || 0)), 0) +
+    staffSales.reduce((sum, s) => sum + getMobileSaleGoodsAdjustment(s).goodsShortfallUsd, 0);
 
   if (overrideSales !== undefined) {
     totalSales = overrideSales;
@@ -11717,14 +12946,15 @@ export const ingestMeshSupervisorApproval = (entry: AuditLogEntry): boolean => {
 
 export const ingestMeshCashLog = (entry: CashLogEntry): boolean => {
   if (!entry) return false;
+  const normEntry = normalizeCashLogRecord(entry);
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const currentBranchCode = getCurrentBranch()?.code;
 
-  const compId = (entry.company_id || (entry as any).companyId || currentCompany).trim().toUpperCase();
+  const compId = (normEntry.company_id || normEntry.companyId || currentCompany).trim().toUpperCase();
   if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
 
-  const brId = (entry.branch_id || (entry as any).branchId || currentBranch).trim().toUpperCase();
+  const brId = (normEntry.branch_id || normEntry.branchId || currentBranch).trim().toUpperCase();
   if (
     brId &&
     brId !== currentBranch.trim().toUpperCase() &&
@@ -11733,20 +12963,38 @@ export const ingestMeshCashLog = (entry: CashLogEntry): boolean => {
     return false;
   }
 
-  const all = getCashLogs();
-  const exists = all.some(
-    (l) =>
-      (entry.id && l.id === entry.id) ||
-      (entry.reference && l.reference === entry.reference && l.timestamp === entry.timestamp)
-  );
+  const all = getRawStoredCashLogs();
+  const incomingSem = getCashLogSemanticKey(normEntry);
+  const incomingIsW = isCashLogWithdrawal(normEntry);
+  const incomingRef = extractCashLogRef(normEntry);
+  const exists = all.some((l) => {
+    const lComp = String(l.company_id || (l as any).companyId || currentCompany).trim().toUpperCase();
+    const lBr = String((l as any).branch_id || (l as any).branchId || currentBranch).trim().toUpperCase();
+    if (normEntry.id && l.id === normEntry.id) return true;
+    if (lComp === compId && lBr === brId) {
+      if (incomingSem && getCashLogSemanticKey(l) === incomingSem) return true;
+      if (
+        incomingRef &&
+        extractCashLogRef(l) === incomingRef &&
+        l.timestamp === normEntry.timestamp &&
+        isCashLogWithdrawal(l) === incomingIsW
+      ) {
+        return true;
+      }
+    }
+    return false;
+  });
   if (exists) return false;
 
   const normalized: CashLogEntry = {
-    ...entry,
+    ...normEntry,
+    id: normEntry.id || getNextCashLogId(),
     company_id: compId,
+    companyId: compId,
     branch_id: brId,
+    branchId: brId,
   };
-  const updated = [normalized, ...all];
+  const updated = deduplicateCashLogs([normalized, ...all]);
   setStored(STORAGE_KEYS.CASH_LOGS, updated);
   notifyListeners();
   return true;
@@ -11785,7 +13033,15 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
   };
   if (idx >= 0) {
     const existing = all[idx];
-    if (!isIncomingRecordNewer(normalized, existing)) {
+    const exStatus = String(existing.status || '').trim().toUpperCase();
+    const incStatus = String(normalized.status || '').trim().toUpperCase();
+    const isExistingFinal = exStatus === 'APPROVED' || exStatus === 'REJECTED';
+    const isIncomingPending = !incStatus || incStatus === 'PENDING' || incStatus === 'PENDING_APPROVAL';
+    if (isExistingFinal && isIncomingPending) {
+      console.log(`[ingestMeshGRV] 🛡️ Protected finalized GRV ${grv.grvNumber} (${exStatus}) from stale ${incStatus} update.`);
+      return false;
+    }
+    if (!isIncomingRecordNewer(normalized, existing) && exStatus === incStatus) {
       console.log(`[ingestMeshGRV] 🛡️ Stale GRV update ignored for ${grv.grvNumber}. Existing timestamp is newer.`);
       return false;
     }
@@ -11864,7 +13120,8 @@ export const ingestMeshSettings = (settingsPayload: any): boolean => {
   if (!settingsPayload) return false;
   const currentCompany = getCurrentCompanyId();
   const compId = (settingsPayload.company_id || settingsPayload.companyId || currentCompany).trim().toUpperCase();
-  if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
+  const normTenant = (c: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' ? 'COMP-001' : c);
+  if (compId && currentCompany && normTenant(compId) !== normTenant(currentCompany.trim().toUpperCase())) return false;
 
   let changed = false;
   if (settingsPayload.sheetsConfig) {
@@ -11872,8 +13129,12 @@ export const ingestMeshSettings = (settingsPayload: any): boolean => {
     changed = true;
   }
   if (settingsPayload.exchangeRates) {
-    setStored(STORAGE_KEYS.EXCHANGE_RATES, settingsPayload.exchangeRates);
-    changed = true;
+    const rateTs = parseTimestampMs(
+      settingsPayload.updatedAt ?? settingsPayload.exchangeRates.updatedAt ?? settingsPayload.exchangeRates.lastUpdated
+    );
+    if (ingestMeshMultiCurrencyConfig(settingsPayload.exchangeRates, rateTs)) {
+      changed = true;
+    }
   }
   if (changed) {
     notifyListeners();
@@ -12236,6 +13497,7 @@ export const getDeltaRecordsSince = (sinceIsoTimestamp: string) => {
     directGrvs: filterByTime(getDirectGrvs()),
     auditLogs: filterByTime(getAuditLogs()),
     goodsReceivedNotes: filterByTime(getAllGoodsReceived()),
+    internalConsumptions: filterByTime(getStored<any[]>('saimetric_internal_consumption', [])),
     inventoryItems: getAllInventoryItems(),
   };
 };
@@ -18102,12 +19364,16 @@ export const saveDirectGrv = (
   const currentBranch = getCurrentBranchId();
   const compId = (grv as any).company_id || (grv as any).companyId || currentCompany || 'COMP-001';
   const brId = (grv as any).branch_id || (grv as any).branchId || currentBranch || 'BR-MAIN';
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   const normalized: DirectGrv = {
     ...grv,
     companyId: compId,
     company_id: compId,
     branchId: brId,
     branch_id: brId,
+    updatedAt: (grv as any).updatedAt || nowMs,
+    lastUpdated: (grv as any).lastUpdated || nowIso,
   } as any;
   const index = list.findIndex((g) => g.id === grv.id || g.grvNumber === grv.grvNumber);
   if (index >= 0) {
@@ -18145,6 +19411,7 @@ export const saveDirectGrv = (
   if (!options?.fromSync && !(grv as any).fromMesh) {
     console.log(`[Row10] Direct enqueue: Direct_GRV ${normalized.grvNumber || normalized.id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('Direct_GRV', 'INSERT', normalized);
+    notifyDirectGrvChanged(normalized);
   }
   notifyListeners();
   if (typeof window !== 'undefined') {
@@ -18176,11 +19443,14 @@ export const approveDirectGrv = (
     return { success: false, message: 'GRV voucher is already approved.' };
   }
 
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   grv.status = 'APPROVED';
   grv.approvedByStaffId = approverId;
   grv.approvedByStaffName = approverName;
   grv.approvedAt = now;
+  (grv as any).updatedAt = nowMs;
+  (grv as any).lastUpdated = now;
 
   // 1. Increment inventory for each item with FIFO batches & audit movement logs
   const allInventory = getAllInventoryItems();
@@ -18417,6 +19687,7 @@ export const approveDirectGrv = (
   });
 
   enqueueSync('Direct_GRV', 'UPDATE', grv);
+  notifyDirectGrvChanged(grv);
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -18443,11 +19714,17 @@ export const rejectDirectGrv = (
   }
 
   const wasPreviouslyApproved = grv.status === 'APPROVED';
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   const shiftDate = grv.date || now.split('T')[0];
 
   grv.status = 'REJECTED';
   grv.rejectedReason = reason;
+  (grv as any).approvedByStaffId = rejectorId;
+  (grv as any).approvedByStaffName = rejectorName;
+  (grv as any).approvedAt = now;
+  (grv as any).updatedAt = nowMs;
+  (grv as any).lastUpdated = now;
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
 
   // 1. Update associated supplier_payment cashMovements to rejected status & affectsDrawer: false
@@ -18546,6 +19823,8 @@ export const rejectDirectGrv = (
     referenceId: grv.grvNumber,
   });
 
+  enqueueSync('Direct_GRV', 'UPDATE', grv);
+  notifyDirectGrvChanged(grv);
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -18975,7 +20254,7 @@ export const saveElectronicSettlement = (
 
 /**
  * Gatekeeper: Returns all cashier activities requiring supervisor authorization for this date
- * (Direct GRVs, Expenses, Shop Use)
+ * (Direct GRVs, Expenses, Shop Use, Mobile Money EcoCash & ZiG verification)
  */
 export const getPendingSupervisorApprovals = (
   date: string,
@@ -18984,15 +20263,22 @@ export const getPendingSupervisorApprovals = (
   directGrvs: DirectGrv[];
   expenses: ExpenseEntry[];
   shopUse: any[];
+  mobileMoney: SaleInvoice[];
   totalCount: number;
 } => {
   const currentBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
+  const branches = getBranches();
 
   // 1. Pending Direct GRVs
   const allGrvs = getAllDirectGrvs(currentBranch);
-  const pendingGrvs = allGrvs.filter(
-    (g) => isSameDaySafe(g.date, (g as any).createdAt, date) && g.status === 'PENDING'
-  );
+  const pendingGrvs = allGrvs.filter((g) => {
+    if ((g as any).isDeleted) return false;
+    const isToday = isSameDaySafe(g.date, (g as any).createdAt || (g as any).timestamp, date);
+    if (!isToday) return false;
+    const statusNorm = String(g.status || '').trim().toUpperCase();
+    return statusNorm === 'PENDING' || statusNorm === 'PENDING_APPROVAL';
+  });
 
   // 2. Pending Expenses
   const allExpenses = getAllExpenses(currentBranch);
@@ -19000,21 +20286,57 @@ export const getPendingSupervisorApprovals = (
     if (e.isDeleted) return false;
     const isToday = isSameDaySafe(e.date, e.timestamp, date);
     if (!isToday) return false;
-    return e.status === 'pending' || (!e.status && !e.approvedBy);
+    const statusNorm = String(e.status || '').trim().toLowerCase();
+    return (
+      statusNorm === 'pending' ||
+      statusNorm === 'pending_supervisor' ||
+      statusNorm === 'pending_approval' ||
+      (!statusNorm && !e.approvedBy)
+    );
   });
 
   // 3. Pending Shop Use / Internal Consumption
   const rawConsumptions = getStored<any[]>('saimetric_internal_consumption', []);
   const allConsumptions = Array.isArray(rawConsumptions) ? rawConsumptions : [];
-  const pendingShopUse = allConsumptions.filter(
-    (c) => isSameDaySafe(c.date, c.requestedAt, date) && c.status === 'PENDING'
-  );
+  const pendingShopUse = allConsumptions.filter((c) => {
+    if (!c || c.isDeleted) return false;
+    const cBr = c.branch_id || c.branchId;
+    const cComp = c.company_id || c.companyId;
+    if (
+      currentBranch &&
+      currentBranch !== 'ALL' &&
+      !isRecordInBranchScope(cBr, currentBranch, branches, currentCompany, cComp)
+    ) {
+      return false;
+    }
+    const isToday = isSameDaySafe(c.date, c.requestedAt || c.createdAt || c.timestamp, date);
+    if (!isToday) return false;
+    const statusNorm = String(c.status || '').trim().toUpperCase();
+    return statusNorm === 'PENDING' || statusNorm === 'PENDING_APPROVAL';
+  });
+
+  // 4. Pending Mobile Money (EcoCash & ZiG) Verifications
+  const allSales = getAllSales(currentBranch);
+  const pendingMobileMoney = allSales.filter((s) => {
+    if (!s || (s as any).isDeleted) return false;
+    if (s.status === 'Voided' || s.status === 'Refunded') return false;
+    if (!getMobileMoneySaleKind(s)) return false;
+    const isToday = isSameDaySafe(s.date, s.timestamp, date);
+    if (!isToday) return false;
+    const mobStatus = String(s.mobileVerificationStatus || '').trim().toUpperCase();
+    return !mobStatus || mobStatus === 'PENDING';
+  });
 
   return {
     directGrvs: pendingGrvs,
     expenses: pendingExpenses,
     shopUse: pendingShopUse,
-    totalCount: pendingGrvs.length + pendingExpenses.length + pendingShopUse.length,
+    mobileMoney: pendingMobileMoney,
+    totalCount:
+      pendingGrvs.length +
+      pendingExpenses.length +
+      pendingShopUse.length +
+      pendingMobileMoney.length,
   };
 };
 

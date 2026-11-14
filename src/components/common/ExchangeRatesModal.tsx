@@ -153,14 +153,31 @@ export const ExchangeRatesModal: React.FC<ExchangeRatesModalProps> = ({
     }
   };
 
-  // Re-sync when modal opens or DB updates
+  // Re-sync when modal opens or DB / remote mesh updates
   useEffect(() => {
-    const unsub = subscribeToDatabase(() => {
+    const refreshFromLive = () => {
       const live = getMultiCurrencyConfig();
       setConfig(live);
-    });
-    return () => unsub();
-  }, []);
+      if (isOpen && !canEdit) {
+        populateRatesFromConfig(live);
+      }
+    };
+    const unsub = subscribeToDatabase(refreshFromLive);
+    const handleRemoteRateSync = () => {
+      const live = getMultiCurrencyConfig();
+      setConfig(live);
+      if (isOpen) {
+        populateRatesFromConfig(live);
+      }
+    };
+    window.addEventListener('saimetric_exchange_rates_updated', handleRemoteRateSync);
+    window.addEventListener('mesh-catchup-completed', refreshFromLive);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_exchange_rates_updated', handleRemoteRateSync);
+      window.removeEventListener('mesh-catchup-completed', refreshFromLive);
+    };
+  }, [isOpen, canEdit]);
 
   useEffect(() => {
     if (isOpen) {

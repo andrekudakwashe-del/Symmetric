@@ -188,6 +188,34 @@ export const addMovement = (
     }
   }
 
+  const current = getAllMovements();
+
+  // Idempotency guard: prevent duplicate POS/Form2 multi-currency & sale movements with same (type, sourceRef, shiftId, branch)
+  const idempotentRefTypes: CashMovementType[] = [
+    'ecocash_cash_out',
+    'zig_cash_out',
+    'ecocash_sale',
+    'zig_sale',
+    'cash_sale',
+  ];
+  if (m.id) {
+    const existingById = current.find((item) => item.id === m.id);
+    if (existingById) return existingById;
+  }
+  if (m.sourceRef && idempotentRefTypes.includes(m.type) && m.status !== 'rejected') {
+    const normRef = String(m.sourceRef).trim().toUpperCase();
+    const existingByRef = current.find(
+      (item) =>
+        item.status !== 'rejected' &&
+        item.type === m.type &&
+        (item.branch_id || 'BR-MAIN') === currentBranch &&
+        item.shiftId === shiftId &&
+        item.sourceRef &&
+        String(item.sourceRef).trim().toUpperCase() === normRef
+    );
+    if (existingByRef) return existingByRef;
+  }
+
   const now = new Date().toISOString();
   const id = m.id || `MOV-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   const fullMovement: CashMovement = {
@@ -200,7 +228,6 @@ export const addMovement = (
     updatedAt: now,
   };
 
-  const current = getAllMovements();
   const updated = [fullMovement, ...current];
   saveAllMovements(updated);
 
@@ -454,6 +481,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
   const seenGrvRefs = new Set<string>();
   const seenChangeReceivedInvoices = new Set<string>();
   const seenCreditDepositInvoices = new Set<string>();
+  const seenMultiCurrCashOuts = new Set<string>();
 
   all.forEach((m) => {
     if (m.type === 'credit_upfront_deposit' && matchesShift(m, shiftId, targetBranch)) {
@@ -499,6 +527,13 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
       if (invMatch && isPosDepositPayment && seenCreditDepositInvoices.has(invMatch)) {
         return;
       }
+    }
+
+    // Prevent double-counting EcoCash & ZiG cash-outs with same sale/log reference
+    if (m.type === 'ecocash_cash_out' || m.type === 'zig_cash_out') {
+      const outKey = `${m.type}_${m.staffId || ''}_${(m.sourceRef || m.id || '').trim().toUpperCase()}`;
+      if (seenMultiCurrCashOuts.has(outKey)) return;
+      seenMultiCurrCashOuts.add(outKey);
     }
 
     const amt = Number(m.amount) || 0;
@@ -695,6 +730,8 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
   const seenGrvRefs = new Set<string>();
   const seenChangeReceivedInvoices = new Set<string>();
   const seenCreditDepositInvoices = new Set<string>();
+  const seenMultiCurrSales = new Set<string>();
+  const seenMultiCurrCashOuts = new Set<string>();
 
   all.forEach((m) => {
     if (m.type === 'credit_upfront_deposit' && matchesShift(m, shiftId)) {
@@ -707,11 +744,19 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
     if (!matchesShift(m, shiftId)) return;
 
     if (m.type === 'ecocash_sale') {
+      if (!validStatuses.includes(m.status)) return;
+      const sKey = `ecocash_sale_${m.staffId || ''}_${(m.sourceRef || m.id || '').trim().toUpperCase()}`;
+      if (seenMultiCurrSales.has(sKey)) return;
+      seenMultiCurrSales.add(sKey);
       ecocashSales += Number(m.amount) || 0;
       movementsCount++;
       return;
     }
     if (m.type === 'zig_sale') {
+      if (!validStatuses.includes(m.status)) return;
+      const sKey = `zig_sale_${m.staffId || ''}_${(m.sourceRef || m.id || '').trim().toUpperCase()}`;
+      if (seenMultiCurrSales.has(sKey)) return;
+      seenMultiCurrSales.add(sKey);
       zigSales += Number(m.amount) || 0;
       movementsCount++;
       return;
@@ -760,6 +805,13 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
       if (invMatch && isPosDepositPayment && seenCreditDepositInvoices.has(invMatch)) {
         return;
       }
+    }
+
+    // Prevent double-counting EcoCash & ZiG cash-outs with same sale/log reference
+    if (m.type === 'ecocash_cash_out' || m.type === 'zig_cash_out') {
+      const outKey = `${m.type}_${m.staffId || ''}_${(m.sourceRef || m.id || '').trim().toUpperCase()}`;
+      if (seenMultiCurrCashOuts.has(outKey)) return;
+      seenMultiCurrCashOuts.add(outKey);
     }
 
     const amt = Number(m.amount) || 0;

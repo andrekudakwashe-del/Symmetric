@@ -4,6 +4,7 @@ export const SAIMETRIC_LAST_CUSTOMER_SYNC = 'saimetric_last_customer_sync';
 export const SAIMETRIC_LAST_CASH_ACCOUNT_SYNC = 'saimetric_last_cash_account_sync';
 export const SAIMETRIC_LAST_CASUAL_WORKER_SYNC = 'saimetric_last_casual_worker_sync';
 export const SAIMETRIC_LAST_STOCKTAKE_SESSION_SYNC = 'saimetric_last_stocktake_session_sync';
+export const SAIMETRIC_LAST_MULTI_CURRENCY_SYNC = 'saimetric_last_multi_currency_sync';
 
 export function parseTimestampMs(val: any): number {
   if (val === undefined || val === null) return 0;
@@ -135,4 +136,19 @@ export function markStocktakeSessionSyncComplete(hubCutoffTs: number): void {
   const valid = typeof hubCutoffTs === 'number' && !isNaN(hubCutoffTs) && hubCutoffTs > 0 ? hubCutoffTs : Date.now();
   setLastStocktakeSessionSync(valid);
   console.log('[HWM] Saved stocktake session HWM:', valid);
+}
+
+// Multi-Currency & Exchange Rates (T2)
+export function getLastMultiCurrencySync(): number {
+  return getStoredHwm(SAIMETRIC_LAST_MULTI_CURRENCY_SYNC);
+}
+
+export function setLastMultiCurrencySync(ts: number): void {
+  setStoredHwm(SAIMETRIC_LAST_MULTI_CURRENCY_SYNC, ts);
+}
+
+export function markMultiCurrencySyncComplete(hubCutoffTs: number): void {
+  const valid = typeof hubCutoffTs === 'number' && !isNaN(hubCutoffTs) && hubCutoffTs > 0 ? hubCutoffTs : Date.now();
+  setLastMultiCurrencySync(valid);
+  console.log('[HWM] Saved multi-currency HWM:', valid);
 }

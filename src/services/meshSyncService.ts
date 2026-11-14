@@ -9,6 +9,7 @@ import {
   AuditLogEntry,
   CashLogEntry,
   DirectGrv,
+  InternalConsumption,
 } from '../types';
 import mqtt, { MqttClient } from 'mqtt';
 import {
@@ -119,11 +120,21 @@ import {
   onCustomerChanged,
   onBranchChanged,
   onCashAccountChanged,
+  onExpenseChanged,
+  onDirectGrvChanged,
   getPermissionsList,
   getPermissionsMatrixUpdatedAt,
   ingestMeshPermissionsMatrix,
   onPermissionsMatrixChanged,
+  getMultiCurrencyConfig,
+  getMultiCurrencyUpdatedAt,
+  onMultiCurrencyChanged,
+  ingestMeshMultiCurrencyConfig,
 } from '../db/roomDatabase';
+import {
+  onInternalConsumptionChanged,
+  ingestMeshInternalConsumption,
+} from './walletService';
 import {
   getStoredRoleDefinitions,
   getRoleDefinitionsUpdatedAt,
@@ -165,6 +176,10 @@ import {
   setLastStocktakeSessionSync,
   markStocktakeSessionSyncComplete,
   SAIMETRIC_LAST_STOCKTAKE_SESSION_SYNC,
+  getLastMultiCurrencySync,
+  setLastMultiCurrencySync,
+  markMultiCurrencySyncComplete,
+  SAIMETRIC_LAST_MULTI_CURRENCY_SYNC,
 } from './sync/highWaterMarks';
 import { EntitySnapshot } from './sync/SyncEnvelope';
 
@@ -846,7 +861,7 @@ class MeshSyncManager {
       (packet.branch && (packet.branch.branchId || packet.branch.id)) ||
       (packet.customer && (packet.customer.customerId || packet.customer.id)) ||
       (packet.payload && (packet.payload.itemId || packet.payload.id || packet.payload.branchId || packet.payload.customerId)) ||
-      (pktKind === 'PERMISSIONS_MATRIX_SYNC' || pktKind === 'ROLE_CONFIGS_SYNC' ? 'SINGLETON' : undefined);
+      (pktKind === 'PERMISSIONS_MATRIX_SYNC' || pktKind === 'ROLE_CONFIGS_SYNC' || pktKind === 'MULTI_CURRENCY_SYNC' || pktKind === 'EXCHANGE_RATES_SYNC' ? 'SINGLETON' : undefined);
 
     if (rawItemId) {
       const cleanKey = `${pktKind}:${String(rawItemId).trim().toUpperCase()}`;
@@ -859,7 +874,7 @@ class MeshSyncManager {
           (p.branch && (p.branch.branchId || p.branch.id)) ||
           (p.customer && (p.customer.customerId || p.customer.id)) ||
           (p.payload && (p.payload.itemId || p.payload.id || p.payload.branchId || p.payload.customerId)) ||
-          (pKind === 'PERMISSIONS_MATRIX_SYNC' || pKind === 'ROLE_CONFIGS_SYNC' ? 'SINGLETON' : undefined);
+          (pKind === 'PERMISSIONS_MATRIX_SYNC' || pKind === 'ROLE_CONFIGS_SYNC' || pKind === 'MULTI_CURRENCY_SYNC' || pKind === 'EXCHANGE_RATES_SYNC' ? 'SINGLETON' : undefined);
         return pItemId && `${pKind}:${String(pItemId).trim().toUpperCase()}` === cleanKey;
       });
       if (existingIdx >= 0) {
@@ -984,6 +999,11 @@ class MeshSyncManager {
       this.broadcastRoleDefinitions(defs, updatedAt);
     });
 
+    // Auto-hook into Multi-Currency & Exchange Rates changes (T2 LWW)
+    onMultiCurrencyChanged((mcConfig) => {
+      this.broadcastMultiCurrencyConfig(mcConfig);
+    });
+
     // Auto-hook into Customer creation & edits: broadcast to Local Hub & mesh
     onCustomerChanged((cust: any) => {
       this.broadcastCustomer(cust);
@@ -1002,6 +1022,21 @@ class MeshSyncManager {
     // Auto-hook into Cash Drawer Movements: broadcast in real-time so cash balances across devices
     onCashMovementCreated((movement: CashMovement) => {
       this.broadcastCashMovement(movement);
+    });
+
+    // Auto-hook into Expenses (Create / Supervisor Approve / Reject): broadcast to Local Hub & mesh
+    onExpenseChanged((expense: any) => {
+      this.broadcastExpense(expense);
+    });
+
+    // Auto-hook into Direct GRVs (Create / Supervisor Approve / Reject): broadcast to Local Hub & mesh
+    onDirectGrvChanged((grv: DirectGrv) => {
+      this.broadcastDirectGrv(grv);
+    });
+
+    // Auto-hook into Shop Use / Internal Consumption (Create / Approve / Reject): broadcast to Local Hub & mesh
+    onInternalConsumptionChanged((req: InternalConsumption) => {
+      this.broadcastInternalConsumption(req);
     });
 
     // Auto-hook into POS Inventory: broadcast product changes
@@ -1996,6 +2031,15 @@ class MeshSyncManager {
       } else if (pType === 'CASUAL_WORKERS_SYNC') {
         entityType = 'CasualWorker';
         entityId = 'ALL';
+      } else if (
+        pType === 'MULTI_CURRENCY_SYNC' ||
+        pType === 'EXCHANGE_RATES_SYNC' ||
+        pType === 'MULTI_CURRENCY' ||
+        pType === 'EXCHANGE_RATES' ||
+        packet.entityType === 'multi_currency'
+      ) {
+        entityType = 'MultiCurrency';
+        entityId = 'MULTI_CURRENCY_CONFIG';
       } else if (typeof pType === 'string' && pType.startsWith('STOCKTAKE_')) {
         entityType = 'StocktakeSession';
         entityId = packet.sessionId || (packet.session && packet.session.sessionId) || '';
@@ -2016,6 +2060,7 @@ class MeshSyncManager {
             p.branchId ||
             p.branch_id ||
             p.sessionId ||
+            ((p.type === 'MULTI_CURRENCY_SYNC' || p.type === 'EXCHANGE_RATES_SYNC' || p.action === 'MULTI_CURRENCY_SYNC') ? 'MULTI_CURRENCY_CONFIG' : undefined) ||
             (p.item && (p.item.itemId || p.item.id)) ||
             (p.branch && (p.branch.branchId || p.branch.id || p.branch.branch_id || p.branch.recordId)) ||
             (p.staff && (p.staff.id || p.staff.staffId || p.staff.recordId)) ||
@@ -2077,6 +2122,8 @@ class MeshSyncManager {
           packet.action === 'SALE_UPDATE' ||
           saleData.status === 'Refunded' ||
           saleData.status === 'Voided' ||
+          saleData.mobileVerificationStatus === 'VERIFIED' ||
+          saleData.mobileVerificationStatus === 'FLAGGED' ||
           Boolean(saleData.hasExchanges);
 
         if (this.knownSaleIds.has(saleId) && !isSaleUpdate) {
@@ -2247,6 +2294,25 @@ class MeshSyncManager {
       return;
     }
 
+    // 10.001 INTERNAL CONSUMPTION / SHOP USE
+    if (
+      pType === 'internal_consumption' ||
+      pType === 'INTERNAL_CONSUMPTION' ||
+      pType === 'INTERNAL_CONSUMPTION_RECORD' ||
+      pType === 'SHOP_USE' ||
+      pType === 'shop_use'
+    ) {
+      const ic = packet.internalConsumption || packet.payload;
+      if (ic && ic.id) {
+        if (ingestMeshInternalConsumption(ic)) {
+          window.dispatchEvent(new CustomEvent('saimetric_internal_consumption_updated', { detail: ic }));
+          window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        }
+      }
+      return;
+    }
+
     // 10.01 CASH MOVEMENTS
     if (pType === 'cash_movement' || pType === 'CASH_MOVEMENT' || pType === 'CASH_MOVEMENTS' || pType === 'CASH_MOVEMENT_RECORD') {
       const movement = packet.movement || packet.payload;
@@ -2321,6 +2387,42 @@ class MeshSyncManager {
           this.addLog(
             'EPIDEMIC_HOP',
             `Role Configurations synced from Hub.`,
+            packet.origin_device_name || packet.originDeviceName || 'Local Hub',
+            this.config.deviceName
+          );
+          this.notifyPeerSubscribers();
+        }
+      }
+      return;
+    }
+
+    // 10.02c MULTI-CURRENCY & EXCHANGE RATES (T2 LWW)
+    if (
+      pType === 'multi_currency' ||
+      pType === 'MULTI_CURRENCY' ||
+      pType === 'MULTI_CURRENCY_SYNC' ||
+      pType === 'exchange_rates' ||
+      pType === 'EXCHANGE_RATES' ||
+      pType === 'EXCHANGE_RATES_SYNC'
+    ) {
+      const mcConfig =
+        packet.multiCurrencyConfig ||
+        packet.exchangeRates ||
+        packet.payload?.multiCurrencyConfig ||
+        packet.payload?.exchangeRates ||
+        packet.payload;
+      const incomingUpdatedAt = parseTimestampMs(
+        packet.updatedAt ?? packet.hubTimestamp ?? mcConfig?.updatedAt ?? mcConfig?.lastUpdated ?? packet.timestamp
+      );
+      if (mcConfig && typeof mcConfig === 'object' && mcConfig.rates) {
+        const ingested = ingestMeshMultiCurrencyConfig(mcConfig, incomingUpdatedAt);
+        if (incomingUpdatedAt > 0) {
+          setLastMultiCurrencySync(Math.max(getLastMultiCurrencySync(), incomingUpdatedAt));
+        }
+        if (ingested) {
+          this.addLog(
+            'EPIDEMIC_HOP',
+            `Multi-Currency & Exchange Rates synced (Base: ${mcConfig.baseCurrency || 'USD'}).`,
             packet.origin_device_name || packet.originDeviceName || 'Local Hub',
             this.config.deviceName
           );
@@ -3083,6 +3185,10 @@ class MeshSyncManager {
             p.action === 'PERMISSIONS_MATRIX_SYNC' ||
             p.type === 'ROLE_CONFIGS_SYNC' ||
             p.action === 'ROLE_CONFIGS_SYNC' ||
+            p.type === 'MULTI_CURRENCY_SYNC' ||
+            p.action === 'MULTI_CURRENCY_SYNC' ||
+            p.type === 'EXCHANGE_RATES_SYNC' ||
+            p.action === 'EXCHANGE_RATES_SYNC' ||
             p.type === 'branch' ||
             p.action === 'BRANCH_SYNC' ||
             p.target_branch_id === 'ALL' ||
@@ -3316,6 +3422,17 @@ class MeshSyncManager {
       }
       if (lastStocktakeSync === 0 && allSessions.length > 0) {
         setLastStocktakeSessionSync(Date.now());
+      }
+
+      // 4.6 Multi-Currency & Exchange Rates Delta Sync on reconnect (never push untouched System Default)
+      const lastMultiCurrencySync = getLastMultiCurrencySync();
+      const localMcConfig = getMultiCurrencyConfig();
+      const localMcTime = getMultiCurrencyUpdatedAt(localMcConfig);
+      if (localMcTime > 0 && (lastMultiCurrencySync === 0 || localMcTime > lastMultiCurrencySync)) {
+        this.broadcastMultiCurrencyConfig(localMcConfig);
+        if (lastMultiCurrencySync > 0) {
+          setLastMultiCurrencySync(Date.now());
+        }
       }
 
       // 5. Flush-Before-Pull: Signal DRAIN_COMPLETE_PING to Local Hub
@@ -4621,6 +4738,10 @@ class MeshSyncManager {
       packet.action === 'PERMISSIONS_MATRIX_SYNC' ||
       packet.type === 'ROLE_CONFIGS_SYNC' ||
       packet.action === 'ROLE_CONFIGS_SYNC' ||
+      packet.type === 'MULTI_CURRENCY_SYNC' ||
+      packet.action === 'MULTI_CURRENCY_SYNC' ||
+      packet.type === 'EXCHANGE_RATES_SYNC' ||
+      packet.action === 'EXCHANGE_RATES_SYNC' ||
       packet.type === 'branch' ||
       packet.action === 'BRANCH_SYNC' ||
       packet.target_branch_id === 'ALL' ||
@@ -4756,6 +4877,13 @@ class MeshSyncManager {
       packet.type === 'role_configs' ||
       packet.type === 'ROLE_CONFIGS_SYNC' ||
       packet.action === 'ROLE_CONFIGS_SYNC' ||
+      packet.type === 'multi_currency' ||
+      packet.type === 'MULTI_CURRENCY' ||
+      packet.type === 'MULTI_CURRENCY_SYNC' ||
+      packet.action === 'MULTI_CURRENCY_SYNC' ||
+      packet.type === 'exchange_rates' ||
+      packet.type === 'EXCHANGE_RATES_SYNC' ||
+      packet.action === 'EXCHANGE_RATES_SYNC' ||
       packet.type === 'branch' ||
       packet.type === 'BRANCH' ||
       packet.action === 'BRANCH_SYNC' ||
@@ -4871,7 +4999,15 @@ class MeshSyncManager {
           }
         }
 
-        if (this.knownSaleIds.has(saleId)) {
+        const isSaleUpdate =
+          packet.action === 'SALE_UPDATE' ||
+          saleData.status === 'Refunded' ||
+          saleData.status === 'Voided' ||
+          saleData.mobileVerificationStatus === 'VERIFIED' ||
+          saleData.mobileVerificationStatus === 'FLAGGED' ||
+          Boolean(saleData.hasExchanges);
+
+        if (this.knownSaleIds.has(saleId) && !isSaleUpdate) {
           return;
         }
 
@@ -5045,6 +5181,45 @@ class MeshSyncManager {
           this.addLog(
             'EPIDEMIC_HOP',
             `Role Configurations updated from ${originName}. Synced locally!`,
+            originName,
+            this.config.deviceName
+          );
+          this.notifyPeerSubscribers();
+        }
+      }
+      return;
+    }
+
+    // 5c2. MULTI-CURRENCY & EXCHANGE RATES BROADCAST (T2 LWW)
+    if (
+      topic.endsWith('/multi_currency') ||
+      packet.type === 'multi_currency' ||
+      packet.type === 'MULTI_CURRENCY' ||
+      packet.type === 'MULTI_CURRENCY_SYNC' ||
+      packet.action === 'MULTI_CURRENCY_SYNC' ||
+      packet.type === 'exchange_rates' ||
+      packet.type === 'EXCHANGE_RATES' ||
+      packet.type === 'EXCHANGE_RATES_SYNC' ||
+      packet.action === 'EXCHANGE_RATES_SYNC'
+    ) {
+      const mcConfig =
+        packet.multiCurrencyConfig ||
+        packet.exchangeRates ||
+        packet.payload?.multiCurrencyConfig ||
+        packet.payload?.exchangeRates ||
+        packet.payload;
+      const incomingUpdatedAt = parseTimestampMs(
+        packet.updatedAt ?? packet.hubTimestamp ?? mcConfig?.updatedAt ?? mcConfig?.lastUpdated ?? packet.timestamp
+      );
+      if (mcConfig && typeof mcConfig === 'object' && mcConfig.rates) {
+        if (ingestMeshMultiCurrencyConfig(mcConfig, incomingUpdatedAt)) {
+          if (incomingUpdatedAt > 0) {
+            setLastMultiCurrencySync(Math.max(getLastMultiCurrencySync(), incomingUpdatedAt));
+          }
+          playChime();
+          this.addLog(
+            'EPIDEMIC_HOP',
+            `Multi-Currency & Exchange Rates (Base: ${mcConfig.baseCurrency || 'USD'}) updated from ${originName}.`,
             originName,
             this.config.deviceName
           );
@@ -5239,6 +5414,26 @@ class MeshSyncManager {
         this.addLog('EPIDEMIC_HOP', `Expense synced from ${originName}: $${expense.amount} (${expense.category})`, originName, this.config.deviceName);
         window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+      }
+      return;
+    }
+
+    // 8d. INTERNAL CONSUMPTION / SHOP USE BROADCAST
+    if (
+      topic.endsWith('/internal_consumption') ||
+      packet.type === 'internal_consumption' ||
+      packet.type === 'INTERNAL_CONSUMPTION' ||
+      packet.action === 'INTERNAL_CONSUMPTION_RECORD' ||
+      packet.type === 'SHOP_USE'
+    ) {
+      const ic = packet.internalConsumption || packet.payload;
+      if (ic && ic.id) {
+        if (ingestMeshInternalConsumption(ic)) {
+          this.addLog('EPIDEMIC_HOP', `Shop Use #${ic.id} (${ic.status}) synced from ${originName}`, originName, this.config.deviceName);
+          window.dispatchEvent(new CustomEvent('saimetric_internal_consumption_updated', { detail: ic }));
+          window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        }
       }
       return;
     }
@@ -5498,6 +5693,17 @@ class MeshSyncManager {
           this.addLog('EPIDEMIC_HOP', `System Settings updated from ${originName}`, originName, this.config.deviceName);
         }
         break;
+      case 'multi_currency': {
+        const mcData = payload?.exchangeRates || payload?.multiCurrencyConfig || payload;
+        const mcTs = parseTimestampMs(payload?.updatedAt ?? mcData?.updatedAt ?? mcData?.lastUpdated ?? packet.timestamp);
+        didIngest = ingestMeshMultiCurrencyConfig(mcData, mcTs);
+        if (didIngest) {
+          playChime();
+          this.addLog('EPIDEMIC_HOP', `Multi-Currency & Exchange Rates updated from ${originName}`, originName, this.config.deviceName);
+          this.notifyPeerSubscribers();
+        }
+        break;
+      }
       case 'cash_account':
         saveCashAccount(payload, { fromSync: true });
         didIngest = true;
@@ -6126,12 +6332,16 @@ class MeshSyncManager {
     const deltaExpenses = filterSince(getAllExpenses());
     const deltaCashAccounts = filterSince(getAllCashAccounts());
     const deltaCashTransfers = filterSince(getAllCashTransfers());
+    const localMc = getMultiCurrencyConfig();
+    const localMcTime = getMultiCurrencyUpdatedAt(localMc);
+    const includeMc = localMcTime > 0 && (localMcTime >= sinceTime || sinceTime <= 0);
 
     const enrichedDelta = {
       ...delta,
       expenses: deltaExpenses,
       cashAccounts: deltaCashAccounts,
       cashTransfers: deltaCashTransfers,
+      ...(includeMc ? { multiCurrencyConfig: localMc } : {}),
     };
 
     const totalRecords =
@@ -6147,7 +6357,8 @@ class MeshSyncManager {
       (delta.auditLogs?.length || 0) +
       deltaExpenses.length +
       deltaCashAccounts.length +
-      deltaCashTransfers.length;
+      deltaCashTransfers.length +
+      (delta.internalConsumptions?.length || 0);
 
     const responsePacketId = `CRS-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(responsePacketId);
@@ -6181,6 +6392,7 @@ class MeshSyncManager {
         expensesCount: deltaExpenses.length,
         cashAccountsCount: deltaCashAccounts.length,
         cashTransfersCount: deltaCashTransfers.length,
+        internalConsumptionsCount: delta.internalConsumptions?.length || 0,
         totalRecords,
       },
       timestamp: Date.now(),
@@ -6400,6 +6612,15 @@ class MeshSyncManager {
       }
     }
 
+    // 7b. Ingest Shop Use / Internal Consumption (T1 - Monotonic Merge)
+    if (Array.isArray((delta as any).internalConsumptions) && (delta as any).internalConsumptions.length > 0) {
+      mergeT1Records('saimetric_internal_consumption', (delta as any).internalConsumptions);
+      overallProcessed += (delta as any).internalConsumptions.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_internal_consumption_updated'));
+      }
+    }
+
     // 8. Ingest Cash Accounts & Transfers
     if (Array.isArray(delta.cashAccounts) && delta.cashAccounts.length > 0) {
       for (const acc of delta.cashAccounts) {
@@ -6580,6 +6801,23 @@ class MeshSyncManager {
       if (Object.keys(roleDefs).length > 0) {
         ingestMeshRoleDefinitions(roleDefs, roleUpdatedAt);
         overallProcessed += Object.keys(roleDefs).length;
+      }
+    }
+
+    // 8.11d Ingest Multi-Currency & Exchange Rates from Catch-up Delta (T2 LWW)
+    const rawMcDelta = (delta as any).multiCurrencyConfig || (delta as any).exchangeRates;
+    if (rawMcDelta && typeof rawMcDelta === 'object') {
+      const mcConfig = rawMcDelta.config && typeof rawMcDelta.config === 'object' ? rawMcDelta.config : rawMcDelta;
+      const mcUpdatedAt = parseTimestampMs(
+        rawMcDelta.updatedAt ?? mcConfig?.updatedAt ?? mcConfig?.lastUpdated ?? packet.cutoffTimestamp ?? packet.timestamp
+      );
+      if (mcConfig && mcConfig.rates) {
+        if (ingestMeshMultiCurrencyConfig(mcConfig, mcUpdatedAt)) {
+          overallProcessed += 1;
+        }
+        if (mcUpdatedAt > 0) {
+          setLastMultiCurrencySync(Math.max(getLastMultiCurrencySync(), mcUpdatedAt));
+        }
       }
     }
 
@@ -6931,6 +7169,58 @@ class MeshSyncManager {
   }
 
   /**
+   * Broadcast Multi-Currency & Exchange Rates configuration (T2 LWW) across Local Hub & mesh peers
+   */
+  public broadcastMultiCurrencyConfig(config?: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    const effectiveConfig = config && config.rates ? config : getMultiCurrencyConfig();
+    const effectiveUpdatedAt = getMultiCurrencyUpdatedAt(effectiveConfig) || Date.now();
+    if (!isReconPush && effectiveUpdatedAt === 0) return;
+
+    const packetId = `CURR-PKT-${effectiveUpdatedAt}-${Math.random().toString(36).substring(2, 5)}`;
+    this.seenPacketIds.add(packetId);
+
+    const payloadConfig = {
+      ...effectiveConfig,
+      companyId: effectiveConfig.companyId || this.config.companyId,
+      updatedAt: effectiveUpdatedAt,
+      lastUpdated: effectiveConfig.lastUpdated || new Date(effectiveUpdatedAt).toISOString(),
+      isSystemDefault: false,
+    };
+
+    const packet = {
+      type: 'MULTI_CURRENCY_SYNC',
+      action: 'MULTI_CURRENCY_SYNC',
+      entityType: 'multi_currency',
+      recordId: 'MULTI_CURRENCY_CONFIG',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      target_branch_id: 'ALL',
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      multiCurrencyConfig: payloadConfig,
+      exchangeRates: payloadConfig,
+      payload: payloadConfig,
+      updatedAt: effectiveUpdatedAt,
+      timestamp: effectiveUpdatedAt,
+      isReconPush,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('multi_currency', packet);
+    this.addLog(
+      'BROADCAST',
+      `Multi-Currency & Exchange Rates (Base: ${payloadConfig.baseCurrency || 'USD'}) broadcasted to WiFi mesh`,
+      this.config.deviceName
+    );
+    this.notifyPeerSubscribers();
+  }
+
+  /**
    * Broadcast a customer profile creation or credit limit update to peers & Hub
    */
   public broadcastCustomer(customer: any, options?: { isReconPush?: boolean }) {
@@ -7038,6 +7328,132 @@ class MeshSyncManager {
 
     this.sendPacketToAllTransports('credit_sale', packet);
     this.addLog('BROADCAST', `Credit transaction for ${credit.customerName} ($${credit.amount || credit.in || credit.out || 0}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast expense creation, supervisor approval, or rejection to peers & Hub
+   */
+  public broadcastExpense(expense: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!expense || !expense.id) return;
+    if (!isReconPush && (expense.fromMesh || expense.fromSync)) return;
+
+    const cleanRec: any = {
+      ...expense,
+      updatedAt: expense.updatedAt || Date.now(),
+      lastUpdated: expense.lastUpdated || new Date().toISOString(),
+    };
+    delete cleanRec.fromMesh;
+    delete cleanRec.fromSync;
+
+    const packetId = `EXP-PKT-${cleanRec.id}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'expense',
+      action: 'EXPENSE_RECORD',
+      entityType: 'expense',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      expense: cleanRec,
+      payload: cleanRec,
+      isReconPush,
+      timestamp: cleanRec.updatedAt,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('expense', packet);
+    this.addLog('BROADCAST', `Expense #${cleanRec.id} (${cleanRec.status}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast Direct GRV creation, supervisor approval, or rejection to peers & Hub
+   */
+  public broadcastDirectGrv(grv: DirectGrv, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!grv || (!grv.id && !grv.grvNumber)) return;
+    if (!isReconPush && ((grv as any).fromMesh || (grv as any).fromSync)) return;
+
+    const cleanRec: any = {
+      ...grv,
+      updatedAt: (grv as any).updatedAt || Date.now(),
+      lastUpdated: (grv as any).lastUpdated || new Date().toISOString(),
+    };
+    delete cleanRec.fromMesh;
+    delete cleanRec.fromSync;
+
+    const gId = cleanRec.grvNumber || cleanRec.id;
+    const packetId = `GRV-PKT-${gId}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'direct_grv',
+      action: 'GRV_RECORD',
+      entityType: 'grv',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      directGrv: cleanRec,
+      payload: cleanRec,
+      isReconPush,
+      timestamp: cleanRec.updatedAt,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('direct_grv', packet);
+    this.addLog('BROADCAST', `Direct GRV ${gId} (${cleanRec.status}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast Shop Use / Internal Consumption creation, approval, or rejection to peers & Hub
+   */
+  public broadcastInternalConsumption(record: InternalConsumption, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!record || !record.id) return;
+
+    const cleanRec: any = {
+      ...record,
+      updatedAt: record.updatedAt || Date.now(),
+      lastUpdated: record.lastUpdated || new Date().toISOString(),
+    };
+    const packetId = `IC-PKT-${cleanRec.id}-${Date.now()}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'internal_consumption',
+      action: 'INTERNAL_CONSUMPTION_RECORD',
+      entityType: 'internal_consumption',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      internalConsumption: cleanRec,
+      payload: cleanRec,
+      isReconPush,
+      timestamp: cleanRec.updatedAt,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('internal_consumption', packet);
+    this.addLog('BROADCAST', `Shop Use #${cleanRec.id} (${cleanRec.status}) broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 
@@ -8287,6 +8703,10 @@ export {
   setLastStocktakeSessionSync,
   markStocktakeSessionSyncComplete,
   SAIMETRIC_LAST_STOCKTAKE_SESSION_SYNC,
+  getLastMultiCurrencySync,
+  setLastMultiCurrencySync,
+  markMultiCurrencySyncComplete,
+  SAIMETRIC_LAST_MULTI_CURRENCY_SYNC,
 };
 
 

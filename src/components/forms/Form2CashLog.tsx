@@ -798,31 +798,76 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       const activeCurrenciesList = getActiveCurrencies();
       const consumedCurrLogs = new Set<CashLogEntry>();
       const newDynamicRows: DynamicSectionRow[] = [];
+      const existingNonCashSaleIds = new Set<string>();
+      const existingWithdrawalSaleIds = new Set<string>();
+
+      const extractRefId = (log: CashLogEntry): string => {
+        const direct = String(log.reference || '').trim();
+        if (direct) return direct.toUpperCase();
+        const text = `${log.description || ''} ${log.notes || ''}`;
+        const m = text.match(/#([A-Za-z0-9_-]+)/);
+        return m && m[1] ? m[1].trim().toUpperCase() : '';
+      };
 
       // Dynamically add rows for all active foreign currencies (rate > 0)
       activeCurrenciesList.forEach((curr) => {
         const currKey = curr.currency;
-        const currLogs = remainingDynamicLogs.filter(
-          (l) =>
-            !consumedCurrLogs.has(l) &&
-            (l.currency === currKey ||
-              l.currency === curr.code ||
-              l.line === currKey ||
-              l.line === curr.code ||
-              l.category?.toLowerCase().includes(currKey.toLowerCase()) ||
-              l.category?.toLowerCase().includes(curr.code.toLowerCase()) ||
-              (l.description && l.description.toLowerCase().includes(currKey.toLowerCase())) ||
-              (l.description && l.description.toLowerCase().includes(curr.code.toLowerCase())))
-        );
+        const currLower = currKey.toLowerCase();
+        const codeLower = (curr.code || '').toLowerCase();
+        const isCurrEco = currLower.includes('eco') || codeLower.includes('eco');
+        const isCurrZig = currLower.includes('zig') || codeLower.includes('zig');
+
+        const currLogs = remainingDynamicLogs.filter((l) => {
+          if (consumedCurrLogs.has(l)) return false;
+          const lCurr = (l.currency || '').toLowerCase();
+          const lLine = (l.line || '').toLowerCase();
+          const lCat = (l.category || '').toLowerCase();
+          const lDesc = (l.description || '').toLowerCase();
+          if (isCurrEco) {
+            return lCurr.includes('eco') || lLine.includes('eco') || lCat.includes('eco') || lDesc.includes('ecocash');
+          }
+          if (isCurrZig) {
+            return lCurr.includes('zig') || lLine.includes('zig') || lCat.includes('zig') || lDesc.includes('zig');
+          }
+          return (
+            l.currency === currKey ||
+            l.currency === curr.code ||
+            l.line === currKey ||
+            l.line === curr.code ||
+            (currKey && lCat.includes(currLower)) ||
+            (codeLower && lCat.includes(codeLower)) ||
+            (currKey && lDesc.includes(currLower)) ||
+            (codeLower && lDesc.includes(codeLower))
+          );
+        });
         currLogs.forEach((l) => consumedCurrLogs.add(l));
+
+        const seenCurrSaleRefs = new Set<string>();
+        const seenCurrWdrRefs = new Set<string>();
 
         currLogs.forEach((log, i) => {
           const isWithdrawal =
-            log.isWithdrawal ||
-            log.line?.toLowerCase().includes('withdrawal') ||
-            log.category?.toLowerCase().includes('withdrawal') ||
-            log.description?.toLowerCase().includes('withdrawal') ||
-            log.description?.toLowerCase().includes('cash-out');
+            Boolean(log.isWithdrawal) ||
+            Boolean(log.line?.toLowerCase().includes('withdrawal')) ||
+            Boolean(log.category?.toLowerCase().includes('withdrawal')) ||
+            Boolean(log.description?.toLowerCase().includes('withdrawal')) ||
+            Boolean(log.description?.toLowerCase().includes('cash-out'));
+
+          const refId = extractRefId(log);
+          if (isWithdrawal) {
+            if (refId) {
+              if (seenCurrWdrRefs.has(refId)) return;
+              seenCurrWdrRefs.add(refId);
+              existingWithdrawalSaleIds.add(refId);
+            }
+          } else {
+            if (refId) {
+              if (seenCurrSaleRefs.has(refId)) return;
+              seenCurrSaleRefs.add(refId);
+              existingNonCashSaleIds.add(refId);
+            }
+          }
+
           const id = `${currKey.toLowerCase()}_${isWithdrawal ? 'withdrawal' : 'sales'}_pos_${i}_${log.id || i}`;
           newDynamicRows.push({
             id,
@@ -960,18 +1005,10 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
       // Merge any active POS sales / withdrawals for this staff & date that might not be in savedLogs
       const staffSales = getSalesForStaffAndDate(targetStaffId, targetDate);
-      const existingSaleRefKeys = new Set<string>();
-      newDynamicRows.forEach((r) => {
-        existingSaleRefKeys.add(r.id);
-        const gridEntry = newGrid[r.id];
-        if (gridEntry?.note) {
-          existingSaleRefKeys.add(gridEntry.note);
-          const match = gridEntry.note.match(/#([A-Za-z0-9-]+)/);
-          if (match) existingSaleRefKeys.add(match[1]);
-        }
-      });
 
       staffSales.forEach((sale, i) => {
+        if (!sale || !sale.id) return;
+        const saleIdUp = String(sale.id).trim().toUpperCase();
         const isEco =
           sale.currency === 'EcoCash' ||
           sale.currency === 'ECO' ||
@@ -998,57 +1035,50 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         ) || { currency: curKey, code: curKey, name: isEco ? 'EcoCash Mobile Money' : curKey };
 
         // Non-cash electronic sale row
-        if (sale.total > 0) {
+        if (sale.total > 0 && !existingNonCashSaleIds.has(saleIdUp)) {
+          existingNonCashSaleIds.add(saleIdUp);
           const saleIdKey = `${curKey.toLowerCase()}_sales_pos_m_${i}_${sale.id}`;
-          if (!existingSaleRefKeys.has(sale.id) && !existingSaleRefKeys.has(saleIdKey)) {
-            existingSaleRefKeys.add(sale.id);
-            existingSaleRefKeys.add(saleIdKey);
-            newDynamicRows.push({
-              id: saleIdKey,
-              type: `${curKey}Sales`,
-              categoryGroup: currConfig.name,
-              label: `${currConfig.name} Sale`,
-              currency: curKey,
-              allowIn: false,
-              allowOut: true,
-              isReadOnly: true,
-              isAutofilledFromPos: true,
-              placeholder: `POS register ${currConfig.name} non-cash sale`,
-            });
-            newGrid[saleIdKey] = {
-              in: '',
-              out: String(sale.total),
-              note: `POS Sale #${sale.id}`,
-            };
-          }
+          newDynamicRows.push({
+            id: saleIdKey,
+            type: `${curKey}Sales`,
+            categoryGroup: currConfig.name,
+            label: `${currConfig.name} Sale`,
+            currency: curKey,
+            allowIn: false,
+            allowOut: true,
+            isReadOnly: true,
+            isAutofilledFromPos: true,
+            placeholder: `POS register ${currConfig.name} non-cash sale`,
+          });
+          newGrid[saleIdKey] = {
+            in: '',
+            out: String(sale.total),
+            note: `POS Sale #${sale.id}`,
+          };
         }
 
         // Cash withdrawal row
-        if (sale.cashWithdrawalAmount && Number(sale.cashWithdrawalAmount) > 0) {
+        if (sale.cashWithdrawalAmount && Number(sale.cashWithdrawalAmount) > 0 && !existingWithdrawalSaleIds.has(saleIdUp)) {
+          existingWithdrawalSaleIds.add(saleIdUp);
           const wIdKey = `${curKey.toLowerCase()}_withdrawal_pos_m_${i}_${sale.id}`;
-          const wRef = `withdrawal_${sale.id}`;
-          if (!existingSaleRefKeys.has(wRef) && !existingSaleRefKeys.has(wIdKey)) {
-            existingSaleRefKeys.add(wRef);
-            existingSaleRefKeys.add(wIdKey);
-            newDynamicRows.push({
-              id: wIdKey,
-              type: `${curKey}Withdrawal`,
-              categoryGroup: currConfig.name,
-              label: `${currConfig.name} Cash-Out`,
-              currency: curKey,
-              allowIn: false,
-              allowOut: true,
-              isReadOnly: true,
-              isAutofilledFromPos: true,
-              isWithdrawal: true,
-              placeholder: `POS ${currConfig.name} Cash-Out (Physical Cash OUT)`,
-            });
-            newGrid[wIdKey] = {
-              in: '',
-              out: String(Number(sale.cashWithdrawalAmount)),
-              note: `POS Cash-Out #${sale.id} ($${Number(sale.cashWithdrawalAmount).toFixed(2)})`,
-            };
-          }
+          newDynamicRows.push({
+            id: wIdKey,
+            type: `${curKey}Withdrawal`,
+            categoryGroup: currConfig.name,
+            label: `${currConfig.name} Cash-Out`,
+            currency: curKey,
+            allowIn: false,
+            allowOut: true,
+            isReadOnly: true,
+            isAutofilledFromPos: true,
+            isWithdrawal: true,
+            placeholder: `POS ${currConfig.name} Cash-Out (Physical Cash OUT)`,
+          });
+          newGrid[wIdKey] = {
+            in: '',
+            out: String(Number(sale.cashWithdrawalAmount)),
+            note: `POS Cash-Out #${sale.id} ($${Number(sale.cashWithdrawalAmount).toFixed(2)})`,
+          };
         }
       });
 
@@ -1914,10 +1944,17 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   const [activeCurrenciesList, setActiveCurrenciesList] = useState(() => getActiveCurrencies());
 
   useEffect(() => {
-    const unsub = subscribeToDatabase(() => {
-      setActiveCurrenciesList(getActiveCurrencies());
-    });
-    return unsub;
+    const refreshCurrencies = () => setActiveCurrenciesList(getActiveCurrencies());
+    const unsub = subscribeToDatabase(refreshCurrencies);
+    window.addEventListener('saimetric_exchange_rates_updated', refreshCurrencies);
+    window.addEventListener('saimetric_settings_updated', refreshCurrencies);
+    window.addEventListener('mesh-catchup-completed', refreshCurrencies);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_exchange_rates_updated', refreshCurrencies);
+      window.removeEventListener('saimetric_settings_updated', refreshCurrencies);
+      window.removeEventListener('mesh-catchup-completed', refreshCurrencies);
+    };
   }, []);
 
   // Dynamic currency grouping for all active currencies

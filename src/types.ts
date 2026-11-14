@@ -352,6 +352,8 @@ export interface InternalConsumption {
   walletDeductedFrom?: WalletId;
   company_id?: string;
   branch_id?: string;
+  updatedAt?: number;
+  lastUpdated?: string;
 }
 
 export type OwnerDrawingCategory = 'PERSONAL' | 'FAMILY' | 'SCHOOL_FEES' | 'HOME_SAFE_TRANSIT' | 'OTHER';

@@ -1,6 +1,6 @@
-import React, { useState, useMemo, useRef } from 'react'; // ADDED useRef
+import React, { useState, useMemo, useRef, useEffect } from 'react'; // ADDED useRef
 import { Product, CartItem, Customer, Salesperson, ActiveTab } from '../../types';
-import { getSalespeople, getAllSalespeople, isSupervisorOrAbove, logManagerOverride, getMultiCurrencyConfig, verifySalespersonPin } from '../../db/roomDatabase';
+import { getSalespeople, getAllSalespeople, isSupervisorOrAbove, logManagerOverride, getMultiCurrencyConfig, subscribeToDatabase, verifySalespersonPin } from '../../db/roomDatabase';
 import { FractionalWeightModal } from './FractionalWeightModal';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { CartItemGestureRow } from './CartItemGestureRow';
@@ -216,9 +216,24 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
   const grandTotal = roundOffEnabled ? Math.round(rawGrandTotal * 10) / 10 : rawGrandTotal;
 
   // Multi-Currency & Withdrawal calculations
-  const multiConfig = useMemo(() => getMultiCurrencyConfig(), []);
+  const [multiConfig, setMultiConfig] = useState(() => getMultiCurrencyConfig());
+  useEffect(() => {
+    const refreshMc = () => setMultiConfig(getMultiCurrencyConfig());
+    const unsub = subscribeToDatabase(refreshMc);
+    window.addEventListener('saimetric_exchange_rates_updated', refreshMc);
+    window.addEventListener('saimetric_settings_updated', refreshMc);
+    window.addEventListener('mesh-catchup-completed', refreshMc);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_exchange_rates_updated', refreshMc);
+      window.removeEventListener('saimetric_settings_updated', refreshMc);
+      window.removeEventListener('mesh-catchup-completed', refreshMc);
+    };
+  }, []);
+
   const currentRate = useMemo(() => {
-    if (!selectedCurrency || selectedCurrency === 'USD') return 1;
+    const base = (multiConfig.baseCurrency || 'USD').toUpperCase();
+    if (!selectedCurrency || selectedCurrency.toUpperCase() === base) return 1;
     const ratesObj = multiConfig.rates || {};
     const match =
       ratesObj[selectedCurrency] ||

@@ -9,6 +9,10 @@ import {
   getCompanies,
   getBranches,
 } from '../db/roomDatabase';
+import type {
+  CashierShiftReportData,
+  ShiftReportDetailMode,
+} from './cashierShiftReportService';
 
 export type PaperWidth = '58mm' | '80mm';
 
@@ -1471,6 +1475,345 @@ class BluetoothThermalPrinter {
     }
 
     throw new Error('Bluetooth printer is turned off or disconnected.');
+  }
+
+  // ============================================================================
+  // ESC/POS CASHIER SHIFT & VARIANCE REPORT (58mm = 32 cols / 80mm = 48 cols)
+  // Supports 'compact' (Summary + Key Highlights) and 'full' (All Itemized Lines)
+  // ============================================================================
+
+  public generateEscPosCashierReport(
+    report: CashierShiftReportData,
+    mode: ShiftReportDetailMode = 'compact',
+    paperWidthOverride?: PaperWidth,
+    targetCompanyId?: string
+  ): Uint8Array {
+    const effectiveCompanyId = targetCompanyId || report.companyId;
+    const config = getPrinterConfig(effectiveCompanyId);
+    const width: PaperWidth = paperWidthOverride || config.paperWidth || '58mm';
+    const maxChars = width === '58mm' ? 32 : 48;
+
+    const buffer: number[] = [];
+    const writeBytes = (...bytes: number[]) => buffer.push(...bytes);
+    const sanitize = (str: string) =>
+      String(str || '').replace(/[^\x20-\x7E]/g, ' ');
+    const writeText = (text: string) => {
+      const clean = sanitize(text);
+      for (let i = 0; i < clean.length; i++) {
+        buffer.push(clean.charCodeAt(i));
+      }
+    };
+    const writeLine = (text: string = '') => {
+      writeText(text);
+      writeBytes(0x0a);
+    };
+    const writeWrapped = (text: string, indent: string = '') => {
+      const clean = sanitize(text).trim();
+      if (!clean) return;
+      const avail = Math.max(8, maxChars - indent.length);
+      let pos = 0;
+      while (pos < clean.length) {
+        writeLine(indent + clean.slice(pos, pos + avail));
+        pos += avail;
+      }
+    };
+    const writeColumns = (left: string, right: string) => {
+      const l = sanitize(left);
+      const r = sanitize(right);
+      const remaining = maxChars - l.length - r.length;
+      if (remaining > 0) {
+        writeLine(l + ' '.repeat(remaining) + r);
+      } else {
+        writeWrapped(l);
+        writeLine(' '.repeat(Math.max(0, maxChars - r.length)) + r);
+      }
+    };
+    const divider = (char: string = '-') => writeLine(char.repeat(maxChars));
+    const sectionHeader = (title: string) => {
+      divider('-');
+      writeBytes(0x1b, 0x45, 0x01); // Bold ON
+      writeWrapped(title);
+      writeBytes(0x1b, 0x45, 0x00); // Bold OFF
+    };
+    const fmtMoney = (n: number) => `$${Number(n || 0).toFixed(2)}`;
+    const fmtSigned = (n: number) =>
+      n < 0 ? `-$${Math.abs(n).toFixed(2)}` : `+$${n.toFixed(2)}`;
+
+    // 1. Init
+    writeBytes(0x1b, 0x40);
+
+    // 2. Store & Title Header
+    writeBytes(0x1b, 0x61, 0x01); // Center
+    writeBytes(0x1b, 0x45, 0x01);
+    writeWrapped(report.storeName.toUpperCase());
+    writeBytes(0x1b, 0x45, 0x00);
+    if (report.branchName) writeWrapped(report.branchName);
+    if (report.storePhone) writeWrapped(`Tel: ${report.storePhone}`);
+    divider('=');
+    writeBytes(0x1b, 0x45, 0x01);
+    writeLine('CASHIER SHIFT REPORT');
+    writeLine(mode === 'compact' ? '(COMPACT AUDIT SLIP)' : '(FULL ITEMIZED AUDIT)');
+    writeBytes(0x1b, 0x45, 0x00);
+    divider('=');
+
+    // 3. Cashier & Shift Metadata
+    writeBytes(0x1b, 0x61, 0x00); // Left
+    writeColumns('Cashier:', report.staffName);
+    writeColumns('Staff ID:', `#${report.staffId}`);
+    writeColumns('Date:', report.date);
+    writeColumns('Shift:', report.shiftId.slice(-14));
+    writeColumns('Status:', report.status.toUpperCase());
+    writeWrapped(`Printed: ${report.generatedAt}`);
+
+    // 4. Cash Balancing Proof ("Why You Balanced / Didn't Balance")
+    sectionHeader('CASH BALANCING PROOF');
+    writeColumns('+ Opening Float', fmtMoney(report.float));
+    writeColumns('+ Cash Sales', fmtMoney(report.cashSales));
+    if (report.mobileShortfallCharged > 0.009) {
+      writeWrapped(`  (Incl. Mob Shortfall ${fmtMoney(report.mobileShortfallCharged)})`);
+    }
+    if (report.creditPayments > 0) {
+      writeColumns('+ Credit/Chg In', fmtMoney(report.creditPayments));
+    }
+    if (report.expenses > 0) {
+      writeColumns('- Cash Expenses', `-${fmtMoney(report.expenses)}`);
+    }
+    if (report.directProcurements > 0) {
+      writeColumns('- Direct GRV Cash', `-${fmtMoney(report.directProcurements)}`);
+    }
+    if (report.cashLift > 0) {
+      writeColumns('- Superv CashLift', `-${fmtMoney(report.cashLift)}`);
+    }
+    if (report.customerChangePaidOut > 0) {
+      writeColumns('- Chg Paid Out', `-${fmtMoney(report.customerChangePaidOut)}`);
+    }
+    if (report.multiCurrencyCashOutTotal > 0) {
+      writeColumns('- MultiCurr Out', `-${fmtMoney(report.multiCurrencyCashOutTotal)}`);
+    }
+    if (report.deductions > 0) {
+      writeColumns('- Misc Deductions', `-${fmtMoney(report.deductions)}`);
+    }
+    divider('-');
+    writeBytes(0x1b, 0x45, 0x01);
+    writeColumns('= EXPECTED CASH:', fmtMoney(report.expectedCash));
+    writeColumns(
+      '  FORM 1 COUNT:',
+      report.submittedForm1Cash !== null ? fmtMoney(report.submittedForm1Cash) : 'NOT COUNTED'
+    );
+    divider('=');
+    writeBytes(0x1d, 0x21, 0x01); // Double height
+    const varLabel =
+      Math.abs(report.variance) < 0.01
+        ? 'BALANCED:'
+        : report.variance < 0
+        ? 'SHORTAGE:'
+        : 'OVERAGE:';
+    writeColumns(varLabel, fmtSigned(report.variance));
+    writeBytes(0x1d, 0x21, 0x00);
+    writeBytes(0x1b, 0x45, 0x00);
+    divider('=');
+
+    // 5. Variance Diagnosis ("Why Not Balancing")
+    if (report.varianceDiagnosis.length > 0) {
+      sectionHeader('VARIANCE DIAGNOSIS');
+      report.varianceDiagnosis.forEach((line) => {
+        writeWrapped(`* ${line}`);
+      });
+    }
+
+    // 6. Form 1 Denomination Summary (if counted)
+    if (report.form1Denominations.length > 0) {
+      sectionHeader('FORM 1 CASH BREAKDOWN');
+      report.form1Denominations.forEach((d) => {
+        writeColumns(`  ${d.count} x ${d.label}`, fmtMoney(d.value));
+      });
+    }
+
+    // 7. Float & Sales Overview
+    sectionHeader('FLOAT & SALES SUMMARY');
+    report.floatEntries.forEach((f) => {
+      writeColumns(`Float (${f.time})`, fmtMoney(f.amount));
+    });
+    writeColumns(
+      `Cash Sales (${report.cashSalesSummary.count})`,
+      fmtMoney(report.cashSalesSummary.total)
+    );
+    if (report.totalNonCashSales > 0) {
+      writeColumns('Non-Cash Sales', fmtMoney(report.totalNonCashSales));
+    }
+    writeColumns('Total Shift Sales', fmtMoney(report.totalSales));
+
+    // 8. Active Multi-Currency Summary (+ Items in Full mode)
+    if (report.multiCurrencySummary.length > 0 || report.multiCurrencyTransactions.length > 0) {
+      sectionHeader('ACTIVE MULTI-CURRENCY');
+      report.multiCurrencySummary.forEach((mc) => {
+        writeBytes(0x1b, 0x45, 0x01);
+        writeColumns(`${mc.currency} (${mc.txCount} tx)`, `Goods ${fmtMoney(mc.goodsTotalUsd)}`);
+        writeBytes(0x1b, 0x45, 0x00);
+        writeColumns('  Cash Handed Out:', `-${fmtMoney(mc.cashOutUsd)}`);
+        if (mc.nativeExpected > 0) {
+          writeColumns('  Native Total:', `${mc.nativeExpected.toFixed(2)} ${mc.currency}`);
+        }
+        writeWrapped(
+          `  Verif: ${mc.verifiedCount} OK, ${mc.pendingCount} Pend, ${mc.flaggedCount} Flag`
+        );
+      });
+      if (mode === 'full' && report.multiCurrencyTransactions.length > 0) {
+        divider('.');
+        report.multiCurrencyTransactions.forEach((tx) => {
+          writeWrapped(`${tx.time} ${tx.currency} ${tx.customerOrDesc} [${tx.verificationStatus}]`);
+          writeColumns(
+            `  Gds ${fmtMoney(tx.goodsUsd)} Out ${fmtMoney(tx.cashOutUsd)}`,
+            `${tx.nativeAmount.toFixed(2)}`
+          );
+          if (tx.popReference) writeWrapped(`  POP: ${tx.popReference}`);
+        });
+      }
+    }
+
+    // 9. Active Cash Lifts
+    sectionHeader(`SUPERVISOR CASH LIFTS (${report.activeCashLifts.length})`);
+    if (report.activeCashLifts.length === 0) {
+      writeLine('  None recorded');
+    } else {
+      report.activeCashLifts.forEach((l) => {
+        writeWrapped(`${l.time} By ${l.supervisorName}`);
+        writeColumns(`  Ref: ${l.id}`, `-${fmtMoney(l.amount)}`);
+      });
+    }
+
+    // 10. Active Cash Expenses (No Shop Use)
+    sectionHeader(`CASH EXPENSES (${report.activeExpenses.length}, NO SHOP USE)`);
+    if (report.activeExpenses.length === 0) {
+      writeLine('  No cash expenses');
+    } else {
+      report.activeExpenses.forEach((e) => {
+        writeWrapped(`${e.time} ${e.description} [${e.status.toUpperCase()}]`);
+        writeColumns(`  ${e.category}`, `-${fmtMoney(e.amount)}`);
+      });
+    }
+    if (report.activeDirectGrvs.length > 0) {
+      report.activeDirectGrvs.forEach((g) => {
+        writeWrapped(`GRV ${g.grvNumber} ${g.supplierName}`);
+        writeColumns(`  Direct GRV Cash`, `-${fmtMoney(g.amount)}`);
+      });
+    }
+    if (report.excludedShopUseCount > 0) {
+      writeWrapped(
+        `Note: ${report.excludedShopUseCount} Shop Use non-cash item(s) ($${report.excludedShopUseAmount.toFixed(2)}) excluded.`
+      );
+    }
+
+    // 11. Form 2 & Form 3 Summary (and full lines in Full mode)
+    sectionHeader('FORM 2 & FORM 3 ACTIVITY');
+    writeColumns(`Form 2 Entries (${report.form2Entries.length})`, `Net ${fmtMoney(report.form2Net)}`);
+    writeColumns(
+      `Form 3 Change (${report.form3ChangeEntries.length})`,
+      `+${fmtMoney(report.changeLeftBehindIn)} / -${fmtMoney(report.customerChangePaidOut)}`
+    );
+    writeColumns(
+      `Form 3 Credit (${report.form3CreditEntries.length})`,
+      `Repay +${fmtMoney(report.creditRepaymentsIn)}`
+    );
+    writeColumns('Sum Form 2 & 3 Net', fmtMoney(report.sumForm2And3Net));
+
+    if (mode === 'full') {
+      if (report.form2Entries.length > 0) {
+        divider('.');
+        writeBytes(0x1b, 0x45, 0x01);
+        writeLine('FORM 2 ALL ENTRIES:');
+        writeBytes(0x1b, 0x45, 0x00);
+        report.form2Entries.forEach((f2) => {
+          writeWrapped(`${f2.time} ${f2.line}: ${f2.description}`);
+          const amtStr =
+            f2.inAmount > 0
+              ? `+${fmtMoney(f2.inAmount)}`
+              : f2.outAmount > 0
+              ? `-${fmtMoney(f2.outAmount)}`
+              : '$0.00';
+          writeColumns(`  ${f2.currency}`, amtStr);
+        });
+      }
+      if (report.form3ChangeEntries.length > 0) {
+        divider('.');
+        writeBytes(0x1b, 0x45, 0x01);
+        writeLine('FORM 3 CHANGE ENTRIES:');
+        writeBytes(0x1b, 0x45, 0x00);
+        report.form3ChangeEntries.forEach((c) => {
+          writeWrapped(`${c.time} ${c.customerName} (${c.status})`);
+          if (c.notes) writeWrapped(`  "${c.notes}"`);
+          const val =
+            c.inAmount > 0 ? `+${fmtMoney(c.inAmount)} In` : `-${fmtMoney(c.outAmount)} Out`;
+          writeColumns('  Change:', val);
+        });
+      }
+      if (report.form3CreditEntries.length > 0) {
+        divider('.');
+        writeBytes(0x1b, 0x45, 0x01);
+        writeLine('FORM 3 CREDIT ENTRIES:');
+        writeBytes(0x1b, 0x45, 0x00);
+        report.form3CreditEntries.forEach((cr) => {
+          writeWrapped(`${cr.time} ${cr.customerName}: ${cr.itemDescription}`);
+          const val =
+            cr.inAmount > 0
+              ? `+${fmtMoney(cr.inAmount)} Paid`
+              : `${fmtMoney(cr.outAmount || cr.amount)} Credit`;
+          writeColumns(`  ${cr.status}`, val);
+        });
+      }
+    }
+
+    // 12. Signatures & Acknowledgment Block
+    sectionHeader('SHIFT SIGN-OFF & ACKNOWLEDGMENT');
+    writeWrapped('I confirm I reviewed this report and variance.');
+    writeLine('');
+    writeWrapped(`Cashier: ${report.staffName}`);
+    writeLine('Sign: __________________________');
+    writeLine('Date/Time: _____________________');
+    writeLine('');
+    writeLine('Supervisor: ____________________');
+    writeLine('Sign: __________________________');
+    divider('=');
+
+    // Feed & cut
+    writeBytes(0x0a, 0x0a, 0x0a, 0x0a);
+    if (config.autoCut) {
+      writeBytes(0x1d, 0x56, 0x41, 0x10);
+    }
+
+    return new Uint8Array(buffer);
+  }
+
+  public async printCashierReport(
+    report: CashierShiftReportData,
+    mode: ShiftReportDetailMode = 'compact',
+    paperWidthOverride?: PaperWidth
+  ): Promise<{ success: boolean; message: string }> {
+    const bytes = this.generateEscPosCashierReport(
+      report,
+      mode,
+      paperWidthOverride,
+      report.companyId
+    );
+
+    if (this.isConnected()) {
+      await this.printBytes(bytes);
+      return {
+        success: true,
+        message: `Cashier Shift Report (${paperWidthOverride || getPrinterConfig(report.companyId).paperWidth}) printed to Bluetooth printer.`,
+      };
+    }
+
+    const reconnected = await this.attemptSilentReconnect();
+    if (reconnected) {
+      await this.printBytes(bytes);
+      return {
+        success: true,
+        message: 'Bluetooth printer reconnected and Cashier Shift Report printed.',
+      };
+    }
+
+    throw new Error('Bluetooth printer is not connected. Pair/connect a Bluetooth printer or use Print / Save PDF.');
   }
 }
 

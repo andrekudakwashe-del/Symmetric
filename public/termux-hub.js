@@ -229,6 +229,7 @@ let creditGroupsStore = [];
 let stockMovementsStore = [];
 let expensesStore = [];
 let cashTransfersStore = [];
+let internalConsumptionsStore = [];
 
 // T1 Batch A Stores (Append-Only)
 let suppliersStore = [];
@@ -253,6 +254,7 @@ let branchesStore = [];
 let cashAccountsStore = [];
 let permissionsMatrixStore = { rules: [], updatedAt: 0 };
 let roleConfigsStore = { definitions: null, updatedAt: 0 };
+let multiCurrencyStore = { config: null, updatedAt: 0 };
 
 // Tombstones Store (Soft Deletes across multi-device Wi-Fi)
 let tombstonesStore = [];
@@ -432,6 +434,7 @@ function pruneOldRecords() {
   stockMovementsStore = stockMovementsStore.filter(shouldRetain);
   expensesStore = expensesStore.filter(shouldRetain);
   cashTransfersStore = cashTransfersStore.filter(shouldRetain);
+  internalConsumptionsStore = internalConsumptionsStore.filter(shouldRetain);
   suppliersStore = suppliersStore.filter(shouldRetain);
   adminSalesStore = adminSalesStore.filter(shouldRetain);
   cashCountsStore = cashCountsStore.filter(shouldRetain);
@@ -455,13 +458,14 @@ function loadData() {
       if (Array.isArray(parsed.directGrvs)) directGrvsStore = parsed.directGrvs;
       if (Array.isArray(parsed.cashMovements)) cashMovementsStore = parsed.cashMovements;
       if (Array.isArray(parsed.cashLifts)) cashLiftsStore = parsed.cashLifts;
-      if (Array.isArray(parsed.cashLogs)) cashLogsStore = parsed.cashLogs;
+      if (Array.isArray(parsed.cashLogs)) cashLogsStore = deduplicateHubCashLogs(parsed.cashLogs);
       if (Array.isArray(parsed.customerChanges)) customerChangesStore = parsed.customerChanges;
       if (Array.isArray(parsed.creditSales)) creditSalesStore = parsed.creditSales;
       if (Array.isArray(parsed.creditGroups)) creditGroupsStore = parsed.creditGroups;
       if (Array.isArray(parsed.stockMovements)) stockMovementsStore = parsed.stockMovements;
       if (Array.isArray(parsed.expenses)) expensesStore = parsed.expenses;
       if (Array.isArray(parsed.cashTransfers)) cashTransfersStore = parsed.cashTransfers;
+      if (Array.isArray(parsed.internalConsumptions)) internalConsumptionsStore = parsed.internalConsumptions;
       if (Array.isArray(parsed.suppliers)) suppliersStore = parsed.suppliers;
       if (Array.isArray(parsed.adminSales)) adminSalesStore = parsed.adminSales;
       if (Array.isArray(parsed.cashCounts)) cashCountsStore = parsed.cashCounts;
@@ -511,6 +515,12 @@ function loadData() {
           updatedAt: Number(parsed.roleConfigs.updatedAt) || 0,
         };
       }
+      if (parsed.multiCurrency && parsed.multiCurrency.config && typeof parsed.multiCurrency.config === 'object') {
+        multiCurrencyStore = {
+          config: parsed.multiCurrency.config,
+          updatedAt: Number(parsed.multiCurrency.updatedAt) || 0,
+        };
+      }
 
       console.log(
         `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${branchesStore.length} branches, ${cashAccountsStore.length} cash accounts, ${suppliersStore.length} suppliers, ${adminSalesStore.length} admin sales, ${cashCountsStore.length} cash counts, ${vouchersStore.length} vouchers, ${businessDayClosuresStore.length} closures, ${electronicSettlementsStore.length} settlements, ${categoriesStore.length} categories, ${tombstonesStore.length} tombstones.`
@@ -549,6 +559,7 @@ function saveData() {
       stockMovements: stockMovementsStore.slice(0, 2000),
       expenses: expensesStore.slice(0, 1000),
       cashTransfers: cashTransfersStore.slice(0, 1000),
+      internalConsumptions: internalConsumptionsStore.slice(0, 1000),
       suppliers: suppliersStore.slice(0, 2000),
       adminSales: adminSalesStore.slice(0, 2000),
       cashCounts: cashCountsStore.slice(0, 2000),
@@ -568,6 +579,7 @@ function saveData() {
       tombstones: tombstonesStore.slice(0, 5000),
       permissionsMatrix: permissionsMatrixStore,
       roleConfigs: roleConfigsStore,
+      multiCurrency: multiCurrencyStore,
       savedAt: new Date().toISOString(),
     };
 
@@ -654,6 +666,87 @@ const server = http.createServer((req, res) => {
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 });
+
+// =====================================================================
+// CASH LOG SEMANTIC DEDUPLICATION HELPERS
+// =====================================================================
+
+function getHubCashLogRef(log) {
+  if (!log || typeof log !== 'object') return '';
+  const direct = String(log.reference || log.Reference || '').trim();
+  if (direct) return direct;
+  const text = `${log.description || log.Description || ''} ${log.notes || ''}`;
+  const m = text.match(/#([A-Za-z0-9_-]+)/);
+  return m && m[1] ? m[1].trim() : '';
+}
+
+function getHubCashLogSemanticKey(log) {
+  const ref = getHubCashLogRef(log).toUpperCase();
+  if (!ref) return null;
+  const line = String(log.line || log.Line || '').toLowerCase();
+  const cat = String(log.category || '').toLowerCase();
+  const desc = String(log.description || log.Description || '').toLowerCase();
+  const cur = String(log.currency || '').toLowerCase();
+  const isW =
+    log.isWithdrawal === true ||
+    log.isWithdrawal === 'true' ||
+    line.includes('withdrawal') ||
+    cat.includes('withdrawal') ||
+    desc.includes('withdrawal') ||
+    desc.includes('cash-out');
+  let curBucket = '';
+  if (cur.includes('eco') || line.includes('eco') || cat.includes('eco') || desc.includes('ecocash')) {
+    curBucket = 'ECOCASH';
+  } else if (cur.includes('zig') || line.includes('zig') || cat.includes('zig') || desc.includes('zig')) {
+    curBucket = 'ZIG';
+  } else {
+    const rawCur = String(log.currency || '').trim().toUpperCase();
+    if (rawCur && rawCur !== 'USD') curBucket = rawCur;
+  }
+  if (!curBucket && !isW) return null;
+  const comp = String(log.company_id || log.companyId || 'COMP-001').trim().toUpperCase();
+  const br = String(log.branch_id || log.branchId || 'BR-MAIN').trim().toUpperCase();
+  return `${comp}::${br}::${isW ? 'WDR' : 'NCSALE'}::${ref}::${curBucket || 'FX'}`;
+}
+
+function deduplicateHubCashLogs(logs) {
+  if (!Array.isArray(logs)) return [];
+  const score = (l) => {
+    let s = 0;
+    const id = String(l?.id || l?.cashLogId || '');
+    if (id.startsWith('CL-WDR-') || id.startsWith('CL-SALE-')) s += 100;
+    if (l?.reference || l?.Reference) s += 10;
+    if (l?.currency) s += 5;
+    if (typeof l?.isWithdrawal === 'boolean') s += 5;
+    return s;
+  };
+  const out = [];
+  const byId = new Map();
+  const bySem = new Map();
+  for (const item of logs) {
+    if (!item || typeof item !== 'object') continue;
+    const id = String(item.id || item.cashLogId || '').trim();
+    const sem = getHubCashLogSemanticKey(item);
+    if (id && byId.has(id)) {
+      const idx = byId.get(id);
+      if (score(item) > score(out[idx])) out[idx] = { ...out[idx], ...item };
+      continue;
+    }
+    if (sem && bySem.has(sem)) {
+      const idx = bySem.get(sem);
+      if (score(item) > score(out[idx])) {
+        out[idx] = { ...out[idx], ...item };
+        if (id) byId.set(id, idx);
+      }
+      continue;
+    }
+    const idx = out.length;
+    out.push(item);
+    if (id) byId.set(id, idx);
+    if (sem) bySem.set(sem, idx);
+  }
+  return out;
+}
 
 // =====================================================================
 // AUTOMATED RECONCILIATION ENGINE HELPERS (PHASE 2)
@@ -1335,6 +1428,7 @@ wss.on('connection', (ws, req) => {
         electronicSettlementsStore = [];
         permissionsMatrixStore = { rules: [], updatedAt: 0 };
         roleConfigsStore = { definitions: null, updatedAt: 0 };
+        multiCurrencyStore = { config: null, updatedAt: 0 };
 
         hubBranchId = packet.new_branch_id || 'UNASSIGNED';
         hubBranchName = packet.new_branch_name || 'Unassigned Hub';
@@ -2318,8 +2412,41 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          // Otherwise update existing record (e.g. cashier issuing refund/void or exchange)
-          salesStore[existingIdx] = { ...salesStore[existingIdx], ...(saleObj || packet) };
+          const isExistingMobFinal = prevSale.mobileVerificationStatus === 'VERIFIED' || prevSale.mobileVerificationStatus === 'FLAGGED';
+          const isIncomingMobPending = !saleObj?.mobileVerificationStatus || saleObj.mobileVerificationStatus === 'PENDING';
+          if (isExistingMobFinal && isIncomingMobPending && isIncomingCompleted) {
+            console.log(`[Termux Hub] 🛡️ Preserved authoritative mobile verification (${prevSale.mobileVerificationStatus}) for Sale #${saleId}.`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'SALE_UPDATE',
+                action: 'SALE_UPDATE',
+                invoice_id: saleId,
+                sale: prevSale,
+                payload: prevSale,
+                status: prevSale.status,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+
+          // Otherwise update existing record (e.g. cashier issuing refund/void, exchange, or mobile money verification)
+          const mergedSale = { ...salesStore[existingIdx], ...(saleObj || packet) };
+          if (isExistingMobFinal && isIncomingMobPending) {
+            mergedSale.mobileVerificationStatus = prevSale.mobileVerificationStatus;
+            mergedSale.mobileVerifiedAmountInCurrency = prevSale.mobileVerifiedAmountInCurrency;
+            mergedSale.mobileExpectedAmountInCurrency = prevSale.mobileExpectedAmountInCurrency;
+            mergedSale.mobileVerifiedRef = prevSale.mobileVerifiedRef;
+            mergedSale.mobileVerifiedBy = prevSale.mobileVerifiedBy;
+            mergedSale.mobileVerifiedByName = prevSale.mobileVerifiedByName;
+            mergedSale.mobileVerifiedAt = prevSale.mobileVerifiedAt;
+            mergedSale.mobileDisputeReason = prevSale.mobileDisputeReason;
+            mergedSale.mobileDisputeResolution = prevSale.mobileDisputeResolution;
+            mergedSale.mobileShortfallUsd = prevSale.mobileShortfallUsd;
+          }
+          salesStore[existingIdx] = mergedSale;
         } else {
           // APPEND-ONLY: Offline invoices arriving with old timestamps (e.g. offline for 5 hours)
           // MUST BE ACCEPTED as long as the invoice_id is unique! NO TIMESTAMP REJECTION!
@@ -2495,7 +2622,7 @@ wss.on('connection', (ws, req) => {
           if (exIdx >= 0) {
             // Protect approved/rejected status from stale pending packets
             const isFinalized = prevGrv.status === 'APPROVED' || prevGrv.status === 'REJECTED';
-            if (isFinalized && grv.status === 'PENDING') {
+            if (isFinalized && (grv.status === 'PENDING' || grv.status === 'PENDING_APPROVAL')) {
               console.log(`[Termux Hub] 🛡️ Retained final status ${prevGrv.status} for GRV #${gId}.`);
               try {
                 ws.send(JSON.stringify({
@@ -2754,20 +2881,38 @@ wss.on('connection', (ws, req) => {
         pType === 'CASH_LOG' ||
         sheetName === 'CashLog' ||
         entityType === 'cash_log' ||
-        (payload && payload.line && (payload.in !== undefined || payload.out !== undefined));
+        (payload && (payload.line || payload.Line) && (payload.in !== undefined || payload.out !== undefined || payload.In !== undefined || payload.Out !== undefined));
 
       if (isCashLog) {
-        const log = packet.cashLog || payload;
-        if (log && (log.id || log.cashLogId)) {
-          const logId = log.id || log.cashLogId;
-          const exIdx = cashLogsStore.findIndex((l) => l.id === logId || l.cashLogId === logId);
-          if (exIdx >= 0) {
-            cashLogsStore[exIdx] = { ...cashLogsStore[exIdx], ...log };
-          } else {
-            cashLogsStore.unshift(log);
-            console.log(`[Termux Hub] 📥 Accepted Cash Log [${log.line || logId}] (Append-Only)`);
+        const rawLog = packet.cashLog || payload;
+        if (rawLog) {
+          const log = {
+            ...rawLog,
+            id: rawLog.id || rawLog.cashLogId,
+            timestamp: rawLog.timestamp ?? rawLog.Timestamp,
+            date: rawLog.date ?? rawLog.Date,
+            staffId: rawLog.staffId ?? rawLog.StaffID,
+            staffName: rawLog.staffName ?? rawLog.StaffName,
+            line: rawLog.line ?? rawLog.Line,
+            description: rawLog.description ?? rawLog.Description,
+            in: rawLog.in !== undefined ? rawLog.in : rawLog.In,
+            out: rawLog.out !== undefined ? rawLog.out : rawLog.Out,
+            reference: rawLog.reference ?? rawLog.Reference ?? (getHubCashLogRef(rawLog) || undefined),
+          };
+          const logId = log.id;
+          const semKey = getHubCashLogSemanticKey(log);
+          if (logId || semKey) {
+            const exByIdIdx = logId ? cashLogsStore.findIndex((l) => l.id === logId || l.cashLogId === logId) : -1;
+            const exBySemIdx = semKey ? cashLogsStore.findIndex((l) => getHubCashLogSemanticKey(l) === semKey) : -1;
+            const exIdx = exByIdIdx >= 0 ? exByIdIdx : exBySemIdx;
+            if (exIdx >= 0) {
+              cashLogsStore[exIdx] = { ...cashLogsStore[exIdx], ...log, id: cashLogsStore[exIdx].id || logId };
+            } else if (logId) {
+              cashLogsStore.unshift(log);
+              console.log(`[Termux Hub] 📥 Accepted Cash Log [${log.line || logId}] (Append-Only)`);
+            }
+            scheduleSave();
           }
-          scheduleSave();
         }
       }
 
@@ -2858,13 +3003,68 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 9. TRANSACTIONAL DATA: EXPENSES & CASH TRANSFERS (APPEND-ONLY)
       // =====================================================================
-      if ((pType === 'EXPENSE' || sheetName === 'Expenses') && payload && payload.id) {
-        const exIdx = expensesStore.findIndex((e) => e.id === payload.id);
+      if ((pType === 'EXPENSE' || pType === 'EXPENSE_RECORD' || sheetName === 'Expenses') && payload && payload.id) {
+        const expObj = packet.expense || payload;
+        const exIdx = expensesStore.findIndex((e) => e.id === expObj.id);
         if (exIdx >= 0) {
-          expensesStore[exIdx] = { ...expensesStore[exIdx], ...payload };
+          const prevExp = expensesStore[exIdx];
+          const prevFinal = prevExp.status === 'approved' || prevExp.status === 'rejected';
+          const incPending =
+            !expObj.status ||
+            expObj.status === 'pending' ||
+            expObj.status === 'pending_supervisor' ||
+            expObj.status === 'pending_approval';
+          if (prevFinal && incPending) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'EXPENSE',
+                action: 'EXPENSE_RECORD',
+                expense: prevExp,
+                payload: prevExp,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+          expensesStore[exIdx] = { ...prevExp, ...expObj };
         } else {
-          expensesStore.unshift(payload);
-          console.log(`[Termux Hub] 📥 Accepted Expense [${payload.id}] (Append-Only)`);
+          expensesStore.unshift(expObj);
+          console.log(`[Termux Hub] 📥 Accepted Expense [${expObj.id}] (Append-Only)`);
+        }
+        scheduleSave();
+      }
+
+      if (
+        (pType === 'INTERNAL_CONSUMPTION' || pType === 'SHOP_USE' || sheetName === 'InternalConsumption') &&
+        (packet.internalConsumption || payload) &&
+        (packet.internalConsumption?.id || payload?.id)
+      ) {
+        const icObj = packet.internalConsumption || payload;
+        const exIdx = internalConsumptionsStore.findIndex((c) => c.id === icObj.id);
+        if (exIdx >= 0) {
+          const prevIc = internalConsumptionsStore[exIdx];
+          const prevFinal = prevIc.status === 'APPROVED' || prevIc.status === 'REJECTED';
+          const incPending = !icObj.status || icObj.status === 'PENDING' || icObj.status === 'PENDING_APPROVAL';
+          if (prevFinal && incPending) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'INTERNAL_CONSUMPTION',
+                action: 'INTERNAL_CONSUMPTION_RECORD',
+                internalConsumption: prevIc,
+                payload: prevIc,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+          internalConsumptionsStore[exIdx] = { ...prevIc, ...icObj };
+        } else {
+          internalConsumptionsStore.unshift(icObj);
+          console.log(`[Termux Hub] 📥 Accepted Shop Use / Internal Consumption [${icObj.id}]`);
         }
         scheduleSave();
       }
@@ -3236,6 +3436,98 @@ wss.on('connection', (ws, req) => {
                 try { client.send(rolesBroadcastStr); } catch (e) {}
               }
             });
+          }
+        }
+        return;
+      }
+
+      // =====================================================================
+      // 9.1d CONFIGURATION DATA: MULTI-CURRENCY & EXCHANGE RATES (STRICT T2 LWW)
+      // =====================================================================
+      if (
+        pType === 'MULTI_CURRENCY' ||
+        pType === 'MULTI_CURRENCY_SYNC' ||
+        pType === 'EXCHANGE_RATES' ||
+        pType === 'EXCHANGE_RATES_SYNC'
+      ) {
+        const incomingMc =
+          packet.multiCurrencyConfig ||
+          packet.exchangeRates ||
+          payload?.multiCurrencyConfig ||
+          payload?.exchangeRates ||
+          (payload && typeof payload === 'object' && payload.rates ? payload : null);
+        if (incomingMc && typeof incomingMc === 'object' && incomingMc.rates) {
+          const hubNow = Date.now();
+          const hubIso = new Date(hubNow).toISOString();
+          const rawIncomingTs = packet.updatedAt ?? incomingMc.updatedAt ?? incomingMc.lastUpdated ?? packet.timestamp;
+          const incomingTime = incomingMc.isSystemDefault === true ? 0 : getTimestamp({ updatedAt: rawIncomingTs });
+          const existingTime = Number(multiCurrencyStore.updatedAt) || 0;
+
+          if (existingTime > 0 && (incomingTime === 0 || existingTime > incomingTime + 60000)) {
+            console.log(
+              `[Termux Hub] 🛡️ LWW Reject: Stale Multi-Currency update (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${incomingTime > 0 ? new Date(incomingTime).toISOString() : 'SystemDefault'}). Sending authoritative rates back.`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'MULTI_CURRENCY_SYNC',
+                action: 'MULTI_CURRENCY_SYNC',
+                entityType: 'multi_currency',
+                recordId: 'MULTI_CURRENCY_CONFIG',
+                multiCurrencyConfig: multiCurrencyStore.config,
+                exchangeRates: multiCurrencyStore.config,
+                payload: multiCurrencyStore.config,
+                updatedAt: existingTime,
+                hubTimestamp: existingTime,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+          } else if (incomingTime > 0 || existingTime === 0) {
+            const storedMc = {
+              ...incomingMc,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+              isSystemDefault: false,
+            };
+            multiCurrencyStore = { config: storedMc, updatedAt: hubNow };
+            scheduleSave();
+            console.log(
+              `[Termux Hub] 💱 Synced Multi-Currency Config (Base: ${storedMc.baseCurrency || 'USD'}) stamped at ${hubIso}`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'SYNC_ACK',
+                action: 'SYNC_ACK',
+                entityType: 'MULTI_CURRENCY',
+                recordId: 'MULTI_CURRENCY_CONFIG',
+                updatedAt: hubNow,
+                hubTimestamp: hubNow,
+                lastUpdated: hubIso,
+              }));
+            } catch (e) {}
+            const mcBroadcastStr = JSON.stringify({
+              type: 'MULTI_CURRENCY_SYNC',
+              action: 'MULTI_CURRENCY_SYNC',
+              entityType: 'multi_currency',
+              recordId: 'MULTI_CURRENCY_CONFIG',
+              multiCurrencyConfig: storedMc,
+              exchangeRates: storedMc,
+              payload: storedMc,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+              origin_device_id: packet.origin_device_id || packet.originDeviceId || 'LOCAL_HUB',
+              origin_device_name: packet.origin_device_name || packet.originDeviceName || 'Termux Local Hub',
+              timestamp: hubNow,
+            });
+            wss.clients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                try { client.send(mcBroadcastStr); } catch (e) {}
+              }
+            });
+            pushToCloud('MULTI_CURRENCY', storedMc);
           }
         }
         return;
@@ -3783,6 +4075,7 @@ wss.on('connection', (ws, req) => {
         const missedStockMovements = stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && (getTimestamp(sm) >= sinceTime || packet.isForced || isExplicitZero));
         const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && (getTimestamp(ex) >= sinceTime || packet.isForced || isExplicitZero));
         const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, reqBranch) && (getTimestamp(tr) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedInternalConsumptions = internalConsumptionsStore.filter((ic) => isMatch(ic, reqComp, reqBranch) && (getTimestamp(ic) >= sinceTime || packet.isForced || isExplicitZero));
         const missedSuppliers = suppliersStore.filter((s) => isMatch(s, reqComp, reqBranch) && (getTimestamp(s) >= sinceTime || packet.isForced || isExplicitZero));
         const missedAdminSales = adminSalesStore.filter((a) => isMatch(a, reqComp, reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced || isExplicitZero));
         const missedCashCounts = cashCountsStore.filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced || isExplicitZero));
@@ -3825,6 +4118,7 @@ wss.on('connection', (ws, req) => {
             stockMovements: missedStockMovements,
             expenses: missedExpenses,
             cashTransfers: missedCashTransfers,
+            internalConsumptions: missedInternalConsumptions,
             suppliers: missedSuppliers,
             adminSales: missedAdminSales,
             cashCounts: missedCashCounts,
@@ -3848,6 +4142,9 @@ wss.on('connection', (ws, req) => {
               : {}),
             ...(roleConfigsStore.definitions && ((roleConfigsStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
               ? { roleConfigs: roleConfigsStore }
+              : {}),
+            ...(multiCurrencyStore.config && ((multiCurrencyStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
+              ? { multiCurrencyConfig: multiCurrencyStore.config }
               : {}),
           },
         };
@@ -3914,6 +4211,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`📦 Voucher sync registered (v3.5.0)`);
   console.log(`📦 Closures & Settlements sync registered (v3.6.0)`);
   console.log(`📦 Categories sync registered (v3.6.0)`);
+  console.log(`💱 Multi-Currency LWW handler registered (v3.7.0)`);
   console.log(`🧹 Automated Reconciliation Sweep Engine active (30m interval + connection trigger)`);
   console.log(`☁️  Edge-to-Cloud (Hub to Supabase) Bridge active (v3.7.0)`);
   console.log(`================================================================`);

@@ -29,6 +29,7 @@ import {
   updateProductStock,
   getProductById,
   getMultiCurrencyConfig,
+  enqueueSync,
 } from '../db/roomDatabase';
 import { addMovement, getShiftId } from '../db/cashLedger';
 import { isSameDaySafe } from '../utils/dateUtils';
@@ -328,6 +329,57 @@ export const saveInternalConsumptions = (list: InternalConsumption[]) => {
   }
 };
 
+export type InternalConsumptionChangeListener = (record: InternalConsumption) => void;
+const internalConsumptionListeners: Set<InternalConsumptionChangeListener> = new Set();
+export const onInternalConsumptionChanged = (listener: InternalConsumptionChangeListener) => {
+  internalConsumptionListeners.add(listener);
+  return () => {
+    internalConsumptionListeners.delete(listener);
+  };
+};
+export const notifyInternalConsumptionChanged = (record: InternalConsumption) => {
+  internalConsumptionListeners.forEach((fn) => {
+    try {
+      fn(record);
+    } catch (e) {
+      console.error('internalConsumptionListener error:', e);
+    }
+  });
+};
+
+export const ingestMeshInternalConsumption = (incoming: InternalConsumption): boolean => {
+  if (!incoming || !incoming.id) return false;
+  const list = getInternalConsumptions();
+  const idx = list.findIndex((r) => r.id === incoming.id);
+  const existing = idx >= 0 ? list[idx] : null;
+
+  const isFinal = (s?: string) => {
+    const u = String(s || '').trim().toUpperCase();
+    return u === 'APPROVED' || u === 'REJECTED';
+  };
+  const isPending = (s?: string) => {
+    const u = String(s || '').trim().toUpperCase();
+    return !u || u === 'PENDING' || u === 'PENDING_APPROVAL';
+  };
+
+  if (existing) {
+    if (isFinal(existing.status) && isPending(incoming.status)) {
+      return false;
+    }
+    const existingTime = Number(existing.updatedAt) || new Date(existing.approvedAt || existing.requestedAt || 0).getTime() || 0;
+    const incomingTime = Number(incoming.updatedAt) || new Date(incoming.approvedAt || incoming.requestedAt || 0).getTime() || 0;
+    if (existing.status === incoming.status && incomingTime <= existingTime) {
+      return false;
+    }
+    list[idx] = { ...existing, ...incoming };
+    saveInternalConsumptions(list);
+    return true;
+  }
+
+  saveInternalConsumptions([incoming, ...list]);
+  return true;
+};
+
 export const createInternalConsumptionRequest = (data: {
   type: 'STAFF_WELFARE' | 'OWNER_DRAWING_GROCERIES' | 'STORE_SUPPLIES';
   items: Array<{
@@ -360,6 +412,7 @@ export const createInternalConsumptionRequest = (data: {
   const totalCost = Math.round(itemsWithTotals.reduce((s, i) => s + i.totalCost, 0) * 100) / 100;
   const totalRetail = Math.round(itemsWithTotals.reduce((s, i) => s + i.totalRetail, 0) * 100) / 100;
 
+  const nowMs = Date.now();
   const request: InternalConsumption = {
     id: `USE-${Date.now().toString().slice(-6)}`,
     type: data.type,
@@ -374,10 +427,14 @@ export const createInternalConsumptionRequest = (data: {
     notes: data.notes,
     company_id: compId,
     branch_id: brId,
+    updatedAt: nowMs,
+    lastUpdated: now,
   };
 
   const list = getInternalConsumptions();
   saveInternalConsumptions([request, ...list]);
+  enqueueSync('InternalConsumption' as any, 'INSERT', request);
+  notifyInternalConsumptionChanged(request);
   return request;
 };
 
@@ -422,6 +479,10 @@ export const approveInternalConsumption = (
       paymentMethod: 'Non-Cash (Shop Use)',
       recordCashLog: false,
       reference: req.id,
+      status: 'approved',
+      approvedBy: approver.id,
+      approvedByName: approver.name,
+      approvalTimestamp: new Date().toISOString(),
       notes: `Approved with PIN by ${approver.name}. Non-cash inventory meal/supplies: affects profit in P&L, zero cash outflow from till drawer. Retail value: $${req.totalRetail.toFixed(2)}, Cost: $${req.totalCost.toFixed(2)}.`,
       companyId: compId,
       branchId: brId,
@@ -438,12 +499,18 @@ export const approveInternalConsumption = (
     });
   }
 
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   req.status = 'APPROVED';
   req.approvedBy = approver.id;
   req.approvedByName = approver.name;
-  req.approvedAt = new Date().toISOString();
+  req.approvedAt = nowIso;
+  req.updatedAt = nowMs;
+  req.lastUpdated = nowIso;
 
   saveInternalConsumptions(list);
+  enqueueSync('InternalConsumption' as any, 'UPDATE', req);
+  notifyInternalConsumptionChanged(req);
   return { success: true, message: `Approved shop use #${req.id} at cost ($${req.totalCost.toFixed(2)}). Stock updated.`, record: req };
 };
 
@@ -456,13 +523,19 @@ export const rejectInternalConsumption = (
   const req = list.find((r) => r.id === id);
   if (!req) return { success: false, message: 'Request not found' };
 
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   req.status = 'REJECTED';
   req.approvedBy = approver.id;
   req.approvedByName = approver.name;
-  req.approvedAt = new Date().toISOString();
+  req.approvedAt = nowIso;
   req.rejectionReason = reason;
+  req.updatedAt = nowMs;
+  req.lastUpdated = nowIso;
 
   saveInternalConsumptions(list);
+  enqueueSync('InternalConsumption' as any, 'UPDATE', req);
+  notifyInternalConsumptionChanged(req);
   return { success: true, message: 'Internal consumption request rejected.' };
 };
 

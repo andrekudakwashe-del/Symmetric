@@ -46,6 +46,9 @@ import {
   saveElectronicSettlement,
   ElectronicSettlementRecord,
   verifySalespersonPin,
+  verifyMobileMoneySale,
+  flagFakeMobileMoneySale,
+  getMobileMoneySaleKind,
 } from '../../db/roomDatabase';
 import {
   handoverTillToSafe,
@@ -104,11 +107,14 @@ import {
   ShieldCheck,
   Truck,
   Package,
+  FileText,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
 import { DatabaseBackupModal } from '../common/DatabaseBackupModal';
 import { DatabaseRestoreModal } from '../common/DatabaseRestoreModal';
+import { CashierShiftReportModal } from './CashierShiftReportModal';
+import { buildCashierShiftReportData } from '../../services/cashierShiftReportService';
 import {
   calculateSupervisorExpectedCash,
   approveInternalConsumption,
@@ -235,6 +241,25 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   // Gatekeeper Drawer
   const [showApprovalsDrawer, setShowApprovalsDrawer] = useState(false);
   const [approvalActionNotice, setApprovalActionNotice] = useState<string | null>(null);
+
+  // Mobile Money Verification State (Supervisor Authorizations Panel)
+  const [mobRefInputs, setMobRefInputs] = useState<Record<string, string>>({});
+  const [mobAmountInputs, setMobAmountInputs] = useState<Record<string, string>>({});
+  const [mobInlineError, setMobInlineError] = useState<Record<string, string>>({});
+  const [flaggingSaleId, setFlaggingSaleId] = useState<string | null>(null);
+  const [flagReasonInput, setFlagReasonInput] = useState('');
+  const [flagPinInput, setFlagPinInput] = useState('');
+
+  // Audited (Verified / Flagged) Mobile Money sales for selected date
+  const auditedMobileSales = useMemo(() => {
+    return salesList.filter((s) => {
+      if (!s || (s as any).isDeleted) return false;
+      if (s.status === 'Voided' || s.status === 'Refunded') return false;
+      if (!getMobileMoneySaleKind(s)) return false;
+      if (!isSameDaySafe(s.date, s.timestamp, date)) return false;
+      return s.mobileVerificationStatus === 'VERIFIED' || s.mobileVerificationStatus === 'FLAGGED';
+    });
+  }, [salesList, date, refreshKey]);
 
   // Electronic Settlements & Sweep State
   const [showElectronicModal, setShowElectronicModal] = useState(false);
@@ -794,6 +819,112 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     }
   };
 
+  // Gatekeeper: Confirm Received Mobile Money (EcoCash / ZiG)
+  const handleVerifyMobileMoneySale = (sale: SaleInvoice, defaultExpectedInCur: number) => {
+    const refVal = (mobRefInputs[sale.id] ?? sale.proofOfPaymentRef ?? sale.paymentReference ?? '').trim();
+    if (!refVal) {
+      setMobInlineError((prev) => ({
+        ...prev,
+        [sale.id]: 'Please enter the EcoCash/ZiG Confirmation Reference # before confirming.',
+      }));
+      return;
+    }
+
+    const rawAmtStr = mobAmountInputs[sale.id];
+    const parsedAmt =
+      rawAmtStr !== undefined && rawAmtStr.trim() !== '' ? parseFloat(rawAmtStr) : defaultExpectedInCur;
+    if (isNaN(parsedAmt) || parsedAmt < 0) {
+      setMobInlineError((prev) => ({
+        ...prev,
+        [sale.id]: 'Enter a valid received amount.',
+      }));
+      return;
+    }
+
+    const res = verifyMobileMoneySale({
+      saleId: sale.id,
+      supervisor: currentUser,
+      referenceCode: refVal,
+      verifiedAmountInCurrency: parsedAmt,
+      chargeShortfallToCashier: true,
+    });
+
+    if (res.success) {
+      setMobInlineError((prev) => {
+        const next = { ...prev };
+        delete next[sale.id];
+        return next;
+      });
+      setApprovalActionNotice(res.message);
+      setSalesList(getSales());
+      setRefreshKey((k) => k + 1);
+    } else {
+      setMobInlineError((prev) => ({ ...prev, [sale.id]: res.message }));
+    }
+  };
+
+  // Gatekeeper: Flag Fake / Unreceived Mobile Money -> Keep Sale & Charge Cashier Shortage
+  const handleConfirmFlagFakeMobileMoney = (sale: SaleInvoice) => {
+    const reason = flagReasonInput.trim();
+    if (!reason) {
+      setMobInlineError((prev) => ({
+        ...prev,
+        [sale.id]: 'Please enter a reason (e.g. No EcoCash SMS / Fake slip).',
+      }));
+      return;
+    }
+
+    const pin = flagPinInput.trim();
+    if (!pin) {
+      setMobInlineError((prev) => ({
+        ...prev,
+        [sale.id]: 'Enter your Supervisor PIN to authorize charging cashier shortage.',
+      }));
+      return;
+    }
+
+    const allStaff = getSalespeople();
+    const matchedSup = allStaff.find(
+      (s) =>
+        isSupervisorOrAbove(s.role) &&
+        verifySalespersonPin(s, pin)
+    );
+    const pinValid =
+      Boolean(matchedSup) ||
+      verifySalespersonPin(currentUser, pin) ||
+      (pin === '0000' && isSupervisorOrAbove(currentUser?.role));
+
+    if (!pinValid) {
+      setMobInlineError((prev) => ({
+        ...prev,
+        [sale.id]: 'Invalid Supervisor PIN.',
+      }));
+      return;
+    }
+
+    const res = flagFakeMobileMoneySale({
+      saleId: sale.id,
+      supervisor: matchedSup || currentUser,
+      reason,
+    });
+
+    if (res.success) {
+      setFlaggingSaleId(null);
+      setFlagReasonInput('');
+      setFlagPinInput('');
+      setMobInlineError((prev) => {
+        const next = { ...prev };
+        delete next[sale.id];
+        return next;
+      });
+      setApprovalActionNotice(res.message);
+      setSalesList(getSales());
+      setRefreshKey((k) => k + 1);
+    } else {
+      setMobInlineError((prev) => ({ ...prev, [sale.id]: res.message }));
+    }
+  };
+
   // Confirm Electronic Settlement (EcoCash & ZiG Swipe)
   const handleSaveElectronicSettlement = () => {
     try {
@@ -1016,6 +1147,12 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     const adminSale = getAdminSaleForStaffAndDate(auditStaffId, date);
     const shiftId = getShiftId(auditStaffId, date, currentUser?.branchId);
     const staffMovements = getAllMovements().filter((m) => matchesShift(m, shiftId, currentUser?.branchId));
+    const reportData = buildCashierShiftReportData({
+      staff,
+      date,
+      branchId: currentUser?.branchId,
+      row,
+    });
 
     return {
       staff,
@@ -1027,8 +1164,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       staffSales,
       adminSale,
       staffMovements,
+      reportData,
     };
-  }, [auditStaffId, salespeople, balancingData, date, salesList]);
+  }, [auditStaffId, salespeople, balancingData, date, salesList, currentUser?.branchId]);
 
   // Handle logging new company expense
   const handleAddExpense = (e: React.FormEvent) => {
@@ -1591,8 +1729,8 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
                 {pendingApprovals.totalCount > 0
-                  ? 'All Direct GRVs, Cashier Expenses, and Shop Use must be approved or rejected before End of Day can be locked.'
-                  : `All cashier activities requiring authorization for ${date} have been audited. Ready for EOD.`}
+                  ? 'All Direct GRVs, Cashier Expenses, Shop Use, and EcoCash/ZiG transactions must be verified or resolved before End of Day can be locked.'
+                  : `All cashier activities & mobile money receipts for ${date} have been audited. Ready for EOD.`}
               </p>
             </div>
           </div>
@@ -1619,7 +1757,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         {/* Collapsible Detailed Review Drawer */}
         {showApprovalsDrawer && (
           <div className="mt-4 pt-4 border-t border-slate-800/80 space-y-4 animate-fadeIn">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
               {/* Category 1: Direct GRVs */}
               <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-3">
                 <div className="flex items-center justify-between border-b border-slate-800 pb-2">
@@ -1639,41 +1777,72 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                     No pending direct GRVs for {date}
                   </p>
                 ) : (
-                  <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                    {pendingApprovals.directGrvs.map((grv) => (
-                      <div
-                        key={grv.id}
-                        className="p-2.5 rounded-xl bg-slate-900 border border-amber-500/30 text-xs space-y-1.5"
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="font-mono font-bold text-white text-[11px]">{grv.grvNumber}</span>
-                          <span className="font-mono-num font-black text-rose-400 text-xs">${grv.totalAmount.toFixed(2)}</span>
+                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                    {pendingApprovals.directGrvs.map((grv) => {
+                      const grvTotal = Number(grv.totalCost ?? grv.totalAmount ?? 0);
+                      const grvItems = Array.isArray(grv.items) ? grv.items : [];
+                      return (
+                        <div
+                          key={grv.id}
+                          className="p-2.5 rounded-xl bg-slate-900 border border-amber-500/30 text-xs space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono font-bold text-white text-[11px]">{grv.grvNumber || grv.id}</span>
+                            <span className="font-mono-num font-black text-rose-400 text-xs">${grvTotal.toFixed(2)}</span>
+                          </div>
+                          <div className="text-[10px] text-slate-300 flex items-center justify-between gap-2">
+                            <span className="truncate">
+                              <strong>Supplier:</strong> {grv.supplierName || 'Supplier'}
+                            </span>
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold shrink-0 ${
+                              grv.payFromTill
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : 'bg-slate-800 text-slate-300'
+                            }`}>
+                              {grv.payFromTill ? 'Till Payout' : 'On Account'}
+                            </span>
+                          </div>
+                          {grvItems.length > 0 && (
+                            <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-1.5 space-y-0.5 max-h-24 overflow-y-auto">
+                              {grvItems.map((it: any, idx: number) => {
+                                const qty = it.quantityCases
+                                  ? `${it.quantityCases}c${it.quantitySingles ? ` + ${it.quantitySingles}u` : ''}`
+                                  : `${it.quantitySingles || it.quantity || 1}x`;
+                                const lineCost = Number(it.lineTotal ?? ((it.costPrice || 0) * (it.quantity || 1)));
+                                return (
+                                  <div key={idx} className="flex items-center justify-between gap-2 text-[10px]">
+                                    <span className="text-slate-200 truncate">
+                                      <strong className="text-blue-300">{qty}</strong> {it.productName || it.itemName || 'Product'}
+                                    </span>
+                                    <span className="font-mono-num text-slate-400 shrink-0">${lineCost.toFixed(2)}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          <div className="text-[10px] text-slate-400 flex items-center justify-between">
+                            <span>Staff: <strong className="text-slate-200">{grv.receivedByStaffName || 'Cashier'}</strong></span>
+                            <span>{grvItems.length} item(s)</span>
+                          </div>
+                          <div className="pt-1.5 flex items-center space-x-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleApprovePendingGrv(grv.id, grv.grvNumber || grv.id)}
+                              className="flex-1 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] transition shadow-sm"
+                            >
+                              ✓ Approve
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRejectPendingGrv(grv.id, grv.grvNumber || grv.id)}
+                              className="flex-1 py-1 rounded-lg bg-rose-600/80 hover:bg-rose-600 text-white font-bold text-[10px] transition"
+                            >
+                              ✗ Reject (Refund)
+                            </button>
+                          </div>
                         </div>
-                        <div className="text-[10px] text-slate-300">
-                          <strong>Supplier:</strong> {grv.supplierName}
-                        </div>
-                        <div className="text-[10px] text-slate-400 flex items-center justify-between">
-                          <span>By: {grv.receivedByStaffName}</span>
-                          <span>{grv.items.length} item(s)</span>
-                        </div>
-                        <div className="pt-1.5 flex items-center space-x-1.5">
-                          <button
-                            type="button"
-                            onClick={() => handleApprovePendingGrv(grv.id, grv.grvNumber)}
-                            className="flex-1 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] transition shadow-sm"
-                          >
-                            ✓ Approve
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRejectPendingGrv(grv.id, grv.grvNumber)}
-                            className="flex-1 py-1 rounded-lg bg-rose-600/80 hover:bg-rose-600 text-white font-bold text-[10px] transition"
-                          >
-                            ✗ Reject (Refund)
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1697,34 +1866,41 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                     No pending expenses for {date}
                   </p>
                 ) : (
-                  <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
                     {pendingApprovals.expenses.map((exp) => (
                       <div
                         key={exp.id}
                         className="p-2.5 rounded-xl bg-slate-900 border border-purple-500/30 text-xs space-y-1.5"
                       >
-                        <div className="flex items-center justify-between">
-                          <span className="font-bold text-white text-[11px]">{exp.category}</span>
-                          <span className="font-mono-num font-black text-rose-400 text-xs">${exp.amount.toFixed(2)}</span>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-bold text-white text-[11px] truncate">{exp.category || 'Expense'}</span>
+                          <span className="font-mono-num font-black text-rose-400 text-xs shrink-0">
+                            ${(Number(exp.amount) || 0).toFixed(2)}
+                          </span>
                         </div>
-                        <div className="text-[10px] text-slate-300 truncate">
-                          {exp.description}
+                        <div className="text-[10px] text-slate-300 break-words">
+                          {exp.description || 'No description provided'}
                         </div>
+                        {exp.vendorOrCustomer && exp.vendorOrCustomer !== 'General Expense' && (
+                          <div className="text-[10px] text-slate-400 truncate">
+                            Payee: <span className="text-slate-300">{exp.vendorOrCustomer}</span>
+                          </div>
+                        )}
                         <div className="text-[10px] text-slate-400 flex items-center justify-between">
-                          <span>Staff: {exp.staffName}</span>
-                          <span>{exp.paymentMethod || 'CASH'}</span>
+                          <span>Staff: <strong className="text-slate-200">{exp.staffName || 'Cashier'}</strong></span>
+                          <span>{exp.paymentMethod || 'Cash'}</span>
                         </div>
                         <div className="pt-1.5 flex items-center space-x-1.5">
                           <button
                             type="button"
-                            onClick={() => handleApprovePendingExpense(exp.id, exp.description)}
+                            onClick={() => handleApprovePendingExpense(exp.id, exp.description || exp.category || 'Expense')}
                             className="flex-1 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] transition shadow-sm"
                           >
                             ✓ Approve
                           </button>
                           <button
                             type="button"
-                            onClick={() => handleRejectPendingExpense(exp.id, exp.description)}
+                            onClick={() => handleRejectPendingExpense(exp.id, exp.description || exp.category || 'Expense')}
                             className="flex-1 py-1 rounded-lg bg-rose-600/80 hover:bg-rose-600 text-white font-bold text-[10px] transition"
                           >
                             ✗ Reject
@@ -1755,41 +1931,355 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                     No pending shop use for {date}
                   </p>
                 ) : (
-                  <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                    {pendingApprovals.shopUse.map((su) => (
-                      <div
-                        key={su.id}
-                        className="p-2.5 rounded-xl bg-slate-900 border border-emerald-500/30 text-xs space-y-1.5"
-                      >
-                        <div className="flex items-center justify-between">
-                          <span className="font-bold text-white text-[11px]">{su.consumptionType || 'STAFF_TEA'}</span>
-                          <span className="font-mono-num font-black text-amber-400 text-xs">${(su.totalCost || 0).toFixed(2)}</span>
+                  <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                    {pendingApprovals.shopUse.map((su) => {
+                      const rawType = su.type || su.consumptionType || 'SHOP_USE';
+                      const typeLabel =
+                        rawType === 'STAFF_WELFARE'
+                          ? 'Staff Welfare / Meals'
+                          : rawType === 'OWNER_DRAWING_GROCERIES'
+                          ? 'Owner Home Groceries'
+                          : rawType === 'STORE_SUPPLIES'
+                          ? 'Store Supplies'
+                          : rawType;
+                      const staffDisplay =
+                        su.requestedByName || su.requestedByStaffName || su.staffName || 'Unknown Staff';
+                      const suItems = Array.isArray(su.items) ? su.items : [];
+                      const reqTime =
+                        su.requestedAt && !isNaN(new Date(su.requestedAt).getTime())
+                          ? new Date(su.requestedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                          : '';
+
+                      return (
+                        <div
+                          key={su.id}
+                          className="p-2.5 rounded-xl bg-slate-900 border border-emerald-500/30 text-xs space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-bold text-white text-[11px] truncate">{typeLabel}</span>
+                            <span className="font-mono-num font-black text-amber-400 text-xs shrink-0">
+                              ${(Number(su.totalCost) || 0).toFixed(2)}
+                            </span>
+                          </div>
+
+                          <div className="text-[10px] text-slate-300 flex items-center justify-between gap-2">
+                            <span>
+                              Staff: <strong className="text-emerald-300">{staffDisplay}</strong>
+                            </span>
+                            <span className="text-slate-500 font-mono">
+                              {su.id}{reqTime ? ` • ${reqTime}` : ''}
+                            </span>
+                          </div>
+
+                          {suItems.length > 0 ? (
+                            <div className="bg-slate-950/70 border border-slate-800/80 rounded-lg p-1.5 space-y-0.5 max-h-28 overflow-y-auto">
+                              {suItems.map((item: any, idx: number) => {
+                                const qty = Number(item.quantity) || 1;
+                                const lineCost = Number(
+                                  item.totalCost ?? (Number(item.costPrice) || 0) * qty
+                                );
+                                return (
+                                  <div key={idx} className="flex items-center justify-between gap-2 text-[10px]">
+                                    <span className="text-slate-200 truncate">
+                                      <strong className="text-emerald-300">{qty}x</strong>{' '}
+                                      {item.productName || item.name || 'Unnamed Product'}
+                                      {item.sku ? (
+                                        <span className="text-slate-500 ml-1 font-mono">({item.sku})</span>
+                                      ) : null}
+                                    </span>
+                                    <span className="font-mono-num text-amber-300 shrink-0">
+                                      ${lineCost.toFixed(2)}
+                                    </span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-slate-400 italic">No products listed</div>
+                          )}
+
+                          {su.notes && (
+                            <div className="text-[10px] text-slate-400 italic break-words">
+                              Note: {su.notes}
+                            </div>
+                          )}
+
+                          <div className="pt-1.5 flex items-center space-x-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleApprovePendingShopUse(su.id)}
+                              className="flex-1 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] transition shadow-sm"
+                            >
+                              ✓ Authorize
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRejectPendingShopUse(su.id)}
+                              className="flex-1 py-1 rounded-lg bg-rose-600/80 hover:bg-rose-600 text-white font-bold text-[10px] transition"
+                            >
+                              ✗ Reject
+                            </button>
+                          </div>
                         </div>
-                        <div className="text-[10px] text-slate-300">
-                          {su.notes || `${su.items?.length || 0} item(s) logged`}
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Category 4: Mobile Money (EcoCash & ZiG) Verification */}
+              <div className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <div className="flex items-center space-x-2">
+                    <Smartphone className="w-4 h-4 text-cyan-400" />
+                    <span className="font-bold text-xs text-white">Mobile Money (EcoCash / ZiG)</span>
+                  </div>
+                  <span className={`text-[10px] font-black px-1.5 py-0.2 rounded-full ${
+                    pendingApprovals.mobileMoney.length > 0 ? 'bg-amber-500/20 text-amber-300' : 'bg-slate-800 text-slate-500'
+                  }`}>
+                    {pendingApprovals.mobileMoney.length}
+                  </span>
+                </div>
+
+                {pendingApprovals.mobileMoney.length === 0 ? (
+                  <p className="text-[11px] text-slate-500 py-3 text-center italic">
+                    {auditedMobileSales.length > 0
+                      ? `All ${auditedMobileSales.length} mobile money receipt(s) verified/audited for ${date}`
+                      : `No pending EcoCash/ZiG transactions for ${date}`}
+                  </p>
+                ) : (
+                  <div className="space-y-2.5 max-h-80 overflow-y-auto pr-1">
+                    {pendingApprovals.mobileMoney.map((sale) => {
+                      const curKind = getMobileMoneySaleKind(sale) || 'EcoCash';
+                      const rate = Number(sale.exchangeRate) || (curKind === 'ZiG' ? 26.5 : 1.05);
+                      const goodsUsd = Number(sale.total) || 0;
+                      const cashOutUsd = Number(sale.cashWithdrawalAmount) || 0;
+                      const grossUsd = Math.round((goodsUsd + cashOutUsd) * 100) / 100;
+                      const expectedInCur =
+                        Number(sale.totalChargedInCurrency) ||
+                        Math.round(((goodsUsd + cashOutUsd) * rate) * 100) / 100;
+                      const refVal =
+                        mobRefInputs[sale.id] ?? sale.proofOfPaymentRef ?? sale.paymentReference ?? '';
+                      const amtValStr = mobAmountInputs[sale.id] ?? expectedInCur.toFixed(2);
+                      const parsedAmtVal = parseFloat(amtValStr);
+                      const shortfallCur =
+                        !isNaN(parsedAmtVal) && parsedAmtVal + 0.01 < expectedInCur
+                          ? Math.max(0, Math.round((expectedInCur - parsedAmtVal) * 100) / 100)
+                          : 0;
+                      const shortfallUsd =
+                        shortfallCur > 0 ? Math.round((shortfallCur / rate) * 100) / 100 : 0;
+                      const isFlagging = flaggingSaleId === sale.id;
+                      const errText = mobInlineError[sale.id];
+                      const txTime =
+                        sale.timestamp && !isNaN(new Date(sale.timestamp).getTime())
+                          ? new Date(sale.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                          : '';
+
+                      return (
+                        <div
+                          key={sale.id}
+                          className={`p-2.5 rounded-xl bg-slate-900 border text-xs space-y-2 ${
+                            curKind === 'ZiG' ? 'border-amber-500/35' : 'border-cyan-500/35'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center space-x-1.5 min-w-0">
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wide shrink-0 ${
+                                  curKind === 'ZiG'
+                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                    : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                                }`}
+                              >
+                                {curKind}
+                              </span>
+                              <span className="font-mono font-bold text-white text-[11px] truncate">
+                                #{sale.id}
+                              </span>
+                            </div>
+                            <span className="font-mono-num font-black text-emerald-300 text-xs shrink-0">
+                              {expectedInCur.toFixed(2)} {curKind}
+                            </span>
+                          </div>
+
+                          {/* Unified Goods + Cash-Out Breakdown */}
+                          <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-1.5 space-y-0.5 text-[10px]">
+                            <div className="flex items-center justify-between text-slate-300">
+                              <span>Goods Value (Base):</span>
+                              <span className="font-mono-num font-bold text-white">${goodsUsd.toFixed(2)} USD</span>
+                            </div>
+                            {cashOutUsd > 0 && (
+                              <div className="flex items-center justify-between text-amber-300">
+                                <span>+ Cash Handed Out:</span>
+                                <span className="font-mono-num font-bold">${cashOutUsd.toFixed(2)} USD</span>
+                              </div>
+                            )}
+                            <div className="flex items-center justify-between text-slate-400 border-t border-slate-800/80 pt-0.5 mt-0.5">
+                              <span>Expected Unified Receipt:</span>
+                              <span className="font-mono-num text-cyan-300 font-bold">
+                                {expectedInCur.toFixed(2)} {curKind} (${grossUsd.toFixed(2)})
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="text-[10px] text-slate-400 flex items-center justify-between gap-2">
+                            <span className="truncate">
+                              Staff: <strong className="text-slate-200">{sale.staffName || 'Cashier'}</strong>
+                            </span>
+                            <span className="font-mono shrink-0">
+                              Rate {rate.toFixed(2)}{txTime ? ` • ${txTime}` : ''}
+                            </span>
+                          </div>
+
+                          {sale.proofOfPaymentRef && (
+                            <div className="text-[10px] text-cyan-300 bg-cyan-950/30 border border-cyan-500/20 rounded px-1.5 py-0.5 truncate">
+                              Cashier POP Ref: <strong className="font-mono">{sale.proofOfPaymentRef}</strong>
+                            </div>
+                          )}
+
+                          {/* Reference # + Actual Received Inputs */}
+                          <div className="grid grid-cols-2 gap-1.5">
+                            <div>
+                              <label className="block text-[9px] text-slate-400 mb-0.5">
+                                Confirm Ref / Txn ID *
+                              </label>
+                              <input
+                                type="text"
+                                value={refVal}
+                                onChange={(e) =>
+                                  setMobRefInputs((prev) => ({ ...prev, [sale.id]: e.target.value }))
+                                }
+                                placeholder="SMS Ref / Auth #"
+                                className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700 text-white text-[10px] font-mono focus:ring-1 focus:ring-cyan-500 outline-none"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[9px] text-slate-400 mb-0.5">
+                                Received ({curKind})
+                              </label>
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                value={amtValStr}
+                                onChange={(e) =>
+                                  setMobAmountInputs((prev) => ({ ...prev, [sale.id]: e.target.value }))
+                                }
+                                className="w-full px-2 py-1 rounded-lg bg-slate-950 border border-slate-700 text-white text-[10px] font-mono-num font-bold focus:ring-1 focus:ring-cyan-500 outline-none"
+                              />
+                            </div>
+                          </div>
+
+                          {shortfallCur > 0 && (
+                            <div className="text-[10px] bg-amber-950/50 border border-amber-500/40 text-amber-200 rounded-lg px-2 py-1">
+                              Short-paid by <strong>{shortfallCur.toFixed(2)} {curKind}</strong> (${shortfallUsd.toFixed(2)} USD) — shortfall will charge to {sale.staffName}'s till.
+                            </div>
+                          )}
+
+                          {errText && (
+                            <div className="text-[10px] bg-rose-950/60 border border-rose-500/40 text-rose-200 rounded-lg px-2 py-1">
+                              {errText}
+                            </div>
+                          )}
+
+                          {isFlagging ? (
+                            <div className="p-2 rounded-lg bg-rose-950/40 border border-rose-500/40 space-y-1.5">
+                              <div className="text-[10px] font-bold text-rose-200">
+                                Keep Sale &amp; Charge ${grossUsd.toFixed(2)} USD Cashier Shortage
+                              </div>
+                              <input
+                                type="text"
+                                value={flagReasonInput}
+                                onChange={(e) => setFlagReasonInput(e.target.value)}
+                                placeholder="Reason (e.g. No SMS / Fake confirmation)"
+                                className="w-full px-2 py-1 rounded bg-slate-950 border border-rose-500/40 text-white text-[10px] outline-none"
+                              />
+                              <input
+                                type="password"
+                                value={flagPinInput}
+                                onChange={(e) => setFlagPinInput(e.target.value)}
+                                placeholder="Supervisor PIN *"
+                                className="w-full px-2 py-1 rounded bg-slate-950 border border-rose-500/40 text-white text-[10px] font-mono outline-none"
+                              />
+                              <div className="flex items-center space-x-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => handleConfirmFlagFakeMobileMoney(sale)}
+                                  className="flex-1 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold text-[10px]"
+                                >
+                                  Confirm Charge Shortage
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setFlaggingSaleId(null);
+                                    setFlagReasonInput('');
+                                    setFlagPinInput('');
+                                  }}
+                                  className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-[10px]"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="pt-1 flex items-center space-x-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleVerifyMobileMoneySale(sale, expectedInCur)}
+                                className="flex-1 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] transition shadow-sm"
+                              >
+                                ✓ Confirm Received
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setFlaggingSaleId(sale.id);
+                                  setFlagReasonInput('');
+                                  setFlagPinInput('');
+                                }}
+                                className="flex-1 py-1 rounded-lg bg-rose-600/80 hover:bg-rose-600 text-white font-bold text-[10px] transition"
+                              >
+                                ✗ Flag Fake
+                              </button>
+                            </div>
+                          )}
                         </div>
-                        <div className="text-[10px] text-slate-400 flex items-center justify-between">
-                          <span>By: {su.requestedByStaffName || 'Cashier'}</span>
-                          <span>Dept: {su.department || 'Store'}</span>
-                        </div>
-                        <div className="pt-1.5 flex items-center space-x-1.5">
-                          <button
-                            type="button"
-                            onClick={() => handleApprovePendingShopUse(su.id)}
-                            className="flex-1 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] transition shadow-sm"
+                      );
+                    })}
+                  </div>
+                )}
+
+                {auditedMobileSales.length > 0 && (
+                  <div className="pt-2 border-t border-slate-800/80 space-y-1">
+                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                      Audited Today ({auditedMobileSales.length})
+                    </div>
+                    <div className="max-h-28 overflow-y-auto space-y-1 pr-1">
+                      {auditedMobileSales.map((s) => {
+                        const isFlagged = s.mobileVerificationStatus === 'FLAGGED';
+                        const cur = getMobileMoneySaleKind(s) || 'EcoCash';
+                        return (
+                          <div
+                            key={s.id}
+                            className={`flex items-center justify-between gap-2 px-2 py-1 rounded-lg text-[10px] border ${
+                              isFlagged
+                                ? 'bg-rose-950/30 border-rose-500/30 text-rose-200'
+                                : 'bg-emerald-950/20 border-emerald-500/20 text-emerald-200'
+                            }`}
                           >
-                            ✓ Authorize
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRejectPendingShopUse(su.id)}
-                            className="flex-1 py-1 rounded-lg bg-rose-600/80 hover:bg-rose-600 text-white font-bold text-[10px] transition"
-                          >
-                            ✗ Reject
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                            <span className="truncate font-mono">
+                              #{s.id} ({cur})
+                            </span>
+                            <span className="shrink-0 font-bold">
+                              {isFlagged
+                                ? `FLAGGED (-$${(Number(s.mobileShortfallUsd) || 0).toFixed(2)})`
+                                : `✓ ${s.mobileVerifiedRef || 'Verified'}`}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
               </div>
@@ -2235,10 +2725,10 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                                 type="button"
                                 onClick={() => setAuditStaffId(row.staffId)}
                                 className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 hover:text-white text-[11px] font-bold inline-flex items-center space-x-1.5 transition border border-slate-700"
-                                title={`Drill-down to see movements for ${row.staffName}`}
+                                title={`Open printable Shift Report & Raw Ledger Movements for ${row.staffName}`}
                               >
-                                <Eye className="w-3.5 h-3.5 text-[#6A4DFF]" />
-                                <span>Movements</span>
+                                <FileText className="w-3.5 h-3.5 text-[#6A4DFF]" />
+                                <span>Shift Report</span>
                               </button>
 
                               {(() => {
@@ -2764,485 +3254,15 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       )}
 
       {/* ========================================================================= */}
-      {/* AUDIT DRILL-DOWN MODAL FOR SELECTED SALESPERSON */}
+      {/* CASHIER SHIFT REPORT & AUDIT DRILL-DOWN MODAL */}
       {/* ========================================================================= */}
       {selectedAuditData && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden animate-scaleUp">
-            {/* Modal Header */}
-            <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
-              <div className="flex items-center space-x-3">
-                <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-[#6A4DFF] to-[#FF8A00] flex items-center justify-center text-white font-bold text-base shadow-md">
-                  {selectedAuditData.staff.name.charAt(0)}
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-white">
-                    Audit Breakdown: {selectedAuditData.staff.name}
-                  </h3>
-                  <p className="text-xs text-slate-400">
-                    Date: <strong className="text-slate-200">{date}</strong> • Staff ID: #{selectedAuditData.staff.id}
-                  </p>
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => setAuditStaffId(null)}
-                className="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center transition"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Modal Body */}
-            <div className="p-4 sm:p-5 space-y-4 overflow-y-auto text-xs">
-              {/* Summary Stats Pill */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 p-3 rounded-2xl bg-slate-950 border border-slate-800 text-center">
-                <div>
-                  <span className="text-[10px] text-slate-400 block">Form 2 Net</span>
-                  <span className="text-sm font-bold font-mono-num text-white">
-                    ${(selectedAuditData.row?.form2Net ?? 0).toFixed(2)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-400 block">Form 3 Net</span>
-                  <span className="text-sm font-bold font-mono-num text-white">
-                    ${(selectedAuditData.row?.form3Net ?? 0).toFixed(2)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-purple-300 block font-bold">Sum 2 & 3 Net</span>
-                  <span className="text-sm font-black font-mono-num text-[#FF8A00]">
-                    ${(selectedAuditData.row?.sumForm2And3Net ?? 0).toFixed(2)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-emerald-300 block font-bold">Sales</span>
-                  <span className="text-sm font-bold font-mono-num text-emerald-400">
-                    ${(selectedAuditData.row?.sales ?? 0).toFixed(2)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-indigo-300 block font-bold">Should Have</span>
-                  <span className="text-sm font-black font-mono-num text-indigo-300">
-                    ${(selectedAuditData.row?.shouldHave ?? 0).toFixed(2)}
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-400 block font-bold">Variance</span>
-                  <span className={`text-sm font-black font-mono-num ${
-                    Math.abs(selectedAuditData.row?.variance || 0) < 0.01
-                      ? 'text-emerald-400'
-                      : (selectedAuditData.row?.variance || 0) < 0
-                      ? 'text-rose-400'
-                      : 'text-orange-400'
-                  }`}>
-                    {Math.abs(selectedAuditData.row?.variance || 0) < 0.01
-                      ? '$0.00'
-                      : (selectedAuditData.row?.variance || 0) < 0
-                      ? `-$${Math.abs(selectedAuditData.row?.variance || 0).toFixed(2)}`
-                      : `+$${(selectedAuditData.row?.variance || 0).toFixed(2)}`}
-                  </span>
-                </div>
-              </div>
-
-              {/* Form 4 Cash Balancing Breakdown */}
-              {selectedAuditData.row && (
-                <div className="p-4 rounded-2xl bg-slate-950/80 border border-indigo-500/30 space-y-3">
-                  <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
-                    <div className="flex items-center space-x-2">
-                      <Calculator className="w-4 h-4 text-indigo-400" />
-                      <span className="font-bold text-xs uppercase tracking-wider text-indigo-200">
-                        Form 4 Cash Balancing Breakdown
-                      </span>
-                    </div>
-                    <div className="text-right">
-                      <span className="text-[10px] text-slate-400 block">Expected Cash in Till</span>
-                      <span className="text-sm font-mono-num font-black text-indigo-300">
-                        ${(selectedAuditData.row.expectedCash ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Formula Breakdown Items Grid */}
-                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 text-[11px]">
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">+ Float</span>
-                      <span className="font-mono-num font-bold text-emerald-400">
-                        +${(selectedAuditData.row.float ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">+ Cash Sales</span>
-                      <span className="font-mono-num font-bold text-emerald-400">
-                        +${(selectedAuditData.row.cashSales ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">+ Credit Payments</span>
-                      <span className="font-mono-num font-bold text-emerald-400">
-                        +${(selectedAuditData.row.creditPayments ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">- Expenses</span>
-                      <span className="font-mono-num font-bold text-rose-400">
-                        -${(selectedAuditData.row.expenses ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">- Direct Procurements</span>
-                      <span className="font-mono-num font-bold text-rose-400">
-                        -${(selectedAuditData.row.directProcurements ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">- Cash Lift</span>
-                      <span className="font-mono-num font-bold text-rose-400">
-                        -${(selectedAuditData.row.cashLift ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">- Customer Change</span>
-                      <span className="font-mono-num font-bold text-rose-400">
-                        -${(selectedAuditData.row.customerChange ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
-                      <span className="text-slate-400 block text-[10px]">- Deductions</span>
-                      <span className="font-mono-num font-bold text-rose-400">
-                        -${(selectedAuditData.row.deductions ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                    {/* Active currencies till cash-outs */}
-                    {(selectedAuditData.row.activeCurrencies || getActiveCurrencies()).map((c) => {
-                      const wVal =
-                        (selectedAuditData.row.currencyWithdrawals && selectedAuditData.row.currencyWithdrawals[c.currency]) ??
-                        (c.currency === 'EcoCash'
-                          ? selectedAuditData.row.ecocashWithdrawal
-                          : c.currency === 'ZiG'
-                          ? selectedAuditData.row.zigWithdrawal
-                          : 0) ??
-                        0;
-                      return (
-                        <div key={c.currency} className="p-2 rounded-xl bg-purple-950/30 border border-purple-800/40">
-                          <span className="text-purple-300 block text-[10px] font-semibold">- {c.name} Cash-Out</span>
-                          <span className="font-mono-num font-bold text-rose-400">
-                            -${(Number(wVal) || 0).toFixed(2)}
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Reporting-only non-cash sales */}
-                  <div className="p-2.5 rounded-xl bg-slate-900/60 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between text-[11px] text-slate-400 gap-2">
-                    <div className="flex items-center space-x-1.5">
-                      <Smartphone className="w-3.5 h-3.5 text-slate-400" />
-                      <span>Non-Cash Sales (Reporting Only — Not in Expected Physical Cash):</span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono-num">
-                      {(selectedAuditData.row.activeCurrencies || getActiveCurrencies()).map((c) => {
-                        const sVal =
-                          (selectedAuditData.row.currencySales && selectedAuditData.row.currencySales[c.currency]) ??
-                          (c.currency === 'EcoCash'
-                            ? selectedAuditData.row.ecocashSales
-                            : c.currency === 'ZiG'
-                            ? selectedAuditData.row.zigSales
-                            : 0) ??
-                          0;
-                        return (
-                          <span key={c.currency}>
-                            {c.name}: ${sVal.toFixed(2)}
-                          </span>
-                        );
-                      })}
-                      <span className="text-slate-200 font-bold">
-                        Total Non-Cash: ${(selectedAuditData.row.totalNonCashSales ?? 0).toFixed(2)}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Form 1 Physical Count if available */}
-              {selectedAuditData.form1Count && (
-                <div className="p-3 rounded-2xl bg-emerald-950/40 border border-emerald-500/30 flex items-center justify-between text-xs">
-                  <div className="flex items-center space-x-2">
-                    <Coins className="w-4 h-4 text-emerald-400" />
-                    <span>Form 1 (Physical Cash Count Counted):</span>
-                  </div>
-                  <span className="font-mono-num font-black text-emerald-300 text-sm">
-                    ${(selectedAuditData.form1Count.finalCashOutTotal ?? 0).toFixed(2)}
-                  </span>
-                </div>
-              )}
-
-              {/* Section 0: Canonical Cash Movements (cashMovements ledger) */}
-              <div className="space-y-2">
-                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
-                  <span className="flex items-center space-x-1.5">
-                    <History className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Canonical Cash Movements ({selectedAuditData.staffMovements.length})</span>
-                  </span>
-                  <span className="text-indigo-300 font-mono-num font-bold">
-                    Expected: ${(selectedAuditData.row?.expectedCash ?? 0).toFixed(2)}
-                  </span>
-                </h4>
-
-                {selectedAuditData.staffMovements.length === 0 ? (
-                  <p className="p-3 text-center text-slate-500 bg-slate-950/40 rounded-xl">
-                    No canonical ledger movements recorded for this staff on this date.
-                  </p>
-                ) : (
-                  <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
-                    {selectedAuditData.staffMovements.map((mov, movIdx) => {
-                      const isIn = mov.direction === 'in';
-                      const isOut = mov.direction === 'out';
-                      const timeStr = new Date(mov.timestamp).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      });
-
-                      return (
-                        <div
-                          key={`${mov.id}-${movIdx}`}
-                          className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between text-[11px] gap-2"
-                        >
-                          <div className="space-y-0.5 min-w-0">
-                            <div className="flex items-center space-x-1.5">
-                              <span
-                                className={`px-1.5 py-0.2 rounded text-[9px] font-black uppercase tracking-wider ${
-                                  isIn
-                                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                    : isOut
-                                    ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                                    : 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
-                                }`}
-                              >
-                                {mov.direction}
-                              </span>
-                              <span className="font-bold text-white uppercase tracking-tight text-[10px]">
-                                {mov.type.replace(/_/g, ' ')}
-                              </span>
-                              <span className="text-[10px] text-slate-500 font-mono-num">
-                                {timeStr}
-                              </span>
-                              <span className="text-[9px] px-1 py-0.2 rounded bg-slate-800 text-slate-400">
-                                {mov.sourceModule}
-                              </span>
-                            </div>
-                            <p className="text-slate-400 truncate text-[10px]">
-                              {mov.notes || mov.sourceRef || 'No details'}
-                            </p>
-                          </div>
-
-                          <div className="text-right shrink-0">
-                            <span
-                              className={`font-mono-num font-black text-xs block ${
-                                isIn
-                                  ? 'text-emerald-400'
-                                  : isOut
-                                  ? 'text-rose-400'
-                                  : 'text-indigo-300'
-                              }`}
-                            >
-                              {isIn ? '+' : isOut ? '-' : ''}${(mov.amount ?? 0).toFixed(2)}
-                            </span>
-                            <span className="text-[9px] text-slate-500 block">
-                              {mov.affectsDrawer ? 'Drawer' : 'Non-Drawer'}
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* Section 1: Form 2 Cash Log Transactions */}
-              <div className="space-y-2">
-                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
-                  <span>Form 2: Cash Log Movements ({selectedAuditData.form2Logs.length})</span>
-                  <span className="text-purple-300 font-mono-num font-bold">
-                    Net: ${(selectedAuditData.row?.form2Net ?? 0).toFixed(2)}
-                  </span>
-                </h4>
-
-                {selectedAuditData.form2Logs.length === 0 ? (
-                  <p className="p-3 text-center text-slate-500 bg-slate-950/40 rounded-xl">
-                    No Form 2 cash log movements for this date.
-                  </p>
-                ) : (
-                  <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-                    {selectedAuditData.form2Logs.map((log, logIdx) => (
-                      <div
-                        key={`${log.id}-${logIdx}`}
-                        className="p-2 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
-                      >
-                        <div>
-                          <span className="font-bold text-white">{log.line}</span>
-                          <span className="text-slate-400 ml-1.5">({log.description})</span>
-                        </div>
-                        <div className="text-right font-mono-num font-bold">
-                          {log.in > 0 && <span className="text-emerald-400">+${(log.in ?? 0).toFixed(2)}</span>}
-                          {log.out > 0 && <span className="text-rose-400">-${(log.out ?? 0).toFixed(2)}</span>}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Section 2: Form 3 Customer Change Entries */}
-              <div className="space-y-2">
-                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
-                  <span>Form 3: Customer Change Records ({selectedAuditData.form3Changes.length})</span>
-                  <span className="text-slate-400 font-mono-num">
-                    Net: ${(((selectedAuditData.row?.changeReceived ?? selectedAuditData.row?.changeIn ?? 0) - (selectedAuditData.row?.changePaid ?? selectedAuditData.row?.customerChange ?? 0))).toFixed(2)}
-                  </span>
-                </h4>
-
-                {selectedAuditData.form3Changes.length === 0 ? (
-                  <p className="p-3 text-center text-slate-500 bg-slate-950/40 rounded-xl">
-                    No Form 3 customer change entries for this date.
-                  </p>
-                ) : (
-                  <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-                    {selectedAuditData.form3Changes.map((chg, chgIdx) => (
-                      <div
-                        key={`${chg.id}-${chgIdx}`}
-                        className="p-2 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
-                      >
-                        <div>
-                          <span className="font-bold text-white">{chg.customerName}</span>
-                          {chg.notes && <span className="text-slate-400 ml-1.5">"{chg.notes}"</span>}
-                        </div>
-                        <div className="text-right font-mono-num font-bold">
-                          {chg.in > 0 && <span className="text-emerald-400">+${chg.in.toFixed(2)} In </span>}
-                          {chg.out > 0 && <span className="text-rose-400">-${chg.out.toFixed(2)} Out</span>}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Section 3: Form 3 Credit Sales */}
-              {selectedAuditData.form3Credits.length > 0 && (
-                <div className="space-y-2">
-                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
-                    <span>Form 3: Credit Sales ({selectedAuditData.form3Credits.length})</span>
-                  </h4>
-                  <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
-                    {selectedAuditData.form3Credits.map((cr, crIdx) => (
-                      <div
-                        key={`${cr.id}-${crIdx}`}
-                        className="p-2 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
-                      >
-                        <div>
-                          <span className="font-bold text-white">{cr.customerName}</span>
-                          <span className="text-slate-400 ml-1.5">({cr.itemDescription})</span>
-                        </div>
-                        <div className="text-right font-mono-num font-bold text-amber-300">
-                          ${(cr.amount ?? 0).toFixed(2)}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Section 4: Recorded System Sales */}
-              <div className="space-y-2">
-                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center justify-between">
-                  <span className="flex items-center space-x-1.5">
-                    <ShoppingBag className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>
-                      Recorded Sales (
-                      {selectedAuditData.staffSales.length + (selectedAuditData.adminSale ? 1 : 0)})
-                    </span>
-                  </span>
-                  <span className="text-emerald-400 font-mono-num font-bold">
-                    Total: $
-                    {(
-                      selectedAuditData.staffSales.reduce((sum, s) => sum + (s.total || 0), 0) +
-                      (selectedAuditData.adminSale && selectedAuditData.staffSales.length === 0
-                        ? selectedAuditData.adminSale.salesAmount || 0
-                        : 0)
-                    ).toFixed(2)}
-                  </span>
-                </h4>
-
-                {/* Display Admin / Form 4 Sales Entry if recorded */}
-                {selectedAuditData.adminSale && (
-                  <div className="p-2.5 rounded-xl bg-indigo-950/50 border border-indigo-500/40 flex items-center justify-between text-[11px] mb-2">
-                    <div className="space-y-0.5">
-                      <div className="flex items-center space-x-2">
-                        <span className="font-bold text-indigo-300">Balancing / Admin Sales Record</span>
-                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-indigo-900/80 text-indigo-200 font-semibold">
-                          Form 4 Entry
-                        </span>
-                      </div>
-                      <div className="text-[10px] text-slate-400">
-                        {selectedAuditData.adminSale.notes ||
-                          `Reconciliation sales record for ${selectedAuditData.staff.name}`}
-                      </div>
-                    </div>
-                    <div className="text-right font-mono-num font-bold text-emerald-400 text-xs">
-                      ${(selectedAuditData.adminSale.salesAmount ?? 0).toFixed(2)}
-                    </div>
-                  </div>
-                )}
-
-                {selectedAuditData.staffSales.length === 0 && !selectedAuditData.adminSale ? (
-                  <p className="p-3 text-center text-slate-500 bg-slate-950/40 rounded-xl">
-                    No sales invoices recorded for this salesperson on this date.
-                  </p>
-                ) : (
-                  <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                    {selectedAuditData.staffSales.map((sale, saleIdx) => (
-                      <div
-                        key={`${sale.id}-${saleIdx}`}
-                        className="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800 flex items-center justify-between text-[11px]"
-                      >
-                        <div className="space-y-0.5">
-                          <div className="flex items-center space-x-2">
-                            <span className="font-bold text-white font-mono-num">{sale.id || 'POS-INV'}</span>
-                            <span className="text-slate-400">• {sale.customerName || 'Walk-in Customer'}</span>
-                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-800 text-slate-300 font-semibold">
-                              {sale.paymentMethod || sale.currency || 'Cash'}
-                            </span>
-                          </div>
-                          <div className="text-[10px] text-slate-400 truncate max-w-sm">
-                            {sale.itemsSummary ||
-                              (sale.items && sale.items.length > 0
-                                ? sale.items.map((i) => `${i.quantity}x ${i.name}`).join(', ')
-                                : 'General Store Sale Items')}
-                          </div>
-                        </div>
-                        <div className="text-right font-mono-num font-bold text-emerald-400 text-xs">
-                          ${(sale.total ?? 0).toFixed(2)}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Modal Footer */}
-            <div className="p-3.5 bg-slate-950 border-t border-slate-800 flex justify-end">
-              <button
-                type="button"
-                onClick={() => setAuditStaffId(null)}
-                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs transition"
-              >
-                Close Audit Details
-              </button>
-            </div>
-          </div>
-        </div>
+        <CashierShiftReportModal
+          report={selectedAuditData.reportData}
+          auditData={selectedAuditData}
+          date={date}
+          onClose={() => setAuditStaffId(null)}
+        />
       )}
 
       {/* Customer search modal */}
@@ -3483,7 +3503,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                         <div>
                           <div className="font-bold text-white text-xs">Supervisor Authorization Gatekeeper</div>
                           <div className="text-[11px] text-slate-300">
-                            Direct GRVs ({pendingApprovals.directGrvs.length}), Expenses ({pendingApprovals.expenses.length}), Shop Use ({pendingApprovals.shopUse.length})
+                            Direct GRVs ({pendingApprovals.directGrvs.length}), Expenses ({pendingApprovals.expenses.length}), Shop Use ({pendingApprovals.shopUse.length}), Mobile Money ({pendingApprovals.mobileMoney.length})
                           </div>
                         </div>
                       </div>

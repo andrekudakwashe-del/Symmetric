@@ -506,6 +506,16 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     uiEventName: 'saimetric_settings_updated',
     description: 'Device and system operating policies',
   },
+  multi_currency: {
+    entityType: 'multi_currency',
+    class: 'T2',
+    appendOnly: false,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: true,
+    uiEventName: 'saimetric_exchange_rates_updated',
+    description: 'Multi-currency base currency, exchange rates, and till cash-out policy (LWW)',
+  },
 
   // ==========================================================================
   // T3 LOCAL-ONLY (Never synced across mesh or cloud)
