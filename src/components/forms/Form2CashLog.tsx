@@ -9,6 +9,7 @@ import {
   getSalespeople,
   subscribeToDatabase,
   getTodayDateString,
+  toDateStringSafe,
   getCashLogsForStaffAndDate,
   getCashCountForStaffAndDate,
   getDirectGrvs,
@@ -238,7 +239,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   // Direct GRVs that were processed on the active sheet date
   const allDateDirectGrvs = useMemo(() => {
     return directGrvs.filter((g) => {
-      const gDate = (g.date || g.createdAt || '').slice(0, 10);
+      const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
       return gDate === sheetDate;
     });
   }, [directGrvs, sheetDate]);
@@ -471,7 +472,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     };
   }, [selectedStaffId, sheetDate]);
 
-  // Direct Procurements derived from cashMovements (supplier_payment) + directGrvs
+  // Direct Procurements derived from cashMovements (supplier_payment), directGrvs, and manual Form 2 Direct Procurement logs
   const derivedProcurements = useMemo(() => {
     const list: Array<{
       grvId: string;
@@ -487,9 +488,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       approvedByName?: string;
       date: string;
       movementId?: string;
+      isDirectGrv?: boolean;
     }> = [];
 
     const seenVouchers = new Set<string>();
+    const seenManualRefs = new Set<string>();
 
     // O(1) GRV lookup map to prevent nested linear scans on large datasets
     const grvMap = new Map<string, DirectGrv>();
@@ -498,35 +501,58 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       if (g.id) grvMap.set(g.id, g);
     });
 
-    // 1. First, check shiftMovements for supplier_payment movements for this specific cashier
+    const resolveMatchingGrv = (sourceRef?: string, notes?: string, staffId?: string): DirectGrv | undefined => {
+      if (sourceRef) {
+        const direct = grvMap.get(sourceRef);
+        if (direct) return direct;
+        if (staffId) {
+          const escaped = staffId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const stripped = sourceRef.replace(new RegExp(`-${escaped}$`, 'i'), '');
+          const byStripped = grvMap.get(stripped);
+          if (byStripped) return byStripped;
+        }
+      }
+      return directGrvs.find(
+        (g) =>
+          (sourceRef &&
+            (g.grvNumber === sourceRef ||
+              g.id === sourceRef ||
+              (g.grvNumber && sourceRef.startsWith(`${g.grvNumber}-`)))) ||
+          (notes && g.grvNumber && notes.includes(g.grvNumber))
+      );
+    };
+
+    const isNonTillGrv = (g?: DirectGrv): boolean =>
+      Boolean(
+        g &&
+          (g.payFromTill === false ||
+            g.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
+            g.paymentMethod === 'CREDIT' ||
+            g.paymentMethod === 'BANK' ||
+            g.paymentStatus === 'AWAITING_SAFE_PAYMENT')
+      );
+
+    // 1. Check shiftMovements for supplier_payment movements (both DirectGRV and Form 2) for this cashier
     const procurementMovements = shiftMovements.filter(
       (m) =>
         m.type === 'supplier_payment' &&
-        (!m.sourceModule || m.sourceModule === 'DirectGRV') &&
+        (!m.sourceModule || m.sourceModule === 'DirectGRV' || m.sourceModule === 'form2') &&
         isStaffMatch(m.staffId, m.staffName)
     );
 
     procurementMovements.forEach((m) => {
-      const matchingGrv = (m.sourceRef ? grvMap.get(m.sourceRef.split('-')[0]) : undefined) ||
-        (m.sourceRef ? grvMap.get(m.sourceRef) : undefined) ||
-        directGrvs.find(
-          (g) => g.grvNumber === m.sourceRef || g.id === m.sourceRef || (m.sourceRef && m.sourceRef.startsWith(g.grvNumber))
-        );
+      const matchingGrv = resolveMatchingGrv(m.sourceRef, m.notes, m.staffId);
 
-      // If matching GRV is explicitly NOT paid from till (e.g. invoice on account / credit), do not record in Form 2
-      if (
-        matchingGrv &&
-        (matchingGrv.payFromTill === false ||
-          matchingGrv.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
-          matchingGrv.paymentMethod === 'CREDIT' ||
-          matchingGrv.paymentMethod === 'BANK')
-      ) {
-        return;
-      }
+      // If matching GRV is explicitly NOT paid from till, do not record in Form 2
+      if (isNonTillGrv(matchingGrv)) return;
+      // Ignore deleted/rejected manual Form 2 logs (not linked to a Direct GRV audit trail)
+      if (!matchingGrv && m.status === 'rejected') return;
 
       const vKey = `${matchingGrv?.grvNumber || m.sourceRef || m.id}-${selectedStaffId}`;
       if (seenVouchers.has(vKey)) return;
       seenVouchers.add(vKey);
+      if (m.sourceRef) seenManualRefs.add(m.sourceRef);
+      if (m.notes) seenManualRefs.add(m.notes.trim().toLowerCase());
 
       const isRejected = m.status === 'rejected' || matchingGrv?.status === 'REJECTED';
 
@@ -537,38 +563,40 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       list.push({
         grvId: matchingGrv?.id || m.id,
         grvNumber: matchingGrv?.grvNumber || m.sourceRef || m.id,
-        supplierName: matchingGrv?.supplierName || m.notes?.replace('Direct Supplier Delivery: ', '').split(' (')[0] || 'Supplier Delivery',
-        invoiceNo: matchingGrv?.invoiceNo,
-        itemsSummary: matchingGrv ? matchingGrv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', ') : (m.notes || 'Procurement voucher'),
+        supplierName:
+          matchingGrv?.supplierName ||
+          m.notes?.replace(/^Direct Supplier Delivery:\s*/i, '').split(' (')[0] ||
+          'Direct Procurement',
+        invoiceNo: matchingGrv?.invoiceNo || (!matchingGrv ? m.sourceRef : undefined),
+        itemsSummary: matchingGrv
+          ? matchingGrv.items.map((i) => `${i.quantity}x ${i.productName}`).join(', ')
+          : (m.notes || 'Direct Procurement'),
         amount: isRejected ? 0 : portionAmount,
         originalAmount: portionAmount || matchingGrv?.totalCost || 0,
         drawerId: matchingPayment?.drawerId || m.terminalId || 'Till 1',
-        status: isRejected ? 'REJECTED' : (matchingGrv?.status || m.status),
-        rejectionReason: matchingGrv?.rejectedReason || (m.notes?.includes('REJECTED') ? m.notes.split('REJECTED')[1]?.replace(/^[:\s-]+/, '') : undefined),
+        status: isRejected ? 'REJECTED' : (matchingGrv?.status || (m.sourceModule === 'form2' ? 'APPROVED' : m.status)),
+        rejectionReason:
+          matchingGrv?.rejectedReason ||
+          (m.notes?.includes('REJECTED') ? m.notes.split('REJECTED')[1]?.replace(/^[:\s-]+/, '') : undefined),
         approvedByName: matchingGrv?.approvedByStaffName || 'Supervisor',
         date: m.date || sheetDate,
         movementId: m.id,
+        isDirectGrv: Boolean(matchingGrv),
       });
     });
 
     // 2. Also incorporate any Direct GRVs for this staff & date that may not yet have movement indexed
     directGrvs.forEach((grv) => {
-      // Exclude non-till / account deliveries
-      if (
-        grv.payFromTill === false ||
-        grv.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
-        grv.paymentMethod === 'CREDIT' ||
-        grv.paymentMethod === 'BANK'
-      ) {
-        return;
-      }
+      if (isNonTillGrv(grv)) return;
 
-      const grvDate = (grv.date || grv.createdAt || '').slice(0, 10);
+      const grvDate = toDateStringSafe(grv.date) || toDateStringSafe(grv.createdAt);
       if (grvDate && grvDate !== sheetDate) return;
 
       const isRejected = grv.status === 'REJECTED';
+      const hasPositivePayments =
+        Array.isArray(grv.payments) && grv.payments.some((p) => (Number(p.amount) || 0) > 0);
 
-      if (grv.payments && grv.payments.length > 0) {
+      if (hasPositivePayments && grv.payments) {
         // Multi-cashier split payment: find only this cashier's portion!
         grv.payments.forEach((p) => {
           if (isStaffMatch(p.userId, p.userName) && (Number(p.amount) || 0) > 0) {
@@ -589,10 +617,15 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
               rejectionReason: grv.rejectedReason,
               approvedByName: grv.approvedByStaffName,
               date: grvDate || sheetDate,
+              isDirectGrv: true,
             });
           }
         });
-      } else if (isStaffMatch(grv.receivedByStaffId, grv.receivedByStaffName) && (grv.totalCost || 0) > 0) {
+      } else if (
+        grv.payFromTill !== false &&
+        isStaffMatch(grv.receivedByStaffId, grv.receivedByStaffName) &&
+        (grv.totalCost || 0) > 0
+      ) {
         const vKey = `${grv.grvNumber}-${selectedStaffId}`;
         if (seenVouchers.has(vKey)) return;
         seenVouchers.add(vKey);
@@ -610,12 +643,58 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
           rejectionReason: grv.rejectedReason,
           approvedByName: grv.approvedByStaffName,
           date: grvDate || sheetDate,
+          isDirectGrv: true,
         });
       }
     });
 
+    // 3. Also incorporate manual/Quick-Add Form 2 Direct Procurement CashLogs for this cashier & date
+    cashLogs.forEach((l) => {
+      const lDate = toDateStringSafe(l.date) || toDateStringSafe(l.timestamp);
+      if (lDate !== sheetDate) return;
+      if (!isStaffMatch(l.staffId || l.staff_id, l.staffName)) return;
+      if ((Number(l.out) || 0) <= 0) return;
+
+      const isProcLog =
+        l.line === 'Direct Procurement' ||
+        l.category === 'Direct Procurement' ||
+        (l.description || '').toLowerCase().includes('procurement');
+      if (!isProcLog) return;
+
+      // Skip GRV-backed logs (handled in steps 1 & 2, even if rejected or non-till)
+      if (
+        (l.reference && /^(D?GRV)-/i.test(l.reference)) ||
+        (l.description && l.description.includes('(GRV:')) ||
+        resolveMatchingGrv(l.reference, l.description, l.staffId)
+      ) {
+        return;
+      }
+
+      if (seenManualRefs.has(l.id)) return;
+      const descKey = (l.description || '').trim().toLowerCase();
+      if (descKey && seenManualRefs.has(descKey)) return;
+
+      seenManualRefs.add(l.id);
+      if (descKey) seenManualRefs.add(descKey);
+
+      list.push({
+        grvId: l.id,
+        grvNumber: l.reference || l.id,
+        supplierName: l.description || 'Direct Procurement',
+        invoiceNo: l.reference,
+        itemsSummary: l.description || 'Form 2 Direct Procurement',
+        amount: Number(l.out) || 0,
+        originalAmount: Number(l.out) || 0,
+        drawerId: 'Till 1',
+        status: 'APPROVED',
+        approvedByName: 'Form 2 Entry',
+        date: lDate || sheetDate,
+        isDirectGrv: false,
+      });
+    });
+
     return list;
-  }, [shiftMovements, directGrvs, sheetDate, selectedStaffId, selectedStaff, isStaffMatch]);
+  }, [shiftMovements, directGrvs, cashLogs, sheetDate, selectedStaffId, selectedStaff, isStaffMatch]);
 
   const derivedProcurementTotalOut = useMemo(() => {
     return (derivedProcurements || [])
@@ -779,7 +858,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
           (l.line === 'Direct Procurement' ||
             l.category === 'Direct Procurement' ||
             (l.description && l.description.toLowerCase().includes('procurement'))) &&
-          !l.reference?.startsWith('GRV-') &&
+          !l.reference?.match(/^(D?GRV)-/i) &&
           !l.description?.includes('(GRV:')
       );
       const cashLogsList = remainingDynamicLogs.filter(
@@ -1591,10 +1670,10 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       }
     });
 
-    // 2. Dynamic points (Direct Procurement, Manual Cash)
-    // Automated POS rows (ZiG, EcoCash) and Dual-PIN Cash Lifts are preserved by database logic and should not be saved as manual entries
+    // 2. Dynamic points (Manual Cash)
+    // Automated POS rows (ZiG, EcoCash), Dual-PIN Cash Lifts, and Section 3 Direct Procurements are handled separately
     dynamicRows.forEach((r) => {
-      if (r.isReadOnly || r.isAutofilledFromPos || r.isCashLift) {
+      if (r.isReadOnly || r.isAutofilledFromPos || r.isCashLift || r.type === 'procurement') {
         return;
       }
       const row = gridValues[r.id];
@@ -1605,11 +1684,6 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
       if (inAmt > 0 || outAmt > 0) {
         let fullDesc = r.label; // Clean "Direct Procurement", "Cash"
-
-        // If Direct Procurement has "what was bought" specified, append it
-        if (r.type === 'procurement' && row.itemBought?.trim()) {
-          fullDesc = `Direct Procurement: ${row.itemBought.trim()}`;
-        }
 
         if (row.note?.trim()) {
           fullDesc += ` - ${row.note.trim()}`;
@@ -1625,16 +1699,26 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       }
     });
 
-    // 3. Derived Direct Procurements from Direct Supplier Receiving Vouchers
+    // 3. Derived Direct Procurements (Direct Supplier Receiving Vouchers & Form 2 Direct Procurements)
     derivedProcurements.forEach((proc) => {
       if (proc.status === 'REJECTED' || proc.status === 'rejected') return;
-      entriesToSave.push({
-        line: 'Direct Procurement',
-        description: `Direct Procurement: ${proc.supplierName} (GRV: ${proc.grvNumber}${proc.invoiceNo ? `, Inv: ${proc.invoiceNo}` : ''})`,
-        in: 0,
-        out: proc.amount,
-        reference: proc.grvNumber,
-      });
+      if (proc.isDirectGrv) {
+        entriesToSave.push({
+          line: 'Direct Procurement',
+          description: `Direct Procurement: ${proc.supplierName} (GRV: ${proc.grvNumber}${proc.invoiceNo ? `, Inv: ${proc.invoiceNo}` : ''})`,
+          in: 0,
+          out: proc.amount,
+          reference: `${proc.grvNumber}-${selectedStaff.id}`,
+        });
+      } else {
+        entriesToSave.push({
+          line: 'Direct Procurement',
+          description: proc.itemsSummary || proc.supplierName || 'Direct Procurement',
+          in: 0,
+          out: proc.amount,
+          reference: proc.invoiceNo || undefined,
+        });
+      }
     });
 
     if (entriesToSave.length === 0) {
@@ -3002,8 +3086,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                         </td>
                         <td className="py-2 sm:py-2.5 px-2 sm:px-4">
                           <div
-                            className="space-y-0.5 cursor-pointer group"
+                            className={`space-y-0.5 ${proc.isDirectGrv ? 'cursor-pointer group' : ''}`}
                             onClick={() => {
+                              if (!proc.isDirectGrv) return;
                               const grv = directGrvs.find((g) => g.id === proc.grvId || g.grvNumber === proc.grvNumber);
                               if (grv) {
                                 setViewingProcurementGrv(grv);
@@ -3021,13 +3106,22 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                               </span>
                             </div>
                             <span className="text-[10px] text-slate-400 block truncate">
-                              Voucher: <strong className="font-mono text-slate-300">{proc.grvNumber}</strong> • {proc.itemsSummary}
+                              {proc.isDirectGrv ? (
+                                <>Voucher: <strong className="font-mono text-slate-300">{proc.grvNumber}</strong> • {proc.itemsSummary}</>
+                              ) : (
+                                <>Cash Log: <strong className="font-mono text-slate-300">{proc.grvNumber}</strong> • {proc.itemsSummary}</>
+                              )}
                             </span>
                             <div className="flex items-center gap-1.5 pt-0.5 flex-wrap">
                               {proc.status === 'REJECTED' ? (
                                 <span className="text-[10px] text-rose-400 font-bold flex items-center gap-1 bg-rose-950/80 px-1.5 py-0.5 rounded border border-rose-800/80">
                                   <AlertTriangle className="w-2.5 h-2.5 text-rose-400 shrink-0" />
                                   <span>REJECTED (Amount Returned to Till)</span>
+                                </span>
+                              ) : !proc.isDirectGrv ? (
+                                <span className="text-[10px] text-emerald-400 font-bold flex items-center gap-0.5">
+                                  <CheckCircle2 className="w-2.5 h-2.5" />
+                                  Recorded in Form 2 Cash Log
                                 </span>
                               ) : proc.status === 'APPROVED' ? (
                                 <span className="text-[10px] text-emerald-400 font-bold flex items-center gap-0.5">
@@ -3040,9 +3134,11 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                                   Pending Supervisor Approval
                                 </span>
                               )}
-                              <span className="text-[9px] text-slate-500 font-mono">
-                                (Click to view recorded voucher)
-                              </span>
+                              {proc.isDirectGrv && (
+                                <span className="text-[9px] text-slate-500 font-mono">
+                                  (Click to view recorded voucher)
+                                </span>
+                              )}
                             </div>
                             {proc.status === 'REJECTED' && (
                               <span className="text-[10px] text-rose-300 font-medium block pt-0.5">
@@ -3086,8 +3182,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                         <td className="py-2 sm:py-2.5 px-3 sm:px-4 hidden md:table-cell">
                           <div className="text-xs text-slate-300 font-mono">
                             <span>
-                              Voucher: {proc.grvNumber}
-                              {proc.invoiceNo ? ` • Inv: ${proc.invoiceNo}` : ''}
+                              {proc.isDirectGrv ? 'Voucher: ' : 'Ref: '}
+                              {proc.grvNumber}
+                              {proc.isDirectGrv && proc.invoiceNo ? ` • Inv: ${proc.invoiceNo}` : ''}
                             </span>
                             {proc.status === 'REJECTED' && proc.rejectionReason && (
                               <span className="block text-[10px] text-rose-400 truncate">
@@ -3099,21 +3196,25 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
                         {/* Action */}
                         <td className="py-2 text-center">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              const grv = directGrvs.find((g) => g.id === proc.grvId || g.grvNumber === proc.grvNumber);
-                              if (grv) {
-                                setViewingProcurementGrv(grv);
-                              } else if (onNavigateToDirectGrv) {
-                                onNavigateToDirectGrv(proc.grvId);
-                              }
-                            }}
-                            title="View Recorded Direct Delivery Voucher"
-                            className="p-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 transition"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
+                          {proc.isDirectGrv ? (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const grv = directGrvs.find((g) => g.id === proc.grvId || g.grvNumber === proc.grvNumber);
+                                if (grv) {
+                                  setViewingProcurementGrv(grv);
+                                } else if (onNavigateToDirectGrv) {
+                                  onNavigateToDirectGrv(proc.grvId);
+                                }
+                              }}
+                              title="View Recorded Direct Delivery Voucher"
+                              className="p-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 transition"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                            </button>
+                          ) : (
+                            <span className="text-[10px] text-amber-400/70 font-mono">Form 2</span>
+                          )}
                         </td>
                       </tr>
                     ))
@@ -3201,15 +3302,15 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                                                 g.receivedByStaffName ||
                                                 'Other Cashier'}
                                             </span>
-                                            {primaryPayer && primaryPayer !== selectedStaffId && (
-                                              <button
-                                                type="button"
-                                                onClick={() => setSelectedStaffId(primaryPayer)}
-                                                className="text-[10px] text-amber-400 hover:underline font-bold"
-                                              >
-                                                Switch to Sheet →
-                                              </button>
-                                            )}
+                                             {primaryPayer && !isStaffMatch(primaryPayer) && (
+                                               <button
+                                                 type="button"
+                                                 onClick={() => setSelectedStaffId(primaryPayer)}
+                                                 className="text-[10px] text-amber-400 hover:underline font-bold"
+                                               >
+                                                 Switch to Sheet →
+                                               </button>
+                                             )}
                                           </div>
                                         )}
                                         <button

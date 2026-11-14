@@ -309,6 +309,117 @@ export const matchesShift = (m: CashMovement, shiftId: string, branchId?: string
   return false;
 };
 
+const normalizeStaffKey = (staffId?: string): string =>
+  String(staffId || '').replace(/^usr-|^staff-|^0+/i, '').trim().toLowerCase();
+
+const recordCountedSupplierGrvRefs = (
+  m: CashMovement,
+  seenGrvRefs: Set<string>
+) => {
+  const normStaff = normalizeStaffKey(m.staffId);
+  const addRef = (raw?: string) => {
+    const clean = String(raw || '').trim().toUpperCase();
+    if (!clean) return;
+    seenGrvRefs.add(`${normStaff}_${clean}`);
+    seenGrvRefs.add(`_${clean}`);
+  };
+
+  if (m.sourceRef) {
+    addRef(m.sourceRef);
+    if (m.staffId) {
+      const escapedStaff = m.staffId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      addRef(m.sourceRef.replace(new RegExp(`-${escapedStaff}$`, 'i'), ''));
+    }
+    const refMatches = m.sourceRef.match(/D?GRV-\d+(?:-\d+)?/gi);
+    if (refMatches) refMatches.forEach(addRef);
+  }
+  if (m.notes) {
+    const noteMatches = m.notes.match(/D?GRV-[A-Za-z0-9-]+/gi);
+    if (noteMatches) noteMatches.forEach(addRef);
+  }
+};
+
+const computeMissingDirectGrvPayouts = (
+  shiftId: string,
+  targetBranch: string | undefined,
+  seenGrvRefs: Set<string>,
+  currency: string = 'USD'
+): number => {
+  if (currency && currency.toUpperCase() !== 'USD') return 0;
+  if (typeof window === 'undefined' || !window.localStorage) return 0;
+
+  let extraTotal = 0;
+  try {
+    const rawGrvs = window.localStorage.getItem('saimetric_room_direct_grvs');
+    if (!rawGrvs) return 0;
+    const grvs = JSON.parse(rawGrvs);
+    if (!Array.isArray(grvs)) return 0;
+
+    const parts = shiftId.split('_');
+    const targetStaff = parts[0] || '';
+    const targetDate = parts[1] || '';
+    const shiftBranch = targetBranch || parts[2] || getActiveBranchId();
+    const tStaff = normalizeStaffKey(targetStaff);
+
+    grvs.forEach((g: any) => {
+      if (!g || g.status === 'REJECTED') return;
+      if (
+        g.payFromTill === false ||
+        g.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
+        g.paymentMethod === 'CREDIT' ||
+        g.paymentMethod === 'BANK' ||
+        g.paymentStatus === 'AWAITING_SAFE_PAYMENT'
+      ) {
+        return;
+      }
+
+      const gBranch = g.branchId || g.branch_id;
+      if (shiftBranch && gBranch && gBranch !== shiftBranch) return;
+
+      const gDate = String(g.date || g.createdAt || '').slice(0, 10);
+      if (targetDate && gDate && gDate !== targetDate) return;
+
+      const grvNumUpper = String(g.grvNumber || '').trim().toUpperCase();
+      const grvIdUpper = String(g.id || '').trim().toUpperCase();
+      const alreadyCountedForStaff =
+        (grvNumUpper && seenGrvRefs.has(`${tStaff}_${grvNumUpper}`)) ||
+        (grvIdUpper && seenGrvRefs.has(`${tStaff}_${grvIdUpper}`));
+      if (alreadyCountedForStaff) return;
+
+      const hasPositivePayments =
+        Array.isArray(g.payments) && g.payments.some((p: any) => (Number(p.amount) || 0) > 0);
+
+      if (hasPositivePayments) {
+        g.payments.forEach((p: any) => {
+          const amt = Number(p.amount) || 0;
+          if (amt <= 0) return;
+          const pStaff = normalizeStaffKey(p.userId);
+          const staffMatch =
+            !targetStaff || p.userId === targetStaff || (pStaff && tStaff && pStaff === tStaff);
+          const compositeKey = grvNumUpper ? `${tStaff}_${grvNumUpper}-${String(p.userId || '').trim().toUpperCase()}` : '';
+          if (staffMatch && !(compositeKey && seenGrvRefs.has(compositeKey))) {
+            if (grvNumUpper) seenGrvRefs.add(`${tStaff}_${grvNumUpper}`);
+            if (grvIdUpper) seenGrvRefs.add(`${tStaff}_${grvIdUpper}`);
+            extraTotal += amt;
+          }
+        });
+      } else if (g.payFromTill !== false && (Number(g.totalCost) || 0) > 0) {
+        const gStaff = normalizeStaffKey(g.receivedByStaffId);
+        const staffMatch =
+          !targetStaff ||
+          g.receivedByStaffId === targetStaff ||
+          (gStaff && tStaff && gStaff === tStaff);
+        if (staffMatch) {
+          if (grvNumUpper) seenGrvRefs.add(`${tStaff}_${grvNumUpper}`);
+          if (grvIdUpper) seenGrvRefs.add(`${tStaff}_${grvIdUpper}`);
+          extraTotal += Number(g.totalCost) || 0;
+        }
+      }
+    });
+  } catch {}
+  return extraTotal;
+};
+
 /**
  * Compute the live drawer balance for a shift.
  *
@@ -340,6 +451,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
 
   let balance = 0;
   const seenSupplierPayments = new Set<string>();
+  const seenGrvRefs = new Set<string>();
   const seenChangeReceivedInvoices = new Set<string>();
   const seenCreditDepositInvoices = new Set<string>();
 
@@ -368,6 +480,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
       const refKey = `${m.staffId || ''}_${m.sourceRef || m.notes || m.id}`;
       if (seenSupplierPayments.has(refKey)) return;
       seenSupplierPayments.add(refKey);
+      recordCountedSupplierGrvRefs(m, seenGrvRefs);
     }
 
     // Prevent double-counting customer change received if logged in both POS and Form 3
@@ -443,45 +556,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
   });
 
   // Direct GRVs safety sync: ensure any Direct GRVs with till payments for this shift are accounted for
-  try {
-    const rawGrvs = typeof window !== 'undefined' && window.localStorage
-      ? window.localStorage.getItem('saimetric_direct_grvs')
-      : null;
-    if (rawGrvs) {
-      const grvs = JSON.parse(rawGrvs);
-      if (Array.isArray(grvs)) {
-        const [targetStaff, targetDate] = shiftId.split('_');
-        grvs.forEach((g: any) => {
-          if (g.status === 'REJECTED') return;
-          if (targetDate && g.date !== targetDate) return;
-          const refKey = `${targetStaff}_${g.grvNumber || g.id}`;
-          if (seenSupplierPayments.has(refKey)) return;
-
-          if (g.payments && Array.isArray(g.payments)) {
-            g.payments.forEach((p: any) => {
-              const pStaff = String(p.userId || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-              const tStaff = String(targetStaff || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-              const staffMatch = !targetStaff || p.userId === targetStaff || (pStaff && tStaff && pStaff === tStaff);
-              if (staffMatch && (Number(p.amount) || 0) > 0) {
-                if (!seenSupplierPayments.has(refKey)) {
-                  seenSupplierPayments.add(refKey);
-                  balance -= Number(p.amount) || 0;
-                }
-              }
-            });
-          } else if (g.payFromTill && (Number(g.totalCost) || 0) > 0) {
-            const gStaff = String(g.receivedByStaffId || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-            const tStaff = String(targetStaff || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-            const staffMatch = !targetStaff || g.receivedByStaffId === targetStaff || (gStaff && tStaff && gStaff === tStaff);
-            if (staffMatch) {
-              seenSupplierPayments.add(refKey);
-              balance -= Number(g.totalCost) || 0;
-            }
-          }
-        });
-      }
-    }
-  } catch {}
+  balance -= computeMissingDirectGrvPayouts(shiftId, targetBranch, seenGrvRefs, currency);
 
   return Math.round(balance * 100) / 100;
 };
@@ -617,6 +692,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
   let physicalCount: number | null = null;
   let movementsCount = 0;
   const seenSupplierPayments = new Set<string>();
+  const seenGrvRefs = new Set<string>();
   const seenChangeReceivedInvoices = new Set<string>();
   const seenCreditDepositInvoices = new Set<string>();
 
@@ -665,6 +741,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
       const refKey = `${m.staffId || ''}_${m.sourceRef || m.notes || m.id}`;
       if (seenSupplierPayments.has(refKey)) return;
       seenSupplierPayments.add(refKey);
+      recordCountedSupplierGrvRefs(m, seenGrvRefs);
     }
 
     // Prevent double-counting customer change received if logged in both POS and Form 3
@@ -745,45 +822,8 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
   });
 
   // Direct GRVs safety sync: ensure any Direct GRVs with till payments for this shift are accounted for
-  try {
-    const rawGrvs = typeof window !== 'undefined' && window.localStorage
-      ? window.localStorage.getItem('saimetric_direct_grvs')
-      : null;
-    if (rawGrvs) {
-      const grvs = JSON.parse(rawGrvs);
-      if (Array.isArray(grvs)) {
-        const [targetStaff, targetDate] = shiftId.split('_');
-        grvs.forEach((g: any) => {
-          if (g.status === 'REJECTED') return;
-          if (targetDate && g.date !== targetDate) return;
-          const refKey = `${targetStaff}_${g.grvNumber || g.id}`;
-          if (seenSupplierPayments.has(refKey)) return;
-
-          if (g.payments && Array.isArray(g.payments)) {
-            g.payments.forEach((p: any) => {
-              const pStaff = String(p.userId || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-              const tStaff = String(targetStaff || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-              const staffMatch = !targetStaff || p.userId === targetStaff || (pStaff && tStaff && pStaff === tStaff);
-              if (staffMatch && (Number(p.amount) || 0) > 0) {
-                if (!seenSupplierPayments.has(refKey)) {
-                  seenSupplierPayments.add(refKey);
-                  directProcurements += Number(p.amount) || 0;
-                }
-              }
-            });
-          } else if (g.payFromTill && (Number(g.totalCost) || 0) > 0) {
-            const gStaff = String(g.receivedByStaffId || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-            const tStaff = String(targetStaff || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
-            const staffMatch = !targetStaff || g.receivedByStaffId === targetStaff || (gStaff && tStaff && gStaff === tStaff);
-            if (staffMatch) {
-              seenSupplierPayments.add(refKey);
-              directProcurements += Number(g.totalCost) || 0;
-            }
-          }
-        });
-      }
-    }
-  } catch {}
+  const targetBranch = shiftId.split('_')[2] || getActiveBranchId();
+  directProcurements += computeMissingDirectGrvPayouts(shiftId, targetBranch, seenGrvRefs, currency);
 
   const cashInTotal = Math.round((openingFloat + cashSales + creditPayments + changeReceived) * 100) / 100;
   const cashOutTotal =

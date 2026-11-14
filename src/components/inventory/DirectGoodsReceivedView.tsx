@@ -57,6 +57,7 @@ import {
   approveDirectGrv,
   rejectDirectGrv,
   getSalespeople,
+  getTodayDateString,
   subscribeRoomDatabase,
   verifySalespersonPin,
 } from '../../db/roomDatabase';
@@ -149,11 +150,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
   // Form Header Fields
   const [grvNumber, setGrvNumber] = useState<string>(() => {
-    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const today = getTodayDateString().replace(/-/g, '');
     const rand = Math.floor(100 + Math.random() * 900);
     return `DGRV-${today}-${rand}`;
   });
-  const [voucherDate, setVoucherDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [voucherDate, setVoucherDate] = useState<string>(() => getTodayDateString());
   const [supplierName, setSupplierName] = useState<string>('');
   const [supplierId, setSupplierId] = useState<string>('');
   const [isSupplierDropdownOpen, setIsSupplierDropdownOpen] = useState<boolean>(false);
@@ -814,9 +815,10 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setLastDirectDraftSavedAt(null);
 
     // Reset Form
-    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const today = getTodayDateString().replace(/-/g, '');
     const rand = Math.floor(100 + Math.random() * 900);
     setGrvNumber(`DGRV-${today}-${rand}`);
+    setVoucherDate(getTodayDateString());
     setSupplierName('');
     setSupplierId('');
     setInvoiceNo('');

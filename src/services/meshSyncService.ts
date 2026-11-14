@@ -61,6 +61,7 @@ import {
   ingestMeshCashLog,
   ingestMeshCustomer,
   ingestMeshGRV,
+  recordDirectGrvTillPayouts,
   getDirectGrvs,
   getRawStoredDirectGrvs,
   getRawStoredCustomerChanges,
@@ -118,7 +119,17 @@ import {
   onCustomerChanged,
   onBranchChanged,
   onCashAccountChanged,
+  getPermissionsList,
+  getPermissionsMatrixUpdatedAt,
+  ingestMeshPermissionsMatrix,
+  onPermissionsMatrixChanged,
 } from '../db/roomDatabase';
+import {
+  getStoredRoleDefinitions,
+  getRoleDefinitionsUpdatedAt,
+  ingestMeshRoleDefinitions,
+  onRoleDefinitionsChanged,
+} from './roleNavigationService';
 import { getMovements, addMovement, onCashMovementCreated, CashMovement } from '../db/cashLedger';
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { getSyncMeta, setSyncMeta } from '../db/indexedDBService';
@@ -826,20 +837,30 @@ class MeshSyncManager {
       return;
     }
 
-    // Deduplicate by item ID so the offline queue never contains multiple edits or old versions for the same item
-    const itemId =
+    // Deduplicate by packet kind + entity ID so the offline queue never contains stale edits or cross-entity collisions
+    const pktKind = String(packet.type || packet.action || 'PKT').trim().toUpperCase();
+    const rawItemId =
       packet.itemId ||
       (packet.item && (packet.item.itemId || packet.item.id)) ||
-      (packet.payload && (packet.payload.itemId || packet.payload.id));
+      (packet.staff && packet.staff.id) ||
+      (packet.branch && (packet.branch.branchId || packet.branch.id)) ||
+      (packet.customer && (packet.customer.customerId || packet.customer.id)) ||
+      (packet.payload && (packet.payload.itemId || packet.payload.id || packet.payload.branchId || packet.payload.customerId)) ||
+      (pktKind === 'PERMISSIONS_MATRIX_SYNC' || pktKind === 'ROLE_CONFIGS_SYNC' ? 'SINGLETON' : undefined);
 
-    if (itemId) {
-      const cleanId = String(itemId).trim().toUpperCase();
+    if (rawItemId) {
+      const cleanKey = `${pktKind}:${String(rawItemId).trim().toUpperCase()}`;
       const existingIdx = this.pendingLocalHubQueue.findIndex((p) => {
+        const pKind = String(p.type || p.action || 'PKT').trim().toUpperCase();
         const pItemId =
           p.itemId ||
           (p.item && (p.item.itemId || p.item.id)) ||
-          (p.payload && (p.payload.itemId || p.payload.id));
-        return pItemId && String(pItemId).trim().toUpperCase() === cleanId;
+          (p.staff && p.staff.id) ||
+          (p.branch && (p.branch.branchId || p.branch.id)) ||
+          (p.customer && (p.customer.customerId || p.customer.id)) ||
+          (p.payload && (p.payload.itemId || p.payload.id || p.payload.branchId || p.payload.customerId)) ||
+          (pKind === 'PERMISSIONS_MATRIX_SYNC' || pKind === 'ROLE_CONFIGS_SYNC' ? 'SINGLETON' : undefined);
+        return pItemId && `${pKind}:${String(pItemId).trim().toUpperCase()}` === cleanKey;
       });
       if (existingIdx >= 0) {
         this.pendingLocalHubQueue[existingIdx] = packet;
@@ -951,6 +972,16 @@ class MeshSyncManager {
       const activeStrategy = getPackageSyncMode();
       console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', this.isLocalHubActive());
       this.broadcastStaff(staff);
+    });
+
+    // Auto-hook into 52 Granular Permissions Matrix changes
+    onPermissionsMatrixChanged((rules, updatedAt) => {
+      this.broadcastPermissionsMatrix(rules, updatedAt);
+    });
+
+    // Auto-hook into Role Navigation / Access Config changes
+    onRoleDefinitionsChanged((defs, updatedAt) => {
+      this.broadcastRoleDefinitions(defs, updatedAt);
     });
 
     // Auto-hook into Customer creation & edits: broadcast to Local Hub & mesh
@@ -2181,13 +2212,15 @@ class MeshSyncManager {
     }
 
     // 8. DIRECT GRV
-    if (pType === 'grv' || pType === 'GRV_RECORD') {
-      const grv = packet.grv || packet.payload;
+    if (pType === 'grv' || pType === 'GRV_RECORD' || pType === 'direct_grv' || pType === 'DIRECT_GRV') {
+      const grv = packet.directGrv || packet.grv || packet.payload;
       if (grv) {
         ingestMeshGRV({ ...grv, fromMesh: true } as any);
         window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
       }
       return;
     }
@@ -2228,17 +2261,71 @@ class MeshSyncManager {
       return;
     }
 
-    // 10.02 STAFF (TILL OPERATORS)
-    if (pType === 'staff' || pType === 'STAFF' || pType === 'STAFF_SYNC' || pType === 'STAFF_RECORD') {
+    // 10.02 STAFF (TILL OPERATORS, MANAGERS & PERMISSIONS)
+    if (
+      pType === 'staff' ||
+      pType === 'STAFF' ||
+      pType === 'STAFF_SYNC' ||
+      pType === 'STAFF_RECORD' ||
+      pType === 'staff_permission' ||
+      pType === 'STAFF_PERMISSION_RECORD'
+    ) {
       const staff = packet.staff || packet.payload;
       if (staff && staff.id) {
         const staffTime = extractRecordTimestamp(staff);
-        ingestMeshStaff({ ...staff, fromMesh: true } as any, { fromSync: true });
+        const ingested = ingestMeshStaff({ ...staff, fromMesh: true } as any, { fromSync: true });
         if (staffTime > 0) {
           setLastStaffSync(Math.max(getLastStaffSync(), staffTime));
         }
         window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
+        if (ingested) {
+          this.addLog(
+            'EPIDEMIC_HOP',
+            `Staff account ${staff.name || staff.id} (${staff.role || 'STAFF'}) synced from Hub.`,
+            packet.origin_device_name || packet.originDeviceName || 'Local Hub',
+            this.config.deviceName
+          );
+          this.notifyPeerSubscribers();
+        }
+      }
+      return;
+    }
+
+    // 10.02a GRANULAR PERMISSIONS MATRIX (52 RULES)
+    if (pType === 'permissions_matrix' || pType === 'PERMISSIONS_MATRIX' || pType === 'PERMISSIONS_MATRIX_SYNC') {
+      const rules = packet.rules || packet.permissionsMatrix || packet.payload?.rules || packet.payload;
+      const incomingUpdatedAt = parseTimestampMs(packet.updatedAt ?? packet.hubTimestamp ?? packet.timestamp);
+      if (Array.isArray(rules) && rules.length > 0) {
+        const ingested = ingestMeshPermissionsMatrix(rules, incomingUpdatedAt);
+        if (ingested) {
+          this.addLog(
+            'EPIDEMIC_HOP',
+            `Permissions Matrix (${rules.length} rules) synced from Hub.`,
+            packet.origin_device_name || packet.originDeviceName || 'Local Hub',
+            this.config.deviceName
+          );
+          this.notifyPeerSubscribers();
+        }
+      }
+      return;
+    }
+
+    // 10.02b ROLE CONFIGURATIONS & MODULE ACCESS
+    if (pType === 'role_configs' || pType === 'ROLE_CONFIGS' || pType === 'ROLE_CONFIGS_SYNC') {
+      const defs = packet.definitions || packet.roleConfigs || packet.roleDefinitions || packet.payload?.definitions || packet.payload;
+      const incomingUpdatedAt = parseTimestampMs(packet.updatedAt ?? packet.hubTimestamp ?? packet.timestamp);
+      if (defs && typeof defs === 'object' && !Array.isArray(defs)) {
+        const ingested = ingestMeshRoleDefinitions(defs, incomingUpdatedAt);
+        if (ingested) {
+          this.addLog(
+            'EPIDEMIC_HOP',
+            `Role Configurations synced from Hub.`,
+            packet.origin_device_name || packet.originDeviceName || 'Local Hub',
+            this.config.deviceName
+          );
+          this.notifyPeerSubscribers();
+        }
       }
       return;
     }
@@ -2987,6 +3074,17 @@ class MeshSyncManager {
             p.action === 'INVENTORY_RECORD' ||
             p.action === 'INVENTORY_UPDATE' ||
             p.type === 'product' ||
+            p.type === 'staff' ||
+            p.type === 'STAFF' ||
+            p.action === 'STAFF_SYNC' ||
+            p.type === 'staff_permission' ||
+            p.action === 'STAFF_PERMISSION_RECORD' ||
+            p.type === 'PERMISSIONS_MATRIX_SYNC' ||
+            p.action === 'PERMISSIONS_MATRIX_SYNC' ||
+            p.type === 'ROLE_CONFIGS_SYNC' ||
+            p.action === 'ROLE_CONFIGS_SYNC' ||
+            p.type === 'branch' ||
+            p.action === 'BRANCH_SYNC' ||
             p.target_branch_id === 'ALL' ||
             targetBr === 'ALL';
 
@@ -3632,6 +3730,9 @@ class MeshSyncManager {
         mergeT1Records(STORAGE_KEYS.STOCK_MOVEMENTS, batchRecords);
       } else if (entityType === 'direct_grvs' || entityType === 'direct_grv' || entityType === 'grv') {
         mergeT1Records(STORAGE_KEYS.DIRECT_GRVS, batchRecords);
+        for (const grv of batchRecords) {
+          recordDirectGrvTillPayouts({ ...grv, fromMesh: true } as any);
+        }
       } else if (entityType === 'expenses' || entityType === 'expense') {
         mergeT1Records(STORAGE_KEYS.EXPENSES, batchRecords);
       } else if (entityType === 'inventory' || entityType === 'inventory_item' || entityType === 'products') {
@@ -3670,7 +3771,12 @@ class MeshSyncManager {
       window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated'));
     } else if (norm === 'cash_logs' || norm === 'cash_log') {
       window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
-    } else if (norm === 'stock_movements' || norm === 'direct_grvs' || norm === 'inventory') {
+    } else if (norm === 'direct_grvs' || norm === 'direct_grv' || norm === 'grv') {
+      window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+    } else if (norm === 'stock_movements' || norm === 'inventory') {
       window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
     } else if (norm === 'expenses' || norm === 'expense') {
       window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -4506,6 +4612,17 @@ class MeshSyncManager {
       packet.action === 'INVENTORY_RECORD' ||
       packet.action === 'INVENTORY_UPDATE' ||
       packet.type === 'product' ||
+      packet.type === 'staff' ||
+      packet.type === 'STAFF' ||
+      packet.action === 'STAFF_SYNC' ||
+      packet.type === 'staff_permission' ||
+      packet.action === 'STAFF_PERMISSION_RECORD' ||
+      packet.type === 'PERMISSIONS_MATRIX_SYNC' ||
+      packet.action === 'PERMISSIONS_MATRIX_SYNC' ||
+      packet.type === 'ROLE_CONFIGS_SYNC' ||
+      packet.action === 'ROLE_CONFIGS_SYNC' ||
+      packet.type === 'branch' ||
+      packet.action === 'BRANCH_SYNC' ||
       packet.target_branch_id === 'ALL' ||
       targetBranch === 'ALL';
 
@@ -4628,8 +4745,22 @@ class MeshSyncManager {
       packet.action === 'INVENTORY_UPDATE' ||
       packet.type === 'product' ||
       packet.type === 'staff' ||
+      packet.type === 'STAFF' ||
       packet.action === 'STAFF_SYNC' ||
+      packet.action === 'STAFF_RECORD' ||
+      packet.type === 'staff_permission' ||
+      packet.action === 'STAFF_PERMISSION_RECORD' ||
+      packet.type === 'permissions_matrix' ||
+      packet.type === 'PERMISSIONS_MATRIX_SYNC' ||
+      packet.action === 'PERMISSIONS_MATRIX_SYNC' ||
+      packet.type === 'role_configs' ||
+      packet.type === 'ROLE_CONFIGS_SYNC' ||
+      packet.action === 'ROLE_CONFIGS_SYNC' ||
+      packet.type === 'branch' ||
+      packet.type === 'BRANCH' ||
+      packet.action === 'BRANCH_SYNC' ||
       packet.type === 'customer' ||
+      packet.type === 'CUSTOMER' ||
       packet.action === 'CUSTOMER_SYNC' ||
       packet.target_branch_id === 'ALL' ||
       branchCandidate === 'ALL';
@@ -4842,7 +4973,16 @@ class MeshSyncManager {
     }
 
     // 5. STAFF PERMISSION & USER BROADCAST
-    if (topic.endsWith('/staff_permission') || packet.type === 'staff_permission' || packet.action === 'STAFF_PERMISSION_RECORD') {
+    if (
+      topic.endsWith('/staff_permission') ||
+      topic.endsWith('/staff') ||
+      packet.type === 'staff_permission' ||
+      packet.action === 'STAFF_PERMISSION_RECORD' ||
+      packet.type === 'staff' ||
+      packet.type === 'STAFF' ||
+      packet.action === 'STAFF_SYNC' ||
+      packet.action === 'STAFF_RECORD'
+    ) {
       const staff: Salesperson = packet.staff || packet.payload;
       if (staff && staff.id) {
         const staffTime = extractRecordTimestamp(staff);
@@ -4850,6 +4990,8 @@ class MeshSyncManager {
         if (staffTime > 0) {
           setLastStaffSync(Math.max(getLastStaffSync(), staffTime));
         }
+        window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
         if (ingested) {
           playChime();
           this.addLog(
@@ -4858,7 +5000,90 @@ class MeshSyncManager {
             originName,
             this.config.deviceName
           );
+          this.notifyPeerSubscribers();
         }
+      }
+      return;
+    }
+
+    // 5b. GRANULAR PERMISSIONS MATRIX BROADCAST
+    if (
+      topic.endsWith('/permissions_matrix') ||
+      packet.type === 'permissions_matrix' ||
+      packet.type === 'PERMISSIONS_MATRIX_SYNC' ||
+      packet.action === 'PERMISSIONS_MATRIX_SYNC'
+    ) {
+      const rules = packet.rules || packet.permissionsMatrix || packet.payload?.rules || packet.payload;
+      const incomingUpdatedAt = parseTimestampMs(packet.updatedAt ?? packet.hubTimestamp ?? packet.timestamp);
+      if (Array.isArray(rules) && rules.length > 0) {
+        if (ingestMeshPermissionsMatrix(rules, incomingUpdatedAt)) {
+          playChime();
+          this.addLog(
+            'EPIDEMIC_HOP',
+            `Permissions Matrix (${rules.length} rules) updated from ${originName}. Synced locally!`,
+            originName,
+            this.config.deviceName
+          );
+          this.notifyPeerSubscribers();
+        }
+      }
+      return;
+    }
+
+    // 5c. ROLE CONFIGURATIONS BROADCAST
+    if (
+      topic.endsWith('/role_configs') ||
+      packet.type === 'role_configs' ||
+      packet.type === 'ROLE_CONFIGS_SYNC' ||
+      packet.action === 'ROLE_CONFIGS_SYNC'
+    ) {
+      const defs = packet.definitions || packet.roleConfigs || packet.roleDefinitions || packet.payload?.definitions || packet.payload;
+      const incomingUpdatedAt = parseTimestampMs(packet.updatedAt ?? packet.hubTimestamp ?? packet.timestamp);
+      if (defs && typeof defs === 'object' && !Array.isArray(defs)) {
+        if (ingestMeshRoleDefinitions(defs, incomingUpdatedAt)) {
+          playChime();
+          this.addLog(
+            'EPIDEMIC_HOP',
+            `Role Configurations updated from ${originName}. Synced locally!`,
+            originName,
+            this.config.deviceName
+          );
+          this.notifyPeerSubscribers();
+        }
+      }
+      return;
+    }
+
+    // 5d. BRANCH BROADCAST
+    if (topic.endsWith('/branch') || packet.type === 'branch' || packet.type === 'BRANCH' || packet.action === 'BRANCH_SYNC' || packet.action === 'BRANCH_RECORD') {
+      const branch = packet.branch || ((packet.entityType === 'branch' || !packet.entityType) ? packet.payload : null);
+      if (branch && isValidBranchRecord(branch) && (branch.branchId || branch.id)) {
+        const branchTime = extractRecordTimestamp(branch);
+        saveBranch({ ...branch, fromMesh: true }, { fromSync: true });
+        if (branchTime > 0) {
+          setLastBranchSync(Math.max(getLastBranchSync(), branchTime));
+        }
+        window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
+        this.addLog(
+          'EPIDEMIC_HOP',
+          `Branch [${branch.name || branch.branchId || branch.id}] updated from ${originName}.`,
+          originName,
+          this.config.deviceName
+        );
+      }
+      return;
+    }
+
+    // 5e. CUSTOMER BROADCAST
+    if (topic.endsWith('/customer') || packet.type === 'customer' || packet.type === 'CUSTOMER' || packet.action === 'CUSTOMER_SYNC' || packet.action === 'CUSTOMER_RECORD') {
+      const customer = packet.customer || packet.payload;
+      if (customer && (customer.customerId || customer.id)) {
+        const custTime = extractRecordTimestamp(customer);
+        ingestMeshCustomer({ ...customer, fromMesh: true }, { fromSync: true });
+        if (custTime > 0) {
+          setLastCustomerSync(Math.max(getLastCustomerSync(), custTime));
+        }
+        window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
       }
       return;
     }
@@ -4970,8 +5195,8 @@ class MeshSyncManager {
     }
 
     // 8. DIRECT GRV (GOODS RECEIVED) BROADCAST
-    if (topic.endsWith('/grv') || packet.type === 'grv' || packet.action === 'GRV_RECORD') {
-      const grv: DirectGrv = packet.grv || packet.payload;
+    if (topic.endsWith('/grv') || topic.endsWith('/direct_grv') || packet.type === 'grv' || packet.type === 'direct_grv' || packet.action === 'GRV_RECORD' || packet.action === 'DIRECT_GRV') {
+      const grv: DirectGrv = packet.directGrv || packet.grv || packet.payload;
       if (grv && grv.grvNumber) {
         const ingested = ingestMeshGRV({ ...grv, fromMesh: true } as any);
         if (ingested) {
@@ -4983,8 +5208,10 @@ class MeshSyncManager {
             this.config.deviceName
           );
           window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
           window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
           window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
         }
       }
       return;
@@ -6103,10 +6330,16 @@ class MeshSyncManager {
     }
     if (Array.isArray(delta.directGrvs) && delta.directGrvs.length > 0) {
       mergeT1Records(STORAGE_KEYS.DIRECT_GRVS, delta.directGrvs);
+      delta.directGrvs.forEach((grv: any) => {
+        recordDirectGrvTillPayouts({ ...grv, fromMesh: true } as any);
+      });
       overallProcessed += delta.directGrvs.length;
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
       }
     }
     if (Array.isArray(delta.goodsReceivedNotes) && delta.goodsReceivedNotes.length > 0) {
@@ -6325,6 +6558,29 @@ class MeshSyncManager {
     if (Array.isArray(delta.categories)) {
       this.ingestMeshCategories(delta.categories);
       overallProcessed += delta.categories.length;
+    }
+
+    // 8.11b Ingest Permissions Matrix from Catch-up Delta (T2)
+    const rawPermsDelta = (delta as any).permissionsMatrix;
+    if (Array.isArray(rawPermsDelta)) {
+      ingestMeshPermissionsMatrix(rawPermsDelta, parseTimestampMs(packet.cutoffTimestamp || packet.timestamp));
+      overallProcessed += rawPermsDelta.length;
+    } else if (rawPermsDelta && Array.isArray(rawPermsDelta.rules) && rawPermsDelta.rules.length > 0) {
+      ingestMeshPermissionsMatrix(rawPermsDelta.rules, parseTimestampMs(rawPermsDelta.updatedAt || packet.cutoffTimestamp));
+      overallProcessed += rawPermsDelta.rules.length;
+    }
+
+    // 8.11c Ingest Role Configurations from Catch-up Delta (T2)
+    const rawRolesDelta = (delta as any).roleConfigs || (delta as any).roleDefinitions;
+    if (rawRolesDelta && typeof rawRolesDelta === 'object' && !Array.isArray(rawRolesDelta)) {
+      const roleDefs = rawRolesDelta.definitions && typeof rawRolesDelta.definitions === 'object'
+        ? rawRolesDelta.definitions
+        : rawRolesDelta;
+      const roleUpdatedAt = parseTimestampMs(rawRolesDelta.updatedAt || packet.cutoffTimestamp || packet.timestamp);
+      if (Object.keys(roleDefs).length > 0) {
+        ingestMeshRoleDefinitions(roleDefs, roleUpdatedAt);
+        overallProcessed += Object.keys(roleDefs).length;
+      }
     }
 
     // 8.12 Apply Tombstones (Soft Deletes) from Catch-up Delta
@@ -6560,16 +6816,20 @@ class MeshSyncManager {
     const packetId = `STAFF-PKT-${staff.id}-${Date.now()}`;
     this.seenPacketIds.add(packetId);
 
-    // Ensure password and credentials integrity across LAN / Hub
+    // Ensure password and credentials integrity across LAN / Hub (NEVER transmit plaintext pin)
     const sanitizedStaff = sanitizeUserForExport(staff);
     const effectiveHash = staff.pin_hash || (sanitizedStaff as any).pin_hash || '';
-    const effectivePassword = staff.password || (sanitizedStaff as any).password || effectiveHash || '';
-    const effectivePin = staff.pin || (sanitizedStaff as any).pin || '';
+    const effectivePassword = (sanitizedStaff as any).password || effectiveHash || '';
+    const assignedBranchIds = Array.isArray((staff as any).assignedBranchIds)
+      ? (staff as any).assignedBranchIds
+      : Array.isArray(staff.branchAssignments) && staff.branchAssignments.length > 0
+      ? staff.branchAssignments.map((b: any) => b.branchId).filter(Boolean)
+      : (staff.branchId ? [staff.branchId] : []);
     const staffPayload = {
       ...sanitizedStaff,
-      pin: effectivePin,
       password: effectivePassword,
       pin_hash: effectiveHash,
+      assignedBranchIds,
       updatedAt: staff.updatedAt,
       lastUpdated: staff.lastUpdated,
     };
@@ -6587,7 +6847,6 @@ class MeshSyncManager {
       originDeviceName: this.config.deviceName,
       staff: staffPayload,
       payload: staffPayload,
-      pin: effectivePin,
       password: effectivePassword,
       pin_hash: effectiveHash,
       isReconPush,
@@ -6600,6 +6859,74 @@ class MeshSyncManager {
     console.log('[STAFF TRACE] 3. LocalHub Outbound:', JSON.stringify(payload.staff || payload));
     this.sendPacketToAllTransports('staff', packet);
     this.addLog('BROADCAST', `Staff account ${staff.name} (${staff.id} - ${staff.role}) broadcasted to WiFi mesh (PIN protected)`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast 52 Granular Permissions Matrix rules across Local Hub & mesh peers
+   */
+  public broadcastPermissionsMatrix(rules?: any[], updatedAt?: number) {
+    if (this.isIngestingFromHub) return;
+    const effectiveRules = Array.isArray(rules) && rules.length > 0 ? rules : getPermissionsList();
+    const effectiveUpdatedAt = updatedAt || getPermissionsMatrixUpdatedAt() || Date.now();
+    const packetId = `PERMS-PKT-${effectiveUpdatedAt}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'PERMISSIONS_MATRIX_SYNC',
+      action: 'PERMISSIONS_MATRIX_SYNC',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      target_branch_id: 'ALL',
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      rules: effectiveRules,
+      permissionsMatrix: { rules: effectiveRules, updatedAt: effectiveUpdatedAt },
+      payload: { rules: effectiveRules, updatedAt: effectiveUpdatedAt },
+      updatedAt: effectiveUpdatedAt,
+      timestamp: effectiveUpdatedAt,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('permissions_matrix', packet);
+    this.addLog('BROADCAST', `Granular Permissions Matrix (${effectiveRules.length} rules) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast Role Configurations & Module Access definitions across Local Hub & mesh peers
+   */
+  public broadcastRoleDefinitions(defs?: Record<string, any>, updatedAt?: number) {
+    if (this.isIngestingFromHub) return;
+    const effectiveDefs = defs && typeof defs === 'object' ? defs : getStoredRoleDefinitions();
+    const effectiveUpdatedAt = updatedAt || getRoleDefinitionsUpdatedAt() || Date.now();
+    const packetId = `ROLES-PKT-${effectiveUpdatedAt}`;
+    this.seenPacketIds.add(packetId);
+
+    const packet = {
+      type: 'ROLE_CONFIGS_SYNC',
+      action: 'ROLE_CONFIGS_SYNC',
+      packet_id: packetId,
+      companyId: this.config.companyId,
+      branchId: this.config.branchId,
+      target_branch_id: 'ALL',
+      branchCode: this.config.branchCode,
+      deviceId: this.config.deviceId,
+      originDeviceId: this.config.deviceId,
+      originDeviceName: this.config.deviceName,
+      definitions: effectiveDefs,
+      roleConfigs: { definitions: effectiveDefs, updatedAt: effectiveUpdatedAt },
+      payload: { definitions: effectiveDefs, updatedAt: effectiveUpdatedAt },
+      updatedAt: effectiveUpdatedAt,
+      timestamp: effectiveUpdatedAt,
+      ttl: 5,
+    };
+
+    this.sendPacketToAllTransports('role_configs', packet);
+    this.addLog('BROADCAST', `Role Configurations & Module Access broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 

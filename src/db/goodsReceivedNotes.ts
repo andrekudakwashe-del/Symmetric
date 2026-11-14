@@ -136,6 +136,13 @@ export const directGrvToGrn = (grv: DirectGrv): GoodsReceivedNote => {
     totalQuantity,
   };
 
+  const isPayFromTill =
+    grv.payFromTill !== false &&
+    grv.paymentMethod !== 'INVOICE_ON_ACCOUNT' &&
+    grv.paymentMethod !== 'CREDIT' &&
+    grv.paymentMethod !== 'BANK' &&
+    grv.paymentStatus !== 'AWAITING_SAFE_PAYMENT';
+
   return {
     id: grv.id,
     grnNumber: grv.grvNumber || grv.id,
@@ -146,10 +153,10 @@ export const directGrvToGrn = (grv: DirectGrv): GoodsReceivedNote => {
     suppliers: [grv.supplierId || grv.supplierName || 'Direct Supplier'],
     lineItems,
     landedCosts: [],
-    paymentMode: 'cash_immediate',
+    paymentMode: isPayFromTill ? 'cash_immediate' : 'credit_account',
     paymentRef,
     dueDate: undefined,
-    requiresApproval: true,
+    requiresApproval: grv.status !== 'APPROVED',
     status: grv.status,
     cashMovementId,
     payableId: undefined,
@@ -376,19 +383,37 @@ export const getDualReadDirectGrvs = (legacyDirectGrvs: DirectGrv[]): DirectGrv[
   const allGrns = getAllGoodsReceivedNotes();
   const directGrns = allGrns.filter((g) => g.sourceTemplate === 'direct_delivery');
 
+  const legacyByKey = new Map<string, DirectGrv>();
+  for (const legacy of legacyDirectGrvs) {
+    if (legacy.id) legacyByKey.set(legacy.id, legacy);
+    if (legacy.grvNumber) legacyByKey.set(legacy.grvNumber, legacy);
+  }
+
   const seenIds = new Set<string>();
   const reconciled: DirectGrv[] = [];
 
-  // 1. First add records from unified goodsReceivedNotes
+  // 1. Reconcile records from unified goodsReceivedNotes with fresher fields from STORAGE_KEYS.DIRECT_GRVS
   for (const grn of directGrns) {
-    const grv = grnToDirectGrv(grn);
-    const primaryId = grv.id;
-    const numId = grv.grvNumber;
+    const grvFromGrn = grnToDirectGrv(grn);
+    const matchingLegacy = legacyByKey.get(grvFromGrn.id) || (grvFromGrn.grvNumber ? legacyByKey.get(grvFromGrn.grvNumber) : undefined);
+    const merged: DirectGrv = matchingLegacy
+      ? {
+          ...grvFromGrn,
+          ...matchingLegacy,
+          payments:
+            matchingLegacy.payments && matchingLegacy.payments.length > 0
+              ? matchingLegacy.payments
+              : grvFromGrn.payments,
+        }
+      : grvFromGrn;
+
+    const primaryId = merged.id;
+    const numId = merged.grvNumber;
 
     if (!seenIds.has(primaryId) && (!numId || !seenIds.has(numId))) {
       seenIds.add(primaryId);
       if (numId) seenIds.add(numId);
-      reconciled.push(grv);
+      reconciled.push(merged);
     }
   }
 

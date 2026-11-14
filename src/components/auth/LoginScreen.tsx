@@ -174,6 +174,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         }
         return fresh;
       });
+      setStaffVersion((v) => v + 1);
     });
 
     const handleHubIdentity = () => {
@@ -200,6 +201,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     window.addEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
     window.addEventListener('saimetric_salespeople_updated', handleStaffUpdate);
     window.addEventListener('saimetric_staff_updated', handleStaffUpdate);
+    window.addEventListener('saimetric_branches_updated', handleStaffUpdate);
 
     return () => {
       unsub();
@@ -209,6 +211,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       window.removeEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
       window.removeEventListener('saimetric_salespeople_updated', handleStaffUpdate);
       window.removeEventListener('saimetric_staff_updated', handleStaffUpdate);
+      window.removeEventListener('saimetric_branches_updated', handleStaffUpdate);
     };
   }, []);
 
@@ -586,7 +589,22 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           permissions: branchPerms,
         };
 
-        saveSalesperson(fullStaffUser);
+        // Never overwrite stored multi-branch assignments or global role during routine login
+        const existsLocally = getSalespeopleForCompany(selectedCompanyId).some((s) => s.id === fullStaffUser.id);
+        if (!existsLocally && authenticatedUser) {
+          saveSalesperson(
+            {
+              ...authenticatedUser,
+              id: authenticatedUser.id || fullStaffUser.id,
+              name: authenticatedUser.name || fullStaffUser.name,
+              role: (authenticatedUser.role || fullStaffUser.role) as any,
+              branchId: authenticatedUser.branchId || selectedBranchId,
+              branch_id: authenticatedUser.branch_id || selectedBranchId,
+            },
+            { fromSync: true }
+          );
+        }
+
         setCurrentCompanyId(fullStaffUser.companyId || selectedCompanyId);
         setCurrentBranchId(selectedBranchId);
         setSessionUser(fullStaffUser);

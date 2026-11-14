@@ -87,13 +87,16 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
     const brId = grn.branch_id || grn.branchId || getCurrentBranchId();
     const now = grn.createdAt || new Date().toISOString();
 
-    const initialMovementStatus =
-      grn.status === 'APPROVED' ? 'approved' : grn.requiresApproval ? 'pending' : 'approved';
+    const isDirectDelivery = grn.sourceTemplate === 'direct_delivery';
+    const initialMovementStatus = isDirectDelivery
+      ? (grn.status === 'REJECTED' ? 'rejected' : 'approved')
+      : (grn.status === 'APPROVED' ? 'approved' : grn.requiresApproval ? 'pending' : 'approved');
 
     // If payments breakdown exists in raw record, respect each individual till payout
+    const rawPayments = grn._rawDirectGrv?.payments;
     const payments =
-      grn._rawDirectGrv?.payments && grn._rawDirectGrv.payments.length > 0
-        ? grn._rawDirectGrv.payments
+      rawPayments && rawPayments.length > 0 && rawPayments.some((p) => (Number(p.amount) || 0) > 0)
+        ? rawPayments.filter((p) => (Number(p.amount) || 0) > 0)
         : [
             {
               userId: grn.receivedBy || 'USR-003',
@@ -110,16 +113,19 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
 
     payments.forEach((p, pIdx) => {
       const pAmount = Number(p.amount) || 0;
-      if (pAmount <= 0) return;
+      if (pAmount <= 0 || !p.userId) return;
 
       const staffShiftId = getShiftId(p.userId, shiftDate);
-      const voucherKey = payments.length > 1 ? `${grn.grnNumber}-P${pIdx + 1}` : grn.grnNumber;
+      const staffVoucherKey = `${grn.grnNumber}-${p.userId}`;
+      const indexedVoucherKey = payments.length > 1 ? `${grn.grnNumber}-P${pIdx + 1}` : grn.grnNumber;
 
       const existingM = existingMovements.find(
         (m) =>
           m.type === 'supplier_payment' &&
-          (m.sourceRef === grn.grnNumber ||
-            m.sourceRef === voucherKey ||
+          m.staffId === p.userId &&
+          (m.sourceRef === staffVoucherKey ||
+            m.sourceRef === grn.grnNumber ||
+            m.sourceRef === indexedVoucherKey ||
             m.sourceRef === grn.id ||
             (m.notes && m.notes.includes(grn.grnNumber)))
       );
@@ -129,8 +135,9 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
         updateMovement(existingM.id, {
           amount: pAmount,
           status: initialMovementStatus,
-          affectsDrawer: true,
+          affectsDrawer: initialMovementStatus !== 'rejected',
           direction: 'out',
+          sourceRef: isDirectDelivery ? staffVoucherKey : existingM.sourceRef,
         });
       } else {
         const createdM = addMovement({
@@ -143,10 +150,10 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
           amount: pAmount,
           currency: 'USD',
           direction: 'out',
-          affectsDrawer: true,
+          affectsDrawer: initialMovementStatus !== 'rejected',
           status: initialMovementStatus,
           sourceModule: 'DirectGRV',
-          sourceRef: grn.grnNumber,
+          sourceRef: isDirectDelivery ? staffVoucherKey : grn.grnNumber,
           notes: `Direct Supplier Delivery: ${grn.suppliers.join(', ')} (${grn.grnNumber})`,
           company_id: compId,
           branch_id: brId,
@@ -181,9 +188,15 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
  * Thin wrapper for posting Direct Delivery via postGRN
  */
 export function postDirectDelivery(dd: DirectGrv): DirectGrv {
+  const isPayFromTill =
+    dd.payFromTill !== false &&
+    dd.paymentMethod !== 'INVOICE_ON_ACCOUNT' &&
+    dd.paymentMethod !== 'CREDIT' &&
+    dd.paymentMethod !== 'BANK' &&
+    dd.paymentStatus !== 'AWAITING_SAFE_PAYMENT';
   const grn = directGrvToGrn(dd);
   grn.sourceTemplate = 'direct_delivery';
-  grn.paymentMode = 'cash_immediate';
+  grn.paymentMode = isPayFromTill ? 'cash_immediate' : 'credit_account';
   grn.requiresApproval = dd.status !== 'APPROVED';
   
   const postedGrn = postGRN(grn);

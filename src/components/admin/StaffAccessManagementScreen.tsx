@@ -473,8 +473,10 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           name: formName.trim(),
           email: formEmail.trim() || undefined,
           role: formRole as Role,
+          branchId: resolvedBranchId,
           branch_id: resolvedBranchId,
           branchAssignments: finalAssignments,
+          assignedBranchIds: finalAssignments.map((a) => a.branchId),
           company_id: editingStaff.company_id || getCurrentCompanyId(),
           phone: formPhone.trim() || undefined,
           active: formActive,
@@ -494,8 +496,6 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           })
         );
         updateSalesperson(editingStaff.id, staffPayload, { fromSync: false });
-
-        updateStaffBranchAssignments(editingStaff.id, finalAssignments);
 
         // Audit log
         addAuditLog({
@@ -545,15 +545,15 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           email: formEmail.trim() || undefined,
           pin: formPin,
           role: formRole as Role,
+          branchId: resolvedBranchId,
           branch_id: resolvedBranchId,
           branchAssignments: finalAssignments,
+          assignedBranchIds: finalAssignments.map((a) => a.branchId),
           company_id: getCurrentCompanyId(),
           phone: formPhone.trim() || undefined,
           active: formActive,
           permissions: tempPermissions,
-        });
-
-        updateStaffBranchAssignments(newId, finalAssignments);
+        } as any);
 
         addAuditLog({
           action: 'STAFF_ROLE_CHANGE',
@@ -1440,7 +1440,16 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
                   <div className="space-y-1.5 max-h-56 overflow-y-auto pr-0.5">
                     {branches.map((b) => {
                       const bId = b.branchId || b.id || (b as any).branch_id || '1';
-                      const assignment = formBranchAssignments.find((a) => a.branchId === bId);
+                      const isMainAlias = (val?: string) => {
+                        const c = (val || '').trim().toLowerCase();
+                        return c === '1' || c === 'br-main' || c === 'hq-01' || c === 'sai-01';
+                      };
+                      const matchesBranch = (val?: string) =>
+                        Boolean(val) &&
+                        (val === bId ||
+                          String(val).trim().toLowerCase() === String(bId).trim().toLowerCase() ||
+                          (isMainAlias(val) && isMainAlias(bId)));
+                      const assignment = formBranchAssignments.find((a) => matchesBranch(a.branchId));
                       const isAssigned = !!assignment;
 
                       return (
@@ -1471,7 +1480,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
                                     ]);
                                   } else {
                                     setFormBranchAssignments((prev) => {
-                                      const next = prev.filter((a) => a.branchId !== bId);
+                                      const next = prev.filter((a) => !matchesBranch(a.branchId));
                                       if (assignment?.isPrimary && next.length > 0) {
                                         next[0].isPrimary = true;
                                       }

@@ -554,6 +554,63 @@ export const normalizeRoleId = (rawRole: string | undefined): string => {
 
 // --- Storage & Service Methods ---
 
+const STORAGE_KEY_ROLE_CONFIGS_UPDATED_AT = 'saimetric_role_configs_updated_at';
+
+export type RoleDefinitionsChangeListener = (
+  defs: Record<string, RoleDefinition>,
+  updatedAt: number
+) => void;
+const roleDefinitionsChangeListeners: Set<RoleDefinitionsChangeListener> = new Set();
+
+export const onRoleDefinitionsChanged = (listener: RoleDefinitionsChangeListener) => {
+  roleDefinitionsChangeListeners.add(listener);
+  return () => {
+    roleDefinitionsChangeListeners.delete(listener);
+  };
+};
+
+const notifyRoleDefinitionsChanged = (
+  defs: Record<string, RoleDefinition>,
+  updatedAt: number
+) => {
+  roleDefinitionsChangeListeners.forEach((fn) => {
+    try {
+      fn(defs, updatedAt);
+    } catch (e) {
+      console.error('roleDefinitionsChangeListener error:', e);
+    }
+  });
+};
+
+export const getRoleDefinitionsUpdatedAt = (): number => {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const val = Number(localStorage.getItem(STORAGE_KEY_ROLE_CONFIGS_UPDATED_AT) || '0');
+      return isNaN(val) ? 0 : val;
+    }
+  } catch {}
+  return 0;
+};
+
+const persistRoleDefinitions = (
+  all: Record<string, RoleDefinition>,
+  options?: { fromSync?: boolean; updatedAt?: number }
+): void => {
+  const ts = options?.updatedAt && options.updatedAt > 0 ? options.updatedAt : Date.now();
+  try {
+    localStorage.setItem(STORAGE_KEY_ROLE_CONFIGS, JSON.stringify(all));
+    localStorage.setItem(STORAGE_KEY_ROLE_CONFIGS_UPDATED_AT, String(ts));
+  } catch (err) {
+    console.error('Failed to persist role configs:', err);
+  }
+  if (!options?.fromSync) {
+    notifyRoleDefinitionsChanged(all, ts);
+  }
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_role_configs_updated', { detail: all }));
+  }
+};
+
 export const getStoredRoleDefinitions = (): Record<string, RoleDefinition> => {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_ROLE_CONFIGS);
@@ -576,7 +633,7 @@ export const saveRoleDefinition = (roleDef: RoleDefinition): void => {
   all[roleDef.roleId] = {
     ...roleDef,
   };
-  localStorage.setItem(STORAGE_KEY_ROLE_CONFIGS, JSON.stringify(all));
+  persistRoleDefinitions(all, { fromSync: false });
 };
 
 export const deleteCustomRole = (roleId: string): boolean => {
@@ -585,12 +642,31 @@ export const deleteCustomRole = (roleId: string): boolean => {
     return false; // Cannot delete core system role
   }
   delete all[roleId];
-  localStorage.setItem(STORAGE_KEY_ROLE_CONFIGS, JSON.stringify(all));
+  persistRoleDefinitions(all, { fromSync: false });
   return true;
 };
 
 export const resetRolesToDefault = (): void => {
-  localStorage.removeItem(STORAGE_KEY_ROLE_CONFIGS);
+  const defaults = { ...DEFAULT_ROLE_DEFINITIONS };
+  persistRoleDefinitions(defaults, { fromSync: false });
+};
+
+export const ingestMeshRoleDefinitions = (
+  defs: Record<string, RoleDefinition>,
+  incomingUpdatedAt?: number
+): boolean => {
+  if (!defs || typeof defs !== 'object' || Array.isArray(defs)) return false;
+  const existingTime = getRoleDefinitionsUpdatedAt();
+  const incomingTime = typeof incomingUpdatedAt === 'number' && !isNaN(incomingUpdatedAt) ? incomingUpdatedAt : 0;
+  if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+    return false;
+  }
+  const merged = {
+    ...DEFAULT_ROLE_DEFINITIONS,
+    ...defs,
+  };
+  persistRoleDefinitions(merged, { fromSync: true, updatedAt: incomingTime || Date.now() });
+  return true;
 };
 
 export const getRoleDefinitionForUser = (user: Salesperson | null): RoleDefinition => {

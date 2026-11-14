@@ -40,6 +40,8 @@ import {
   addAuditLog,
   isStaffAssignedToBranch,
   getStaffRoleInBranch,
+  getStaffBranchAssignments,
+  isRecordInBranchScope,
   updateStaffBranchAssignments,
   getCompanyBranchSettings,
   saveCompanyBranchSettings,
@@ -118,13 +120,23 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
     const handlePkgUpdate = () => {
       setCompany(getCurrentCompany());
       setBranches(getBranches());
+      setStaffList(getSalespeople());
+    };
+    const handleStaffUpdated = () => {
+      setStaffList(getSalespeople());
     };
     window.addEventListener('saas_packages_updated', handlePkgUpdate);
     window.addEventListener('saas_company_updated', handlePkgUpdate);
+    window.addEventListener('saimetric_staff_updated', handleStaffUpdated);
+    window.addEventListener('saimetric_salespeople_updated', handleStaffUpdated);
+    window.addEventListener('saimetric_branches_updated', handlePkgUpdate);
     return () => {
       unsub();
       window.removeEventListener('saas_packages_updated', handlePkgUpdate);
       window.removeEventListener('saas_company_updated', handlePkgUpdate);
+      window.removeEventListener('saimetric_staff_updated', handleStaffUpdated);
+      window.removeEventListener('saimetric_salespeople_updated', handleStaffUpdated);
+      window.removeEventListener('saimetric_branches_updated', handlePkgUpdate);
     };
   }, []);
 
@@ -261,11 +273,15 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
     let assignedManagerName = selectedBranchForTeam.manager_name || '';
 
     // Persist assignments for each staff member
+    const allBranches = getBranches();
     staffList.forEach((staff) => {
       const config = teamAssignments[staff.id];
       if (!config) return;
 
-      const existing = (staff.branchAssignments || []).filter((a) => a.branchId !== bId);
+      const baseAssignments = getStaffBranchAssignments(staff);
+      const existing = baseAssignments.filter(
+        (a) => !(a.branchId && (a.branchId === bId || isRecordInBranchScope(a.branchId, bId, allBranches)))
+      );
 
       if (config.assigned) {
         existing.push({
@@ -275,7 +291,6 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
           assignedAt: new Date().toISOString(),
           isPrimary: existing.length === 0,
         });
-
         if (config.role === 'BRANCH_MANAGER') {
           assignedManagerId = staff.id;
           assignedManagerName = staff.name;
@@ -377,11 +392,15 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
     setBranches(getBranches());
 
     // Save any configured team member assignments for this branch
+    const allBranches = getBranches();
     staffList.forEach((staff) => {
       const config = teamAssignments[staff.id];
       if (!config) return;
 
-      const existing = (staff.branchAssignments || []).filter((a) => a.branchId !== branchId);
+      const baseAssignments = getStaffBranchAssignments(staff);
+      const existing = baseAssignments.filter(
+        (a) => !(a.branchId && (a.branchId === branchId || isRecordInBranchScope(a.branchId, branchId, allBranches)))
+      );
 
       if (config.assigned) {
         existing.push({
@@ -395,6 +414,7 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
 
       updateStaffBranchAssignments(staff.id, existing);
     });
+    setStaffList(getSalespeople());
 
     // Audit log
     addAuditLog({

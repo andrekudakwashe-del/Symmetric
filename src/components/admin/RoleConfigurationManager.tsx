@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { ActiveTab, Salesperson } from '../../types';
 import {
   ALL_SYSTEM_MODULES,
@@ -44,6 +44,16 @@ export const RoleConfigurationManager: React.FC<RoleConfigurationManagerProps> =
     getStoredRoleDefinitions()
   );
   const [selectedRoleId, setSelectedRoleId] = useState<string>('CASHIER');
+
+  useEffect(() => {
+    const handleRoleConfigsUpdated = () => {
+      setRoleDefs(getStoredRoleDefinitions());
+    };
+    window.addEventListener('saimetric_role_configs_updated', handleRoleConfigsUpdated);
+    return () => {
+      window.removeEventListener('saimetric_role_configs_updated', handleRoleConfigsUpdated);
+    };
+  }, []);
 
   // Custom role creation state
   const [isCreatingRole, setIsCreatingRole] = useState(false);

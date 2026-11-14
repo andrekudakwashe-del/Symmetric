@@ -135,6 +135,7 @@ import { saveWallet, SaveWalletParams } from '../services/walletService';
 import { LandedCostItem } from '../types';
 import { resolveItemCost } from '../utils/costResolver';
 import { toDateStringSafe, safeDateSlice, isSameDaySafe } from '../utils/dateUtils';
+export { toDateStringSafe };
 import {
   hashPin,
   generatePinSalt,
@@ -707,6 +708,7 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
     if (!item || typeof item !== 'object') return '';
     return String(
       item.id ||
+      item.grvNumber ||
       item.invoice_id ||
       item.invoiceNumber ||
       item.supplierId ||
@@ -1814,7 +1816,14 @@ export const getRawStoredSalespeople = (): Salesperson[] => {
     const cleanId = String(s.id).trim();
     if (!seenIds.has(cleanId)) {
       seenIds.add(cleanId);
-      deduped.push(s);
+      if ((s as any).fromMesh || (s as any).fromSync) {
+        const cleaned = { ...s };
+        delete (cleaned as any).fromMesh;
+        delete (cleaned as any).fromSync;
+        deduped.push(cleaned);
+      } else {
+        deduped.push(s);
+      }
     }
   }
   return deduped;
@@ -1915,18 +1924,34 @@ export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }
     pinHash = hashPin(rawPin, salt);
   }
 
+  const now = Date.now();
+  const assignedBranchIds =
+    Array.isArray(person.branchAssignments) && person.branchAssignments.length > 0
+      ? person.branchAssignments.map((a) => a.branchId)
+      : (person as any).assignedBranchIds;
+
   const created: Salesperson = {
     ...person,
     id: newId,
+    name: person.name,
+    role: person.role,
     companyId: compId,
     company_id: compId,
     branchId: brId,
     branch_id: brId,
     pin_hash: pinHash,
+    password: pinHash,
     pin_salt: salt,
+    updatedAt: (person as any).updatedAt || now,
+    lastUpdated: (person as any).lastUpdated || new Date(now).toISOString(),
   } as Salesperson;
-  // Permanently strip plain-text PIN
+  if (assignedBranchIds) {
+    (created as any).assignedBranchIds = assignedBranchIds;
+  }
+  // Permanently strip plain-text PIN and transient mesh flags
   delete (created as any).pin;
+  delete (created as any).fromMesh;
+  delete (created as any).fromSync;
 
   const updated = [...all, created];
   setStored(STORAGE_KEYS.SALESPEOPLE, updated);
@@ -1985,7 +2010,7 @@ export const getOwnerDefaultPermissions = () => ({
 
 export const saveSalesperson = (
   person: Salesperson,
-  options?: { fromSync?: boolean; silent?: boolean }
+  options?: { fromSync?: boolean; silent?: boolean; silentBroadcast?: boolean }
 ): Salesperson => {
   const all = getRawStoredSalespeople();
   const compId = person.companyId || person.company_id || getCurrentCompanyId();
@@ -2015,36 +2040,58 @@ export const saveSalesperson = (
   // Secure One-Way PIN Hashing (SHA-256 with Salt)
   const salt = person.pin_salt || existingPerson?.pin_salt || generatePinSalt();
   let pinHash = (options?.fromSync && person.pin_hash) ? person.pin_hash : (person.pin_hash || existingPerson?.pin_hash);
+  let hasExplicitPinUpdate = false;
   if (person.pin && !options?.fromSync) {
     const rawPin = String(person.pin).trim();
     if (rawPin) {
       pinHash = hashPin(rawPin, salt);
+      hasExplicitPinUpdate = true;
     }
   } else if (!pinHash) {
     pinHash = hashPin('123456', salt);
+    hasExplicitPinUpdate = true;
   }
 
   const now = Date.now();
+  const resolvedBranchId =
+    person.branchId || person.branch_id || existingPerson?.branchId || existingPerson?.branch_id;
+  const resolvedBranchAssignments =
+    person.branchAssignments !== undefined ? person.branchAssignments : existingPerson?.branchAssignments;
+  const resolvedAssignedBranchIds = Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
+    ? resolvedBranchAssignments.map((a) => a.branchId)
+    : ((person as any).assignedBranchIds ?? (existingPerson as any)?.assignedBranchIds);
+
   const merged: Salesperson = {
     ...(existingPerson || {}),
     ...person,
     companyId: compId,
     company_id: compId,
+    ...(resolvedBranchId ? { branchId: resolvedBranchId, branch_id: resolvedBranchId } : {}),
+    ...(resolvedBranchAssignments !== undefined ? { branchAssignments: resolvedBranchAssignments } : {}),
+    ...(resolvedAssignedBranchIds !== undefined ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
     pin_hash: pinHash,
-    password: options?.fromSync ? ((person as any).password || pinHash) : ((person as any).password || (existingPerson as any)?.password || pinHash),
+    password: hasExplicitPinUpdate
+      ? pinHash
+      : (options?.fromSync
+          ? ((person as any).password || pinHash)
+          : ((person as any).password || (person.pin_hash ? pinHash : (existingPerson as any)?.password) || pinHash)),
     pin_salt: salt,
     active: person.active || existingPerson?.active || 'Y',
     permissions: resolvedPermissions,
     updatedAt: options?.fromSync ? ((person as any).updatedAt || now) : now,
     lastUpdated: options?.fromSync ? ((person as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
   };
-  // Permanently strip plain-text PIN
+  // Permanently strip plain-text PIN and transient sync flags so future local edits always broadcast
   delete (merged as any).pin;
+  delete (merged as any).fromMesh;
+  delete (merged as any).fromSync;
 
   if (index >= 0) {
     all[index] = { ...all[index], ...merged };
+    delete (all[index] as any).fromMesh;
+    delete (all[index] as any).fromSync;
     setStored(STORAGE_KEYS.SALESPEOPLE, all);
-    if (!options?.fromSync) {
+    if (!options?.fromSync && !options?.silentBroadcast) {
       notifyStaffChanged(all[index]);
     }
     notifyListeners();
@@ -2056,7 +2103,7 @@ export const saveSalesperson = (
   } else {
     const updated = [...all, merged];
     setStored(STORAGE_KEYS.SALESPEOPLE, updated);
-    if (!options?.fromSync) {
+    if (!options?.fromSync && !options?.silentBroadcast) {
       notifyStaffChanged(merged);
     }
     notifyListeners();
@@ -2071,7 +2118,7 @@ export const saveSalesperson = (
 export const updateSalesperson = (
   id: string,
   updates: Partial<Salesperson>,
-  options?: { fromSync?: boolean; silent?: boolean }
+  options?: { fromSync?: boolean; silent?: boolean; silentBroadcast?: boolean }
 ): Salesperson | null => {
   const all = getRawStoredSalespeople();
   const index = all.findIndex((s) => s.id === id);
@@ -2080,27 +2127,44 @@ export const updateSalesperson = (
   const current = all[index];
   const salt = updates.pin_salt || current.pin_salt || generatePinSalt();
   let pinHash = updates.pin_hash || current.pin_hash;
+  let hasExplicitPinUpdate = false;
 
   if (updates.pin) {
     const rawPin = String(updates.pin).trim();
     if (rawPin) {
       pinHash = hashPin(rawPin, salt);
+      hasExplicitPinUpdate = true;
     }
   } else if (!pinHash) {
     pinHash = hashPin('123456', salt);
+    hasExplicitPinUpdate = true;
   }
 
   const now = Date.now();
+  const nextBranchId = updates.branchId || updates.branch_id || current.branchId || current.branch_id;
+  const nextAssignments =
+    updates.branchAssignments !== undefined ? updates.branchAssignments : current.branchAssignments;
+  const nextAssignedBranchIds = Array.isArray(nextAssignments) && nextAssignments.length > 0
+    ? nextAssignments.map((a) => a.branchId)
+    : ((updates as any).assignedBranchIds ?? (current as any).assignedBranchIds);
+
   const updatedPerson: Salesperson = {
     ...current,
     ...updates,
+    ...(nextBranchId ? { branchId: nextBranchId, branch_id: nextBranchId } : {}),
+    ...(nextAssignments !== undefined ? { branchAssignments: nextAssignments } : {}),
+    ...(nextAssignedBranchIds !== undefined ? { assignedBranchIds: nextAssignedBranchIds } : {}),
     pin_hash: pinHash,
-    password: (updates as any).password || (current as any)?.password || pinHash,
+    password: hasExplicitPinUpdate
+      ? pinHash
+      : ((updates as any).password || (updates.pin_hash ? pinHash : (current as any)?.password) || pinHash),
     pin_salt: salt,
     updatedAt: options?.fromSync ? ((updates as any).updatedAt || now) : now,
     lastUpdated: options?.fromSync ? ((updates as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
   };
   delete (updatedPerson as any).pin;
+  delete (updatedPerson as any).fromMesh;
+  delete (updatedPerson as any).fromSync;
 
   all[index] = updatedPerson;
   setStored(STORAGE_KEYS.SALESPEOPLE, all);
@@ -2111,7 +2175,7 @@ export const updateSalesperson = (
     setSessionUser(updatedPerson);
   }
 
-  if (!options?.fromSync) {
+  if (!options?.fromSync && !options?.silentBroadcast) {
     notifyStaffChanged(updatedPerson);
   }
   notifyListeners();
@@ -2235,13 +2299,17 @@ export const getStaffRoleInBranch = (staff: Salesperson, branchId: string): Role
   if (staff.role === 'OWNER' || staff.role === 'SUPER_ADMIN') {
     return staff.role;
   }
+  const branches = getBranches();
   if (staff.branchAssignments && Array.isArray(staff.branchAssignments)) {
-    const match = staff.branchAssignments.find((b) => b.branchId === branchId);
+    const match = staff.branchAssignments.find(
+      (b) => b?.branchId && (b.branchId === branchId || isRecordInBranchScope(b.branchId, branchId, branches))
+    );
     if (match && match.role) {
       return match.role;
     }
   }
-  if ((staff.branchId || staff.branch_id) === branchId) {
+  const staffBranch = staff.branchId || staff.branch_id;
+  if (staffBranch && (staffBranch === branchId || isRecordInBranchScope(staffBranch, branchId, branches))) {
     return staff.role;
   }
   return staff.role || 'CASHIER';
@@ -2254,37 +2322,52 @@ export const isStaffAssignedToBranch = (staff: Salesperson, branchId: string): b
   if (!branchId || branchId === 'ALL') {
     return true;
   }
-  const isTargetMain = branchId === '1' || branchId === 'BR-MAIN';
+  const branches = getBranches();
   if (staff.branchAssignments && Array.isArray(staff.branchAssignments) && staff.branchAssignments.length > 0) {
-    return staff.branchAssignments.some((b) => b.branchId === branchId || (isTargetMain && (b.branchId === '1' || b.branchId === 'BR-MAIN')));
+    return staff.branchAssignments.some(
+      (b) => Boolean(b?.branchId) && isRecordInBranchScope(b.branchId, branchId, branches)
+    );
+  }
+  const assignedIds = (staff as any).assignedBranchIds;
+  if (Array.isArray(assignedIds) && assignedIds.length > 0) {
+    return assignedIds.some(
+      (id: any) => Boolean(id) && isRecordInBranchScope(String(id), branchId, branches)
+    );
   }
   const assigned = staff.branchId || staff.branch_id;
   if (!assigned) {
     return true; // Unassigned staff can log in to main branch or any store branch
   }
-  if (assigned === 'ALL' || assigned === branchId) {
+  if (assigned === 'ALL') {
     return true;
   }
-  if (isTargetMain && (assigned === '1' || assigned === 'BR-MAIN')) {
-    return true;
-  }
-  return false;
+  return isRecordInBranchScope(assigned, branchId, branches);
 };
 
 export const updateStaffBranchAssignments = (
   staffId: string,
-  assignments: StaffBranchAssignment[]
+  assignments: StaffBranchAssignment[],
+  options?: { fromSync?: boolean; silentBroadcast?: boolean }
 ): Salesperson | null => {
   const staff = getRawStoredSalespeople().find((s) => s.id === staffId);
   if (!staff) return null;
-  const primaryBranch = assignments[0]?.branchId || staff.branchId || '1';
-  const primaryRole = assignments[0]?.role || staff.role;
-  return updateSalesperson(staffId, {
-    branchAssignments: assignments,
-    branchId: primaryBranch,
-    branch_id: primaryBranch,
-    role: primaryRole,
-  });
+  const primaryAssignment = assignments.find((a) => a.isPrimary) || assignments[0];
+  const primaryBranch = primaryAssignment?.branchId || staff.branchId || staff.branch_id || '1';
+  const preservedRole =
+    staff.role === 'OWNER' || staff.role === 'SUPER_ADMIN'
+      ? staff.role
+      : (primaryAssignment?.role || staff.role);
+  return updateSalesperson(
+    staffId,
+    {
+      branchAssignments: assignments,
+      assignedBranchIds: assignments.map((a) => a.branchId),
+      branchId: primaryBranch,
+      branch_id: primaryBranch,
+      role: preservedRole,
+    } as any,
+    options
+  );
 };
 
 // ==================== CUSTOMER DAO ====================
@@ -4062,6 +4145,46 @@ export const addCashLog = (
   const updated = [newEntry, ...all.filter((c) => c.id !== newEntry.id)];
   setStored(STORAGE_KEYS.CASH_LOGS, updated);
 
+  // Record canonical supplier_payment movement for manual/Quick-Add Form 2 Direct Procurement payouts
+  const lowerLine = (newEntry.line || '').toLowerCase();
+  const lowerCat = (newEntry.category || '').toLowerCase();
+  const lowerDesc = (newEntry.description || '').toLowerCase();
+  const isManualProcurementOut =
+    (lowerLine === 'direct procurement' || lowerCat === 'direct procurement') &&
+    (Number(newEntry.out) || 0) > 0 &&
+    !(newEntry.reference && /^(D?GRV)-/i.test(newEntry.reference)) &&
+    !lowerDesc.includes('(grv:');
+
+  if (isManualProcurementOut && !entry.fromMesh && !options?.fromSync) {
+    const shiftDate = toDateStringSafe(newEntry.date) || getTodayDateString();
+    const existingMovs = getAllMovements();
+    const hasMov = existingMovs.some(
+      (m) =>
+        m.type === 'supplier_payment' &&
+        (m.sourceRef === newEntry.id ||
+          (newEntry.reference && m.sourceRef === newEntry.reference && m.staffId === newEntry.staffId))
+    );
+    if (!hasMov) {
+      addMovement({
+        shiftId: getShiftId(newEntry.staffId, shiftDate, brId),
+        staffId: newEntry.staffId,
+        date: shiftDate,
+        timestamp: newEntry.timestamp,
+        type: 'supplier_payment',
+        amount: Number(newEntry.out) || 0,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form2',
+        sourceRef: newEntry.id,
+        notes: newEntry.description || 'Direct Procurement',
+        company_id: compId,
+        branch_id: brId,
+      });
+    }
+  }
+
   // Only enqueue write to cloud if this action originated locally (not from mesh peer sync)
   if (!entry.skipSync && !entry.fromMesh && !options?.fromSync) {
     console.log(`[Row10] Direct enqueue: CashLog ${newEntry.id} (fromSync=${options?.fromSync ?? false})`);
@@ -4088,6 +4211,12 @@ export const deleteCashLog = (id: string): boolean => {
   const filtered = all.filter((item) => item.id !== id);
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.CASH_LOGS, filtered);
+  // Reverse any linked manual Form 2 cash movement
+  getAllMovements()
+    .filter((m) => m.sourceModule === 'form2' && m.sourceRef === id && m.status !== 'rejected')
+    .forEach((m) => {
+      updateMovement(m.id, { status: 'rejected', affectsDrawer: false });
+    });
   enqueueSync('CashLog', 'DELETE', { id, company_id: getCurrentCompanyId() });
   return true;
 };
@@ -4345,25 +4474,23 @@ export const saveDailyCashLogSheet = (
         const existingMovements = getAllMovements().filter(
           (m) => matchesShift(m, shiftId, currentBranch) && m.type === 'supplier_payment'
         );
-        const grvs = getDirectGrvsForStaffAndDate(staffId, date);
+        const grvs = getDirectGrvsForStaffAndDate(staffId, date, staffName);
         const isAlreadyInMovements = existingMovements.some((m) => {
-          if (entry.reference && m.sourceRef === entry.reference) return true;
+          if (entry.reference && (m.sourceRef === entry.reference || m.sourceRef?.startsWith(`${entry.reference}-`))) return true;
           if (m.notes && (m.notes.includes(entry.description) || entry.description.includes(m.notes))) return true;
-          const grvMatch = (entry.description + ' ' + (entry.reference || '')).match(/GRV[A-Z0-9_-]*/i);
+          const grvMatch = (entry.description + ' ' + (entry.reference || '')).match(/D?GRV[-A-Z0-9_]*/i);
           if (grvMatch && (m.sourceRef?.includes(grvMatch[0]) || m.notes?.includes(grvMatch[0]))) return true;
           return false;
         });
         const matchesGrv = grvs.some((g) => {
           const gRef = g.grvNumber || g.id;
-          const gTotal = g.totalCost || 0;
           return (
-            (entry.reference && entry.reference === gRef) ||
-            entry.description.includes(gRef) ||
-            Math.abs(gTotal - entry.out) < 0.01
+            (entry.reference && (entry.reference === gRef || entry.reference.startsWith(`${gRef}-`))) ||
+            entry.description.includes(gRef)
           );
         });
 
-        if (!isAlreadyInMovements) {
+        if (!isAlreadyInMovements && !matchesGrv) {
           addMovement({
             shiftId,
             staffId,
@@ -8644,10 +8771,35 @@ export const calculateForm4 = (
     );
     let expenses = totalTillExpenses;
 
-    // Direct Procurements: Calculate from breakdown or staff split payments on active (non-rejected) Direct GRVs
-    const staffGrvPayments = getDirectGrvPaymentsForStaff(staffId, date, false);
+    // Direct Procurements: combine staff split payments on active Direct GRVs + non-GRV Form 2 Direct Procurement logs
+    const staffGrvPayments = getDirectGrvPaymentsForStaff(staffId, date, false, staffName);
     const grvPayoutTotal = staffGrvPayments.reduce((sum, item) => sum + (Number(item.payment.amount) || 0), 0);
-    let directProcurements = Math.max(breakdown.directProcurements || 0, grvPayoutTotal);
+    const knownGrvRefsForDate = new Set<string>();
+    getDirectGrvs().forEach((g) => {
+      const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
+      if (gDate === date) {
+        if (g.id) knownGrvRefsForDate.add(g.id);
+        if (g.grvNumber) knownGrvRefsForDate.add(g.grvNumber);
+      }
+    });
+    const nonGrvProcLogs = form2Logs.filter(
+      (l) =>
+        (l.out || 0) > 0 &&
+        (l.line === 'Direct Procurement' ||
+          l.category === 'Direct Procurement' ||
+          (l as any).categoryGroup === 'Direct Procurement' ||
+          l.description?.toLowerCase().includes('direct procurement') ||
+          l.description?.toLowerCase().includes('procurement')) &&
+        !l.reference?.match(/^(D?GRV)-/i) &&
+        !l.description?.includes('(GRV:') &&
+        !Array.from(knownGrvRefsForDate).some(
+          (ref) =>
+            (l.reference && (l.reference === ref || l.reference.startsWith(`${ref}-`))) ||
+            (l.description && l.description.includes(ref))
+        )
+    );
+    const nonGrvProcTotal = nonGrvProcLogs.reduce((sum, l) => sum + (Number(l.out) || 0), 0);
+    let directProcurements = Math.max(breakdown.directProcurements || 0, grvPayoutTotal + nonGrvProcTotal);
     let cashLift = breakdown.cashLift;
     let customerChange = breakdown.changePaid;
     let deductions = 0; // All till expenses & petty cash are captured in expenses
@@ -8776,27 +8928,24 @@ export const calculateForm4 = (
   const float = floatLog?.in || 0;
 
   // Direct Procurements (Out) - attribute each operator's actual share, not the entire invoice total
-  const staffPayments = getDirectGrvPaymentsForStaff(staffId, date);
-  const directGrvs = getDirectGrvsForStaffAndDate(staffId, date);
+  const staffPayments = getDirectGrvPaymentsForStaff(staffId, date, false, staffName);
+  const directGrvs = getDirectGrvsForStaffAndDate(staffId, date, staffName);
   let grvTotal = 0;
   const processedGrvIds = new Set<string>();
 
   staffPayments.forEach(({ grv, payment }) => {
-    grvTotal += payment.amount || 0;
-    processedGrvIds.add(grv.id);
+    grvTotal += Number(payment.amount) || 0;
+    if (grv.id) processedGrvIds.add(grv.id);
     if (grv.grvNumber) processedGrvIds.add(grv.grvNumber);
   });
 
-  // Include any legacy GRVs that didn't have payments array but were received by this staff
-  directGrvs.forEach((g) => {
-    if (!processedGrvIds.has(g.id) && (!g.payments || g.payments.length === 0)) {
-      const gRecId = String(g.receivedByStaffId || '').trim().toLowerCase();
-      const sId = String(staffId).trim().toLowerCase();
-      if ((gRecId === sId || gRecId.replace(/^usr-|^staff-|^0+/, '') === sId.replace(/^usr-|^staff-|^0+/, '')) && g.payFromTill) {
-        grvTotal += g.totalCost || 0;
-        processedGrvIds.add(g.id);
-        if (g.grvNumber) processedGrvIds.add(g.grvNumber);
-      }
+  // Exclude all known Direct GRV refs for date (including non-till or rejected) so they aren't double-counted or leaked from stale logs
+  const allGrvRefsForDate = new Set<string>(processedGrvIds);
+  getDirectGrvs().forEach((g) => {
+    const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
+    if (gDate === date) {
+      if (g.id) allGrvRefsForDate.add(g.id);
+      if (g.grvNumber) allGrvRefsForDate.add(g.grvNumber);
     }
   });
 
@@ -8809,15 +8958,17 @@ export const calculateForm4 = (
           (l as any).categoryGroup === 'Direct Procurement' ||
           l.description?.toLowerCase().includes('direct procurement') ||
           l.description?.toLowerCase().includes('procurement')) &&
-        !Array.from(processedGrvIds).some((ref) => {
+        !l.reference?.match(/^(D?GRV)-/i) &&
+        !l.description?.includes('(GRV:') &&
+        !Array.from(allGrvRefsForDate).some((ref) => {
           return (
-            (l.reference && l.reference === ref) ||
+            (l.reference && (l.reference === ref || l.reference.startsWith(`${ref}-`))) ||
             (l.description && l.description.includes(ref))
           );
         })
     )
-    .reduce((sum, l) => sum + (l.out || 0), 0);
-  const directProcurements = grvTotal > 0 ? (grvTotal + nonGrvProcurements) : nonGrvProcurements;
+    .reduce((sum, l) => sum + (Number(l.out) || 0), 0);
+  const directProcurements = grvTotal + nonGrvProcurements;
 
   // Cash Lift (Out: supervisor pick-ups)
   const staffLifts = getCashLiftsForStaffAndDate(staffId, date);
@@ -9203,6 +9354,8 @@ export const calculateForm4 = (
     form3Credits.length > 0 ||
     totalSales > 0 ||
     staffSales.length > 0 ||
+    directProcurements > 0 ||
+    directGrvs.length > 0 ||
     actualCashCount !== null;
 
   let status: 'Balanced' | 'Over' | 'Shortage' | 'No Activity' = 'Balanced';
@@ -11447,12 +11600,24 @@ export const ingestMeshStaff = (
     hash = hashPin(rawPin, salt);
   }
 
+  const resolvedAssignments = Array.isArray(staff.branchAssignments)
+    ? staff.branchAssignments
+    : existing?.branchAssignments;
+  const resolvedAssignedBranchIds =
+    Array.isArray(resolvedAssignments) && resolvedAssignments.length > 0
+      ? resolvedAssignments.map((a) => a.branchId)
+      : (Array.isArray((staff as any).assignedBranchIds)
+          ? (staff as any).assignedBranchIds
+          : (existing as any)?.assignedBranchIds);
+
   const incomingTime = extractRecordTimestamp(staff);
   const now = Date.now();
   const normalized: Salesperson = {
     ...staff,
     companyId: compId,
     company_id: compId,
+    ...(resolvedAssignments !== undefined ? { branchAssignments: resolvedAssignments } : {}),
+    ...(resolvedAssignedBranchIds !== undefined ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
     pin_hash: hash,
     password: (staff as any).password || hash,
     pin_salt: salt,
@@ -11460,23 +11625,20 @@ export const ingestMeshStaff = (
     lastUpdated: staff.lastUpdated || new Date(incomingTime || now).toISOString(),
   } as any;
   delete (normalized as any).pin;
+  delete (normalized as any).fromMesh;
+  delete (normalized as any).fromSync;
 
   if (existing) {
     // Strict Last-Write-Wins (LWW) check (60000ms skew tolerance):
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
-    const incomingTime = parseTimestampMs(staff.updatedAt || staff.lastUpdated || (staff as any).hubTimestamp);
+    const incomingTimeCheck = parseTimestampMs(staff.updatedAt || staff.lastUpdated || (staff as any).hubTimestamp);
 
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+    if (existingTime > 0 && incomingTimeCheck > 0 && existingTime > incomingTimeCheck + 60000) {
       console.warn(
-        `[LWW Client] 🛡️ Rejected stale staff update for ${staff.name || staff.id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+        `[LWW Client] 🛡️ Rejected stale staff update for ${staff.name || staff.id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTimeCheck).toISOString()})`
       );
       return false;
     }
-
-    // Explicitly copy pin_hash / password into local record
-    existing.pin_hash = hash;
-    (existing as any).password = (staff as any).password || hash;
-    if (salt) existing.pin_salt = salt;
   }
 
   const savedStaff = saveSalesperson(normalized, { fromSync: true });
@@ -11532,13 +11694,21 @@ export const ingestMeshSupervisorApproval = (entry: AuditLogEntry): boolean => {
   // If this was an approved GRV or EOD, update corresponding record
   if (((entry.action as string) === 'APPROVE_DIRECT_GRV' || (entry.action as string) === 'DIRECT_GRV_APPROVE') && entry.referenceId) {
     const grvs = getDirectGrvs();
-    const grv = grvs.find((g) => g.grvNumber === entry.referenceId);
+    const grv = grvs.find((g) => g.grvNumber === entry.referenceId || g.id === entry.referenceId);
     if (grv && grv.status !== 'APPROVED') {
       grv.status = 'APPROVED';
       grv.approvedAt = entry.timestamp;
       (grv as any).approvedByName = entry.staffName;
       (grv as any).approvedById = entry.staffId;
+      grv.approvedByStaffId = entry.staffId;
+      grv.approvedByStaffName = entry.staffName;
       setStored(STORAGE_KEYS.DIRECT_GRVS, grvs);
+      recordDirectGrvTillPayouts({ ...grv, fromMesh: true } as any);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+      }
     }
   }
   notifyListeners();
@@ -17331,23 +17501,79 @@ export const activateCompanyWithCode = (
 // 52 GRANULAR PERMISSIONS DAO
 // ============================================================================
 
+const PERMISSIONS_UPDATED_AT_KEY = 'saimetric_permissions_updated_at';
+
+export type PermissionsMatrixChangeListener = (rules: PermissionRule[], updatedAt: number) => void;
+const permissionsMatrixChangeListeners: Set<PermissionsMatrixChangeListener> = new Set();
+
+export const onPermissionsMatrixChanged = (listener: PermissionsMatrixChangeListener) => {
+  permissionsMatrixChangeListeners.add(listener);
+  return () => {
+    permissionsMatrixChangeListeners.delete(listener);
+  };
+};
+
+const notifyPermissionsMatrixChanged = (rules: PermissionRule[], updatedAt: number) => {
+  permissionsMatrixChangeListeners.forEach((fn) => {
+    try {
+      fn(rules, updatedAt);
+    } catch (e) {
+      console.error('permissionsMatrixChangeListener error:', e);
+    }
+  });
+};
+
+export const getPermissionsMatrixUpdatedAt = (): number => {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const val = Number(localStorage.getItem(PERMISSIONS_UPDATED_AT_KEY) || '0');
+      return isNaN(val) ? 0 : val;
+    }
+  } catch {}
+  return 0;
+};
+
 export const getPermissionsList = (): PermissionRule[] => {
   return getStored<PermissionRule[]>(STORAGE_KEYS.PERMISSIONS, MASTER_PERMISSIONS_52);
 };
 
-export const savePermissionsList = (rules: PermissionRule[]): void => {
+export const savePermissionsList = (
+  rules: PermissionRule[],
+  options?: { fromSync?: boolean; updatedAt?: number }
+): void => {
+  const ts = options?.updatedAt && options.updatedAt > 0 ? options.updatedAt : Date.now();
   setStored(STORAGE_KEYS.PERMISSIONS, rules);
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(PERMISSIONS_UPDATED_AT_KEY, String(ts));
+    }
+  } catch {}
+  if (!options?.fromSync) {
+    notifyPermissionsMatrixChanged(rules, ts);
+  }
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_permissions_updated', { detail: rules }));
+  }
 };
 
 export const updatePermissionRule = (id: string, allowed: boolean): void => {
-  const list = getPermissionsList();
-  const idx = list.findIndex((p) => p.id === id);
-  if (idx >= 0) {
-    list[idx].allowed = allowed;
-    setStored(STORAGE_KEYS.PERMISSIONS, list);
-    notifyListeners();
+  const list = getPermissionsList().map((p) => (p.id === id ? { ...p, allowed } : p));
+  savePermissionsList(list, { fromSync: false });
+};
+
+export const ingestMeshPermissionsMatrix = (
+  rules: PermissionRule[],
+  incomingUpdatedAt?: number
+): boolean => {
+  if (!Array.isArray(rules) || rules.length === 0) return false;
+  const existingTime = getPermissionsMatrixUpdatedAt();
+  const incomingTime = typeof incomingUpdatedAt === 'number' && !isNaN(incomingUpdatedAt) ? incomingUpdatedAt : 0;
+  if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+    return false;
   }
+  savePermissionsList(rules, { fromSync: true, updatedAt: incomingTime || Date.now() });
+  return true;
 };
 
 export const hasStaffPermission = (role: string, module: string, action: string): boolean => {
@@ -17599,7 +17825,8 @@ export const getDirectGrvById = (id: string): DirectGrv | null => {
 export const getDirectGrvPaymentsForStaff = (
   staffId: string,
   date?: string,
-  includeRejected: boolean = false
+  includeRejected: boolean = false,
+  staffName?: string
 ): Array<{
   grv: DirectGrv;
   payment: DirectGrvTillPayment;
@@ -17608,30 +17835,50 @@ export const getDirectGrvPaymentsForStaff = (
   const results: Array<{ grv: DirectGrv; payment: DirectGrvTillPayment }> = [];
   const targetId = String(staffId || '').trim().toLowerCase();
   const normTarget = targetId.replace(/^usr-|^staff-|^0+/, '');
+  const normTargetName = String(staffName || '').trim().toLowerCase();
+
+  const matchesOperator = (opId?: string, opName?: string): boolean => {
+    const cleanId = String(opId || '').trim().toLowerCase();
+    const normOp = cleanId.replace(/^usr-|^staff-|^0+/, '');
+    if (cleanId && targetId && (cleanId === targetId || (normTarget && normOp === normTarget))) {
+      return true;
+    }
+    const cleanName = String(opName || '').trim().toLowerCase();
+    if (normTargetName && cleanName && cleanName === normTargetName) {
+      return true;
+    }
+    return false;
+  };
 
   grvs.forEach((grv) => {
     if (!includeRejected && grv.status === 'REJECTED') return;
-    const gDate = grv.date || toDateStringSafe(grv.createdAt);
+    const isNonTill =
+      grv.payFromTill === false ||
+      grv.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
+      grv.paymentMethod === 'CREDIT' ||
+      grv.paymentMethod === 'BANK' ||
+      grv.paymentStatus === 'AWAITING_SAFE_PAYMENT';
+    if (isNonTill) return;
+
+    const gDate = toDateStringSafe(grv.date) || toDateStringSafe(grv.createdAt);
     if (date && gDate !== date) return;
 
-    if (grv.payments && grv.payments.length > 0) {
+    const hasPositivePayments =
+      Array.isArray(grv.payments) && grv.payments.some((p) => (Number(p.amount) || 0) > 0);
+
+    if (hasPositivePayments && grv.payments) {
       grv.payments.forEach((p) => {
-        const pId = String(p.userId || '').trim().toLowerCase();
-        const normP = pId.replace(/^usr-|^staff-|^0+/, '');
-        const matchesStaff = pId === targetId || (normTarget && normP === normTarget);
-        if (matchesStaff && (Number(p.amount) || 0) > 0) {
+        if (matchesOperator(p.userId, p.userName) && (Number(p.amount) || 0) > 0) {
           results.push({ grv, payment: p });
         }
       });
-    } else if (grv.payFromTill && (Number(grv.totalCost) || 0) > 0) {
-      const recId = String(grv.receivedByStaffId || '').trim().toLowerCase();
-      const normRec = recId.replace(/^usr-|^staff-|^0+/, '');
-      if (recId === targetId || (normTarget && normRec === normTarget)) {
+    } else if (grv.payFromTill !== false && (Number(grv.totalCost) || 0) > 0) {
+      if (matchesOperator(grv.receivedByStaffId, grv.receivedByStaffName)) {
         results.push({
           grv,
           payment: {
             userId: grv.receivedByStaffId || staffId,
-            userName: grv.receivedByStaffName || 'Cashier',
+            userName: grv.receivedByStaffName || staffName || 'Cashier',
             amount: Number(grv.totalCost) || 0,
             drawerId: 'Till 1',
             pinConfirmed: true,
@@ -17644,28 +17891,47 @@ export const getDirectGrvPaymentsForStaff = (
   return results;
 };
 
-export const getDirectGrvsForStaffAndDate = (staffId: string, date: string): DirectGrv[] => {
+export const getDirectGrvsForStaffAndDate = (
+  staffId: string,
+  date: string,
+  staffName?: string
+): DirectGrv[] => {
   const grvs = getDirectGrvs();
-  const targetId = String(staffId).trim().toLowerCase();
+  const targetId = String(staffId || '').trim().toLowerCase();
   const normTarget = targetId.replace(/^usr-|^staff-|^0+/, '');
+  const normTargetName = String(staffName || '').trim().toLowerCase();
+
+  const matchesOperator = (opId?: string, opName?: string): boolean => {
+    const cleanId = String(opId || '').trim().toLowerCase();
+    const normOp = cleanId.replace(/^usr-|^staff-|^0+/, '');
+    if (cleanId && targetId && (cleanId === targetId || (normTarget && normOp === normTarget))) {
+      return true;
+    }
+    const cleanName = String(opName || '').trim().toLowerCase();
+    if (normTargetName && cleanName && cleanName === normTargetName) {
+      return true;
+    }
+    return false;
+  };
 
   return grvs.filter((g) => {
     if (g.status === 'REJECTED') return false;
-    const gDate = g.date || toDateStringSafe(g.createdAt);
+    if (
+      g.payFromTill === false ||
+      g.paymentMethod === 'INVOICE_ON_ACCOUNT' ||
+      g.paymentMethod === 'CREDIT' ||
+      g.paymentMethod === 'BANK' ||
+      g.paymentStatus === 'AWAITING_SAFE_PAYMENT'
+    ) {
+      return false;
+    }
+    const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
     if (gDate !== date) return false;
 
-    // Check receivedByStaffId
-    const recId = g.receivedByStaffId ? String(g.receivedByStaffId).trim().toLowerCase() : '';
-    const normRec = recId.replace(/^usr-|^staff-|^0+/, '');
-    if (recId === targetId || (normTarget && normRec === normTarget)) return true;
+    if (matchesOperator(g.receivedByStaffId, g.receivedByStaffName)) return true;
 
-    // Check payments from till
     if (g.payments && g.payments.length > 0) {
-      return g.payments.some((p) => {
-        const pId = p.userId ? String(p.userId).trim().toLowerCase() : '';
-        const normP = pId.replace(/^usr-|^staff-|^0+/, '');
-        return pId === targetId || (normTarget && normP === normTarget);
-      });
+      return g.payments.some((p) => (Number(p.amount) || 0) > 0 && matchesOperator(p.userId, p.userName));
     }
 
     return false;
@@ -17673,10 +17939,15 @@ export const getDirectGrvsForStaffAndDate = (staffId: string, date: string): Dir
 };
 
 export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
-  const isPayFromTill = grv.payFromTill !== false && grv.paymentMethod !== 'INVOICE_ON_ACCOUNT' && grv.paymentMethod !== 'CREDIT' && grv.paymentMethod !== 'BANK';
+  const isPayFromTill =
+    grv.payFromTill !== false &&
+    grv.paymentMethod !== 'INVOICE_ON_ACCOUNT' &&
+    grv.paymentMethod !== 'CREDIT' &&
+    grv.paymentMethod !== 'BANK' &&
+    grv.paymentStatus !== 'AWAITING_SAFE_PAYMENT';
 
   if (grv.status === 'REJECTED' || !isPayFromTill) {
-    // If rejected, deactivate movements and set CashLog out to 0 so the money is returned to the drawer
+    // If rejected or non-till, deactivate movements and set CashLog out to 0 so the money is returned to the drawer
     // but the rejection reason and audit trail remain visible in Form 2
     const existingMovements = getMovements();
     existingMovements
@@ -17701,16 +17972,17 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
     return;
   }
 
-  const shiftDate = grv.date || (grv.createdAt ? grv.createdAt.split('T')[0] : new Date().toISOString().split('T')[0]);
+  const shiftDate = toDateStringSafe(grv.date) || toDateStringSafe(grv.createdAt) || getTodayDateString();
   const now = grv.createdAt || new Date().toISOString();
   const compId = (grv as any).companyId || (grv as any).company_id || getCurrentCompanyId();
   const brId = (grv as any).branchId || (grv as any).branch_id || getCurrentBranchId();
+  const isFromMesh = Boolean((grv as any).fromMesh);
 
   // Determine payments for each till operator
   const payments: DirectGrvTillPayment[] =
     grv.payments && grv.payments.length > 0 && grv.payments.some((p: any) => (Number(p.amount) || 0) > 0)
       ? grv.payments.filter((p: any) => (Number(p.amount) || 0) > 0)
-      : (grv.payFromTill && (grv.totalCost || 0) > 0)
+      : (grv.payFromTill !== false && (grv.totalCost || 0) > 0)
       ? [
           {
             userId: grv.receivedByStaffId || 'USR-003',
@@ -17729,25 +18001,37 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
   payments.forEach((p, pIdx) => {
     const amt = Number(p.amount) || 0;
     if (amt <= 0 || !p.userId) return;
-    const staffShiftId = getShiftId(p.userId, shiftDate);
+    const staffShiftId = getShiftId(p.userId, shiftDate, brId);
     // Distinct cashier-specific voucher reference to prevent cross-cashier overwriting on split payments
     const voucherKey = `${grv.grvNumber}-${p.userId}`;
+    const normPId = String(p.userId).trim().toLowerCase().replace(/^usr-|^staff-|^0+/, '');
 
-    const existingM = existingMovements.find(
-      (m) =>
-        m.type === 'supplier_payment' &&
-        m.staffId === p.userId &&
-        (m.sourceRef === voucherKey ||
-          m.sourceRef === grv.grvNumber ||
-          m.sourceRef === `${grv.grvNumber}-P${pIdx + 1}` ||
-          m.sourceRef === grv.id ||
-          (m.notes && m.notes.includes(grv.grvNumber)))
-    );
+    const existingM = existingMovements.find((m) => {
+      if (m.type !== 'supplier_payment') return false;
+      const mNormId = String(m.staffId || '').trim().toLowerCase().replace(/^usr-|^staff-|^0+/, '');
+      const sameStaff = m.staffId === p.userId || (Boolean(normPId) && mNormId === normPId);
+      if (!sameStaff) return false;
+      return (
+        m.sourceRef === voucherKey ||
+        m.sourceRef === grv.grvNumber ||
+        m.sourceRef === `${grv.grvNumber}-P${pIdx + 1}` ||
+        m.sourceRef === grv.id ||
+        Boolean(m.notes && m.notes.includes(grv.grvNumber))
+      );
+    });
 
     if (existingM) {
-      if (existingM.amount !== amt || existingM.status !== 'approved' || !existingM.affectsDrawer || existingM.sourceRef !== voucherKey) {
+      if (
+        existingM.amount !== amt ||
+        existingM.status !== 'approved' ||
+        !existingM.affectsDrawer ||
+        existingM.sourceRef !== voucherKey ||
+        existingM.date !== shiftDate
+      ) {
         updateMovement(existingM.id, {
           amount: amt,
+          date: shiftDate,
+          shiftId: staffShiftId,
           status: 'approved',
           affectsDrawer: true,
           direction: 'out',
@@ -17778,24 +18062,33 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
 
     const hasLog = currentLogs.some(
       (l) =>
-        l.staffId === p.userId &&
+        (l.staffId === p.userId ||
+          (Boolean(normPId) &&
+            String(l.staffId || '').trim().toLowerCase().replace(/^usr-|^staff-|^0+/, '') === normPId)) &&
         l.date === shiftDate &&
         (l.reference === voucherKey || l.reference === grv.grvNumber || l.description.includes(grv.grvNumber))
     );
 
     if (!hasLog) {
-      addCashLog({
-        timestamp: now,
-        date: shiftDate,
-        staffId: p.userId,
-        staffName: p.userName,
-        line: 'Direct Procurement',
-        description: `Direct Supplier Delivery Payout: ${grv.supplierName} (${grv.grvNumber}) - Payout from ${p.userName} till`,
-        in: 0,
-        out: amt,
-        category: 'Direct Procurement',
-        reference: voucherKey,
-      });
+      addCashLog(
+        {
+          timestamp: now,
+          date: shiftDate,
+          staffId: p.userId,
+          staffName: p.userName,
+          line: 'Direct Procurement',
+          description: `Direct Supplier Delivery Payout: ${grv.supplierName} (${grv.grvNumber}) - Payout from ${p.userName} till`,
+          in: 0,
+          out: amt,
+          category: 'Direct Procurement',
+          reference: voucherKey,
+          company_id: compId,
+          branch_id: brId,
+          skipSync: isFromMesh,
+          fromMesh: isFromMesh,
+        },
+        isFromMesh ? { fromSync: true } : undefined
+      );
     }
   });
 };

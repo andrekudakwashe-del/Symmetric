@@ -755,6 +755,13 @@ class PersistentSyncEngine {
           const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
           const pinHash = u.pin_hash || existingStaff?.pin_hash;
           const pinSalt = u.pin_salt || existingStaff?.pin_salt;
+          const resolvedBranchId = u.branch_id || u.branchId || existingStaff?.branchId || 'BR-MAIN';
+          const resolvedBranchAssignments = u.branchAssignments || existingStaff?.branchAssignments;
+          const resolvedAssignedBranchIds =
+            u.assignedBranchIds ||
+            (Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
+              ? resolvedBranchAssignments.map((a: any) => a.branchId).filter(Boolean)
+              : (existingStaff as any)?.assignedBranchIds);
           const userPerson: Salesperson = {
             id: staffId,
             name: u.full_name || u.name || 'Staff',
@@ -763,8 +770,13 @@ class PersistentSyncEngine {
             ...(pinHash ? { pin_hash: pinHash, pin_salt: pinSalt } : { pin: String(u.pin || '1234') }),
             active: (u.is_active !== false && u.active !== 'N' && u.active !== false) ? 'Y' : 'N',
             companyId: u.company_id || companyId,
-            branchId: u.branch_id || 'BR-MAIN',
-          };
+            branchId: resolvedBranchId,
+            branch_id: resolvedBranchId,
+            ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
+            ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
+            ...(u.permissions || existingStaff?.permissions ? { permissions: u.permissions || existingStaff?.permissions } : {}),
+            ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
+          } as any;
           const savedStaff = saveSalesperson(userPerson, { fromSync: true });
           console.log(
             '[STAFF TRACE] 7. Saved to DB. New Pin:',
@@ -838,6 +850,13 @@ class PersistentSyncEngine {
         const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
         const pinHash = u.pin_hash || existingStaff?.pin_hash;
         const pinSalt = u.pin_salt || existingStaff?.pin_salt;
+        const resolvedBranchId = u.branch_id || u.branchId || existingStaff?.branchId || 'BR-MAIN';
+        const resolvedBranchAssignments = u.branchAssignments || existingStaff?.branchAssignments;
+        const resolvedAssignedBranchIds =
+          u.assignedBranchIds ||
+          (Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
+            ? resolvedBranchAssignments.map((a: any) => a.branchId).filter(Boolean)
+            : (existingStaff as any)?.assignedBranchIds);
         const savedStaff = saveSalesperson({
           id: staffId,
           name: u.full_name || u.name || 'Staff',
@@ -846,8 +865,13 @@ class PersistentSyncEngine {
           ...(pinHash ? { pin_hash: pinHash, pin_salt: pinSalt } : { pin: String(u.pin || '1234') }),
           active: (u.is_active !== false && u.active !== 'N' && u.active !== false) ? 'Y' : 'N',
           companyId: u.company_id || currentCompany.company_id,
-          branchId: u.branch_id || 'BR-MAIN',
-        }, { fromSync: true });
+          branchId: resolvedBranchId,
+          branch_id: resolvedBranchId,
+          ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
+          ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
+          ...(u.permissions || existingStaff?.permissions ? { permissions: u.permissions || existingStaff?.permissions } : {}),
+          ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
+        } as any, { fromSync: true });
         console.log(
           '[STAFF TRACE] 7. Saved to DB. New Pin:',
           savedStaff.pin_hash,

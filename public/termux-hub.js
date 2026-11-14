@@ -251,6 +251,8 @@ let salespeopleStore = [];
 let customersStore = [];
 let branchesStore = [];
 let cashAccountsStore = [];
+let permissionsMatrixStore = { rules: [], updatedAt: 0 };
+let roleConfigsStore = { definitions: null, updatedAt: 0 };
 
 // Tombstones Store (Soft Deletes across multi-device Wi-Fi)
 let tombstonesStore = [];
@@ -497,6 +499,18 @@ function loadData() {
       if (Array.isArray(parsed.stocktakeSessions)) stocktakeSessionsStore = parsed.stocktakeSessions;
       if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
       if (Array.isArray(parsed.tombstones)) tombstonesStore = parsed.tombstones;
+      if (parsed.permissionsMatrix && Array.isArray(parsed.permissionsMatrix.rules)) {
+        permissionsMatrixStore = {
+          rules: parsed.permissionsMatrix.rules,
+          updatedAt: Number(parsed.permissionsMatrix.updatedAt) || 0,
+        };
+      }
+      if (parsed.roleConfigs && parsed.roleConfigs.definitions && typeof parsed.roleConfigs.definitions === 'object') {
+        roleConfigsStore = {
+          definitions: parsed.roleConfigs.definitions,
+          updatedAt: Number(parsed.roleConfigs.updatedAt) || 0,
+        };
+      }
 
       console.log(
         `[Termux Hub] Loaded from disk: [Branch: ${hubBranchId} - ${hubBranchName}], ${salesStore.length} sales, ${directGrvsStore.length} direct GRVs, ${inventoryStore.length} items, ${salespeopleStore.length} staff, ${customersStore.length} customers, ${branchesStore.length} branches, ${cashAccountsStore.length} cash accounts, ${suppliersStore.length} suppliers, ${adminSalesStore.length} admin sales, ${cashCountsStore.length} cash counts, ${vouchersStore.length} vouchers, ${businessDayClosuresStore.length} closures, ${electronicSettlementsStore.length} settlements, ${categoriesStore.length} categories, ${tombstonesStore.length} tombstones.`
@@ -552,6 +566,8 @@ function saveData() {
       stocktakeSessions: stocktakeSessionsStore.slice(0, 500),
       stocktakeSegments: stocktakeSegmentsStore.slice(0, 2000),
       tombstones: tombstonesStore.slice(0, 5000),
+      permissionsMatrix: permissionsMatrixStore,
+      roleConfigs: roleConfigsStore,
       savedAt: new Date().toISOString(),
     };
 
@@ -1317,6 +1333,8 @@ wss.on('connection', (ws, req) => {
         cashAccountsStore = [];
         businessDayClosuresStore = [];
         electronicSettlementsStore = [];
+        permissionsMatrixStore = { rules: [], updatedAt: 0 };
+        roleConfigsStore = { definitions: null, updatedAt: 0 };
 
         hubBranchId = packet.new_branch_id || 'UNASSIGNED';
         hubBranchName = packet.new_branch_name || 'Unassigned Hub';
@@ -3013,10 +3031,23 @@ wss.on('connection', (ws, req) => {
         staffObj = { ...rawStaffObj };
         delete staffObj.pin; // CRITICAL: Never retain plain-text PIN in hub memory or disk
       }
-      const isStaff = pType === 'STAFF' || pType === 'STAFF_SYNC' || pType === 'STAFF_RECORD' || sheetName === 'Salespeople' || sheetName === 'users' || !!staffObj;
+      const isStaff =
+        pType === 'STAFF' ||
+        pType === 'STAFF_SYNC' ||
+        pType === 'STAFF_RECORD' ||
+        pType === 'STAFF_PERMISSION' ||
+        pType === 'STAFF_PERMISSION_RECORD' ||
+        sheetName === 'Salespeople' ||
+        sheetName === 'users' ||
+        !!staffObj;
       if (isStaff && staffObj && staffObj.id) {
         const hubNow = Date.now();
         const hubIso = new Date().toISOString();
+        if (Array.isArray(staffObj.branchAssignments) && staffObj.branchAssignments.length > 0) {
+          staffObj.assignedBranchIds = staffObj.branchAssignments.map((a) => a.branchId).filter(Boolean);
+        } else if (staffObj.branchId && !Array.isArray(staffObj.assignedBranchIds)) {
+          staffObj.assignedBranchIds = [staffObj.branchId];
+        }
         const sIdx = salespeopleStore.findIndex((s) => s.id === staffObj.id);
         const incomingTime = getTimestamp(staffObj);
         let accepted = true;
@@ -3051,13 +3082,16 @@ wss.on('connection', (ws, req) => {
           staffObj.hubTimestamp = hubNow;
           staffObj.lastUpdated = hubIso;
 
+          let mergedStaff = staffObj;
           if (sIdx >= 0) {
-            salespeopleStore[sIdx] = { ...salespeopleStore[sIdx], ...staffObj };
+            mergedStaff = { ...salespeopleStore[sIdx], ...staffObj };
+            delete mergedStaff.pin;
+            salespeopleStore[sIdx] = mergedStaff;
           } else {
-            salespeopleStore.unshift(staffObj);
+            salespeopleStore.unshift(mergedStaff);
           }
           scheduleSave();
-          console.log(`[Termux Hub] 👤 Synced Staff account securely: ${staffObj.name} (${staffObj.id} - ${staffObj.role}) stamped at ${hubIso}`);
+          console.log(`[Termux Hub] 👤 Synced Staff account securely: ${mergedStaff.name} (${mergedStaff.id} - ${mergedStaff.role}) stamped at ${hubIso}`);
 
           // Send SYNC_ACK
           try {
@@ -3065,21 +3099,24 @@ wss.on('connection', (ws, req) => {
               type: 'SYNC_ACK',
               action: 'SYNC_ACK',
               entityType: 'STAFF',
-              id: staffObj.id,
+              id: mergedStaff.id,
               updatedAt: hubNow,
               hubTimestamp: hubNow,
               lastUpdated: hubIso,
             }));
           } catch (e) {}
 
-          // Broadcast updated staff to other peers
+          // Broadcast merged staff record to other peers
           const staffBroadcastStr = JSON.stringify({
             type: 'STAFF',
             action: 'STAFF_SYNC',
-            staff: staffObj,
-            payload: staffObj,
-            origin_device_id: 'LOCAL_HUB',
-            origin_device_name: 'Termux Local Hub',
+            staff: mergedStaff,
+            payload: mergedStaff,
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
+            origin_device_id: packet.origin_device_id || packet.originDeviceId || 'LOCAL_HUB',
+            origin_device_name: packet.origin_device_name || packet.originDeviceName || 'Termux Local Hub',
             timestamp: hubNow,
           });
           wss.clients.forEach((client) => {
@@ -3089,8 +3126,119 @@ wss.on('connection', (ws, req) => {
           });
 
           // Edge Gateway: Background HTTP push to Cloud Bridge (App Scripts / Supabase)
-          pushToCloud('STAFF', staffObj);
+          pushToCloud('STAFF', mergedStaff);
         }
+        return;
+      }
+
+      // =====================================================================
+      // 9.1b CONFIGURATION DATA: 52 GRANULAR PERMISSIONS MATRIX (STRICT LWW)
+      // =====================================================================
+      if (pType === 'PERMISSIONS_MATRIX' || pType === 'PERMISSIONS_MATRIX_SYNC') {
+        const incomingRules = packet.rules || packet.permissionsMatrix?.rules || (Array.isArray(payload) ? payload : payload?.rules);
+        if (Array.isArray(incomingRules) && incomingRules.length > 0) {
+          const hubNow = Date.now();
+          const incomingTime = Number(packet.updatedAt ?? packet.permissionsMatrix?.updatedAt ?? packet.timestamp) || hubNow;
+          const existingTime = Number(permissionsMatrixStore.updatedAt) || 0;
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'PERMISSIONS_MATRIX_SYNC',
+                action: 'PERMISSIONS_MATRIX_SYNC',
+                rules: permissionsMatrixStore.rules,
+                permissionsMatrix: permissionsMatrixStore,
+                updatedAt: existingTime,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+          } else {
+            permissionsMatrixStore = { rules: incomingRules, updatedAt: hubNow };
+            scheduleSave();
+            console.log(`[Termux Hub] 🔐 Synced Permissions Matrix (${incomingRules.length} rules)`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'SYNC_ACK',
+                action: 'SYNC_ACK',
+                entityType: 'PERMISSIONS_MATRIX',
+                updatedAt: hubNow,
+              }));
+            } catch (e) {}
+            const permsBroadcastStr = JSON.stringify({
+              type: 'PERMISSIONS_MATRIX_SYNC',
+              action: 'PERMISSIONS_MATRIX_SYNC',
+              rules: permissionsMatrixStore.rules,
+              permissionsMatrix: permissionsMatrixStore,
+              payload: permissionsMatrixStore,
+              updatedAt: hubNow,
+              origin_device_id: packet.origin_device_id || packet.originDeviceId || 'LOCAL_HUB',
+              origin_device_name: packet.origin_device_name || packet.originDeviceName || 'Termux Local Hub',
+              timestamp: hubNow,
+            });
+            wss.clients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                try { client.send(permsBroadcastStr); } catch (e) {}
+              }
+            });
+          }
+        }
+        return;
+      }
+
+      // =====================================================================
+      // 9.1c CONFIGURATION DATA: ROLE CONFIGURATIONS & MODULE ACCESS (LWW)
+      // =====================================================================
+      if (pType === 'ROLE_CONFIGS' || pType === 'ROLE_CONFIGS_SYNC') {
+        const incomingDefs = packet.definitions || packet.roleConfigs?.definitions || payload?.definitions || (payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null);
+        if (incomingDefs && typeof incomingDefs === 'object') {
+          const hubNow = Date.now();
+          const incomingTime = Number(packet.updatedAt ?? packet.roleConfigs?.updatedAt ?? packet.timestamp) || hubNow;
+          const existingTime = Number(roleConfigsStore.updatedAt) || 0;
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'ROLE_CONFIGS_SYNC',
+                action: 'ROLE_CONFIGS_SYNC',
+                definitions: roleConfigsStore.definitions,
+                roleConfigs: roleConfigsStore,
+                updatedAt: existingTime,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+          } else {
+            roleConfigsStore = { definitions: incomingDefs, updatedAt: hubNow };
+            scheduleSave();
+            console.log(`[Termux Hub] 🛡️ Synced Role Configurations`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'SYNC_ACK',
+                action: 'SYNC_ACK',
+                entityType: 'ROLE_CONFIGS',
+                updatedAt: hubNow,
+              }));
+            } catch (e) {}
+            const rolesBroadcastStr = JSON.stringify({
+              type: 'ROLE_CONFIGS_SYNC',
+              action: 'ROLE_CONFIGS_SYNC',
+              definitions: roleConfigsStore.definitions,
+              roleConfigs: roleConfigsStore,
+              payload: roleConfigsStore,
+              updatedAt: hubNow,
+              origin_device_id: packet.origin_device_id || packet.originDeviceId || 'LOCAL_HUB',
+              origin_device_name: packet.origin_device_name || packet.originDeviceName || 'Termux Local Hub',
+              timestamp: hubNow,
+            });
+            wss.clients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                try { client.send(rolesBroadcastStr); } catch (e) {}
+              }
+            });
+          }
+        }
+        return;
       }
 
       // =====================================================================
@@ -3695,6 +3843,12 @@ wss.on('connection', (ws, req) => {
             stocktakeSessions: stocktakeSessionsStore,
             stocktakeSegments: stocktakeSegmentsStore,
             tombstones: missedTombstones,
+            ...(Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && ((permissionsMatrixStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
+              ? { permissionsMatrix: permissionsMatrixStore }
+              : {}),
+            ...(roleConfigsStore.definitions && ((roleConfigsStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
+              ? { roleConfigs: roleConfigsStore }
+              : {}),
           },
         };
 
