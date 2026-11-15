@@ -53,10 +53,15 @@ import {
   pullTenantSales,
   clearAllSyncQueueItems,
   markReceiptAsSynced,
+  parseTimestampMs,
 } from '../db/roomDatabase';
 import { retentionLifecycleService } from './backendAdapter/retentionService';
 import { Company, SaaSBranch } from '../data/saasData';
 import { Salesperson, Branch } from '../types';
+import {
+  isAppScriptsIngestPaused,
+  routeCloudRecordThroughSyncCore,
+} from './sync/syncIngestBridge';
 
 // Exponential backoff schedule in milliseconds: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s (cap)
 const BACKOFF_SCHEDULE_MS = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 300000];
@@ -186,14 +191,16 @@ class PersistentSyncEngine {
     // 3. Register Background Sync API if supported
     this.registerBackgroundSync();
 
-    // 4. Force initial drain of any pending items
-    this.drainSyncQueue().catch((err) => console.warn('[SyncEngine] Initial queue drain error:', err));
+    // 4. Force initial drain & delta refresh only if AppScriptsAdapter is not paused
+    if (!this.isOutboundSyncPaused && !isAppScriptsIngestPaused()) {
+      this.drainSyncQueue().catch((err) => console.warn('[SyncEngine] Initial queue drain error:', err));
 
-    // 5. Force initial delta refresh & tenant context refresh
-    this.performDeltaSync().catch((err) => console.warn('[SyncEngine] Initial delta sync error:', err));
-    this.refreshTenantContext().catch((err) => console.warn('[SyncEngine] Initial tenant context error:', err));
-    pullTenantInventory().catch(() => {});
-    pullTenantSales().catch(() => {});
+      // 5. Force initial delta refresh & tenant context refresh
+      this.performDeltaSync().catch((err) => console.warn('[SyncEngine] Initial delta sync error:', err));
+      this.refreshTenantContext().catch((err) => console.warn('[SyncEngine] Initial tenant context error:', err));
+      pullTenantInventory().catch(() => {});
+      pullTenantSales().catch(() => {});
+    }
 
     // 6. Start Background Workers
     // - Queue worker: every 30 seconds
@@ -366,7 +373,7 @@ class PersistentSyncEngine {
    * Drains pending items with tenant isolation and high-speed batching for high volume items.
    */
   public async drainSyncQueue(companyId?: string): Promise<{ processed: number; succeeded: number; failed: number }> {
-    if (this.isOutboundSyncPaused) {
+    if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
       console.log('[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping drainSyncQueue.');
       return { processed: 0, succeeded: 0, failed: 0 };
     }
@@ -545,7 +552,7 @@ class PersistentSyncEngine {
       const isLocalHubActive = () => this.isOutboundSyncPaused;
       console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', isLocalHubActive());
     }
-    if (this.isOutboundSyncPaused) {
+    if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
       console.log(`[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping pushSingleItem for ${item.id} (${item.sheetName}).`);
       return false;
     }
@@ -722,7 +729,7 @@ class PersistentSyncEngine {
    * Calls get_users_since(lastSyncAt) and get_branches_since(lastSyncAt).
    */
   public async performDeltaSync(): Promise<{ usersCount: number; branchesCount: number }> {
-    if (this.isOutboundSyncPaused) {
+    if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
       console.log('[PersistentSyncEngine] 🛑 Cloud delta sync suspended (Local Hub is Edge Gateway). Skipping performDeltaSync.');
       return { usersCount: 0, branchesCount: 0 };
     }
@@ -739,7 +746,7 @@ class PersistentSyncEngine {
     let branchesCount = 0;
 
     try {
-      // 1. Refresh Users
+      // 1. Refresh Users (routed through SyncCore T2 LWW gate)
       const usersMeta = await getSyncMeta('users');
       const sinceUsers = usersMeta?.lastSyncAt || '1970-01-01T00:00:00.000Z';
       const usersRes = await this.fetchServerAction('get_users_since', {
@@ -777,22 +784,43 @@ class PersistentSyncEngine {
             ...(u.permissions || existingStaff?.permissions ? { permissions: u.permissions || existingStaff?.permissions } : {}),
             ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
           } as any;
-          const savedStaff = saveSalesperson(userPerson, { fromSync: true });
-          console.log(
-            '[STAFF TRACE] 7. Saved to DB. New Pin:',
-            savedStaff.pin_hash,
-            'New Branches:',
-            (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
-            'Role:',
-            savedStaff.role
+
+          const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || Date.now();
+          const resIngest = await routeCloudRecordThroughSyncCore(
+            {
+              packetId: `CLOUD-STAFF-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
+              entityType: 'staff',
+              entityId: String(staffId),
+              action: 'UPSERT',
+              data: userPerson,
+              updatedAt: incomingTs,
+              originDeviceId: 'APPS_SCRIPT_CLOUD',
+              targetBranchId: 'ALL',
+              class: 'T2',
+            },
+            existingStaff,
+            () => {
+              const savedStaff = saveSalesperson(userPerson, { fromSync: true });
+              console.log(
+                '[STAFF TRACE] 7. Saved to DB. New Pin:',
+                savedStaff.pin_hash,
+                'New Branches:',
+                (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+                'Role:',
+                savedStaff.role
+              );
+              usersCount++;
+            }
           );
-          usersCount++;
+          if (!resIngest.accepted && resIngest.reason === 'STALE_T2') {
+            console.warn(`[SyncCore Gate] 🛡️ Rejected stale AppScripts staff update for ${staffId} (${resIngest.reason})`);
+          }
         }
         const serverTime = usersRes.server_time || new Date().toISOString();
         await setSyncMeta('users', serverTime, serverTime);
       }
 
-      // 2. Refresh Branches
+      // 2. Refresh Branches (routed through SyncCore T2 LWW gate)
       const branchesMeta = await getSyncMeta('branches');
       const sinceBranches = branchesMeta?.lastSyncAt || '1970-01-01T00:00:00.000Z';
       const branchesRes = await this.fetchServerAction('get_branches_since', {
@@ -803,6 +831,8 @@ class PersistentSyncEngine {
       if (branchesRes && branchesRes.success && Array.isArray(branchesRes.branches)) {
         for (const b of branchesRes.branches) {
           const brId = b.branch_id || b.branchId || 'BR-MAIN';
+          const existingBranch = getBranches().find((eb) => eb.branchId === brId || eb.id === brId);
+          const incomingTs = parseTimestampMs(b.updatedAt || b.updated_at || b.lastUpdated) || Date.now();
           const branchObj: Branch = {
             id: brId,
             branchId: brId,
@@ -813,9 +843,27 @@ class PersistentSyncEngine {
             company_id: b.company_id || companyId,
             companyId: b.company_id || companyId,
             is_active: b.is_active !== false,
-          };
-          saveBranch(branchObj, { fromSync: true });
-          branchesCount++;
+            ...(b.updatedAt || b.updated_at ? { updatedAt: b.updatedAt || b.updated_at } : {}),
+          } as any;
+
+          await routeCloudRecordThroughSyncCore(
+            {
+              packetId: `CLOUD-BRANCH-${brId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
+              entityType: 'branch',
+              entityId: String(brId),
+              action: 'UPSERT',
+              data: branchObj,
+              updatedAt: incomingTs,
+              originDeviceId: 'APPS_SCRIPT_CLOUD',
+              targetBranchId: 'ALL',
+              class: 'T2',
+            },
+            existingBranch,
+            () => {
+              saveBranch(branchObj, { fromSync: true });
+              branchesCount++;
+            }
+          );
         }
         const serverTime = branchesRes.server_time || new Date().toISOString();
         await setSyncMeta('branches', serverTime, serverTime);
@@ -832,7 +880,7 @@ class PersistentSyncEngine {
   }
 
   public async forceRefreshStaff(): Promise<number> {
-    if (this.isOutboundSyncPaused) {
+    if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
       console.log('[PersistentSyncEngine] 🛑 Cloud staff refresh suspended (Local Hub is Edge Gateway). Skipping forceRefreshStaff.');
       return 0;
     }
@@ -857,7 +905,7 @@ class PersistentSyncEngine {
           (Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
             ? resolvedBranchAssignments.map((a: any) => a.branchId).filter(Boolean)
             : (existingStaff as any)?.assignedBranchIds);
-        const savedStaff = saveSalesperson({
+        const userObj: any = {
           id: staffId,
           name: u.full_name || u.name || 'Staff',
           email: u.email || '',
@@ -871,16 +919,34 @@ class PersistentSyncEngine {
           ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
           ...(u.permissions || existingStaff?.permissions ? { permissions: u.permissions || existingStaff?.permissions } : {}),
           ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
-        } as any, { fromSync: true });
-        console.log(
-          '[STAFF TRACE] 7. Saved to DB. New Pin:',
-          savedStaff.pin_hash,
-          'New Branches:',
-          (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
-          'Role:',
-          savedStaff.role
+        };
+        const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || Date.now();
+        await routeCloudRecordThroughSyncCore(
+          {
+            packetId: `CLOUD-STAFF-FULL-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
+            entityType: 'staff',
+            entityId: String(staffId),
+            action: 'UPSERT',
+            data: userObj,
+            updatedAt: incomingTs,
+            originDeviceId: 'APPS_SCRIPT_CLOUD',
+            targetBranchId: 'ALL',
+            class: 'T2',
+          },
+          existingStaff,
+          () => {
+            const savedStaff = saveSalesperson(userObj, { fromSync: true });
+            console.log(
+              '[STAFF TRACE] 7. Saved to DB. New Pin:',
+              savedStaff.pin_hash,
+              'New Branches:',
+              (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+              'Role:',
+              savedStaff.role
+            );
+            count++;
+          }
         );
-        count++;
       }
       const serverTime = res.server_time || new Date().toISOString();
       await setSyncMeta('users', serverTime, serverTime);
@@ -889,6 +955,10 @@ class PersistentSyncEngine {
   }
 
   public async forceRefreshBranches(): Promise<number> {
+    if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
+      console.log('[PersistentSyncEngine] 🛑 Cloud branches refresh suspended (Local Hub is Edge Gateway). Skipping forceRefreshBranches.');
+      return 0;
+    }
     const currentCompany = getCurrentCompany();
     const res = await this.fetchServerAction('get_branches_since', {
       company_id: currentCompany.company_id,
@@ -898,21 +968,38 @@ class PersistentSyncEngine {
     if (res && res.success && Array.isArray(res.branches)) {
       for (const b of res.branches) {
         const brId = b.branch_id || b.branchId || 'BR-MAIN';
-        saveBranch(
+        const existingBranch = getBranches().find((eb) => eb.branchId === brId || eb.id === brId);
+        const incomingTs = parseTimestampMs(b.updatedAt || b.updated_at || b.lastUpdated) || Date.now();
+        const branchObj: any = {
+          id: brId,
+          branchId: brId,
+          name: b.name || b.branch_name || 'Branch',
+          code: b.code || b.branch_code || brId,
+          location: b.location || b.address || '',
+          address: b.location || b.address || '',
+          company_id: b.company_id || currentCompany.company_id,
+          companyId: b.company_id || currentCompany.company_id,
+          is_active: b.is_active !== false,
+          ...(b.updatedAt || b.updated_at ? { updatedAt: b.updatedAt || b.updated_at } : {}),
+        };
+        await routeCloudRecordThroughSyncCore(
           {
-            id: brId,
-            branchId: brId,
-            name: b.name || b.branch_name || 'Branch',
-            code: b.code || b.branch_code || brId,
-            location: b.location || b.address || '',
-            address: b.location || b.address || '',
-            company_id: b.company_id || currentCompany.company_id,
-            companyId: b.company_id || currentCompany.company_id,
-            is_active: b.is_active !== false,
+            packetId: `CLOUD-BRANCH-FULL-${brId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
+            entityType: 'branch',
+            entityId: String(brId),
+            action: 'UPSERT',
+            data: branchObj,
+            updatedAt: incomingTs,
+            originDeviceId: 'APPS_SCRIPT_CLOUD',
+            targetBranchId: 'ALL',
+            class: 'T2',
           },
-          { fromSync: true }
+          existingBranch,
+          () => {
+            saveBranch(branchObj, { fromSync: true });
+            count++;
+          }
         );
-        count++;
       }
       const serverTime = res.server_time || new Date().toISOString();
       await setSyncMeta('branches', serverTime, serverTime);

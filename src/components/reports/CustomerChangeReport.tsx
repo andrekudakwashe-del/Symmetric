@@ -5,6 +5,8 @@ import {
   settleCustomerChangePayout,
   recordManualCustomerChange,
   getCustomers,
+  getSalespeople,
+  getTodayDateString,
   subscribeToDatabase,
 } from '../../db/roomDatabase';
 import {
@@ -54,7 +56,20 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
   const [payoutModalItem, setPayoutModalItem] = useState<CustomerChangeReportItem | null>(null);
   const [payoutAmount, setPayoutAmount] = useState<string>('');
   const [payoutNotes, setPayoutNotes] = useState<string>('');
+  const [payoutDate, setPayoutDate] = useState<string>(() => getTodayDateString());
   const [successToast, setSuccessToast] = useState<string | null>(null);
+
+  const [salespeople, setSalespeople] = useState<Salesperson[]>(() => getSalespeople());
+  const [selectedStaffId, setSelectedStaffId] = useState<string>(() => {
+    const list = getSalespeople();
+    const matched = list.find((s) => s.id === currentUser?.id);
+    return matched ? matched.id : (list[0]?.id || currentUser?.id || '001');
+  });
+  const [payoutStaffId, setPayoutStaffId] = useState<string>(() => {
+    const list = getSalespeople();
+    const matched = list.find((s) => s.id === currentUser?.id);
+    return matched ? matched.id : (list[0]?.id || currentUser?.id || '001');
+  });
 
   // Manual Change Booking Modal State (e.g. customer rejected note, no replacement note available)
   const [showManualModal, setShowManualModal] = useState<boolean>(false);
@@ -69,12 +84,18 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
   const [cashReceivedInDrawer, setCashReceivedInDrawer] = useState<boolean>(true);
   const [manualCustomNotes, setManualCustomNotes] = useState<string>('');
   const [manualInvoiceRef, setManualInvoiceRef] = useState<string>('');
-  const [manualDate, setManualDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [manualDate, setManualDate] = useState<string>(() => getTodayDateString());
   const [allCustomers, setAllCustomers] = useState<Customer[]>(() => getCustomers());
 
   const handleOpenManualModal = (targetCustomer?: CustomerChangeReportItem | Customer | null) => {
     const list = getCustomers();
     setAllCustomers(list);
+    const staffList = getSalespeople();
+    setSalespeople(staffList);
+    if (!staffList.some((s) => s.id === selectedStaffId)) {
+      const matched = staffList.find((s) => s.id === currentUser?.id);
+      setSelectedStaffId(matched ? matched.id : (staffList[0]?.id || currentUser?.id || '001'));
+    }
     if (targetCustomer) {
       setManualCustomerType('existing');
       const custId = (targetCustomer as any).customerId || (targetCustomer as any).id || '';
@@ -89,6 +110,7 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
     setManualAmount('');
     setManualCustomNotes('');
     setManualInvoiceRef('');
+    setManualDate(getTodayDateString());
     setManualReasonPreset(
       'Customer rejected / complained about note after invoice processed (no replacement note)'
     );
@@ -127,16 +149,17 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
       ? `${manualReasonPreset}: ${manualCustomNotes.trim()}`
       : manualReasonPreset;
 
-    const staffId = currentUser?.id || '001';
-    const staffName = currentUser?.name || 'Cashier';
-    const staffRole = currentUser?.role || 'Staff';
+    const selectedStaff = salespeople.find((s) => s.id === selectedStaffId);
+    const staffId = selectedStaff?.id || selectedStaffId || currentUser?.id || '001';
+    const staffName = selectedStaff?.name || currentUser?.name || 'Cashier';
+    const staffRole = selectedStaff?.role || currentUser?.role || 'Staff';
 
     recordManualCustomerChange({
       customerName: finalCustName,
       customerId: finalCustId,
       phone: manualCustomerPhone.trim(),
       amount: amt,
-      date: manualDate,
+      date: manualDate || getTodayDateString(),
       notes: fullNotes,
       reference: manualInvoiceRef.trim() || undefined,
       cashReceivedInDrawer,
@@ -146,7 +169,7 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
     });
 
     setReportData(getCustomerChangeReport());
-    setSuccessToast(`Change of $${amt.toFixed(2)} booked for "${finalCustName}". Customer ledger updated.`);
+    setSuccessToast(`Change of $${amt.toFixed(2)} booked for "${finalCustName}" on ${staffName}'s till. Form 4 updated.`);
     setShowManualModal(false);
 
     // Reset fields
@@ -162,16 +185,21 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
   useEffect(() => {
     const handleRefresh = () => {
       setReportData(getCustomerChangeReport());
+      setSalespeople(getSalespeople());
     };
     const unsub = subscribeToDatabase(handleRefresh);
     window.addEventListener('saimetric_customer_changes_updated', handleRefresh);
     window.addEventListener('saimetric_customers_updated', handleRefresh);
     window.addEventListener('saimetric_sales_updated', handleRefresh);
+    window.addEventListener('saimetric_salespeople_updated', handleRefresh);
+    window.addEventListener('saimetric_cash_updated', handleRefresh);
     return () => {
       unsub();
       window.removeEventListener('saimetric_customer_changes_updated', handleRefresh);
       window.removeEventListener('saimetric_customers_updated', handleRefresh);
       window.removeEventListener('saimetric_sales_updated', handleRefresh);
+      window.removeEventListener('saimetric_salespeople_updated', handleRefresh);
+      window.removeEventListener('saimetric_cash_updated', handleRefresh);
     };
   }, []);
 
@@ -231,8 +259,10 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
       return;
     }
 
-    const staffId = currentUser?.id || '001';
-    const staffName = currentUser?.name || 'Cashier';
+    const payoutStaff = salespeople.find((s) => s.id === payoutStaffId);
+    const staffId = payoutStaff?.id || payoutStaffId || currentUser?.id || '001';
+    const staffName = payoutStaff?.name || currentUser?.name || 'Cashier';
+    const payoutDateStr = payoutDate || getTodayDateString();
 
     settleCustomerChangePayout(
       payoutModalItem.customerId,
@@ -240,11 +270,12 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
       amountNum,
       staffId,
       staffName,
-      payoutNotes || `Change refund payout to customer`
+      payoutNotes || `Change refund payout to customer`,
+      payoutDateStr
     );
 
     setSuccessToast(
-      `Successfully paid out $${amountNum.toFixed(2)} change to ${payoutModalItem.customerName}`
+      `Successfully paid out $${amountNum.toFixed(2)} change to ${payoutModalItem.customerName} (${staffName} till)`
     );
     setPayoutModalItem(null);
     setPayoutAmount('');
@@ -286,7 +317,7 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `Customer_Change_Report_${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute('download', `Customer_Change_Report_${getTodayDateString()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -320,7 +351,7 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
             <button
               type="button"
               id="btn-book-cash-in-change"
-              onClick={handleOpenManualModal}
+              onClick={() => handleOpenManualModal()}
               className="py-2 px-3.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:brightness-110 text-white text-xs font-black shadow-md shadow-purple-950 flex items-center space-x-1.5 transition active:scale-95 border border-purple-400/40 cursor-pointer"
               title="Book change owed to customer (e.g. customer rejected note / small change unavailable)"
             >
@@ -651,9 +682,14 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
                             <button
                               type="button"
                               onClick={() => {
+                                const staffList = getSalespeople();
+                                setSalespeople(staffList);
                                 setPayoutModalItem(item);
                                 setPayoutAmount(String(item.netChangeOwed));
                                 setPayoutNotes(`Payout change balance to ${item.customerName}`);
+                                setPayoutDate(getTodayDateString());
+                                const matched = staffList.find((s) => s.id === currentUser?.id);
+                                setPayoutStaffId(matched ? matched.id : (staffList[0]?.id || currentUser?.id || '001'));
                               }}
                               title="Pay out / Refund change to customer"
                               className="px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-purple-600 hover:brightness-110 text-white text-[11px] font-bold shadow-md transition active:scale-95 flex items-center space-x-1"
@@ -802,6 +838,45 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
                     onChange={(e) => setPayoutAmount(e.target.value)}
                     required
                     className="w-full pl-8 pr-4 py-2.5 rounded-2xl bg-slate-950 border border-slate-700 focus:border-[#6A4DFF] text-base font-mono-num font-bold text-white placeholder-slate-600 outline-none"
+                  />
+                </div>
+              </div>
+
+              {/* Cashier / Till Drawer & Payout Date */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-bold text-slate-300">
+                    Cashier / Till Drawer <span className="text-rose-400">*</span>
+                  </label>
+                  <select
+                    value={payoutStaffId}
+                    onChange={(e) => setPayoutStaffId(e.target.value)}
+                    required
+                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white focus:border-[#6A4DFF] outline-none"
+                  >
+                    {salespeople.length === 0 ? (
+                      <option value={currentUser?.id || '001'}>
+                        {currentUser?.name || 'Cashier'} (#{currentUser?.id || '001'})
+                      </option>
+                    ) : (
+                      salespeople.map((sp) => (
+                        <option key={sp.id} value={sp.id}>
+                          {sp.name} (#{sp.id}) — {sp.role}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-bold text-slate-300">
+                    Payout Date <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="date"
+                    required
+                    value={payoutDate}
+                    onChange={(e) => setPayoutDate(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white focus:border-[#6A4DFF] outline-none"
                   />
                 </div>
               </div>
@@ -1194,10 +1269,30 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
                 </div>
               </div>
 
-              {/* Staff Stamp */}
-              <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-2.5 text-[11px] text-slate-400 flex items-center justify-between">
-                <span>Attributed Staff: <strong className="text-white">{currentUser?.name || 'Cashier'}</strong> (#{currentUser?.id || '001'})</span>
-                <span className="text-purple-300 font-bold">● Live Room DB Log</span>
+              {/* Cashier / Till Drawer Selector */}
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold text-slate-300 flex items-center justify-between">
+                  <span>Cashier / Till Drawer (Form 4 Attribution) *</span>
+                  <span className="text-purple-300 font-bold text-[10px]">● Links to Form 4 Shift</span>
+                </label>
+                <select
+                  value={selectedStaffId}
+                  onChange={(e) => setSelectedStaffId(e.target.value)}
+                  required
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-purple-500"
+                >
+                  {salespeople.length === 0 ? (
+                    <option value={currentUser?.id || '001'}>
+                      {currentUser?.name || 'Cashier'} (#{currentUser?.id || '001'})
+                    </option>
+                  ) : (
+                    salespeople.map((sp) => (
+                      <option key={sp.id} value={sp.id}>
+                        {sp.name} (#{sp.id}) — {sp.role}
+                      </option>
+                    ))
+                  )}
+                </select>
               </div>
 
               {/* Submit Buttons */}

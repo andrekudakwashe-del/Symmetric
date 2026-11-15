@@ -88,6 +88,10 @@ import {
   getDailyCustomerLedgerSummary,
 } from './customerLedger';
 import {
+  isAppScriptsIngestPaused,
+  routeCloudRecordThroughSyncCore,
+} from '../services/sync/syncIngestBridge';
+import {
   Company,
   SaaSBranch,
   SaaSUser,
@@ -1618,15 +1622,18 @@ export const cleanupDuplicateChangeMovements = (): void => {
     // Pass 2: delete duplicate change_received and duplicate credit_cash_payment
     all.forEach((m) => {
       if (m.type === 'change_received') {
-        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
-        if (invMatch) {
-          const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
-          const key = `chg_${shiftPart}_${invMatch}`;
-          if (seenChangeIn.has(key)) {
-            deleteMovement(m.id);
-            return;
+        const isManualRef = Boolean(m.notes?.includes('[Manual Change]') || m.sourceRef?.startsWith('MAN-CHG-'));
+        if (!isManualRef && (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #'))) {
+          const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+          if (invMatch) {
+            const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
+            const key = `chg_${shiftPart}_${invMatch}`;
+            if (seenChangeIn.has(key)) {
+              deleteMovement(m.id);
+              return;
+            }
+            seenChangeIn.add(key);
           }
-          seenChangeIn.add(key);
         }
       }
 
@@ -4716,14 +4723,56 @@ export const getCashLogsForStaffAndDate = (staffId: string, date: string): CashL
   });
 };
 
-export const getCustomerChangesForStaffAndDate = (staffId: string, date: string): CustomerChangeEntry[] => {
-  const changes = getCustomerChanges();
-  return changes.filter((c) => c.staffId === staffId && c.date === date);
+const matchesStaffRecord = (
+  recStaffId?: string,
+  recStaffName?: string,
+  targetStaffId?: string,
+  targetStaffName?: string
+): boolean => {
+  const cleanTargetId = String(targetStaffId || '').trim().toLowerCase();
+  const normTarget = cleanTargetId.replace(/^usr-|^staff-|^0+/i, '');
+  const cleanTargetName = (targetStaffName || '').trim().toLowerCase();
+
+  const cleanRecId = String(recStaffId || '').trim().toLowerCase();
+  const normRec = cleanRecId.replace(/^usr-|^staff-|^0+/i, '');
+  const cleanRecName = (recStaffName || '').trim().toLowerCase();
+
+  if (!cleanTargetId || cleanTargetId === 'all') return true;
+  if (cleanRecId && cleanRecId === cleanTargetId) return true;
+  if (normTarget && normRec && normRec === normTarget) return true;
+  if (cleanTargetName && cleanRecName && cleanRecName === cleanTargetName) return true;
+  return false;
 };
 
-export const getCreditSalesForStaffAndDate = (staffId: string, date: string): CreditSaleEntry[] => {
+const matchesBusinessDate = (recDate?: string, recTimestamp?: string, targetDate?: string): boolean => {
+  if (!targetDate) return false;
+  const cleanEntryDate = recDate ? String(recDate).trim().slice(0, 10) : '';
+  if (cleanEntryDate && /^\d{4}-\d{2}-\d{2}$/.test(cleanEntryDate)) {
+    return cleanEntryDate === targetDate;
+  }
+  return isSameDaySafe(recDate, recTimestamp, targetDate);
+};
+
+export const getCustomerChangesForStaffAndDate = (
+  staffId: string,
+  date: string,
+  staffName?: string
+): CustomerChangeEntry[] => {
+  const changes = getCustomerChanges();
+  return changes.filter(
+    (c) => matchesStaffRecord(c.staffId, c.staffName, staffId, staffName) && matchesBusinessDate(c.date, c.timestamp, date)
+  );
+};
+
+export const getCreditSalesForStaffAndDate = (
+  staffId: string,
+  date: string,
+  staffName?: string
+): CreditSaleEntry[] => {
   const creditSales = getCreditSales();
-  return creditSales.filter((c) => c.staffId === staffId && c.date === date);
+  return creditSales.filter(
+    (c) => matchesStaffRecord(c.staffId, c.staffName, staffId, staffName) && matchesBusinessDate(c.date, c.timestamp, date)
+  );
 };
 
 export const saveDailyCashLogSheet = (
@@ -5533,14 +5582,23 @@ export const getNextCustomerChangeId = (): string => {
 };
 
 export const addCustomerChange = (
-  entry: Omit<CustomerChangeEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string },
-  options?: { fromSync?: boolean }
+  entry: Omit<CustomerChangeEntry, 'id' | 'synced'> & {
+    id?: string;
+    company_id?: string;
+    companyId?: string;
+    branch_id?: string;
+    branchId?: string;
+    affectsDrawer?: boolean;
+    isManual?: boolean;
+  },
+  options?: { fromSync?: boolean; skipCashMovement?: boolean; isManual?: boolean }
 ): CustomerChangeEntry => {
-  const all = getAllCustomerChanges();
+  const all = getRawStoredCustomerChanges();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
   const brId = entry.branch_id || entry.branchId || currentBranch;
+  const isManualEntry = Boolean(options?.isManual || (entry as any).isManual);
   const created: CustomerChangeEntry = {
     ...entry,
     id: entry.id || getNextCustomerChangeId(),
@@ -5584,75 +5642,102 @@ export const addCustomerChange = (
     });
   }
 
-  // Ensure cashMovements has change_received (In) or change_paid (Out) if not already recorded
-  const shiftId = getShiftId(created.staffId, created.date);
+  // Ensure cashMovements has change_received (In) or change_paid (Out) if affectsDrawer !== false
+  const shiftId = getShiftId(created.staffId, created.date, brId);
   const invRef = created.reference || (created.notes?.match(/INV-[A-Za-z0-9-]+/i)?.[0]);
-  const existingMov = getMovements().find(
-    (m) =>
-      matchesShift(m, shiftId) &&
-      (m.type === 'change_received' || m.type === 'change_paid') &&
-      (m.sourceRef === created.id ||
-        (invRef && (m.sourceRef?.includes(invRef) || m.notes?.includes(invRef))))
-  );
-  if (!existingMov && created.in > 0) {
-    addMovement({
-      shiftId,
-      staffId: created.staffId,
-      date: created.date,
-      timestamp: created.timestamp,
-      type: 'change_received',
-      amount: created.in,
-      currency: 'USD',
-      direction: 'in',
-      affectsDrawer: true,
-      status: 'approved',
-      sourceModule: 'form3',
-      sourceRef: created.id,
-      notes: `Customer change in: ${created.customerName}${invRef && !created.notes?.includes(invRef) ? ` (POS Invoice #${invRef})` : ''}${created.notes ? ` (${created.notes})` : ''}`,
-      company_id: compId,
-      branch_id: brId,
-    });
-  } else if (!existingMov && created.out > 0) {
-    addMovement({
-      shiftId,
-      staffId: created.staffId,
-      date: created.date,
-      timestamp: created.timestamp,
-      type: 'change_paid',
-      amount: created.out,
-      currency: 'USD',
-      direction: 'out',
-      affectsDrawer: true,
-      status: 'approved',
-      sourceModule: 'form3',
-      sourceRef: created.id,
-      notes: `Customer change out: ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
-      company_id: compId,
-      branch_id: brId,
-    });
+  const shouldAffectDrawer = (entry as any).affectsDrawer !== false && !options?.skipCashMovement;
+  const existingMovements = getMovements(undefined, brId);
+
+  if (shouldAffectDrawer && created.in > 0) {
+    const existingChangeIn = existingMovements.find(
+      (m) =>
+        matchesShift(m, shiftId, brId) &&
+        m.type === 'change_received' &&
+        (m.sourceRef === created.id ||
+          (!isManualEntry &&
+            invRef &&
+            (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #')) &&
+            (m.sourceRef?.includes(invRef) || m.notes?.includes(invRef))))
+    );
+    if (!existingChangeIn) {
+      const refSuffix = isManualEntry
+        ? `${invRef && !created.notes?.includes(invRef) ? ` (Ref: ${invRef})` : ''} [Manual Change]`
+        : `${invRef && !created.notes?.includes(invRef) ? ` (POS Invoice #${invRef})` : ''}`;
+      addMovement({
+        shiftId,
+        staffId: created.staffId,
+        date: created.date,
+        timestamp: created.timestamp,
+        type: 'change_received',
+        amount: created.in,
+        currency: 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form3',
+        sourceRef: created.id,
+        notes: `Customer change in: ${created.customerName}${refSuffix}${created.notes ? ` (${created.notes})` : ''}`,
+        company_id: compId,
+        branch_id: brId,
+      });
+    }
+  } else if (shouldAffectDrawer && created.out > 0) {
+    const existingChangeOut = existingMovements.find(
+      (m) =>
+        matchesShift(m, shiftId, brId) &&
+        m.type === 'change_paid' &&
+        m.sourceRef === created.id
+    );
+    if (!existingChangeOut) {
+      addMovement({
+        shiftId,
+        staffId: created.staffId,
+        date: created.date,
+        timestamp: created.timestamp,
+        type: 'change_paid',
+        amount: created.out,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form3',
+        sourceRef: created.id,
+        notes: `Customer change out: ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
+        company_id: compId,
+        branch_id: brId,
+      });
+    }
   }
 
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: created }));
     window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: created }));
   }
   return created;
 };
 
 export const deleteCustomerChange = (id: string): boolean => {
-  const all = getAllCustomerChanges();
+  const all = getRawStoredCustomerChanges();
   const filtered = all.filter((c) => c.id !== id);
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.CUSTOMER_CHANGES, filtered);
   enqueueSync('CustomerChange', 'DELETE', { id, company_id: getCurrentCompanyId() });
 
   // Clean up associated cashMovements and customerLedger entries
-  const movements = getMovements();
+  const movements = getAllMovements();
   movements.filter((m) => m.sourceRef === id).forEach((m) => deleteMovement(m.id));
   const custEntries = getCustomerLedgerEntries((e) => e.sourceRef === id);
   custEntries.forEach((e) => deleteCustomerLedgerEntry(e.id));
 
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+  }
   return true;
 };
 
@@ -5856,10 +5941,20 @@ export const getNextCreditSaleId = (): string => {
 };
 
 export const addCreditSale = (
-  entry: Omit<CreditSaleEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string; fromMesh?: boolean },
+  entry: Omit<CreditSaleEntry, 'id' | 'synced'> & {
+    id?: string;
+    company_id?: string;
+    companyId?: string;
+    branch_id?: string;
+    branchId?: string;
+    fromMesh?: boolean;
+    disburseCashFromDrawer?: boolean;
+    creditType?: string;
+    isManual?: boolean;
+  },
   options?: { fromSync?: boolean }
 ): CreditSaleEntry => {
-  const all = getAllCreditSales();
+  const all = getRawStoredCreditSales();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
@@ -5915,9 +6010,10 @@ export const addCreditSale = (
   if (created.in && created.in > 0) {
     const isPosInitialDeposit = created.notes?.includes('POS Credit Sale Invoice');
     if (!isPosInitialDeposit) {
-      const shiftId = getShiftId(created.staffId, created.date);
-      const existingMov = getMovements().find(
+      const shiftId = getShiftId(created.staffId, created.date, brId);
+      const existingMov = getMovements(undefined, brId).find(
         (m) =>
+          matchesShift(m, shiftId, brId) &&
           (m.type === 'credit_cash_payment' || m.type === 'credit_upfront_deposit') &&
           (m.sourceRef === created.id || (created.notes && m.sourceRef && created.notes.includes(m.sourceRef)))
       );
@@ -5947,23 +6043,31 @@ export const addCreditSale = (
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: created }));
     window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: created }));
   }
   return created;
 };
 
 export const deleteCreditSale = (id: string): boolean => {
-  const all = getAllCreditSales();
+  const all = getRawStoredCreditSales();
   const filtered = all.filter((c) => c.id !== id);
   if (filtered.length === all.length) return false;
   setStored(STORAGE_KEYS.CREDIT_SALES, filtered);
   enqueueSync('CreditSales', 'DELETE', { id, company_id: getCurrentCompanyId() });
 
   // Clean up associated cashMovements and customerLedger entries
-  const movements = getMovements();
+  const movements = getAllMovements();
   movements.filter((m) => m.sourceRef === id).forEach((m) => deleteMovement(m.id));
   const custEntries = getCustomerLedgerEntries((e) => e.sourceRef === id);
   custEntries.forEach((e) => deleteCustomerLedgerEntry(e.id));
 
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+  }
   return true;
 };
 
@@ -9924,33 +10028,75 @@ export const calculateForm4 = (
   const effectiveEcoSales = Math.max(ecocashSales, breakdown.ecocashSales || 0);
   const effectiveZigSales = Math.max(zigSales, breakdown.zigSales || 0);
 
-  // Credit extended from customerLedger (NOT cashMovements)
-  const staffCustomerLedger = getCustomerLedgerEntries((entry) =>
-    (entry.staffId === staffId || !entry.staffId) && entry.date === date
+  // Form 2 & 3 logs for this shift (normalized staff + business date matching)
+  const form2Logs = getCashLogsForStaffAndDate(staffId, date);
+  const form3Changes = getCustomerChangesForStaffAndDate(staffId, date, staffName);
+  const form3Credits = getCreditSalesForStaffAndDate(staffId, date, staffName);
+
+  const isRepaymentCreditEntry = (c: CreditSaleEntry): boolean => {
+    const desc = (c.itemDescription || '').toLowerCase();
+    return (
+      desc.includes('repayment') ||
+      desc.includes('settlement') ||
+      (c.status === 'Paid' && (Number(c.out) || 0) === 0 && (Number(c.amount) || 0) === 0)
+    );
+  };
+  const isCashDisbursedCreditEntry = (c: CreditSaleEntry): boolean => {
+    return Boolean((c as any).disburseCashFromDrawer);
+  };
+
+  const form3DrawerChangeIn = form3Changes
+    .filter((c) => (c as any).affectsDrawer !== false)
+    .reduce((sum, c) => sum + (Number(c.in) || 0), 0);
+  const form3ChangeOut = form3Changes.reduce((sum, c) => sum + (Number(c.out) || 0), 0);
+  const form3CreditIn = form3Credits.reduce((sum, c) => sum + (Number(c.in) || 0), 0);
+  const form3CashCreditOut = form3Credits
+    .filter((c) => isCashDisbursedCreditEntry(c))
+    .reduce((sum, c) => sum + (Number(c.out) || Number(c.amount) || 0), 0);
+  const form3GoodsCreditOut = form3Credits
+    .filter((c) => {
+      if (isCashDisbursedCreditEntry(c) || isRepaymentCreditEntry(c)) return false;
+      const desc = (c.itemDescription || (c as any).creditType || '').toLowerCase();
+      if (desc.includes('cash credit') || desc.includes('cash advance')) return false;
+      return true;
+    })
+    .reduce((sum, c) => sum + Math.max(0, (Number(c.out) || Number(c.amount) || 0) - (Number(c.in) || 0)), 0);
+
+  // Credit extended from customerLedger + Form 3 Goods Credit (excluding cash-disbursed cash loans)
+  const cashCreditRecordIds = new Set(
+    form3Credits
+      .filter((c) => {
+        if (isCashDisbursedCreditEntry(c)) return true;
+        const desc = (c.itemDescription || (c as any).creditType || '').toLowerCase();
+        return desc.includes('cash credit') || desc.includes('cash advance');
+      })
+      .map((c) => c.id)
   );
-  const creditExtended = staffCustomerLedger
-    .filter((e) => e.type === 'credit_extended')
+  const staffCustomerLedger = getCustomerLedgerEntries(
+    (entry) =>
+      matchesStaffRecord(entry.staffId, entry.staffName, staffId, staffName) &&
+      matchesBusinessDate(entry.date, entry.timestamp, date)
+  );
+  const ledgerGoodsCreditExtended = staffCustomerLedger
+    .filter((e) => e.type === 'credit_extended' && (!e.sourceRef || !cashCreditRecordIds.has(e.sourceRef)))
     .reduce((sum, e) => sum + (e.amount || 0), 0);
+  const creditExtended = Math.max(ledgerGoodsCreditExtended, form3GoodsCreditOut);
 
   const totalNonCashSales = effectiveEcoSales + effectiveZigSales + creditExtended;
-
-  // Form 2 & 3 legacy logs for compatibility
-  const form2Logs = getCashLogsForStaffAndDate(staffId, date);
-  const form3Changes = getCustomerChangesForStaffAndDate(staffId, date);
-  const form3Credits = getCreditSalesForStaffAndDate(staffId, date);
 
   const savedAdminSale = getAdminSaleForStaffAndDate(staffId, date);
   let totalSales = systemSalesTotal;
   let isOverridden = false;
 
   // If cashMovements exist for this shift, use breakdown as the canonical source
+  // (reconciled with Form 3 Change/Credit entries so manual/synced report actions are never dropped)
   if (breakdown.movementsCount > 0) {
     let float = breakdown.openingFloat;
     let refunds = breakdown.refunds || 0;
     let netCashSales = Math.max(0, (breakdown.cashSales || 0) - refunds);
     let cashSales = netCashSales;
-    let creditPayments = breakdown.creditPayments;
-    let changeReceived = breakdown.changeReceived;
+    let creditPayments = Math.max(breakdown.creditPayments || 0, form3CreditIn);
+    let changeReceived = Math.max(breakdown.changeReceived || 0, form3DrawerChangeIn);
     
     // Merge expenses from cashMovements, Form 2 logs, and approved Cash till expenses
     const utilitiesLogs = form2Logs.filter(
@@ -10035,7 +10181,8 @@ export const calculateForm4 = (
     const nonGrvProcTotal = nonGrvProcLogs.reduce((sum, l) => sum + (Number(l.out) || 0), 0);
     let directProcurements = Math.max(breakdown.directProcurements || 0, grvPayoutTotal + nonGrvProcTotal);
     let cashLift = breakdown.cashLift;
-    let customerChange = breakdown.changePaid;
+    let customerChange = Math.max(breakdown.changePaid || 0, form3ChangeOut);
+    let creditCashOut = Math.max(breakdown.creditCashOut || 0, form3CashCreditOut);
     let deductions = 0; // All till expenses & petty cash are captured in expenses
     let ecocashWithdrawal = breakdown.ecocashCashOut;
     let zigWithdrawal = breakdown.zigCashOut;
@@ -10054,7 +10201,7 @@ export const calculateForm4 = (
 
     const cashInTotal = Math.round((float + cashSales + creditPayments + changeReceived) * 100) / 100;
     const cashOutTotal = Math.round(
-      (expenses + directProcurements + cashLift + customerChange + deductions + ecocashWithdrawal + zigWithdrawal) * 100
+      (expenses + directProcurements + cashLift + customerChange + creditCashOut + deductions + ecocashWithdrawal + zigWithdrawal) * 100
     ) / 100;
     const expectedCash = Math.round((cashInTotal - cashOutTotal) * 100) / 100;
     const shouldHave = expectedCash;
@@ -10088,11 +10235,14 @@ export const calculateForm4 = (
     const form2Net = form2In - form2Out;
     const changeIn = changeReceived;
     const changeOut = customerChange;
-    const creditIn = breakdown.creditPayments;
-    const creditOut = creditExtended;
+    const creditIn = creditPayments;
+    const creditOut = Math.max(
+      creditExtended + creditCashOut,
+      form3Credits.filter((c) => !isRepaymentCreditEntry(c)).reduce((sum, c) => sum + (Number(c.out) || Number(c.amount) || 0), 0)
+    );
     const form3In = changeIn + creditIn;
     const form3Out = changeOut + creditOut;
-    const form3Net = form3In - form3Out;
+    const form3Net = (changeIn + creditIn) - (changeOut + creditCashOut);
     const sumForm2And3Net = form2Net + form3Net;
 
     return {
@@ -10106,9 +10256,11 @@ export const calculateForm4 = (
       directProcurements,
       cashLift,
       customerChange,
+      creditCashOut,
       deductions,
       ecocashWithdrawal,
       zigWithdrawal,
+      totalMultiCurrencyWithdrawals: ecocashWithdrawal + zigWithdrawal,
       expectedCash,
       shouldHave,
       ecocashSales: effectiveEcoSales,
@@ -10407,18 +10559,25 @@ export const calculateForm4 = (
     totalSales = savedAdminSale.salesAmount;
     isOverridden = true;
     cashSales = Math.max(0, savedAdminSale.salesAmount - totalNonCashSales);
+  } else {
+    totalSales = Math.max(systemSalesTotal, cashSales + totalNonCashSales);
   }
 
   // 3. Form 3 Customer Change & Credit Sales
-  const changeIn = form3Changes.reduce((sum, c) => sum + (c.in || 0), 0);
-  const changeOut = form3Changes.reduce((sum, c) => sum + (c.out || 0), 0);
+  const changeIn = form3DrawerChangeIn;
+  const changeOut = form3ChangeOut;
   const customerChange = changeOut;
 
-  const creditIn = form3Credits.reduce((sum, c) => sum + (c.in || 0), 0);
-  const creditOut = form3Credits.reduce((sum, c) => sum + (c.out || c.amount || 0), 0);
+  const creditIn = form3CreditIn;
+  const creditCashOut = form3CashCreditOut;
+  const creditOut = Math.max(
+    creditExtended + creditCashOut,
+    form3Credits.filter((c) => !isRepaymentCreditEntry(c)).reduce((sum, c) => sum + (Number(c.out) || Number(c.amount) || 0), 0)
+  );
 
-  // Credit payments received into drawer (repayments on account + change left behind in till)
-  const creditPayments = creditIn + changeIn;
+  // Credit repayments & customer change received into drawer kept separate for parity with movements branch
+  const creditPayments = creditIn;
+  const changeReceived = changeIn;
 
   // 4. Miscellaneous cash deductions in Form 2
   // Must exclude all items that have their own dedicated calculation terms to prevent double deductions!
@@ -10541,17 +10700,11 @@ export const calculateForm4 = (
     .reduce((sum, l) => sum + (l.out || 0), 0);
 
   // 5. Expected Cash Formula (Core User Balancing Formula)
-  // expectedCash = float + cashSales + creditPayments - expenses - directProcurements - cashLift - customerChange - deductions - totalMultiCurrencyWithdrawals
-  const expectedCash =
-    float +
-    cashSales +
-    creditPayments -
-    expenses -
-    directProcurements -
-    cashLift -
-    customerChange -
-    deductions -
-    totalMultiCurrencyWithdrawals;
+  const cashInTotal = Math.round((float + cashSales + creditPayments + changeReceived) * 100) / 100;
+  const cashOutTotal = Math.round(
+    (expenses + directProcurements + cashLift + customerChange + creditCashOut + deductions + totalMultiCurrencyWithdrawals) * 100
+  ) / 100;
+  const expectedCash = Math.round((cashInTotal - cashOutTotal) * 100) / 100;
 
   const shouldHave = expectedCash;
 
@@ -10572,9 +10725,9 @@ export const calculateForm4 = (
   // If pending count, variance = 0 - expectedCash
   let variance = 0;
   if (actualCashCount !== null) {
-    variance = actualCashCount - expectedCash;
+    variance = Math.round((actualCashCount - expectedCash) * 100) / 100;
   } else {
-    variance = 0 - expectedCash;
+    variance = Math.round((0 - expectedCash) * 100) / 100;
   }
 
   const hasActivity =
@@ -10612,12 +10765,12 @@ export const calculateForm4 = (
   const form2Out = form2Logs.reduce((sum, l) => sum + (l.out || 0), 0);
   const form2Net = form2In - form2OperationalOut;
 
-  // Form 3 Cash Net: Cash transactions only (repayments and change left behind minus customer change handed out)
-  // Note: creditOut is goods delivered on credit, not cash removed from the physical drawer
+  // Form 3 Cash Net: Cash transactions only (repayments and change left behind minus customer change & cash credit handed out)
+  // Note: goods creditOut is goods delivered on credit, not cash removed from the physical drawer
   const form3In = changeIn + creditIn;
   const form3Out = changeOut + creditOut;
   const form3CashIn = changeIn + creditIn;
-  const form3CashOut = changeOut;
+  const form3CashOut = changeOut + creditCashOut;
   const form3Net = form3CashIn - form3CashOut;
   const sumForm2And3Net = form2Net + form3Net;
 
@@ -10633,6 +10786,7 @@ export const calculateForm4 = (
     directProcurements,
     cashLift,
     customerChange,
+    creditCashOut,
     deductions,
     ecocashWithdrawal,
     zigWithdrawal,
@@ -10642,13 +10796,14 @@ export const calculateForm4 = (
     activeCurrencies: activeCurrenciesList,
     expectedCash,
     shouldHave,
-    cashInTotal: Math.round((float + cashSales + creditPayments + changeIn) * 100) / 100,
-    cashOutTotal: Math.round(
-      (expenses + directProcurements + cashLift + customerChange + deductions + totalMultiCurrencyWithdrawals) * 100
-    ) / 100,
+    cashInTotal,
+    cashOutTotal,
+    changeReceived,
+    changePaid: changeOut,
     // Reporting only
     ecocashSales,
     zigSales,
+    creditExtended,
     totalNonCashSales,
     totalSales,
     sales: totalSales,
@@ -11413,28 +11568,33 @@ export const settleCustomerChangePayout = (
   amountOut: number,
   staffId: string,
   staffName: string,
-  notes?: string
+  notes?: string,
+  date?: string
 ): CustomerChangeEntry => {
-  const todayStr = new Date().toISOString().split('T')[0];
+  const dateStr = date || getTodayDateString();
   const uniqueId = `CHG-PAYOUT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-  const created = addCustomerChange({
-    id: uniqueId,
-    timestamp: new Date().toISOString(),
-    date: todayStr,
-    staffId,
-    staffName,
-    customerId,
-    customerName,
-    in: 0,
-    out: amountOut,
-    notes: notes || `Settlement payout of customer change balance ($${amountOut.toFixed(2)})`,
-  });
+  const created = addCustomerChange(
+    {
+      id: uniqueId,
+      timestamp: new Date().toISOString(),
+      date: dateStr,
+      staffId,
+      staffName,
+      customerId,
+      customerName,
+      in: 0,
+      out: amountOut,
+      notes: notes || `Settlement payout of customer change balance ($${amountOut.toFixed(2)})`,
+      isManual: true,
+    },
+    { isManual: true }
+  );
 
   try {
     addCustomerLedgerEntry({
       customerId: customerId || '',
       customerName: customerName.trim(),
-      date: todayStr,
+      date: dateStr,
       timestamp: new Date().toISOString(),
       type: 'change_paid',
       amount: amountOut,
@@ -11458,14 +11618,15 @@ export const recordCustomerCreditPayment = (
   amountRepaid: number,
   staffId: string,
   staffName: string,
-  notes?: string
+  notes?: string,
+  date?: string
 ): CreditSaleEntry => {
-  const todayStr = new Date().toISOString().split('T')[0];
+  const dateStr = date || getTodayDateString();
   const uniqueId = `CRD-PAYMENT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   const created = addCreditSale({
     id: uniqueId,
     timestamp: new Date().toISOString(),
-    date: todayStr,
+    date: dateStr,
     staffId,
     staffName,
     customerId,
@@ -11476,13 +11637,14 @@ export const recordCustomerCreditPayment = (
     itemDescription: 'Credit Debt Repayment / Settlement',
     notes: notes || `Customer debt repayment received ($${amountRepaid.toFixed(2)})`,
     status: 'Paid',
+    isManual: true,
   });
 
   try {
     addCustomerLedgerEntry({
       customerId: customerId || '',
       customerName: customerName.trim(),
-      date: todayStr,
+      date: dateStr,
       timestamp: new Date().toISOString(),
       type: 'credit_repaid',
       amount: amountRepaid,
@@ -11515,20 +11677,26 @@ export const recordManualCustomerChange = (params: {
   cashReceivedInDrawer?: boolean;
 }): CustomerChangeEntry => {
   const now = new Date();
-  const dateStr = params.date || now.toISOString().split('T')[0];
+  const dateStr = params.date || getTodayDateString();
+  const affectsDrawer = params.cashReceivedInDrawer !== false;
 
-  const created = addCustomerChange({
-    timestamp: now.toISOString(),
-    date: dateStr,
-    staffId: params.staffId,
-    staffName: params.staffName,
-    customerId: params.customerId || '',
-    customerName: params.customerName.trim(),
-    in: params.amount,
-    out: 0,
-    notes: params.notes || 'Manual change booking (customer rejected note / small change unavailable)',
-    reference: params.reference || `MAN-CHG-${Date.now().toString().slice(-4)}`,
-  });
+  const created = addCustomerChange(
+    {
+      timestamp: now.toISOString(),
+      date: dateStr,
+      staffId: params.staffId,
+      staffName: params.staffName,
+      customerId: params.customerId || '',
+      customerName: params.customerName.trim(),
+      in: params.amount,
+      out: 0,
+      notes: params.notes || 'Manual change booking (customer rejected note / small change unavailable)',
+      reference: params.reference || `MAN-CHG-${Date.now().toString().slice(-4)}`,
+      affectsDrawer,
+      isManual: true,
+    },
+    { skipCashMovement: !affectsDrawer, isManual: true }
+  );
 
   // Also log into customer ledger
   try {
@@ -11557,11 +11725,12 @@ export const recordManualCustomerChange = (params: {
     staffRole: params.staffRole || 'Cashier',
     amount: params.amount,
     referenceId: created.id,
-    details: `Manual customer change booked: $${params.amount.toFixed(2)} owed to "${params.customerName.trim()}". Reason: ${params.notes || 'Customer rejected note / small change unavailable'}.`,
+    details: `Manual customer change booked: $${params.amount.toFixed(2)} owed to "${params.customerName.trim()}". Reason: ${params.notes || 'Customer rejected note / small change unavailable'}.${affectsDrawer ? ' [Cash IN till]' : ' [Ledger only / non-drawer]'}`,
     metadata: {
       customerId: params.customerId,
       customerName: params.customerName,
       reference: params.reference,
+      cashReceivedInDrawer: affectsDrawer,
     },
   });
 
@@ -11590,13 +11759,16 @@ export const recordManualCustomerCredit = (params: {
   disburseCashFromDrawer?: boolean;
 }): CreditSaleEntry => {
   const now = new Date();
-  const dateStr = params.date || now.toISOString().split('T')[0];
+  const dateStr = params.date || getTodayDateString();
   const defaultDue = new Date();
   defaultDue.setDate(defaultDue.getDate() + 14);
-  const dueStr = params.dueDate || defaultDue.toISOString().split('T')[0];
+  const localDueStr = `${defaultDue.getFullYear()}-${String(defaultDue.getMonth() + 1).padStart(2, '0')}-${String(defaultDue.getDate()).padStart(2, '0')}`;
+  const dueStr = params.dueDate || localDueStr;
 
   const authSuffix = params.authorizedByName ? ` (Authorized by: ${params.authorizedByName})` : '';
   const itemDesc = params.itemDescription || (params.creditType || 'Cash Credit (Owner Approved)');
+  const currentCompany = getCurrentCompanyId();
+  const currentBranch = getCurrentBranchId();
 
   const created = addCreditSale({
     timestamp: now.toISOString(),
@@ -11612,12 +11784,19 @@ export const recordManualCustomerCredit = (params: {
     dueDate: dueStr,
     notes: `${params.notes || 'Owner approved credit'}${authSuffix}`,
     status: 'Owing',
+    disburseCashFromDrawer: Boolean(params.disburseCashFromDrawer),
+    creditType: params.creditType,
+    isManual: true,
+    company_id: currentCompany,
+    companyId: currentCompany,
+    branch_id: currentBranch,
+    branchId: currentBranch,
   });
 
   // If cash was disbursed from drawer for cash credit, record cash movement
   if (params.disburseCashFromDrawer) {
     try {
-      const shiftId = getShiftId(params.staffId, dateStr);
+      const shiftId = getShiftId(params.staffId, dateStr, currentBranch);
       addMovement({
         shiftId,
         staffId: params.staffId,
@@ -11632,8 +11811,8 @@ export const recordManualCustomerCredit = (params: {
         sourceModule: 'form3',
         sourceRef: created.id,
         notes: `Cash credit paid out from drawer: $${params.amount.toFixed(2)} to ${params.customerName.trim()} (${params.authorizedByName ? `Authorized by: ${params.authorizedByName}` : 'Owner Approved'})`,
-        company_id: getCurrentCompanyId(),
-        branch_id: getCurrentBranchId(),
+        company_id: currentCompany,
+        branch_id: currentBranch,
       });
     } catch (err) {
       // safe fallback
@@ -11678,6 +11857,12 @@ export const recordManualCustomerCredit = (params: {
       disburseCashFromDrawer: params.disburseCashFromDrawer,
     },
   });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: created }));
+  }
 
   return created;
 };
@@ -13146,7 +13331,7 @@ export const ingestMeshCustomerChange = (entry: any): boolean => {
   if (!entry) return false;
   const id = entry.id || entry.changeId;
   if (!id) return false;
-  const all = getCustomerChanges();
+  const all = getRawStoredCustomerChanges();
   if (all.some((c) => c.id === id || (entry.changeId && c.id === entry.changeId))) return false;
   const normalized = { ...entry, id, changeId: id };
   setStored(STORAGE_KEYS.CUSTOMER_CHANGES, [normalized, ...all]);
@@ -13155,6 +13340,7 @@ export const ingestMeshCustomerChange = (entry: any): boolean => {
     window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: normalized }));
     window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
   }
   return true;
 };
@@ -13163,7 +13349,7 @@ export const ingestMeshCreditSale = (entry: any): boolean => {
   if (!entry) return false;
   const id = entry.id || entry.creditId;
   if (!id) return false;
-  const all = getCreditSales();
+  const all = getRawStoredCreditSales();
   if (all.some((c) => c.id === id || (entry.creditId && c.id === entry.creditId))) return false;
   const normalized = { ...entry, id, creditId: id };
   setStored(STORAGE_KEYS.CREDIT_SALES, [normalized, ...all]);
@@ -13172,6 +13358,7 @@ export const ingestMeshCreditSale = (entry: any): boolean => {
     window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: normalized }));
     window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
   }
   return true;
 };
@@ -13661,61 +13848,67 @@ export const markSaleAsSynced = (invoiceId: string): boolean => {
 };
 
 export async function pullTenantInventory(companyId?: string): Promise<{ added: number; updated: number; count: number }> {
+  if (isAppScriptsIngestPaused()) {
+    return { added: 0, updated: 0, count: getInventoryItems().length };
+  }
+
   const compId = companyId || getCurrentCompanyId();
   if (!compId) return { added: 0, updated: 0, count: 0 };
 
   let added = 0;
   let updated = 0;
 
-  // 1. Fetch from server central store (/api/inventory/items)
+  // 1. Fetch from server central store (/api/inventory/items) — route each T2 item through SyncCore LWW
   try {
     const res = await fetch(`/api/inventory/items?company_id=${encodeURIComponent(compId)}`);
     if (res.ok) {
       const data = await res.json();
       if (data && data.success && Array.isArray(data.items)) {
-        const localAll = getRawStoredInventoryItems();
-        const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
-        let changed = false;
-
         for (const remote of data.items) {
-          let rId = (remote.itemId || remote.id || '').trim().toUpperCase();
+          const rId = (remote.itemId || remote.id || '').trim().toUpperCase();
           if (!rId) continue;
 
-          const idx = localAll.findIndex((i) => {
+          const existingAll = getRawStoredInventoryItems();
+          const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
+          const existing = existingAll.find((i) => {
             const iComp = i.company_id || (i as any).companyId || compId;
             if (normTenant(iComp) !== normTenant(compId)) return false;
             const iId = (i.itemId || (i as any).id || '').trim().toUpperCase();
             return rId && iId && rId === iId;
           });
 
-          if (idx >= 0) {
-            const local = localAll[idx];
-            if (!local.lastUpdated || (remote.lastUpdated && remote.lastUpdated >= local.lastUpdated)) {
-              localAll[idx] = { ...local, ...remote, itemId: local.itemId || rId, id: local.itemId || rId };
-              updated++;
-              changed = true;
+          const ts = parseTimestampMs(remote.hubTimestamp ?? remote.updatedAt ?? remote.lastUpdated) || Date.now();
+          await routeCloudRecordThroughSyncCore(
+            {
+              packetId: `CLOUD-TENANT-INV-${rId}-${ts}-${Math.random().toString(36).substring(2, 6)}`,
+              entityType: 'inventory_item',
+              entityId: rId,
+              action: 'UPSERT',
+              data: remote,
+              updatedAt: ts,
+              originDeviceId: 'APPS_SCRIPT_CLOUD',
+              targetBranchId: 'ALL',
+              class: 'T2',
+            },
+            existing,
+            () => {
+              const wasExisting = Boolean(existing);
+              const didSave = ingestMeshInventoryItem({
+                ...remote,
+                itemId: rId,
+                id: rId,
+                company_id: compId,
+                companyId: compId,
+                branch_id: remote.branch_id || 'ALL',
+                branchId: remote.branch_id || 'ALL',
+                fromMesh: true,
+              });
+              if (didSave) {
+                if (wasExisting) updated++;
+                else added++;
+              }
             }
-          } else {
-            localAll.unshift({
-              ...remote,
-              itemId: rId,
-              id: rId,
-              company_id: compId,
-              companyId: compId,
-              branch_id: remote.branch_id || 'ALL',
-              branchId: remote.branch_id || 'ALL',
-            });
-            added++;
-            changed = true;
-          }
-        }
-
-        if (changed) {
-          setStored(STORAGE_KEYS.INVENTORY_ITEMS, localAll);
-          try {
-            setStored(STORAGE_KEYS.PRODUCTS, localAll.map((item) => inventoryItemToProduct(item)));
-          } catch (e) {}
-          notifyListeners();
+          );
         }
       }
     }
@@ -13725,12 +13918,37 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
 
   // 2. Also check if Google Sheets has additional products via /api/saas/call-action
   try {
-    const gasRes = await fetch(`/api/saas/call-action?action=get_inventory&company_id=${encodeURIComponent(compId)}`);
-    if (gasRes.ok) {
-      const gasData = await gasRes.json().catch(() => null);
-      if (gasData && gasData.success && Array.isArray(gasData.items) && gasData.items.length > 0) {
-        for (const item of gasData.items) {
-          ingestMeshInventoryItem(item);
+    if (!isAppScriptsIngestPaused()) {
+      const gasRes = await fetch(`/api/saas/call-action?action=get_inventory&company_id=${encodeURIComponent(compId)}`);
+      if (gasRes.ok) {
+        const gasData = await gasRes.json().catch(() => null);
+        if (gasData && gasData.success && Array.isArray(gasData.items) && gasData.items.length > 0) {
+          const existingAll = getRawStoredInventoryItems();
+          for (const item of gasData.items) {
+            const rId = String(item?.itemId || item?.id || '').trim().toUpperCase();
+            if (!rId) continue;
+            const existing = existingAll.find(
+              (ex) => String(ex.itemId || (ex as any).id || '').trim().toUpperCase() === rId
+            );
+            const ts = parseTimestampMs(item.hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
+            await routeCloudRecordThroughSyncCore(
+              {
+                packetId: `CLOUD-GAS-INV-${rId}-${ts}-${Math.random().toString(36).substring(2, 6)}`,
+                entityType: 'inventory_item',
+                entityId: rId,
+                action: 'UPSERT',
+                data: item,
+                updatedAt: ts,
+                originDeviceId: 'APPS_SCRIPT_CLOUD',
+                targetBranchId: 'ALL',
+                class: 'T2',
+              },
+              existing,
+              () => {
+                ingestMeshInventoryItem(item);
+              }
+            );
+          }
         }
       }
     }
@@ -13738,18 +13956,20 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
 
   // 3. Opportunistically push newly added/updated local items for this company to central server
   try {
-    const tenantLocalItems = getInventoryItems().filter((i) => (i.company_id || (i as any).companyId) === compId);
-    if (tenantLocalItems.length > 0 && (added > 0 || updated > 0)) {
-      const deviceId = (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'terminal-local';
-      fetch('/api/inventory/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          company_id: compId,
-          device_id: deviceId,
-          items: tenantLocalItems,
-        }),
-      }).catch(() => {});
+    if (!isAppScriptsIngestPaused()) {
+      const tenantLocalItems = getInventoryItems().filter((i) => (i.company_id || (i as any).companyId) === compId);
+      if (tenantLocalItems.length > 0 && (added > 0 || updated > 0)) {
+        const deviceId = (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'terminal-local';
+        fetch('/api/inventory/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            company_id: compId,
+            device_id: deviceId,
+            items: tenantLocalItems,
+          }),
+        }).catch(() => {});
+      }
     }
   } catch (syncErr) {}
 
@@ -13757,6 +13977,9 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
 }
 
 export async function pullTenantSales(companyId?: string): Promise<number> {
+  if (isAppScriptsIngestPaused()) {
+    return 0;
+  }
   const compId = companyId || getCurrentCompanyId();
   if (!compId) return 0;
   try {
@@ -13765,22 +13988,32 @@ export async function pullTenantSales(companyId?: string): Promise<number> {
       const data = await res.json();
       if (data && data.success && Array.isArray(data.sales)) {
         const localAll = getAllSales();
-        const localIdSet = new Set(localAll.map((s) => s.id));
+        const localById = new Map(localAll.map((s) => [s.id, s]));
         let addedCount = 0;
-        const merged = [...localAll];
         for (const remoteSale of data.sales) {
-          if (remoteSale && remoteSale.id && !localIdSet.has(remoteSale.id)) {
-            merged.push(remoteSale);
-            localIdSet.add(remoteSale.id);
-            addedCount++;
-          }
-        }
-        if (addedCount > 0) {
-          setStored(STORAGE_KEYS.SALES, merged);
-          notifyListeners();
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
-          }
+          if (!remoteSale || !remoteSale.id) continue;
+          const existing = localById.get(remoteSale.id);
+          const ts = parseTimestampMs(remoteSale.updatedAt || remoteSale.timestamp) || Date.now();
+          await routeCloudRecordThroughSyncCore(
+            {
+              packetId: `CLOUD-SALE-${remoteSale.id}`,
+              entityType: 'sale',
+              entityId: String(remoteSale.id),
+              action: 'APPEND',
+              data: remoteSale,
+              updatedAt: ts,
+              originDeviceId: 'APPS_SCRIPT_CLOUD',
+              targetBranchId: remoteSale.branch_id || remoteSale.branchId || 'ALL',
+              class: 'T1',
+            },
+            existing,
+            () => {
+              if (ingestMeshSale({ ...remoteSale, fromMesh: true })) {
+                localById.set(remoteSale.id, remoteSale);
+                addedCount++;
+              }
+            }
+          );
         }
         return addedCount;
       }

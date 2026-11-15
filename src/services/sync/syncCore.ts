@@ -11,15 +11,59 @@ export class SyncCore {
     return this.adapter;
   }
 
+  setAdapter(adapter: SyncAdapter): void {
+    this.adapter = adapter;
+  }
+
   getDeviceId(): string {
     return this.deviceId;
   }
 
+  setDeviceId(deviceId: string): void {
+    this.deviceId = deviceId;
+  }
+
+  hasSeenPacket(packetId: string): boolean {
+    return this.seenPacketIds.has(packetId);
+  }
+
+  markPacketSeen(packetId: string): void {
+    if (!packetId) return;
+    if (this.seenPacketIds.size > 10000) {
+      const first = this.seenPacketIds.values().next().value;
+      if (first) this.seenPacketIds.delete(first);
+    }
+    this.seenPacketIds.add(packetId);
+  }
+
   /**
    * Lesson 1 (Save=Broadcast), Lesson 3 (Fresh Timestamp), Lesson 8 (IndexedDB First).
-   * Note: Caller persists to IndexedDB before calling saveAndSync. This method broadcasts.
+   * Supports either a pre-built canonical SyncEnvelope or (entityType, record, branchId).
    */
-  async saveAndSync<T>(entityType: string, record: T, branchId: string): Promise<BroadcastResult> {
+  async saveAndSync<T>(envelope: SyncEnvelope<T>): Promise<BroadcastResult>;
+  async saveAndSync<T>(entityType: string, record: T, branchId: string): Promise<BroadcastResult>;
+  async saveAndSync<T>(
+    entityTypeOrEnvelope: string | SyncEnvelope<T>,
+    record?: T,
+    branchId?: string
+  ): Promise<BroadcastResult> {
+    if (typeof entityTypeOrEnvelope !== 'string') {
+      const env = entityTypeOrEnvelope;
+      const spec = this.getSpec(env.entityType);
+      const canonical: SyncEnvelope<T> = {
+        ...env,
+        class: env.class || spec.class,
+        originDeviceId: env.originDeviceId || this.deviceId,
+        updatedAt: env.updatedAt || Date.now(),
+        packetId:
+          env.packetId ||
+          `${env.entityType}-${env.entityId || 'unknown'}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+      };
+      this.markPacketSeen(canonical.packetId);
+      return await this.adapter.broadcast(canonical);
+    }
+
+    const entityType: string = entityTypeOrEnvelope;
     const spec = this.getSpec(entityType);
     const action: SyncAction = spec.appendOnly ? 'APPEND' : 'UPSERT';
     const recId = (record as any)?.id || (record as any)?.itemId || 'unknown';
@@ -30,13 +74,14 @@ export class SyncCore {
       entityType,
       entityId: String(recId),
       action,
-      data: record,
+      data: record as T,
       updatedAt: Date.now(),
       originDeviceId: this.deviceId,
-      targetBranchId: branchId,
+      targetBranchId: branchId || 'ALL',
       class: spec.class,
     };
 
+    this.markPacketSeen(packetId);
     return await this.adapter.broadcast(envelope);
   }
 
@@ -46,7 +91,8 @@ export class SyncCore {
    */
   async ingest(
     envelope: SyncEnvelope,
-    existingRecord?: any
+    existingRecord?: any,
+    onAcceptedPersist?: (envelope: SyncEnvelope) => void | Promise<void>
   ): Promise<{ accepted: boolean; reason?: string }> {
     // Lesson 4 (No Re-Broadcast): reject packets from self
     if (envelope.originDeviceId === this.deviceId) {
@@ -57,7 +103,7 @@ export class SyncCore {
     if (this.seenPacketIds.has(envelope.packetId)) {
       return { accepted: false, reason: 'DUPLICATE_PACKET' };
     }
-    this.seenPacketIds.add(envelope.packetId);
+    this.markPacketSeen(envelope.packetId);
 
     // Entity registry lookup
     const spec = ENTITY_REGISTRY[envelope.entityType];
@@ -83,6 +129,10 @@ export class SyncCore {
       if (existingRecord !== undefined && existingRecord !== null) {
         return { accepted: false, reason: 'DUPLICATE_T1' };
       }
+    }
+
+    if (onAcceptedPersist) {
+      await onAcceptedPersist(envelope);
     }
 
     // Lesson 10 (Cross-Device UI Events): dispatch UI event

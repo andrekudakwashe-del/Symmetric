@@ -256,10 +256,11 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
     return createInitialCreditRows();
   });
 
-  // Load existing saved sheet entries when date or staff changes
+  // Load existing saved sheet entries when date, staff, or ledger records change
   useEffect(() => {
-    const savedChanges = getCustomerChangesForStaffAndDate(selectedStaffId, selectedDate);
-    const savedCredits = getCreditSalesForStaffAndDate(selectedStaffId, selectedDate);
+    const activeStaff = salespeople.find((s) => s.id === selectedStaffId) || currentUser;
+    const savedChanges = getCustomerChangesForStaffAndDate(selectedStaffId, selectedDate, activeStaff?.name);
+    const savedCredits = getCreditSalesForStaffAndDate(selectedStaffId, selectedDate, activeStaff?.name);
 
     if (savedChanges.length > 0) {
       const loadedChangeRows: CustomerChangeRowState[] = savedChanges.map((c, idx) => ({
@@ -301,7 +302,7 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
     } else {
       setCreditRows(createInitialCreditRows());
     }
-  }, [selectedDate, selectedStaffId]);
+  }, [selectedDate, selectedStaffId, historyChangeLogs, historyCreditLogs]);
 
   // Sync preselected customer when prop updates
   useEffect(() => {

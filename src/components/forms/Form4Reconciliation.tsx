@@ -12,7 +12,9 @@ import {
   getCashLogs,
   getCashLogsForStaffAndDate,
   getCustomerChanges,
+  getCustomerChangesForStaffAndDate,
   getCreditSales,
+  getCreditSalesForStaffAndDate,
   getCashCounts,
   getAdminSales,
   getAdminSaleForStaffAndDate,
@@ -317,6 +319,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     window.addEventListener('saimetric_sales_updated', handleUpdate);
     window.addEventListener('saimetric_cash_updated', handleUpdate);
     window.addEventListener('saimetric_cash_movements_updated', handleUpdate);
+    window.addEventListener('saimetric_customer_changes_updated', handleUpdate);
+    window.addEventListener('saimetric_credit_sales_updated', handleUpdate);
+    window.addEventListener('saimetric_customer_ledger_updated', handleUpdate);
     window.addEventListener('saimetric_direct_grvs_updated', handleUpdate);
     window.addEventListener('saimetric_expenses_updated', handleUpdate);
     window.addEventListener('saimetric_internal_consumption_updated', handleUpdate);
@@ -328,6 +333,9 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       window.removeEventListener('saimetric_sales_updated', handleUpdate);
       window.removeEventListener('saimetric_cash_updated', handleUpdate);
       window.removeEventListener('saimetric_cash_movements_updated', handleUpdate);
+      window.removeEventListener('saimetric_customer_changes_updated', handleUpdate);
+      window.removeEventListener('saimetric_credit_sales_updated', handleUpdate);
+      window.removeEventListener('saimetric_customer_ledger_updated', handleUpdate);
       window.removeEventListener('saimetric_direct_grvs_updated', handleUpdate);
       window.removeEventListener('saimetric_expenses_updated', handleUpdate);
       window.removeEventListener('saimetric_internal_consumption_updated', handleUpdate);
@@ -418,6 +426,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     let totalEcocashSales = 0;
     let totalZigSales = 0;
     let totalCreditExtended = 0;
+    let totalCreditCashOut = 0;
 
     const activeCurrenciesList = getActiveCurrencies();
     const currencyWithdrawalTotals: Record<string, number> = {};
@@ -464,6 +473,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       totalEcocashSales += r.ecocashSales || 0;
       totalZigSales += r.zigSales || 0;
       totalCreditExtended += r.creditExtended || 0;
+      totalCreditCashOut += r.creditCashOut || 0;
 
       activeCurrenciesList.forEach((c) => {
         const wVal =
@@ -515,6 +525,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       totalEcocashSales: Math.round(totalEcocashSales * 100) / 100,
       totalZigSales: Math.round(totalZigSales * 100) / 100,
       totalCreditExtended: Math.round(totalCreditExtended * 100) / 100,
+      totalCreditCashOut: Math.round(totalCreditCashOut * 100) / 100,
       activeCurrencies: activeCurrenciesList,
       currencyWithdrawalTotals,
       currencySalesTotals,
@@ -1137,8 +1148,8 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
 
     // Form 1-4 is strictly for POS register events: exclude vault custody transfers
     const form2Logs = getCashLogsForStaffAndDate(auditStaffId, date);
-    const form3Changes = getCustomerChanges().filter((c) => c.staffId === auditStaffId && c.date === date);
-    const form3Credits = getCreditSales().filter((c) => c.staffId === auditStaffId && c.date === date);
+    const form3Changes = getCustomerChangesForStaffAndDate(auditStaffId, date, staff.name);
+    const form3Credits = getCreditSalesForStaffAndDate(auditStaffId, date, staff.name);
     const form1Count = getCashCounts().find((c) => c.staffId === auditStaffId && c.date === date);
     const staffSales =
       (row as any)?.staffSales && (row as any).staffSales.length > 0
@@ -1166,7 +1177,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       staffMovements,
       reportData,
     };
-  }, [auditStaffId, salespeople, balancingData, date, salesList, currentUser?.branchId]);
+  }, [auditStaffId, salespeople, balancingData, date, salesList, currentUser?.branchId, refreshKey]);
 
   // Handle logging new company expense
   const handleAddExpense = (e: React.FormEvent) => {
@@ -2485,6 +2496,12 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
               <span className="text-rose-400 font-bold">Cash Lift (${summaryTotals.totalCashLift.toFixed(2)})</span>
               {' − '}
               <span className="text-rose-400 font-bold">Change Out (${summaryTotals.totalChangeOut.toFixed(2)})</span>
+              {summaryTotals.totalCreditCashOut > 0 && (
+                <>
+                  {' − '}
+                  <span className="text-rose-400 font-bold">Cash Credit Out (${summaryTotals.totalCreditCashOut.toFixed(2)})</span>
+                </>
+              )}
               <br className="my-1.5" />
               {summaryTotals.activeCurrencies.map((c) => {
                 const wAmt = summaryTotals.currencyWithdrawalTotals[c.currency] || 0;

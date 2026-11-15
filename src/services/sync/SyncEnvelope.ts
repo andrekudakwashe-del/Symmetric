@@ -12,6 +12,7 @@ export interface SyncEnvelope<T = any> {
   originDeviceId: string;
   targetBranchId: string;
   class: EntityClass;           // determines LWW vs append-only
+  meta?: Record<string, any>;   // optional adapter/transport metadata (companyId, branchCode, originDeviceName, isReconPush, sheetName)
 }
 
 export type ReconPacketType =

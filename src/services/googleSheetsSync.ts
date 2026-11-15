@@ -37,12 +37,18 @@ import {
   getDirectGrvs,
   getAllCashLifts,
   getAllGoodsReceived,
+  getRawStoredInventoryItems,
+  parseTimestampMs,
 } from '../db/roomDatabase';
 import { SyncQueueItem, SheetName, StaffPermissions, InventoryItem } from '../types';
 import { Company, SaaSBranch } from '../data/saasData';
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { runtimeSyncDispatcher } from './backendAdapter/runtimeSyncDispatcher';
 import { getTenantBackendConfig } from './backendAdapter/adapterRegistry';
+import {
+  isAppScriptsIngestPaused,
+  routeCloudRecordThroughSyncCore,
+} from './sync/syncIngestBridge';
 
 export interface SyncResult {
   total: number;
@@ -557,7 +563,7 @@ export const processSyncQueue = async (
     errors: [],
   };
 
-  if (persistentSyncEngine.isSyncPaused()) {
+  if (persistentSyncEngine.isSyncPaused() || isAppScriptsIngestPaused()) {
     console.log('[GoogleSheetsSync] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping processSyncQueue.');
     return result;
   }
@@ -2100,10 +2106,50 @@ export const fetchProductsFromSheet = async (
   companyId?: string
 ): Promise<{ success: boolean; items: InventoryItem[]; count: number; message: string }> => {
   const compId = companyId || getCurrentCompanyId();
+
+  if (persistentSyncEngine.isSyncPaused() || isAppScriptsIngestPaused()) {
+    const local = getInventoryItems();
+    return {
+      success: true,
+      items: local,
+      count: local.length,
+      message: `Using ${local.length} local inventory items (AppScriptsAdapter paused while Local Hub active).`,
+    };
+  }
+
   const currentComp = getCurrentCompany();
   const config = getSheetsConfig();
   const targetWebhook = currentComp.webhook_url || config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL;
   const sheetId = currentComp.sheet_id || config.spreadsheetId;
+
+  const ingestViaSyncCore = async (items: any[]) => {
+    const existingAll = getRawStoredInventoryItems();
+    for (const item of items) {
+      const rId = String(item?.itemId || item?.id || '').trim().toUpperCase();
+      if (!rId) continue;
+      const existing = existingAll.find(
+        (ex) => String(ex.itemId || (ex as any).id || '').trim().toUpperCase() === rId
+      );
+      const ts = parseTimestampMs(item.hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
+      await routeCloudRecordThroughSyncCore(
+        {
+          packetId: `CLOUD-INV-${rId}-${ts}-${Math.random().toString(36).substring(2, 6)}`,
+          entityType: 'inventory_item',
+          entityId: rId,
+          action: 'UPSERT',
+          data: item,
+          updatedAt: ts,
+          originDeviceId: 'APPS_SCRIPT_CLOUD',
+          targetBranchId: 'ALL',
+          class: 'T2',
+        },
+        existing,
+        () => {
+          ingestMeshInventoryItem(item);
+        }
+      );
+    }
+  };
 
   // 1. Try server endpoint
   try {
@@ -2111,9 +2157,7 @@ export const fetchProductsFromSheet = async (
     if (res.ok) {
       const data = await res.json();
       if (data && data.success && Array.isArray(data.items)) {
-        for (const item of data.items) {
-          ingestMeshInventoryItem(item);
-        }
+        await ingestViaSyncCore(data.items);
         return {
           success: true,
           items: data.items,
@@ -2134,9 +2178,7 @@ export const fetchProductsFromSheet = async (
       if (res.ok) {
         const data = await res.json();
         if (data && data.items && Array.isArray(data.items)) {
-          for (const item of data.items) {
-            ingestMeshInventoryItem(item);
-          }
+          await ingestViaSyncCore(data.items);
           return {
             success: true,
             items: data.items,
@@ -2259,15 +2301,18 @@ export const fetchCompaniesFromMasterSheet = async (
       });
     }
 
-    // Cross-device user synchronization: Save remote staff & owner users into room database
-    if (remoteUsers.length > 0) {
-      remoteUsers.forEach((u) => {
+    // Cross-device user synchronization: route through SyncCore T2 LWW gate and skip when paused
+    if (remoteUsers.length > 0 && !persistentSyncEngine.isSyncPaused() && !isAppScriptsIngestPaused()) {
+      for (const u of remoteUsers) {
         const cloudStaff = u;
         console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
         const uComp = u.company_id || u.companyId;
         if (uComp) {
-          const savedStaff = saveSalesperson({
-            id: u.id || u.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
+          const staffId = u.id || u.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+          const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
+          const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || Date.now();
+          const staffObj: any = {
+            id: staffId,
             name: u.name || u.full_name || 'Staff Member',
             role: (u.role || 'OWNER').toUpperCase() as any,
             email: u.email || '',
@@ -2279,17 +2324,35 @@ export const fetchCompaniesFromMasterSheet = async (
             branchId: u.branch_id || u.branchId || 'BR-MAIN',
             branch_id: u.branch_id || u.branchId || 'BR-MAIN',
             permissions: getOwnerDefaultPermissions(),
-          });
-          console.log(
-            '[STAFF TRACE] 7. Saved to DB. New Pin:',
-            savedStaff.pin_hash,
-            'New Branches:',
-            (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
-            'Role:',
-            savedStaff.role
+            ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
+          };
+          await routeCloudRecordThroughSyncCore(
+            {
+              packetId: `CLOUD-MASTER-STAFF-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
+              entityType: 'staff',
+              entityId: String(staffId),
+              action: 'UPSERT',
+              data: staffObj,
+              updatedAt: incomingTs,
+              originDeviceId: 'APPS_SCRIPT_CLOUD',
+              targetBranchId: 'ALL',
+              class: 'T2',
+            },
+            existingStaff,
+            () => {
+              const savedStaff = saveSalesperson(staffObj);
+              console.log(
+                '[STAFF TRACE] 7. Saved to DB. New Pin:',
+                savedStaff.pin_hash,
+                'New Branches:',
+                (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+                'Role:',
+                savedStaff.role
+              );
+            }
           );
         }
-      });
+      }
     }
 
     if (remoteList.length > 0 || remoteUsers.length > 0) {

@@ -415,8 +415,12 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                       </div>
                     )}
                     <div className="flex justify-between">
-                      <span>+ Credit Repay & Chg Left (F3)</span>
-                      <span className="font-bold">{fmtMoney(report.creditPayments)}</span>
+                      <span>+ Credit Repayments (F3)</span>
+                      <span className="font-bold">{fmtMoney(report.creditRepaymentsIn)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>+ Customer Change In (F3)</span>
+                      <span className="font-bold">{fmtMoney(report.changeLeftBehindIn)}</span>
                     </div>
                     <div className="flex justify-between">
                       <span>- Cash Expenses (Excl. Shop Use)</span>
@@ -436,6 +440,12 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                       <span>- Customer Change Paid Out (F3)</span>
                       <span className="font-bold">-{fmtMoney(report.customerChangePaidOut)}</span>
                     </div>
+                    {report.creditCashOut > 0 && (
+                      <div className="flex justify-between">
+                        <span>- Cash Credit Paid Out (F3)</span>
+                        <span className="font-bold">-{fmtMoney(report.creditCashOut)}</span>
+                      </div>
+                    )}
                     <div className="flex justify-between">
                       <span>- Multi-Currency Cash Handed Out</span>
                       <span className="font-bold">
@@ -957,6 +967,12 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                     </span>
                   </div>
                   <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                    <span className="text-slate-400 block text-[10px]">+ Change In (F3)</span>
+                    <span className="font-mono-num font-bold text-emerald-400">
+                      +${((auditData.row.changeReceived ?? auditData.row.changeIn) ?? 0).toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
                     <span className="text-slate-400 block text-[10px]">- Expenses</span>
                     <span className="font-mono-num font-bold text-rose-400">
                       -${(auditData.row.expenses ?? 0).toFixed(2)}
@@ -980,6 +996,14 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                       -${(auditData.row.customerChange ?? 0).toFixed(2)}
                     </span>
                   </div>
+                  {(auditData.row.creditCashOut ?? 0) > 0 && (
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">- Cash Credit Out</span>
+                      <span className="font-mono-num font-bold text-rose-400">
+                        -${(auditData.row.creditCashOut ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                  )}
                   <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
                     <span className="text-slate-400 block text-[10px]">- Deductions</span>
                     <span className="font-mono-num font-bold text-rose-400">
@@ -1221,8 +1245,14 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                         <span className="font-bold text-white">{cr.customerName}</span>
                         <span className="text-slate-400 ml-1.5">({cr.itemDescription})</span>
                       </div>
-                      <div className="text-right font-mono-num font-bold text-amber-300">
-                        ${(cr.amount ?? 0).toFixed(2)}
+                      <div className="text-right font-mono-num font-bold">
+                        {(cr.in ?? 0) > 0 ? (
+                          <span className="text-emerald-400">+${(cr.in ?? 0).toFixed(2)} Paid</span>
+                        ) : (cr as any).disburseCashFromDrawer ? (
+                          <span className="text-rose-400">-${(cr.out ?? cr.amount ?? 0).toFixed(2)} Cash Cr</span>
+                        ) : (
+                          <span className="text-amber-300">${(cr.amount ?? cr.out ?? 0).toFixed(2)} Cr</span>
+                        )}
                       </div>
                     </div>
                   ))}

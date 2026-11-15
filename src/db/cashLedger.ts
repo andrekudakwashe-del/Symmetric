@@ -60,7 +60,9 @@ export const getActiveCompanyId = (): string => {
  */
 export const getShiftId = (staffId: string, date: string, branchId?: string): string => {
   const cleanStaff = (staffId || 'staff').trim();
-  const cleanDate = (date || new Date().toISOString().split('T')[0]).trim();
+  const n = new Date();
+  const localToday = `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+  const cleanDate = (date || localToday).trim();
   const cleanBranch = (branchId || getActiveBranchId() || 'BR-MAIN').trim();
   return `${cleanStaff}_${cleanDate}_${cleanBranch}`;
 };
@@ -511,12 +513,16 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
       recordCountedSupplierGrvRefs(m, seenGrvRefs);
     }
 
-    // Prevent double-counting customer change received if logged in both POS and Form 3
+    // Prevent double-counting customer change received if logged in both POS and Form 3 sheet
+    // Note: Do NOT suppress manual change bookings (e.g. rejected note on an existing invoice)
     if (m.type === 'change_received') {
-      const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
-      if (invMatch) {
-        if (seenChangeReceivedInvoices.has(invMatch)) return;
-        seenChangeReceivedInvoices.add(invMatch);
+      const isManualRef = Boolean(m.notes?.includes('[Manual Change]') || m.sourceRef?.startsWith('MAN-CHG-'));
+      if (!isManualRef && (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #'))) {
+        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        if (invMatch) {
+          if (seenChangeReceivedInvoices.has(invMatch)) return;
+          seenChangeReceivedInvoices.add(invMatch);
+        }
       }
     }
 
@@ -563,6 +569,12 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
       case 'ecocash_cash_out':
       case 'zig_cash_out':
         balance -= amt;
+        break;
+
+      case 'credit_extended':
+        if (m.direction === 'out') {
+          balance -= amt;
+        }
         break;
 
       case 'supervisor_lift':
@@ -686,6 +698,7 @@ export interface ShiftLedgerBreakdown {
   directProcurements: number;
   cashLift: number;
   changePaid: number;
+  creditCashOut: number;
   ecocashCashOut: number;
   zigCashOut: number;
   ecocashSales?: number;
@@ -717,6 +730,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
   let directProcurements = 0;
   let cashLift = 0;
   let changePaid = 0;
+  let creditCashOut = 0;
   let ecocashCashOut = 0;
   let zigCashOut = 0;
   let ecocashSales = 0;
@@ -789,12 +803,16 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
       recordCountedSupplierGrvRefs(m, seenGrvRefs);
     }
 
-    // Prevent double-counting customer change received if logged in both POS and Form 3
+    // Prevent double-counting customer change received if logged in both POS and Form 3 sheet
+    // Note: Do NOT suppress manual change bookings (e.g. rejected note on an existing invoice)
     if (m.type === 'change_received') {
-      const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
-      if (invMatch) {
-        if (seenChangeReceivedInvoices.has(invMatch)) return;
-        seenChangeReceivedInvoices.add(invMatch);
+      const isManualRef = Boolean(m.notes?.includes('[Manual Change]') || m.sourceRef?.startsWith('MAN-CHG-'));
+      if (!isManualRef && (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #'))) {
+        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        if (invMatch) {
+          if (seenChangeReceivedInvoices.has(invMatch)) return;
+          seenChangeReceivedInvoices.add(invMatch);
+        }
       }
     }
 
@@ -836,6 +854,9 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
         break;
       case 'change_paid':
         changePaid += amt;
+        break;
+      case 'credit_extended':
+        if (m.direction === 'out') creditCashOut += amt;
         break;
       case 'petty_cash':
         pettyCash += amt;
@@ -880,7 +901,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
   const cashInTotal = Math.round((openingFloat + cashSales + creditPayments + changeReceived) * 100) / 100;
   const cashOutTotal =
     Math.round(
-      (changePaid + pettyCash + directProcurements + cashLift + ecocashCashOut + zigCashOut + expenses + refunds) * 100
+      (changePaid + creditCashOut + pettyCash + directProcurements + cashLift + ecocashCashOut + zigCashOut + expenses + refunds) * 100
     ) / 100;
   const expectedCash = Math.round((cashInTotal - cashOutTotal) * 100) / 100;
 
@@ -911,6 +932,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
     directProcurements: Math.round(directProcurements * 100) / 100,
     cashLift: Math.round(cashLift * 100) / 100,
     changePaid: Math.round(changePaid * 100) / 100,
+    creditCashOut: Math.round(creditCashOut * 100) / 100,
     ecocashCashOut: Math.round(ecocashCashOut * 100) / 100,
     zigCashOut: Math.round(zigCashOut * 100) / 100,
     ecocashSales: Math.round(ecocashSales * 100) / 100,

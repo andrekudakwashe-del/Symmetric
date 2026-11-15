@@ -162,6 +162,8 @@ export interface CashierShiftReportData {
   directProcurements: number;
   cashLift: number;
   customerChangePaidOut: number;
+  creditCashOut: number;
+  creditExtended: number;
   deductions: number;
   multiCurrencyCashOutTotal: number;
   currencyWithdrawalsMap: Record<string, number>;
@@ -325,10 +327,10 @@ export const buildCashierShiftReportData = (params: {
     (l) => !isVoidedOrInactive(l)
   );
   const dedupedForm2Logs = deduplicateCashLogs(rawForm2Logs);
-  const form3Changes = getCustomerChangesForStaffAndDate(staff.id, date).filter(
+  const form3Changes = getCustomerChangesForStaffAndDate(staff.id, date, staff.name).filter(
     (c) => !isVoidedOrInactive(c)
   );
-  const form3Credits = getCreditSalesForStaffAndDate(staff.id, date).filter(
+  const form3Credits = getCreditSalesForStaffAndDate(staff.id, date, staff.name).filter(
     (c) => !isVoidedOrInactive(c)
   );
   const form1Count = getCashCountForStaffAndDate(staff.id, date);
@@ -785,13 +787,37 @@ export const buildCashierShiftReportData = (params: {
     }
   }
 
+  const creditCashOut = Number(row.creditCashOut || 0);
+  const creditExtended = Number(row.creditExtended || 0);
+
+  if (Math.abs(variance) >= 0.01 || submittedForm1Cash === null) {
+    if (creditCashOut > 0) {
+      varianceDiagnosis.push(
+        `Form 3 Cash Credit loans handed out from till reduced expected drawer cash by -$${creditCashOut.toFixed(2)}.`
+      );
+    }
+    if (creditExtended > 0) {
+      varianceDiagnosis.push(
+        `Goods sold on Credit ($${creditExtended.toFixed(2)}) excluded from expected physical cash.`
+      );
+    }
+  }
+
   // Also include raw movements count sanity note if Form 2 + 3 net vs Sales+Float differs
   const allMovements = getAllMovements().filter((m) => matchesShift(m, shiftId, branchId));
   void allMovements;
   void adminSale;
 
-  const creditRepaymentsIn = form3Credits.reduce((s, c) => s + Number(c.in || 0), 0);
-  const changeLeftBehindIn = form3Changes.reduce((s, c) => s + Number(c.in || 0), 0);
+  const creditRepaymentsIn = Math.max(
+    Number(row.creditPayments || 0),
+    form3Credits.reduce((s, c) => s + Number(c.in || 0), 0)
+  );
+  const changeLeftBehindIn = Math.max(
+    Number(row.changeReceived ?? row.changeIn ?? 0),
+    form3Changes
+      .filter((c) => c.affectsDrawer !== false)
+      .reduce((s, c) => s + Number(c.in || 0), 0)
+  );
 
   return {
     companyId: comp?.company_id || 'COMP-001',
@@ -819,6 +845,8 @@ export const buildCashierShiftReportData = (params: {
     directProcurements: Number(row.directProcurements || 0),
     cashLift: Number(row.cashLift || 0),
     customerChangePaidOut: Number(row.customerChange || 0),
+    creditCashOut,
+    creditExtended,
     deductions: Number(row.deductions || 0),
     multiCurrencyCashOutTotal,
     currencyWithdrawalsMap: row.currencyWithdrawals || {},

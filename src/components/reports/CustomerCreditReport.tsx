@@ -5,6 +5,8 @@ import {
   recordCustomerCreditPayment,
   recordManualCustomerCredit,
   getCustomers,
+  getSalespeople,
+  getTodayDateString,
   subscribeToDatabase,
 } from '../../db/roomDatabase';
 import {
@@ -51,12 +53,31 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
   const [filterType, setFilterType] = useState<'owing' | 'overdue' | '0-7' | '8-14' | '15+' | 'settled' | 'all'>('owing');
   const [sortBy, setSortBy] = useState<'daysDesc' | 'daysAsc' | 'amountDesc' | 'nameAsc'>('daysDesc');
 
+  const getLocalOffsetDateString = (offsetDays: number): string => {
+    const d = new Date();
+    d.setDate(d.getDate() + offsetDays);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+
   // Modal states
   const [selectedItemForHistory, setSelectedItemForHistory] = useState<CustomerCreditReportItem | null>(null);
   const [paymentModalItem, setPaymentModalItem] = useState<CustomerCreditReportItem | null>(null);
   const [paymentAmount, setPaymentAmount] = useState<string>('');
   const [paymentNotes, setPaymentNotes] = useState<string>('');
+  const [paymentDate, setPaymentDate] = useState<string>(() => getTodayDateString());
   const [successToast, setSuccessToast] = useState<string | null>(null);
+
+  const [salespeople, setSalespeople] = useState<Salesperson[]>(() => getSalespeople());
+  const [selectedStaffId, setSelectedStaffId] = useState<string>(() => {
+    const list = getSalespeople();
+    const matched = list.find((s) => s.id === currentUser?.id);
+    return matched ? matched.id : (list[0]?.id || currentUser?.id || '001');
+  });
+  const [paymentStaffId, setPaymentStaffId] = useState<string>(() => {
+    const list = getSalespeople();
+    const matched = list.find((s) => s.id === currentUser?.id);
+    return matched ? matched.id : (list[0]?.id || currentUser?.id || '001');
+  });
 
   // Manual Credit Modal State (e.g. days where owner actually approves cash credit or goods credit)
   const [showManualCreditModal, setShowManualCreditModal] = useState<boolean>(false);
@@ -68,19 +89,21 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
   const [creditType, setCreditType] = useState<string>('Cash Credit (Owner Approved)');
   const [disburseCashFromDrawer, setDisburseCashFromDrawer] = useState<boolean>(true);
   const [dueDatePreset, setDueDatePreset] = useState<'7' | '14' | '30' | 'custom'>('14');
-  const [customDueDate, setCustomDueDate] = useState<string>(() => {
-    const d = new Date();
-    d.setDate(d.getDate() + 14);
-    return d.toISOString().split('T')[0];
-  });
+  const [customDueDate, setCustomDueDate] = useState<string>(() => getLocalOffsetDateString(14));
   const [authorizedByName, setAuthorizedByName] = useState<string>(() => currentUser?.name || 'Owner Approved');
   const [manualNotes, setManualNotes] = useState<string>('');
-  const [manualDate, setManualDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
+  const [manualDate, setManualDate] = useState<string>(() => getTodayDateString());
   const [allCustomers, setAllCustomers] = useState<Customer[]>(() => getCustomers());
 
   const handleOpenManualCreditModal = (targetCustomer?: CustomerCreditReportItem | Customer | null) => {
     const list = getCustomers();
     setAllCustomers(list);
+    const staffList = getSalespeople();
+    setSalespeople(staffList);
+    if (!staffList.some((s) => s.id === selectedStaffId)) {
+      const matched = staffList.find((s) => s.id === currentUser?.id);
+      setSelectedStaffId(matched ? matched.id : (staffList[0]?.id || currentUser?.id || '001'));
+    }
     if (targetCustomer) {
       setManualCreditCustomerType('existing');
       const custId = (targetCustomer as any).customerId || (targetCustomer as any).id || '';
@@ -95,6 +118,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     setManualAmount('');
     setCreditType('Cash Credit (Owner Approved)');
     setDisburseCashFromDrawer(true);
+    setManualDate(getTodayDateString());
     setManualNotes('');
     setShowManualCreditModal(true);
   };
@@ -129,21 +153,20 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     let computedDueDate = customDueDate;
     if (dueDatePreset !== 'custom') {
       const days = parseInt(dueDatePreset, 10);
-      const d = new Date();
-      d.setDate(d.getDate() + days);
-      computedDueDate = d.toISOString().split('T')[0];
+      computedDueDate = getLocalOffsetDateString(days);
     }
 
-    const staffId = currentUser?.id || '001';
-    const staffName = currentUser?.name || 'Staff';
-    const staffRole = currentUser?.role || 'Staff';
+    const selectedStaff = salespeople.find((s) => s.id === selectedStaffId);
+    const staffId = selectedStaff?.id || selectedStaffId || currentUser?.id || '001';
+    const staffName = selectedStaff?.name || currentUser?.name || 'Staff';
+    const staffRole = selectedStaff?.role || currentUser?.role || 'Staff';
 
     recordManualCustomerCredit({
       customerName: finalCustName,
       customerId: finalCustId,
       phone: manualCustomerPhone.trim(),
       amount: amt,
-      date: manualDate,
+      date: manualDate || getTodayDateString(),
       dueDate: computedDueDate,
       creditType,
       itemDescription: creditType,
@@ -156,7 +179,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     });
 
     setReportData(getCustomerCreditReport());
-    setSuccessToast(`Credit of $${amt.toFixed(2)} recorded for "${finalCustName}". Due date: ${computedDueDate}.`);
+    setSuccessToast(`Credit of $${amt.toFixed(2)} recorded for "${finalCustName}" on ${staffName}'s till. Form 4 updated.`);
     setShowManualCreditModal(false);
 
     // Reset form
@@ -171,16 +194,21 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
   useEffect(() => {
     const handleRefresh = () => {
       setReportData(getCustomerCreditReport());
+      setSalespeople(getSalespeople());
     };
     const unsub = subscribeToDatabase(handleRefresh);
     window.addEventListener('saimetric_credit_sales_updated', handleRefresh);
     window.addEventListener('saimetric_customers_updated', handleRefresh);
     window.addEventListener('saimetric_sales_updated', handleRefresh);
+    window.addEventListener('saimetric_salespeople_updated', handleRefresh);
+    window.addEventListener('saimetric_cash_updated', handleRefresh);
     return () => {
       unsub();
       window.removeEventListener('saimetric_credit_sales_updated', handleRefresh);
       window.removeEventListener('saimetric_customers_updated', handleRefresh);
       window.removeEventListener('saimetric_sales_updated', handleRefresh);
+      window.removeEventListener('saimetric_salespeople_updated', handleRefresh);
+      window.removeEventListener('saimetric_cash_updated', handleRefresh);
     };
   }, []);
 
@@ -241,8 +269,10 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
       return;
     }
 
-    const staffId = currentUser?.id || '001';
-    const staffName = currentUser?.name || 'Cashier';
+    const payStaff = salespeople.find((s) => s.id === paymentStaffId);
+    const staffId = payStaff?.id || paymentStaffId || currentUser?.id || '001';
+    const staffName = payStaff?.name || currentUser?.name || 'Cashier';
+    const payDateStr = paymentDate || getTodayDateString();
 
     recordCustomerCreditPayment(
       paymentModalItem.customerId,
@@ -250,11 +280,12 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
       amountNum,
       staffId,
       staffName,
-      paymentNotes || `Debt repayment from ${paymentModalItem.customerName}`
+      paymentNotes || `Debt repayment from ${paymentModalItem.customerName}`,
+      payDateStr
     );
 
     setSuccessToast(
-      `Successfully recorded $${amountNum.toFixed(2)} repayment from ${paymentModalItem.customerName}`
+      `Successfully recorded $${amountNum.toFixed(2)} repayment from ${paymentModalItem.customerName} (${staffName} till)`
     );
     setPaymentModalItem(null);
     setPaymentAmount('');
@@ -302,7 +333,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `Customer_Credit_Debt_Report_${new Date().toISOString().split('T')[0]}.csv`);
+    link.setAttribute('download', `Customer_Credit_Debt_Report_${getTodayDateString()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -336,7 +367,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
             <button
               type="button"
               id="btn-add-manual-credit"
-              onClick={handleOpenManualCreditModal}
+              onClick={() => handleOpenManualCreditModal()}
               className="py-2 px-3.5 rounded-xl bg-gradient-to-r from-[#FF8A00] to-amber-600 hover:brightness-110 text-slate-950 text-xs font-black shadow-md shadow-orange-950 flex items-center space-x-1.5 transition active:scale-95 border border-amber-400/40 cursor-pointer"
               title="Manually record customer credit (e.g. days where owner actually approves cash credit or goods credit)"
             >
@@ -689,9 +720,14 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                             <button
                               type="button"
                               onClick={() => {
+                                const staffList = getSalespeople();
+                                setSalespeople(staffList);
                                 setPaymentModalItem(item);
                                 setPaymentAmount(String(item.netDebtOwed));
                                 setPaymentNotes(`Debt repayment from ${item.customerName}`);
+                                setPaymentDate(getTodayDateString());
+                                const matched = staffList.find((s) => s.id === currentUser?.id);
+                                setPaymentStaffId(matched ? matched.id : (staffList[0]?.id || currentUser?.id || '001'));
                               }}
                               title="Record debt repayment from customer"
                               className="px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-[#FF8A00] to-amber-600 hover:brightness-110 text-slate-950 text-[11px] font-black shadow-md transition active:scale-95 flex items-center space-x-1"
@@ -861,6 +897,45 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                     onChange={(e) => setPaymentAmount(e.target.value)}
                     required
                     className="w-full pl-8 pr-4 py-2.5 rounded-2xl bg-slate-950 border border-slate-700 focus:border-[#FF8A00] text-base font-mono-num font-bold text-white placeholder-slate-600 outline-none"
+                  />
+                </div>
+              </div>
+
+              {/* Cashier / Till Drawer & Repayment Date */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-bold text-slate-300">
+                    Cashier / Till Drawer <span className="text-rose-400">*</span>
+                  </label>
+                  <select
+                    value={paymentStaffId}
+                    onChange={(e) => setPaymentStaffId(e.target.value)}
+                    required
+                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white focus:border-[#FF8A00] outline-none"
+                  >
+                    {salespeople.length === 0 ? (
+                      <option value={currentUser?.id || '001'}>
+                        {currentUser?.name || 'Cashier'} (#{currentUser?.id || '001'})
+                      </option>
+                    ) : (
+                      salespeople.map((sp) => (
+                        <option key={sp.id} value={sp.id}>
+                          {sp.name} (#{sp.id}) — {sp.role}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="block text-[11px] font-bold text-slate-300">
+                    Repayment Date <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="date"
+                    required
+                    value={paymentDate}
+                    onChange={(e) => setPaymentDate(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white focus:border-[#FF8A00] outline-none"
                   />
                 </div>
               </div>
@@ -1298,10 +1373,27 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                   />
                 </div>
                 <div>
-                  <label className="text-[11px] font-bold text-slate-400 block mb-1">Recorded By Staff</label>
-                  <div className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-slate-300 truncate">
-                    {currentUser?.name || 'Staff'} (#{currentUser?.id || '001'})
-                  </div>
+                  <label className="text-[11px] font-bold text-slate-400 block mb-1">
+                    Cashier / Till Drawer *
+                  </label>
+                  <select
+                    value={selectedStaffId}
+                    onChange={(e) => setSelectedStaffId(e.target.value)}
+                    required
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs text-white focus:outline-none focus:border-[#FF8A00]"
+                  >
+                    {salespeople.length === 0 ? (
+                      <option value={currentUser?.id || '001'}>
+                        {currentUser?.name || 'Staff'} (#{currentUser?.id || '001'})
+                      </option>
+                    ) : (
+                      salespeople.map((sp) => (
+                        <option key={sp.id} value={sp.id}>
+                          {sp.name} (#{sp.id}) — {sp.role}
+                        </option>
+                      ))
+                    )}
+                  </select>
                 </div>
               </div>
 
