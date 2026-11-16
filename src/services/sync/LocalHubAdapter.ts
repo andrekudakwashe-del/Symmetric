@@ -139,7 +139,8 @@ export class LocalHubAdapter implements SyncAdapter {
               pType === 'SYNC_ID_DIGEST_REQUEST' ||
               pType === 'RECON_BACKFILL_PAYLOAD' ||
               pType === 'RECON_PUSH_BACKFILL_REQUEST' ||
-              pType === 'HUB_CLOUD_BROADCAST'
+              pType === 'HUB_CLOUD_BROADCAST' ||
+              pType === 'SYNC_CLOUD_CONFIG_ACK'
             ) {
               this.onControlPacketCallback?.(pType, parsed);
               return;
@@ -405,13 +406,16 @@ export class LocalHubAdapter implements SyncAdapter {
 
     const pktKind = String(packet.type || packet.action || 'PKT').trim().toUpperCase();
     const rawItemId =
+      packet.entityId ||
+      (packet.tombstone && (packet.tombstone.entityId || packet.tombstone.id)) ||
       packet.itemId ||
       (packet.item && (packet.item.itemId || packet.item.id)) ||
       (packet.staff && packet.staff.id) ||
       (packet.branch && (packet.branch.branchId || packet.branch.id)) ||
       (packet.customer && (packet.customer.customerId || packet.customer.id)) ||
       (packet.payload &&
-        (packet.payload.itemId ||
+        (packet.payload.entityId ||
+          packet.payload.itemId ||
           packet.payload.id ||
           packet.payload.branchId ||
           packet.payload.customerId)) ||
@@ -422,18 +426,28 @@ export class LocalHubAdapter implements SyncAdapter {
         ? 'SINGLETON'
         : undefined);
 
+    if (pktKind === 'TOMBSTONE_SYNC' && rawItemId) {
+      this.removeQueuedPacketsByEntityId(String(rawItemId));
+    }
+
     if (rawItemId) {
       const cleanKey = `${pktKind}:${String(rawItemId).trim().toUpperCase()}`;
       const existingIdx = this.pendingQueue.findIndex((p) => {
         const pKind = String(p.type || p.action || 'PKT').trim().toUpperCase();
         const pItemId =
+          p.entityId ||
+          (p.tombstone && (p.tombstone.entityId || p.tombstone.id)) ||
           p.itemId ||
           (p.item && (p.item.itemId || p.item.id)) ||
           (p.staff && p.staff.id) ||
           (p.branch && (p.branch.branchId || p.branch.id)) ||
           (p.customer && (p.customer.customerId || p.customer.id)) ||
           (p.payload &&
-            (p.payload.itemId || p.payload.id || p.payload.branchId || p.payload.customerId)) ||
+            (p.payload.entityId ||
+              p.payload.itemId ||
+              p.payload.id ||
+              p.payload.branchId ||
+              p.payload.customerId)) ||
           (pKind === 'PERMISSIONS_MATRIX_SYNC' ||
           pKind === 'ROLE_CONFIGS_SYNC' ||
           pKind === 'MULTI_CURRENCY_SYNC' ||
@@ -463,6 +477,7 @@ export class LocalHubAdapter implements SyncAdapter {
     this.pendingQueue = this.pendingQueue.filter((p) => {
       const pItemId =
         p.recordId ||
+        p.entityId ||
         p.itemId ||
         p.id ||
         p.branchId ||
@@ -473,6 +488,7 @@ export class LocalHubAdapter implements SyncAdapter {
         p.action === 'MULTI_CURRENCY_SYNC'
           ? 'MULTI_CURRENCY_CONFIG'
           : undefined) ||
+        (p.tombstone && (p.tombstone.entityId || p.tombstone.id)) ||
         (p.item && (p.item.itemId || p.item.id)) ||
         (p.branch && (p.branch.branchId || p.branch.id || p.branch.branch_id || p.branch.recordId)) ||
         (p.staff && (p.staff.id || p.staff.staffId || p.staff.recordId)) ||
@@ -481,6 +497,7 @@ export class LocalHubAdapter implements SyncAdapter {
           (p.cashAccount.account_id || p.cashAccount.id || p.cashAccount.recordId)) ||
         (p.payload &&
           (p.payload.recordId ||
+            p.payload.entityId ||
             p.payload.itemId ||
             p.payload.id ||
             p.payload.branchId ||
@@ -598,7 +615,14 @@ export class LocalHubAdapter implements SyncAdapter {
 
   public envelopeToWirePacket(envelope: SyncEnvelope): any {
     const ctx = this.context;
-    const d: any = envelope.data || {};
+    const rawData: any = envelope.data || {};
+    const isCloudSynced = Boolean(
+      envelope.isCloudSynced === true || rawData?.isCloudSynced === true
+    );
+    const d: any =
+      isCloudSynced && rawData && typeof rawData === 'object' && !Array.isArray(rawData)
+        ? { ...rawData, isCloudSynced: true }
+        : rawData;
     const meta: any = envelope.meta || {};
     const base = {
       packet_id: envelope.packetId,
@@ -619,6 +643,7 @@ export class LocalHubAdapter implements SyncAdapter {
       updatedAt: envelope.updatedAt,
       timestamp: envelope.updatedAt || Date.now(),
       isReconPush: Boolean(meta.isReconPush),
+      ...(isCloudSynced ? { isCloudSynced: true } : {}),
       ttl: 5,
     };
 
@@ -806,15 +831,45 @@ export class LocalHubAdapter implements SyncAdapter {
           payload: d,
         };
 
-      case 'cash_account':
+      case 'cash_account': {
+        const isGlobalAcc =
+          d?.account_type === 'HQ_SAFE' ||
+          d?.account_type === 'BANK_ACCOUNT' ||
+          String(d?.branch_id || '').toUpperCase().trim() === 'HQ' ||
+          String(d?.target_branch_id || '').toUpperCase().trim() === 'ALL';
         return {
           ...base,
           type: 'cash_account',
           action: 'CASH_ACCOUNT_SYNC',
-          target_branch_id: d.branch_id || ctx.branchId,
+          target_branch_id: isGlobalAcc ? 'ALL' : (d?.branch_id || ctx.branchId),
           cashAccount: d,
           payload: d,
         };
+      }
+
+      case 'cash_transfer': {
+        const typeUpper = String(d?.type || '').toUpperCase().trim();
+        const brUpper = String(d?.branch_id || ctx.branchId || '').toUpperCase().trim();
+        const isGlobalTransfer =
+          brUpper === 'HQ' ||
+          brUpper === 'ALL' ||
+          String(d?.target_branch_id || '').toUpperCase().trim() === 'ALL' ||
+          typeUpper === 'HQ_TO_BRANCH' ||
+          typeUpper === 'BRANCH_TO_HQ' ||
+          typeUpper === 'BANK_DEPOSIT' ||
+          typeUpper === 'BANK_WITHDRAWAL' ||
+          typeUpper === 'CAPITAL_INFUSION' ||
+          typeUpper === 'SUPPLIER_PAYMENT' ||
+          typeUpper === 'THIRD_PARTY_PAYOUT';
+        return {
+          ...base,
+          type: 'cash_transfer',
+          action: envelope.action === 'UPSERT' ? 'CASH_TRANSFER_UPDATE' : 'CASH_TRANSFER',
+          target_branch_id: isGlobalTransfer ? 'ALL' : (d?.branch_id || ctx.branchId),
+          cashTransfer: d,
+          payload: d,
+        };
+      }
 
       case 'cash_movement':
         return {
@@ -825,14 +880,21 @@ export class LocalHubAdapter implements SyncAdapter {
           payload: d,
         };
 
-      case 'cash_log':
+      case 'cash_log': {
+        const isVaultLog = Boolean(
+          d?.isVaultCustody ||
+          String(d?.staffId || '').toUpperCase().trim() === 'VAULT_CUSTODY' ||
+          String(d?.branch_id || d?.branchId || '').toUpperCase().trim() === 'HQ'
+        );
         return {
           ...base,
           type: 'cash_log',
-          action: 'CASH_LOG_RECORD',
+          action: envelope.action === 'UPSERT' ? 'CASH_LOG_UPDATE' : 'CASH_LOG_RECORD',
+          ...(isVaultLog ? { target_branch_id: 'ALL' } : {}),
           cashLog: d,
           payload: d,
         };
+      }
 
       case 'stock_movement':
         return {
@@ -1066,11 +1128,16 @@ export class LocalHubAdapter implements SyncAdapter {
       } else {
         action = spec?.appendOnly && unwrapped.action !== 'UPSERT' ? 'APPEND' : 'UPSERT';
       }
-    } else if (pTypeLower === 'cash_log' || pTypeUpper === 'CASH_LOG' || pTypeUpper === 'CASH_LOG_RECORD') {
+    } else if (
+      pTypeLower === 'cash_log' ||
+      pTypeUpper === 'CASH_LOG' ||
+      pTypeUpper === 'CASH_LOG_RECORD' ||
+      pTypeUpper === 'CASH_LOG_UPDATE'
+    ) {
       entityType = 'cash_log';
       data = unwrapped.cashLog || unwrapped.payload || unwrapped;
       entityId = String(data?.id || unwrapped.id || `CL-${data?.date || ''}-${data?.timestamp || Date.now()}`);
-      action = 'APPEND';
+      action = pTypeUpper === 'CASH_LOG_UPDATE' || unwrapped.action === 'CASH_LOG_UPDATE' || unwrapped.action === 'UPSERT' ? 'UPSERT' : 'APPEND';
     } else if (pTypeLower === 'customer_change' || pTypeUpper === 'CUSTOMER_CHANGE_RECORD' || pTypeUpper === 'CUSTOMER_CHANGE' || pTypeUpper === 'CUSTOMER_CHANGE_SYNC') {
       entityType = 'customer_change';
       data = unwrapped.change || unwrapped.payload || unwrapped;
@@ -1184,6 +1251,20 @@ export class LocalHubAdapter implements SyncAdapter {
       entityType = 'cash_account';
       data = unwrapped.cashAccount || unwrapped.payload || unwrapped;
       entityId = String(data?.account_id || data?.id || unwrapped.entityId || unwrapped.id || '');
+    } else if (
+      pTypeLower === 'cash_transfer' ||
+      pTypeLower === 'cash_transfers' ||
+      pTypeUpper === 'CASH_TRANSFER' ||
+      pTypeUpper === 'CASH_TRANSFERS' ||
+      pTypeUpper === 'CASH_TRANSFER_SYNC' ||
+      pTypeUpper === 'CASH_TRANSFER_UPDATE' ||
+      pTypeUpper === 'CASH_TRANSFER_RECORD'
+    ) {
+      entityType = 'cash_transfer';
+      data = unwrapped.cashTransfer || unwrapped.payload || unwrapped;
+      entityId = String(data?.transfer_id || data?.id || unwrapped.entityId || unwrapped.id || '');
+      const st = String(data?.status || '').toUpperCase();
+      action = st && st !== 'DRAFT' ? 'UPSERT' : 'APPEND';
     } else if (pTypeLower === 'supplier' || pTypeUpper === 'SUPPLIER' || pTypeUpper === 'SUPPLIER_SYNC' || pTypeUpper === 'SUPPLIER_RECORD') {
       entityType = 'supplier';
       data = unwrapped.supplier || unwrapped.payload || unwrapped.item || unwrapped;
@@ -1293,6 +1374,10 @@ export class LocalHubAdapter implements SyncAdapter {
         fallbackUniqueId
     );
 
+    const incomingCloudSynced = Boolean(
+      unwrapped.isCloudSynced === true || packet.isCloudSynced === true || data?.isCloudSynced === true
+    );
+
     return {
       packetId,
       entityType,
@@ -1304,6 +1389,7 @@ export class LocalHubAdapter implements SyncAdapter {
       originDeviceId,
       targetBranchId,
       class: spec.class,
+      ...(incomingCloudSynced ? { isCloudSynced: true } : {}),
       meta: {
         rawPacket: packet,
         unwrappedPacket: unwrapped,
@@ -1361,6 +1447,34 @@ export class LocalHubAdapter implements SyncAdapter {
   private isCatalogOrCompanyWirePacket(packet: any, topicSuffix: string, targetBranch: string): boolean {
     const pt = String(packet.type || '').toUpperCase();
     const pa = String(packet.action || '').toUpperCase();
+    const ca = packet.cashAccount || packet.payload;
+    const isGlobalCashAccount =
+      pt === 'CASH_ACCOUNT' &&
+      (ca?.account_type === 'HQ_SAFE' ||
+        ca?.account_type === 'BANK_ACCOUNT' ||
+        String(ca?.branch_id || '').toUpperCase().trim() === 'HQ');
+    const ct = packet.cashTransfer || packet.payload;
+    const ctType = String(ct?.type || '').toUpperCase().trim();
+    const ctBranch = String(ct?.branch_id || '').toUpperCase().trim();
+    const isGlobalCashTransfer =
+      pt === 'CASH_TRANSFER' &&
+      (ctBranch === 'HQ' ||
+        ctBranch === 'ALL' ||
+        ctType === 'HQ_TO_BRANCH' ||
+        ctType === 'BRANCH_TO_HQ' ||
+        ctType === 'BANK_DEPOSIT' ||
+        ctType === 'BANK_WITHDRAWAL' ||
+        ctType === 'CAPITAL_INFUSION' ||
+        ctType === 'SUPPLIER_PAYMENT' ||
+        ctType === 'THIRD_PARTY_PAYOUT');
+    const cl = packet.cashLog || packet.payload;
+    const isVaultCashLog =
+      (pt === 'CASH_LOG' || pa === 'CASH_LOG_RECORD' || pa === 'CASH_LOG_UPDATE') &&
+      Boolean(
+        cl?.isVaultCustody ||
+          String(cl?.staffId || '').toUpperCase().trim() === 'VAULT_CUSTODY' ||
+          String(cl?.branch_id || cl?.branchId || '').toUpperCase().trim() === 'HQ'
+      );
     return (
       topicSuffix === 'inventory' ||
       topicSuffix === 'inventory_item' ||
@@ -1386,6 +1500,9 @@ export class LocalHubAdapter implements SyncAdapter {
       pa === 'BRANCH_SYNC' ||
       pt === 'TOMBSTONE_SYNC' ||
       pa === 'TOMBSTONE_SYNC' ||
+      isGlobalCashAccount ||
+      isGlobalCashTransfer ||
+      isVaultCashLog ||
       packet.target_branch_id === 'ALL' ||
       targetBranch === 'ALL'
     );

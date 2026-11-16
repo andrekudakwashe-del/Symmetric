@@ -20,8 +20,11 @@ import {
   getDirectGrvPaymentsForStaff,
   getExpensesForStaffAndDate,
   getSalesForStaffAndDate,
+  getAllSalesForStaffAndDate,
   getActiveCurrencies,
   deduplicateCashLogs,
+  sortChronologicallyAsc,
+  isCashLogWithdrawal,
   calculateSalespersonCashBalancing,
 } from '../db/roomDatabase';
 import { getAllMovements, getShiftId, matchesShift } from '../db/cashLedger';
@@ -164,6 +167,7 @@ export interface CashierShiftReportData {
   customerChangePaidOut: number;
   creditCashOut: number;
   creditExtended: number;
+  refunds: number;
   deductions: number;
   multiCurrencyCashOutTotal: number;
   currencyWithdrawalsMap: Record<string, number>;
@@ -322,26 +326,37 @@ export const buildCashierShiftReportData = (params: {
 
   const shiftId = getShiftId(staff.id, date, branchId);
 
-  // Raw data collections scoped to this cashier & date
+  // Raw data collections scoped to this cashier & date (sorted chronologically ascending)
   const rawForm2Logs = getCashLogsForStaffAndDate(staff.id, date).filter(
     (l) => !isVoidedOrInactive(l)
   );
-  const dedupedForm2Logs = deduplicateCashLogs(rawForm2Logs);
-  const form3Changes = getCustomerChangesForStaffAndDate(staff.id, date, staff.name).filter(
-    (c) => !isVoidedOrInactive(c)
+  const dedupedForm2Logs = sortChronologicallyAsc(deduplicateCashLogs(rawForm2Logs));
+  const form3Changes = sortChronologicallyAsc(
+    getCustomerChangesForStaffAndDate(staff.id, date, staff.name).filter(
+      (c) => !isVoidedOrInactive(c)
+    )
   );
-  const form3Credits = getCreditSalesForStaffAndDate(staff.id, date, staff.name).filter(
-    (c) => !isVoidedOrInactive(c)
+  const form3Credits = sortChronologicallyAsc(
+    getCreditSalesForStaffAndDate(staff.id, date, staff.name).filter(
+      (c) => !isVoidedOrInactive(c)
+    )
   );
   const form1Count = getCashCountForStaffAndDate(staff.id, date);
-  const rawSales = getSalesForStaffAndDate(staff.id, date, staff.name).filter(
-    (s) => !isVoidedOrInactive(s)
+  const allSalesSorted = getAllSalesForStaffAndDate(staff.id, date, staff.name, true).filter(
+    (s) => !s?.isDeleted
+  );
+  const rawSales = sortChronologicallyAsc(
+    getSalesForStaffAndDate(staff.id, date, staff.name).filter(
+      (s) => !isVoidedOrInactive(s)
+    )
   );
   const adminSale = getAdminSaleForStaffAndDate(staff.id, date);
-  const cashLifts = getCashLiftsForStaffAndDate(staff.id, date).filter(
-    (l) => !isVoidedOrInactive(l)
+  const cashLifts = sortChronologicallyAsc(
+    getCashLiftsForStaffAndDate(staff.id, date).filter(
+      (l) => !isVoidedOrInactive(l)
+    )
   );
-  const allStaffExpenses = getExpensesForStaffAndDate(staff.id, date);
+  const allStaffExpenses = sortChronologicallyAsc(getExpensesForStaffAndDate(staff.id, date));
   const directGrvPayments = getDirectGrvPaymentsForStaff(staff.id, date, false, staff.name);
   const allDirectGrvs = getAllDirectGrvs();
   const activeCurrencies = getActiveCurrencies();
@@ -423,10 +438,25 @@ export const buildCashierShiftReportData = (params: {
       s.mobileVerificationStatus === 'FLAGGED' &&
       s.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE'
   );
-  const mobileShortfallCharged = Math.max(
-    0,
-    (row.cashSales || 0) - systemCashSales
-  );
+  const mobileShortfallCharged =
+    Math.round(
+      rawSales.reduce((sum, s) => {
+        if (s.mobileVerificationStatus === 'FLAGGED' && s.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE') {
+          return sum + (Number(s.total) || 0);
+        }
+        if (
+          s.mobileVerificationStatus === 'VERIFIED' &&
+          s.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE' &&
+          (Number(s.mobileShortfallUsd) || 0) > 0.009
+        ) {
+          const shortfall = Number(s.mobileShortfallUsd) || 0;
+          const wdr = Number(s.cashWithdrawalAmount) || 0;
+          const wdrRed = Math.min(shortfall, wdr);
+          return sum + Math.max(0, shortfall - wdrRed);
+        }
+        return sum;
+      }, 0) * 100
+    ) / 100;
 
   // 5. Active Multi-Currency Transactions & Per-Currency Summaries
   const multiCurrencyTransactions: ShiftReportMultiCurrencyTx[] = [];
@@ -451,23 +481,33 @@ export const buildCashierShiftReportData = (params: {
     return created;
   };
 
-  // 5a. POS Multi-Currency Sales
+  // 5a. POS Multi-Currency Sales (use allSalesSorted so Refunded/Voided goods are excluded without leaking Form 2 duplicates)
   const recordedSaleIds = new Set<string>();
-  rawSales
+  allSalesSorted
     .filter((s) => isMultiCurrencySale(s, activeCurrencyCodes))
     .forEach((s) => {
-      recordedSaleIds.add(String(s.id || '').toLowerCase());
+      const saleIdLower = String(s.id || '').toLowerCase();
+      if (saleIdLower) recordedSaleIds.add(saleIdLower);
+
+      const isReversed = s.status === 'Refunded' || s.status === 'Voided';
+      const cashOutUsd = Number(s.cashWithdrawalAmount || 0);
+      // Skip purely reversed sales that had no physical USD cash handed out
+      if (isReversed && (cashOutUsd <= 0 || s.status === 'Voided')) {
+        return;
+      }
+
       const currLabel =
         s.currency && s.currency !== 'USD' ? s.currency : s.paymentMethod || 'Mobile';
-      const goodsUsd = Number(s.total || 0);
-      const cashOutUsd = Number(s.cashWithdrawalAmount || 0);
+      const goodsUsd = isReversed ? 0 : Number(s.total || 0);
       const rate = Number(s.exchangeRate || 1);
-      const nativeAmount = Number(
-        s.totalChargedInCurrency ??
-          (s.totalInCurrency !== undefined
-            ? Number(s.totalInCurrency) + Number(s.cashWithdrawalInCurrency || 0)
-            : (goodsUsd + cashOutUsd) * rate)
-      );
+      const nativeAmount = isReversed
+        ? cashOutUsd * rate
+        : Number(
+            s.totalChargedInCurrency ??
+              (s.totalInCurrency !== undefined
+                ? Number(s.totalInCurrency) + Number(s.cashWithdrawalInCurrency || 0)
+                : (goodsUsd + cashOutUsd) * rate)
+          );
 
       const verStatus: ShiftReportMultiCurrencyTx['verificationStatus'] =
         s.mobileVerificationStatus === 'VERIFIED'
@@ -481,7 +521,9 @@ export const buildCashierShiftReportData = (params: {
         time: formatTimeShort(s.timestamp),
         currency: currLabel,
         source: 'POS_SALE',
-        customerOrDesc: s.customerName || 'Walk-in Customer',
+        customerOrDesc: isReversed
+          ? `${s.customerName || 'Walk-in Customer'} (${s.status} - Cash-Out Retained)`
+          : s.customerName || 'Walk-in Customer',
         goodsUsd,
         cashOutUsd,
         nativeAmount,
@@ -515,6 +557,7 @@ export const buildCashierShiftReportData = (params: {
 
   // 5b. Standalone Form 2 Multi-Currency Logs (not already matched to a POS sale)
   dedupedForm2Logs.forEach((l) => {
+    if ((l as any).isRefunded || (l as any).isVoided) return;
     const curr = (l.currency || '').trim();
     const lineLower = (l.line || '').toLowerCase();
     const descLower = (l.description || '').toLowerCase();
@@ -552,23 +595,26 @@ export const buildCashierShiftReportData = (params: {
 
     const outAmt = Number(l.out || 0);
     const inAmt = Number(l.in || 0);
+    const isWdr = isCashLogWithdrawal(l);
+    const cashOutUsd = isWdr ? outAmt : 0;
+    const goodsUsd = isWdr ? 0 : (inAmt > 0 ? inAmt : outAmt);
     multiCurrencyTransactions.push({
       id: l.id,
       time: formatTimeShort(l.timestamp),
       currency: resolvedCurr,
       source: 'FORM2_LOG',
       customerOrDesc: l.description || l.line || 'Multi-Currency Cash Log',
-      goodsUsd: inAmt,
-      cashOutUsd: outAmt,
-      nativeAmount: Number((l as any).nativeAmount || outAmt || inAmt),
+      goodsUsd,
+      cashOutUsd,
+      nativeAmount: Number((l as any).nativeAmount || cashOutUsd || goodsUsd),
       verificationStatus: 'LOG_ONLY',
       popReference: l.reference,
     });
 
     const sumObj = ensureCurrSummary(resolvedCurr);
     sumObj.txCount += 1;
-    sumObj.goodsTotalUsd += inAmt;
-    sumObj.cashOutUsd += outAmt;
+    sumObj.goodsTotalUsd += goodsUsd;
+    sumObj.cashOutUsd += cashOutUsd;
   });
 
   // Ensure summary reflects authoritative Form 4 totals for each active currency
@@ -785,6 +831,11 @@ export const buildCashierShiftReportData = (params: {
         `${excludedShopUseCount} Shop Use / non-cash entry ($${excludedShopUseAmount.toFixed(2)}) excluded from cash balancing.`
       );
     }
+    if ((row.refunds || 0) > 0) {
+      varianceDiagnosis.push(
+        `Form 2 Cash Refunds / Returns reduced expected drawer cash by -$${Number(row.refunds).toFixed(2)}.`
+      );
+    }
   }
 
   const creditCashOut = Number(row.creditCashOut || 0);
@@ -847,6 +898,7 @@ export const buildCashierShiftReportData = (params: {
     customerChangePaidOut: Number(row.customerChange || 0),
     creditCashOut,
     creditExtended,
+    refunds: Number(row.refunds || 0),
     deductions: Number(row.deductions || 0),
     multiCurrencyCashOutTotal,
     currencyWithdrawalsMap: row.currencyWithdrawals || {},

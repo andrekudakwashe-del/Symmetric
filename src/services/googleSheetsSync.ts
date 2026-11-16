@@ -39,7 +39,9 @@ import {
   getAllGoodsReceived,
   getRawStoredInventoryItems,
   parseTimestampMs,
+  markRecordsCloudSynced,
 } from '../db/roomDatabase';
+import { getActiveCloudConfig } from './sync/cloudConfigResolver';
 import { SyncQueueItem, SheetName, StaffPermissions, InventoryItem } from '../types';
 import { Company, SaaSBranch } from '../data/saasData';
 import { persistentSyncEngine } from './persistentSyncEngine';
@@ -326,13 +328,21 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
     console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', isLocalHubActive());
   }
 
+  const activeCloud = getActiveCloudConfig();
   if (
+    activeCloud.databaseType === 'supabase' ||
+    activeCloud.databaseType === 'firebase' ||
+    activeCloud.databaseType === 'mongodb' ||
+    activeCloud.databaseType === 'room' ||
     tenantBackendConfig.backendType === 'firebase' ||
     tenantBackendConfig.backendType === 'supabase' ||
     tenantBackendConfig.backendType === 'room'
   ) {
+    if (activeCloud.databaseType === 'mongodb') {
+      throw new Error('AppScripts sync disabled: active databaseType is mongodb');
+    }
     const dispatchResult = await runtimeSyncDispatcher.dispatchItem(item);
-    if (!dispatchResult.success && tenantBackendConfig.backendType !== 'room') {
+    if (!dispatchResult.success) {
       throw new Error(dispatchResult.message || `Failed to dispatch sync item to ${tenantBackendConfig.backendType}`);
     }
     return true;
@@ -376,7 +386,12 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
     console.log('[STAFF TRACE] 4. AppScripts Outbound:', JSON.stringify(staffObj));
   }
 
-  // 1. Try server-side proxy route (/api/sheets/sync-row) - bypasses browser CORS!
+  if (!targetWebhook || !targetWebhook.startsWith('http')) {
+    throw new Error('No Google Apps Script webhook URL configured; record remains queued for retry.');
+  }
+
+  // 1. Try server-side proxy route (/api/sheets/sync-row) - requires verified HTTP 200/201
+  let proxyNotFound = false;
   try {
     const srvRes = await fetch('/api/sheets/sync-row', {
       method: 'POST',
@@ -388,78 +403,54 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
       signal: AbortSignal.timeout(10000),
     });
 
-    if (srvRes.ok) {
+    if (srvRes.status === 200 || srvRes.status === 201 || srvRes.ok) {
       const srvData = await srvRes.json().catch(() => null);
-      if (srvData && (srvData.success !== false && srvData.status !== 'error')) {
+      if (srvData && srvData.success !== false && srvData.status !== 'error') {
+        const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
+        markRecordsCloudSynced(
+          [recId, item.id].filter(Boolean),
+          [payloadData.clientRequestId].filter(Boolean),
+          item.sheetName,
+          false
+        );
         return true;
       }
+      throw new Error(srvData?.error || srvData?.message || 'Google Apps Script rejected write');
     }
-  } catch (proxyErr) {
-    // Fall back to direct dispatch or server store
-  }
 
-  // 2. Direct browser fetch to Google Apps Script Webhook (no-cors mode)
-  if (targetWebhook && targetWebhook.startsWith('http')) {
-    try {
-      await fetch(targetWebhook, {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: {
-          'Content-Type': 'text/plain;charset=utf-8',
-        },
-        body: JSON.stringify(payloadData),
-      });
-      return true;
-    } catch (err: any) {
-      console.warn('Google Sheets Webhook network dispatch failed:', err);
-    }
-  }
-
-  // 3. Fallback: Replicate to central server store so all devices stay in sync
-  try {
-    if (item.sheetName === 'InventoryMaster' || item.sheetName === 'Products') {
-      await fetch('/api/inventory/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          company_id: companyId,
-          branch_id: branchId,
-          items: [item.payload],
-        }),
-      });
-      return true;
-    } else if (item.sheetName === 'Sales') {
-      await fetch('/api/mesh/sync-sales', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          branchCode: branchId,
-          sales: [item.payload],
-        }),
-      });
-      return true;
+    if (srvRes.status === 404) {
+      proxyNotFound = true;
     } else {
-      await fetch('/api/saas/call-action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: item.action.toLowerCase(),
-          company_id: companyId,
-          sheet: item.sheetName,
-          data: item.payload,
-        }),
-      });
-      return true;
+      const errJson = await srvRes.json().catch(() => null);
+      throw new Error(errJson?.error || `Cloud proxy returned HTTP ${srvRes.status}`);
     }
-  } catch (localStoreErr) {
-    // If even server store unreachable, mark as retained locally
+  } catch (proxyErr: any) {
+    if (!proxyNotFound && proxyErr?.name !== 'TypeError') {
+      throw proxyErr;
+    }
   }
 
-  // If webhook is not configured yet, record that item is locally retained
-  if (!targetWebhook || !targetWebhook.startsWith('http')) {
-    return true; // Mark as safely captured locally without breaking the queue
+  // 2. Direct browser fetch to Google Apps Script Webhook (strict CORS/HTTP verification - NO blind no-cors)
+  const directRes = await fetch(targetWebhook, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/plain;charset=utf-8',
+    },
+    body: JSON.stringify(payloadData),
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (directRes.status !== 200 && directRes.status !== 201 && !directRes.ok) {
+    throw new Error(`Google Apps Script webhook failed with HTTP ${directRes.status}`);
   }
 
+  const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
+  markRecordsCloudSynced(
+    [recId, item.id].filter(Boolean),
+    [payloadData.clientRequestId].filter(Boolean),
+    item.sheetName,
+    false
+  );
   return true;
 };
 

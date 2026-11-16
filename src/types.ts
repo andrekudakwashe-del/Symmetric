@@ -443,6 +443,8 @@ export interface CashAccount {
   updated_at: string;
   updatedAt?: number;
   lastUpdated?: string;
+  hubTimestamp?: number;
+  target_branch_id?: string;
 }
 
 export type CashTransferType =
@@ -461,6 +463,8 @@ export type CashTransferStatus =
   | 'PENDING_APPROVAL'      // Awaiting manager/owner approval
   | 'PENDING_ACCEPTANCE'    // Dispatched, awaiting receiver PIN
   | 'IN_TRANSIT'            // Physical money on the move
+  | 'APPROVED'              // Approved and ready / settled
+  | 'RECEIVED'              // Physically received into destination vault
   | 'COMPLETED'
   | 'REJECTED'
   | 'CANCELLED'
@@ -470,12 +474,16 @@ export interface CashTransfer {
   transfer_id: string;            // e.g. "TRF-20261016-0042"
   company_id: string;
   branch_id: string;
+  target_branch_id?: string;      // 'ALL' for company-wide / HQ / inter-branch transfers
   type: CashTransferType;
   from_account_id: string;
   to_account_id?: string;        // Optional for supplier or bank deposits
   amount: number;
   currency: string;
   status: CashTransferStatus;
+  updatedAt?: number;
+  lastUpdated?: string;
+  hubTimestamp?: number;
   
   // Initiator
   created_by_user_id: string;

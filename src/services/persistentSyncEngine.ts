@@ -53,8 +53,10 @@ import {
   pullTenantSales,
   clearAllSyncQueueItems,
   markReceiptAsSynced,
+  markRecordsCloudSynced,
   parseTimestampMs,
 } from '../db/roomDatabase';
+import { getActiveCloudConfig } from './sync/cloudConfigResolver';
 import { retentionLifecycleService } from './backendAdapter/retentionService';
 import { Company, SaaSBranch } from '../data/saasData';
 import { Salesperson, Branch } from '../types';
@@ -373,6 +375,10 @@ class PersistentSyncEngine {
    * Drains pending items with tenant isolation and high-speed batching for high volume items.
    */
   public async drainSyncQueue(companyId?: string): Promise<{ processed: number; succeeded: number; failed: number }> {
+    const activeCloud = getActiveCloudConfig();
+    if (activeCloud.databaseType !== 'appscripts') {
+      return { processed: 0, succeeded: 0, failed: 0 };
+    }
     if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
       console.log('[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping drainSyncQueue.');
       return { processed: 0, succeeded: 0, failed: 0 };
@@ -511,6 +517,7 @@ class PersistentSyncEngine {
                     c.payload?.voucherId,
                   ]).filter(Boolean) as string[];
                   markReceiptAsSynced(bReqIds, bItemIds);
+                  markRecordsCloudSynced(bItemIds, bReqIds, 'Transactions', false);
                 } catch {}
                 succeeded += chunk.length;
                 processed += chunk.length;
@@ -552,6 +559,10 @@ class PersistentSyncEngine {
       const isLocalHubActive = () => this.isOutboundSyncPaused;
       console.log('[STAFF TRACE] 2. Sync Router. Strategy:', activeStrategy, 'isLocalHubActive:', isLocalHubActive());
     }
+    const activeCloud = getActiveCloudConfig();
+    if (activeCloud.databaseType !== 'appscripts') {
+      return false;
+    }
     if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
       console.log(`[PersistentSyncEngine] 🛑 Outbound cloud sync suspended (Local Hub is Edge Gateway). Skipping pushSingleItem for ${item.id} (${item.sheetName}).`);
       return false;
@@ -590,7 +601,9 @@ class PersistentSyncEngine {
             item.payload?.grnId,
             item.payload?.voucherId,
           ].filter(Boolean) as string[];
-          markReceiptAsSynced(item.clientRequestId ? [item.clientRequestId] : [], targetItemIds);
+          const singleReqIds = item.clientRequestId ? [item.clientRequestId] : [];
+          markReceiptAsSynced(singleReqIds, targetItemIds);
+          markRecordsCloudSynced(targetItemIds, singleReqIds, item.sheetName, false);
         } catch {}
 
         // Trigger immediate entity refresh if staff or branch was modified
@@ -665,61 +678,61 @@ class PersistentSyncEngine {
       console.log('[STAFF TRACE] 4. AppScripts Outbound:', JSON.stringify(staffObj));
     }
 
-    // 1. Try server-side proxy route (/api/sheets/sync-row) - bypasses browser CORS!
-    if (targetUrl && targetUrl.startsWith('http')) {
-      try {
-        const srvRes = await fetch('/api/sheets/sync-row', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            webhook_url: targetUrl,
-            ...payload,
-          }),
-          signal: AbortSignal.timeout(12000),
-        });
-
-        if (srvRes.ok) {
-          const json = await srvRes.json().catch(() => null);
-          if (json && (json.success !== false && json.status !== 'error')) {
-            return json;
-          }
-        }
-      } catch (proxyErr) {}
-
-      // Direct fallback using no-cors
-      try {
-        await fetch(targetUrl, {
-          method: 'POST',
-          mode: 'no-cors',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify(payload),
-        });
-        return { success: true };
-      } catch (err: any) {
-        throw err;
-      }
+    const activeCloud = getActiveCloudConfig();
+    if (activeCloud.databaseType !== 'appscripts') {
+      throw new Error(`AppScripts sync disabled: active databaseType is ${activeCloud.databaseType}`);
     }
 
-    // 2. Local backend fallback proxy if no Apps Script webhook is defined
+    if (!targetUrl || !targetUrl.startsWith('http')) {
+      throw new Error('No Google Apps Script webhook URL configured; record remains in offline queue for retry.');
+    }
+
+    // 1. Try server-side proxy route (/api/sheets/sync-row) - requires verified HTTP 200/201
+    let proxyNotFound = false;
     try {
-      const res = await fetch('/api/saas/call-action', {
+      const srvRes = await fetch('/api/sheets/sync-row', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          webhook_url: targetUrl,
+          ...payload,
+        }),
+        signal: AbortSignal.timeout(12000),
       });
-      if (res.ok) {
-        return await res.json();
+
+      if (srvRes.status === 200 || srvRes.status === 201 || srvRes.ok) {
+        const json = await srvRes.json().catch(() => null);
+        if (json && json.success !== false && json.status !== 'error') {
+          return json;
+        }
+        throw new Error(json?.error || json?.message || 'Google Apps Script rejected write');
       }
-    } catch {
-      // Local server might not have /api/saas/call-action
+
+      if (srvRes.status === 404) {
+        proxyNotFound = true;
+      } else {
+        const errJson = await srvRes.json().catch(() => null);
+        throw new Error(errJson?.error || `Cloud proxy returned HTTP ${srvRes.status}`);
+      }
+    } catch (proxyErr: any) {
+      if (!proxyNotFound && proxyErr?.name !== 'TypeError') {
+        throw proxyErr;
+      }
     }
 
-    // If neither is configured, simulate offline retention
-    return {
-      success: true,
-      simulated: true,
-      message: 'Locally retained. Will sync when Google Apps Script Webhook URL is connected.',
-    };
+    // 2. Direct browser fetch to Apps Script (strict HTTP 200/201 verification - NO blind no-cors)
+    const directRes = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(12000),
+    });
+
+    if (directRes.status !== 200 && directRes.status !== 201 && !directRes.ok) {
+      throw new Error(`Google Apps Script webhook failed with HTTP ${directRes.status}`);
+    }
+
+    return await directRes.json().catch(() => ({ success: true }));
   }
 
   // ==================== WORK STREAM B: DELTA REFRESH ====================
@@ -729,7 +742,8 @@ class PersistentSyncEngine {
    * Calls get_users_since(lastSyncAt) and get_branches_since(lastSyncAt).
    */
   public async performDeltaSync(): Promise<{ usersCount: number; branchesCount: number }> {
-    if (this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
+    const activeCloud = getActiveCloudConfig();
+    if (activeCloud.databaseType !== 'appscripts' || this.isOutboundSyncPaused || isAppScriptsIngestPaused()) {
       console.log('[PersistentSyncEngine] 🛑 Cloud delta sync suspended (Local Hub is Edge Gateway). Skipping performDeltaSync.');
       return { usersCount: 0, branchesCount: 0 };
     }

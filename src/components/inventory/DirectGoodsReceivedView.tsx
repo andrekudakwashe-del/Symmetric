@@ -364,8 +364,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     }
 
     const sellingPrice = Math.max(0, Number(r.sellingPrice) || 0);
-    const profit = Math.max(0, sellingPrice - unitCost);
-    const markupPercent = unitCost > 0 ? ((sellingPrice - unitCost) / unitCost) * 100 : 0;
+    lineTotal = Math.round((Number(lineTotal) || 0) * 100) / 100;
+    const profit = Math.round(Math.max(0, sellingPrice - unitCost) * 100) / 100;
+    const markupPercent = unitCost > 0 ? Math.round((((sellingPrice - unitCost) / unitCost) * 100) * 100) / 100 : 0;
 
     return {
       qtyCases,
@@ -389,13 +390,13 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
     rows.forEach((r) => {
       const calc = getRowCalculations(r);
-      totalCost += calc.lineTotal;
-      totalSelling += calc.sellingPrice * calc.totalUnits;
+      totalCost = Math.round((totalCost + calc.lineTotal) * 100) / 100;
+      totalSelling = Math.round((totalSelling + calc.sellingPrice * calc.totalUnits) * 100) / 100;
       totalUnits += calc.totalUnits;
     });
 
-    const totalProfit = Math.max(0, totalSelling - totalCost);
-    const overallMarkup = totalCost > 0 ? ((totalSelling - totalCost) / totalCost) * 100 : 0;
+    const totalProfit = Math.round(Math.max(0, totalSelling - totalCost) * 100) / 100;
+    const overallMarkup = totalCost > 0 ? Math.round((((totalSelling - totalCost) / totalCost) * 100) * 100) / 100 : 0;
 
     return {
       totalCost,
@@ -692,6 +693,11 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     }
     setPaymentErrors({});
 
+    if (!Number.isFinite(voucherTotals.totalCost) || voucherTotals.totalCost > 10_000_000) {
+      showToast('error', 'GRV total exceeds the maximum allowed transaction limit of $10,000,000.00. Please verify quantities and costs.');
+      return;
+    }
+
     const targetBranch = branches.find((b) => b.branchId === selectedBranchId) || currentBranch;
 
     // Convert rows to DirectGrvItem
@@ -745,9 +751,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       }
     }
 
-    const tillPaidTotal = formattedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+    const tillPaidTotal = Math.round(formattedPayments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0) * 100) / 100;
     const unpaidInvoiceBalance = payFromTill
-      ? Math.max(0, voucherTotals.totalCost - tillPaidTotal)
+      ? Math.round(Math.max(0, voucherTotals.totalCost - tillPaidTotal) * 100) / 100
       : voucherTotals.totalCost;
 
     const newDirectGrv: DirectGrv = {

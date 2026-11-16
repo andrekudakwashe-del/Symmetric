@@ -12,6 +12,7 @@ export interface SyncEnvelope<T = any> {
   originDeviceId: string;
   targetBranchId: string;
   class: EntityClass;           // determines LWW vs append-only
+  isCloudSynced?: boolean;      // true ONLY when cloud backend returned HTTP 200/201 ACK
   meta?: Record<string, any>;   // optional adapter/transport metadata (companyId, branchCode, originDeviceName, isReconPush, sheetName)
 }
 

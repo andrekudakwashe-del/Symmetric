@@ -452,6 +452,12 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                         -{fmtMoney(report.multiCurrencyCashOutTotal)}
                       </span>
                     </div>
+                    {(report.refunds || 0) > 0 && (
+                      <div className="flex justify-between">
+                        <span>- Cash Refunds / Returns (F2)</span>
+                        <span className="font-bold">-{fmtMoney(report.refunds)}</span>
+                      </div>
+                    )}
                     {report.deductions > 0 && (
                       <div className="flex justify-between">
                         <span>- Misc Form 2 Deductions</span>

@@ -9,7 +9,8 @@ import {
   syncCompanyToCloud,
 } from '../googleSheetsSync';
 import { registerAppScriptsPausedChecker } from './syncIngestBridge';
-import { getCurrentCompany } from '../../db/roomDatabase';
+import { getActiveCloudConfig } from './cloudConfigResolver';
+import { getCurrentCompany, markRecordsCloudSynced } from '../../db/roomDatabase';
 import { SyncQueueItem } from '../../types';
 
 const ENTITY_TO_SHEET: Record<string, string> = {
@@ -50,19 +51,9 @@ const ENTITY_TO_SHEET: Record<string, string> = {
   role_configs: 'RoleConfigs',
 };
 
-/**
- * Entities NOT automatically enqueued by roomDatabase's enqueueSync() that should be
- * dispatched explicitly when AppScriptsAdapter is active.
- */
-const EXPLICIT_DIRECT_CLOUD_ENTITIES = new Set([
-  'multi_currency',
-  'permissions_matrix',
-  'role_configs',
-  'system_settings',
-]);
-
 export class AppScriptsAdapter implements SyncAdapter {
   readonly name = 'AppScriptsAdapter';
+  readonly myDatabaseType = 'appscripts' as const;
 
   private paused = false;
   private receiveHandlers: Set<(envelope: SyncEnvelope) => void> = new Set();
@@ -74,49 +65,54 @@ export class AppScriptsAdapter implements SyncAdapter {
 
   /**
    * Stops outbound pushes and inbound pulls when the Local Hub is active
-   * (stopping Ghost Overwrites of staff passwords & config).
+   * OR when active databaseType is not 'appscripts' (preventing Ghost Overwrites & Dual-Racing).
    */
   public pause(): void {
     if (!this.paused) {
       this.paused = true;
       persistentSyncEngine.pauseOutboundSync();
-      console.log('[AppScriptsAdapter] 🛑 Paused (Local Hub active or HUB_ONLY mode).');
+      console.log('[AppScriptsAdapter] 🛑 Paused (Local Hub active, HUB_ONLY, or non-appscripts tenant).');
     }
   }
 
   /**
-   * Resumes cloud pushes and pulls when operating in Cloud-Only / Hub-offline mode.
+   * Resumes cloud pushes and pulls ONLY when active databaseType === 'appscripts'
+   * and operating in Cloud-Only / Hub-offline mode.
    */
   public resume(): void {
-    try {
-      const comp = getCurrentCompany();
-      if (comp?.sync_strategy === 'HUB_ONLY') {
-        this.paused = true;
-        persistentSyncEngine.pauseOutboundSync();
-        return;
-      }
-    } catch {}
+    const cfg = getActiveCloudConfig();
+    if (cfg.databaseType !== this.myDatabaseType || cfg.strategy === 'HUB_ONLY') {
+      this.paused = true;
+      persistentSyncEngine.pauseOutboundSync();
+      return;
+    }
 
     if (this.paused) {
       this.paused = false;
       persistentSyncEngine.resumeOutboundSync();
-      console.log('[AppScriptsAdapter] 🟢 Resumed (Cloud-Only / Hub disconnected).');
+      console.log('[AppScriptsAdapter] 🟢 Resumed (Single Active Cloud Adapter: appscripts).');
     } else if (persistentSyncEngine.isSyncPaused()) {
       persistentSyncEngine.resumeOutboundSync();
     }
   }
 
   public isPaused(): boolean {
-    try {
-      const comp = getCurrentCompany();
-      if (comp?.sync_strategy === 'HUB_ONLY') return true;
-      if (comp?.sync_strategy === 'CLOUD_ONLY') return false;
-    } catch {}
+    const cfg = getActiveCloudConfig();
+    if (cfg.databaseType !== this.myDatabaseType) {
+      return true;
+    }
+    if (cfg.strategy === 'HUB_ONLY') {
+      return true;
+    }
+    if (cfg.strategy === 'CLOUD_ONLY') {
+      return false;
+    }
     return this.paused || persistentSyncEngine.isSyncPaused();
   }
 
   async connect(): Promise<void> {
-    if (this.isPaused()) {
+    const cfg = getActiveCloudConfig();
+    if (cfg.databaseType !== this.myDatabaseType || this.isPaused()) {
       return;
     }
     try {
@@ -131,7 +127,8 @@ export class AppScriptsAdapter implements SyncAdapter {
   }
 
   isConnected(): boolean {
-    if (this.isPaused()) return false;
+    const cfg = getActiveCloudConfig();
+    if (cfg.databaseType !== this.myDatabaseType || this.isPaused()) return false;
     return typeof navigator === 'undefined' ? true : navigator.onLine;
   }
 
@@ -143,7 +140,8 @@ export class AppScriptsAdapter implements SyncAdapter {
   }
 
   public emitReceivedEnvelope(envelope: SyncEnvelope): void {
-    if (this.isPaused()) return;
+    const cfg = getActiveCloudConfig();
+    if (cfg.databaseType !== this.myDatabaseType || this.isPaused()) return;
     this.receiveHandlers.forEach((fn) => {
       try {
         fn(envelope);
@@ -152,6 +150,15 @@ export class AppScriptsAdapter implements SyncAdapter {
   }
 
   async broadcast(envelope: SyncEnvelope): Promise<BroadcastResult> {
+    const config = getActiveCloudConfig();
+    if (config.databaseType !== this.myDatabaseType) {
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: `AppScriptsAdapter disabled: active databaseType is ${config.databaseType}`,
+      };
+    }
+
     if (this.isPaused()) {
       return {
         success: false,
@@ -161,24 +168,8 @@ export class AppScriptsAdapter implements SyncAdapter {
     }
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      return {
-        success: false,
-        packetId: envelope.packetId,
-        error: 'Device offline; queued locally in persistentSyncEngine',
-      };
+      throw new Error('Device offline; Apps Script record retained in offline queue for retry.');
     }
-
-    if (this.dispatchedPacketIds.has(envelope.packetId)) {
-      return {
-        success: true,
-        packetId: envelope.packetId,
-      };
-    }
-    if (this.dispatchedPacketIds.size > 5000) {
-      const first = this.dispatchedPacketIds.values().next().value;
-      if (first) this.dispatchedPacketIds.delete(first);
-    }
-    this.dispatchedPacketIds.add(envelope.packetId);
 
     const spec = ENTITY_REGISTRY[envelope.entityType];
     if (!spec || !spec.requiresBroadcast) {
@@ -188,55 +179,84 @@ export class AppScriptsAdapter implements SyncAdapter {
       };
     }
 
-    const sheetName =
-      envelope.meta?.sheetName || ENTITY_TO_SHEET[envelope.entityType] || envelope.entityType;
-    const isExplicitDirect =
-      EXPLICIT_DIRECT_CLOUD_ENTITIES.has(envelope.entityType) ||
-      Boolean(envelope.meta?.forceCloudPush);
-
-    try {
-      if (isExplicitDirect) {
-        const d: any = envelope.data || {};
-        const queueItem: SyncQueueItem = {
-          id: envelope.packetId,
-          sheetName: sheetName as any,
-          action: envelope.action === 'DELETE' ? 'DELETE' : 'UPDATE',
-          payload: {
-            ...d,
-            id: d.id || envelope.entityId,
-            entityType: envelope.entityType,
-            updatedAt: envelope.updatedAt,
-            clientRequestId: envelope.packetId,
-            company_id: d.company_id || d.companyId || getCurrentCompany()?.company_id || 'COMP-001',
-            branch_id: d.branch_id || d.branchId || envelope.targetBranchId || 'ALL',
-          },
-          timestamp: envelope.updatedAt || Date.now(),
-          retries: 0,
-          status: 'pending',
-        };
-        await syncItemToGoogleSheets(queueItem);
-      } else {
-        // roomDatabase's enqueueSync() already enqueued T1/T2 items into IndexedDB/localStorage;
-        // trigger an immediate non-blocking flush rather than duplicating queue entries.
-        processSyncQueue().catch(() => {});
-        persistentSyncEngine.drainSyncQueue().catch(() => {});
-      }
-
+    if (this.dispatchedPacketIds.has(envelope.packetId)) {
       return {
         success: true,
         packetId: envelope.packetId,
       };
-    } catch (err: any) {
-      return {
-        success: false,
-        packetId: envelope.packetId,
-        error: err?.message || String(err),
-      };
     }
+
+    const sheetName =
+      envelope.meta?.sheetName || ENTITY_TO_SHEET[envelope.entityType] || envelope.entityType;
+    const rawData: any =
+      envelope.data && typeof envelope.data === 'object' ? { ...envelope.data } : { value: envelope.data };
+    if (rawData && typeof rawData === 'object' && 'reversalCashLogs' in rawData) {
+      delete rawData.reversalCashLogs;
+    }
+    const d = rawData;
+    const queueItem: SyncQueueItem = {
+      id: envelope.packetId,
+      sheetName: sheetName as any,
+      action: envelope.action === 'DELETE' ? 'DELETE' : 'UPDATE',
+      payload: {
+        ...d,
+        id: d.id || envelope.entityId,
+        entityType: envelope.entityType,
+        updatedAt: envelope.updatedAt,
+        clientRequestId: d.clientRequestId || envelope.packetId,
+        company_id: d.company_id || d.companyId || getCurrentCompany()?.company_id || 'COMP-001',
+        branch_id: d.branch_id || d.branchId || envelope.targetBranchId || 'ALL',
+      },
+      timestamp: envelope.updatedAt || Date.now(),
+      retries: 0,
+      status: 'pending',
+    };
+
+    // True Cloud ACK Confirmation: await the actual HTTP request and verify 200/201 response.
+    // Do NOT fire-and-forget or return { success: true } blindly.
+    const confirmed = await syncItemToGoogleSheets(queueItem);
+    if (!confirmed) {
+      throw new Error(
+        `AppScripts sync failed without HTTP 200/201 confirmation for ${envelope.entityType}:${envelope.entityId}`
+      );
+    }
+
+    if (this.dispatchedPacketIds.size > 5000) {
+      const first = this.dispatchedPacketIds.values().next().value;
+      if (first) this.dispatchedPacketIds.delete(first);
+    }
+    this.dispatchedPacketIds.add(envelope.packetId);
+
+    // ONLY confirm isCloudSynced = true after verified HTTP 200/201 confirmation
+    envelope.isCloudSynced = true;
+    if (envelope.data && typeof envelope.data === 'object') {
+      (envelope.data as any).isCloudSynced = true;
+    }
+
+    const idList = [
+      envelope.entityId,
+      d.id,
+      d.itemId,
+      d.invoice_id,
+      d.grvNumber,
+      d.customerId,
+      d.creditId,
+      d.changeId,
+    ]
+      .filter(Boolean)
+      .map(String);
+    const reqList = [envelope.packetId, d.clientRequestId].filter(Boolean).map(String);
+    markRecordsCloudSynced(idList, reqList, envelope.entityType, false);
+
+    return {
+      success: true,
+      packetId: envelope.packetId,
+    };
   }
 
   async requestCatchUp(_sinceTimestamp: number): Promise<CatchUpResult> {
-    if (this.isPaused()) {
+    const config = getActiveCloudConfig();
+    if (config.databaseType !== this.myDatabaseType || this.isPaused()) {
       return { envelopes: [], cutoffTimestamp: Date.now() };
     }
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -259,7 +279,8 @@ export class AppScriptsAdapter implements SyncAdapter {
   }
 
   async drainOfflineQueue(): Promise<void> {
-    if (this.isPaused()) {
+    const config = getActiveCloudConfig();
+    if (config.databaseType !== this.myDatabaseType || this.isPaused()) {
       return;
     }
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -275,7 +296,8 @@ export class AppScriptsAdapter implements SyncAdapter {
   }
 
   public async pushCompanyProfile(company: any): Promise<void> {
-    if (this.isPaused()) return;
+    const config = getActiveCloudConfig();
+    if (config.databaseType !== this.myDatabaseType || this.isPaused()) return;
     await syncCompanyToCloud(company);
   }
 }

@@ -1009,9 +1009,10 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     }
 
     const sellingPrice = Math.max(0, Number(row.sellingPrice) || 0);
+    lineTotal = Math.round((Number(lineTotal) || 0) * 100) / 100;
     const marginPercent =
       sellingPrice > 0 ? ((sellingPrice - unitCost) / sellingPrice) * 100 : 0;
-    const marginDollar = sellingPrice - unitCost;
+    const marginDollar = Math.round((sellingPrice - unitCost) * 100) / 100;
 
     // Check Rule A for this item
     const matchedItem = items.find((i) => i.itemId === row.itemId);
@@ -1051,10 +1052,12 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   };
 
   // Grand totals across all rows
-  const voucherGrandTotal = rows.reduce((acc, row) => {
-    const calc = getRowCalculations(row);
-    return acc + calc.lineTotal;
-  }, 0);
+  const voucherGrandTotal = Math.round(
+    rows.reduce((acc, row) => {
+      const calc = getRowCalculations(row);
+      return acc + calc.lineTotal;
+    }, 0) * 100
+  ) / 100;
 
   const voucherTotalCases = rows.reduce((acc, row) => {
     return row.receiveAs === 'Cases' ? acc + (Number(row.quantityCases) || 0) : acc;
@@ -1210,6 +1213,11 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
 
     if (validItemsToReceive.length === 0) {
       showToast('error', 'Please enter a received quantity (cases, singles, or prepacks) greater than 0 for your line items.');
+      return;
+    }
+
+    if (!Number.isFinite(voucherGrandTotal) || voucherGrandTotal > 10_000_000) {
+      showToast('error', 'Voucher grand total exceeds the maximum allowed limit of $10,000,000.00. Please verify quantities and costs.');
       return;
     }
 

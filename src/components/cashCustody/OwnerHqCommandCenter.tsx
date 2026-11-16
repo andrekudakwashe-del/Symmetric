@@ -12,6 +12,7 @@ import {
   getBranches,
   getSalespeople,
   getCashGovernanceConfig,
+  subscribeToDatabase,
 } from '../../db/roomDatabase';
 import {
   getCustodyBalancesSummary,
@@ -24,6 +25,7 @@ import {
   getUnpaidGrvsForSafePayment,
   createCashTransferVoucher,
   DEFAULT_SUPPLIER_APPROVAL_THRESHOLD,
+  MAX_CUSTODY_TRANSACTION_AMOUNT,
   UnpaidGrvRecord,
 } from '../../services/cashCustodyService';
 import {
@@ -112,6 +114,27 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
 
   useEffect(() => {
     reloadData();
+    const handleUpdate = () => reloadData();
+    const unsub = subscribeToDatabase(handleUpdate);
+    window.addEventListener('saimetric_cash_transfers_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_accounts_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_updated', handleUpdate);
+    window.addEventListener('saimetric_accounts_updated', handleUpdate);
+    window.addEventListener('saimetric_direct_grvs_updated', handleUpdate);
+    window.addEventListener('saimetric_supplier_invoices_updated', handleUpdate);
+    window.addEventListener('saimetric_grn_updated', handleUpdate);
+    window.addEventListener('storage', handleUpdate);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_cash_transfers_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_accounts_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_updated', handleUpdate);
+      window.removeEventListener('saimetric_accounts_updated', handleUpdate);
+      window.removeEventListener('saimetric_direct_grvs_updated', handleUpdate);
+      window.removeEventListener('saimetric_supplier_invoices_updated', handleUpdate);
+      window.removeEventListener('saimetric_grn_updated', handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
+    };
   }, []);
 
   const showToast = (text: string, type: 'success' | 'error' = 'success') => {
@@ -247,9 +270,13 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
 
   const handleCreateHqVoucher = (e: React.FormEvent) => {
     e.preventDefault();
-    const numAmount = parseFloat(amount);
-    if (!numAmount || numAmount <= 0) {
+    const numAmount = Math.round(parseFloat(amount) * 100) / 100;
+    if (!Number.isFinite(numAmount) || numAmount <= 0) {
       showToast('Please enter a valid transfer amount.', 'error');
+      return;
+    }
+    if (numAmount > MAX_CUSTODY_TRANSACTION_AMOUNT) {
+      showToast('Transfer amount exceeds the maximum allowed limit of $10,000,000.00.', 'error');
       return;
     }
 
@@ -449,7 +476,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
               <PlusCircle className="w-3.5 h-3.5 opacity-70" />
             </div>
             <div>
-              <div className="text-xs font-bold text-white mt-1">HQ $\rightarrow$ Branch</div>
+              <div className="text-xs font-bold text-white mt-1">HQ ➔ Branch</div>
               <div className="text-[9px] text-slate-400">Salaries & Ops</div>
             </div>
           </button>
@@ -464,7 +491,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
               <PlusCircle className="w-3.5 h-3.5 opacity-70" />
             </div>
             <div>
-              <div className="text-xs font-bold text-white mt-1">Branch $\rightarrow$ HQ</div>
+              <div className="text-xs font-bold text-white mt-1">Branch ➔ HQ</div>
               <div className="text-[9px] text-slate-400">Recall Vault</div>
             </div>
           </button>
@@ -494,7 +521,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
             </div>
             <div>
               <div className="text-xs font-bold text-white mt-1">Till Turnover</div>
-              <div className="text-[9px] text-slate-400">Till $\rightarrow$ Vault</div>
+              <div className="text-[9px] text-slate-400">Till ➔ Vault</div>
             </div>
           </button>
 
@@ -522,7 +549,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
             </div>
             <div>
               <div className="text-xs font-bold text-white mt-1">Bank Deposit</div>
-              <div className="text-[9px] text-slate-400">Vault $\rightarrow$ Bank</div>
+              <div className="text-[9px] text-slate-400">Vault ➔ Bank</div>
             </div>
           </button>
 
@@ -536,7 +563,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
             </div>
             <div>
               <div className="text-xs font-bold text-white mt-1">Bank Withdraw</div>
-              <div className="text-[9px] text-slate-400">Bank $\rightarrow$ Vault</div>
+              <div className="text-[9px] text-slate-400">Bank ➔ Vault</div>
             </div>
           </button>
 
@@ -1155,8 +1182,8 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
             {/* Explanation of Cash Movements */}
             <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 text-[11px] text-slate-400 space-y-1">
               <div className="font-semibold text-slate-300">💡 Where does the money go?</div>
-              <div>• <strong>Bank Deposit:</strong> Physical cash moves from HQ Central Vault / Branch Safe $\rightarrow$ Commercial Bank. Safe decreases, Bank Balance increases.</div>
-              <div>• <strong>Bank Withdrawal:</strong> Funds move from Commercial Bank $\rightarrow$ Vault to replenish physical cash on hand. Bank Balance decreases, Safe increases.</div>
+              <div>• <strong>Bank Deposit:</strong> Physical cash moves from HQ Central Vault / Branch Safe ➔ Commercial Bank. Safe decreases, Bank Balance increases.</div>
+              <div>• <strong>Bank Withdrawal:</strong> Funds move from Commercial Bank ➔ Vault to replenish physical cash on hand. Bank Balance decreases, Safe increases.</div>
             </div>
 
             {/* Action buttons */}

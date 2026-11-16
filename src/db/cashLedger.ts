@@ -470,12 +470,24 @@ const computeMissingDirectGrvPayouts = (
  * Only includes: shiftId matches, status in ['approved', 'pending-POS-auto'], affectsDrawer === true.
  * Excludes: physical_count (snapshot, not a movement).
  */
+const sortMovementsChronologicallyAsc = (movs: CashMovement[]): CashMovement[] => {
+  if (!Array.isArray(movs) || movs.length <= 1) return Array.isArray(movs) ? [...movs] : [];
+  return [...movs].sort((a, b) => {
+    const ta = Date.parse(String(a?.timestamp || a?.date || '')) || 0;
+    const tb = Date.parse(String(b?.timestamp || b?.date || '')) || 0;
+    if (ta !== tb) return ta - tb;
+    return String(a?.id || '').localeCompare(String(b?.id || ''));
+  });
+};
+
 export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', branchId?: string): number => {
   const targetBranch = branchId || shiftId.split('_')[2] || getActiveBranchId();
-  const all = getAllMovements().filter((m) => {
-    const movBranch = m.branch_id || (m as any).branchId || 'BR-MAIN';
-    return movBranch === targetBranch;
-  });
+  const all = sortMovementsChronologicallyAsc(
+    getAllMovements().filter((m) => {
+      const movBranch = m.branch_id || (m as any).branchId || 'BR-MAIN';
+      return movBranch === targetBranch;
+    })
+  );
   const validStatuses: CashMovementStatus[] = ['approved', 'pending-POS-auto'];
 
   let balance = 0;
@@ -719,7 +731,7 @@ export interface ShiftLedgerBreakdown {
  * Get detailed live reconciliation breakdown for a shift from cashMovements ledger.
  */
 export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD'): ShiftLedgerBreakdown => {
-  const all = getAllMovements();
+  const all = sortMovementsChronologicallyAsc(getAllMovements());
   const validStatuses: CashMovementStatus[] = ['approved', 'pending-POS-auto'];
 
   let openingFloat = 0;

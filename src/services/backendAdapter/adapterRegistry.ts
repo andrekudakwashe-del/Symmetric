@@ -130,6 +130,11 @@ export const saveTenantBackendConfig = (
   };
 
   saveCompany(updatedCompany);
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem('saimetric_cloud_config_purged');
+    }
+  } catch {}
 
   // Sync with server if online
   if (typeof fetch !== 'undefined') {

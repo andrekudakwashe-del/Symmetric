@@ -19,6 +19,7 @@ import { InventoryCategory } from '../../types';
 import {
   getCategories,
   saveCategories,
+  deleteCategory,
   resetRoomDatabase,
   getInventoryItems,
 } from '../../db/roomDatabase';
@@ -80,9 +81,8 @@ export const InventorySetupView: React.FC<InventorySetupViewProps> = ({ onRefres
 
   const handleDeleteCategory = (catId: string, catName: string) => {
     if (confirm(`Are you sure you want to delete category "${catName}"?`)) {
-      const updated = categories.filter((c) => c.categoryId !== catId);
-      setCategoriesState(updated);
-      saveCategories(updated);
+      deleteCategory(catId);
+      setCategoriesState(getCategories());
       showToast('success', `Category removed`);
       onRefreshAll();
     }

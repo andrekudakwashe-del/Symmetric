@@ -1590,6 +1590,9 @@ class BluetoothThermalPrinter {
     if (report.multiCurrencyCashOutTotal > 0) {
       writeColumns('- MultiCurr Out', `-${fmtMoney(report.multiCurrencyCashOutTotal)}`);
     }
+    if ((report.refunds || 0) > 0) {
+      writeColumns('- Cash Refunds', `-${fmtMoney(report.refunds)}`);
+    }
     if (report.deductions > 0) {
       writeColumns('- Misc Deductions', `-${fmtMoney(report.deductions)}`);
     }

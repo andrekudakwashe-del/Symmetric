@@ -90,7 +90,9 @@ import {
 import {
   isAppScriptsIngestPaused,
   routeCloudRecordThroughSyncCore,
+  saveAndSyncThroughBridge,
 } from '../services/sync/syncIngestBridge';
+import { SyncEnvelope } from '../services/sync/SyncEnvelope';
 import {
   Company,
   SaaSBranch,
@@ -120,7 +122,7 @@ import {
   INITIAL_AUDIT_LOGS,
 } from '../data/initialData';
 import { persistentSyncEngine } from '../services/persistentSyncEngine';
-import { getMeta, setMeta } from './indexedDBService';
+import { getMeta, setMeta, deleteMeta, purgeTenantContextCredentials } from './indexedDBService';
 import {
   getDualReadDirectGrvs,
   getDualReadSupplierInvoices,
@@ -239,33 +241,97 @@ export interface TombstoneRecord {
   deletedAtIso: string;
   company_id?: string;
   branch_id?: string;
+  syncedToHub?: boolean;
 }
 
 export const getTombstones = (): TombstoneRecord[] => {
   return getStored<TombstoneRecord[]>(STORAGE_KEYS.DELETED_RECORDS, []);
 };
 
+export const normalizeRoomTombstoneType = (rawType: string): string => {
+  const clean = String(rawType || '').trim().toLowerCase();
+  switch (clean) {
+    case 'inventory':
+    case 'inventory_item':
+    case 'inventory_items':
+    case 'inventorymaster':
+    case 'product':
+    case 'products':
+      return 'inventory_item';
+    case 'customer':
+    case 'customers':
+      return 'customer';
+    case 'staff':
+    case 'salesperson':
+    case 'salespeople':
+    case 'user':
+    case 'users':
+      return 'staff';
+    case 'supplier':
+    case 'suppliers':
+      return 'supplier';
+    case 'branch':
+    case 'branches':
+      return 'branch';
+    case 'category':
+    case 'categories':
+    case 'inventory_category':
+    case 'inventory_categories':
+      return 'inventory_category';
+    case 'cash_account':
+    case 'cash_accounts':
+    case 'cashaccounts':
+      return 'cash_account';
+    case 'credit_group':
+    case 'credit_groups':
+      return 'credit_group';
+    case 'casual':
+    case 'casual_worker':
+    case 'casual_workers':
+    case 'temporary_casual':
+    case 'temporary_casuals':
+      return 'casual_worker';
+    case 'stocktake_session':
+    case 'stocktake_sessions':
+      return 'stocktake_session';
+    default:
+      return clean;
+  }
+};
+
 export const recordTombstone = (
   entityType: string,
   entityId: string,
-  options?: { fromSync?: boolean }
+  options?: { fromSync?: boolean; deletedAt?: number }
 ): TombstoneRecord => {
   const all = getTombstones();
   const cleanId = String(entityId || '').trim();
-  const cleanType = String(entityType || '').trim().toLowerCase();
-  const now = Date.now();
+  const cleanType = normalizeRoomTombstoneType(entityType);
+  const incomingTs =
+    typeof options?.deletedAt === 'number' && !isNaN(options.deletedAt) && options.deletedAt > 0
+      ? options.deletedAt
+      : Date.now();
   const tombstoneId = `TOMB-${cleanType}-${cleanId}`;
 
-  const existingIdx = all.findIndex((t) => t.id === tombstoneId || (t.entityType === cleanType && t.entityId === cleanId));
+  const existingIdx = all.findIndex(
+    (t) =>
+      t.id === tombstoneId ||
+      (normalizeRoomTombstoneType(t.entityType) === cleanType &&
+        String(t.entityId || '').trim().toUpperCase() === cleanId.toUpperCase())
+  );
+  const existingTs = existingIdx >= 0 ? Number(all[existingIdx]?.deletedAt || 0) : 0;
+  const effectiveDeletedAt = Math.max(existingTs, incomingTs);
+
   const record: TombstoneRecord = {
     id: tombstoneId,
     entityType: cleanType,
     entityId: cleanId,
     isDeleted: true,
-    deletedAt: now,
-    deletedAtIso: new Date(now).toISOString(),
+    deletedAt: effectiveDeletedAt,
+    deletedAtIso: new Date(effectiveDeletedAt).toISOString(),
     company_id: getCurrentCompanyId(),
     branch_id: getCurrentBranchId(),
+    syncedToHub: options?.fromSync ? true : false,
   };
 
   if (existingIdx >= 0) {
@@ -280,6 +346,56 @@ export const recordTombstone = (
   }
 
   return record;
+};
+
+export const markTombstonesSyncedToHub = (identifiers: string[], targetEntityType?: string): number => {
+  if (!Array.isArray(identifiers) || identifiers.length === 0) return 0;
+  const cleanIds = new Set(identifiers.map((id) => String(id || '').trim().toUpperCase()).filter(Boolean));
+  if (cleanIds.size === 0) return 0;
+  const normTargetType = targetEntityType ? normalizeRoomTombstoneType(targetEntityType) : '';
+
+  const all = getTombstones();
+  let updatedCount = 0;
+  const next = all.map((t) => {
+    const tIdUpper = String(t.id || '').trim().toUpperCase();
+    const tEntityIdUpper = String(t.entityId || '').trim().toUpperCase();
+    const typeMatch = !normTargetType || normalizeRoomTombstoneType(t.entityType) === normTargetType;
+    if ((cleanIds.has(tIdUpper) || (typeMatch && cleanIds.has(tEntityIdUpper))) && !t.syncedToHub) {
+      updatedCount++;
+      return { ...t, syncedToHub: true };
+    }
+    return t;
+  });
+
+  if (updatedCount > 0) {
+    setStored(STORAGE_KEYS.DELETED_RECORDS, next);
+  }
+  return updatedCount;
+};
+
+export const dispatchTombstoneThroughSyncCore = (record: TombstoneRecord): void => {
+  if (!record || !record.entityId || !record.entityType) return;
+  const now = record.deletedAt || Date.now();
+  const cleanType = normalizeRoomTombstoneType(record.entityType);
+  const cleanId = String(record.entityId).trim();
+  const envelope: SyncEnvelope<TombstoneRecord> = {
+    packetId: `TOMB-PKT-${cleanType}-${cleanId}-${now}-${Math.random().toString(36).substring(2, 6)}`,
+    entityType: 'tombstone',
+    entityId: cleanId,
+    action: 'APPEND',
+    data: record,
+    updatedAt: now,
+    originDeviceId: '',
+    targetBranchId: 'ALL',
+    class: 'T1',
+    meta: {
+      topicSuffix: 'tombstone',
+      companyId: record.company_id || getCurrentCompanyId(),
+    },
+  };
+  void saveAndSyncThroughBridge(envelope).catch((err) => {
+    console.warn('[TombstoneSync] SyncCore.saveAndSync dispatch error:', err);
+  });
 };
 
 export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
@@ -392,7 +508,7 @@ let notifyScheduled = false;
 let notifyTimer: any = null;
 
 // Throttled listener notification to coalesce rapid bulk writes into a single render tick
-const notifyListeners = () => {
+export const notifyListeners = () => {
   if (notifyScheduled) return;
   notifyScheduled = true;
   if (typeof requestAnimationFrame !== 'undefined') {
@@ -715,6 +831,11 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
     if (!item || typeof item !== 'object') return '';
     return String(
       item.id ||
+      item.movementId ||
+      item.txnId ||
+      item.cashLogId ||
+      item.creditId ||
+      item.changeId ||
       item.grvNumber ||
       item.invoice_id ||
       item.invoiceNumber ||
@@ -740,11 +861,26 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
   // Iterate over incoming delta: update Map if ID exists (or add if new), enforcing monotonic finalized status
   const isFinalApprovalStatus = (s: any): boolean => {
     const u = String(s || '').trim().toUpperCase();
-    return u === 'APPROVED' || u === 'REJECTED' || u === 'VOIDED' || u === 'REFUNDED';
+    return (
+      u === 'APPROVED' ||
+      u === 'REJECTED' ||
+      u === 'VOIDED' ||
+      u === 'REFUNDED' ||
+      u === 'COMPLETED' ||
+      u === 'RECEIVED' ||
+      u === 'RETURNED' ||
+      u === 'CANCELLED'
+    );
   };
   const isPendingApprovalStatus = (s: any): boolean => {
     const u = String(s || '').trim().toUpperCase();
-    return u === 'PENDING' || u === 'PENDING_APPROVAL' || u === 'PENDING_SUPERVISOR';
+    return (
+      u === 'DRAFT' ||
+      u === 'PENDING' ||
+      u === 'PENDING_APPROVAL' ||
+      u === 'PENDING_ACCEPTANCE' ||
+      u === 'IN_TRANSIT'
+    );
   };
   const isFinalMobileStatus = (s: any): boolean => {
     const u = String(s || '').trim().toUpperCase();
@@ -761,7 +897,7 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
         return;
       }
       const mergedItem = { ...prev, ...item };
-      // Protect finalized approval/void statuses from being downgraded by stale pending records
+      // Protect finalized approval/void/custody statuses from being downgraded by stale pending/in-transit records
       if (isFinalApprovalStatus(prev.status) && (!item.status || isPendingApprovalStatus(item.status))) {
         mergedItem.status = prev.status;
         if (prev.approvedBy !== undefined) mergedItem.approvedBy = prev.approvedBy;
@@ -771,6 +907,17 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
         if (prev.approvedByStaffId !== undefined) mergedItem.approvedByStaffId = prev.approvedByStaffId;
         if (prev.approvedByStaffName !== undefined) mergedItem.approvedByStaffName = prev.approvedByStaffName;
         if (prev.rejectedReason !== undefined) mergedItem.rejectedReason = prev.rejectedReason;
+        if (prev.approved_by_user_id !== undefined) mergedItem.approved_by_user_id = prev.approved_by_user_id;
+        if (prev.approved_by_user_name !== undefined) mergedItem.approved_by_user_name = prev.approved_by_user_name;
+        if (prev.approved_at !== undefined) mergedItem.approved_at = prev.approved_at;
+        if (prev.received_by_user_id !== undefined) mergedItem.received_by_user_id = prev.received_by_user_id;
+        if (prev.received_by_user_name !== undefined) mergedItem.received_by_user_name = prev.received_by_user_name;
+        if (prev.received_at !== undefined) mergedItem.received_at = prev.received_at;
+        if (prev.returned_by_user_id !== undefined) mergedItem.returned_by_user_id = prev.returned_by_user_id;
+        if (prev.returned_by_user_name !== undefined) mergedItem.returned_by_user_name = prev.returned_by_user_name;
+        if (prev.returned_at !== undefined) mergedItem.returned_at = prev.returned_at;
+        if (prev.linked_cash_log_ids !== undefined) mergedItem.linked_cash_log_ids = prev.linked_cash_log_ids;
+        if (prev.linked_grv_id !== undefined) mergedItem.linked_grv_id = prev.linked_grv_id;
       }
       // Protect finalized mobile verification status from being downgraded by stale PENDING/unset records
       if (isFinalMobileStatus(prev.mobileVerificationStatus) && !isFinalMobileStatus(item.mobileVerificationStatus)) {
@@ -798,10 +945,27 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
       : mergedRaw;
   setStored(storageKey, merged);
   notifyListeners();
-
   console.log(`[Merge] Merged ${incomingRecords.length} incoming records into ${existing.length} local records for ${storageKey} (final: ${merged.length})`);
-
   return merged;
+};
+
+export const sortChronologicallyAsc = <T extends Record<string, any>>(items: T[]): T[] => {
+  if (!Array.isArray(items) || items.length <= 1) return Array.isArray(items) ? [...items] : [];
+  const getMs = (item: any): number => {
+    if (!item || typeof item !== 'object') return 0;
+    const raw = item.timestamp ?? item.createdAt ?? item.date ?? item.Timestamp ?? item.Date ?? 0;
+    if (typeof raw === 'number') return Number.isFinite(raw) ? raw : 0;
+    const ms = Date.parse(String(raw));
+    return Number.isFinite(ms) ? ms : 0;
+  };
+  return [...items].sort((a, b) => {
+    const ta = getMs(a);
+    const tb = getMs(b);
+    if (ta !== tb) return ta - tb;
+    const ia = String(a?.id || a?.grvNumber || '');
+    const ib = String(b?.id || b?.grvNumber || '');
+    return ia.localeCompare(ib);
+  });
 };
 
 // ==================== MULTI-CURRENCY & EXCHANGE RATES ====================
@@ -1709,7 +1873,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
       console.log(`[healMultiCurrencySalesAndMovements] 🧹 Collapsed ${removedMovsCount} duplicate multi-currency movements`);
     }
 
-    const allSales = getAllSales();
+    const allSales = sortChronologicallyAsc(getAllSales());
     const allMovements = getAllMovements();
     const allCashLogs = getAllCashLogs();
     const existingMovKeys = new Set(allMovements.map((m) => `${m.sourceRef}_${m.type}`));
@@ -1719,6 +1883,101 @@ export const healMultiCurrencySalesAndMovements = (): void => {
 
     for (const sale of allSales) {
       if (!sale || !sale.id) continue;
+      const isSaleReversed = sale.status === 'Refunded' || sale.status === 'Voided';
+
+      // Auto-heal Cash & Multi-Currency Refund/Void Form 2 Logs & Reversals
+      if (isSaleReversed) {
+        const saleCurKind = getMobileMoneySaleKind(sale);
+        if (saleCurKind) {
+          allMovements.forEach((m) => {
+            if (
+              m.sourceRef === sale.id &&
+              (m.type === 'ecocash_sale' || m.type === 'zig_sale') &&
+              m.status !== 'rejected'
+            ) {
+              updateMovement(m.id, {
+                status: 'rejected',
+                affectsDrawer: false,
+                notes: `${m.notes || ''} [${sale.status} Reversed]`.trim(),
+              });
+              healed = true;
+            }
+          });
+          allCashLogs.forEach((c) => {
+            const isSaleExemptLog =
+              (c.id === `CL-SALE-${sale.id}` ||
+                (extractCashLogRef(c) === sale.id &&
+                  !isCashLogWithdrawal(c) &&
+                  getCashLogCurrencyBucket(c) !== '')) &&
+              !c.id?.startsWith('CL-REF-') &&
+              !c.id?.startsWith('CL-VOID-');
+            if (isSaleExemptLog && ((Number(c.out) || 0) > 0 || (Number(c.in) || 0) > 0) && !(c as any).isRefunded) {
+              updateCashLog(
+                c.id,
+                {
+                  out: 0,
+                  in: 0,
+                  isRefunded: true,
+                  description: `[${String(sale.status).toUpperCase()}] ${c.description || ''}`.trim(),
+                } as any,
+                { skipSync: true }
+              );
+              healed = true;
+            }
+          });
+        }
+
+        const isVoid = sale.status === 'Voided';
+        const revPrefix = isVoid ? 'VOID' : 'REF';
+        const revSemKey = `${revPrefix}::${String(sale.id).trim().toUpperCase()}`;
+        const hasRevCashLog =
+          existingSemanticKeys.has(revSemKey) ||
+          allCashLogs.some(
+            (c) =>
+              c.id === `CL-${revPrefix}-${sale.id}` ||
+              (extractCashLogRef(c) === sale.id &&
+                ((c.category || '').toLowerCase() === 'refund' ||
+                  (c.line || '').toLowerCase().includes('refund') ||
+                  (c.line || '').toLowerCase().includes('void')))
+          );
+        const revCashAmt =
+          sale.paymentMethod === 'Cash'
+            ? Math.max(0, (Number(sale.total) || 0) - (Number(sale.customerCreditUsed) || 0))
+            : saleCurKind
+            ? Math.max(0, Number(sale.total) || 0)
+            : sale.paymentMethod === 'Credit'
+            ? Math.max(0, Number(sale.creditDeposit) || 0)
+            : 0;
+
+        if (!hasRevCashLog && revCashAmt > 0) {
+          const revTs = isVoid ? sale.voidedAt || sale.timestamp : sale.refundedAt || sale.timestamp;
+          const revDate = toDateStringSafe(revTs) || sale.date || getTodayDateString();
+          addCashLog(
+            {
+              id: `CL-${revPrefix}-${sale.id}`,
+              timestamp: revTs || new Date().toISOString(),
+              date: revDate,
+              staffId: sale.staffId,
+              staffName: sale.staffName || 'Cashier',
+              company_id: sale.company_id || sale.companyId,
+              companyId: sale.company_id || sale.companyId,
+              branch_id: sale.branch_id || sale.branchId,
+              branchId: sale.branch_id || sale.branchId,
+              line: isVoid ? 'Voids / Reversals' : 'Refunds / Returns',
+              description: `${isVoid ? 'Void reversal' : 'Cash refund'} for ${saleCurKind || sale.paymentMethod || 'Cash'} Invoice #${sale.id}`,
+              in: 0,
+              out: revCashAmt,
+              category: 'Refund',
+              reference: sale.id,
+              skipSync: true,
+            },
+            { fromSync: true }
+          );
+          existingSemanticKeys.add(revSemKey);
+          healed = true;
+        }
+      }
+
       const isEco =
         sale.currency === 'EcoCash' ||
         sale.currency === 'ECO' ||
@@ -1743,7 +2002,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
       const curBucket = cur === 'ZiG' ? 'ZIG' : 'ECOCASH';
       const saleMovType = cur === 'ZiG' ? 'zig_sale' : 'ecocash_sale';
       const saleKey = `${sale.id}_${saleMovType}`;
-      if (!existingMovKeys.has(saleKey)) {
+      if (!isSaleReversed && !existingMovKeys.has(saleKey)) {
         addMovement({
           shiftId: getShiftId(sale.staffId, sale.date, sale.branch_id || sale.branchId),
           staffId: sale.staffId,
@@ -1765,7 +2024,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
         healed = true;
       }
 
-      // Auto-heal CashLog for non-cash sale if missing in Form 2
+      // Auto-heal CashLog for non-cash sale if missing in Form 2 (active non-reversed sales only)
       const saleSemanticKey = `NCSALE::${String(sale.id).trim().toUpperCase()}::${curBucket}`;
       const hasSaleCashLog =
         existingSemanticKeys.has(saleSemanticKey) ||
@@ -1775,7 +2034,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
             !isCashLogWithdrawal(c) &&
             (c.currency === cur || c.line === cur || (c.category && c.category.includes(cur)))
         );
-      if (!hasSaleCashLog && Number(sale.total) > 0) {
+      if (!isSaleReversed && !hasSaleCashLog && Number(sale.total) > 0) {
         const currencyConfig = getMultiCurrencyConfig();
         const rate =
           sale.exchangeRate ||
@@ -3058,93 +3317,181 @@ export const updateSupplier = (
   return updated;
 };
 
-export const deleteSupplier = (supplierId: string): boolean => {
+export const deleteSupplier = (supplierId: string, options?: { fromSync?: boolean }): boolean => {
+  const cleanId = String(supplierId || '').trim();
+  const cleanUpper = cleanId.toUpperCase();
   const all = getRawStoredSuppliers();
-  const filtered = all.filter((s) => s.supplierId !== supplierId);
-  if (filtered.length === all.length) return false;
-  setStored(STORAGE_KEYS.SUPPLIERS, filtered);
-  recordTombstone('supplier', supplierId);
-  enqueueSync('Suppliers', 'DELETE', { supplierId, company_id: getCurrentCompanyId() });
-  return true;
+  const filtered = all.filter((s) => {
+    const sId = String(s.supplierId || (s as any).id || (s as any).SupplierID || '').trim().toUpperCase();
+    return sId !== cleanUpper;
+  });
+  const removed = filtered.length !== all.length;
+  if (removed) {
+    setStored(STORAGE_KEYS.SUPPLIERS, filtered);
+  }
+  const tomb = recordTombstone('supplier', cleanId, options);
+  if (!options?.fromSync) {
+    enqueueSync('Suppliers', 'DELETE', { supplierId: cleanId, company_id: getCurrentCompanyId() });
+    dispatchTombstoneThroughSyncCore(tomb);
+  }
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_supplier_updated'));
+  }
+  return removed;
 };
 
 export const deleteCustomer = (customerId: string, options?: { fromSync?: boolean }): boolean => {
   const all = getRawStoredCustomers();
   const cleanId = String(customerId || '').trim();
-  const filtered = all.filter((c) => c.customerId !== cleanId && c.id !== cleanId);
-  if (filtered.length === all.length) return false;
-  setStored(STORAGE_KEYS.CUSTOMERS, filtered);
-  recordTombstone('customer', cleanId, options);
+  const cleanUpper = cleanId.toUpperCase();
+  const filtered = all.filter(
+    (c) =>
+      String(c.customerId || '').trim().toUpperCase() !== cleanUpper &&
+      String(c.id || '').trim().toUpperCase() !== cleanUpper
+  );
+  const removed = filtered.length !== all.length;
+  if (removed) {
+    setStored(STORAGE_KEYS.CUSTOMERS, filtered);
+  }
+  const tomb = recordTombstone('customer', cleanId, options);
   if (!options?.fromSync) {
     enqueueSync('Customers', 'DELETE', { customerId: cleanId, company_id: getCurrentCompanyId() });
+    dispatchTombstoneThroughSyncCore(tomb);
   }
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
   }
-  return true;
+  return removed;
 };
 
 export const deleteSalesperson = (id: string, options?: { fromSync?: boolean }): boolean => {
   const all = getRawStoredSalespeople();
   const cleanId = String(id || '').trim();
-  const filtered = all.filter((s) => s.id !== cleanId);
-  if (filtered.length === all.length) return false;
-  setStored(STORAGE_KEYS.SALESPEOPLE, filtered);
-  recordTombstone('staff', cleanId, options);
+  const cleanUpper = cleanId.toUpperCase();
+  const filtered = all.filter((s) => String(s.id || '').trim().toUpperCase() !== cleanUpper);
+  const removed = filtered.length !== all.length;
+  if (removed) {
+    setStored(STORAGE_KEYS.SALESPEOPLE, filtered);
+  }
+  const tomb = recordTombstone('staff', cleanId, options);
   if (!options?.fromSync) {
     enqueueSync('Salespeople', 'DELETE', { id: cleanId, company_id: getCurrentCompanyId() });
+    dispatchTombstoneThroughSyncCore(tomb);
   }
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
   }
-  return true;
+  return removed;
 };
 
 export const applyTombstone = (tombstone: { entityType: string; entityId: string; deletedAt?: number }): boolean => {
   if (!tombstone || !tombstone.entityId || !tombstone.entityType) return false;
   const cleanId = String(tombstone.entityId).trim();
-  const cleanType = String(tombstone.entityType).trim().toLowerCase();
+  const cleanUpper = cleanId.toUpperCase();
+  const cleanType = normalizeRoomTombstoneType(tombstone.entityType);
 
-  recordTombstone(cleanType, cleanId, { fromSync: true });
+  recordTombstone(cleanType, cleanId, { fromSync: true, deletedAt: tombstone.deletedAt });
 
-  if (cleanType === 'inventory' || cleanType === 'product') {
+  if (cleanType === 'inventory_item') {
+    const deletedAtTs =
+      typeof tombstone.deletedAt === 'number' && !isNaN(tombstone.deletedAt) && tombstone.deletedAt > 0
+        ? tombstone.deletedAt
+        : Date.now();
+    const currentCompany = getCurrentCompanyId();
+    const normTenant = (c?: string) =>
+      !c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase();
+
+    const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+    const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+    const existsInDeleted = deletedList.some(
+      (d) => (d.itemId || '').trim().toUpperCase() === cleanUpper && normTenant(d.companyId) === normTenant(currentCompany)
+    );
+    if (!existsInDeleted) {
+      setStored(deletedRegistryKey, [
+        ...deletedList,
+        { itemId: cleanUpper, companyId: currentCompany, deletedAt: new Date(deletedAtTs).toISOString() },
+      ]);
+    }
+
     const allItems = getRawStoredInventoryItems();
-    const filtered = allItems.filter(i => (i.itemId || (i as any).id || '').trim().toUpperCase() !== cleanId.toUpperCase());
-    if (filtered.length !== allItems.length) {
+    const filtered = allItems.filter(
+      (i) => (i.itemId || (i as any).ItemID || (i as any).id || '').trim().toUpperCase() !== cleanUpper
+    );
+    const invRemoved = filtered.length !== allItems.length;
+    if (invRemoved) {
       setStored(STORAGE_KEYS.INVENTORY_ITEMS, filtered);
-      try {
-        setStored(STORAGE_KEYS.PRODUCTS, filtered.map(item => inventoryItemToProduct(item)));
-      } catch {}
+    }
+
+    let prodRemoved = false;
+    try {
+      const existingProducts = getStored<any[]>(STORAGE_KEYS.PRODUCTS, []);
+      const filteredProducts = existingProducts.filter(
+        (p) => (p?.id || p?.itemId || p?.ItemID || '').trim().toUpperCase() !== cleanUpper
+      );
+      prodRemoved = filteredProducts.length !== existingProducts.length;
+      if (invRemoved) {
+        setStored(STORAGE_KEYS.PRODUCTS, filtered.map((item) => inventoryItemToProduct(item)));
+      } else if (prodRemoved) {
+        setStored(STORAGE_KEYS.PRODUCTS, filteredProducts);
+      }
+    } catch {}
+
+    if (invRemoved || prodRemoved) {
       if (typeof window !== 'undefined') {
+        window.dispatchEvent(
+          new CustomEvent('saimetric_inventory_item_deleted', {
+            detail: { itemId: cleanUpper, companyId: currentCompany, fromMesh: true },
+          })
+        );
         window.dispatchEvent(new Event('saimetric_inventory_updated'));
         window.dispatchEvent(new Event('saimetric_products_updated'));
       }
+      notifyListeners();
       return true;
     }
+    return false;
   } else if (cleanType === 'customer') {
     return deleteCustomer(cleanId, { fromSync: true });
   } else if (cleanType === 'staff') {
     return deleteSalesperson(cleanId, { fromSync: true });
   } else if (cleanType === 'supplier') {
-    const all = getRawStoredSuppliers();
-    const filtered = all.filter(s => s.supplierId !== cleanId && (s as any).id !== cleanId);
-    if (filtered.length !== all.length) {
-      setStored(STORAGE_KEYS.SUPPLIERS, filtered);
+    return deleteSupplier(cleanId, { fromSync: true });
+  } else if (cleanType === 'branch') {
+    return deleteBranch(cleanId, { fromSync: true });
+  } else if (cleanType === 'inventory_category') {
+    return deleteCategory(cleanId, { fromSync: true });
+  } else if (cleanType === 'casual_worker') {
+    return deleteTemporaryCasual(cleanId, { fromSync: true });
+  } else if (cleanType === 'stocktake_session') {
+    return deleteStocktakeSession(cleanId, { fromSync: true });
+  } else if (cleanType === 'cash_account') {
+    const accounts = getStored<CashAccount[]>(STORAGE_KEYS.CASH_ACCOUNTS, []);
+    const filtered = accounts.filter(
+      (a) =>
+        String(a.account_id || '').trim().toUpperCase() !== cleanUpper &&
+        String((a as any).id || '').trim().toUpperCase() !== cleanUpper
+    );
+    if (filtered.length !== accounts.length) {
+      setStored(STORAGE_KEYS.CASH_ACCOUNTS, filtered);
+      notifyListeners();
       if (typeof window !== 'undefined') {
-        window.dispatchEvent(new CustomEvent('saimetric_supplier_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
       }
       return true;
     }
-  } else if (cleanType === 'branch') {
-    const all = getAllBranches();
-    const filtered = all.filter(b => b.branchId !== cleanId && b.id !== cleanId);
-    if (filtered.length !== all.length) {
-      setStored(STORAGE_KEYS.BRANCHES, filtered);
+  } else if (cleanType === 'credit_group') {
+    const groups = getStored<CreditGroup[]>(STORAGE_KEYS.CREDIT_GROUPS, DEFAULT_CREDIT_GROUPS);
+    const filtered = groups.filter((g) => String(g.id || '').trim().toUpperCase() !== cleanUpper);
+    if (filtered.length !== groups.length) {
+      setStored(STORAGE_KEYS.CREDIT_GROUPS, filtered);
+      notifyListeners();
       if (typeof window !== 'undefined') {
-        window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_credit_groups_updated'));
       }
       return true;
     }
@@ -3597,29 +3944,45 @@ export const saveBranch = (
   }
 };
 
-export const deleteBranch = (branchId: string): boolean => {
+export const deleteBranch = (branchId: string, options?: { fromSync?: boolean }): boolean => {
+  const cleanId = String(branchId || '').trim();
+  const cleanUpper = cleanId.toUpperCase();
   // 1. Add to permanent deleted tombstones
-  recordTombstone('branch', branchId);
+  const tomb = recordTombstone('branch', cleanId, options);
   const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
-  if (!deletedList.includes(branchId)) {
-    setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, [...deletedList, branchId]);
+  if (!deletedList.includes(cleanId)) {
+    setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, [...deletedList, cleanId]);
   }
 
   // 2. Remove from local store
   const branches = getAllBranches();
-  const filtered = branches.filter((b) => b.branchId !== branchId && b.id !== branchId && (b as any).branch_id !== branchId);
-  setStored(STORAGE_KEYS.BRANCHES, filtered);
+  const filtered = branches.filter(
+    (b) =>
+      String(b.branchId || '').trim().toUpperCase() !== cleanUpper &&
+      String(b.id || '').trim().toUpperCase() !== cleanUpper &&
+      String((b as any).branch_id || '').trim().toUpperCase() !== cleanUpper
+  );
+  const removed = filtered.length !== branches.length;
+  if (removed) {
+    setStored(STORAGE_KEYS.BRANCHES, filtered);
+  }
 
-  // 3. Enqueue sync deletion to backend and cloud
-  enqueueSync('branches', 'DELETE', {
-    branch_id: branchId,
-    branchId: branchId,
-    id: branchId,
-    company_id: getCurrentCompanyId(),
-  });
+  // 3. Enqueue sync deletion & dispatch TOMBSTONE_SYNC through SyncCore.saveAndSync()
+  if (!options?.fromSync) {
+    enqueueSync('branches', 'DELETE', {
+      branch_id: cleanId,
+      branchId: cleanId,
+      id: cleanId,
+      company_id: getCurrentCompanyId(),
+    });
+    dispatchTombstoneThroughSyncCore(tomb);
+  }
 
   notifyListeners();
-  return true;
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
+  }
+  return removed || true;
 };
 
 // ==================== PRODUCT DAO (POS INVENTORY UNIFIED BRIDGE) ====================
@@ -4147,9 +4510,11 @@ export const updateProductStock = (
 
     const timestampNow = new Date().toISOString();
     const dateStrNow = timestampNow.split('T')[0];
-    const txnId = `TXN-${dateStrNow.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${Math.floor(Math.random() * 1000)}`;
+    const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    const txnId = `TXN-${dateStrNow.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${realId}-${randSuffix}`;
 
     addStockMovement({
+      id: txnId,
       txnId,
       movementId: txnId,
       date: dateStrNow,
@@ -4347,6 +4712,40 @@ export const getCashLogCurrencyBucket = (log: any): string => {
 export const getCashLogSemanticKey = (log: any): string | null => {
   const ref = extractCashLogRef(log).toUpperCase();
   if (!ref) return null;
+  const idStr = String(log?.id || '').toUpperCase();
+  const line = String(log?.line || log?.Line || '').toLowerCase();
+  const cat = String(log?.category || '').toLowerCase();
+  const desc = String(log?.description || log?.Description || '').toLowerCase();
+
+  if (
+    idStr.startsWith('CL-REF-') ||
+    line.includes('refund') ||
+    cat === 'refund' ||
+    desc.includes('cash refund')
+  ) {
+    return `REF::${ref}`;
+  }
+  if (
+    idStr.startsWith('CL-VOID-') ||
+    line.includes('void') ||
+    desc.includes('voided invoice') ||
+    desc.includes('cash reversal')
+  ) {
+    return `VOID::${ref}`;
+  }
+  if (
+    idStr.startsWith('CL-CSH-') ||
+    cat === 'sales cash'
+  ) {
+    return `CSH::${ref}`;
+  }
+  if (
+    idStr.startsWith('CL-CRDEP-') ||
+    cat === 'credit deposit'
+  ) {
+    return `CRDEP::${ref}`;
+  }
+
   const curBucket = getCashLogCurrencyBucket(log);
   const isW = isCashLogWithdrawal(log);
   if (!curBucket && !isW) return null;
@@ -4384,7 +4783,17 @@ export const deduplicateCashLogs = (logs: CashLogEntry[]): CashLogEntry[] => {
   const scoreLog = (l: any): number => {
     let score = 0;
     const idStr = String(l?.id || '');
-    if (idStr.startsWith('CL-WDR-') || idStr.startsWith('CL-SALE-')) score += 100;
+    if (
+      idStr.startsWith('CL-WDR-') ||
+      idStr.startsWith('CL-SALE-') ||
+      idStr.startsWith('CL-REF-') ||
+      idStr.startsWith('CL-VOID-') ||
+      idStr.startsWith('CL-CSH-') ||
+      idStr.startsWith('CL-CRDEP-')
+    ) {
+      score += 100;
+    }
+    if (l?.isRefunded || l?.isVoided || l?.isFlaggedMobileReversal) score += 50;
     if (l?.reference) score += 10;
     if (l?.currency) score += 5;
     if (typeof l?.isWithdrawal === 'boolean') score += 5;
@@ -4408,7 +4817,7 @@ export const deduplicateCashLogs = (logs: CashLogEntry[]): CashLogEntry[] => {
 
     if (idKey && byIdIndex.has(idKey)) {
       const idx = byIdIndex.get(idKey)!;
-      if (scoreLog(item) > scoreLog(result[idx])) {
+      if (scoreLog(item) >= scoreLog(result[idx])) {
         result[idx] = { ...result[idx], ...item, synced: Boolean(result[idx].synced || item.synced) };
       }
       continue;
@@ -4446,7 +4855,7 @@ export const getRawStoredCashLogs = (): CashLogEntry[] => {
   let hasDuplicates = false;
   const numbers = logs
     .map((c) => {
-      const match = c?.id?.match?.(/^CL-(\d+)$/i);
+      const match = c?.id?.match?.(/^CL-(\d+)/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
@@ -4455,7 +4864,7 @@ export const getRawStoredCashLogs = (): CashLogEntry[] => {
   const idSanitized = logs.map((item) => {
     if (!item || !item.id || seenIds.has(item.id)) {
       hasDuplicates = true;
-      const newId = `CL-${String(nextCounter++).padStart(3, '0')}`;
+      const newId = `CL-${String(nextCounter++).padStart(3, '0')}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
       seenIds.add(newId);
       return { ...item, id: newId };
     }
@@ -4509,13 +4918,14 @@ export const getNextCashLogId = (): string => {
     .map((c) => {
       if (!c) return null;
       const rawId = c.id || (c as any).cashLogId || '';
-      const match = String(rawId).match(/^CL-(\d+)$/i);
+      const match = String(rawId).match(/^CL-(\d+)/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
   const max = numbers.length > 0 ? Math.max(...numbers) : 0;
   const next = max + 1;
-  return `CL-${String(next).padStart(3, '0')}`;
+  const uniq = Math.random().toString(36).substring(2, 6).toUpperCase();
+  return `CL-${String(next).padStart(3, '0')}-${uniq}`;
 };
 
 export const addCashLog = (
@@ -4608,9 +5018,10 @@ export const addCashLog = (
     }
   }
 
-  // Only enqueue write to cloud if this action originated locally (not from mesh peer sync)
+  // Only enqueue write to cloud & notify real-time mesh if originated locally
   if (!entry.skipSync && !entry.fromMesh && !options?.fromSync) {
     console.log(`[Row10] Direct enqueue: CashLog ${newEntry.id} (fromSync=${options?.fromSync ?? false})`);
+    notifyCashLogCreated(newEntry);
     enqueueSync('CashLog', 'INSERT', {
       id: newEntry.id,
       company_id: compId,
@@ -4662,7 +5073,11 @@ export const deleteCashLog = (id: string): boolean => {
   return true;
 };
 
-export const updateCashLog = (id: string, updates: Partial<CashLogEntry>): CashLogEntry | null => {
+export const updateCashLog = (
+  id: string,
+  updates: Partial<CashLogEntry>,
+  options?: { skipSync?: boolean; fromMesh?: boolean }
+): CashLogEntry | null => {
   const all = getRawStoredCashLogs();
   const idx = all.findIndex((l) => l.id === id);
   if (idx === -1) return null;
@@ -4673,11 +5088,14 @@ export const updateCashLog = (id: string, updates: Partial<CashLogEntry>): CashL
   };
   all[idx] = updatedEntry;
   setStored(STORAGE_KEYS.CASH_LOGS, all);
-  enqueueSync('CashLog', 'UPDATE', {
-    company_id: updatedEntry.company_id || getCurrentCompanyId(),
-    branch_id: updatedEntry.branch_id || getCurrentBranchId(),
-    ...updatedEntry,
-  });
+  if (!options?.skipSync && !options?.fromMesh) {
+    notifyCashLogUpdated(updatedEntry);
+    enqueueSync('CashLog', 'UPDATE', {
+      company_id: updatedEntry.company_id || getCurrentCompanyId(),
+      branch_id: updatedEntry.branch_id || getCurrentBranchId(),
+      ...updatedEntry,
+    });
+  }
   return updatedEntry;
 };
 
@@ -4698,7 +5116,7 @@ export const getCashCountForStaffAndDate = (staffId: string, date: string): Cash
 
 export const getCashLogsForStaffAndDate = (staffId: string, date: string): CashLogEntry[] => {
   const logs = getCashLogs();
-  return logs.filter((l) => {
+  const filtered = logs.filter((l) => {
     if (l.staffId !== staffId || l.date !== date) return false;
     // Form 1 to Form 4 is strictly for POS register tills and events linked to the POS register
     // Exclude vault custody transfers, safe-to-hq, hq-to-branch, bank transfers, or any non-POS custody movements
@@ -4721,6 +5139,7 @@ export const getCashLogsForStaffAndDate = (staffId: string, date: string): CashL
     }
     return true;
   });
+  return sortChronologicallyAsc(filtered);
 };
 
 const matchesStaffRecord = (
@@ -4818,6 +5237,10 @@ export const saveDailyCashLogSheet = (
         l.category?.includes('Supervisor Pick-Up') ||
         l.id?.startsWith('CL-SALE-') ||
         l.id?.startsWith('CL-WDR-') ||
+        l.id?.startsWith('CL-REF-') ||
+        l.id?.startsWith('CL-VOID-') ||
+        l.id?.startsWith('CL-CSH-') ||
+        l.id?.startsWith('CL-CRDEP-') ||
         l.reference?.startsWith('SALE-') ||
         l.reference?.startsWith('INV-'))
   );
@@ -4865,16 +5288,17 @@ export const saveDailyCashLogSheet = (
   // Find max ID counter once to avoid duplicate IDs in batch insertion
   const numbers = currentLogs
     .map((c) => {
-      const match = c.id?.match?.(/^CL-(\d+)$/i);
+      const match = c.id?.match?.(/^CL-(\d+)/i);
       return match ? parseInt(match[1], 10) : null;
     })
     .filter((n): n is number => n !== null);
   let nextCounter = (numbers.length > 0 ? Math.max(...numbers) : 0) + 1;
+  const batchSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
 
-  // Create new entries for the valid lines with unique sequential IDs
+  // Create new entries for the valid lines with unique sequential + device-safe IDs
   validEntries.forEach((entry, idx) => {
     const newEntry: CashLogEntry = {
-      id: `CL-${String(nextCounter++).padStart(3, '0')}`,
+      id: `CL-${String(nextCounter++).padStart(3, '0')}-${batchSuffix}`,
       timestamp: new Date(now.getTime() + idx * 100).toISOString(),
       date,
       staffId,
@@ -6850,7 +7274,7 @@ export const onSaleCreated = (listener: SaleCreationListener) => {
   };
 };
 
-export type SaleUpdateListener = (sale: SaleInvoice) => void;
+export type SaleUpdateListener = (sale: SaleInvoice, extraCashLogs?: CashLogEntry[]) => void;
 const saleUpdateListeners: Set<SaleUpdateListener> = new Set();
 export const onSaleUpdated = (listener: SaleUpdateListener) => {
   saleUpdateListeners.add(listener);
@@ -6858,12 +7282,46 @@ export const onSaleUpdated = (listener: SaleUpdateListener) => {
     saleUpdateListeners.delete(listener);
   };
 };
-export const notifySaleUpdated = (sale: SaleInvoice) => {
+export const notifySaleUpdated = (sale: SaleInvoice, extraCashLogs?: CashLogEntry[]) => {
   saleUpdateListeners.forEach((fn) => {
     try {
-      fn(sale);
+      fn(sale, extraCashLogs);
     } catch (e) {
       console.error('saleUpdateListener error:', e);
+    }
+  });
+};
+
+export type CashLogListener = (log: CashLogEntry) => void;
+const cashLogCreatedListeners: Set<CashLogListener> = new Set();
+const cashLogUpdatedListeners: Set<CashLogListener> = new Set();
+export const onCashLogCreated = (listener: CashLogListener) => {
+  cashLogCreatedListeners.add(listener);
+  return () => {
+    cashLogCreatedListeners.delete(listener);
+  };
+};
+export const notifyCashLogCreated = (log: CashLogEntry) => {
+  cashLogCreatedListeners.forEach((fn) => {
+    try {
+      fn(log);
+    } catch (e) {
+      console.error('cashLogCreatedListener error:', e);
+    }
+  });
+};
+export const onCashLogUpdated = (listener: CashLogListener) => {
+  cashLogUpdatedListeners.add(listener);
+  return () => {
+    cashLogUpdatedListeners.delete(listener);
+  };
+};
+export const notifyCashLogUpdated = (log: CashLogEntry) => {
+  cashLogUpdatedListeners.forEach((fn) => {
+    try {
+      fn(log);
+    } catch (e) {
+      console.error('cashLogUpdatedListener error:', e);
     }
   });
 };
@@ -6936,6 +7394,24 @@ export const notifyCashAccountChanged = (account: CashAccount) => {
       fn(account);
     } catch (e) {
       console.error('cashAccountChangeListener error:', e);
+    }
+  });
+};
+
+export type CashTransferChangeListener = (transfer: CashTransfer) => void;
+const cashTransferChangeListeners: Set<CashTransferChangeListener> = new Set();
+export const onCashTransferChanged = (listener: CashTransferChangeListener) => {
+  cashTransferChangeListeners.add(listener);
+  return () => {
+    cashTransferChangeListeners.delete(listener);
+  };
+};
+export const notifyCashTransferChanged = (transfer: CashTransfer) => {
+  cashTransferChangeListeners.forEach((fn) => {
+    try {
+      fn(transfer);
+    } catch (e) {
+      console.error('cashTransferChangeListener error:', e);
     }
   });
 };
@@ -7371,43 +7847,92 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
         });
       }
 
-      // If cash sale, deduct from Cashier Drawer balance & Form 2 so cash balances across all tablets!
-      if (sale.paymentMethod === 'Cash') {
-        const targetStaffId = sale.staffId || '001';
-        const targetStaffName = sale.staffName || 'Cashier';
-        const refundDate = (sale.refundedAt || new Date().toISOString()).split('T')[0];
+      const targetStaffId = sale.staffId || '001';
+      const targetStaffName = sale.staffName || 'Cashier';
+      const refundDate = toDateStringSafe(sale.refundedAt) || sale.date || getTodayDateString();
+      const refundTs = sale.refundedAt || new Date().toISOString();
+      const peerCurKind = getMobileMoneySaleKind(sale);
 
-        addCashLog({
-          timestamp: sale.refundedAt || new Date().toISOString(),
-          date: refundDate,
-          staffId: targetStaffId,
-          staffName: targetStaffName,
-          line: 'Refunds / Returns',
-          description: `Peer Mesh Cash refund for Invoice #${sale.id} (${sale.refundReason || 'Refund'}) - Auth by ${sale.refundApprovedBy || 'Manager'}`,
-          in: 0,
-          out: sale.total,
-          category: 'Refund',
-          reference: sale.id,
-          company_id: sale.company_id || sale.companyId,
-          branch_id: sale.branch_id || sale.branchId,
-          fromMesh: true,
-          skipSync: true,
+      if (peerCurKind) {
+        // Reject non-cash electronic sale movement & neutralize CL-SALE-* exemption
+        getAllMovements().forEach((m) => {
+          if (m.sourceRef === sale.id && (m.type === 'ecocash_sale' || m.type === 'zig_sale') && m.status !== 'rejected') {
+            updateMovement(m.id, {
+              status: 'rejected',
+              affectsDrawer: false,
+              notes: `${m.notes || ''} [Peer Refunded: ${sale.refundReason || ''}]`.trim(),
+            });
+          }
         });
+        getRawStoredCashLogs().forEach((l) => {
+          const isSaleExempt =
+            (l.id === `CL-SALE-${sale.id}` ||
+              (extractCashLogRef(l) === sale.id &&
+                !isCashLogWithdrawal(l) &&
+                getCashLogCurrencyBucket(l) !== '')) &&
+            !l.id?.startsWith('CL-REF-') &&
+            !l.id?.startsWith('CL-VOID-');
+          if (isSaleExempt && !(l as any).isRefunded) {
+            updateCashLog(
+              l.id,
+              {
+                out: 0,
+                in: 0,
+                isRefunded: true,
+                description: `[REFUNDED] ${l.description || ''}`.trim(),
+                notes: `${l.notes ? l.notes + ' | ' : ''}Peer refund reversed electronic goods sale.`,
+              } as any,
+              { skipSync: true, fromMesh: true }
+            );
+          }
+        });
+      }
+
+      const refundCashAmt =
+        sale.paymentMethod === 'Cash'
+          ? Math.max(0, (Number(sale.total) || 0) - (Number(sale.customerCreditUsed) || 0))
+          : peerCurKind
+          ? Math.max(0, Number(sale.total) || 0)
+          : sale.paymentMethod === 'Credit'
+          ? Math.max(0, Number(sale.creditDeposit) || 0)
+          : 0;
+
+      if (refundCashAmt > 0) {
+        addCashLog(
+          {
+            id: `CL-REF-${sale.id}`,
+            timestamp: refundTs,
+            date: refundDate,
+            staffId: targetStaffId,
+            staffName: targetStaffName,
+            line: 'Refunds / Returns',
+            description: `Peer Mesh Cash refund for ${peerCurKind || sale.paymentMethod || 'Cash'} Invoice #${sale.id} (${sale.refundReason || 'Refund'}) - Auth by ${sale.refundApprovedBy || 'Manager'}`,
+            in: 0,
+            out: refundCashAmt,
+            category: 'Refund',
+            reference: sale.id,
+            company_id: sale.company_id || sale.companyId,
+            branch_id: sale.branch_id || sale.branchId,
+            fromMesh: true,
+            skipSync: true,
+          },
+          { fromSync: true }
+        );
 
         addMovement({
-          shiftId: getShiftId(targetStaffId, refundDate),
+          shiftId: getShiftId(targetStaffId, refundDate, sale.branch_id || sale.branchId),
           staffId: targetStaffId,
           date: refundDate,
-          timestamp: sale.refundedAt || new Date().toISOString(),
+          timestamp: refundTs,
           type: 'refund',
-          amount: sale.total,
-          currency: sale.currency || 'USD',
+          amount: refundCashAmt,
+          currency: 'USD',
           direction: 'out',
           affectsDrawer: true,
           status: 'approved',
           sourceModule: 'POS',
           sourceRef: sale.id,
-          notes: `Peer Mesh Cash refund #${sale.id} ($${sale.total.toFixed(2)}) auth by ${sale.refundApprovedBy || 'Manager'}`,
+          notes: `Peer Mesh Cash refund #${sale.id} ($${refundCashAmt.toFixed(2)}) auth by ${sale.refundApprovedBy || 'Manager'}`,
           approvedBy: sale.refundApprovedById,
           approvedByName: sale.refundApprovedBy,
           company_id: sale.company_id || sale.companyId,
@@ -7435,23 +7960,97 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
           }
         });
       }
-      if (sale.paymentMethod === 'Cash') {
-        const targetStaffId = sale.staffId || '001';
-        const targetStaffName = sale.staffName || 'Cashier';
-        const voidDate = (sale.voidedAt || new Date().toISOString()).split('T')[0];
-        addCashLog({
-          timestamp: sale.voidedAt || new Date().toISOString(),
-          date: voidDate,
+
+      const targetStaffId = sale.staffId || '001';
+      const targetStaffName = sale.staffName || 'Cashier';
+      const voidDate = toDateStringSafe(sale.voidedAt) || sale.date || getTodayDateString();
+      const voidTs = sale.voidedAt || new Date().toISOString();
+      const peerCurKind = getMobileMoneySaleKind(sale);
+
+      if (peerCurKind) {
+        getAllMovements().forEach((m) => {
+          if (m.sourceRef === sale.id && (m.type === 'ecocash_sale' || m.type === 'zig_sale') && m.status !== 'rejected') {
+            updateMovement(m.id, {
+              status: 'rejected',
+              affectsDrawer: false,
+              notes: `${m.notes || ''} [Peer Voided: ${sale.voidReason || ''}]`.trim(),
+            });
+          }
+        });
+        getRawStoredCashLogs().forEach((l) => {
+          const isSaleExempt =
+            (l.id === `CL-SALE-${sale.id}` ||
+              (extractCashLogRef(l) === sale.id &&
+                !isCashLogWithdrawal(l) &&
+                getCashLogCurrencyBucket(l) !== '')) &&
+            !l.id?.startsWith('CL-REF-') &&
+            !l.id?.startsWith('CL-VOID-');
+          if (isSaleExempt && !(l as any).isVoided && !(l as any).isRefunded) {
+            updateCashLog(
+              l.id,
+              {
+                out: 0,
+                in: 0,
+                isVoided: true,
+                description: `[VOIDED] ${l.description || ''}`.trim(),
+                notes: `${l.notes ? l.notes + ' | ' : ''}Peer void reversed electronic goods sale.`,
+              } as any,
+              { skipSync: true, fromMesh: true }
+            );
+          }
+        });
+      }
+
+      const voidCashAmt =
+        sale.paymentMethod === 'Cash'
+          ? Math.max(0, (Number(sale.total) || 0) - (Number(sale.customerCreditUsed) || 0))
+          : peerCurKind
+          ? Math.max(0, Number(sale.total) || 0)
+          : sale.paymentMethod === 'Credit'
+          ? Math.max(0, Number(sale.creditDeposit) || 0)
+          : 0;
+
+      if (voidCashAmt > 0) {
+        addCashLog(
+          {
+            id: `CL-VOID-${sale.id}`,
+            timestamp: voidTs,
+            date: voidDate,
+            staffId: targetStaffId,
+            staffName: targetStaffName,
+            line: 'Voids / Reversals',
+            description: `Peer Mesh Cash reversal for Voided ${peerCurKind || sale.paymentMethod || 'Cash'} Invoice #${sale.id} (${sale.voidReason || 'Voided'})`,
+            in: 0,
+            out: voidCashAmt,
+            category: 'Refund',
+            reference: sale.id,
+            company_id: sale.company_id || sale.companyId,
+            branch_id: sale.branch_id || sale.branchId,
+            fromMesh: true,
+            skipSync: true,
+          },
+          { fromSync: true }
+        );
+
+        addMovement({
+          shiftId: getShiftId(targetStaffId, voidDate, sale.branch_id || sale.branchId),
           staffId: targetStaffId,
-          staffName: targetStaffName,
-          line: 'Voids / Reversals',
-          description: `Peer Mesh Cash reversal for Voided Invoice #${sale.id} (${sale.voidReason || 'Voided'})`,
-          in: 0,
-          out: sale.total,
-          category: 'Refund',
-          reference: sale.id,
+          date: voidDate,
+          timestamp: voidTs,
+          type: 'refund',
+          amount: voidCashAmt,
+          currency: 'USD',
+          direction: 'out',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'POS',
+          sourceRef: sale.id,
+          notes: `Peer Mesh Void reversal #${sale.id} ($${voidCashAmt.toFixed(2)}) auth by ${sale.voidApprovedBy || 'Manager'}`,
+          approvedBy: sale.voidApprovedById,
+          approvedByName: sale.voidApprovedBy,
+          company_id: sale.company_id || sale.companyId,
+          branch_id: sale.branch_id || sale.branchId,
           fromMesh: true,
-          skipSync: true,
         });
       }
     }
@@ -7567,25 +8166,53 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     ensureCustomerExists(normalized.customerName, normalized.staffId);
   }
 
-  // Cash log entry
+  // Cash log entry & cash_sale movement
   if (normalized.paymentMethod === 'Cash') {
     const actualCash = Math.max(0, normalized.total - (normalized.customerCreditUsed || 0));
-    addCashLog({
-      timestamp: normalized.timestamp,
-      date: normalized.date,
-      staffId: normalized.staffId,
-      staffName: normalized.staffName,
-      line: 'Sales',
-      description: `Mesh Sale #${normalized.id} - ${normalized.customerName} (${normalized.itemsSummary})`,
-      in: actualCash,
-      out: 0,
-      category: 'Sales Cash',
-      reference: normalized.id,
-      company_id: normalized.company_id,
-      branch_id: normalized.branch_id,
-      fromMesh: true,
-      skipSync: true,
-    });
+    addCashLog(
+      {
+        id: `CL-CSH-${normalized.id}`,
+        timestamp: normalized.timestamp,
+        date: normalized.date,
+        staffId: normalized.staffId,
+        staffName: normalized.staffName,
+        line: 'Sales',
+        description: `Mesh Sale #${normalized.id} - ${normalized.customerName} (${normalized.itemsSummary})`,
+        in: actualCash,
+        out: 0,
+        category: 'Sales Cash',
+        reference: normalized.id,
+        company_id: normalized.company_id,
+        branch_id: normalized.branch_id,
+        fromMesh: true,
+        skipSync: true,
+      },
+      { fromSync: true }
+    );
+
+    const hasCashSaleMov = getAllMovements().some(
+      (m) => m.type === 'cash_sale' && m.sourceRef === normalized.id
+    );
+    if (!hasCashSaleMov) {
+      addMovement({
+        shiftId: getShiftId(normalized.staffId, normalized.date, normalized.branch_id),
+        staffId: normalized.staffId,
+        date: normalized.date,
+        timestamp: normalized.timestamp,
+        type: 'cash_sale',
+        amount: actualCash,
+        currency: 'USD',
+        direction: 'in',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'POS',
+        sourceRef: normalized.id,
+        notes: `Mesh POS Cash sale #${normalized.id} - ${normalized.customerName}`,
+        company_id: normalized.company_id,
+        branch_id: normalized.branch_id,
+        fromMesh: true,
+      });
+    }
   }
 
   // Non-cash electronic sale (ZiG / EcoCash) ledger synchronization for mesh peer terminals
@@ -8080,6 +8707,7 @@ export const addSale = (
     // Actual cash received is total minus any applied store credit
     const actualCashCollected = Math.max(0, created.total - (created.customerCreditUsed || 0));
     addCashLog({
+      id: `CL-CSH-${created.id}`,
       timestamp: created.timestamp,
       date: created.date,
       staffId: created.staffId,
@@ -8215,6 +8843,7 @@ export const addSale = (
     // If partial deposit paid in cash, record the deposit into CashLog (Form 2) and cashMovements
     if (deposit > 0) {
       addCashLog({
+        id: `CL-CRDEP-${created.id}`,
         timestamp: created.timestamp,
         date: created.date,
         staffId: created.staffId,
@@ -8567,42 +9196,96 @@ export const refundSaleInvoice = (params: {
     });
   }
 
-  // If cash sale, add Cash Log (Form 2) payout entry & cash movement for CASHIER's drawer balance
-  if (invoice.paymentMethod === 'Cash') {
-    const targetCashierId = params.cashier?.id || invoice.staffId || params.manager.id;
-    const targetCashierName = params.cashier?.name || invoice.staffName || params.manager.name;
-    const shiftDate = now.toISOString().split('T')[0];
+  const targetCashierId = params.cashier?.id || invoice.staffId || params.manager.id;
+  const targetCashierName = params.cashier?.name || invoice.staffName || params.manager.name;
+  const shiftDate = toDateStringSafe(now.toISOString()) || getTodayDateString();
+  const curKind = getMobileMoneySaleKind(invoice);
+  const extraCashLogs: CashLogEntry[] = [];
 
-    addCashLog({
+  if (curKind) {
+    // Reject electronic non-cash goods movement so refunded invoice never leaks into Non-Cash sales
+    getAllMovements().forEach((m) => {
+      if (
+        m.sourceRef === invoice.id &&
+        (m.type === 'ecocash_sale' || m.type === 'zig_sale') &&
+        m.status !== 'rejected'
+      ) {
+        updateMovement(m.id, {
+          status: 'rejected',
+          affectsDrawer: false,
+          notes: `${m.notes || ''} [Refunded: ${params.reason}]`.trim(),
+        });
+      }
+    });
+    // Neutralize CL-SALE-* Form 2 deduction so Section 5 & Form 2 Net do not miscount electronic goods
+    getRawStoredCashLogs().forEach((l) => {
+      const isSaleExempt =
+        (l.id === `CL-SALE-${invoice.id}` ||
+          (extractCashLogRef(l) === invoice.id &&
+            !isCashLogWithdrawal(l) &&
+            getCashLogCurrencyBucket(l) !== '')) &&
+        !l.id?.startsWith('CL-REF-') &&
+        !l.id?.startsWith('CL-VOID-');
+      if (isSaleExempt && !(l as any).isRefunded) {
+        const updatedSaleLog = updateCashLog(
+          l.id,
+          {
+            out: 0,
+            in: 0,
+            isRefunded: true,
+            description: `[REFUNDED] ${l.description || ''}`.trim(),
+            notes: `${l.notes ? l.notes + ' | ' : ''}Refunded ${curKind} Invoice #${invoice.id}: reversed electronic goods deduction.`,
+          } as any,
+          { skipSync: true }
+        );
+        if (updatedSaleLog) extraCashLogs.push(updatedSaleLog);
+      }
+    });
+  }
+
+  // Explicitly log the physical cash return under Form 2 Cash Logs (Refunds / Returns) & CashDrawer
+  const refundCashAmount =
+    invoice.paymentMethod === 'Cash'
+      ? Math.max(0, (Number(invoice.total) || 0) - (Number(invoice.customerCreditUsed) || 0))
+      : curKind
+      ? Math.max(0, Number(invoice.total) || 0)
+      : invoice.paymentMethod === 'Credit'
+      ? Math.max(0, Number(invoice.creditDeposit) || 0)
+      : 0;
+
+  if (refundCashAmount > 0) {
+    const refLog = addCashLog({
+      id: `CL-REF-${invoice.id}`,
       timestamp: now.toISOString(),
       date: shiftDate,
       staffId: targetCashierId,
       staffName: targetCashierName,
       line: 'Refunds / Returns',
-      description: `Cash refund for Invoice #${invoice.id} (${params.reason}) - Auth by ${params.manager.name}`,
+      description: `Cash refund for ${curKind || invoice.paymentMethod || 'Cash'} Invoice #${invoice.id} (${params.reason}) - Auth by ${params.manager.name}`,
       in: 0,
-      out: invoice.total,
+      out: refundCashAmount,
       category: 'Refund',
       reference: invoice.id,
       company_id: invoice.company_id || invoice.companyId,
       branch_id: invoice.branch_id || invoice.branchId,
+      skipSync: true,
     });
+    extraCashLogs.push(refLog);
 
-    // Write cash deduction movement to the CASHIER's drawer so the cashier's drawer balances correctly
     addMovement({
-      shiftId: getShiftId(targetCashierId, shiftDate),
+      shiftId: getShiftId(targetCashierId, shiftDate, invoice.branch_id || invoice.branchId),
       staffId: targetCashierId,
       date: shiftDate,
       timestamp: now.toISOString(),
       type: 'refund',
-      amount: invoice.total,
-      currency: invoice.currency || 'USD',
+      amount: refundCashAmount,
+      currency: 'USD',
       direction: 'out',
       affectsDrawer: true,
       status: 'approved',
       sourceModule: 'POS',
       sourceRef: invoice.id,
-      notes: `Cash refund #${invoice.id} ($${invoice.total.toFixed(2)}) auth by ${params.manager.name} (${params.reason})`,
+      notes: `Cash refund #${invoice.id} ($${refundCashAmount.toFixed(2)}) auth by ${params.manager.name} (${params.reason})`,
       approvedBy: params.manager.id,
       approvedByName: params.manager.name,
       company_id: invoice.company_id || invoice.companyId,
@@ -8624,7 +9307,7 @@ export const refundSaleInvoice = (params: {
     },
   });
 
-  notifySaleUpdated(invoice);
+  notifySaleUpdated(invoice, extraCashLogs);
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: invoice }));
@@ -8647,6 +9330,9 @@ export const voidSaleInvoice = (params: {
   if (!invoice) {
     return { success: false, message: `Invoice #${params.invoiceId} not found.` };
   }
+  if (invoice.status === 'Voided') {
+    return { success: false, message: `Invoice #${params.invoiceId} is already voided.` };
+  }
 
   const now = new Date();
   invoice.status = 'Voided';
@@ -8657,19 +9343,97 @@ export const voidSaleInvoice = (params: {
 
   setStored(STORAGE_KEYS.SALES, allSales);
 
-  // If cash sale, add Cash Log (Form 2) reversal entry
-  if (invoice.paymentMethod === 'Cash') {
-    addCashLog({
+  const targetCashierId = params.cashier?.id || invoice.staffId || params.manager.id;
+  const targetCashierName = params.cashier?.name || invoice.staffName || params.manager.name;
+  const shiftDate = toDateStringSafe(now.toISOString()) || getTodayDateString();
+  const curKind = getMobileMoneySaleKind(invoice);
+  const extraCashLogs: CashLogEntry[] = [];
+
+  if (curKind) {
+    getAllMovements().forEach((m) => {
+      if (
+        m.sourceRef === invoice.id &&
+        (m.type === 'ecocash_sale' || m.type === 'zig_sale') &&
+        m.status !== 'rejected'
+      ) {
+        updateMovement(m.id, {
+          status: 'rejected',
+          affectsDrawer: false,
+          notes: `${m.notes || ''} [Voided: ${params.reason}]`.trim(),
+        });
+      }
+    });
+    getRawStoredCashLogs().forEach((l) => {
+      const isSaleExempt =
+        (l.id === `CL-SALE-${invoice.id}` ||
+          (extractCashLogRef(l) === invoice.id &&
+            !isCashLogWithdrawal(l) &&
+            getCashLogCurrencyBucket(l) !== '')) &&
+        !l.id?.startsWith('CL-REF-') &&
+        !l.id?.startsWith('CL-VOID-');
+      if (isSaleExempt && !(l as any).isVoided && !(l as any).isRefunded) {
+        const updatedSaleLog = updateCashLog(
+          l.id,
+          {
+            out: 0,
+            in: 0,
+            isVoided: true,
+            description: `[VOIDED] ${l.description || ''}`.trim(),
+            notes: `${l.notes ? l.notes + ' | ' : ''}Voided ${curKind} Invoice #${invoice.id}: reversed electronic goods deduction.`,
+          } as any,
+          { skipSync: true }
+        );
+        if (updatedSaleLog) extraCashLogs.push(updatedSaleLog);
+      }
+    });
+  }
+
+  const voidCashAmount =
+    invoice.paymentMethod === 'Cash'
+      ? Math.max(0, (Number(invoice.total) || 0) - (Number(invoice.customerCreditUsed) || 0))
+      : curKind
+      ? Math.max(0, Number(invoice.total) || 0)
+      : invoice.paymentMethod === 'Credit'
+      ? Math.max(0, Number(invoice.creditDeposit) || 0)
+      : 0;
+
+  if (voidCashAmount > 0) {
+    const voidLog = addCashLog({
+      id: `CL-VOID-${invoice.id}`,
       timestamp: now.toISOString(),
-      date: now.toISOString().split('T')[0],
-      staffId: params.manager.id,
-      staffName: params.manager.name,
+      date: shiftDate,
+      staffId: targetCashierId,
+      staffName: targetCashierName,
       line: 'Voids / Reversals',
-      description: `Cash reversal for Voided Invoice #${invoice.id} (${params.reason})`,
+      description: `Cash reversal for Voided ${curKind || invoice.paymentMethod || 'Cash'} Invoice #${invoice.id} (${params.reason})`,
       in: 0,
-      out: invoice.total,
+      out: voidCashAmount,
       category: 'Refund',
       reference: invoice.id,
+      company_id: invoice.company_id || invoice.companyId,
+      branch_id: invoice.branch_id || invoice.branchId,
+      skipSync: true,
+    });
+    extraCashLogs.push(voidLog);
+
+    addMovement({
+      shiftId: getShiftId(targetCashierId, shiftDate, invoice.branch_id || invoice.branchId),
+      staffId: targetCashierId,
+      date: shiftDate,
+      timestamp: now.toISOString(),
+      type: 'refund',
+      amount: voidCashAmount,
+      currency: 'USD',
+      direction: 'out',
+      affectsDrawer: true,
+      status: 'approved',
+      sourceModule: 'POS',
+      sourceRef: invoice.id,
+      notes: `Void reversal #${invoice.id} ($${voidCashAmount.toFixed(2)}) auth by ${params.manager.name} (${params.reason})`,
+      approvedBy: params.manager.id,
+      approvedByName: params.manager.name,
+      company_id: invoice.company_id || invoice.companyId,
+      branch_id: invoice.branch_id || invoice.branchId,
     });
   }
 
@@ -8698,11 +9462,12 @@ export const voidSaleInvoice = (params: {
     details: `Invoice #${invoice.id} ($${invoice.total.toFixed(2)}) voided by ${params.manager.role} ${params.manager.name}. Reason: ${params.reason}`,
   });
 
-  notifySaleUpdated(invoice);
+  notifySaleUpdated(invoice, extraCashLogs);
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_sales_updated', { detail: invoice }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
   }
 
@@ -9903,14 +10668,19 @@ export const saveAllAdminSalesEntries = (
   return newDateEntries;
 };
 
-export const getSalesForStaffAndDate = (staffId: string, date: string, staffName?: string): SaleInvoice[] => {
+export const getAllSalesForStaffAndDate = (
+  staffId: string,
+  date: string,
+  staffName?: string,
+  includeReversed: boolean = false
+): SaleInvoice[] => {
   const currentCompany = getCurrentCompanyId();
   const allSales = getAllSales();
   const targetStaffId = String(staffId || '').trim().toLowerCase();
   const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
   const targetName = staffName ? staffName.trim().toLowerCase() : '';
 
-  return allSales.filter((s) => {
+  const filtered = allSales.filter((s) => {
     const compId = (s.company_id || s.companyId || '').trim();
     const matchesComp =
       !compId ||
@@ -9932,11 +10702,17 @@ export const getSalesForStaffAndDate = (staffId: string, date: string, staffName
       (targetName && saleStaffName === targetName) ||
       (saleStaffName && targetStaffId && saleStaffName.toLowerCase().includes(targetStaffId));
 
-    // Support both direct date match and local timestamp date match
     const isSameDate = isSameDaySafe(s.date, s.timestamp, date);
-    const isValidStatus = s.status !== 'Refunded' && s.status !== 'Voided';
-    return isSameStaff && isSameDate && isValidStatus;
+    if (!isSameStaff || !isSameDate) return false;
+    if (!includeReversed && (s.status === 'Refunded' || s.status === 'Voided')) return false;
+    return true;
   });
+
+  return sortChronologicallyAsc(filtered);
+};
+
+export const getSalesForStaffAndDate = (staffId: string, date: string, staffName?: string): SaleInvoice[] => {
+  return getAllSalesForStaffAndDate(staffId, date, staffName, false);
 };
 
 export const getTotalSalesForStaffAndDate = (staffId: string, date: string): number => {
@@ -9945,14 +10721,14 @@ export const getTotalSalesForStaffAndDate = (staffId: string, date: string): num
 };
 
 /**
- * Calculates the exact cash position, net sums, should have, and variance for a salesperson on a given date.
- * Formulas:/**
  * ==================== FORM 4: SALESPERSON CASH BALANCING ====================
- * Expected Cash Formula (Core User Balancing Formula):
- * expectedCash = float + cashSales + creditPayments - expenses - directProcurements - cashLift - customerChange - deductions - ecocashWithdrawal - zigWithdrawal
- * 
- * Non-Cash Sales:
- * totalNonCashSales = ecocashSales + zigSales (Reporting only, NOT for expected cash)
+ * Single unified, deterministic calculation used identically on Origin, Peer, Local Hub,
+ * and Cloud-Only devices. All T1 arrays are sorted chronologically ascending prior to loops.
+ *
+ * Refund Accounting Rule:
+ * - Refunded/Voided sales are deducted from Total Sales (active sales only).
+ * - Refunded sales are NOT deducted from Cash Sales; the cash return is explicitly
+ *   accounted under Form 2 Cash Logs (`Refunds / Returns`, category `'Refund'`).
  */
 export const calculateForm4 = (
   staffId: string,
@@ -9965,9 +10741,14 @@ export const calculateForm4 = (
   const shiftId = getShiftId(staffId, date, currentBranch);
   const breakdown = getShiftLedgerBreakdown(shiftId);
 
-  // Non-cash sales (for reporting only, not in expected cash)
-  const staffSales = getSalesForStaffAndDate(staffId, date, staffName);
+  // 0. Sort ALL T1 records chronologically ascending (timestamp asc, ID tie-breaker) BEFORE any math!
+  const allStaffSalesSorted = getAllSalesForStaffAndDate(staffId, date, staffName, true);
+  const staffSales = allStaffSalesSorted.filter((s) => s.status !== 'Refunded' && s.status !== 'Voided');
   const systemSalesTotal = staffSales.reduce((sum, s) => sum + (s.total || 0), 0);
+
+  const form2Logs = sortChronologicallyAsc(deduplicateCashLogs(getCashLogsForStaffAndDate(staffId, date)));
+  const form3Changes = sortChronologicallyAsc(getCustomerChangesForStaffAndDate(staffId, date, staffName));
+  const form3Credits = sortChronologicallyAsc(getCreditSalesForStaffAndDate(staffId, date, staffName));
 
   const getMobileSaleGoodsAdjustment = (s: SaleInvoice): { isFlaggedShortage: boolean; goodsShortfallUsd: number; wdrReductionUsd: number } => {
     if (s.mobileVerificationStatus === 'FLAGGED' && s.mobileDisputeResolution === 'CHARGED_TO_CASHIER_SHORTAGE') {
@@ -9991,6 +10772,7 @@ export const calculateForm4 = (
     return { isFlaggedShortage: false, goodsShortfallUsd: 0, wdrReductionUsd: 0 };
   };
 
+  // Active Non-Cash Sales (excludes Refunded & Voided!)
   const ecocashSales = staffSales
     .filter(
       (s) =>
@@ -10009,6 +10791,7 @@ export const calculateForm4 = (
       if (adj.isFlaggedShortage) return sum;
       return sum + Math.max(0, (s.total || 0) - adj.goodsShortfallUsd);
     }, 0);
+
   const zigSales = staffSales
     .filter(
       (s) =>
@@ -10025,14 +10808,7 @@ export const calculateForm4 = (
       return sum + Math.max(0, (s.total || 0) - adj.goodsShortfallUsd);
     }, 0);
 
-  const effectiveEcoSales = Math.max(ecocashSales, breakdown.ecocashSales || 0);
-  const effectiveZigSales = Math.max(zigSales, breakdown.zigSales || 0);
-
-  // Form 2 & 3 logs for this shift (normalized staff + business date matching)
-  const form2Logs = getCashLogsForStaffAndDate(staffId, date);
-  const form3Changes = getCustomerChangesForStaffAndDate(staffId, date, staffName);
-  const form3Credits = getCreditSalesForStaffAndDate(staffId, date, staffName);
-
+  // Form 3 Change & Credit
   const isRepaymentCreditEntry = (c: CreditSaleEntry): boolean => {
     const desc = (c.itemDescription || '').toLowerCase();
     return (
@@ -10062,7 +10838,6 @@ export const calculateForm4 = (
     })
     .reduce((sum, c) => sum + Math.max(0, (Number(c.out) || Number(c.amount) || 0) - (Number(c.in) || 0)), 0);
 
-  // Credit extended from customerLedger + Form 3 Goods Credit (excluding cash-disbursed cash loans)
   const cashCreditRecordIds = new Set(
     form3Credits
       .filter((c) => {
@@ -10072,237 +10847,21 @@ export const calculateForm4 = (
       })
       .map((c) => c.id)
   );
-  const staffCustomerLedger = getCustomerLedgerEntries(
-    (entry) =>
-      matchesStaffRecord(entry.staffId, entry.staffName, staffId, staffName) &&
-      matchesBusinessDate(entry.date, entry.timestamp, date)
+  const staffCustomerLedger = sortChronologicallyAsc(
+    getCustomerLedgerEntries(
+      (entry) =>
+        matchesStaffRecord(entry.staffId, entry.staffName, staffId, staffName) &&
+        matchesBusinessDate(entry.date, entry.timestamp, date)
+    )
   );
   const ledgerGoodsCreditExtended = staffCustomerLedger
     .filter((e) => e.type === 'credit_extended' && (!e.sourceRef || !cashCreditRecordIds.has(e.sourceRef)))
     .reduce((sum, e) => sum + (e.amount || 0), 0);
   const creditExtended = Math.max(ledgerGoodsCreditExtended, form3GoodsCreditOut);
 
-  const totalNonCashSales = effectiveEcoSales + effectiveZigSales + creditExtended;
+  const totalNonCashSales = ecocashSales + zigSales + creditExtended;
 
-  const savedAdminSale = getAdminSaleForStaffAndDate(staffId, date);
-  let totalSales = systemSalesTotal;
-  let isOverridden = false;
-
-  // If cashMovements exist for this shift, use breakdown as the canonical source
-  // (reconciled with Form 3 Change/Credit entries so manual/synced report actions are never dropped)
-  if (breakdown.movementsCount > 0) {
-    let float = breakdown.openingFloat;
-    let refunds = breakdown.refunds || 0;
-    let netCashSales = Math.max(0, (breakdown.cashSales || 0) - refunds);
-    let cashSales = netCashSales;
-    let creditPayments = Math.max(breakdown.creditPayments || 0, form3CreditIn);
-    let changeReceived = Math.max(breakdown.changeReceived || 0, form3DrawerChangeIn);
-    
-    // Merge expenses from cashMovements, Form 2 logs, and approved Cash till expenses
-    const utilitiesLogs = form2Logs.filter(
-      (l) =>
-        (l.out || 0) > 0 &&
-        (l.line === 'Expenses' ||
-          l.category === 'Expenses' ||
-          l.line === 'Daily Store Expenses' ||
-          l.category === 'Daily Store Expenses' ||
-          (l as any).categoryGroup === 'Daily Store Expenses' ||
-          l.description?.toLowerCase().includes('expense') ||
-          l.line?.toLowerCase().includes('expense') ||
-          l.category?.toLowerCase().includes('expense') ||
-          l.description?.toLowerCase().includes('petty') ||
-          l.line?.toLowerCase().includes('petty') ||
-          l.category?.toLowerCase().includes('petty') ||
-          l.line === 'Bread' ||
-          l.line === 'Airtime' ||
-          l.line === 'Home Use' ||
-          l.line === 'Daily Utilities & Home' ||
-          l.category === 'Daily Utilities & Home' ||
-          (l as any).categoryGroup === 'Daily Utilities & Home' ||
-          l.description?.toLowerCase().includes('bread') ||
-          l.description?.toLowerCase().includes('airtime') ||
-          l.description?.toLowerCase().includes('home use') ||
-          l.description?.toLowerCase().includes('utilities'))
-    );
-    const expensesFromLogs = utilitiesLogs.reduce((sum, l) => sum + (l.out || 0), 0);
-
-    const dbExpenses = getExpensesForStaffAndDate(staffId, date).filter(
-      (e) =>
-        !e.isDeleted &&
-        e.status !== 'rejected' &&
-        (e.paymentMethod === 'Cash' || !e.paymentMethod) &&
-        e.category !== 'Direct Supplier Delivery Payout' &&
-        !e.description?.toLowerCase().includes('direct delivery voucher')
-    );
-    const dbExpensesNotLogged = dbExpenses
-      .filter(
-        (e) =>
-          !utilitiesLogs.some(
-            (l) =>
-              (l.reference && l.reference === e.id) ||
-              (e.description && l.description?.toLowerCase().includes(e.description.toLowerCase()))
-          )
-      )
-      .reduce((sum, e) => sum + (e.amount || 0), 0);
-
-    const totalTillExpenses = Math.max(
-      (breakdown.expenses || 0) + (breakdown.pettyCash || 0),
-      expensesFromLogs + dbExpensesNotLogged
-    );
-    let expenses = totalTillExpenses;
-
-    // Direct Procurements: combine staff split payments on active Direct GRVs + non-GRV Form 2 Direct Procurement logs
-    const staffGrvPayments = getDirectGrvPaymentsForStaff(staffId, date, false, staffName);
-    const grvPayoutTotal = staffGrvPayments.reduce((sum, item) => sum + (Number(item.payment.amount) || 0), 0);
-    const knownGrvRefsForDate = new Set<string>();
-    getDirectGrvs().forEach((g) => {
-      const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
-      if (gDate === date) {
-        if (g.id) knownGrvRefsForDate.add(g.id);
-        if (g.grvNumber) knownGrvRefsForDate.add(g.grvNumber);
-      }
-    });
-    const nonGrvProcLogs = form2Logs.filter(
-      (l) =>
-        (l.out || 0) > 0 &&
-        (l.line === 'Direct Procurement' ||
-          l.category === 'Direct Procurement' ||
-          (l as any).categoryGroup === 'Direct Procurement' ||
-          l.description?.toLowerCase().includes('direct procurement') ||
-          l.description?.toLowerCase().includes('procurement')) &&
-        !l.reference?.match(/^(D?GRV)-/i) &&
-        !l.description?.includes('(GRV:') &&
-        !Array.from(knownGrvRefsForDate).some(
-          (ref) =>
-            (l.reference && (l.reference === ref || l.reference.startsWith(`${ref}-`))) ||
-            (l.description && l.description.includes(ref))
-        )
-    );
-    const nonGrvProcTotal = nonGrvProcLogs.reduce((sum, l) => sum + (Number(l.out) || 0), 0);
-    let directProcurements = Math.max(breakdown.directProcurements || 0, grvPayoutTotal + nonGrvProcTotal);
-    let cashLift = breakdown.cashLift;
-    let customerChange = Math.max(breakdown.changePaid || 0, form3ChangeOut);
-    let creditCashOut = Math.max(breakdown.creditCashOut || 0, form3CashCreditOut);
-    let deductions = 0; // All till expenses & petty cash are captured in expenses
-    let ecocashWithdrawal = breakdown.ecocashCashOut;
-    let zigWithdrawal = breakdown.zigCashOut;
-
-    if (overrideSales !== undefined) {
-      totalSales = overrideSales;
-      isOverridden = Math.abs(overrideSales - systemSalesTotal) > 0.001;
-      cashSales = Math.max(0, overrideSales - (effectiveEcoSales + effectiveZigSales));
-    } else if (savedAdminSale && savedAdminSale.notes?.includes('Manual Override')) {
-      totalSales = savedAdminSale.salesAmount;
-      isOverridden = true;
-      cashSales = Math.max(0, savedAdminSale.salesAmount - (effectiveEcoSales + effectiveZigSales));
-    } else {
-      totalSales = Math.max(systemSalesTotal, cashSales + effectiveEcoSales + effectiveZigSales + creditExtended);
-    }
-
-    const cashInTotal = Math.round((float + cashSales + creditPayments + changeReceived) * 100) / 100;
-    const cashOutTotal = Math.round(
-      (expenses + directProcurements + cashLift + customerChange + creditCashOut + deductions + ecocashWithdrawal + zigWithdrawal) * 100
-    ) / 100;
-    const expectedCash = Math.round((cashInTotal - cashOutTotal) * 100) / 100;
-    const shouldHave = expectedCash;
-
-    // Form 1 Cash Count record
-    const countRecord = getCashCountForStaffAndDate(staffId, date);
-    const actualCashCount = countRecord
-      ? countRecord.finalCashOutTotal
-      : (breakdown.physicalCount !== null ? breakdown.physicalCount : null);
-    const form1Counted = actualCashCount;
-    const physicalCashCount = actualCashCount !== null ? actualCashCount : (expectedCash > 0 ? expectedCash : 0);
-
-    let variance = 0;
-    if (actualCashCount !== null) {
-      variance = Math.round((actualCashCount - expectedCash) * 100) / 100;
-    } else {
-      variance = Math.round((0 - expectedCash) * 100) / 100;
-    }
-
-    let status: 'Balanced' | 'Over' | 'Shortage' | 'No Activity' = 'Balanced';
-    if (actualCashCount !== null) {
-      if (Math.abs(variance) < 0.01) status = 'Balanced';
-      else if (variance < 0) status = 'Shortage';
-      else status = 'Over';
-    } else {
-      status = 'Shortage';
-    }
-
-    const form2In = form2Logs.reduce((sum, l) => sum + (l.in || 0), 0);
-    const form2Out = form2Logs.reduce((sum, l) => sum + (l.out || 0), 0);
-    const form2Net = form2In - form2Out;
-    const changeIn = changeReceived;
-    const changeOut = customerChange;
-    const creditIn = creditPayments;
-    const creditOut = Math.max(
-      creditExtended + creditCashOut,
-      form3Credits.filter((c) => !isRepaymentCreditEntry(c)).reduce((sum, c) => sum + (Number(c.out) || Number(c.amount) || 0), 0)
-    );
-    const form3In = changeIn + creditIn;
-    const form3Out = changeOut + creditOut;
-    const form3Net = (changeIn + creditIn) - (changeOut + creditCashOut);
-    const sumForm2And3Net = form2Net + form3Net;
-
-    return {
-      staffId,
-      staffName,
-      date,
-      float,
-      cashSales,
-      creditPayments,
-      expenses,
-      directProcurements,
-      cashLift,
-      customerChange,
-      creditCashOut,
-      deductions,
-      ecocashWithdrawal,
-      zigWithdrawal,
-      totalMultiCurrencyWithdrawals: ecocashWithdrawal + zigWithdrawal,
-      expectedCash,
-      shouldHave,
-      ecocashSales: effectiveEcoSales,
-      zigSales: effectiveZigSales,
-      creditExtended,
-      totalNonCashSales,
-      cashInTotal,
-      cashOutTotal,
-      changeReceived,
-      changePaid: customerChange,
-      totalSales,
-      sales: totalSales,
-      systemSalesTotal,
-      systemSalesCount: staffSales.length,
-      staffSales,
-      isOverridden,
-      actualCashCount,
-      form1Counted,
-      physicalCashCount,
-      variance,
-      status,
-      hasActivity: true,
-      notes: savedAdminSale?.notes || '',
-      form2In,
-      form2Out,
-      form2Net,
-      form3In,
-      form3Out,
-      form3Net,
-      changeIn,
-      changeOut,
-      creditIn,
-      creditOut,
-      sumForm2And3Net,
-      form2LogsCount: form2Logs.length,
-      form3ChangesCount: form3Changes.length,
-      form3CreditsCount: form3Credits.length,
-    };
-  }
-
-  // 1. Form 2 Logs for this staff & date (Legacy fallback)
-  // Float (Opening cash drawer float)
+  // 1. Float (Opening cash drawer float)
   const floatLog = form2Logs.find(
     (l) =>
       l.line === 'Float' ||
@@ -10311,11 +10870,11 @@ export const calculateForm4 = (
       (l as any).categoryGroup === 'Float & Closeout' ||
       l.description?.toLowerCase().startsWith('float')
   );
-  const float = floatLog?.in || 0;
+  const float = floatLog ? (Number(floatLog.in) || 0) : (breakdown.openingFloat || 0);
 
-  // Direct Procurements (Out) - attribute each operator's actual share, not the entire invoice total
+  // 2. Direct Procurements (Out)
   const staffPayments = getDirectGrvPaymentsForStaff(staffId, date, false, staffName);
-  const directGrvs = getDirectGrvsForStaffAndDate(staffId, date, staffName);
+  const directGrvs = sortChronologicallyAsc(getDirectGrvsForStaffAndDate(staffId, date, staffName));
   let grvTotal = 0;
   const processedGrvIds = new Set<string>();
 
@@ -10325,7 +10884,6 @@ export const calculateForm4 = (
     if (grv.grvNumber) processedGrvIds.add(grv.grvNumber);
   });
 
-  // Exclude all known Direct GRV refs for date (including non-till or rejected) so they aren't double-counted or leaked from stale logs
   const allGrvRefsForDate = new Set<string>(processedGrvIds);
   getDirectGrvs().forEach((g) => {
     const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
@@ -10356,8 +10914,8 @@ export const calculateForm4 = (
     .reduce((sum, l) => sum + (Number(l.out) || 0), 0);
   const directProcurements = grvTotal + nonGrvProcurements;
 
-  // Cash Lift (Out: supervisor pick-ups)
-  const staffLifts = getCashLiftsForStaffAndDate(staffId, date);
+  // 3. Cash Lift (Out: supervisor pick-ups)
+  const staffLifts = sortChronologicallyAsc(getCashLiftsForStaffAndDate(staffId, date));
   const liftFromDb = staffLifts.reduce((sum, l) => sum + (l.totalAmount || (l as any).amount || 0), 0);
   const liftFromLogs = form2Logs
     .filter(
@@ -10372,7 +10930,7 @@ export const calculateForm4 = (
     .reduce((sum, l) => sum + (l.out || 0), 0);
   const cashLift = Math.max(liftFromDb, liftFromLogs);
 
-  // Cash Expenses (Out: utilities, bread, airtime, home use, operational cash expenses, store expenses)
+  // 4. Cash Expenses (Excl. Shop Use / Internal Consumption)
   const utilitiesLogs = form2Logs.filter(
     (l) =>
       (l.out || 0) > 0 &&
@@ -10400,9 +10958,15 @@ export const calculateForm4 = (
   );
   const expensesFromLogs = utilitiesLogs.reduce((sum, l) => sum + (l.out || 0), 0);
 
-  // Operational cash expenses from expense database that are not already recorded in Form 2 logs
-  const dbExpensesNotLogged = getExpensesForStaffAndDate(staffId, date)
-    .filter((e) => !e.isDeleted && e.status !== 'rejected' && (e.paymentMethod === 'Cash' || !e.paymentMethod))
+  const dbExpensesNotLogged = sortChronologicallyAsc(getExpensesForStaffAndDate(staffId, date))
+    .filter(
+      (e) =>
+        !e.isDeleted &&
+        e.status !== 'rejected' &&
+        (e.paymentMethod === 'Cash' || !e.paymentMethod) &&
+        e.category !== 'Direct Supplier Delivery Payout' &&
+        !e.description?.toLowerCase().includes('direct delivery voucher')
+    )
     .filter(
       (e) =>
         !utilitiesLogs.some(
@@ -10414,11 +10978,14 @@ export const calculateForm4 = (
     .reduce((sum, e) => sum + (e.amount || 0), 0);
   const expenses = expensesFromLogs + dbExpensesNotLogged;
 
-  // EcoCash & ZiG & Dynamic Multi-Currency Cash-Outs / Withdrawals (Physical Cash OUT from till)
-  const dedupedForm2Logs = deduplicateCashLogs(form2Logs);
+  // 5. Multi-Currency Cash-Outs / Withdrawals (Physical USD Cash OUT from till)
+  // NOTE: Exclude refunded/voided multi-currency goods from active sales, while retaining actual physical USD cash handed out!
   const activeCurrenciesList = getActiveCurrencies();
   const currencyWithdrawalsMap: Record<string, number> = {};
   const currencySalesMap: Record<string, number> = {};
+  const salesForWithdrawals = allStaffSalesSorted.filter(
+    (s) => s.status !== 'Voided' || Boolean(s.cashWithdrawalAmount && Number(s.cashWithdrawalAmount) > 0)
+  );
 
   activeCurrenciesList.forEach((c) => {
     const code = c.code;
@@ -10426,8 +10993,7 @@ export const calculateForm4 = (
     const lowerCode = code.toLowerCase();
     const lowerName = name.toLowerCase();
 
-    // Withdrawals recorded in Form 2 logs (deduplicated by semantic sale reference)
-    const logWithdrawals = dedupedForm2Logs
+    const logWithdrawals = form2Logs
       .filter((l) => {
         if ((l.out || 0) <= 0) return false;
         const line = (l.line || '').toLowerCase();
@@ -10446,8 +11012,7 @@ export const calculateForm4 = (
       })
       .reduce((sum, l) => sum + (l.out || 0), 0);
 
-    // Withdrawals from POS Sales transactions (excluding flagged fake mobile money claims)
-    const salesWithdrawals = staffSales
+    const salesWithdrawals = salesForWithdrawals
       .filter((s) => {
         const sMeth = (s.paymentMethod || '').toLowerCase();
         const sCurr = (s.currency || '').toLowerCase();
@@ -10460,10 +11025,8 @@ export const calculateForm4 = (
         return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
       }, 0);
 
-    const totalCurrWithdrawal = Math.max(logWithdrawals, salesWithdrawals);
-    currencyWithdrawalsMap[code] = totalCurrWithdrawal;
+    currencyWithdrawalsMap[code] = Math.max(logWithdrawals, salesWithdrawals);
 
-    // Non-cash electronic sales
     const currSales = staffSales
       .filter((s) => {
         const sMeth = (s.paymentMethod || '').toLowerCase();
@@ -10478,17 +11041,11 @@ export const calculateForm4 = (
     currencySalesMap[code] = currSales;
   });
 
-  // Ensure EcoCash and ZiG backward compatibility (deduplicated by semantic key)
-  const ecoWithdrawalLogs = dedupedForm2Logs
-    .filter(
-      (l) =>
-        (l.out || 0) > 0 &&
-        getCashLogCurrencyBucket(l) === 'ECOCASH' &&
-        isCashLogWithdrawal(l)
-    )
+  const ecoWithdrawalLogs = form2Logs
+    .filter((l) => (l.out || 0) > 0 && getCashLogCurrencyBucket(l) === 'ECOCASH' && isCashLogWithdrawal(l))
     .reduce((sum, l) => sum + (l.out || 0), 0);
 
-  const ecoWithdrawalSales = staffSales
+  const ecoWithdrawalSales = salesForWithdrawals
     .filter(
       (s) =>
         (s.paymentMethod === 'EcoCash' ||
@@ -10508,21 +11065,17 @@ export const calculateForm4 = (
       if (adj.isFlaggedShortage) return sum;
       return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
     }, 0);
+
   const ecocashWithdrawal = Math.max(
     currencyWithdrawalsMap['EcoCash'] || currencyWithdrawalsMap['ECO'] || currencyWithdrawalsMap['ECOCASH'] || 0,
     Math.max(ecoWithdrawalLogs, ecoWithdrawalSales)
   );
 
-  const zigWithdrawalLogs = dedupedForm2Logs
-    .filter(
-      (l) =>
-        (l.out || 0) > 0 &&
-        getCashLogCurrencyBucket(l) === 'ZIG' &&
-        isCashLogWithdrawal(l)
-    )
+  const zigWithdrawalLogs = form2Logs
+    .filter((l) => (l.out || 0) > 0 && getCashLogCurrencyBucket(l) === 'ZIG' && isCashLogWithdrawal(l))
     .reduce((sum, l) => sum + (l.out || 0), 0);
 
-  const zigWithdrawalSales = staffSales
+  const zigWithdrawalSales = salesForWithdrawals
     .filter(
       (s) =>
         (s.paymentMethod === 'ZiG' || s.currency === 'ZiG') &&
@@ -10534,21 +11087,62 @@ export const calculateForm4 = (
       if (adj.isFlaggedShortage) return sum;
       return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
     }, 0);
+
   const zigWithdrawal = Math.max(
     currencyWithdrawalsMap['ZiG'] || currencyWithdrawalsMap['ZIG'] || 0,
     Math.max(zigWithdrawalLogs, zigWithdrawalSales)
   );
 
-  // Total multi-currency withdrawals across all active currencies
   currencyWithdrawalsMap['EcoCash'] = ecocashWithdrawal;
   currencyWithdrawalsMap['ZiG'] = zigWithdrawal;
   const totalMultiCurrencyWithdrawals = Object.values(currencyWithdrawalsMap).reduce((sum, v) => sum + v, 0);
 
-  // Base cash sales from POS (less any store credit applied) + unverified/short-paid mobile money goods charged to cashier shortage
+  // 6. Explicit Form 2 Cash Refunds / Returns
+  const isForm2RefundLog = (l: CashLogEntry): boolean => {
+    if ((l.out || 0) <= 0) return false;
+    const idStr = String(l.id || '').toUpperCase();
+    const line = (l.line || '').toLowerCase();
+    const cat = (l.category || '').toLowerCase();
+    const desc = (l.description || '').toLowerCase();
+    return (
+      idStr.startsWith('CL-REF-') ||
+      idStr.startsWith('CL-VOID-') ||
+      cat === 'refund' ||
+      line === 'refunds / returns' ||
+      line === 'voids / reversals' ||
+      line.includes('refund') ||
+      desc.includes('cash refund') ||
+      desc.includes('cash reversal for voided')
+    );
+  };
+  const refunds = Math.round(
+    form2Logs.filter(isForm2RefundLog).reduce((sum, l) => sum + (Number(l.out) || 0), 0) * 100
+  ) / 100;
+
+  // Track which voided cash sales have a corresponding Form 2 Void reversal log so Gross Cash Sales aligns
+  const reversedVoidRefs = new Set(
+    form2Logs
+      .filter((l) => isForm2RefundLog(l))
+      .map((l) => extractCashLogRef(l).toUpperCase())
+      .filter(Boolean)
+  );
+
+  // 7. Gross Cash Sales (NEVER deduct refunded sales from Cash Sales — cash returns live in Form 2 Refunds!)
+  const cashSalesForGross = allStaffSalesSorted.filter((s) => {
+    const isCashMethod = s.paymentMethod === 'Cash' || (!s.paymentMethod && (!s.currency || s.currency === 'USD'));
+    if (!isCashMethod) return false;
+    if (s.status === 'Voided') {
+      return reversedVoidRefs.has(String(s.id || '').toUpperCase());
+    }
+    return true;
+  });
+
+  const savedAdminSale = getAdminSaleForStaffAndDate(staffId, date);
+  let totalSales = systemSalesTotal;
+  let isOverridden = false;
+
   let cashSales =
-    staffSales
-      .filter((s) => s.paymentMethod === 'Cash' || (!s.paymentMethod && (!s.currency || s.currency === 'USD')))
-      .reduce((sum, s) => sum + Math.max(0, (s.total || 0) - (s.customerCreditUsed || 0)), 0) +
+    cashSalesForGross.reduce((sum, s) => sum + Math.max(0, (s.total || 0) - (s.customerCreditUsed || 0)), 0) +
     staffSales.reduce((sum, s) => sum + getMobileSaleGoodsAdjustment(s).goodsShortfallUsd, 0);
 
   if (overrideSales !== undefined) {
@@ -10560,10 +11154,16 @@ export const calculateForm4 = (
     isOverridden = true;
     cashSales = Math.max(0, savedAdminSale.salesAmount - totalNonCashSales);
   } else {
-    totalSales = Math.max(systemSalesTotal, cashSales + totalNonCashSales);
+    // Active Total Sales excludes Refunded/Voided sales cleanly
+    const activeCashSalesOnly =
+      staffSales
+        .filter((s) => s.paymentMethod === 'Cash' || (!s.paymentMethod && (!s.currency || s.currency === 'USD')))
+        .reduce((sum, s) => sum + Math.max(0, (s.total || 0) - (s.customerCreditUsed || 0)), 0) +
+      staffSales.reduce((sum, s) => sum + getMobileSaleGoodsAdjustment(s).goodsShortfallUsd, 0);
+    totalSales = Math.max(systemSalesTotal, activeCashSalesOnly + totalNonCashSales);
   }
 
-  // 3. Form 3 Customer Change & Credit Sales
+  // 8. Form 3 Change & Credit Totals
   const changeIn = form3DrawerChangeIn;
   const changeOut = form3ChangeOut;
   const customerChange = changeOut;
@@ -10574,36 +11174,23 @@ export const calculateForm4 = (
     creditExtended + creditCashOut,
     form3Credits.filter((c) => !isRepaymentCreditEntry(c)).reduce((sum, c) => sum + (Number(c.out) || Number(c.amount) || 0), 0)
   );
-
-  // Credit repayments & customer change received into drawer kept separate for parity with movements branch
   const creditPayments = creditIn;
   const changeReceived = changeIn;
 
-  // 4. Miscellaneous cash deductions in Form 2
-  // Must exclude all items that have their own dedicated calculation terms to prevent double deductions!
+  // 9. Miscellaneous cash deductions in Form 2 (exclude Refunds, Expenses, Procurements, Lifts, Multi-Currency)
   const deductions = form2Logs
     .filter((l) => {
       if ((l.out || 0) <= 0) return false;
+      if (isForm2RefundLog(l)) return false;
 
       const line = (l.line || '').toLowerCase();
       const desc = (l.description || '').toLowerCase();
       const cat = (l.category || '').toLowerCase();
       const ref = (l.reference || '').toLowerCase();
 
-      // Exclude float and closeout
       if (line.includes('final cash out') || desc.includes('final cash out')) return false;
       if (line.includes('float') || desc.startsWith('float')) return false;
-
-      // Exclude direct procurement
-      if (
-        line.includes('procurement') ||
-        cat.includes('procurement') ||
-        desc.includes('procurement')
-      ) {
-        return false;
-      }
-
-      // Exclude cash lift / supervisor pick-up
+      if (line.includes('procurement') || cat.includes('procurement') || desc.includes('procurement')) return false;
       if (
         cat.includes('cash lift') ||
         cat.includes('supervisor pick-up') ||
@@ -10613,8 +11200,6 @@ export const calculateForm4 = (
       ) {
         return false;
       }
-
-      // Exclude utilities / expenses / petty cash
       if (
         line === 'bread' ||
         line === 'airtime' ||
@@ -10635,7 +11220,6 @@ export const calculateForm4 = (
         return false;
       }
 
-      // Exclude multi-currency logs (both withdrawals and non-cash sales are handled via explicit multi-currency terms)
       const isMultiCurrencyLog = activeCurrenciesList.some((c) => {
         const lc = (c.code || '').toLowerCase();
         const ln = (c.name || '').toLowerCase();
@@ -10648,27 +11232,12 @@ export const calculateForm4 = (
         );
       });
       if (isMultiCurrencyLog) return false;
-
-      // Exclude EcoCash & ZiG fallback terms
-      if (
-        l.currency === 'EcoCash' ||
-        line.includes('ecocash') ||
-        cat.includes('ecocash') ||
-        desc.includes('ecocash')
-      ) {
+      if (l.currency === 'EcoCash' || line.includes('ecocash') || cat.includes('ecocash') || desc.includes('ecocash')) {
         return false;
       }
-
-      if (
-        l.currency === 'ZiG' ||
-        line.includes('zig') ||
-        cat.includes('zig') ||
-        desc.includes('zig')
-      ) {
+      if (l.currency === 'ZiG' || line.includes('zig') || cat.includes('zig') || desc.includes('zig')) {
         return false;
       }
-
-      // Exclude vault custody, corporate transfers, and EOD handovers (Safe <-> HQ, Bank, Capital injections, Till Handovers)
       if (
         l.isVaultCustody ||
         (l as any).isNonPosTransfer ||
@@ -10694,21 +11263,20 @@ export const calculateForm4 = (
       ) {
         return false;
       }
-
       return true;
     })
     .reduce((sum, l) => sum + (l.out || 0), 0);
 
-  // 5. Expected Cash Formula (Core User Balancing Formula)
+  // 10. Unified Expected Cash Proof
   const cashInTotal = Math.round((float + cashSales + creditPayments + changeReceived) * 100) / 100;
-  const cashOutTotal = Math.round(
-    (expenses + directProcurements + cashLift + customerChange + creditCashOut + deductions + totalMultiCurrencyWithdrawals) * 100
-  ) / 100;
+  const cashOutTotal =
+    Math.round(
+      (expenses + directProcurements + cashLift + customerChange + creditCashOut + deductions + refunds + totalMultiCurrencyWithdrawals) * 100
+    ) / 100;
   const expectedCash = Math.round((cashInTotal - cashOutTotal) * 100) / 100;
-
   const shouldHave = expectedCash;
 
-  // 6. Actual physical cash count from Form 1
+  // 11. Physical cash count (Form 1)
   const countRecord = getCashCountForStaffAndDate(staffId, date);
   const finalCashOutLog = form2Logs.find(
     (l) => l.line === 'Final Cash Out' || l.description?.toLowerCase().includes('final cash out')
@@ -10717,12 +11285,11 @@ export const calculateForm4 = (
     ? countRecord.finalCashOutTotal
     : finalCashOutLog && (finalCashOutLog.out || 0) > 0
     ? finalCashOutLog.out
+    : breakdown.physicalCount !== null
+    ? breakdown.physicalCount
     : null;
   const form1Counted = actualCashCount;
 
-  // 7. Variance & Balancing Status
-  // If drawer was counted, variance = actualCashCount - expectedCash
-  // If pending count, variance = 0 - expectedCash
   let variance = 0;
   if (actualCashCount !== null) {
     variance = Math.round((actualCashCount - expectedCash) * 100) / 100;
@@ -10735,7 +11302,7 @@ export const calculateForm4 = (
     form3Changes.length > 0 ||
     form3Credits.length > 0 ||
     totalSales > 0 ||
-    staffSales.length > 0 ||
+    allStaffSalesSorted.length > 0 ||
     directProcurements > 0 ||
     directGrvs.length > 0 ||
     actualCashCount !== null;
@@ -10752,8 +11319,6 @@ export const calculateForm4 = (
   }
 
   // Form 2 & Form 3 Net values
-  // Operational Form 2 Net: Cash in drawer from daily operations before final closeout handover
-  // Exclude 'Final Cash Out' from operational outflows so Form 2 Net reflects true operational cash movement
   const form2In = form2Logs.reduce((sum, l) => sum + (l.in || 0), 0);
   const form2OperationalOut = form2Logs
     .filter(
@@ -10765,8 +11330,6 @@ export const calculateForm4 = (
   const form2Out = form2Logs.reduce((sum, l) => sum + (l.out || 0), 0);
   const form2Net = form2In - form2OperationalOut;
 
-  // Form 3 Cash Net: Cash transactions only (repayments and change left behind minus customer change & cash credit handed out)
-  // Note: goods creditOut is goods delivered on credit, not cash removed from the physical drawer
   const form3In = changeIn + creditIn;
   const form3Out = changeOut + creditOut;
   const form3CashIn = changeIn + creditIn;
@@ -10778,7 +11341,6 @@ export const calculateForm4 = (
     staffId,
     staffName,
     date,
-    // Core user formula components
     float,
     cashSales,
     creditPayments,
@@ -10788,6 +11350,7 @@ export const calculateForm4 = (
     customerChange,
     creditCashOut,
     deductions,
+    refunds,
     ecocashWithdrawal,
     zigWithdrawal,
     totalMultiCurrencyWithdrawals,
@@ -10800,7 +11363,6 @@ export const calculateForm4 = (
     cashOutTotal,
     changeReceived,
     changePaid: changeOut,
-    // Reporting only
     ecocashSales,
     zigSales,
     creditExtended,
@@ -10818,7 +11380,6 @@ export const calculateForm4 = (
     status,
     hasActivity,
     notes: savedAdminSale?.notes || '',
-    // Form 2 & 3 legacy
     form2In,
     form2Out,
     form2Net,
@@ -10979,7 +11540,223 @@ export const purgeSyncedRecords = clearSyncedQueueItems;
 
 export const DEFAULT_MASTER_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec';
 
+export const getRawStoredSheetsConfig = (): Partial<GoogleSheetsConfig> | null => {
+  try {
+    if (memoryCache.has(STORAGE_KEYS.SHEETS_CONFIG)) {
+      return memoryCache.get(STORAGE_KEYS.SHEETS_CONFIG) as Partial<GoogleSheetsConfig>;
+    }
+    if (typeof localStorage !== 'undefined') {
+      const raw = localStorage.getItem(STORAGE_KEYS.SHEETS_CONFIG);
+      if (raw) {
+        return JSON.parse(raw) as Partial<GoogleSheetsConfig>;
+      }
+    }
+  } catch {}
+  return null;
+};
+
+export const isCloudConfigPurged = (): boolean => {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      return localStorage.getItem('saimetric_cloud_config_purged') === 'true';
+    }
+  } catch {}
+  return false;
+};
+
+/**
+ * Security Purge (HUB_CLOUD mode):
+ * Deletes cloud database URLs, API keys, webhooks, spreadsheet IDs, and URIs
+ * from in-memory cache, localStorage, and IndexedDB so only the encrypted Hub holds them.
+ */
+export const purgeLocalCloudCredentialsFromStorage = (companyId?: string): void => {
+  try {
+    const companies = getCompanies();
+    let updatedAny = false;
+    const scrubbed = companies.map((comp) => {
+      if (companyId && comp.company_id !== companyId) {
+        return comp;
+      }
+      if (comp.sync_strategy === 'CLOUD_ONLY') {
+        return comp;
+      }
+      updatedAny = true;
+      const existingCfg: any = comp.backend_config || {};
+      const nextBackendConfig = comp.backend_config
+        ? {
+            ...existingCfg,
+            sheets: {
+              ...(existingCfg.sheets || {}),
+              webhookUrl: '',
+              masterWebhookUrl: '',
+              spreadsheetId: '',
+              sheetFolderId: '',
+            },
+            firebase: {
+              ...(existingCfg.firebase || {}),
+              projectId: '',
+              apiKey: '',
+              appId: '',
+              authDomain: '',
+              databaseId: '',
+            },
+            supabase: {
+              ...(existingCfg.supabase || {}),
+              projectUrl: '',
+              anonKey: '',
+              serviceRoleKey: '',
+            },
+            ...(existingCfg.mongodb
+              ? {
+                  mongodb: {
+                    ...existingCfg.mongodb,
+                    mongoUri: '',
+                    uri: '',
+                    url: '',
+                    apiKey: '',
+                  },
+                }
+              : {}),
+          }
+        : undefined;
+
+      return {
+        ...comp,
+        webhook_url: '',
+        sheet_id: '',
+        sheet_folder_id: '',
+        ...(nextBackendConfig ? { backend_config: nextBackendConfig } : {}),
+      };
+    });
+
+    if (updatedAny) {
+      setStored(STORAGE_KEYS.COMPANIES, scrubbed);
+    }
+
+    // Clear SHEETS_CONFIG in memoryCache, localStorage, and IndexedDB
+    const emptySheetsConfig = {
+      webhookUrl: '',
+      masterWebhookUrl: '',
+      deploymentUrl: '',
+      spreadsheetId: '',
+      masterSpreadsheetId: '',
+      tenantConfigs: {},
+    };
+    memoryCache.set(STORAGE_KEYS.SHEETS_CONFIG, emptySheetsConfig);
+
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(STORAGE_KEYS.SHEETS_CONFIG);
+      const strayCredentialKeys = [
+        'saimetric_cloud_config',
+        'saimetric_supabase_url',
+        'saimetric_supabase_key',
+        'saimetric_supabase_config',
+        'saimetric_mongo_uri',
+        'saimetric_firebase_config',
+      ];
+      for (const k of strayCredentialKeys) {
+        try {
+          localStorage.removeItem(k);
+        } catch {}
+      }
+      try {
+        const legacyCompKeys = ['saimetric_room_company', 'saimetric_company'];
+        for (const ck of legacyCompKeys) {
+          const raw = localStorage.getItem(ck);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.sync_strategy !== 'CLOUD_ONLY') {
+              parsed.webhook_url = '';
+              parsed.sheet_id = '';
+              parsed.sheet_folder_id = '';
+              if (parsed.backend_config) {
+                if (parsed.backend_config.supabase) {
+                  parsed.backend_config.supabase.projectUrl = '';
+                  parsed.backend_config.supabase.anonKey = '';
+                  parsed.backend_config.supabase.serviceRoleKey = '';
+                }
+                if (parsed.backend_config.sheets) {
+                  parsed.backend_config.sheets.webhookUrl = '';
+                  parsed.backend_config.sheets.masterWebhookUrl = '';
+                  parsed.backend_config.sheets.spreadsheetId = '';
+                  parsed.backend_config.sheets.sheetFolderId = '';
+                }
+                if (parsed.backend_config.firebase) {
+                  parsed.backend_config.firebase.projectId = '';
+                  parsed.backend_config.firebase.apiKey = '';
+                  parsed.backend_config.firebase.appId = '';
+                  parsed.backend_config.firebase.authDomain = '';
+                }
+                if (parsed.backend_config.mongodb) {
+                  parsed.backend_config.mongodb.mongoUri = '';
+                  parsed.backend_config.mongodb.uri = '';
+                  parsed.backend_config.mongodb.url = '';
+                  parsed.backend_config.mongodb.apiKey = '';
+                }
+              }
+              localStorage.setItem(ck, JSON.stringify(parsed));
+            }
+          }
+        }
+      } catch {}
+      localStorage.setItem('saimetric_cloud_config_purged', 'true');
+    }
+
+    if (typeof window !== 'undefined' && window.indexedDB) {
+      deleteMeta(`room_${STORAGE_KEYS.SHEETS_CONFIG}`).catch(() => {});
+      deleteMeta('saimetric_cloud_config').catch(() => {});
+      deleteMeta('saimetric_supabase_config').catch(() => {});
+      purgeTenantContextCredentials(companyId).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('[Storage] Failed to purge local cloud credentials:', err);
+  }
+};
+
 export const getSheetsConfig = (): GoogleSheetsConfig => {
+  if (isCloudConfigPurged()) {
+    const activeComp = getCurrentCompany();
+    if (activeComp?.sync_strategy !== 'CLOUD_ONLY') {
+      const blankBase = getStored<GoogleSheetsConfig>(STORAGE_KEYS.SHEETS_CONFIG, {
+        webhookUrl: '',
+        spreadsheetId: '',
+        masterSpreadsheetId: '',
+        masterWebhookUrl: '',
+        branchIsolationMode: 'ROW_LEVEL',
+        sheetNameMap: {
+          Customers: 'Customers',
+          Suppliers: 'Suppliers',
+          CashLog: 'CashLog',
+          Sales: 'Sales',
+          Expenses: 'Expenses',
+          Reconciliations: 'Reconciliations',
+          Salespeople: 'Salespeople',
+          CustomerChange: 'CustomerChange',
+          CreditSales: 'CreditSales',
+          Products: 'InventoryMaster',
+          InventoryMaster: 'InventoryMaster',
+          companies: 'companies',
+          branches: 'branches',
+          users: 'users',
+          Direct_GRV: 'Direct_GRV',
+          Audit_Log: 'Audit_Log',
+          StockMovement: 'StockMovement',
+          GoodsReceived: 'GoodsReceived',
+        },
+        autoSync: true,
+        simulateSyncLatency: true,
+      });
+      return {
+        ...blankBase,
+        webhookUrl: '',
+        masterWebhookUrl: '',
+        deploymentUrl: '',
+        spreadsheetId: '',
+        masterSpreadsheetId: '',
+      };
+    }
+  }
+
   const base = getStored<GoogleSheetsConfig>(STORAGE_KEYS.SHEETS_CONFIG, {
     webhookUrl: DEFAULT_MASTER_WEBHOOK_URL,
     spreadsheetId: '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
@@ -11102,6 +11879,19 @@ export const updateSheetsConfig = (updates: Partial<GoogleSheetsConfig>) => {
     tenantConfigs: updatedTenantConfigs,
   };
   setStored(STORAGE_KEYS.SHEETS_CONFIG, updated);
+  if (
+    updates.webhookUrl ||
+    updates.masterWebhookUrl ||
+    updates.deploymentUrl ||
+    updates.spreadsheetId ||
+    updates.masterSpreadsheetId
+  ) {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.removeItem('saimetric_cloud_config_purged');
+      }
+    } catch {}
+  }
   return updated;
 };
 
@@ -12771,9 +13561,11 @@ export const ingestMeshInventoryDelete = (itemId: string, companyId?: string): b
 
   // 1. Record deleted item tombstone with company and timestamp
   const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+  const normTenant = (c?: string) =>
+    !c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase();
   const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
   const existsInDeleted = deletedList.some(
-    (d) => (d.itemId || '').toUpperCase() === cleanId && (d.companyId || '').toUpperCase() === currentCompany.toUpperCase()
+    (d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === normTenant(currentCompany)
   );
   if (!existsInDeleted) {
     const updatedDeleted = [
@@ -12787,18 +13579,33 @@ export const ingestMeshInventoryDelete = (itemId: string, companyId?: string): b
   const allItems = getRawStoredInventoryItems();
   const filtered = allItems.filter((i) => {
     const cId = (i.company_id || (i as any).companyId || 'COMP-001').toUpperCase();
-    if (cId === currentCompany.toUpperCase() && (i.itemId || '').trim().toUpperCase() === cleanId) {
+    const itemKey = (i.itemId || (i as any).ItemID || (i as any).id || '').trim().toUpperCase();
+    if (normTenant(cId) === normTenant(currentCompany) && itemKey === cleanId) {
       return false;
     }
     return true;
   });
 
-  if (filtered.length !== allItems.length) {
+  const invRemoved = filtered.length !== allItems.length;
+  if (invRemoved) {
     setStored(STORAGE_KEYS.INVENTORY_ITEMS, filtered);
-    try {
-      setStored(STORAGE_KEYS.PRODUCTS, filtered.map((item) => inventoryItemToProduct(item)));
-    } catch (e) {}
+  }
 
+  let prodRemoved = false;
+  try {
+    const existingProducts = getStored<any[]>(STORAGE_KEYS.PRODUCTS, []);
+    const filteredProducts = existingProducts.filter(
+      (p) => (p?.id || p?.itemId || p?.ItemID || '').trim().toUpperCase() !== cleanId
+    );
+    prodRemoved = filteredProducts.length !== existingProducts.length;
+    if (invRemoved) {
+      setStored(STORAGE_KEYS.PRODUCTS, filtered.map((item) => inventoryItemToProduct(item)));
+    } else if (prodRemoved) {
+      setStored(STORAGE_KEYS.PRODUCTS, filteredProducts);
+    }
+  } catch (e) {}
+
+  if (invRemoved || prodRemoved) {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
         new CustomEvent('saimetric_inventory_item_deleted', {
@@ -13152,7 +13959,7 @@ export const ingestMeshCashLog = (entry: CashLogEntry): boolean => {
   const incomingSem = getCashLogSemanticKey(normEntry);
   const incomingIsW = isCashLogWithdrawal(normEntry);
   const incomingRef = extractCashLogRef(normEntry);
-  const exists = all.some((l) => {
+  const existingIdx = all.findIndex((l) => {
     const lComp = String(l.company_id || (l as any).companyId || currentCompany).trim().toUpperCase();
     const lBr = String((l as any).branch_id || (l as any).branchId || currentBranch).trim().toUpperCase();
     if (normEntry.id && l.id === normEntry.id) return true;
@@ -13169,7 +13976,33 @@ export const ingestMeshCashLog = (entry: CashLogEntry): boolean => {
     }
     return false;
   });
-  if (exists) return false;
+
+  if (existingIdx >= 0) {
+    const existing = all[existingIdx] as any;
+    const isIncomingReversalUpdate = Boolean(
+      (normEntry as any).isRefunded ||
+        (normEntry as any).isVoided ||
+        (normEntry as any).isFlaggedMobileReversal
+    );
+    const isExistingAlreadyReversed = Boolean(
+      existing.isRefunded || existing.isVoided || existing.isFlaggedMobileReversal
+    );
+    if (isIncomingReversalUpdate && !isExistingAlreadyReversed) {
+      all[existingIdx] = {
+        ...existing,
+        ...normEntry,
+        id: existing.id || normEntry.id,
+        company_id: compId,
+        companyId: compId,
+        branch_id: brId,
+        branchId: brId,
+      };
+      setStored(STORAGE_KEYS.CASH_LOGS, deduplicateCashLogs(all));
+      notifyListeners();
+      return true;
+    }
+    return false;
+  }
 
   const normalized: CashLogEntry = {
     ...normEntry,
@@ -13364,11 +14197,50 @@ export const ingestMeshCreditSale = (entry: any): boolean => {
 };
 
 export const ingestMeshStockMovement = (entry: any): boolean => {
-  if (!entry || (!entry.txnId && !entry.movementId)) return false;
-  const all = getStockMovements();
-  const id = entry.txnId || entry.movementId;
-  if (all.some((s) => s.txnId === id || s.movementId === id)) return false;
-  setStored(STORAGE_KEYS.STOCK_MOVEMENTS, [entry, ...all]);
+  if (!entry || typeof entry !== 'object') return false;
+  const rawId = String(entry.id || entry.movementId || entry.txnId || '').trim();
+  if (!rawId) return false;
+
+  const baseId = stripStockMovementDupSuffix(rawId);
+  const incomingItemId = String(entry.itemId || '').trim();
+  const all = getRawStoredStockMovements();
+
+  // Block recursive -dup-... echo clones if base ID already exists for this item
+  if (rawId !== baseId) {
+    const baseExists = all.some((s: any) => {
+      const sId = String(s.id || s.movementId || s.txnId || '').trim();
+      const sBase = stripStockMovementDupSuffix(sId);
+      const sItem = String(s.itemId || '').trim();
+      return sBase === baseId && (!incomingItemId || !sItem || sItem === incomingItemId);
+    });
+    if (baseExists) {
+      return false;
+    }
+  }
+
+  const existingIdx = all.findIndex((s: any) => {
+    const sId = String(s.id || s.movementId || s.txnId || '').trim();
+    return sId === rawId || s.id === rawId || s.movementId === rawId || s.txnId === rawId;
+  });
+
+  if (existingIdx >= 0) {
+    const existing: any = all[existingIdx];
+    const incomingCloudSynced = entry.isCloudSynced === true || entry.synced === true;
+    if (incomingCloudSynced && existing.isCloudSynced !== true) {
+      all[existingIdx] = { ...existing, isCloudSynced: true, synced: true };
+      setStored(STORAGE_KEYS.STOCK_MOVEMENTS, all);
+      notifyListeners();
+    }
+    return false;
+  }
+
+  const normalizedEntry: StockMovementEntry = {
+    ...entry,
+    id: rawId,
+    movementId: entry.movementId || rawId,
+    txnId: entry.txnId || rawId,
+  };
+  setStored(STORAGE_KEYS.STOCK_MOVEMENTS, [normalizedEntry, ...all]);
   notifyListeners();
   return true;
 };
@@ -13713,15 +14585,15 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
     setStored(STORAGE_KEYS.SYNC_QUEUE, updatedQueue);
   }
 
-  // 2. Update Sales syncStatus and synced flag
+  // 2. Update Sales syncStatus, synced, and syncedToHub flag
   const sales = getAllSales();
   let salesChanged = false;
   const updatedSales = sales.map((sale) => {
     const saleReqId = (sale as any).clientRequestId || sale.id;
     const isMatch = itemIdSet.has(sale.id) || (saleReqId && reqIdSet.has(saleReqId)) || itemIdSet.has(saleReqId);
-    if (isMatch && ((sale as any).syncStatus !== 'synced' || !sale.synced)) {
+    if (isMatch && ((sale as any).syncStatus !== 'synced' || !sale.synced || !(sale as any).syncedToHub)) {
       salesChanged = true;
-      return { ...sale, syncStatus: 'synced' as const, synced: true };
+      return { ...sale, syncStatus: 'synced' as const, synced: true, syncedToHub: true };
     }
     return sale;
   });
@@ -13735,9 +14607,9 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   const updatedCashLogs = cashLogs.map((log) => {
     const logReqId = (log as any).clientRequestId || log.id;
     const isMatch = itemIdSet.has(log.id) || (logReqId && reqIdSet.has(logReqId)) || (log.reference && (itemIdSet.has(log.reference) || reqIdSet.has(log.reference)));
-    if (isMatch && !log.synced) {
+    if (isMatch && (!log.synced || !(log as any).syncedToHub)) {
       cashLogsChanged = true;
-      return { ...log, synced: true, syncStatus: 'synced' };
+      return { ...log, synced: true, syncStatus: 'synced', syncedToHub: true };
     }
     return log;
   });
@@ -13750,9 +14622,9 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   const suppInvoices = getStored<any[]>(STORAGE_KEYS.SUPPLIER_INVOICES, []);
   const updatedSuppInvoices = suppInvoices.map((inv) => {
     const isMatch = itemIdSet.has(inv.id) || itemIdSet.has(inv.invoiceNumber) || (inv.clientRequestId && reqIdSet.has(inv.clientRequestId));
-    if (isMatch && (!inv.synced || inv.syncStatus !== 'synced')) {
+    if (isMatch && (!inv.synced || inv.syncStatus !== 'synced' || !inv.syncedToHub)) {
       suppInvoicesChanged = true;
-      return { ...inv, synced: true, syncStatus: 'synced' };
+      return { ...inv, synced: true, syncStatus: 'synced', syncedToHub: true };
     }
     return inv;
   });
@@ -13765,9 +14637,9 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   const grns = getStored<any[]>(STORAGE_KEYS.GOODS_RECEIVED_NOTES, []);
   const updatedGrns = grns.map((g) => {
     const isMatch = itemIdSet.has(g.id) || (g.clientRequestId && reqIdSet.has(g.clientRequestId));
-    if (isMatch && (!g.synced || g.syncStatus !== 'synced')) {
+    if (isMatch && (!g.synced || g.syncStatus !== 'synced' || !g.syncedToHub)) {
       grnsChanged = true;
-      return { ...g, synced: true, syncStatus: 'synced' };
+      return { ...g, synced: true, syncStatus: 'synced', syncedToHub: true };
     }
     return g;
   });
@@ -13778,10 +14650,10 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   let directGrvsChanged = false;
   const directGrvs = getStored<any[]>(STORAGE_KEYS.DIRECT_GRVS, []);
   const updatedDirectGrvs = directGrvs.map((g) => {
-    const isMatch = itemIdSet.has(g.id) || (g.clientRequestId && reqIdSet.has(g.clientRequestId));
-    if (isMatch && (!g.synced || g.syncStatus !== 'synced')) {
+    const isMatch = itemIdSet.has(g.id) || itemIdSet.has(g.grvNumber) || (g.clientRequestId && reqIdSet.has(g.clientRequestId));
+    if (isMatch && (!g.synced || g.syncStatus !== 'synced' || !g.syncedToHub)) {
       directGrvsChanged = true;
-      return { ...g, synced: true, syncStatus: 'synced' };
+      return { ...g, synced: true, syncStatus: 'synced', syncedToHub: true };
     }
     return g;
   });
@@ -13793,10 +14665,10 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   let creditSalesChanged = false;
   const creditSales = getStored<any[]>(STORAGE_KEYS.CREDIT_SALES, []);
   const updatedCreditSales = creditSales.map((c) => {
-    const isMatch = itemIdSet.has(c.id) || (c.clientRequestId && reqIdSet.has(c.clientRequestId));
-    if (isMatch && (!c.synced || c.syncStatus !== 'synced')) {
+    const isMatch = itemIdSet.has(c.id) || itemIdSet.has(c.creditId) || (c.clientRequestId && reqIdSet.has(c.clientRequestId));
+    if (isMatch && (!c.synced || c.syncStatus !== 'synced' || !c.syncedToHub)) {
       creditSalesChanged = true;
-      return { ...c, synced: true, syncStatus: 'synced' };
+      return { ...c, synced: true, syncStatus: 'synced', syncedToHub: true };
     }
     return c;
   });
@@ -13808,10 +14680,10 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   let cashLiftsChanged = false;
   const cashLifts = getStored<any[]>(STORAGE_KEYS.CASH_LIFTS, []);
   const updatedCashLifts = cashLifts.map((l) => {
-    const isMatch = itemIdSet.has(l.id) || (l.clientRequestId && reqIdSet.has(l.clientRequestId)) || (l.cashLogId && itemIdSet.has(l.cashLogId));
-    if (isMatch && (!l.synced || l.syncStatus !== 'synced')) {
+    const isMatch = itemIdSet.has(l.id) || itemIdSet.has(l.liftId) || (l.clientRequestId && reqIdSet.has(l.clientRequestId)) || (l.cashLogId && itemIdSet.has(l.cashLogId));
+    if (isMatch && (!l.synced || l.syncStatus !== 'synced' || !l.syncedToHub)) {
       cashLiftsChanged = true;
-      return { ...l, synced: true, syncStatus: 'synced' };
+      return { ...l, synced: true, syncStatus: 'synced', syncedToHub: true };
     }
     return l;
   });
@@ -13824,9 +14696,9 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   const expenses = getStored<any[]>(STORAGE_KEYS.EXPENSES, []);
   const updatedExpenses = expenses.map((e) => {
     const isMatch = itemIdSet.has(e.id) || (e.clientRequestId && reqIdSet.has(e.clientRequestId));
-    if (isMatch && (!e.synced || e.syncStatus !== 'synced')) {
+    if (isMatch && (!e.synced || e.syncStatus !== 'synced' || !e.syncedToHub)) {
       expensesChanged = true;
-      return { ...e, synced: true, syncStatus: 'synced' };
+      return { ...e, synced: true, syncStatus: 'synced', syncedToHub: true };
     }
     return e;
   });
@@ -13845,6 +14717,140 @@ export const markReceiptAsSynced = markSyncItemsAsSynced;
 export const markSaleAsSynced = (invoiceId: string): boolean => {
   if (!invoiceId) return false;
   return markSyncItemsAsSynced([], [invoiceId]) > 0;
+};
+
+/**
+ * Dual-Writer Sync Marker:
+ * Marks matching records across Room DB with `isCloudSynced: true` ONLY when confirmed
+ * by a cloud HTTP 200/201 response or a Hub `T1_CLOUD_SYNC_ACK` handoff.
+ * When `alsoMarkHubSynced` is false (direct cloud push while Hub is offline), `syncedToHub`
+ * remains false so the PWA still pushes the record to the Hub on reconnect with `isCloudSynced: true`.
+ */
+export const markRecordsCloudSynced = (
+  itemIds: string[] = [],
+  clientRequestIds: string[] = [],
+  _entityType?: string,
+  alsoMarkHubSynced: boolean = false
+): number => {
+  const idSet = new Set(itemIds.filter(Boolean).map((v) => String(v).trim()));
+  const reqIdSet = new Set(clientRequestIds.filter(Boolean).map((v) => String(v).trim()));
+  if (idSet.size === 0 && reqIdSet.size === 0) return 0;
+
+  let updatedTotal = 0;
+  let anyStoreChanged = false;
+
+  const matchesRecord = (rec: any): boolean => {
+    if (!rec || typeof rec !== 'object') return false;
+    const candidateIds = [
+      rec.id,
+      rec.invoice_id,
+      rec.invoiceId,
+      rec.itemId,
+      rec.grvNumber,
+      rec.grnId,
+      rec.voucherId,
+      rec.customerId,
+      rec.supplierId,
+      rec.creditId,
+      rec.changeId,
+      rec.liftId,
+      rec.cashLogId,
+      rec.movementId,
+      rec.branchId,
+      rec.account_id,
+    ];
+    for (const cid of candidateIds) {
+      if (cid !== undefined && cid !== null && idSet.has(String(cid).trim())) {
+        return true;
+      }
+    }
+    const reqCandidates = [rec.clientRequestId, rec.packetId];
+    for (const rid of reqCandidates) {
+      if (rid !== undefined && rid !== null && reqIdSet.has(String(rid).trim())) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const storeKeysToScan = [
+    STORAGE_KEYS.SALES,
+    STORAGE_KEYS.CASH_LOGS,
+    STORAGE_KEYS.DIRECT_GRVS,
+    STORAGE_KEYS.GOODS_RECEIVED_NOTES,
+    STORAGE_KEYS.GOODS_RECEIVED,
+    STORAGE_KEYS.SUPPLIER_INVOICES,
+    STORAGE_KEYS.CREDIT_SALES,
+    STORAGE_KEYS.CUSTOMER_CHANGES,
+    STORAGE_KEYS.CASH_LIFTS,
+    STORAGE_KEYS.STOCK_MOVEMENTS,
+    STORAGE_KEYS.EXPENSES,
+    STORAGE_KEYS.INVENTORY_ITEMS,
+    STORAGE_KEYS.CUSTOMERS,
+    STORAGE_KEYS.SALESPEOPLE,
+    STORAGE_KEYS.BRANCHES,
+    STORAGE_KEYS.SUPPLIERS,
+    STORAGE_KEYS.CASH_ACCOUNTS,
+    STORAGE_KEYS.CASH_TRANSFERS,
+    STORAGE_KEYS.ADMIN_SALES,
+    STORAGE_KEYS.CASH_COUNTS,
+    STORAGE_KEYS.BUSINESS_DAY_CLOSURES,
+    STORAGE_KEYS.ELECTRONIC_SETTLEMENTS,
+  ];
+
+  for (const key of storeKeysToScan) {
+    const arr = getStored<any[]>(key, []);
+    if (!Array.isArray(arr) || arr.length === 0) continue;
+    let changed = false;
+    const nextArr = arr.map((rec) => {
+      if (!matchesRecord(rec)) return rec;
+      const needsCloudFlag = rec.isCloudSynced !== true;
+      const needsHubFlag = alsoMarkHubSynced && (rec.syncedToHub !== true || rec.synced !== true);
+      if (needsCloudFlag || needsHubFlag) {
+        changed = true;
+        updatedTotal++;
+        return {
+          ...rec,
+          isCloudSynced: true,
+          ...(alsoMarkHubSynced ? { syncedToHub: true, synced: true, syncStatus: 'synced' } : {}),
+        };
+      }
+      return rec;
+    });
+    if (changed) {
+      anyStoreChanged = true;
+      setStored(key, nextArr);
+    }
+  }
+
+  // Also mark matching SYNC_QUEUE entries as synced when cloud ACK confirmed
+  const queue = getSyncQueue();
+  let queueChanged = false;
+  const nextQueue = queue.map((q) => {
+    const isMatch =
+      idSet.has(String(q.id || '').trim()) ||
+      (q.payload?.id && idSet.has(String(q.payload.id).trim())) ||
+      (q.payload?.clientRequestId && reqIdSet.has(String(q.payload.clientRequestId).trim()));
+    if (isMatch && (q.status !== 'synced' || (q.payload && (q.payload as any).isCloudSynced !== true))) {
+      queueChanged = true;
+      return {
+        ...q,
+        status: 'synced' as const,
+        error: undefined,
+        payload: q.payload ? { ...q.payload, isCloudSynced: true } : q.payload,
+      };
+    }
+    return q;
+  });
+  if (queueChanged) {
+    anyStoreChanged = true;
+    setStored(STORAGE_KEYS.SYNC_QUEUE, nextQueue);
+  }
+
+  if (anyStoreChanged) {
+    notifyListeners();
+  }
+  return updatedTotal;
 };
 
 export async function pullTenantInventory(companyId?: string): Promise<{ added: number; updated: number; count: number }> {
@@ -14466,7 +15472,8 @@ export function recordPriceCostChangeAudit(params: {
 }): StockMovementEntry {
   const timestamp = new Date().toISOString();
   const dateStr = timestamp.split('T')[0];
-  const txnId = `AUDIT-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+  const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const txnId = `AUDIT-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${params.itemId}-${randSuffix}`;
   const percentChange = params.oldValue > 0
     ? Number((((params.newValue - params.oldValue) / params.oldValue) * 100).toFixed(2))
     : 100;
@@ -14477,6 +15484,7 @@ export function recordPriceCostChangeAudit(params: {
   const closingSingles = invItem ? invItem.stockSingles : 0;
 
   const entry: StockMovementEntry = {
+    id: txnId,
     txnId,
     movementId: txnId,
     date: dateStr,
@@ -14594,10 +15602,12 @@ export const removeManualStock = (params: {
 
   const timestamp = new Date().toISOString();
   const dateStr = timestamp.split('T')[0];
-  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
-  const refId = params.referenceId || `MAN-REM-${Date.now().toString().slice(-4)}`;
+  const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffix}`;
+  const refId = params.referenceId || `MAN-REM-${Date.now().toString().slice(-6)}`;
 
   const movement: StockMovementEntry = {
+    id: txnId,
     txnId,
     movementId: txnId,
     date: dateStr,
@@ -14726,14 +15736,14 @@ export const getProductAuditTrail = (itemId: string): StockMovementEntry[] => {
   });
 };
 
-export const deleteInventoryItem = (itemId: string): boolean => {
+export const deleteInventoryItem = (itemId: string, options?: { fromSync?: boolean }): boolean => {
   const currentCompany = getCurrentCompanyId();
   const allItems = getRawStoredInventoryItems();
   const cleanId = (itemId || '').trim().toUpperCase();
   const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
 
   // 1. Record deleted item tombstone with company and timestamp so offline peer devices know it was deleted
-  recordTombstone('inventory', cleanId);
+  const tomb = recordTombstone('inventory_item', cleanId, options);
   const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
   const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
   const existsInDeleted = deletedList.some(
@@ -14742,7 +15752,7 @@ export const deleteInventoryItem = (itemId: string): boolean => {
   if (!existsInDeleted) {
     const updatedDeleted = [
       ...deletedList,
-      { itemId: cleanId, companyId: currentCompany, deletedAt: new Date().toISOString() },
+      { itemId: cleanId, companyId: currentCompany, deletedAt: new Date(tomb.deletedAt).toISOString() },
     ];
     setStored(deletedRegistryKey, updatedDeleted);
   }
@@ -14750,19 +15760,36 @@ export const deleteInventoryItem = (itemId: string): boolean => {
   // 2. Remove from active inventory store
   const filtered = allItems.filter((i) => {
     const compId = (i.company_id || (i as any).companyId || 'COMP-001').toUpperCase();
-    if (normTenant(compId) === normTenant(currentCompany) && (i.itemId || (i as any).id || '').trim().toUpperCase() === cleanId) {
+    const itemKey = (i.itemId || (i as any).ItemID || (i as any).id || '').trim().toUpperCase();
+    if (normTenant(compId) === normTenant(currentCompany) && itemKey === cleanId) {
       return false;
     }
     return true;
   });
 
-  if (filtered.length !== allItems.length) {
+  const invRemoved = filtered.length !== allItems.length;
+  if (invRemoved) {
     setStored(STORAGE_KEYS.INVENTORY_ITEMS, filtered);
-    try {
-      setStored(STORAGE_KEYS.PRODUCTS, filtered.map((item) => inventoryItemToProduct(item)));
-    } catch (e) {}
+  }
 
-    // 3. Enqueue sync & Broadcast peer notification across offline devices via mesh & syncQueue
+  let prodRemoved = false;
+  try {
+    const existingProducts = getStored<any[]>(STORAGE_KEYS.PRODUCTS, []);
+    const filteredProducts = existingProducts.filter(
+      (p) => (p?.id || p?.itemId || p?.ItemID || '').trim().toUpperCase() !== cleanId
+    );
+    prodRemoved = filteredProducts.length !== existingProducts.length;
+    if (invRemoved) {
+      setStored(STORAGE_KEYS.PRODUCTS, filtered.map((item) => inventoryItemToProduct(item)));
+    } else if (prodRemoved) {
+      setStored(STORAGE_KEYS.PRODUCTS, filteredProducts);
+    }
+  } catch (e) {}
+
+  const removed = invRemoved || prodRemoved;
+
+  // 3. Enqueue sync & dispatch canonical TOMBSTONE_SYNC via SyncCore.saveAndSync()
+  if (!options?.fromSync) {
     try {
       enqueueSync('InventoryMaster' as SheetName, 'DELETE', {
         id: itemId,
@@ -14770,23 +15797,25 @@ export const deleteInventoryItem = (itemId: string): boolean => {
         ItemID: itemId,
         CompanyID: currentCompany,
         company_id: currentCompany,
-        deletedAt: new Date().toISOString(),
+        deletedAt: new Date(tomb.deletedAt).toISOString(),
       });
     } catch (e) {}
-
-    // 4. Broadcast specific local/peer custom event
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('saimetric_inventory_item_deleted', {
-          detail: { itemId: cleanId, companyId: currentCompany },
-        })
-      );
-    }
-
-    notifyListeners();
-    return true;
+    dispatchTombstoneThroughSyncCore(tomb);
   }
-  return false;
+
+  // 4. Broadcast specific local/peer custom event
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('saimetric_inventory_item_deleted', {
+        detail: { itemId: cleanId, companyId: currentCompany },
+      })
+    );
+    window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_products_updated'));
+  }
+
+  notifyListeners();
+  return removed;
 };
 
 export const getRawStoredSupplierInvoiceVouchers = (): SupplierInvoiceVoucher[] => {
@@ -14904,6 +15933,50 @@ export const receiveSupplierInvoice = (params: {
     return {
       success: false,
       message: 'Please add at least one product to the supplier invoice voucher.',
+      itemsProcessed: 0,
+      ruleATriggeredCount: 0,
+    };
+  }
+
+  // Hard math overflow validation ($10,000,000 limit) before mutating any inventory or batches
+  let previewInvoiceTotal = 0;
+  for (const rawItem of params.items) {
+    const item = getInventoryItemById(rawItem.itemId);
+    if (!item) continue;
+    const isVariant = rawItem.receiveAs === 'Variant';
+    const isSingles = rawItem.receiveAs === 'Singles';
+    const isCases = !isVariant && !isSingles;
+    const unitsPerPack = rawItem.unitsPerReceivePack || 1;
+    const recPacks = Math.max(0, Number(rawItem.receivedPacks) || 0);
+    const recCases = isCases ? Math.max(0, Number(rawItem.receivedCases) || 0) : 0;
+    const recSingles = isSingles
+      ? Math.max(0, Number(rawItem.receivedSingles) || 0)
+      : isVariant
+      ? recPacks * unitsPerPack
+      : Math.max(0, Number(rawItem.receivedSingles) || 0);
+    const cCase = Number(rawItem.costPerCase !== undefined && rawItem.costPerCase >= 0 ? rawItem.costPerCase : item.costPerCase) || 0;
+    const cUnit = Number(rawItem.costPerUnit !== undefined && rawItem.costPerUnit >= 0 ? rawItem.costPerUnit : item.costPerUnit) || 0;
+    const cPack = Number(rawItem.costPerPack !== undefined && rawItem.costPerPack >= 0 ? rawItem.costPerPack : cUnit * unitsPerPack) || 0;
+    const estLine = isVariant
+      ? recPacks * cPack
+      : isSingles
+      ? recSingles * cUnit
+      : recCases * cCase + recSingles * cUnit;
+    const roundedEstLine = Math.round(estLine * 100) / 100;
+    if (!Number.isFinite(roundedEstLine) || roundedEstLine > 10_000_000) {
+      return {
+        success: false,
+        message: `Line total ($${roundedEstLine.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) exceeds the maximum allowed limit of $10,000,000.00.`,
+        itemsProcessed: 0,
+        ruleATriggeredCount: 0,
+      };
+    }
+    previewInvoiceTotal = Math.round((previewInvoiceTotal + roundedEstLine) * 100) / 100;
+  }
+  if (!Number.isFinite(previewInvoiceTotal) || previewInvoiceTotal > 10_000_000) {
+    return {
+      success: false,
+      message: `Total invoice amount ($${previewInvoiceTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) exceeds the maximum allowed limit of $10,000,000.00.`,
       itemsProcessed: 0,
       ruleATriggeredCount: 0,
     };
@@ -15165,14 +16238,15 @@ export const receiveSupplierInvoice = (params: {
     };
     saveInventoryItem(updatedItem);
 
-    const lineTotal = isReceivingVariant && costPerPack !== undefined
+    const rawLineTotal = isReceivingVariant && costPerPack !== undefined
       ? recPacks * costPerPack
       : recCases * costPerCase + recSingles * costPerUnit;
+    const lineTotal = Math.round((Number(rawLineTotal) || 0) * 100) / 100;
 
     totalCases += recCases;
     totalSingles += recSingles;
     totalUnitsReceived += lineTotalUnits;
-    totalInvoiceAmount += lineTotal;
+    totalInvoiceAmount = Math.round((totalInvoiceAmount + lineTotal) * 100) / 100;
 
     lineItems.push({
       itemId: item.itemId,
@@ -15236,8 +16310,10 @@ export const receiveSupplierInvoice = (params: {
     addGoodsReceived(grnEntry);
 
     // Add StockMovement log
-    const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${item.itemId}`;
+    const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffix}`;
     const movement: StockMovementEntry = {
+      id: txnId,
       txnId,
       movementId: txnId,
       date: dateStr,
@@ -15373,8 +16449,10 @@ export const recalculateItemPackagingRatio = (
   saveInventoryItem(updated);
 
   // Add stock movement log for audit trail
-  const txnId = `TXN-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}-RECALC`;
+  const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const txnId = `TXN-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}-${item.itemId}-${randSuffix}-RECALC`;
   addStockMovement({
+    id: txnId,
     txnId,
     movementId: txnId,
     date: new Date().toISOString().split('T')[0],
@@ -15696,45 +16774,99 @@ export const addGoodsReceived = (
   return normalized;
 };
 
-export const getRawStoredStockMovements = (): StockMovementEntry[] => {
-  const rawList = getStored<StockMovementEntry[]>(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS);
-  if (!Array.isArray(rawList)) return [];
-  const seenMovementIds = new Set<string>();
-  const seenTxnIds = new Set<string>();
-  let hasDuplicates = false;
+export const stripStockMovementDupSuffix = (id: string): string => {
+  return String(id || '').trim().replace(/(?:-dup-\d+-\d{4})+$/gi, '');
+};
 
-  const sanitized = rawList.map((m, index) => {
-    let movementId = (m.movementId || m.txnId || '').trim();
-    let txnId = (m.txnId || movementId || '').trim();
+export const deduplicateStockMovementsList = (
+  rawList: StockMovementEntry[]
+): { deduplicated: StockMovementEntry[]; changed: boolean } => {
+  if (!Array.isArray(rawList)) return { deduplicated: [], changed: false };
 
-    if (!movementId || seenMovementIds.has(movementId)) {
-      hasDuplicates = true;
-      movementId = `${movementId || 'MOV'}-dup-${index + 1}-${Math.floor(1000 + Math.random() * 9000)}`;
+  const seenExactIds = new Set<string>();
+  const seenBaseItemKeys = new Set<string>();
+  const deduplicated: StockMovementEntry[] = [];
+  let changed = false;
+
+  // Prefer canonical (non-dup) and cloud-synced records first when scanning
+  const indexed = rawList
+    .map((m, idx) => ({ m, idx }))
+    .filter(({ m }) => Boolean(m && typeof m === 'object'));
+
+  for (const { m } of indexed) {
+    const rawId = String((m as any).id || m.movementId || m.txnId || '').trim();
+    const itemId = String(m.itemId || '').trim();
+    const baseId = stripStockMovementDupSuffix(rawId);
+
+    if (!rawId) {
+      changed = true;
+      continue;
     }
-    seenMovementIds.add(movementId);
 
-    if (!txnId || seenTxnIds.has(txnId)) {
-      hasDuplicates = true;
-      txnId = `${txnId || 'TXN'}-dup-${index + 1}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const isDupId = rawId !== baseId;
+    const baseItemKey = `${baseId}::${itemId}`;
+
+    // Skip if exact ID or same base-ID + itemId clone already kept
+    if (seenExactIds.has(rawId) || (isDupId && seenBaseItemKeys.has(baseItemKey))) {
+      changed = true;
+      continue;
     }
-    seenTxnIds.add(txnId);
 
-    return {
+    // If non-dup exact match wasn't seen yet, record it cleanly
+    let finalId = rawId;
+    if (isDupId) {
+      // If we haven't seen baseId for this itemId, see if baseId itself is completely unused anywhere else
+      const baseUnused = !seenExactIds.has(baseId) && !indexed.some((other) => {
+        const oId = String((other.m as any).id || other.m.movementId || other.m.txnId || '').trim();
+        return oId === baseId && String(other.m.itemId || '').trim() !== itemId;
+      });
+      if (baseUnused && !indexed.some((other) => {
+        const oId = String((other.m as any).id || other.m.movementId || other.m.txnId || '').trim();
+        return oId === baseId;
+      })) {
+        finalId = baseId;
+        changed = true;
+      }
+    }
+
+    seenExactIds.add(rawId);
+    seenExactIds.add(finalId);
+    seenBaseItemKeys.add(baseItemKey);
+
+    const normalized: StockMovementEntry = {
       ...m,
-      movementId,
-      txnId,
+      id: (m as any).id || finalId,
+      movementId: (m.movementId && !isDupId ? m.movementId : finalId),
+      txnId: (m.txnId && !isDupId ? m.txnId : finalId),
       movementType: m.movementType || (m.txnType === 'RECEIVE' ? 'GOODS_RECEIVED' : m.txnType),
       casesChange: m.casesChange !== undefined ? m.casesChange : (m.txnType === 'RECEIVE' ? m.qtyCases : -m.qtyCases),
       singlesChange: m.singlesChange !== undefined ? m.singlesChange : (m.txnType === 'RECEIVE' || m.txnType === 'BREAK_CASE' ? m.qtySingles : -m.qtySingles),
       resultingStockCases: m.resultingStockCases !== undefined ? m.resultingStockCases : m.closingCases,
       resultingStockSingles: m.resultingStockSingles !== undefined ? m.resultingStockSingles : m.closingSingles,
     };
-  });
 
-  if (hasDuplicates) {
-    setStored(STORAGE_KEYS.STOCK_MOVEMENTS, sanitized);
+    if (
+      normalized.id !== (m as any).id ||
+      normalized.movementId !== m.movementId ||
+      normalized.txnId !== m.txnId
+    ) {
+      changed = true;
+    }
+
+    deduplicated.push(normalized);
   }
-  return sanitized;
+
+  return { deduplicated, changed };
+};
+
+export const getRawStoredStockMovements = (): StockMovementEntry[] => {
+  const rawList = getStored<StockMovementEntry[]>(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS);
+  if (!Array.isArray(rawList)) return [];
+  const { deduplicated, changed } = deduplicateStockMovementsList(rawList);
+  if (changed) {
+    setStored(STORAGE_KEYS.STOCK_MOVEMENTS, deduplicated);
+  }
+  return deduplicated;
 };
 
 export const getAllStockMovements = (branchId?: string): StockMovementEntry[] => {
@@ -15760,14 +16892,43 @@ export const addStockMovement = (
   entry: StockMovementEntry,
   options?: { fromSync?: boolean }
 ): StockMovementEntry => {
-  const list = getStored<StockMovementEntry[]>(STORAGE_KEYS.STOCK_MOVEMENTS, INITIAL_STOCK_MOVEMENTS);
+  // Never generate or re-enqueue movements during sync / reconciliation ingestion
+  if (options?.fromSync || (entry as any)?.fromMesh) {
+    ingestMeshStockMovement(entry);
+    const id = String((entry as any).id || entry.movementId || entry.txnId || '').trim();
+    const all = getRawStoredStockMovements();
+    return all.find((s: any) => s.id === id || s.movementId === id || s.txnId === id) || entry;
+  }
+
+  const list = getRawStoredStockMovements();
+  const rawId = String((entry as any).id || entry.movementId || entry.txnId || '').trim();
+  const generatedId =
+    rawId ||
+    `TXN-${(entry.date || new Date().toISOString().split('T')[0]).replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${entry.itemId || 'ITEM'}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+  // Strict Duplicate Guard: if movementId / txnId / id already exists, do NOT save a duplicate
+  const existing = list.find((s: any) => {
+    const sId = String(s.id || s.movementId || s.txnId || '').trim();
+    return (
+      sId === generatedId ||
+      s.id === generatedId ||
+      s.movementId === generatedId ||
+      s.txnId === generatedId
+    );
+  });
+  if (existing) {
+    return existing;
+  }
+
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = (entry as any).company_id || (entry as any).companyId || currentCompany;
   const brId = (entry as any).branch_id || (entry as any).branchId || currentBranch;
   const normalized: StockMovementEntry = {
     ...entry,
-    movementId: entry.movementId || entry.txnId,
+    id: generatedId,
+    movementId: entry.movementId || generatedId,
+    txnId: entry.txnId || generatedId,
     movementType: entry.movementType || entry.txnType,
     casesChange: entry.casesChange !== undefined ? entry.casesChange : entry.qtyCases,
     singlesChange: entry.singlesChange !== undefined ? entry.singlesChange : entry.qtySingles,
@@ -15778,13 +16939,12 @@ export const addStockMovement = (
     branch_id: brId,
     branchId: brId,
   } as any;
+
   list.unshift(normalized);
   setStored(STORAGE_KEYS.STOCK_MOVEMENTS, list);
 
-  if (!options?.fromSync && !(entry as any).fromMesh) {
-    console.log(`[Row10] Direct enqueue: StockMovements ${normalized.movementId || (normalized as any).txnId} (fromSync=${options?.fromSync ?? false})`);
-    enqueueSync('StockMovements' as any, 'INSERT', normalized);
-  }
+  console.log(`[Row10] Direct enqueue: StockMovements ${normalized.movementId || (normalized as any).txnId} (fromSync=false)`);
+  enqueueSync('StockMovements' as any, 'INSERT', normalized);
 
   notifyListeners();
   return normalized;
@@ -15819,9 +16979,11 @@ export const recordMovement = (params: {
 
   const timestamp = new Date().toISOString();
   const dateStr = timestamp.split('T')[0];
-  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+  const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffix}`;
 
   const movement: StockMovementEntry = {
+    id: txnId,
     txnId,
     movementId: txnId,
     date: dateStr,
@@ -15897,6 +17059,43 @@ export const saveCategories = (
     window.dispatchEvent(new Event('saimetric_categories_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_categories_updated', { detail: categories }));
   }
+};
+
+export const deleteCategory = (
+  categoryId: string,
+  options?: { fromSync?: boolean }
+): boolean => {
+  const cleanId = String(categoryId || '').trim();
+  if (!cleanId) return false;
+  const cleanUpper = cleanId.toUpperCase();
+  const stored = getStored<import('../types').InventoryCategory[]>('saimetric_room_categories', DEFAULT_CATEGORIES);
+  const filtered = stored.filter(
+    (c) =>
+      String(c.categoryId || '').trim().toUpperCase() !== cleanUpper &&
+      String(c.categoryName || '').trim().toUpperCase() !== cleanUpper
+  );
+  const removed = filtered.length !== stored.length;
+  if (removed) {
+    setStored('saimetric_room_categories', filtered);
+  }
+  const tomb = recordTombstone('inventory_category', cleanId, options);
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('Categories' as any, 'DELETE', {
+        categoryId: cleanId,
+        id: cleanId,
+        updatedAt: tomb.deletedAt,
+        company_id: getCurrentCompanyId(),
+      });
+    } catch {}
+    dispatchTombstoneThroughSyncCore(tomb);
+  }
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_categories_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_categories_updated', { detail: filtered }));
+  }
+  return removed;
 };
 
 export const ensureCategoryExists = (categoryName: string): void => {
@@ -16032,9 +17231,12 @@ export const receiveStock = (params: {
   addGoodsReceived(grn);
 
   // Log to StockMovement
-  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+  const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffix}`;
   const movement: StockMovementEntry = {
+    id: txnId,
     txnId,
+    movementId: txnId,
     date: dateStr,
     staffId: params.staffId,
     staffName: params.staffName,
@@ -16177,8 +17379,11 @@ export const sellStock = (params: {
     // Log negative SALE movement
     const timestampSale = new Date().toISOString();
     const dateStrSale = timestampSale.split('T')[0];
-    const txnIdSale = `TXN-${dateStrSale.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+    const randSuffixSale = Math.random().toString(36).slice(2, 6).toUpperCase();
+    const txnIdSale = `TXN-${dateStrSale.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffixSale}`;
     addStockMovement({
+      id: txnIdSale,
+      movementId: txnIdSale,
       txnId: txnIdSale,
       date: dateStrSale,
       staffId: params.staffId,
@@ -16272,8 +17477,11 @@ export const sellStock = (params: {
     // Log the Break Case transaction
     const timestampBreak = new Date().toISOString();
     const dateStrBreak = timestampBreak.split('T')[0];
-    const txnIdBreak = `TXN-${dateStrBreak.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+    const randSuffixBreak = Math.random().toString(36).slice(2, 6).toUpperCase();
+    const txnIdBreak = `TXN-${dateStrBreak.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffixBreak}`;
     addStockMovement({
+      id: txnIdBreak,
+      movementId: txnIdBreak,
       txnId: txnIdBreak,
       date: dateStrBreak,
       staffId: params.staffId,
@@ -16320,8 +17528,11 @@ export const sellStock = (params: {
   // Log SALE movement
   const timestampSale = new Date().toISOString();
   const dateStrSale = timestampSale.split('T')[0];
-  const txnIdSale = `TXN-${dateStrSale.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+  const randSuffixSale = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const txnIdSale = `TXN-${dateStrSale.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffixSale}`;
   addStockMovement({
+    id: txnIdSale,
+    movementId: txnIdSale,
     txnId: txnIdSale,
     date: dateStrSale,
     staffId: params.staffId,
@@ -16392,9 +17603,12 @@ export const breakCase = (
 
   const timestamp = new Date().toISOString();
   const dateStr = timestamp.split('T')[0];
-  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+  const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+  const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${item.itemId}-${randSuffix}`;
 
   addStockMovement({
+    id: txnId,
+    movementId: txnId,
     txnId,
     date: dateStr,
     staffId,
@@ -16493,14 +17707,27 @@ export const saveStocktakeSession = (
   return normalized;
 };
 
-export const deleteStocktakeSession = (sessionId: string): boolean => {
-  const sessions = getAllStocktakeSessions();
-  const filtered = sessions.filter((s) => s.sessionId.toUpperCase() !== sessionId.toUpperCase());
-  if (filtered.length !== sessions.length) {
+export const deleteStocktakeSession = (sessionId: string, options?: { fromSync?: boolean }): boolean => {
+  const cleanId = (sessionId || '').trim().toUpperCase();
+  const tomb = recordTombstone('stocktake_session', cleanId, options);
+  const sessions = getRawStoredStocktakeSessions();
+  const filtered = sessions.filter((s) => (s.sessionId || '').trim().toUpperCase() !== cleanId);
+  const removed = filtered.length !== sessions.length;
+  if (removed) {
     setStored(STORAGE_KEYS.STOCKTAKE_SESSIONS, filtered);
-    return true;
+    notifyListeners();
   }
-  return false;
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('StocktakeSessions' as any, 'DELETE', {
+        id: cleanId,
+        sessionId: cleanId,
+        deletedAt: new Date(tomb.deletedAt).toISOString(),
+      });
+    } catch {}
+    dispatchTombstoneThroughSyncCore(tomb);
+  }
+  return removed;
 };
 
 // ============================================================================
@@ -16649,15 +17876,26 @@ export const saveTemporaryCasualAccount = (
   return normalized;
 };
 
-export const deleteTemporaryCasual = (id: string): boolean => {
+export const deleteTemporaryCasual = (id: string, options?: { fromSync?: boolean }): boolean => {
+  const cleanId = (id || '').trim();
+  const tomb = recordTombstone('casual_worker', cleanId, options);
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
-  const filtered = all.filter((c) => c.id !== id);
-  if (filtered.length !== all.length) {
+  const filtered = all.filter((c) => (c.id || '').trim().toUpperCase() !== cleanId.toUpperCase());
+  const removed = filtered.length !== all.length;
+  if (removed) {
     setStored(STORAGE_KEYS.TEMPORARY_CASUALS, filtered);
     notifyListeners();
-    return true;
   }
-  return false;
+  if (!options?.fromSync) {
+    try {
+      enqueueSync('CasualWorkers' as any, 'DELETE', {
+        id: cleanId,
+        deletedAt: new Date(tomb.deletedAt).toISOString(),
+      });
+    } catch {}
+    dispatchTombstoneThroughSyncCore(tomb);
+  }
+  return removed;
 };
 
 export const authenticateCasualWorker = (pin: string): TemporaryCasualAccount | null => {
@@ -18377,8 +19615,10 @@ export const approveAndCommitStocktake = (
         saveInventoryItem(updatedMaster);
 
         // 2. Log StockMovementEntry (ADJUSTMENT)
-        const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${cItem.itemId}`;
+        const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+        const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${cItem.itemId}-${randSuffix}`;
         const movement: StockMovementEntry = {
+          id: txnId,
           txnId,
           movementId: txnId,
           date: dateStr,
@@ -19599,8 +20839,35 @@ export const saveDirectGrv = (
   const brId = (grv as any).branch_id || (grv as any).branchId || currentBranch || 'BR-MAIN';
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
+  const round2 = (v: unknown): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+  };
+  const safeTotalCost = round2((grv as any).totalCost);
+  if (!options?.fromSync && !(grv as any).fromMesh && safeTotalCost > 10_000_000) {
+    throw new Error(
+      `GRV total ($${safeTotalCost.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) exceeds the maximum allowed transaction limit of $10,000,000.00.`
+    );
+  }
+  const safeTotalSelling = round2((grv as any).totalSellingPrice);
+  const safePaidFromDrawer = round2((grv as any).paidFromDrawerAmount);
+  const safeUnpaidBalance = (grv as any).unpaidBalance !== undefined ? round2((grv as any).unpaidBalance) : undefined;
+  const safeItems = Array.isArray((grv as any).items)
+    ? (grv as any).items.map((it: any) => ({
+        ...it,
+        lineTotal: round2(it.lineTotal),
+        costPerCase: round2(it.costPerCase),
+        costPerSingle: round2(it.costPerSingle),
+        sellingPricePerSingle: round2(it.sellingPricePerSingle),
+      }))
+    : (grv as any).items;
   const normalized: DirectGrv = {
     ...grv,
+    items: safeItems,
+    totalCost: safeTotalCost,
+    totalSellingPrice: safeTotalSelling,
+    paidFromDrawerAmount: safePaidFromDrawer,
+    ...(safeUnpaidBalance !== undefined ? { unpaidBalance: safeUnpaidBalance } : {}),
     companyId: compId,
     company_id: compId,
     branchId: brId,
@@ -19862,8 +21129,10 @@ export const approveDirectGrv = (
     });
 
     // 1c. Add StockMovement log
-    const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${invItem.itemId}`;
+    const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${invItem.itemId}-${randSuffix}`;
     addStockMovement({
+      id: txnId,
       txnId,
       movementId: txnId,
       date: dateStr,
@@ -20224,6 +21493,35 @@ export const getRawStoredCashTransfers = (): CashTransfer[] => {
   return Array.isArray(transfers) ? transfers : [];
 };
 
+const isCompanyLevelCashTransfer = (t?: Partial<CashTransfer> | null): boolean => {
+  if (!t) return false;
+  const branch = String(t.branch_id || '').toUpperCase().trim();
+  const target = String(t.target_branch_id || '').toUpperCase().trim();
+  const type = String(t.type || '').toUpperCase().trim();
+  return (
+    branch === 'HQ' ||
+    branch === 'ALL' ||
+    target === 'ALL' ||
+    type === 'HQ_TO_BRANCH' ||
+    type === 'BRANCH_TO_HQ' ||
+    type === 'BANK_DEPOSIT' ||
+    type === 'BANK_WITHDRAWAL' ||
+    type === 'CAPITAL_INFUSION' ||
+    type === 'SUPPLIER_PAYMENT' ||
+    type === 'THIRD_PARTY_PAYOUT'
+  );
+};
+
+const getTransferStatusRank = (status?: string): number => {
+  const s = String(status || '').toUpperCase().trim();
+  if (s === 'DRAFT') return 0;
+  if (s === 'PENDING_APPROVAL' || s === 'PENDING_ACCEPTANCE') return 1;
+  if (s === 'IN_TRANSIT') return 2;
+  if (s === 'APPROVED') return 3;
+  if (s === 'RECEIVED' || s === 'COMPLETED' || s === 'RETURNED' || s === 'CANCELLED' || s === 'REJECTED') return 4;
+  return 0;
+};
+
 export const getAllCashTransfers = (branchId?: string): CashTransfer[] => {
   const all = getRawStoredCashTransfers();
   const currentCompany = getCurrentCompanyId();
@@ -20234,6 +21532,8 @@ export const getAllCashTransfers = (branchId?: string): CashTransfer[] => {
     const compMatch = isCashCompanyMatch(t.company_id, currentCompany);
     if (!compMatch) return false;
     if (targetBranch === 'ALL') return true;
+    // Company/HQ-level transfers (HQ_TO_BRANCH, BRANCH_TO_HQ, BANK_DEPOSIT, etc.) are global across devices/branches
+    if (isCompanyLevelCashTransfer(t)) return true;
     return isRecordInBranchScope(t.branch_id, targetBranch, branches, currentCompany);
   });
 };
@@ -20248,12 +21548,30 @@ export const saveCashTransfer = (
 ): CashTransfer => {
   const all = getRawStoredCashTransfers();
   const currentCompany = getCurrentCompanyId();
-  const index = all.findIndex((t) => t.transfer_id === transfer.transfer_id);
+  const transferKey = String(transfer.transfer_id || (transfer as any).id || '').trim();
+  const index = all.findIndex((t) => String(t.transfer_id || (t as any).id || '').trim() === transferKey);
+
+  const rawAmt = typeof transfer.amount === 'number' ? transfer.amount : parseFloat(String(transfer.amount || '0'));
+  const safeAmt = Number.isFinite(rawAmt) ? Math.round(rawAmt * 100) / 100 : 0;
+  if (!options?.fromSync && !(transfer as any).fromMesh && safeAmt > 10_000_000) {
+    throw new Error(
+      `Transfer amount ($${safeAmt.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) exceeds the maximum allowed limit of $10,000,000.00.`
+    );
+  }
+
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const companyLevel = isCompanyLevelCashTransfer(transfer);
 
   const toSave: CashTransfer = {
     ...transfer,
+    transfer_id: transferKey || transfer.transfer_id,
+    amount: safeAmt,
     company_id: transfer.company_id || currentCompany,
-    created_at: transfer.created_at || new Date().toISOString(),
+    target_branch_id: companyLevel ? 'ALL' : (transfer.target_branch_id || transfer.branch_id),
+    created_at: transfer.created_at || nowIso,
+    updatedAt: (options?.fromSync ? (transfer.updatedAt || nowMs) : nowMs),
+    lastUpdated: (options?.fromSync ? (transfer.lastUpdated || nowIso) : nowIso),
   };
 
   let updated: CashTransfer[];
@@ -20268,9 +21586,177 @@ export const saveCashTransfer = (
   if (!options?.fromSync && !(transfer as any).fromMesh) {
     console.log(`[Row10] Direct enqueue: CashTransfers ${toSave.transfer_id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('CashTransfers' as any, index >= 0 ? 'UPDATE' : 'INSERT', toSave);
+    notifyCashTransferChanged(toSave);
   }
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated', { detail: toSave }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: toSave }));
+  }
   return toSave;
+};
+
+export const ingestMeshCashTransfer = (transfer: CashTransfer): boolean => {
+  if (!transfer || typeof transfer !== 'object') return false;
+  const transferKey = String(transfer.transfer_id || (transfer as any).id || '').trim();
+  if (!transferKey) return false;
+
+  const currentCompany = getCurrentCompanyId();
+  if (transfer.company_id && !isCashCompanyMatch(transfer.company_id, currentCompany)) {
+    return false;
+  }
+
+  const rawAmt = typeof transfer.amount === 'number' ? transfer.amount : parseFloat(String(transfer.amount || '0'));
+  const safeAmt = Number.isFinite(rawAmt) ? Math.round(rawAmt * 100) / 100 : 0;
+  if (safeAmt < 0 || safeAmt > 10_000_000) {
+    console.warn(`[Mesh] 🛡️ Rejected invalid cash transfer amount for ${transferKey}: ${transfer.amount}`);
+    return false;
+  }
+
+  const all = getRawStoredCashTransfers();
+  const existingIdx = all.findIndex((t) => String(t.transfer_id || (t as any).id || '').trim() === transferKey);
+  const existing = existingIdx >= 0 ? all[existingIdx] : undefined;
+
+  if (existing) {
+    const existingRank = getTransferStatusRank(existing.status);
+    const incomingRank = getTransferStatusRank(transfer.status);
+    const sameStatus = String(existing.status || '').toUpperCase() === String(transfer.status || '').toUpperCase();
+    const existingLogs = Array.isArray(existing.linked_cash_log_ids) ? existing.linked_cash_log_ids.length : 0;
+    const incomingLogs = Array.isArray(transfer.linked_cash_log_ids) ? transfer.linked_cash_log_ids.length : 0;
+    const existingTime = parseTimestampMs(existing.updatedAt ?? existing.lastUpdated ?? existing.hubTimestamp ?? existing.created_at);
+    const incomingTime = parseTimestampMs(transfer.updatedAt ?? transfer.lastUpdated ?? transfer.hubTimestamp ?? transfer.created_at);
+
+    // Monotonic guard: do not downgrade a higher status rank
+    if (incomingRank < existingRank) {
+      return false;
+    }
+    // Skip redundant identical status with no newer timestamp/metadata
+    if (sameStatus && incomingLogs <= existingLogs && incomingTime <= existingTime) {
+      return false;
+    }
+  }
+
+  const companyLevel = isCompanyLevelCashTransfer(transfer);
+  const merged: CashTransfer = {
+    ...(existing || {}),
+    ...transfer,
+    transfer_id: transferKey,
+    amount: safeAmt,
+    company_id: transfer.company_id || existing?.company_id || currentCompany,
+    target_branch_id: companyLevel ? 'ALL' : (transfer.target_branch_id || transfer.branch_id || existing?.branch_id),
+  };
+
+  let updated: CashTransfer[];
+  if (existingIdx >= 0) {
+    updated = [...all];
+    updated[existingIdx] = merged;
+  } else {
+    updated = [merged, ...all];
+  }
+  setStored(STORAGE_KEYS.CASH_TRANSFERS, updated);
+
+  // Propagate linked GRV / Supplier Invoice PAID status across devices when transfer settles/approves
+  const stUpper = String(merged.status || '').toUpperCase().trim();
+  if (
+    merged.linked_grv_id &&
+    (stUpper === 'COMPLETED' || stUpper === 'RECEIVED' || stUpper === 'APPROVED')
+  ) {
+    try {
+      const targetGrv = String(merged.linked_grv_id).trim();
+      const paidAtIso = merged.received_at || merged.approved_at || merged.lastUpdated || new Date().toISOString();
+
+      const directGrvs = getAllDirectGrvs();
+      let directGrvChanged = false;
+      const updatedDirectGrvs = directGrvs.map((g) => {
+        if (g.grvNumber === targetGrv || g.id === targetGrv) {
+          if (g.paymentStatus !== 'PAID' || (g as any).paidVoucherId !== merged.transfer_id) {
+            directGrvChanged = true;
+            return {
+              ...g,
+              paymentStatus: 'PAID' as any,
+              unpaidBalance: 0,
+              paidAt: paidAtIso,
+              paidVoucherId: merged.transfer_id,
+              updatedAt: Date.now(),
+              lastUpdated: paidAtIso,
+            };
+          }
+        }
+        return g;
+      });
+      if (directGrvChanged) {
+        setStored(STORAGE_KEYS.DIRECT_GRVS, updatedDirectGrvs);
+      }
+
+      const vouchers = getAllSupplierInvoiceVouchers();
+      vouchers.forEach((v) => {
+        if (v.voucherId === targetGrv || v.invoiceNo === targetGrv) {
+          if ((v as any).paymentStatus !== 'PAID' || (v as any).paidVoucherId !== merged.transfer_id) {
+            saveSupplierInvoiceVoucher(
+              {
+                ...v,
+                paymentStatus: 'PAID',
+                paidAt: paidAtIso,
+                paidVoucherId: merged.transfer_id,
+              } as any,
+              { fromSync: true }
+            );
+          }
+        }
+      });
+
+      const grnNotes = getAllGoodsReceivedNotes();
+      grnNotes.forEach((n) => {
+        if (n.grnNumber === targetGrv || n.id === targetGrv || n.payableId === targetGrv) {
+          if ((n as any).paymentStatus !== 'PAID' || n.status !== 'PAID') {
+            saveGoodsReceivedNote({
+              ...n,
+              status: 'PAID',
+              paymentStatus: 'PAID',
+              paidAt: paidAtIso,
+              paidVoucherId: merged.transfer_id,
+            } as any);
+          }
+        }
+      });
+
+      const legacyGrns = getStored<GoodsReceivedEntry[]>(STORAGE_KEYS.GOODS_RECEIVED, []);
+      let legacyChanged = false;
+      const updatedLegacy = legacyGrns.map((n) => {
+        if (n.grnId === targetGrv || n.grnNumber === targetGrv || n.invoiceNo === targetGrv) {
+          if ((n as any).paymentStatus !== 'PAID') {
+            legacyChanged = true;
+            return {
+              ...n,
+              paymentStatus: 'PAID',
+              paidAt: paidAtIso,
+              paidVoucherId: merged.transfer_id,
+            };
+          }
+        }
+        return n;
+      });
+      if (legacyChanged) {
+        setStored(STORAGE_KEYS.GOODS_RECEIVED, updatedLegacy);
+      }
+    } catch (e) {
+      console.warn('[Mesh] Failed to propagate linked GRV paid status on cash_transfer:', e);
+    }
+  }
+
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated', { detail: merged }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: merged }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: merged }));
+    window.dispatchEvent(new CustomEvent('saimetric_accounts_updated', { detail: merged }));
+    if (merged.linked_grv_id) {
+      window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_supplier_invoices_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
+    }
+  }
+  return true;
 };
 
 // ==================== CASH GOVERNANCE CONFIG ====================

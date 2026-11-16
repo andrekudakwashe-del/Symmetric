@@ -336,6 +336,14 @@ export async function setMeta(key: string, value: any): Promise<void> {
   }
 }
 
+export async function deleteMeta(key: string): Promise<void> {
+  try {
+    await executeTx('meta', 'readwrite', (store) => store.delete(key));
+  } catch (err) {
+    console.warn(`[IDB] deleteMeta(${key}) error:`, err);
+  }
+}
+
 // ==================== SYNC QUEUE STORE ====================
 
 export async function enqueueSyncItem(
@@ -708,5 +716,24 @@ export async function saveTenantContext(record: TenantContextRecord): Promise<vo
     await executeTx('tenantContext', 'readwrite', (store) => store.put(withTimestamp));
   } catch (err) {
     console.warn(`[IDB] Failed to save tenantContext for ${record.company_id}:`, err);
+  }
+}
+
+export async function purgeTenantContextCredentials(company_id?: string): Promise<void> {
+  try {
+    const all = await getAllFromIDBStore<TenantContextRecord>('tenantContext');
+    if (!all || all.length === 0) return;
+    for (const rec of all) {
+      if (!company_id || rec.company_id === company_id) {
+        await executeTx('tenantContext', 'readwrite', (store) =>
+          store.put({
+            ...rec,
+            sheet_id: '',
+          })
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[IDB] Failed to purge tenantContext credentials:', err);
   }
 }

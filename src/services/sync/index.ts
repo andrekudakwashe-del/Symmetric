@@ -3,5 +3,8 @@ export * from './EntityRegistry';
 export * from './SyncAdapter';
 export * from './syncIngestBridge';
 export * from './syncCore';
+export * from './cloudConfigResolver';
 export * from './LocalHubAdapter';
 export * from './AppScriptsAdapter';
+export * from './SupabaseAdapter';
+export * from './MongoDBAdapter';

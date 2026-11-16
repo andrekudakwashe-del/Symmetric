@@ -4,7 +4,7 @@
 import { BackendType, TenantBackendConfig } from './types';
 import { getTenantBackendConfig, getBackendAdapter } from './adapterRegistry';
 import { circuitBreakerFailover } from './circuitBreakerFailover';
-import { getCurrentCompany, getCompanies, getStored, setStored, STORAGE_KEYS } from '../../db/roomDatabase';
+import { getCurrentCompany, getCompanies, getStored, setStored, STORAGE_KEYS, markRecordsCloudSynced } from '../../db/roomDatabase';
 import { SyncQueueItem } from '../../types';
 
 export interface RuntimeDispatchResult {
@@ -124,29 +124,46 @@ export class RuntimeSyncDispatcherService {
   ): Promise<RuntimeDispatchResult> {
     const webhookUrl = config.sheets.webhookUrl || '';
 
-    // If webhook is configured, dispatch via proxy or direct
-    if (webhookUrl && webhookUrl.startsWith('http')) {
-      try {
-        const payload = {
-          webhook_url: webhookUrl,
-          sheetName: item.sheetName,
-          action: item.action,
-          company_id: companyId,
-          tenant_sheet_id: config.sheets.spreadsheetId,
-          data: item.payload,
-          clientRequestId: item.payload?.clientRequestId || item.id,
-          timestamp: new Date().toISOString(),
-        };
+    if (!webhookUrl || !webhookUrl.startsWith('http')) {
+      return {
+        success: false,
+        backendType: 'sheets_appscript',
+        recordsProcessed: 0,
+        latencyMs: Date.now() - startTime,
+        message: 'Google Apps Script webhook URL not configured; retained in offline queue.',
+        error: 'NO_WEBHOOK_CONFIGURED',
+      };
+    }
 
-        const res = await fetch('/api/sheets/sync-row', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(8000),
-        });
+    const payload = {
+      webhook_url: webhookUrl,
+      sheetName: item.sheetName,
+      action: item.action,
+      company_id: companyId,
+      tenant_sheet_id: config.sheets.spreadsheetId,
+      data: item.payload,
+      clientRequestId: item.payload?.clientRequestId || item.id,
+      timestamp: new Date().toISOString(),
+    };
 
-        if (res.ok) {
-          const data = await res.json().catch(() => null);
+    try {
+      const res = await fetch('/api/sheets/sync-row', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (res.status === 200 || res.status === 201 || res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data && data.success !== false && data.status !== 'error') {
+          const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
+          markRecordsCloudSynced(
+            [recId, item.id].filter(Boolean),
+            [payload.clientRequestId].filter(Boolean),
+            item.sheetName,
+            false
+          );
           return {
             success: true,
             backendType: 'sheets_appscript',
@@ -155,38 +172,34 @@ export class RuntimeSyncDispatcherService {
             message: data?.message || 'Dispatched to Google Sheet tab.',
           };
         }
-      } catch (err) {
-        // Fallback: browser fetch (no-cors)
-        try {
-          await fetch(webhookUrl, {
-            method: 'POST',
-            mode: 'no-cors',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({
-              action: item.action,
-              sheet: item.sheetName,
-              company_id: companyId,
-              data: item.payload,
-            }),
-          });
-          return {
-            success: true,
-            backendType: 'sheets_appscript',
-            recordsProcessed: 1,
-            latencyMs: Date.now() - startTime,
-            message: 'Queued to Google Apps Script Webhook.',
-          };
-        } catch (e) {}
+        return {
+          success: false,
+          backendType: 'sheets_appscript',
+          recordsProcessed: 0,
+          latencyMs: Date.now() - startTime,
+          message: data?.error || 'Google Apps Script rejected write.',
+          error: data?.error || 'SCRIPT_REJECTED',
+        };
       }
-    }
 
-    return {
-      success: true,
-      backendType: 'sheets_appscript',
-      recordsProcessed: 1,
-      latencyMs: Date.now() - startTime,
-      message: 'Locally queued for Google Sheets sync when online.',
-    };
+      return {
+        success: false,
+        backendType: 'sheets_appscript',
+        recordsProcessed: 0,
+        latencyMs: Date.now() - startTime,
+        message: `Google Sheets proxy returned HTTP ${res.status}`,
+        error: `HTTP_${res.status}`,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        backendType: 'sheets_appscript',
+        recordsProcessed: 0,
+        latencyMs: Date.now() - startTime,
+        message: err?.message || 'Failed to dispatch to Google Sheets.',
+        error: String(err),
+      };
+    }
   }
 
   /**
@@ -329,7 +342,14 @@ export class RuntimeSyncDispatcherService {
         signal: AbortSignal.timeout(6000),
       });
 
-      if (res.ok || res.status === 201) {
+      if (res.ok || res.status === 200 || res.status === 201) {
+        const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
+        markRecordsCloudSynced(
+          [recId, item.id].filter(Boolean),
+          [item.payload?.clientRequestId].filter(Boolean) as string[],
+          item.sheetName,
+          false
+        );
         return {
           success: true,
           backendType: 'supabase',

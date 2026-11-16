@@ -27,6 +27,8 @@ import {
   acceptTillFloat,
   completeThirdPartyPayout,
   DEFAULT_SUPPLIER_APPROVAL_THRESHOLD,
+  MAX_CUSTODY_TRANSACTION_AMOUNT,
+  isSettledTransferStatus,
   getClerkFloatAccount,
   getBranchSafeAccount,
   getUnpaidGrvsForSafePayment,
@@ -164,14 +166,24 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
     };
     const unsub = subscribeToDatabase(handleUpdate);
     window.addEventListener('saimetric_cash_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_transfers_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_accounts_updated', handleUpdate);
+    window.addEventListener('saimetric_accounts_updated', handleUpdate);
     window.addEventListener('saimetric_cash_movements_updated', handleUpdate);
     window.addEventListener('saimetric_grn_updated', handleUpdate);
+    window.addEventListener('saimetric_direct_grvs_updated', handleUpdate);
+    window.addEventListener('saimetric_supplier_invoices_updated', handleUpdate);
     window.addEventListener('storage', handleUpdate);
     return () => {
       unsub();
       window.removeEventListener('saimetric_cash_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_transfers_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_accounts_updated', handleUpdate);
+      window.removeEventListener('saimetric_accounts_updated', handleUpdate);
       window.removeEventListener('saimetric_cash_movements_updated', handleUpdate);
       window.removeEventListener('saimetric_grn_updated', handleUpdate);
+      window.removeEventListener('saimetric_direct_grvs_updated', handleUpdate);
+      window.removeEventListener('saimetric_supplier_invoices_updated', handleUpdate);
       window.removeEventListener('storage', handleUpdate);
     };
   }, []);
@@ -284,9 +296,13 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
   // Submit Custodial Expense (Safe / Clerk Float)
   const handleRecordCustodialExpenseSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const numAmt = parseFloat(custodialAmount);
-    if (!numAmt || numAmt <= 0) {
+    const numAmt = Math.round(parseFloat(custodialAmount) * 100) / 100;
+    if (!Number.isFinite(numAmt) || numAmt <= 0) {
       showToast('Please enter a valid expense amount greater than 0.', 'error');
+      return;
+    }
+    if (numAmt > MAX_CUSTODY_TRANSACTION_AMOUNT) {
+      showToast('Expense amount exceeds the maximum allowed limit of $10,000,000.00.', 'error');
       return;
     }
     if (!custodialPayee.trim()) {
@@ -439,9 +455,13 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
 
   const handleCreateVoucher = (e: React.FormEvent) => {
     e.preventDefault();
-    const numAmount = parseFloat(amount);
-    if (!numAmount || numAmount <= 0) {
+    const numAmount = Math.round(parseFloat(amount) * 100) / 100;
+    if (!Number.isFinite(numAmount) || numAmount <= 0) {
       showToast('Please enter a valid transfer amount.', 'error');
+      return;
+    }
+    if (numAmount > MAX_CUSTODY_TRANSACTION_AMOUNT) {
+      showToast('Transfer amount exceeds the maximum allowed limit of $10,000,000.00.', 'error');
       return;
     }
 
@@ -549,7 +569,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
       // Tab filter
       if (activeTab === 'pending' && t.status !== 'PENDING_APPROVAL' && t.status !== 'PENDING_ACCEPTANCE') return false;
       if (activeTab === 'in_transit' && t.status !== 'IN_TRANSIT') return false;
-      if (activeTab === 'completed' && t.status !== 'COMPLETED') return false;
+      if (activeTab === 'completed' && !isSettledTransferStatus(t.status)) return false;
 
       // Search filter
       if (searchQuery.trim()) {
@@ -821,7 +841,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
           </div>
           <div>
             <div className="text-xs font-bold text-white mt-1">Issue Float</div>
-            <div className="text-[9px] text-slate-400">Safe $\rightarrow$ Till</div>
+            <div className="text-[9px] text-slate-400">Safe ➔ Till</div>
           </div>
         </button>
 
@@ -864,7 +884,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
           </div>
           <div>
             <div className="text-xs font-bold text-white mt-1">Bank Withdraw</div>
-            <div className="text-[9px] text-slate-400">Bank $\rightarrow$ Safe</div>
+            <div className="text-[9px] text-slate-400">Bank ➔ Safe</div>
           </div>
         </button>
 
@@ -893,7 +913,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
           </div>
           <div>
             <div className="text-xs font-bold text-white mt-1">Send to HQ</div>
-            <div className="text-[9px] text-slate-400">Safe $\rightarrow$ HQ</div>
+            <div className="text-[9px] text-slate-400">Safe ➔ HQ</div>
           </div>
         </button>
 
@@ -962,7 +982,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
                 activeTab === 'completed' ? 'bg-emerald-600 text-white shadow-md' : 'text-slate-400 hover:text-white'
               }`}
             >
-              Completed ({transfers.filter((t) => t.status === 'COMPLETED').length})
+              Completed ({transfers.filter((t) => isSettledTransferStatus(t.status)).length})
             </button>
             <button
               onClick={() => setActiveTab('returned')}
@@ -1038,10 +1058,16 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
 
                     {/* Unboxed Status Display */}
                     <div className="text-[11px] flex items-center space-x-2 mt-1">
-                      {t.status === 'COMPLETED' && (
+                      {isSettledTransferStatus(t.status) && (
                         <span className="text-emerald-400 flex items-center space-x-1">
                           <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>Settled & Reconciled into CashLog</span>
+                          <span>
+                            {t.status === 'RECEIVED'
+                              ? 'Received into Destination Vault'
+                              : t.status === 'APPROVED'
+                              ? 'Owner Approved & Settled'
+                              : 'Settled & Reconciled into CashLog'}
+                          </span>
                         </span>
                       )}
                       {t.status === 'PENDING_APPROVAL' && (
@@ -1069,7 +1095,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
                   <div className="flex items-center justify-between sm:justify-end space-x-3 pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-800">
                     <div className="text-right">
                       <div className="text-base sm:text-lg font-bold font-mono tabular-nums text-white">
-                        ${t.amount.toFixed(2)}
+                        ${(Number(t.amount) || 0).toFixed(2)}
                       </div>
                       <div className="text-[10px] text-slate-500 uppercase">{t.currency}</div>
                     </div>
@@ -1997,8 +2023,8 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
             {/* Explanation of Cash Movements */}
             <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 text-[11px] text-slate-400 space-y-1">
               <div className="font-semibold text-slate-300">💡 How Bank Deposits & Withdrawals Work:</div>
-              <div>• <strong>Bank Deposit:</strong> Physical cash moves from Branch Safe / Vault $\rightarrow$ Commercial Bank. Safe decreases, Bank Balance increases.</div>
-              <div>• <strong>Bank Withdrawal:</strong> Funds move from Commercial Bank $\rightarrow$ Branch Safe to replenish physical cash on hand. Bank Balance decreases, Safe increases.</div>
+              <div>• <strong>Bank Deposit:</strong> Physical cash moves from Branch Safe / Vault ➔ Commercial Bank. Safe decreases, Bank Balance increases.</div>
+              <div>• <strong>Bank Withdrawal:</strong> Funds move from Commercial Bank ➔ Branch Safe to replenish physical cash on hand. Bank Balance decreases, Safe increases.</div>
             </div>
 
             {/* Action buttons */}

@@ -19,6 +19,9 @@ import {
   addSale,
   getSyncQueue,
   getSheetsConfig,
+  getRawStoredSheetsConfig,
+  purgeLocalCloudCredentialsFromStorage,
+  isCloudConfigPurged,
   purgeSyncedRecords,
   onSaleCreated,
   ingestMeshSale,
@@ -39,6 +42,7 @@ import {
   applyTombstone,
   recordTombstone,
   getTombstones,
+  markTombstonesSyncedToHub,
   parseTimestampMs,
   extractRecordTimestamp,
   pullTenantInventory,
@@ -60,6 +64,11 @@ import {
   ingestMeshStaff,
   ingestMeshSupervisorApproval,
   ingestMeshCashLog,
+  onCashLogCreated,
+  onCashLogUpdated,
+  deduplicateCashLogs,
+  normalizeCashLogRecord,
+  healMultiCurrencySalesAndMovements,
   ingestMeshCustomer,
   ingestMeshGRV,
   recordDirectGrvTillPayouts,
@@ -93,6 +102,7 @@ import {
   ingestMeshCreditSale,
   ingestMeshCreditGroup,
   ingestMeshStockMovement,
+  stripStockMovementDupSuffix,
   ingestMeshCashLift,
   ingestMeshGoodsReceived,
   addExpense,
@@ -108,12 +118,14 @@ import {
   saveCashAccount,
   saveBranch,
   saveCashTransfer,
+  ingestMeshCashTransfer,
   getAllExpenses,
   getAllCashAccounts,
   getAllCashTransfers,
   generateInvoiceNumber,
   getNextInvoiceId,
   markSaleAsSynced,
+  markRecordsCloudSynced,
   syncCasualWorkersFromHub,
   syncLockdownFromHub,
   claimZoneSlot,
@@ -133,6 +145,7 @@ import {
   onCustomerChanged,
   onBranchChanged,
   onCashAccountChanged,
+  onCashTransferChanged,
   onExpenseChanged,
   onDirectGrvChanged,
   getPermissionsList,
@@ -196,10 +209,18 @@ import {
 } from './sync/highWaterMarks';
 import { SyncEnvelope, SyncAction, EntitySnapshot } from './sync/SyncEnvelope';
 import { ENTITY_REGISTRY } from './sync/EntityRegistry';
-import { SyncCore } from './sync/syncCore';
+import { SyncCore, normalizeTombstoneEntityType } from './sync/syncCore';
+import { SyncAdapter } from './sync/SyncAdapter';
 import { LocalHubAdapter } from './sync/LocalHubAdapter';
 import { AppScriptsAdapter } from './sync/AppScriptsAdapter';
-import { registerSyncCoreIngestBridge } from './sync/syncIngestBridge';
+import { SupabaseAdapter } from './sync/SupabaseAdapter';
+import { MongoDBAdapter } from './sync/MongoDBAdapter';
+import { getActiveCloudConfig, ActiveDatabaseType } from './sync/cloudConfigResolver';
+import {
+  registerSyncCoreIngestBridge,
+  registerSyncCoreSaveAndSyncBridge,
+  registerTombstoneLookup,
+} from './sync/syncIngestBridge';
 
 export { isPosActiveCheckout };
 
@@ -469,9 +490,13 @@ class MeshSyncManager {
   private lastNotifiedPeerSignature: string = '';
   private lastCatchUpRequestTime: Map<string, number> = new Map();
 
-  // Hexagonal SyncCore & Transport Adapters (LocalHubAdapter exclusively owns WebSocket)
+  // Hexagonal SyncCore & Transport Adapters (LocalHubAdapter exclusively owns WebSocket;
+  // only ONE Cloud Adapter is ever instantiated & active at a time per config.databaseType)
   private localHubAdapter: LocalHubAdapter;
-  private appScriptsAdapter: AppScriptsAdapter;
+  private activeCloudAdapter:
+    | (SyncAdapter & { pause?: () => void; resume?: () => void; isPaused?: () => boolean })
+    | null = null;
+  private activeCloudAdapterType: ActiveDatabaseType | null = null;
   private syncCore: SyncCore;
 
   // Local WebSocket Hub state tracking
@@ -817,18 +842,35 @@ class MeshSyncManager {
 
     // Hexagonal Architecture Initialization: Adapters + SyncCore + Ingest Bridge
     this.localHubAdapter = new LocalHubAdapter();
-    this.appScriptsAdapter = new AppScriptsAdapter();
     this.syncLocalHubContext();
 
+    const cloudAdapter = this.getOrCreateSingleCloudAdapter();
     const initialAdapter =
       this.isLocalHubActive() && !this.isCloudOnlyMode
         ? this.localHubAdapter
-        : this.appScriptsAdapter;
+        : cloudAdapter;
     this.syncCore = new SyncCore(initialAdapter, this.config.deviceId);
+    if (this.isLocalHubActive() && !this.isCloudOnlyMode) {
+      cloudAdapter.pause?.();
+    }
+    this.syncCore.setTombstoneProvider(() => getTombstones());
+    registerTombstoneLookup(() => getTombstones());
 
     registerSyncCoreIngestBridge((envelope, existingRecord, onAcceptedPersist) =>
       this.syncCore.ingest(envelope, existingRecord, onAcceptedPersist)
     );
+    registerSyncCoreSaveAndSyncBridge(async (envelope) => {
+      if (this.isIngestingFromHub) {
+        return { success: false, packetId: envelope.packetId, error: 'INGEST_GUARD_ACTIVE' };
+      }
+      this.seenPacketIds.add(envelope.packetId);
+      this.syncLocalHubContext();
+      this.syncActiveAdapter();
+      const result = await this.syncCore.saveAndSync(envelope);
+      const wirePacket = this.localHubAdapter.envelopeToWirePacket(envelope);
+      this.mirrorToSecondaryP2PTransports(envelope.meta?.topicSuffix || envelope.entityType, wirePacket);
+      return result;
+    });
 
     // Bind LocalHubAdapter exclusive WebSocket lifecycle callbacks
     this.localHubAdapter.onOpenCallback = (hubUrl: string) => {
@@ -852,9 +894,11 @@ class MeshSyncManager {
       );
       playChime();
 
+      const activeSyncStrategy = this.getActiveSyncStrategy();
+
       try {
-        const cfg = getSheetsConfig();
-        const cloudUrl = cfg?.deploymentUrl || '';
+        const cfg = activeSyncStrategy === 'CLOUD_ONLY' ? null : getSheetsConfig();
+        const cloudUrl = activeSyncStrategy === 'CLOUD_ONLY' ? '' : (cfg?.deploymentUrl || '');
         this.localHubAdapter.sendControlPacket({
           type: 'PING_HUB',
           action: 'PING_HUB',
@@ -866,6 +910,16 @@ class MeshSyncManager {
         });
       } catch (e) {
         console.warn('[MeshSync] Error sending PING_HUB:', e);
+      }
+
+      if (activeSyncStrategy === 'HUB_CLOUD') {
+        this.sendAndPurgeCloudConfigIfHubCloud();
+      } else if (activeSyncStrategy === 'CLOUD_ONLY') {
+        this.addLog(
+          'DISCOVERY',
+          'CLOUD_ONLY mode active: Skipping Hub cloud config handshake and keeping local cloud credentials.',
+          this.config.deviceName
+        );
       }
 
       try {
@@ -1019,12 +1073,20 @@ class MeshSyncManager {
 
     // Auto-hook into POS Sales: broadcast in real-time
     onSaleCreated((sale: SaleInvoice) => {
-      this.broadcastSale(sale);
+      this.broadcastSale(sale).catch(() => {});
     });
 
     // Auto-hook into POS Sales updates (Refunds, Voids, Item Exchanges): broadcast in real-time
-    onSaleUpdated((sale: SaleInvoice) => {
-      this.broadcastSaleUpdate(sale);
+    onSaleUpdated((sale: SaleInvoice, extraCashLogs?: CashLogEntry[]) => {
+      this.broadcastSaleUpdate(sale, extraCashLogs).catch(() => {});
+    });
+
+    // Auto-hook into Form 2 Cash Logs (Refunds, Voids, Sale Deposits, Manual Entries)
+    onCashLogCreated((log: CashLogEntry) => {
+      this.broadcastCashLog(log, 'APPEND');
+    });
+    onCashLogUpdated((log: CashLogEntry) => {
+      this.broadcastCashLog(log, 'UPSERT');
     });
 
     // Auto-hook into Staff creation & edits: broadcast to Local Hub & mesh
@@ -1062,6 +1124,11 @@ class MeshSyncManager {
     // Auto-hook into Cash Account creation & edits: broadcast to Local Hub & mesh
     onCashAccountChanged((account: any) => {
       this.broadcastCashAccount(account);
+    });
+
+    // Auto-hook into Cash Transfer creation & state transitions: broadcast to Local Hub & mesh
+    onCashTransferChanged((transfer: any) => {
+      this.broadcastCashTransfer(transfer);
     });
 
     // Auto-hook into Cash Drawer Movements: broadcast in real-time so cash balances across devices
@@ -1138,7 +1205,8 @@ class MeshSyncManager {
     if (typeof window !== 'undefined') {
       window.setInterval(() => {
         if (this.isLocalHubActive() && !this.isCloudOnlyMode) return;
-        if (this.appScriptsAdapter.isPaused()) return;
+        const cloudAdapter = this.getOrCreateSingleCloudAdapter();
+        if (cloudAdapter.isPaused?.() || getActiveCloudConfig().databaseType !== 'appscripts') return;
         pullTenantInventory().catch(() => {});
       }, 180000);
     }
@@ -1502,23 +1570,262 @@ class MeshSyncManager {
   }
 
   /**
+   * Strict Single-Cloud Adapter Factory (Part A: No Data Racing).
+   * Ensures ONLY ONE Cloud Adapter matching `config.databaseType` is instantiated and active at a time.
+   * Any previous non-matching Cloud Adapter is paused/disconnected and dereferenced.
+   */
+  private getOrCreateSingleCloudAdapter(): SyncAdapter & {
+    pause?: () => void;
+    resume?: () => void;
+    isPaused?: () => boolean;
+  } {
+    const { databaseType } = getActiveCloudConfig();
+    if (this.activeCloudAdapter && this.activeCloudAdapterType === databaseType) {
+      return this.activeCloudAdapter;
+    }
+
+    if (this.activeCloudAdapter) {
+      try {
+        this.activeCloudAdapter.pause?.();
+        void this.activeCloudAdapter.disconnect();
+      } catch {}
+      this.activeCloudAdapter = null;
+    }
+
+    this.activeCloudAdapterType = databaseType;
+
+    if (databaseType === 'supabase') {
+      this.activeCloudAdapter = new SupabaseAdapter();
+    } else if (databaseType === 'mongodb') {
+      this.activeCloudAdapter = new MongoDBAdapter();
+    } else if (databaseType === 'appscripts') {
+      this.activeCloudAdapter = new AppScriptsAdapter();
+    } else {
+      // Passive disabled adapter for 'room' / 'none' / 'firebase' when LocalHub is off
+      this.activeCloudAdapter = {
+        name: `DisabledCloudAdapter(${databaseType})`,
+        pause: () => {},
+        resume: () => {},
+        isPaused: () => true,
+        broadcast: async (envelope) => ({
+          success: false,
+          packetId: envelope.packetId,
+          error: `Cloud adapter disabled for databaseType=${databaseType}`,
+        }),
+        onReceive: () => () => {},
+        connect: async () => {},
+        disconnect: async () => {},
+        isConnected: () => false,
+        requestCatchUp: async () => ({ envelopes: [], cutoffTimestamp: Date.now() }),
+        drainOfflineQueue: async () => {},
+      };
+    }
+
+    return this.activeCloudAdapter;
+  }
+
+  /**
    * Hexagonal Switch:
    * - If Local Hub is active (and not Cloud-Only), route all outbound sync to LocalHubAdapter
-   *   and completely pause AppScriptsAdapter to stop Ghost Overwrites of passwords/config.
-   * - Otherwise, route all outbound sync to AppScriptsAdapter and resume Cloud sync.
+   *   and completely pause the active Cloud Adapter to stop Ghost Overwrites & Dual-Racing.
+   * - Otherwise, route all outbound sync to the SINGLE Cloud Adapter matching config.databaseType.
    */
   private syncActiveAdapter(): void {
     if (!this.syncCore) return;
     this.syncLocalHubContext();
+    const cloudAdapter = this.getOrCreateSingleCloudAdapter();
     const useLocalHub = this.isLocalHubActive() && !this.isCloudOnlyMode;
     if (useLocalHub) {
       this.syncCore.setAdapter(this.localHubAdapter);
-      this.appScriptsAdapter.pause();
+      cloudAdapter.pause?.();
       pauseCloudSync();
     } else {
-      this.syncCore.setAdapter(this.appScriptsAdapter);
-      this.appScriptsAdapter.resume();
-      resumeCloudSync();
+      this.syncCore.setAdapter(cloudAdapter);
+      cloudAdapter.resume?.();
+      if (this.activeCloudAdapterType === 'appscripts') {
+        resumeCloudSync();
+      } else {
+        pauseCloudSync();
+      }
+    }
+  }
+
+  private getActiveSyncStrategy(): 'HUB_CLOUD' | 'HUB_ONLY' | 'CLOUD_ONLY' {
+    try {
+      const comp = getCurrentCompany();
+      if (this.isCloudOnlyMode || LocalHubConfig.isCloudOnlyMode() || comp?.sync_strategy === 'CLOUD_ONLY') {
+        return 'CLOUD_ONLY';
+      }
+      if (comp?.sync_strategy === 'HUB_ONLY') {
+        return 'HUB_ONLY';
+      }
+    } catch {}
+    return 'HUB_CLOUD';
+  }
+
+  private buildGenericCloudConfigPacket(): {
+    strategy: 'HUB_CLOUD';
+    databaseType: string;
+    credentials: Record<string, any>;
+    companyId?: string;
+  } | null {
+    try {
+      const comp: any = getCurrentCompany();
+      const backendCfg: any = comp?.backend_config || {};
+      const rawType = String(backendCfg?.backendType || comp?.backend_type || '').toLowerCase().trim();
+      const rawSheets = getRawStoredSheetsConfig() as any;
+      const alreadyPurged = isCloudConfigPurged();
+
+      // 1. Check MongoDB credentials
+      const mongoCfg = backendCfg?.mongodb || {};
+      const mongoUri = String(
+        mongoCfg?.mongoUri ||
+          mongoCfg?.uri ||
+          (typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_mongo_uri') : '') ||
+          ''
+      ).trim();
+      if (rawType === 'mongodb' || mongoUri) {
+        const credentials: Record<string, any> = {
+          mongoUri,
+          ...(mongoCfg?.url ? { url: String(mongoCfg.url).trim() } : {}),
+          ...(mongoCfg?.apiKey ? { apiKey: String(mongoCfg.apiKey).trim() } : {}),
+          ...(mongoCfg?.database ? { database: String(mongoCfg.database).trim() } : {}),
+        };
+        if (mongoUri || credentials.url || credentials.apiKey) {
+          return {
+            strategy: 'HUB_CLOUD',
+            databaseType: 'mongodb',
+            credentials,
+            companyId: comp?.company_id,
+          };
+        }
+      }
+
+      // 2. Check Supabase credentials
+      const sbCfg = backendCfg?.supabase || {};
+      const sbUrl = String(
+        sbCfg?.projectUrl ||
+          sbCfg?.url ||
+          (typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_supabase_url') : '') ||
+          ''
+      ).trim();
+      const sbApiKey = String(
+        sbCfg?.serviceRoleKey ||
+          sbCfg?.anonKey ||
+          sbCfg?.apiKey ||
+          (typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_supabase_key') : '') ||
+          ''
+      ).trim();
+      if (rawType === 'supabase' || (sbUrl && sbApiKey)) {
+        if (sbUrl || sbApiKey) {
+          return {
+            strategy: 'HUB_CLOUD',
+            databaseType: 'supabase',
+            credentials: {
+              url: sbUrl,
+              apiKey: sbApiKey,
+              ...(sbCfg?.anonKey ? { anonKey: String(sbCfg.anonKey).trim() } : {}),
+              ...(sbCfg?.serviceRoleKey ? { serviceRoleKey: String(sbCfg.serviceRoleKey).trim() } : {}),
+              ...(sbCfg?.schema ? { schema: String(sbCfg.schema).trim() } : {}),
+            },
+            companyId: comp?.company_id,
+          };
+        }
+      }
+
+      // 3. Check Firebase credentials
+      const fbCfg = backendCfg?.firebase || {};
+      const fbProjectId = String(fbCfg?.projectId || '').trim();
+      const fbApiKey = String(fbCfg?.apiKey || '').trim();
+      if (rawType === 'firebase' || fbProjectId || fbApiKey) {
+        if (fbProjectId || fbApiKey) {
+          return {
+            strategy: 'HUB_CLOUD',
+            databaseType: 'firebase',
+            credentials: {
+              ...(fbCfg?.databaseURL ? { url: String(fbCfg.databaseURL).trim() } : {}),
+              apiKey: fbApiKey,
+              projectId: fbProjectId,
+              ...(fbCfg?.appId ? { appId: String(fbCfg.appId).trim() } : {}),
+              ...(fbCfg?.authDomain ? { authDomain: String(fbCfg.authDomain).trim() } : {}),
+              ...(fbCfg?.firestoreRegion ? { firestoreRegion: String(fbCfg.firestoreRegion).trim() } : {}),
+              ...(fbCfg?.databaseId ? { databaseId: String(fbCfg.databaseId).trim() } : {}),
+            },
+            companyId: comp?.company_id,
+          };
+        }
+      }
+
+      // 4. Check Apps Script / Google Sheets credentials (avoid re-sending empty defaults if already purged)
+      const sheetsCfg = backendCfg?.sheets || {};
+      const activeSheetsCfg = alreadyPurged ? null : getSheetsConfig();
+      const webhookUrl = String(
+        sheetsCfg?.webhookUrl ||
+          comp?.webhook_url ||
+          rawSheets?.deploymentUrl ||
+          rawSheets?.webhookUrl ||
+          (!alreadyPurged ? activeSheetsCfg?.webhookUrl || '' : '')
+      ).trim();
+      const masterWebhookUrl = String(
+        sheetsCfg?.masterWebhookUrl ||
+          rawSheets?.masterWebhookUrl ||
+          (!alreadyPurged ? activeSheetsCfg?.masterWebhookUrl || '' : '')
+      ).trim();
+      const spreadsheetId = String(
+        sheetsCfg?.spreadsheetId ||
+          comp?.sheet_id ||
+          rawSheets?.spreadsheetId ||
+          (!alreadyPurged ? activeSheetsCfg?.spreadsheetId || '' : '')
+      ).trim();
+      const sheetFolderId = String(sheetsCfg?.sheetFolderId || comp?.sheet_folder_id || '').trim();
+
+      if (webhookUrl || masterWebhookUrl || spreadsheetId) {
+        return {
+          strategy: 'HUB_CLOUD',
+          databaseType: 'appscripts',
+          credentials: {
+            url: webhookUrl || masterWebhookUrl,
+            ...(masterWebhookUrl ? { masterWebhookUrl } : {}),
+            ...(spreadsheetId ? { spreadsheetId } : {}),
+            ...(sheetFolderId ? { sheetFolderId } : {}),
+            isolationMode: sheetsCfg?.isolationMode || comp?.branch_isolation_mode || 'ROW_LEVEL',
+          },
+          companyId: comp?.company_id,
+        };
+      }
+    } catch (err) {
+      console.warn('[MeshSync] Error reading cloud configuration for Hub handshake:', err);
+    }
+    return null;
+  }
+
+  private sendAndPurgeCloudConfigIfHubCloud(): void {
+    const strategy = this.getActiveSyncStrategy();
+    if (strategy !== 'HUB_CLOUD') {
+      return;
+    }
+
+    const config = this.buildGenericCloudConfigPacket();
+    if (!config) {
+      return;
+    }
+
+    const sent = this.localHubAdapter.sendControlPacket({
+      type: 'SYNC_CLOUD_CONFIG',
+      action: 'SYNC_CLOUD_CONFIG',
+      config,
+      deviceId: this.config.deviceId,
+      deviceName: this.config.deviceName,
+      timestamp: Date.now(),
+    });
+
+    if (sent) {
+      purgeLocalCloudCredentialsFromStorage(config.companyId);
+      this.addLog(
+        'CLOUD_SYNC',
+        `Synced encrypted cloud config (${config.databaseType}) to Local Hub and purged local PWA credentials.`,
+        this.config.deviceName
+      );
     }
   }
 
@@ -1865,7 +2172,8 @@ class MeshSyncManager {
         );
       case 'cash_transfer':
         return getRawStoredCashTransfers().find(
-          (t: any) => String(t.id || '').trim().toUpperCase() === cleanUpper
+          (t: any) =>
+            String(t.transfer_id || t.id || '').trim().toUpperCase() === cleanUpper
         );
       case 'stock_movement':
         return getRawStoredStockMovements().find(
@@ -1928,6 +2236,10 @@ class MeshSyncManager {
         console.warn(
           `[SyncCore LWW] 🛡️ Blocked stale T2 [${envelope.entityType}:${envelope.entityId}] from hitting RoomDatabase.`
         );
+      } else if (result.reason === 'RESURRECTION_BLOCKED') {
+        console.warn(
+          `[SyncCore Resurrection Guard] 🪦 Blocked resurrection of [${envelope.entityType}:${envelope.entityId}] from ${originName}.`
+        );
       }
       return false;
     }
@@ -1951,11 +2263,18 @@ class MeshSyncManager {
     const ttl = unwrapped.ttl || 5;
 
     if (envelope.action === 'DELETE') {
-      if (envelope.entityType === 'inventory_item' && envelope.entityId) {
-        ingestMeshInventoryDelete(envelope.entityId, packetComp);
+      if (envelope.entityId) {
+        if (envelope.entityType === 'inventory_item') {
+          ingestMeshInventoryDelete(envelope.entityId, packetComp);
+        }
+        applyTombstone({
+          entityType: envelope.entityType,
+          entityId: envelope.entityId,
+          deletedAt: envelope.updatedAt || Date.now(),
+        });
         this.addLog(
           'EPIDEMIC_HOP',
-          `Item record [${envelope.entityId}] deleted on peer ${originName}. Deletion synced across local mesh!`,
+          `Record [${envelope.entityType}:${envelope.entityId}] deleted on peer ${originName}. Deletion synced across local mesh!`,
           originName,
           this.config.deviceName
         );
@@ -1983,15 +2302,33 @@ class MeshSyncManager {
         this.knownSaleIds.add(saleId);
         this.broadcastedInvoiceIds.add(saleId);
 
+        const attachedLogs: CashLogEntry[] = Array.isArray(d.reversalCashLogs)
+          ? d.reversalCashLogs
+          : Array.isArray(unwrapped.reversalCashLogs)
+          ? unwrapped.reversalCashLogs
+          : [];
+        const cleanSaleData: any = { ...d };
+        if ('reversalCashLogs' in cleanSaleData) {
+          delete cleanSaleData.reversalCashLogs;
+        }
+
         const ingested = ingestMeshSale({
-          ...d,
+          ...cleanSaleData,
           id: saleId,
           company_id: this.config.companyId,
-          branch_id: d.branch_id || d.branchId || this.config.branchId,
+          branch_id: cleanSaleData.branch_id || cleanSaleData.branchId || this.config.branchId,
           fromMesh: true,
         } as any);
 
-        if (ingested && !isSilent) {
+        if (attachedLogs.length > 0) {
+          attachedLogs.forEach((cl) => {
+            if (cl && typeof cl === 'object') {
+              ingestMeshCashLog({ ...cl, fromMesh: true } as any);
+            }
+          });
+        }
+
+        if ((ingested || attachedLogs.length > 0) && !isSilent) {
           if (typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
             window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -2191,13 +2528,11 @@ class MeshSyncManager {
         break;
 
       case 'cash_transfer':
-        if (d) {
-          saveCashTransfer(d, { fromSync: true });
-          if (!isSilent && typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated', { detail: d }));
-            window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
-            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
-          }
+        if (d && ingestMeshCashTransfer(d) && !isSilent && typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated', { detail: d }));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: d }));
+          window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         }
         break;
 
@@ -2400,7 +2735,10 @@ class MeshSyncManager {
 
       case 'tombstone':
         if (d && d.entityId && d.entityType) {
-          applyTombstone(d);
+          applyTombstone({
+            ...d,
+            deletedAt: d.deletedAt ?? envelope.updatedAt ?? envelope.hubTimestamp,
+          });
         }
         break;
 
@@ -2622,10 +2960,17 @@ class MeshSyncManager {
     }
 
     if (pTypeUpper === 'T1_CLOUD_SYNC_ACK') {
+      const ackId = String(packet.id || packet.invoice_id || packet.grvNumber || '').trim();
+      if (ackId) {
+        markRecordsCloudSynced([ackId], [], packet.entityType, true);
+        if (/^INV-/i.test(ackId) || String(packet.entityType || '').toUpperCase() === 'SALE') {
+          this.pendingSaleAcks.delete(ackId);
+        }
+      }
       if (typeof window !== 'undefined') {
         window.dispatchEvent(
           new CustomEvent('saimetric_cloud_sync_ack', {
-            detail: { entityType: packet.entityType, id: packet.id },
+            detail: { entityType: packet.entityType, id: packet.id, isCloudSynced: true },
           })
         );
       }
@@ -2633,6 +2978,14 @@ class MeshSyncManager {
     }
 
     if (pTypeUpper === 'INVENTORY_SNAPSHOT_RESPONSE') {
+      const snapTombstones = packet.tombstones;
+      if (Array.isArray(snapTombstones) && snapTombstones.length > 0) {
+        for (const tomb of snapTombstones) {
+          if (tomb && tomb.entityId && tomb.entityType) {
+            applyTombstone(tomb);
+          }
+        }
+      }
       const items = packet.items || packet.payload;
       if (Array.isArray(items)) {
         for (const it of items) {
@@ -2651,7 +3004,7 @@ class MeshSyncManager {
           void this.ingestEnvelopeThroughSyncCore(snapEnv, 'Local Hub Snapshot', { isReconBackfill: true });
         }
         recalculateInventoryValuationOnce();
-        console.log(`[Snapshot Heartbeat] 📸 Ingested authoritative inventory snapshot of ${items.length} items via SyncCore`);
+        console.log(`[Snapshot Heartbeat] 📸 Ingested authoritative inventory snapshot of ${items.length} items (${Array.isArray(snapTombstones) ? snapTombstones.length : 0} tombstones) via SyncCore`);
       }
       return;
     }
@@ -3238,14 +3591,22 @@ class MeshSyncManager {
         );
       }
 
-      if (pausedForeignCount > 0 && !this.appScriptsAdapter.isPaused()) {
-        this.appScriptsAdapter.drainOfflineQueue().catch(() => {});
+      const singleCloud = this.getOrCreateSingleCloudAdapter();
+      if (pausedForeignCount > 0 && !singleCloud.isPaused?.()) {
+        singleCloud.drainOfflineQueue().catch(() => {});
       }
 
       // 2. Scan local database for offline sales matching this Hub's branch
+      // Include records that already synced directly to cloud (isCloudSynced: true) while Hub was offline
+      // so Hub stores them locally with isCloudSynced: true, skips duplicate cloud push, and ACKs handoff!
       const allSales = getAllSales();
       const unsyncedSales = allSales.filter(
-        (s) => s && s.id && !(s as any).fromMesh && !s.synced && s.syncStatus !== 'synced'
+        (s) =>
+          s &&
+          s.id &&
+          !(s as any).fromMesh &&
+          !(s as any).syncedToHub &&
+          (!s.synced || s.syncStatus !== 'synced' || (s as any).isCloudSynced === true)
       );
 
       const branchMatchedSales = unsyncedSales.filter((s) => {
@@ -3266,7 +3627,7 @@ class MeshSyncManager {
         );
 
         for (const sale of branchMatchedSales) {
-          if (!/^INV-/i.test(sale.id)) {
+          if (!/^INV-/i.test(sale.id) && !sale.synced) {
             this.pendingSaleAcks.set(sale.id, {
               sale,
               sentAt: Date.now(),
@@ -3275,16 +3636,18 @@ class MeshSyncManager {
             });
           }
 
+          const saleIsCloudSynced = (sale as any).isCloudSynced === true;
           const saleEnvelope: SyncEnvelope = {
             packetId: `OFFLINE-FLUSH-${sale.id}-${Date.now()}`,
             entityType: 'sale',
             entityId: sale.id,
             action: 'APPEND',
-            data: sale,
+            data: saleIsCloudSynced ? { ...sale, isCloudSynced: true } : sale,
             updatedAt: sale.timestamp || Date.now(),
             originDeviceId: this.config.deviceId,
             targetBranchId: currentHubBranch,
             class: 'T1',
+            ...(saleIsCloudSynced ? { isCloudSynced: true } : {}),
             meta: {
               wireAction: 'SALE_RECORD',
               isOfflineCatchup: true,
@@ -3305,12 +3668,12 @@ class MeshSyncManager {
           `Data Isolation: ${foreignBranchSales.length} offline sale(s) belong to other branches. Paused for Local Hub.`,
           this.config.deviceName
         );
-        if (!this.appScriptsAdapter.isPaused()) {
-          this.appScriptsAdapter.drainOfflineQueue().catch(() => {});
+        if (!singleCloud.isPaused?.()) {
+          singleCloud.drainOfflineQueue().catch(() => {});
         }
       }
 
-      // 3. Scan for offline Direct GRVs matching this Hub's branch
+      // 3. Scan for offline Direct GRVs matching this Hub's branch (carrying isCloudSynced flag if already pushed to cloud)
       const allGrvs = getDirectGrvs();
       const offlineGrvs = allGrvs.filter(
         (g) => g && g.grvNumber && !(g as any).fromMesh && !(g as any).syncedToHub
@@ -3322,23 +3685,101 @@ class MeshSyncManager {
 
       if (branchMatchedGrvs.length > 0) {
         for (const grv of branchMatchedGrvs) {
+          const grvCloudSynced = (grv as any).isCloudSynced === true;
           (grv as any).syncedToHub = true;
           const grvEnvelope: SyncEnvelope = {
             packetId: `OFFLINE-GRV-${grv.grvNumber}-${Date.now()}`,
             entityType: 'direct_grv',
             entityId: grv.grvNumber || grv.id,
             action: 'APPEND',
-            data: grv,
+            data: grvCloudSynced ? { ...grv, isCloudSynced: true } : grv,
             updatedAt: grv.createdAt ? new Date(grv.createdAt).getTime() : Date.now(),
             originDeviceId: this.config.deviceId,
             targetBranchId: currentHubBranch,
             class: 'T1',
+            ...(grvCloudSynced ? { isCloudSynced: true } : {}),
             meta: { isOfflineCatchup: true },
           };
           try {
             await this.localHubAdapter.broadcast(grvEnvelope);
           } catch (_) {}
         }
+      }
+
+      // 3b. Scan for other offline T1 records (Expenses, Cash Logs, Credit Sales, Customer Changes, Cash Lifts)
+      // that either haven't synced to Hub yet or were cloud-synced offline and need Dual-Writer handoff
+      const flushT1List = async (
+        records: any[],
+        entityType: string,
+        prefix: string,
+        getId: (r: any) => string
+      ) => {
+        for (const rec of records) {
+          const recId = getId(rec);
+          if (!rec || !recId || rec.fromMesh || rec.fromSync || rec.syncedToHub) continue;
+          const rBranch = String(rec.branchId || rec.branch_id || '').trim().toUpperCase();
+          if (rBranch && rBranch !== 'ALL' && rBranch !== currentHubBranch.toUpperCase()) continue;
+          const recCloudSynced = rec.isCloudSynced === true;
+          if (rec.synced && !recCloudSynced) continue;
+          rec.syncedToHub = true;
+          const env: SyncEnvelope = {
+            packetId: `${prefix}-${recId}-${Date.now()}`,
+            entityType,
+            entityId: recId,
+            action: 'APPEND',
+            data: recCloudSynced ? { ...rec, isCloudSynced: true } : rec,
+            updatedAt: parseTimestampMs(rec.updatedAt || rec.timestamp || rec.createdAt) || Date.now(),
+            originDeviceId: this.config.deviceId,
+            targetBranchId: currentHubBranch,
+            class: 'T1',
+            ...(recCloudSynced ? { isCloudSynced: true } : {}),
+            meta: { isOfflineCatchup: true },
+          };
+          try {
+            await this.localHubAdapter.broadcast(env);
+          } catch (_) {}
+        }
+      };
+
+      await flushT1List(getRawStoredExpenses(), 'expense', 'OFFLINE-EXP', (e) => String(e?.id || ''));
+      await flushT1List(getRawStoredCashLogs(), 'cash_log', 'OFFLINE-CL', (c) => String(c?.id || ''));
+      await flushT1List(getRawStoredCreditSales(), 'credit_sale', 'OFFLINE-CR', (c) => String(c?.id || c?.creditId || ''));
+      await flushT1List(getRawStoredCustomerChanges(), 'customer_change', 'OFFLINE-CHG', (c) => String(c?.id || c?.changeId || ''));
+      await flushT1List(getRawStoredCashLifts(), 'cash_lift', 'OFFLINE-CLIFT', (l) => String(l?.id || l?.liftId || ''));
+      for (const tr of getRawStoredCashTransfers()) {
+        const tId = String(tr?.transfer_id || (tr as any)?.id || '');
+        if (!tId) continue;
+        const rBranch = String(tr?.branch_id || '').trim().toUpperCase();
+        const rTarget = String(tr?.target_branch_id || '').trim().toUpperCase();
+        const isGlobalTr =
+          rBranch === 'HQ' ||
+          rBranch === 'ALL' ||
+          rTarget === 'ALL' ||
+          tr?.type === 'HQ_TO_BRANCH' ||
+          tr?.type === 'BRANCH_TO_HQ' ||
+          tr?.type === 'BANK_DEPOSIT' ||
+          tr?.type === 'BANK_WITHDRAWAL' ||
+          tr?.type === 'CAPITAL_INFUSION' ||
+          tr?.type === 'SUPPLIER_PAYMENT' ||
+          tr?.type === 'THIRD_PARTY_PAYOUT';
+        if (!isGlobalTr && rBranch && rBranch !== 'ALL' && rBranch !== currentHubBranch.toUpperCase()) continue;
+        if ((tr as any).synced && (tr as any).isCloudSynced !== true) continue;
+        const env: SyncEnvelope = {
+          packetId: `OFFLINE-TRF-${tId}-${Date.now()}`,
+          entityType: 'cash_transfer',
+          entityId: tId,
+          action: tr?.status && tr.status !== 'DRAFT' ? 'UPSERT' : 'APPEND',
+          data: { ...tr, target_branch_id: isGlobalTr ? 'ALL' : (tr?.branch_id || currentHubBranch) },
+          updatedAt: parseTimestampMs(tr?.updatedAt || tr?.lastUpdated || tr?.created_at) || Date.now(),
+          originDeviceId: this.config.deviceId,
+          targetBranchId: isGlobalTr ? 'ALL' : (tr?.branch_id || currentHubBranch),
+          class: 'T1',
+          ...((tr as any)?.isCloudSynced === true ? { isCloudSynced: true } : {}),
+          meta: { isOfflineCatchup: true },
+        };
+        try {
+          await this.localHubAdapter.broadcast(env);
+        } catch (_) {}
       }
 
       // 4. Staff Delta Sync on reconnect (replaces Staff Firehose with high-water-mark deltas)
@@ -3454,6 +3895,41 @@ class MeshSyncManager {
         }
       }
 
+      // 4.7 Tombstones Delta Sync on reconnect (guarantees offline deletions always reach the Hub)
+      const normTombTenant = (c?: string) =>
+        !c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase();
+      const unsyncedTombstones = getTombstones().filter((t) => {
+        if (!t || !t.entityId || !t.entityType) return false;
+        if (t.syncedToHub) return false;
+        if (t.company_id && this.config.companyId && normTombTenant(t.company_id) !== normTombTenant(this.config.companyId)) {
+          return false;
+        }
+        return true;
+      });
+      if (unsyncedTombstones.length > 0) {
+        console.log(`[TombstoneSync] Flushing ${unsyncedTombstones.length} unsynced local tombstone(s) to Local Hub on reconnect`);
+        for (const tomb of unsyncedTombstones) {
+          const cleanId = String(tomb.entityId).trim();
+          const tombTs = tomb.deletedAt || Date.now();
+          void this.localHubAdapter.broadcast({
+            packetId: `TOMB-FLUSH-${tomb.entityType}-${cleanId}-${tombTs}`,
+            entityType: 'tombstone',
+            entityId: cleanId,
+            action: 'APPEND',
+            data: tomb,
+            updatedAt: tombTs,
+            originDeviceId: this.config.deviceId,
+            targetBranchId: 'ALL',
+            class: 'T1',
+            meta: {
+              topicSuffix: 'tombstone',
+              companyId: tomb.company_id || this.config.companyId,
+              isReconPush: true,
+            },
+          });
+        }
+      }
+
       // 5. Flush-Before-Pull: Signal DRAIN_COMPLETE_PING to Local Hub
       this.isAwaitingDrainAck = true;
       const pingPacket = {
@@ -3556,6 +4032,11 @@ class MeshSyncManager {
           lastUpdated,
         };
         setStored(STORAGE_KEYS.DIRECT_GRVS, all);
+      }
+    } else if (entityType === 'TOMBSTONE') {
+      const ackIds = [packet.id, packet.entityId, packet.recordId].filter(Boolean);
+      if (ackIds.length > 0) {
+        markTombstonesSyncedToHub(ackIds, packet.targetEntityType);
       }
     }
   }
@@ -3717,10 +4198,11 @@ class MeshSyncManager {
       } catch (err: any) {
         console.warn('[Auto-Heal] Error dispatching sweep trigger to Local Hub:', err?.message);
       }
-    } else if (mode === 'CLOUD_ONLY_APPSCRIPTS') {
-      if (this.appScriptsAdapter.isPaused()) return;
-      console.log('[Auto-Heal] ☁️ Running 4-hour throttled Cloud sweep for App Scripts.');
-      this.appScriptsAdapter.drainOfflineQueue().catch(() => {});
+    } else if (mode === 'CLOUD_ONLY_APPSCRIPTS' || mode === 'CLOUD_ONLY_SUPABASE') {
+      const cloudAdapter = this.getOrCreateSingleCloudAdapter();
+      if (cloudAdapter.isPaused?.()) return;
+      console.log(`[Auto-Heal] ☁️ Running 4-hour throttled Cloud sweep for ${getActiveCloudConfig().databaseType}.`);
+      cloudAdapter.drainOfflineQueue().catch(() => {});
     }
   }
 
@@ -3894,8 +4376,7 @@ class MeshSyncManager {
         );
         const recTs =
           extractRecordTimestamp(rec) ||
-          parseTimestampMs(rec.hubTimestamp ?? rec.updatedAt ?? rec.timestamp) ||
-          Date.now();
+          parseTimestampMs(rec.hubTimestamp ?? rec.updatedAt ?? rec.timestamp);
         const envelope: SyncEnvelope = {
           packetId: `RECON-${sweepId}-${canonEntity}-${recId}-${recTs}-${start + idx}`,
           entityType: canonEntity,
@@ -4071,17 +4552,32 @@ class MeshSyncManager {
           pushedCount++;
         }
       } else if (entityType === 'stock_movements' || entityType === 'stock_movement') {
-        const rec = getRawStoredStockMovements().find(
+        const allMoves = getRawStoredStockMovements();
+        const rec = allMoves.find(
           (m: any) => String(m.id || m.txnId || m.movementId || '').trim().toUpperCase() === cleanUpper
         );
         if (rec) {
+          const recId = String((rec as any).id || rec.movementId || rec.txnId || cleanId).trim();
+          const baseId = stripStockMovementDupSuffix(recId);
+          // Never push back an echo -dup- clone if the canonical base record exists for the same item
+          if (recId !== baseId && allMoves.some((other: any) => {
+            const oId = String(other.id || other.movementId || other.txnId || '').trim();
+            return stripStockMovementDupSuffix(oId) === baseId && String(other.itemId || '').trim() === String(rec.itemId || '').trim();
+          })) {
+            continue;
+          }
           this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
+          const cleanRec: any = {
+            ...rec,
+            id: recId,
+            movementId: rec.movementId || recId,
+            txnId: rec.txnId || recId,
+          };
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          await this.dispatchEnvelope('stock_movement', cleanId, cleanRec, {
+          await this.dispatchEnvelope('stock_movement', recId, cleanRec, {
             action: 'APPEND',
             topicSuffix: 'stock_movement',
-            packetId: `SM-RECON-${cleanId}-${Date.now()}`,
+            packetId: `SM-RECON-${recId}-${Date.now()}`,
             meta: { isReconPush: true },
           });
           pushedCount++;
@@ -4760,6 +5256,7 @@ class MeshSyncManager {
       `${entityType}-${entityId || 'unknown'}-${now}-${Math.random().toString(36).substring(2, 6)}`;
     this.seenPacketIds.add(packetId);
 
+    const dataCloudSynced = Boolean(data && typeof data === 'object' && (data as any).isCloudSynced === true);
     const envelope: SyncEnvelope = {
       packetId,
       entityType,
@@ -4770,6 +5267,7 @@ class MeshSyncManager {
       originDeviceId: this.config.deviceId,
       targetBranchId: opts?.targetBranchId || this.config.branchId || 'ALL',
       class: spec?.class || 'T1',
+      ...(dataCloudSynced ? { isCloudSynced: true } : {}),
       meta: {
         ...(opts?.meta || {}),
         companyId: this.config.companyId,
@@ -4832,6 +5330,34 @@ class MeshSyncManager {
       localCandidate === 'ALL' ||
       isRecordInBranchScope(branchCandidate, localCandidate, getBranches(), this.config.companyId);
 
+    const caPayload = packet.cashAccount || packet.payload;
+    const isGlobalCashAccountPkt =
+      (packet.type === 'cash_account' || packet.type === 'CASH_ACCOUNT') &&
+      (caPayload?.account_type === 'HQ_SAFE' ||
+        caPayload?.account_type === 'BANK_ACCOUNT' ||
+        String(caPayload?.branch_id || '').toUpperCase().trim() === 'HQ');
+    const ctPayload = packet.cashTransfer || packet.payload;
+    const ctTypeUpper = String(ctPayload?.type || '').toUpperCase().trim();
+    const isGlobalCashTransferPkt =
+      (packet.type === 'cash_transfer' || packet.type === 'CASH_TRANSFER') &&
+      (branchCandidate === 'HQ' ||
+        branchCandidate === 'ALL' ||
+        ctTypeUpper === 'HQ_TO_BRANCH' ||
+        ctTypeUpper === 'BRANCH_TO_HQ' ||
+        ctTypeUpper === 'BANK_DEPOSIT' ||
+        ctTypeUpper === 'BANK_WITHDRAWAL' ||
+        ctTypeUpper === 'CAPITAL_INFUSION' ||
+        ctTypeUpper === 'SUPPLIER_PAYMENT' ||
+        ctTypeUpper === 'THIRD_PARTY_PAYOUT');
+    const clPayload = packet.cashLog || packet.payload;
+    const isVaultCashLogPkt =
+      (packet.type === 'cash_log' || packet.type === 'CASH_LOG' || packet.action === 'CASH_LOG_RECORD' || packet.action === 'CASH_LOG_UPDATE') &&
+      Boolean(
+        clPayload?.isVaultCustody ||
+          String(clPayload?.staffId || '').toUpperCase().trim() === 'VAULT_CUSTODY' ||
+          branchCandidate === 'HQ'
+      );
+
     const isCatalogOrCompanyPacket =
       topic.endsWith('/inventory') ||
       packet.type === 'inventory' ||
@@ -4840,6 +5366,10 @@ class MeshSyncManager {
       packet.type === 'INVENTORY_UPDATE' ||
       packet.action === 'INVENTORY_RECORD' ||
       packet.action === 'INVENTORY_UPDATE' ||
+      packet.type === 'TOMBSTONE_SYNC' ||
+      packet.action === 'TOMBSTONE_SYNC' ||
+      packet.type === 'tombstone' ||
+      packet.entityType === 'tombstone' ||
       packet.type === 'product' ||
       packet.type === 'staff' ||
       packet.type === 'STAFF' ||
@@ -4866,6 +5396,9 @@ class MeshSyncManager {
       packet.type === 'customer' ||
       packet.type === 'CUSTOMER' ||
       packet.action === 'CUSTOMER_SYNC' ||
+      isGlobalCashAccountPkt ||
+      isGlobalCashTransferPkt ||
+      isVaultCashLogPkt ||
       packet.target_branch_id === 'ALL' ||
       branchCandidate === 'ALL';
 
@@ -5203,13 +5736,29 @@ class MeshSyncManager {
     const rawCategories = Array.isArray(payload) ? payload : (payload?.categories || payload?.item || payload?.data);
     if (!Array.isArray(rawCategories)) return false;
 
+    const tombstones = getTombstones();
+    const catTombstones = tombstones.filter(
+      (t) => normalizeTombstoneEntityType(t.entityType) === 'inventory_category'
+    );
+    const incomingCatTs = parseTimestampMs(payload?.updatedAt || payload?.lastUpdated || payload?.hubTimestamp || 0);
+    const filteredCategories = rawCategories.filter((cat: any) => {
+      const catId = String(cat?.categoryId || cat?.id || '').trim().toUpperCase();
+      if (!catId) return true;
+      const tomb = catTombstones.find(
+        (t) => String(t.entityId || '').trim().toUpperCase() === catId
+      );
+      if (!tomb) return true;
+      const catItemTs = parseTimestampMs(cat?.updatedAt || cat?.lastUpdated || 0) || incomingCatTs;
+      return !(Number(tomb.deletedAt || 0) > catItemTs);
+    });
+
     // T2 LWW Guard (60000ms skew tolerance)
     const existingCats = getCategories();
     const existingTime = Math.max(
       ...existingCats.map((c: any) => parseTimestampMs(c.updatedAt || c.lastUpdated || c.timestamp || 0)),
       0
     );
-    const incomingTime = parseTimestampMs(payload?.updatedAt || payload?.lastUpdated || payload?.hubTimestamp || 0);
+    const incomingTime = incomingCatTs;
 
     if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
@@ -5219,9 +5768,9 @@ class MeshSyncManager {
     }
 
     try {
-      saveCategories(rawCategories, { fromSync: true });
+      saveCategories(filteredCategories, { fromSync: true });
       window.dispatchEvent(new Event('saimetric_categories_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_categories_updated', { detail: rawCategories }));
+      window.dispatchEvent(new CustomEvent('saimetric_categories_updated', { detail: filteredCategories }));
       return true;
     } catch (e) {
       console.warn('[MeshSyncService] ingestMeshCategories error:', e);
@@ -5728,6 +6277,16 @@ class MeshSyncManager {
       this.updateSyncProgress(0, totalRecordsToProcess, `Syncing 0/${totalRecordsToProcess} items...`);
     }
 
+    // 0. Apply Tombstones FIRST so Resurrection Guard blocks any stale T2 items in this catchup delta
+    if (Array.isArray(delta.tombstones) && delta.tombstones.length > 0) {
+      for (const tomb of delta.tombstones) {
+        if (tomb && tomb.entityId && tomb.entityType) {
+          applyTombstone(tomb);
+        }
+      }
+      overallProcessed += delta.tombstones.length;
+    }
+
     // 1. Ingest Sales (T1 - Append-Only Merge)
     if (Array.isArray(delta.sales) && delta.sales.length > 0) {
       mergeT1Records(STORAGE_KEYS.SALES, delta.sales);
@@ -5743,11 +6302,22 @@ class MeshSyncManager {
     // 2. Ingest Cash Logs, Lifts & Movements (T1 - Append-Only Merge)
     if (Array.isArray(delta.cashLogs) && delta.cashLogs.length > 0) {
       mergeT1Records(STORAGE_KEYS.CASH_LOGS, delta.cashLogs);
+      try {
+        const cleanedLogs = deduplicateCashLogs(
+          getRawStoredCashLogs().map((r) => normalizeCashLogRecord(r))
+        );
+        setStored(STORAGE_KEYS.CASH_LOGS, cleanedLogs);
+      } catch {}
       cashLogsIngested += delta.cashLogs.length;
       overallProcessed += delta.cashLogs.length;
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
+    }
+    if ((Array.isArray(delta.sales) && delta.sales.length > 0) || (Array.isArray(delta.cashLogs) && delta.cashLogs.length > 0)) {
+      try {
+        healMultiCurrencySalesAndMovements();
+      } catch {}
     }
     if (Array.isArray(delta.cashLifts) && delta.cashLifts.length > 0) {
       mergeT1Records(STORAGE_KEYS.CASH_LIFTS, delta.cashLifts);
@@ -5787,11 +6357,30 @@ class MeshSyncManager {
       }
     }
 
-    // 4. Ingest Stock Movements, GRVs & Goods Received Notes (T1 - Append-Only Merge)
+    // 4. Ingest Stock Movements, GRVs & Goods Received Notes (T1 - Append-Only Merge, Strict Dedupe)
     if (Array.isArray(delta.stockMovements) && delta.stockMovements.length > 0) {
-      mergeT1Records(STORAGE_KEYS.STOCK_MOVEMENTS, delta.stockMovements);
-      movementsIngested += delta.stockMovements.length;
-      overallProcessed += delta.stockMovements.length;
+      const existingMoves = getRawStoredStockMovements();
+      const filteredIncoming = delta.stockMovements.filter((sm: any) => {
+        if (!sm || typeof sm !== 'object') return false;
+        const smId = String(sm.id || sm.movementId || sm.txnId || '').trim();
+        if (!smId) return false;
+        const baseId = stripStockMovementDupSuffix(smId);
+        if (smId !== baseId) {
+          const itemId = String(sm.itemId || '').trim();
+          const hasBase = existingMoves.some((ex: any) => {
+            const exId = String(ex.id || ex.movementId || ex.txnId || '').trim();
+            return stripStockMovementDupSuffix(exId) === baseId && (!itemId || !ex.itemId || String(ex.itemId).trim() === itemId);
+          });
+          if (hasBase) return false;
+        }
+        return true;
+      });
+      if (filteredIncoming.length > 0) {
+        mergeT1Records(STORAGE_KEYS.STOCK_MOVEMENTS, filteredIncoming);
+        getRawStoredStockMovements();
+      }
+      movementsIngested += filteredIncoming.length;
+      overallProcessed += filteredIncoming.length;
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
       }
@@ -5842,7 +6431,7 @@ class MeshSyncManager {
           chunk.map((it: any) => {
             const id = String(it?.itemId || it?.id || '');
             if (!id) return Promise.resolve(false);
-            const ts = extractRecordTimestamp(it) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+            const ts = extractRecordTimestamp(it);
             return this.ingestEnvelopeThroughSyncCore(
               {
                 packetId: `CATCHUP-INV-${id}-${ts}-${Math.random().toString(36).substring(2, 6)}`,
@@ -5902,7 +6491,7 @@ class MeshSyncManager {
       for (const acc of delta.cashAccounts) {
         const accId = String(acc?.account_id || acc?.id || '');
         if (!accId) continue;
-        const ts = extractRecordTimestamp(acc) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+        const ts = extractRecordTimestamp(acc);
         if (
           await this.ingestEnvelopeThroughSyncCore(
             {
@@ -5925,13 +6514,19 @@ class MeshSyncManager {
       }
     }
     if (Array.isArray(delta.cashTransfers) && delta.cashTransfers.length > 0) {
-      mergeT1Records(STORAGE_KEYS.CASH_TRANSFERS, delta.cashTransfers);
-      accountsIngested += delta.cashTransfers.length;
-      overallProcessed += delta.cashTransfers.length;
+      let transfersIngested = 0;
+      for (const tr of delta.cashTransfers) {
+        if (ingestMeshCashTransfer(tr)) {
+          transfersIngested++;
+        }
+      }
+      accountsIngested += transfersIngested;
+      overallProcessed += transfersIngested;
       if (typeof window !== 'undefined') {
-        window.dispatchEvent(new Event('saimetric_cash_transfers_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
     }
 
@@ -5940,7 +6535,7 @@ class MeshSyncManager {
     if (Array.isArray(delta.salespeople)) {
       for (const st of delta.salespeople) {
         if (!st?.id) continue;
-        const ts = extractRecordTimestamp(st) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+        const ts = extractRecordTimestamp(st);
         if (
           await this.ingestEnvelopeThroughSyncCore(
             {
@@ -5971,7 +6566,7 @@ class MeshSyncManager {
       for (const cust of delta.customers) {
         const custId = String(cust?.customerId || cust?.id || '');
         if (!custId) continue;
-        const ts = extractRecordTimestamp(cust) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+        const ts = extractRecordTimestamp(cust);
         if (
           await this.ingestEnvelopeThroughSyncCore(
             {
@@ -6001,7 +6596,7 @@ class MeshSyncManager {
       for (const group of (delta as any).creditGroups) {
         const gId = String(group?.id || group?.groupId || '');
         if (!gId) continue;
-        const ts = extractRecordTimestamp(group) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+        const ts = extractRecordTimestamp(group);
         await this.ingestEnvelopeThroughSyncCore(
           {
             packetId: `CATCHUP-CGRP-${gId}-${ts}`,
@@ -6037,7 +6632,7 @@ class MeshSyncManager {
           const sessSegments = Array.isArray(sess.segments) && sess.segments.length > 0
             ? sess.segments
             : (Array.isArray(delta.stocktakeSegments) ? delta.stocktakeSegments.filter((sg: any) => sg.sessionId === sess.sessionId) : []);
-          const ts = extractRecordTimestamp(sess) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+          const ts = extractRecordTimestamp(sess);
           await this.ingestEnvelopeThroughSyncCore(
             {
               packetId: `CATCHUP-STS-${sess.sessionId}-${ts}`,
@@ -6066,7 +6661,7 @@ class MeshSyncManager {
       for (const br of delta.branches) {
         const brId = String(br?.branchId || br?.id || '');
         if (!brId || !isValidBranchRecord(br)) continue;
-        const ts = extractRecordTimestamp(br) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+        const ts = extractRecordTimestamp(br);
         if (
           await this.ingestEnvelopeThroughSyncCore(
             {
@@ -6094,14 +6689,26 @@ class MeshSyncManager {
 
     // 8.4 Ingest Casual Workers from Catch-up Delta (T2 via SyncCore)
     if (Array.isArray(delta.casualWorkers)) {
-      const ts = Math.max(...delta.casualWorkers.map((c: any) => extractRecordTimestamp(c)), 0) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+      const tombList = getTombstones();
+      const filteredCasuals = delta.casualWorkers.filter((cw: any) => {
+        const cId = String(cw?.id || '').trim().toUpperCase();
+        if (!cId) return true;
+        const tomb = tombList.find(
+          (t) =>
+            normalizeTombstoneEntityType(t.entityType) === 'casual_worker' &&
+            String(t.entityId || '').trim().toUpperCase() === cId
+        );
+        if (!tomb) return true;
+        return !(Number(tomb.deletedAt || 0) > extractRecordTimestamp(cw));
+      });
+      const ts = Math.max(...filteredCasuals.map((c: any) => extractRecordTimestamp(c)), 0);
       await this.ingestEnvelopeThroughSyncCore(
         {
           packetId: `CATCHUP-CAS-${ts}`,
           entityType: 'casual_worker',
           entityId: 'CASUAL_WORKERS_LIST',
           action: 'UPSERT',
-          data: delta.casualWorkers,
+          data: filteredCasuals,
           updatedAt: ts,
           originDeviceId: packetOrigin || 'MESH_CATCHUP',
           targetBranchId: this.config.branchId,
@@ -6120,7 +6727,7 @@ class MeshSyncManager {
       for (const supp of delta.suppliers) {
         const sId = String(supp?.supplierId || supp?.id || supp?.SupplierID || '');
         if (!sId) continue;
-        const ts = extractRecordTimestamp(supp) || parseTimestampMs(packet.cutoffTimestamp || packet.timestamp) || Date.now();
+        const ts = extractRecordTimestamp(supp);
         await this.ingestEnvelopeThroughSyncCore(
           {
             packetId: `CATCHUP-SUPP-${sId}-${ts}`,
@@ -6288,16 +6895,6 @@ class MeshSyncManager {
       }
     }
 
-    // 8.12 Apply Tombstones (Soft Deletes) from Catch-up Delta
-    if (Array.isArray(delta.tombstones) && delta.tombstones.length > 0) {
-      for (const tomb of delta.tombstones) {
-        if (tomb && tomb.entityId && tomb.entityType) {
-          applyTombstone(tomb);
-        }
-      }
-      overallProcessed += delta.tombstones.length;
-    }
-
     // Complete sync progress indicator
     if (totalRecordsToProcess > 0) {
       this.finishSyncProgress(totalRecordsToProcess, 'Sync Complete');
@@ -6457,12 +7054,22 @@ class MeshSyncManager {
   /**
    * Broadcast an updated sale (Refund, Void, or Item Exchange) to all peers & Local Hub
    */
-  public async broadcastSaleUpdate(sale: SaleInvoice) {
+  public async broadcastSaleUpdate(sale: SaleInvoice, extraCashLogs?: CashLogEntry[]) {
     if (this.isIngestingFromHub) return;
     if (!sale || !sale.id) return;
 
+    const cleanSalePayload: any = { ...sale };
+    if (Array.isArray(extraCashLogs) && extraCashLogs.length > 0) {
+      cleanSalePayload.reversalCashLogs = extraCashLogs.map((cl) => {
+        const copy = { ...cl };
+        delete (copy as any).fromMesh;
+        delete (copy as any).fromSync;
+        return copy;
+      });
+    }
+
     const packetId = `SALE-UPD-${sale.id}-${Date.now()}`;
-    await this.dispatchEnvelope('sale', sale.id, sale, {
+    await this.dispatchEnvelope('sale', sale.id, cleanSalePayload, {
       action: 'UPSERT',
       topicSuffix: 'sale',
       packetId,
@@ -6478,6 +7085,47 @@ class MeshSyncManager {
       sale.id
     );
 
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast a Form 2 CashLog entry creation or reversal update (Refund, Void, Cash Sale, Multi-Currency)
+   */
+  public broadcastCashLog(
+    log: CashLogEntry,
+    action: 'APPEND' | 'UPSERT' = 'APPEND',
+    options?: { isReconPush?: boolean }
+  ) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!log || !log.id) return;
+    if (!isReconPush && ((log as any).fromMesh || (log as any).fromSync)) return;
+
+    const cleanLog: any = {
+      ...log,
+      updatedAt: (log as any).updatedAt || Date.now(),
+      lastUpdated: (log as any).lastUpdated || new Date().toISOString(),
+    };
+    delete cleanLog.fromMesh;
+    delete cleanLog.fromSync;
+
+    const isVaultLog = Boolean(
+      cleanLog.isVaultCustody ||
+        String(cleanLog.staffId || '').toUpperCase().trim() === 'VAULT_CUSTODY' ||
+        String(cleanLog.branch_id || cleanLog.branchId || '').toUpperCase().trim() === 'HQ'
+    );
+    const packetId = `CL-PKT-${cleanLog.id}-${Date.now()}`;
+    void this.dispatchEnvelope('cash_log', cleanLog.id, cleanLog, {
+      action,
+      ...(isVaultLog ? { targetBranchId: 'ALL' } : {}),
+      updatedAt: cleanLog.updatedAt,
+      topicSuffix: 'cash_log',
+      packetId,
+      meta: {
+        wireAction: action === 'UPSERT' ? 'CASH_LOG_UPDATE' : 'CASH_LOG_RECORD',
+        isReconPush,
+      },
+    });
     this.notifyPeerSubscribers();
   }
 
@@ -6804,15 +7452,75 @@ class MeshSyncManager {
     account.updatedAt = account.updatedAt || Date.now();
     account.lastUpdated = account.lastUpdated || new Date().toISOString();
 
+    const isGlobalAcc =
+      account.account_type === 'HQ_SAFE' ||
+      account.account_type === 'BANK_ACCOUNT' ||
+      String(account.branch_id || '').toUpperCase().trim() === 'HQ' ||
+      String(account.target_branch_id || '').toUpperCase().trim() === 'ALL';
+
     const packetId = `CASHACC-PKT-${accId}-${Date.now()}`;
     void this.dispatchEnvelope('cash_account', accId, account, {
       action: 'UPSERT',
-      targetBranchId: account.branch_id || this.config.branchId,
+      targetBranchId: isGlobalAcc ? 'ALL' : (account.branch_id || this.config.branchId),
       updatedAt: account.updatedAt,
       topicSuffix: 'cash_account',
       packetId,
     });
     this.addLog('BROADCAST', `Cash Account [${account.account_name || accId}] broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast a cash transfer voucher (creation, HQ transit, receipt, return, approval) via SyncCore
+   */
+  public broadcastCashTransfer(transfer: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!transfer) return;
+    if (!isReconPush && (transfer.fromMesh || transfer.fromSync)) return;
+
+    const tId = String(transfer.transfer_id || transfer.id || '').trim();
+    if (!tId) return;
+
+    const updatedAt = transfer.updatedAt || Date.now();
+    const lastUpdated = transfer.lastUpdated || new Date(updatedAt).toISOString();
+    const typeUpper = String(transfer.type || '').toUpperCase().trim();
+    const brUpper = String(transfer.branch_id || '').toUpperCase().trim();
+    const isGlobalTransfer =
+      brUpper === 'HQ' ||
+      brUpper === 'ALL' ||
+      String(transfer.target_branch_id || '').toUpperCase().trim() === 'ALL' ||
+      typeUpper === 'HQ_TO_BRANCH' ||
+      typeUpper === 'BRANCH_TO_HQ' ||
+      typeUpper === 'BANK_DEPOSIT' ||
+      typeUpper === 'BANK_WITHDRAWAL' ||
+      typeUpper === 'CAPITAL_INFUSION' ||
+      typeUpper === 'SUPPLIER_PAYMENT' ||
+      typeUpper === 'THIRD_PARTY_PAYOUT';
+
+    const cleanTransfer: any = {
+      ...transfer,
+      transfer_id: tId,
+      target_branch_id: isGlobalTransfer ? 'ALL' : (transfer.target_branch_id || transfer.branch_id || this.config.branchId),
+      updatedAt,
+      lastUpdated,
+    };
+    delete cleanTransfer.fromMesh;
+    delete cleanTransfer.fromSync;
+
+    const packetId = `TRF-PKT-${tId}-${updatedAt}`;
+    void this.dispatchEnvelope('cash_transfer', tId, cleanTransfer, {
+      action: cleanTransfer.status && cleanTransfer.status !== 'DRAFT' ? 'UPSERT' : 'APPEND',
+      targetBranchId: isGlobalTransfer ? 'ALL' : (cleanTransfer.branch_id || this.config.branchId),
+      updatedAt,
+      topicSuffix: 'cash_transfer',
+      packetId,
+      meta: {
+        wireAction: cleanTransfer.status && cleanTransfer.status !== 'DRAFT' ? 'CASH_TRANSFER_UPDATE' : 'CASH_TRANSFER',
+        isReconPush,
+      },
+    });
+    this.addLog('BROADCAST', `Cash Transfer ${tId} (${cleanTransfer.status || 'NEW'}) broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 
@@ -7083,6 +7791,20 @@ class MeshSyncManager {
       rawTarget === 'stocktake';
 
     if (isT2Entity) {
+      return;
+    }
+
+    // CashLog and CashTransfer mutations are already broadcasted cleanly via dedicated SyncCore handlers
+    if (
+      (rawTarget === 'cashlog' ||
+        rawTarget === 'cash_log' ||
+        rawTarget === 'cash_logs' ||
+        rawTarget === 'cashtransfer' ||
+        rawTarget === 'cashtransfers' ||
+        rawTarget === 'cash_transfer' ||
+        rawTarget === 'cash_transfers') &&
+      mutation.action !== 'DELETE'
+    ) {
       return;
     }
 
@@ -7413,12 +8135,13 @@ class MeshSyncManager {
 
   private startOpportunisticCloudSyncTimer() {
     this.opportunisticTimer = window.setInterval(async () => {
-      if ((this.isLocalHubActive() && !this.isCloudOnlyMode) || this.appScriptsAdapter.isPaused()) {
+      const cloudAdapter = this.getOrCreateSingleCloudAdapter();
+      if ((this.isLocalHubActive() && !this.isCloudOnlyMode) || cloudAdapter.isPaused?.()) {
         return;
       }
       if (typeof navigator !== 'undefined' && navigator.onLine) {
         try {
-          await this.appScriptsAdapter.drainOfflineQueue();
+          await cloudAdapter.drainOfflineQueue();
         } catch (e) {}
       }
     }, 120000);
@@ -7847,7 +8570,7 @@ class MeshSyncManager {
     if (!envelope || typeof envelope !== 'object') return false;
     if (envelope.entityType && envelope.packetId) {
       this.syncActiveAdapter();
-      void this.syncCore.saveAndSync(envelope as SyncEnvelope);
+      void this.syncCore.saveAndSync(envelope as SyncEnvelope).catch(() => {});
       return true;
     }
     return this.localHubAdapter.sendControlPacket(envelope);
@@ -7858,7 +8581,8 @@ class MeshSyncManager {
     if (this.isLocalHubActive() && !this.isCloudOnlyMode) {
       await this.drainQueueToLocalHub();
     } else {
-      await this.appScriptsAdapter.drainOfflineQueue();
+      const cloudAdapter = this.getOrCreateSingleCloudAdapter();
+      await cloudAdapter.drainOfflineQueue();
     }
   }
 

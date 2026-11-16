@@ -7,6 +7,7 @@ import {
   Salesperson,
   GoodsReceivedEntry,
   CashGovernanceConfig,
+  DirectGrv,
 } from '../types';
 import {
   getCashAccounts,
@@ -31,6 +32,9 @@ import {
   getCashGovernanceConfig,
   addExpense,
   verifySalespersonPin,
+  enqueueSync,
+  notifyDirectGrvChanged,
+  notifyListeners,
   STORAGE_KEYS,
 } from '../db/roomDatabase';
 import {
@@ -43,6 +47,50 @@ import { toDateStringSafe } from '../utils/dateUtils';
 
 // Standard default threshold for Owner PIN approval on supplier payments
 export const DEFAULT_SUPPLIER_APPROVAL_THRESHOLD = 50.0;
+
+// Hard safety cap ($10,000,000) to prevent math overflow or malformed numeric entries
+export const MAX_CUSTODY_TRANSACTION_AMOUNT = 10_000_000;
+
+export const parseSafeCurrencyAmount = (val: unknown): number => {
+  if (val === null || val === undefined || val === '') return 0;
+  const parsed = typeof val === 'number' ? val : parseFloat(String(val).replace(/[^0-9.-]/g, ''));
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.round(parsed * 100) / 100;
+};
+
+export const validateCustodyTransactionAmount = (val: unknown, label = 'Transaction amount'): number => {
+  const num = parseSafeCurrencyAmount(val);
+  if (!Number.isFinite(num) || num <= 0) {
+    throw new Error(`${label} must be greater than $0.00.`);
+  }
+  if (num > MAX_CUSTODY_TRANSACTION_AMOUNT) {
+    throw new Error(
+      `${label} ($${num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}) exceeds the maximum allowed limit of $10,000,000.00.`
+    );
+  }
+  return num;
+};
+
+export const isSettledTransferStatus = (status?: string): boolean => {
+  const u = String(status || '').toUpperCase().trim();
+  return u === 'COMPLETED' || u === 'RECEIVED' || u === 'APPROVED';
+};
+
+export const isCompanyLevelTransfer = (type?: CashTransferType | string, branchId?: string): boolean => {
+  const t = String(type || '').toUpperCase().trim();
+  const b = String(branchId || '').toUpperCase().trim();
+  return (
+    b === 'HQ' ||
+    b === 'ALL' ||
+    t === 'HQ_TO_BRANCH' ||
+    t === 'BRANCH_TO_HQ' ||
+    t === 'BANK_DEPOSIT' ||
+    t === 'BANK_WITHDRAWAL' ||
+    t === 'CAPITAL_INFUSION' ||
+    t === 'SUPPLIER_PAYMENT' ||
+    t === 'THIRD_PARTY_PAYOUT'
+  );
+};
 
 export interface UnpaidGrvRecord {
   id: string;
@@ -104,22 +152,27 @@ export const ensureDefaultCashAccounts = (companyId?: string, branchId?: string)
   const allTransfers = getAllCashTransfers();
 
   canonicalAccounts.forEach((acc) => {
+    const safeBal = parseSafeCurrencyAmount(acc.current_balance);
+    if (safeBal !== acc.current_balance && safeBal <= MAX_CUSTODY_TRANSACTION_AMOUNT) {
+      acc.current_balance = safeBal;
+    }
+
     if (acc.account_type === 'SAFE') {
       const sent = allTransfers
         .filter(
           (t) =>
             (t.type === 'BRANCH_TO_HQ' || t.from_account_id?.includes('SAFE')) &&
-            (t.status === 'COMPLETED' || t.status === 'IN_TRANSIT')
+            (isSettledTransferStatus(t.status) || t.status === 'IN_TRANSIT')
         )
-        .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+        .reduce((sum, t) => sum + parseSafeCurrencyAmount(t.amount), 0);
 
       const received = allTransfers
         .filter(
           (t) =>
             (t.to_account_id?.includes('SAFE') || (t.type === 'TILL_COLLECTION' && !t.to_account_id?.includes('CLERK'))) &&
-            t.status === 'COMPLETED'
+            isSettledTransferStatus(t.status)
         )
-        .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+        .reduce((sum, t) => sum + parseSafeCurrencyAmount(t.amount), 0);
 
       if (sent > 0 || received > 0) {
         // Base initial safe is 1500.0
@@ -137,17 +190,17 @@ export const ensureDefaultCashAccounts = (companyId?: string, branchId?: string)
         .filter(
           (t) =>
             (t.from_account_id?.includes('CLERK') || t.from_account_id?.includes('FLOAT')) &&
-            (t.status === 'COMPLETED' || t.status === 'IN_TRANSIT')
+            (isSettledTransferStatus(t.status) || t.status === 'IN_TRANSIT')
         )
-        .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+        .reduce((sum, t) => sum + parseSafeCurrencyAmount(t.amount), 0);
 
       const received = allTransfers
         .filter(
           (t) =>
             (t.to_account_id?.includes('CLERK') || (t.type === 'TILL_COLLECTION' && t.to_account_id?.includes('CLERK'))) &&
-            t.status === 'COMPLETED'
+            isSettledTransferStatus(t.status)
         )
-        .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+        .reduce((sum, t) => sum + parseSafeCurrencyAmount(t.amount), 0);
 
       if (sent > 0 || received > 0) {
         // Base initial clerk float is 150.0
@@ -164,6 +217,7 @@ export const ensureDefaultCashAccounts = (companyId?: string, branchId?: string)
       account_id: `ACC-HQ-SAFE-${currentCompany.slice(0, 6)}`,
       company_id: currentCompany,
       branch_id: 'HQ',
+      target_branch_id: 'ALL',
       account_type: 'HQ_SAFE',
       account_name: 'HQ Central Vault Safe',
       current_balance: 5000.0,
@@ -204,6 +258,7 @@ export const ensureDefaultCashAccounts = (companyId?: string, branchId?: string)
       account_id: `ACC-BANK-CBZ-${currentCompany.slice(0, 6)}`,
       company_id: currentCompany,
       branch_id: 'HQ',
+      target_branch_id: 'ALL',
       account_type: 'BANK_ACCOUNT',
       account_name: 'CBZ Bank Corporate (USD)',
       current_balance: 12500.0,
@@ -214,6 +269,7 @@ export const ensureDefaultCashAccounts = (companyId?: string, branchId?: string)
       account_id: `ACC-BANK-STANBIC-${currentCompany.slice(0, 6)}`,
       company_id: currentCompany,
       branch_id: 'HQ',
+      target_branch_id: 'ALL',
       account_type: 'BANK_ACCOUNT',
       account_name: 'Stanbic Bank Commercial (USD)',
       current_balance: 8400.0,
@@ -260,17 +316,19 @@ export const getHqSafeAccount = (companyId?: string): CashAccount => {
   if (hq) return hq;
 
   // Auto-provision if missing
+  const nowIso = new Date().toISOString();
   const newHq: CashAccount = {
     account_id: `ACC-HQ-SAFE-${currentCompany.slice(0, 6)}`,
     company_id: currentCompany,
     branch_id: 'HQ',
+    target_branch_id: 'ALL',
     account_type: 'HQ_SAFE',
     account_name: 'HQ Central Vault Safe',
     current_balance: 0,
     currency: 'USD',
     status: 'OPEN',
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
+    created_at: nowIso,
+    updated_at: nowIso,
   };
   return saveCashAccount(newHq);
 };
@@ -368,13 +426,18 @@ function findAccountWithFallback(accounts: CashAccount[], accountId?: string, br
  * Deducts the source account immediately when cash is dispatched into transit
  */
 function deductSourceAccountForTransit(transfer: CashTransfer, actor?: Salesperson) {
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
   const accounts = getCashAccounts();
   const fromAcc = findAccountWithFallback(accounts, transfer.from_account_id, transfer.branch_id);
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   if (fromAcc) {
     const updatedFrom: CashAccount = {
       ...fromAcc,
-      current_balance: Math.max(0, Math.round(((fromAcc.current_balance || 0) - transfer.amount) * 100) / 100),
-      updated_at: new Date().toISOString(),
+      current_balance: Math.max(0, Math.round((parseSafeCurrencyAmount(fromAcc.current_balance) - safeAmount) * 100) / 100),
+      updated_at: nowIso,
+      updatedAt: nowMs,
+      lastUpdated: nowIso,
     };
     saveCashAccount(updatedFrom);
   }
@@ -392,10 +455,13 @@ function deductSourceAccountForTransit(transfer: CashTransfer, actor?: Salespers
 
   const logStaffId = isVaultTransfer ? 'VAULT_CUSTODY' : (actor?.id || transfer.created_by_user_id);
   const logStaffName = isVaultTransfer ? 'Vault Custody' : (actor?.name || transfer.created_by_user_name);
+  const effectiveLogBranch = (isVaultTransfer || transfer.branch_id === 'HQ' || transfer.target_branch_id === 'ALL')
+    ? 'ALL'
+    : transfer.branch_id;
 
   const logOut = addCashLog({
-    date: new Date().toISOString().split('T')[0],
-    time: new Date().toTimeString().split(' ')[0],
+    date: nowIso.split('T')[0],
+    time: nowIso.slice(11, 19),
     staff_id: logStaffId,
     staffId: logStaffId,
     staff_name: logStaffName,
@@ -406,13 +472,16 @@ function deductSourceAccountForTransit(transfer: CashTransfer, actor?: Salespers
     isNonPosTransfer: isVaultTransfer,
     description: `Custody Transfer Dispatched to IN_TRANSIT: [${transfer.type}] from ${fromAcc?.account_name || 'Safe'} (Ref: ${transfer.transfer_id})${transfer.recipient_name ? ` for ${transfer.recipient_name}` : ''}${transfer.bank_name ? ` (${transfer.bank_name})` : ''}`,
     in: 0,
-    out: transfer.amount,
+    out: safeAmount,
     currency: 'USD',
     company_id: transfer.company_id,
     branch_id: transfer.branch_id,
-  });
+    target_branch_id: effectiveLogBranch,
+  } as any);
 
-  transfer.linked_cash_log_ids = [logOut.id];
+  transfer.linked_cash_log_ids = [...(transfer.linked_cash_log_ids || []), logOut.id];
+  transfer.updatedAt = nowMs;
+  transfer.lastUpdated = nowIso;
   saveCashTransfer(transfer);
 }
 
@@ -420,11 +489,13 @@ function deductSourceAccountForTransit(transfer: CashTransfer, actor?: Salespers
  * Creates a new Cash Transfer Voucher
  */
 export const createCashTransferVoucher = (payload: CreateTransferPayload): CashTransfer => {
+  const safeAmount = validateCustodyTransactionAmount(payload.amount, 'Transfer amount');
   const companyId = getCurrentCompanyId();
   const branchId = getCurrentBranchId();
-  const now = new Date();
-  const dateStr = now.toISOString().slice(0, 10).replace(/-/g, '');
-  const transferId = `TRF-${dateStr}-${Date.now().toString().slice(-4)}`;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const dateStr = nowIso.slice(0, 10).replace(/-/g, '');
+  const transferId = `TRF-${dateStr}-${nowMs.toString().slice(-4)}`;
 
   const isOwner =
     payload.initiator.role === 'OWNER' ||
@@ -443,7 +514,7 @@ export const createCashTransferVoucher = (payload: CreateTransferPayload): CashT
     status = 'PENDING_ACCEPTANCE';
   } else if (payload.type === 'SUPPLIER_PAYMENT') {
     const threshold = govConfig.defaultSupplierApprovalThreshold || DEFAULT_SUPPLIER_APPROVAL_THRESHOLD;
-    if (payload.amount > threshold) {
+    if (safeAmount > threshold) {
       if (isOwner || isLean) {
         status = 'COMPLETED';
         isOwnerOverride = isOwner;
@@ -480,8 +551,8 @@ export const createCashTransferVoucher = (payload: CreateTransferPayload): CashT
       staffRole: payload.initiator.role,
       details: 'Owner/Manager authorized cash transaction under break-glass/lean policy.',
       referenceId: transferId,
-      amount: payload.amount,
-      metadata: { transferType: payload.type, amount: payload.amount, governanceMode: govConfig.governanceMode },
+      amount: safeAmount,
+      metadata: { transferType: payload.type, amount: safeAmount, governanceMode: govConfig.governanceMode },
     });
   } else {
     addAuditLog({
@@ -490,26 +561,36 @@ export const createCashTransferVoucher = (payload: CreateTransferPayload): CashT
       staffId: payload.initiator.id,
       staffName: payload.initiator.name,
       staffRole: payload.initiator.role,
-      details: `Created Cash Transfer ${transferId} (${payload.type}) for $${payload.amount.toFixed(2)}${payload.bank_name ? ` [${payload.bank_name}]` : ''}`,
+      details: `Created Cash Transfer ${transferId} (${payload.type}) for $${safeAmount.toFixed(2)}${payload.bank_name ? ` [${payload.bank_name}]` : ''}`,
       referenceId: transferId,
-      amount: payload.amount,
-      metadata: { transferType: payload.type, amount: payload.amount, status },
+      amount: safeAmount,
+      metadata: { transferType: payload.type, amount: safeAmount, status },
     });
   }
+
+  const companyLevel =
+    isCompanyLevelTransfer(payload.type, branchId) ||
+    Boolean(payload.from_account_id?.includes('HQ')) ||
+    Boolean(payload.to_account_id?.includes('HQ')) ||
+    Boolean(payload.from_account_id?.includes('BANK')) ||
+    Boolean(payload.to_account_id?.includes('BANK'));
 
   const transfer: CashTransfer = {
     transfer_id: transferId,
     company_id: companyId,
     branch_id: branchId,
+    target_branch_id: companyLevel ? 'ALL' : branchId,
     type: payload.type,
     from_account_id: payload.from_account_id,
     to_account_id: payload.to_account_id,
-    amount: Number(payload.amount),
+    amount: safeAmount,
     currency: 'USD',
     status,
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
     created_by_user_id: payload.initiator.id,
     created_by_user_name: payload.initiator.name,
-    created_at: now.toISOString(),
+    created_at: nowIso,
     linked_grv_id: payload.linked_grv_id,
     recipient_name: payload.recipient_name,
     receipt_image_url: payload.receipt_image_url,
@@ -521,7 +602,7 @@ export const createCashTransferVoucher = (payload: CreateTransferPayload): CashT
     owner_override_reason: isOwnerOverride ? 'Owner Break-Glass / Lean Policy Action' : undefined,
     approved_by_user_id: (isOwner || isLean) ? payload.initiator.id : undefined,
     approved_by_user_name: (isOwner || isLean) ? payload.initiator.name : undefined,
-    approved_at: (isOwner || isLean) ? now.toISOString() : undefined,
+    approved_at: (isOwner || isLean) ? nowIso : undefined,
   };
 
   const saved = saveCashTransfer(transfer);
@@ -556,24 +637,32 @@ export const returnTransitToSafe = (
     };
   }
 
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
   // Refund source account
   const accounts = getCashAccounts();
-  const fromAcc = accounts.find((a) => a.account_id === transfer.from_account_id);
+  const fromAcc = findAccountWithFallback(accounts, transfer.from_account_id, transfer.branch_id);
   if (fromAcc) {
     const refunded: CashAccount = {
       ...fromAcc,
-      current_balance: Math.round(((fromAcc.current_balance || 0) + transfer.amount) * 100) / 100,
-      updated_at: new Date().toISOString(),
+      current_balance: Math.round((parseSafeCurrencyAmount(fromAcc.current_balance) + safeAmount) * 100) / 100,
+      updated_at: nowIso,
+      updatedAt: nowMs,
+      lastUpdated: nowIso,
     };
     saveCashAccount(refunded);
   }
 
-  const now = new Date().toISOString();
   const updated: CashTransfer = {
     ...transfer,
+    amount: safeAmount,
     status: 'RETURNED',
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
     returned_reason: reason || 'Trip aborted; returned undelivered cash to safe',
-    returned_at: now,
+    returned_at: nowIso,
     returned_by_user_id: staff.id,
     returned_by_user_name: staff.name,
     notes: `${transfer.notes ? transfer.notes + ' | ' : ''}Returned to safe: ${reason || 'Supplier premises closed'}`,
@@ -586,30 +675,35 @@ export const returnTransitToSafe = (
     staffId: staff.id,
     staffName: staff.name,
     staffRole: staff.role,
-    details: `Undelivered cash of $${transfer.amount.toFixed(2)} returned to ${fromAcc?.account_name || 'Safe'}. Reason: ${reason}`,
+    details: `Undelivered cash of $${safeAmount.toFixed(2)} returned to ${fromAcc?.account_name || 'Safe'}. Reason: ${reason}`,
     referenceId: transfer.transfer_id,
-    amount: transfer.amount,
+    amount: safeAmount,
   });
 
+  const isCompany = isCompanyLevelTransfer(transfer.type, transfer.branch_id);
   addCashLog({
-    date: new Date().toISOString().split('T')[0],
-    time: new Date().toTimeString().split(' ')[0],
-    staff_id: staff.id,
-    staffId: staff.id,
-    staff_name: staff.name,
-    staffName: staff.name,
+    date: nowIso.split('T')[0],
+    time: nowIso.slice(11, 19),
+    staff_id: isCompany ? 'VAULT_CUSTODY' : staff.id,
+    staffId: isCompany ? 'VAULT_CUSTODY' : staff.id,
+    staff_name: isCompany ? 'Vault Custody' : staff.name,
+    staffName: isCompany ? 'Vault Custody' : staff.name,
     type: 'Transfer',
-    description: `Transit RETURNED into Safe: $${transfer.amount.toFixed(2)} (Ref: ${transfer.transfer_id}). Reason: ${reason}`,
-    in: transfer.amount,
+    category: isCompany ? 'Vault Custody Transfer' : 'Transfer',
+    isVaultCustody: isCompany,
+    isNonPosTransfer: isCompany,
+    description: `Transit RETURNED into Safe: $${safeAmount.toFixed(2)} (Ref: ${transfer.transfer_id}). Reason: ${reason}`,
+    in: safeAmount,
     out: 0,
     currency: 'USD',
     company_id: transfer.company_id,
     branch_id: transfer.branch_id,
-  });
+    target_branch_id: isCompany ? 'ALL' : transfer.branch_id,
+  } as any);
 
   return {
     success: true,
-    message: `Successfully returned $${transfer.amount.toFixed(2)} to ${fromAcc?.account_name || 'Safe'}.`,
+    message: `Successfully returned $${safeAmount.toFixed(2)} to ${fromAcc?.account_name || 'Safe'}.`,
     transfer: updated,
   };
 };
@@ -732,12 +826,18 @@ export const approveCashTransfer = (
     return { success: false, message: 'Transfer voucher not found.' };
   }
 
+  if (isSettledTransferStatus(transfer.status) || transfer.status === 'RETURNED' || transfer.status === 'CANCELLED') {
+    return { success: false, message: `Voucher ${transfer.transfer_id} is already finalized (${transfer.status}).` };
+  }
+
   const govConfig = getCashGovernanceConfig();
   if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(approver, enteredPin)) {
     return { success: false, message: 'Invalid PIN entered.' };
   }
 
-  const now = new Date().toISOString();
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   let nextStatus: CashTransferStatus = 'COMPLETED';
 
   if (transfer.type === 'BRANCH_TO_HQ') {
@@ -746,7 +846,11 @@ export const approveCashTransfer = (
 
   const updated: CashTransfer = {
     ...transfer,
+    amount: safeAmount,
     status: nextStatus,
+    updatedAt: nowMs,
+    lastUpdated: now,
+    target_branch_id: isCompanyLevelTransfer(transfer.type, transfer.branch_id) ? 'ALL' : (transfer.target_branch_id || transfer.branch_id),
     approved_by_user_id: approver.id,
     approved_by_user_name: approver.name,
     approved_at: now,
@@ -760,13 +864,15 @@ export const approveCashTransfer = (
     staffId: approver.id,
     staffName: approver.name,
     staffRole: approver.role,
-    details: `Approved Cash Transfer ${transfer.transfer_id} (${transfer.type}) for $${transfer.amount.toFixed(2)}`,
+    details: `Approved Cash Transfer ${transfer.transfer_id} (${transfer.type}) for $${safeAmount.toFixed(2)}`,
     referenceId: transfer.transfer_id,
-    amount: transfer.amount,
+    amount: safeAmount,
   });
 
   if (nextStatus === 'COMPLETED') {
     finalizeTransferLedger(updated, approver, false);
+  } else if (nextStatus === 'IN_TRANSIT') {
+    deductSourceAccountForTransit(updated, approver);
   }
 
   return { success: true, message: `Transfer ${transfer.transfer_id} approved.`, transfer: updated };
@@ -791,15 +897,24 @@ export const acceptTillFloat = (
     return { success: false, message: 'Only Float Issue transfers require Cashier acceptance.' };
   }
 
+  if (isSettledTransferStatus(transfer.status)) {
+    return { success: false, message: `Till Float ${transfer.transfer_id} is already accepted.` };
+  }
+
   const govConfig = getCashGovernanceConfig();
   if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(cashier, enteredPin)) {
     return { success: false, message: 'Incorrect Cashier PIN. Physical custody rejected.' };
   }
 
-  const now = new Date().toISOString();
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   const updated: CashTransfer = {
     ...transfer,
+    amount: safeAmount,
     status: 'COMPLETED',
+    updatedAt: nowMs,
+    lastUpdated: now,
     received_by_user_id: cashier.id,
     received_by_user_name: cashier.name,
     received_at: now,
@@ -813,14 +928,14 @@ export const acceptTillFloat = (
     staffId: cashier.id,
     staffName: cashier.name,
     staffRole: cashier.role,
-    details: `Cashier ${cashier.name} accepted Till Float ${transfer.transfer_id} for $${transfer.amount.toFixed(2)}`,
+    details: `Cashier ${cashier.name} accepted Till Float ${transfer.transfer_id} for $${safeAmount.toFixed(2)}`,
     referenceId: transfer.transfer_id,
-    amount: transfer.amount,
+    amount: safeAmount,
   });
 
   finalizeTransferLedger(updated, cashier, false);
 
-  return { success: true, message: `Till Float of $${transfer.amount.toFixed(2)} accepted into register.`, transfer: updated };
+  return { success: true, message: `Till Float of $${safeAmount.toFixed(2)} accepted into register.`, transfer: updated };
 };
 
 /**
@@ -838,9 +953,14 @@ export const rejectTillFloat = (
     return { success: false, message: 'Transfer voucher not found.' };
   }
 
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
+  const nowMs = Date.now();
   const updated: CashTransfer = {
     ...transfer,
+    amount: safeAmount,
     status: 'CANCELLED',
+    updatedAt: nowMs,
+    lastUpdated: new Date(nowMs).toISOString(),
     notes: `${transfer.notes ? `${transfer.notes}. ` : ''}Rejected by Cashier ${cashier.name}${reason ? `: ${reason}` : ''}`,
   };
 
@@ -852,9 +972,9 @@ export const rejectTillFloat = (
     staffId: cashier.id,
     staffName: cashier.name,
     staffRole: cashier.role,
-    details: `Cashier ${cashier.name} rejected Till Float ${transfer.transfer_id} ($${transfer.amount.toFixed(2)})`,
+    details: `Cashier ${cashier.name} rejected Till Float ${transfer.transfer_id} ($${safeAmount.toFixed(2)})`,
     referenceId: transfer.transfer_id,
-    amount: transfer.amount,
+    amount: safeAmount,
   });
 
   return { success: true, message: `Till Float ${transfer.transfer_id} rejected and returned to custody source.`, transfer: updated };
@@ -872,6 +992,7 @@ export const issueTillFloat = (params: {
   sourceAccountId?: string;
   notes?: string;
 }): { success: boolean; message: string; voucher: CashTransfer } => {
+  const safeAmount = validateCustodyTransactionAmount(params.amount, 'Till float amount');
   const govConfig = getCashGovernanceConfig();
   const branchId = getCurrentBranchId();
   const sourceAccId =
@@ -885,7 +1006,7 @@ export const issueTillFloat = (params: {
     type: 'FLOAT_ISSUE',
     from_account_id: sourceAccId,
     to_account_id: tillAccId,
-    amount: params.amount,
+    amount: safeAmount,
     initiator: params.supervisor,
     recipient_name: params.cashierName,
     notes:
@@ -895,7 +1016,7 @@ export const issueTillFloat = (params: {
 
   return {
     success: true,
-    message: `Float of $${params.amount.toFixed(2)} issued to ${params.cashierName}.`,
+    message: `Float of $${safeAmount.toFixed(2)} issued to ${params.cashierName}.`,
     voucher,
   };
 };
@@ -915,15 +1036,26 @@ export const receiveHqSafeTransfer = (
     return { success: false, message: 'Transfer voucher not found.' };
   }
 
+  if (isSettledTransferStatus(transfer.status)) {
+    return { success: false, message: `Transfer ${transfer.transfer_id} has already been received (${transfer.status}).` };
+  }
+
   const govConfig = getCashGovernanceConfig();
   if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(owner, enteredPin)) {
     return { success: false, message: 'Invalid Owner PIN.' };
   }
 
-  const now = new Date().toISOString();
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  const wasInTransit = transfer.status === 'IN_TRANSIT';
   const updated: CashTransfer = {
     ...transfer,
-    status: 'COMPLETED',
+    amount: safeAmount,
+    status: 'RECEIVED',
+    updatedAt: nowMs,
+    lastUpdated: now,
+    target_branch_id: 'ALL',
     received_by_user_id: owner.id,
     received_by_user_name: owner.name,
     received_at: now,
@@ -937,15 +1069,15 @@ export const receiveHqSafeTransfer = (
     staffId: owner.id,
     staffName: owner.name,
     staffRole: owner.role,
-    details: `Owner received Branch transfer ${transfer.transfer_id} into HQ Safe for $${transfer.amount.toFixed(2)}`,
+    details: `Owner received Branch transfer ${transfer.transfer_id} into HQ Safe for $${safeAmount.toFixed(2)}`,
     referenceId: transfer.transfer_id,
-    amount: transfer.amount,
+    amount: safeAmount,
   });
 
   // Source account was already deducted when dispatched to transit
-  finalizeTransferLedger(updated, owner, true);
+  finalizeTransferLedger(updated, owner, wasInTransit);
 
-  return { success: true, message: `Cash of $${transfer.amount.toFixed(2)} deposited into HQ Safe.`, transfer: updated };
+  return { success: true, message: `Cash of $${safeAmount.toFixed(2)} deposited into HQ Safe.`, transfer: updated };
 };
 
 /**
@@ -963,15 +1095,26 @@ export const receiveBranchSafeTransfer = (
     return { success: false, message: 'Transfer voucher not found.' };
   }
 
+  if (isSettledTransferStatus(transfer.status)) {
+    return { success: false, message: `Transfer ${transfer.transfer_id} has already been received (${transfer.status}).` };
+  }
+
   const govConfig = getCashGovernanceConfig();
   if (govConfig.governanceMode !== 'LEAN' && !verifySalespersonPin(receiver, enteredPin)) {
     return { success: false, message: 'Invalid Receiver PIN.' };
   }
 
-  const now = new Date().toISOString();
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  const wasInTransit = transfer.status === 'IN_TRANSIT';
   const updated: CashTransfer = {
     ...transfer,
-    status: 'COMPLETED',
+    amount: safeAmount,
+    status: 'RECEIVED',
+    updatedAt: nowMs,
+    lastUpdated: now,
+    target_branch_id: 'ALL',
     received_by_user_id: receiver.id,
     received_by_user_name: receiver.name,
     received_at: now,
@@ -985,15 +1128,15 @@ export const receiveBranchSafeTransfer = (
     staffId: receiver.id,
     staffName: receiver.name,
     staffRole: receiver.role,
-    details: `Received HQ transfer ${transfer.transfer_id} into Branch Safe for $${transfer.amount.toFixed(2)}`,
+    details: `Received HQ transfer ${transfer.transfer_id} into Branch Safe for $${safeAmount.toFixed(2)}`,
     referenceId: transfer.transfer_id,
-    amount: transfer.amount,
+    amount: safeAmount,
   });
 
   // Source account was already deducted when dispatched from HQ
-  finalizeTransferLedger(updated, receiver, true);
+  finalizeTransferLedger(updated, receiver, wasInTransit);
 
-  return { success: true, message: `Funds of $${transfer.amount.toFixed(2)} received into Branch Safe.`, transfer: updated };
+  return { success: true, message: `Funds of $${safeAmount.toFixed(2)} received into Branch Safe.`, transfer: updated };
 };
 
 /**
@@ -1011,11 +1154,22 @@ export const completeThirdPartyPayout = (
     return { success: false, message: 'Transfer voucher not found.' };
   }
 
+  if (isSettledTransferStatus(transfer.status)) {
+    return { success: false, message: `Voucher ${transfer.transfer_id} is already completed.` };
+  }
+
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
   const wasInTransit = transfer.status === 'IN_TRANSIT';
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
 
   const updated: CashTransfer = {
     ...transfer,
+    amount: safeAmount,
     status: 'COMPLETED',
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
+    target_branch_id: isCompanyLevelTransfer(transfer.type, transfer.branch_id) ? 'ALL' : (transfer.target_branch_id || transfer.branch_id),
     receipt_image_url: receiptImageUrl || transfer.receipt_image_url,
     notes: notes || transfer.notes,
   };
@@ -1033,28 +1187,39 @@ export const completeThirdPartyPayout = (
  * 3. Writes paired CashLog records (Form 2 ledger)
  */
 function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, wasInTransit = false) {
+  const safeAmount = parseSafeCurrencyAmount(transfer.amount);
+  if (safeAmount <= 0 || safeAmount > MAX_CUSTODY_TRANSACTION_AMOUNT) {
+    throw new Error(`Invalid transfer amount during ledger finalization: $${safeAmount}`);
+  }
+
   const accounts = getCashAccounts();
   const fromAcc = findAccountWithFallback(accounts, transfer.from_account_id, transfer.branch_id);
   const toAcc = findAccountWithFallback(accounts, transfer.to_account_id, transfer.branch_id);
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
 
   // 1. Update source account balance ONLY if not already deducted at transit dispatch
   // (and if not a bank withdrawal or capital infusion where source is external)
   if (fromAcc && !wasInTransit && transfer.type !== 'BANK_WITHDRAWAL' && transfer.type !== 'CAPITAL_INFUSION') {
     const updatedFrom: CashAccount = {
       ...fromAcc,
-      current_balance: Math.max(0, Math.round(((fromAcc.current_balance || 0) - transfer.amount) * 100) / 100),
-      updated_at: new Date().toISOString(),
+      current_balance: Math.max(0, Math.round((parseSafeCurrencyAmount(fromAcc.current_balance) - safeAmount) * 100) / 100),
+      updated_at: nowIso,
+      updatedAt: nowMs,
+      lastUpdated: nowIso,
     };
     saveCashAccount(updatedFrom);
   }
 
   // 2. Update destination account balance if internal account
   const destinationTarget = toAcc || (transfer.type === 'CAPITAL_INFUSION' || transfer.type === 'BANK_WITHDRAWAL' ? fromAcc : undefined);
-  if (destinationTarget) {
+  if (destinationTarget && destinationTarget.account_type !== 'BANK_ACCOUNT') {
     const updatedTo: CashAccount = {
       ...destinationTarget,
-      current_balance: Math.round(((destinationTarget.current_balance || 0) + transfer.amount) * 100) / 100,
-      updated_at: new Date().toISOString(),
+      current_balance: Math.round((parseSafeCurrencyAmount(destinationTarget.current_balance) + safeAmount) * 100) / 100,
+      updated_at: nowIso,
+      updatedAt: nowMs,
+      lastUpdated: nowIso,
     };
     saveCashAccount(updatedTo);
   }
@@ -1072,13 +1237,15 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
     if (bankTarget) {
       const updatedBank: CashAccount = {
         ...bankTarget,
-        current_balance: Math.round(((bankTarget.current_balance || 0) + transfer.amount) * 100) / 100,
-        updated_at: new Date().toISOString(),
+        current_balance: Math.round((parseSafeCurrencyAmount(bankTarget.current_balance) + safeAmount) * 100) / 100,
+        updated_at: nowIso,
+        updatedAt: nowMs,
+        lastUpdated: nowIso,
       };
       saveCashAccount(updatedBank);
     }
     try {
-      adjustWalletBalance('wallet_bank_usd', transfer.amount);
+      adjustWalletBalance('wallet_bank_usd', safeAmount);
     } catch (_) {}
   } else if (transfer.type === 'BANK_WITHDRAWAL') {
     const bankTarget =
@@ -1092,13 +1259,15 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
     if (bankTarget) {
       const updatedBank: CashAccount = {
         ...bankTarget,
-        current_balance: Math.max(0, Math.round(((bankTarget.current_balance || 0) - transfer.amount) * 100) / 100),
-        updated_at: new Date().toISOString(),
+        current_balance: Math.max(0, Math.round((parseSafeCurrencyAmount(bankTarget.current_balance) - safeAmount) * 100) / 100),
+        updated_at: nowIso,
+        updatedAt: nowMs,
+        lastUpdated: nowIso,
       };
       saveCashAccount(updatedBank);
     }
     try {
-      adjustWalletBalance('wallet_bank_usd', -transfer.amount);
+      adjustWalletBalance('wallet_bank_usd', -safeAmount);
     } catch (_) {}
   }
 
@@ -1114,6 +1283,10 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
     transfer.type === 'SUPPLIER_PAYMENT' ||
     transfer.type === 'THIRD_PARTY_PAYOUT';
 
+  const effectiveLogBranch = (isVaultTransfer || transfer.branch_id === 'HQ' || transfer.target_branch_id === 'ALL')
+    ? 'ALL'
+    : transfer.branch_id;
+
   // Entry A: OUT from source (if not already logged during transit dispatch)
   if (!wasInTransit && transfer.type !== 'BANK_WITHDRAWAL' && transfer.type !== 'CAPITAL_INFUSION') {
     const isOutVault = isVaultTransfer || transfer.type === 'FLOAT_ISSUE' || transfer.type === 'TILL_COLLECTION';
@@ -1121,8 +1294,8 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
     const outStaffName = isOutVault ? 'Vault Custody' : (actor?.name || transfer.created_by_user_name);
 
     const logOut = addCashLog({
-      date: new Date().toISOString().split('T')[0],
-      time: new Date().toTimeString().split(' ')[0],
+      date: nowIso.split('T')[0],
+      time: nowIso.slice(11, 19),
       staff_id: outStaffId,
       staffId: outStaffId,
       staff_name: outStaffName,
@@ -1134,11 +1307,12 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
       isNonPosTransfer: true,
       description: `Custody Transfer OUT: [${transfer.type}] from ${fromAcc?.account_name || 'Safe'} (Ref: ${transfer.transfer_id})${transfer.bank_name ? ` to ${transfer.bank_name}` : ''}`,
       in: 0,
-      out: transfer.amount,
+      out: safeAmount,
       currency: 'USD',
       company_id: transfer.company_id,
       branch_id: transfer.branch_id,
-    });
+      target_branch_id: (isOutVault || effectiveLogBranch === 'ALL') ? 'ALL' : transfer.branch_id,
+    } as any);
     linkedCashLogIds.push(logOut.id);
   }
 
@@ -1149,8 +1323,8 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
     const inStaffName = isInVault ? 'Vault Custody' : (actor?.name || transfer.received_by_user_name || transfer.created_by_user_name);
 
     const logIn = addCashLog({
-      date: new Date().toISOString().split('T')[0],
-      time: new Date().toTimeString().split(' ')[0],
+      date: nowIso.split('T')[0],
+      time: nowIso.slice(11, 19),
       staff_id: inStaffId,
       staffId: inStaffId,
       staff_name: inStaffName,
@@ -1161,21 +1335,24 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
       isVaultCustody: isInVault,
       isNonPosTransfer: isVaultTransfer,
       description: `Custody Transfer IN: [${transfer.type}] into ${destinationTarget.account_name} (Ref: ${transfer.transfer_id})${transfer.bank_name ? ` from ${transfer.bank_name}` : ''}`,
-      in: transfer.amount,
+      in: safeAmount,
       out: 0,
       currency: 'USD',
       company_id: transfer.company_id,
       branch_id: transfer.branch_id,
-    });
+      target_branch_id: (isInVault || effectiveLogBranch === 'ALL') ? 'ALL' : transfer.branch_id,
+    } as any);
     linkedCashLogIds.push(logIn.id);
   }
 
   // Update transfer record with linked CashLog IDs
   transfer.linked_cash_log_ids = linkedCashLogIds;
+  transfer.updatedAt = nowMs;
+  transfer.lastUpdated = nowIso;
   saveCashTransfer(transfer);
 
   // 4. If this is a completed FLOAT_ISSUE, record CashMovement for Cashier till so Form 2 & liveDrawerBalance reflect it immediately!
-  if (transfer.type === 'FLOAT_ISSUE' && transfer.status === 'COMPLETED') {
+  if (transfer.type === 'FLOAT_ISSUE' && isSettledTransferStatus(transfer.status)) {
     try {
       const recipientName = transfer.recipient_name;
       const allStaff = getAllSalespeople();
@@ -1185,7 +1362,7 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
         allStaff.find((s) => s.id === transfer.created_by_user_id);
 
       if (targetStaff) {
-        const todayStr = new Date().toISOString().split('T')[0];
+        const todayStr = nowIso.split('T')[0];
         const sId = getShiftId(targetStaff.id, todayStr);
         const moves = getMovements();
         const hasInitialFloat = moves.some(
@@ -1198,9 +1375,9 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
           shiftId: sId,
           staffId: targetStaff.id,
           date: todayStr,
-          timestamp: new Date().toISOString(),
+          timestamp: nowIso,
           type: hasInitialFloat ? 'float_adjustment' : 'opening_float',
-          amount: transfer.amount,
+          amount: safeAmount,
           currency: 'USD',
           direction: 'in',
           affectsDrawer: true,
@@ -1210,7 +1387,7 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
           notes: `Till Float ${hasInitialFloat ? 'Additional Float / Adjustment' : 'Shift Opening Float'} from ${fromAcc?.account_name || 'Custody'} (Voucher: ${transfer.transfer_id})`,
           approvedBy: actor?.id || transfer.created_by_user_id,
           approvedByName: actor?.name || transfer.created_by_user_name,
-          approvedAt: new Date().toISOString(),
+          approvedAt: nowIso,
           company_id: transfer.company_id,
           branch_id: transfer.branch_id,
         });
@@ -1237,20 +1414,23 @@ export const consolidateClerkFloatToSafe = (params: {
   const safeAcc = getBranchSafeAccount(currentBranch);
   const retainedPettyFloat = 150.0; // Standard retained clerk float
 
-  const availableSurplus = Math.max(0, Math.round(((clerkAcc.current_balance || 0) - retainedPettyFloat) * 100) / 100);
-  const transferAmount = params.amount !== undefined ? Number(params.amount) : availableSurplus;
+  const clerkBal = parseSafeCurrencyAmount(clerkAcc.current_balance);
+  const availableSurplus = Math.max(0, Math.round((clerkBal - retainedPettyFloat) * 100) / 100);
+  const transferAmount = params.amount !== undefined
+    ? validateCustodyTransactionAmount(params.amount, 'Consolidation amount')
+    : availableSurplus;
 
   if (transferAmount <= 0) {
     return {
       success: false,
-      message: `Clerk Float ($${(clerkAcc.current_balance || 0).toFixed(2)}) has no surplus above retained petty float ($${retainedPettyFloat.toFixed(2)}) to consolidate.`,
+      message: `Clerk Float ($${clerkBal.toFixed(2)}) has no surplus above retained petty float ($${retainedPettyFloat.toFixed(2)}) to consolidate.`,
     };
   }
 
-  if (transferAmount > (clerkAcc.current_balance || 0)) {
+  if (transferAmount > clerkBal) {
     return {
       success: false,
-      message: `Insufficient funds in Clerk Float ($${(clerkAcc.current_balance || 0).toFixed(2)}) to transfer $${transferAmount.toFixed(2)}.`,
+      message: `Insufficient funds in Clerk Float ($${clerkBal.toFixed(2)}) to transfer $${transferAmount.toFixed(2)}.`,
     };
   }
 
@@ -1275,15 +1455,19 @@ export const consolidateClerkFloatToSafe = (params: {
 /**
  * Marks a GRV voucher as settled and paid from Safe across all underlying stores
  */
-export const markGrvAsPaid = (grvNumber: string, voucherId: string): void => {
+export const markGrvAsPaid = (
+  grvNumber: string,
+  voucherId: string,
+  options?: { fromSync?: boolean }
+): void => {
   if (!grvNumber) return;
   const normTarget = grvNumber.trim().toLowerCase();
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
 
   // 1. Supplier Invoice Vouchers (WPS Excel-style Goods Received Vouchers, e.g. Palliam)
   try {
     const allVouchers = getAllSupplierInvoiceVouchers();
-    let updatedVouchers = false;
     allVouchers.forEach((v) => {
       const vId = (v.voucherId || '').trim().toLowerCase();
       const vInv = (v.invoiceNo || '').trim().toLowerCase();
@@ -1293,15 +1477,19 @@ export const markGrvAsPaid = (grvNumber: string, voucherId: string): void => {
         (vId && (normTarget.includes(vId) || vId.includes(normTarget))) ||
         (vInv && (normTarget.includes(vInv) || vInv.includes(normTarget)))
       ) {
-        v.paymentStatus = 'PAID';
-        v.paidVoucherId = voucherId;
-        v.paidAt = now;
-        updatedVouchers = true;
+        if (v.paymentStatus !== 'PAID' || v.paidVoucherId !== voucherId) {
+          saveSupplierInvoiceVoucher(
+            {
+              ...v,
+              paymentStatus: 'PAID',
+              paidVoucherId: voucherId,
+              paidAt: now,
+            },
+            { fromSync: options?.fromSync }
+          );
+        }
       }
     });
-    if (updatedVouchers) {
-      setStored(STORAGE_KEYS.SUPPLIER_INVOICES, allVouchers);
-    }
   } catch (err) {
     console.warn('[CashCustody] markGrvAsPaid error in SupplierInvoices:', err);
   }
@@ -1310,6 +1498,7 @@ export const markGrvAsPaid = (grvNumber: string, voucherId: string): void => {
   try {
     const all = getAllDirectGrvs();
     let updated = false;
+    const updatedList: DirectGrv[] = [];
     all.forEach((g) => {
       const gNum = (g.grvNumber || '').trim().toLowerCase();
       const gId = (g.id || '').trim().toLowerCase();
@@ -1321,14 +1510,29 @@ export const markGrvAsPaid = (grvNumber: string, voucherId: string): void => {
         (gNum && (normTarget.includes(gNum) || gNum.includes(normTarget))) ||
         (gInv && (normTarget.includes(gInv) || gInv.includes(normTarget)))
       ) {
-        g.paymentStatus = 'PAID';
-        g.unpaidBalance = 0;
-        g.paidVoucherId = voucherId;
-        updated = true;
+        if (g.paymentStatus !== 'PAID' || (g as any).paidVoucherId !== voucherId) {
+          g.paymentStatus = 'PAID';
+          g.unpaidBalance = 0;
+          g.paidVoucherId = voucherId;
+          (g as any).updatedAt = nowMs;
+          (g as any).lastUpdated = now;
+          updated = true;
+          updatedList.push(g);
+        }
       }
     });
     if (updated) {
       setStored(STORAGE_KEYS.DIRECT_GRVS, all);
+      if (!options?.fromSync) {
+        updatedList.forEach((g) => {
+          enqueueSync('Direct_GRV', 'UPDATE', g);
+          notifyDirectGrvChanged(g);
+        });
+      }
+      notifyListeners();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_direct_grvs_updated'));
+      }
     }
   } catch (err) {
     console.warn('[CashCustody] markGrvAsPaid error in DirectGrvs:', err);
@@ -1357,6 +1561,9 @@ export const markGrvAsPaid = (grvNumber: string, voucherId: string): void => {
     });
     if (updatedGrns) {
       saveAllGoodsReceivedNotes(allGrns);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_grn_updated'));
+      }
     }
   } catch (err) {
     console.warn('[CashCustody] markGrvAsPaid error in GoodsReceivedNotes:', err);
@@ -1395,9 +1602,9 @@ export const getUnpaidGrvsForSafePayment = (): UnpaidGrvRecord[] => {
   const transfers = getCashTransfers();
   const paidGrvNumbers = new Set<string>();
 
-  // Collect all paid / settled GRVs from completed or in-transit transfers
+  // Collect all paid / settled GRVs from completed, approved, received, or in-transit transfers
   transfers.forEach((t) => {
-    if (t.linked_grv_id && (t.status === 'COMPLETED' || t.status === 'IN_TRANSIT')) {
+    if (t.linked_grv_id && (isSettledTransferStatus(t.status) || t.status === 'IN_TRANSIT')) {
       paidGrvNumbers.add(t.linked_grv_id.toLowerCase().trim());
     }
   });
@@ -1631,7 +1838,7 @@ export const getCustodyBalancesSummary = (branchId?: string) => {
   const bankBreakdown: { name: string; balance: number; accountId: string }[] = [];
 
   accounts.forEach((acc) => {
-    const bal = Number(acc.current_balance) || 0;
+    const bal = parseSafeCurrencyAmount(acc.current_balance);
     if (acc.account_type === 'HQ_SAFE') {
       totalHqSafe += bal;
     } else if (acc.account_type === 'SAFE') {
@@ -1650,10 +1857,18 @@ export const getCustodyBalancesSummary = (branchId?: string) => {
     }
   });
 
+  totalHqSafe = Math.round(totalHqSafe * 100) / 100;
+  totalBranchSafes = Math.round(totalBranchSafes * 100) / 100;
+  totalClerkFloats = Math.round(totalClerkFloats * 100) / 100;
+  totalTills = Math.round(totalTills * 100) / 100;
+  totalBankBalances = Math.round(totalBankBalances * 100) / 100;
+
   // Calculate Cash In Transit from uncompleted transfers
-  const totalCashInTransit = transfers
-    .filter((t) => t.status === 'IN_TRANSIT')
-    .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+  const totalCashInTransit = Math.round(
+    transfers
+      .filter((t) => t.status === 'IN_TRANSIT')
+      .reduce((sum, t) => sum + parseSafeCurrencyAmount(t.amount), 0) * 100
+  ) / 100;
 
   return {
     totalHqSafe,
@@ -1663,8 +1878,8 @@ export const getCustodyBalancesSummary = (branchId?: string) => {
     totalCashInTransit,
     totalBankBalances,
     bankBreakdown,
-    physicalCashTotal: totalHqSafe + totalBranchSafes + totalClerkFloats + totalTills + totalCashInTransit,
-    grandTotal: totalHqSafe + totalBranchSafes + totalClerkFloats + totalTills + totalCashInTransit + totalBankBalances,
+    physicalCashTotal: Math.round((totalHqSafe + totalBranchSafes + totalClerkFloats + totalTills + totalCashInTransit) * 100) / 100,
+    grandTotal: Math.round((totalHqSafe + totalBranchSafes + totalClerkFloats + totalTills + totalCashInTransit + totalBankBalances) * 100) / 100,
   };
 };
 
@@ -1696,6 +1911,7 @@ export interface RecordCustodialExpenseParams {
 export const recordCustodialExpense = (
   params: RecordCustodialExpenseParams
 ): { success: boolean; message: string; voucher?: CashTransfer } => {
+  const safeAmount = validateCustodyTransactionAmount(params.amount, 'Expense amount');
   const currentBranch = getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
   const accounts = getCashAccounts();
@@ -1705,37 +1921,44 @@ export const recordCustodialExpense = (
     return { success: false, message: 'Source cash account not found.' };
   }
 
-  const currentBal = Number(sourceAcc.current_balance) || 0;
-  if (currentBal < params.amount) {
+  const currentBal = parseSafeCurrencyAmount(sourceAcc.current_balance);
+  if (currentBal < safeAmount) {
     return {
       success: false,
-      message: `Insufficient balance in ${sourceAcc.account_name} ($${currentBal.toFixed(2)}) to pay expense of $${params.amount.toFixed(2)}.`,
+      message: `Insufficient balance in ${sourceAcc.account_name} ($${currentBal.toFixed(2)}) to pay expense of $${safeAmount.toFixed(2)}.`,
     };
   }
 
   const todayStr = params.date || new Date().toISOString().split('T')[0];
-  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
 
   // 1. Deduct custodial account balance
   const updatedAcc: CashAccount = {
     ...sourceAcc,
-    current_balance: Math.round((currentBal - params.amount) * 100) / 100,
+    current_balance: Math.round((currentBal - safeAmount) * 100) / 100,
     updated_at: nowIso,
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
   };
   saveCashAccount(updatedAcc);
 
   // 2. Create and complete CashTransfer voucher
-  const voucherId = `TRF-${todayStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}`;
+  const voucherId = `TRF-${todayStr.replace(/-/g, '')}-${nowMs.toString().slice(-4)}`;
+  const accBranch = sourceAcc.branch_id || currentBranch;
   const voucher: CashTransfer = {
     transfer_id: voucherId,
     company_id: currentCompany,
-    branch_id: sourceAcc.branch_id || currentBranch,
+    branch_id: accBranch,
+    target_branch_id: isCompanyLevelTransfer('THIRD_PARTY_PAYOUT', accBranch) ? 'ALL' : accBranch,
     type: 'THIRD_PARTY_PAYOUT',
     from_account_id: sourceAcc.account_id,
     to_account_id: undefined,
-    amount: params.amount,
+    amount: safeAmount,
     currency: 'USD',
     status: 'COMPLETED',
+    updatedAt: nowMs,
+    lastUpdated: nowIso,
     created_by_user_id: params.supervisor.id,
     created_by_user_name: params.supervisor.name,
     created_at: nowIso,
@@ -1754,7 +1977,7 @@ export const recordCustodialExpense = (
   const custodialStaffId = sourceAcc.account_type === 'SAFE' ? 'CUSTODIAL_SAFE' : 'CUSTODIAL_CLERK';
 
   addExpense({
-    amount: params.amount,
+    amount: safeAmount,
     category: params.category,
     description: `[${sourceAcc.account_name}] ${params.description} (Paid to: ${params.payee})${params.receiptNumber ? ` Receipt #${params.receiptNumber}` : ''}`,
     date: todayStr,
@@ -1766,7 +1989,7 @@ export const recordCustodialExpense = (
     status: 'approved',
     recordCashLog: false, // Don't duplicate in standard till cash log
     company_id: currentCompany,
-    branch_id: sourceAcc.branch_id || currentBranch,
+    branch_id: accBranch,
   });
 
   // 4. Forensics & Audit Log
@@ -1776,14 +1999,14 @@ export const recordCustodialExpense = (
     staffId: params.supervisor.id,
     staffName: params.supervisor.name,
     staffRole: params.supervisor.role,
-    details: `Major utility/operational expense paid from ${sourceAcc.account_name}: $${params.amount.toFixed(2)} for ${params.category} (${params.description}) to ${params.payee}.`,
+    details: `Major utility/operational expense paid from ${sourceAcc.account_name}: $${safeAmount.toFixed(2)} for ${params.category} (${params.description}) to ${params.payee}.`,
     referenceId: voucher.transfer_id,
-    amount: params.amount,
+    amount: safeAmount,
   });
 
   return {
     success: true,
-    message: `Recorded $${params.amount.toFixed(2)} expense for ${params.category} from ${sourceAcc.account_name}. Balance and P&L updated!`,
+    message: `Recorded $${safeAmount.toFixed(2)} expense for ${params.category} from ${sourceAcc.account_name}. Balance and P&L updated!`,
     voucher,
   };
 };
@@ -1819,12 +2042,12 @@ export const getAccountTransactionLedger = (
 } => {
   const accounts = getCashAccounts();
   const account = accounts.find((a) => a.account_id === accountId) || null;
-  const currentBal = account ? Number(account.current_balance) || 0 : 0;
+  const currentBal = account ? parseSafeCurrencyAmount(account.current_balance) : 0;
 
   const allTransfers = getCashTransfers(branchId);
   const relevantTransfers = allTransfers.filter(
     (t) =>
-      (t.status === 'COMPLETED' || t.status === 'IN_TRANSIT') &&
+      (isSettledTransferStatus(t.status) || t.status === 'IN_TRANSIT') &&
       (t.from_account_id === accountId || t.to_account_id === accountId)
   );
 
@@ -1840,16 +2063,17 @@ export const getAccountTransactionLedger = (
   const entriesAsc: AccountLedgerEntry[] = relevantTransfers.map((t) => {
     const isToThisAccount = t.to_account_id === accountId;
     const isFromThisAccount = t.from_account_id === accountId;
+    const txAmt = parseSafeCurrencyAmount(t.amount);
 
     let inAmt = 0;
     let outAmt = 0;
 
     if (isToThisAccount) {
-      inAmt = Number(t.amount) || 0;
+      inAmt = txAmt;
       totalIn += inAmt;
       running += inAmt;
     } else if (isFromThisAccount) {
-      outAmt = Number(t.amount) || 0;
+      outAmt = txAmt;
       totalOut += outAmt;
       running -= outAmt;
     }
