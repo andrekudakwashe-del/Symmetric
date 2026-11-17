@@ -25,6 +25,8 @@ import {
   isStaffAssignedToBranch,
   getStaffRoleInBranch,
   getCurrentCompany,
+  getDuplicateSameNameStaffGroups,
+  deduplicateSameNameStaffProfiles,
 } from '../../db/roomDatabase';
 import { checkStaffLimit } from '../../services/packageService';
 import { PackageLimitModal } from '../common/PackageLimitModal';
@@ -140,6 +142,8 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canEditMasterPrice: false, // Edit Master Price OFF
       canEditExchangeRate: false, // Exchange Rate OFF without Owner assignment
       canSeeMargin: true,
+      canAuditStocktake: false,
+      canPerformDailyBlindCount: true,
     };
   }
 
@@ -171,6 +175,8 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canEditMasterPrice: false,
       canEditExchangeRate: false,
       canSeeMargin: true,
+      canAuditStocktake: false,
+      canPerformDailyBlindCount: true,
     };
   }
 
@@ -202,6 +208,8 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canEditMasterPrice: false,
       canEditExchangeRate: false,
       canSeeMargin: false, // See Margin OFF
+      canAuditStocktake: false,
+      canPerformDailyBlindCount: false,
     };
   }
 
@@ -233,6 +241,8 @@ export const getRolePresetPermissions = (role: string): StaffPermissions => {
       canEditMasterPrice: false,
       canEditExchangeRate: false,
       canSeeMargin: false,
+      canAuditStocktake: false,
+      canPerformDailyBlindCount: true,
     };
   }
 
@@ -742,6 +752,18 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           description: 'Permit modifying catalog selling prices and last costs in Master table',
           critical: true,
         },
+        {
+          key: 'canAuditStocktake' as keyof StaffPermissions,
+          title: 'Designated Stocktake Auditor',
+          description: 'Supervise audits, create segments, view Consolidated Variance Report, and certify READY_FOR_COMMITTAL (Owner still commits stock)',
+          critical: true,
+        },
+        {
+          key: 'canPerformDailyBlindCount' as keyof StaffPermissions,
+          title: 'Run Daily Blind Counts (Fast Movers)',
+          description: 'Allow opening Stocktake module strictly in Counter/Daily Blind mode without full admin access',
+          critical: false,
+        },
       ],
     },
     {
@@ -871,10 +893,11 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
                 setIsRefreshing(true);
                 try {
                   const count = await persistentSyncEngine.forceRefreshStaff();
+                  deduplicateSameNameStaffProfiles({ companyId: getCurrentCompanyId(), broadcastTombstones: false });
                   loadData();
-                  alert(`Staff refreshed from server: ${count} staff records updated.`);
+                  setFormSuccessMsg(`Staff refreshed from server (${count} record(s) processed).`);
                 } catch (e: any) {
-                  alert(`Refresh error: ${e.message || String(e)}`);
+                  setFormError(`Refresh error: ${e.message || String(e)}`);
                 } finally {
                   setIsRefreshing(false);
                 }
@@ -1025,8 +1048,41 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
       {mainTab === 'roles' ? (
         <RoleConfigurationManager currentUser={currentUser} />
       ) : (
-        /* 2. Staff Cards Grid */
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <>
+          {(() => {
+            const dupGroups = getDuplicateSameNameStaffGroups(getCurrentCompanyId());
+            if (dupGroups.length === 0) return null;
+            return (
+              <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-300 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs shadow-xs">
+                <div className="flex items-start space-x-2.5">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-bold text-amber-950">
+                      Duplicate Staff Profiles Detected ({dupGroups.length})
+                    </div>
+                    <p className="text-[11px] text-amber-800">
+                      Same-name profiles found ({dupGroups.map((g) => `${g.displayName} ×${g.profiles.length}`).join(', ')}). Merging consolidates all sales, cash counts &amp; logs under each staff member&apos;s primary ID and tombstones duplicates.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    deduplicateSameNameStaffProfiles({
+                      companyId: getCurrentCompanyId(),
+                      broadcastTombstones: true,
+                    });
+                    loadData();
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-black text-xs shrink-0 transition cursor-pointer"
+                >
+                  Merge Duplicate Profiles
+                </button>
+              </div>
+            );
+          })()}
+          {/* 2. Staff Cards Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {/* Always Visible Quick Add Staff Card */}
           <div
             id="btn-add-staff-grid-card"
@@ -1233,6 +1289,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
           </div>
         )}
       </div>
+        </>
       )}
 
       {/* 3. Unified Staff Editor Modal (Tabs: Profile + Permissions) */}

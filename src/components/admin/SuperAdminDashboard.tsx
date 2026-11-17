@@ -45,7 +45,7 @@ import { getPackages, assignCompanyPackage } from '../../services/packageService
 import {
   getCompanies,
   saveCompany,
-  getBranches,
+  getAllBranches,
   saveBranch,
   subscribeRoomDatabase,
   confirmCompanyPayment,
@@ -96,7 +96,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
 
   const [adminTab, setAdminTab] = useState<'tenants' | 'packages' | 'sheets' | 'reports' | 'backends'>(initialTab);
   const [companies, setCompanies] = useState<Company[]>(() => getCompanies());
-  const [branches, setBranches] = useState(() => getBranches());
+  const [branches, setBranches] = useState(() => getAllBranches());
   const [searchTerm, setSearchTerm] = useState('');
   const [isAddCompanyModalOpen, setIsAddCompanyModalOpen] = useState(false);
   const [selectedCompanyForPayment, setSelectedCompanyForPayment] = useState<Company | null>(null);
@@ -162,7 +162,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   useEffect(() => {
     const unsub = subscribeRoomDatabase(() => {
       setCompanies(getCompanies());
-      setBranches(getBranches());
+      setBranches(getAllBranches());
     });
     return unsub;
   }, []);
@@ -184,14 +184,14 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
       initializeSystemConfigAndSync()
         .then((res) => {
           setCompanies(getCompanies());
-          setBranches(getBranches());
+          setBranches(getAllBranches());
           if (res.success && res.companies.length > 0) {
             setLastSyncStatus(`Master sync active • ${res.companies.length} tenants loaded`);
           }
         })
         .catch(() => {
           setCompanies(getCompanies());
-          setBranches(getBranches());
+          setBranches(getAllBranches());
         });
     }
   }, [isOpen]);
@@ -213,7 +213,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
         // Also push local tenants to master sheet so nothing is lost
         pushAllLocalTenantsToCloud(masterWebhookInput.trim()).then((pRes) => {
           setCompanies(getCompanies());
-          setBranches(getBranches());
+          setBranches(getAllBranches());
           if (pRes.pushedCount > 0) {
             showToast(`✓ Auto-pushed ${pRes.pushedCount} local tenants to Master Sheet!`);
           }
@@ -233,12 +233,12 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
     try {
       const res = await pushAllLocalTenantsToCloud(masterWebhookInput.trim());
       setCompanies(getCompanies());
-      setBranches(getBranches());
+      setBranches(getAllBranches());
       showToast(`✓ Synchronized ${res.pushedCount} tenant companies across all devices & Master Sheet!`);
       confetti({ particleCount: 50, spread: 70, origin: { y: 0.6 } });
     } catch (err: any) {
       setCompanies(getCompanies());
-      setBranches(getBranches());
+      setBranches(getAllBranches());
       showToast(`Sync notice: ${err.message || String(err)}`);
     } finally {
       setIsPushingTenants(false);
@@ -292,7 +292,10 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
           }
           if (sData && Array.isArray(sData.branches)) {
             sData.branches.forEach((sb: any) => {
-              if (sb && (sb.branch_id || sb.branchId || sb.id)) saveBranch(sb, { fromSync: true });
+              const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
+              if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
+                saveBranch(sb, { fromSync: true });
+              }
             });
           }
         }
@@ -303,7 +306,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
       // 2. Fetch from Master Google Sheet
       const res = await fetchCompaniesFromMasterSheet();
       setCompanies(getCompanies());
-      setBranches(getBranches());
+      setBranches(getAllBranches());
       const totalCount = getCompanies().length;
       if (res.success) {
         showToast(res.message || `Synced ${totalCount} companies from Master Google Sheet`);
@@ -314,7 +317,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
       }
     } catch (err: any) {
       setCompanies(getCompanies());
-      setBranches(getBranches());
+      setBranches(getAllBranches());
       showToast(`Synchronized ${getCompanies().length} tenants`);
     } finally {
       setIsSyncingWithMaster(false);

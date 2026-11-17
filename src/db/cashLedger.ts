@@ -273,6 +273,39 @@ export const deleteMovement = (id: string): boolean => {
 };
 
 /**
+ * Reassign all cash movements referencing oldStaffId (either directly on staffId or as shiftId prefix)
+ * to canonical newStaffId when merging duplicate staff profiles.
+ */
+export const reassignMovementsStaffId = (oldStaffId: string, newStaffId: string): number => {
+  const cleanOld = String(oldStaffId || '').trim();
+  const cleanNew = String(newStaffId || '').trim();
+  if (!cleanOld || !cleanNew || cleanOld === cleanNew) return 0;
+
+  const current = getAllMovements();
+  let updatedCount = 0;
+  const oldPrefix = `${cleanOld}_`;
+  const next = current.map((m) => {
+    const mStaff = String(m.staffId || '').trim();
+    const mShift = String(m.shiftId || '');
+    const hasStaffMatch = mStaff === cleanOld;
+    const hasShiftMatch = mShift.startsWith(oldPrefix);
+    if (!hasStaffMatch && !hasShiftMatch) return m;
+    updatedCount++;
+    return {
+      ...m,
+      staffId: hasStaffMatch ? cleanNew : m.staffId,
+      shiftId: hasShiftMatch ? `${cleanNew}_${mShift.slice(oldPrefix.length)}` : m.shiftId,
+      updatedAt: new Date().toISOString(),
+    };
+  });
+
+  if (updatedCount > 0) {
+    saveAllMovements(next);
+  }
+  return updatedCount;
+};
+
+/**
  * Query movements with a filter object or predicate function
  * Strictly isolated to current active branch unless explicitly requested for ALL
  */

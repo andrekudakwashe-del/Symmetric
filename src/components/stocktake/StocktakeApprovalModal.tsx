@@ -16,11 +16,13 @@ import {
 } from 'lucide-react';
 import { StocktakeSession, Salesperson } from '../../types';
 import { verifySalespersonPin } from '../../db/roomDatabase';
+import { isStocktakeLeader, isStocktakeAuditor } from '../../services/stocktakeAccessService';
 
 interface StocktakeApprovalModalProps {
   session: StocktakeSession;
   currentUser: Salesperson | null;
   onApprove: (adminId: string, adminName: string, notes?: string) => void;
+  onCertifyReady?: (auditorId: string, auditorName: string, notes?: string) => void;
   onClose: () => void;
 }
 
@@ -28,6 +30,7 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
   session,
   currentUser,
   onApprove,
+  onCertifyReady,
   onClose,
 }) => {
   const [adminPin, setAdminPin] = useState('');
@@ -40,43 +43,54 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
   const shortageItems = consolidated.filter((i) => i.varianceTotalUnits < 0);
   const overageItems = consolidated.filter((i) => i.varianceTotalUnits > 0);
 
-  const adminName = currentUser?.name || 'Sarah Chidyamakono';
-  const adminId = currentUser?.id || '001';
+  const actorName = currentUser?.name || 'Unknown User';
+  const actorId = currentUser?.id || '';
 
-  // Role validation: Store Owner (SUPER_ADMIN / ADMIN / 001) OR assigned Stocktake Auditor
-  const isOwner =
-    currentUser?.role === 'SUPER_ADMIN' ||
-    currentUser?.role === 'ADMIN' ||
-    currentUser?.id === '001';
-  const isAssignedAuditor = Boolean(
-    session.stocktakeAuditorId &&
-    (currentUser?.id === session.stocktakeAuditorId || adminId === session.stocktakeAuditorId)
-  );
+  // Two-Man Integrity Role Validation:
+  // LEADER (Owner / Super Admin) commits final Inventory Master updates.
+  // AUDITOR certifies counts ready (READY_FOR_COMMITTAL) without self-committing stock.
+  const isLeader = isStocktakeLeader(currentUser);
+  const isAuditor = isStocktakeAuditor(currentUser, session);
+  const isAuditorCertMode = !isLeader && isAuditor && Boolean(onCertifyReady);
+  const isAuthorized = isLeader || isAuditorCertMode;
 
-  const isAuthorized = isOwner || isAssignedAuditor;
   const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
   const countedItemsOnly = consolidated.filter((i) => i.wasCountedInSession !== false);
+  const hasAuditorCertification = Boolean(session.certifiedByName || session.status === 'READY_FOR_COMMITTAL');
 
   const handleConfirmApproval = (e: React.FormEvent) => {
     e.preventDefault();
     setPinError('');
 
-    if (!isAuthorized) {
-      setPinError('Access Denied: Only Store Owner or Assigned Stocktake Auditor can commit to inventory.');
+    if (!currentUser || !isAuthorized) {
+      setPinError(
+        isAuditor && !onCertifyReady
+          ? 'Two-Man Integrity: Only the Store Owner / Leader can commit stock changes.'
+          : 'Access Denied: Only the Store Owner / Leader (commit) or Designated Auditor (certify) is permitted.'
+      );
       return;
     }
 
-    // PIN check - accepts admin default PIN '1234' or valid hashed PIN
-    if (adminPin && adminPin.trim() !== '1234' && (!currentUser || !verifySalespersonPin(currentUser, adminPin.trim()))) {
-      setPinError('Invalid Admin / Auditor Authorization PIN.');
+    const cleanPin = adminPin.trim();
+    if (!cleanPin) {
+      setPinError('Security PIN is required to authorize this action.');
+      return;
+    }
+
+    if (!verifySalespersonPin(currentUser, cleanPin)) {
+      setPinError('Invalid Authorization PIN for signed-in user.');
       return;
     }
 
     setIsSubmitting(true);
     setTimeout(() => {
-      onApprove(adminId, adminName, notes);
+      if (isLeader) {
+        onApprove(actorId, actorName, notes);
+      } else if (isAuditorCertMode && onCertifyReady) {
+        onCertifyReady(actorId, actorName, notes);
+      }
       setIsSubmitting(false);
-    }, 500);
+    }, 300);
   };
 
   return (
@@ -89,13 +103,18 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
               <ShieldCheck className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-base font-bold text-white">Stocktake Master Committal & Signoff</h2>
+              <h2 className="text-base font-bold text-white">
+                {isAuditorCertMode
+                  ? 'Auditor Pre-Commit Certification'
+                  : 'Owner Master Stocktake Committal & Signoff'}
+              </h2>
               <p className="text-xs text-slate-400">
                 Session: {session.title} ({session.sessionId})
               </p>
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition"
           >
@@ -111,17 +130,48 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
               <UserX className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
               <div>
                 <strong className="text-rose-100 font-semibold block mb-0.5">
-                  Authority Restricted: Store Owner or Assigned Stocktake Auditor Required
+                  Two-Man Integrity Lock: Store Owner / Leader Required
                 </strong>
-                During stocktakes, even regular branch managers are being audited. Only the Store Owner or the expressly designated <strong>Stocktake Auditor ({session.stocktakeAuditorName || 'Assigned Auditor'})</strong> has permission to commit inventory adjustments.
+                During stocktakes, even Branch Managers are audited. Only the <strong>Store Owner / Leader</strong> may execute final Inventory Master adjustments, and only the <strong>Assigned Stocktake Auditor ({session.stocktakeAuditorName || 'Assigned Auditor'})</strong> may certify counts ready.
+              </div>
+            </div>
+          ) : isAuditorCertMode ? (
+            <div className="bg-amber-950/40 border border-amber-700/70 rounded-xl p-3.5 text-xs text-amber-200 flex items-start gap-2.5">
+              <ShieldCheck className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <strong className="text-amber-100 block">
+                  Auditor Certification Step ({actorName})
+                </strong>
+                <span>
+                  Under Two-Man Integrity governance, your PIN locks verified counts as <strong>READY FOR COMMITTAL</strong> so the Store Owner / Leader can review and commit stock into Inventory Master.
+                </span>
               </div>
             </div>
           ) : (
-            <div className="bg-emerald-950/40 border border-emerald-800/60 rounded-xl p-3 text-xs text-emerald-200 flex items-center gap-2.5">
-              <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
-              <span>
-                Authorized Approver: <strong>{adminName}</strong> ({isOwner ? 'Store Owner' : 'Assigned Stocktake Auditor'})
-              </span>
+            <div className="space-y-2.5">
+              <div className="bg-emerald-950/40 border border-emerald-800/60 rounded-xl p-3 text-xs text-emerald-200 flex items-center gap-2.5">
+                <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>
+                  Authorized Stocktake Leader: <strong>{actorName}</strong> (Owner / Super Admin)
+                </span>
+              </div>
+
+              {hasAuditorCertification ? (
+                <div className="bg-blue-950/40 border border-blue-800/60 rounded-xl p-3 text-xs text-blue-200 flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-blue-400 shrink-0" />
+                  <span>
+                    Auditor Certified Ready by <strong>{session.certifiedByName || session.stocktakeAuditorName}</strong>
+                    {session.certifiedAt ? ` at ${new Date(session.certifiedAt).toLocaleString()}` : ''}.
+                  </span>
+                </div>
+              ) : (
+                <div className="bg-amber-950/40 border border-amber-800/60 rounded-xl p-3 text-xs text-amber-200 flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>
+                    Note: Designated Auditor has not yet certified counts ready; as Leader you may still proceed to commit or ask Auditor to sign off first.
+                  </span>
+                </div>
+              )}
             </div>
           )}
 
@@ -130,16 +180,17 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
             <Info className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
             <div>
               <strong className="text-white block font-semibold">
-                Committal Scope: {isFullLockdown ? 'Full Storewide Lockdown Overwrite' : `Targeted Count (${session.countType})`}
+                {isAuditorCertMode ? 'Certification Scope' : 'Committal Scope'}:{' '}
+                {isFullLockdown ? 'Full Storewide Lockdown Overwrite' : `Targeted Count (${session.countType})`}
               </strong>
               <p className="mt-0.5 text-slate-300">
                 {isFullLockdown
                   ? 'All lines will be committed to the Inventory Master database. Any uncounted catalog items default to 0 units.'
                   : `Only the ${countedItemsOnly.length} items counted in this session will be updated in the Inventory Master. The rest of the product catalog will remain completely untouched.`}
               </p>
-              {session.isLockdownActive && (
+              {isLeader && session.isLockdownActive && (
                 <div className="mt-2 text-emerald-400 flex items-center gap-1 font-semibold">
-                  <Unlock className="w-3.5 h-3.5" /> Store Lockdown will be automatically released upon approval.
+                  <Unlock className="w-3.5 h-3.5" /> Store Lockdown, temporary casuals & guest passes will be automatically released upon approval.
                 </div>
               )}
             </div>
@@ -199,7 +250,7 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
             <div>
               <label className="block text-xs font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
                 <Lock className="w-3.5 h-3.5 text-blue-400" />
-                Store Owner / Stocktake Auditor Security PIN *
+                {isAuditorCertMode ? 'Auditor Personal Security PIN *' : 'Owner / Leader Personal Security PIN *'}
               </label>
               <input
                 type="password"
@@ -208,7 +259,7 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
                 disabled={!isAuthorized}
                 value={adminPin}
                 onChange={(e) => setAdminPin(e.target.value)}
-                placeholder="Enter PIN (Default: 1234)"
+                placeholder="Enter your 6-digit PIN"
                 className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-lg text-sm text-white focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono disabled:opacity-50"
               />
               {pinError && <p className="text-xs text-rose-400 mt-1 font-medium">{pinError}</p>}
@@ -216,7 +267,7 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
 
             <div>
               <label className="block text-xs font-semibold text-slate-300 mb-1">
-                Audit Approval Remarks / Notes (Optional)
+                {isAuditorCertMode ? 'Auditor Certification Remarks (Optional)' : 'Audit Approval Remarks / Notes (Optional)'}
               </label>
               <textarea
                 rows={2}
@@ -243,10 +294,16 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
             type="button"
             onClick={handleConfirmApproval}
             disabled={isSubmitting || !isAuthorized}
-            className="px-5 py-2 rounded-lg text-xs font-bold bg-blue-600 hover:bg-blue-500 text-white shadow-lg flex items-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`px-5 py-2 rounded-lg text-xs font-bold text-white shadow-lg flex items-center gap-2 transition disabled:opacity-50 disabled:cursor-not-allowed ${
+              isAuditorCertMode ? 'bg-amber-600 hover:bg-amber-500' : 'bg-blue-600 hover:bg-blue-500'
+            }`}
           >
             <ShieldCheck className="w-4 h-4" />
-            {isSubmitting ? 'Posting Stock Updates...' : 'Authorize & Commit to Inventory Master'}
+            {isSubmitting
+              ? 'Processing...'
+              : isAuditorCertMode
+              ? 'Certify Counts Ready for Owner'
+              : 'Authorize & Commit to Inventory Master'}
           </button>
         </div>
       </div>

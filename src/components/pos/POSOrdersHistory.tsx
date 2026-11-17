@@ -34,6 +34,7 @@ import { ManagerPinModal } from '../common/ManagerPinModal';
 import { ItemExchangeModal } from './ItemExchangeModal';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
+import { useClockSecurity, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
 
 interface POSOrdersHistoryProps {
   currentUser?: Salesperson | null;
@@ -48,6 +49,7 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
   isModal = false,
   onCloseModal,
 }) => {
+  const clockSecurity = useClockSecurity();
   const [sales, setSales] = useState<SaleInvoice[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [paymentFilter, setPaymentFilter] = useState<string>('All');
@@ -143,6 +145,13 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
 
   const handleTriggerRefundVoid = (invoice: SaleInvoice) => {
     if (invoice.status === 'Refunded' || invoice.status === 'Voided') return;
+    if (clockSecurity.isClockTampered) {
+      setActionNotice({
+        text: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+        type: 'error',
+      });
+      return;
+    }
     setManagerModalConfig({
       isOpen: true,
       title: 'Manager Authorization: Refund / Void Sale',
@@ -267,6 +276,13 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
 
   // Edit Receipt for Authorized Staff with Audit Trail Logging
   const handleTriggerEdit = (sale: SaleInvoice) => {
+    if (clockSecurity.isClockTampered) {
+      setActionNotice({
+        text: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+        type: 'error',
+      });
+      return;
+    }
     if (isSupervisorOrAbove(currentUser?.role)) {
       setAuthorizedEditor(currentUser || null);
       setEditingInvoice(sale);
@@ -342,6 +358,32 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
 
   return (
     <div id="pos-receipts-screen" className={`max-w-6xl mx-auto space-y-4 ${isModal ? 'p-2' : 'pb-28'}`}>
+      {clockSecurity.isClockTampered && (
+        <div
+          role="alert"
+          className="rounded-2xl bg-red-600 border-2 border-red-400 text-white px-4 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shadow-xl animate-fadeIn"
+        >
+          <div className="flex items-start sm:items-center gap-2.5">
+            <ShieldAlert className="w-5 h-5 text-white shrink-0 animate-pulse mt-0.5 sm:mt-0" />
+            <div>
+              <div className="font-black text-xs sm:text-sm">
+                Security Lock: Please enable Automatic Date &amp; Time in your phone settings to process refunds.
+              </div>
+              {clockSecurity.reason && (
+                <div className="text-[11px] text-red-100 mt-0.5">{clockSecurity.reason}</div>
+              )}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => isDeviceTimeAutomatic()}
+            className="px-3 py-1.5 rounded-xl bg-white text-red-700 hover:bg-red-50 font-black text-[11px] shrink-0 self-start sm:self-center shadow-sm transition active:scale-95"
+          >
+            Re-check Clock
+          </button>
+        </div>
+      )}
+
       {/* Top Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900/90 border border-slate-800 rounded-3xl p-4 shadow-lg backdrop-blur-md">
         <div className="flex items-center space-x-3">
@@ -682,9 +724,23 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
                           <>
                             <button
                               type="button"
-                              onClick={() => setExchangeInvoice(sale)}
-                              className="px-2.5 py-1 rounded-xl bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white text-xs font-bold border border-indigo-500/40 transition-colors flex items-center space-x-1"
-                              title="Exchange Item (Square/Lightspeed POS item replacement without voiding receipt)"
+                              disabled={clockSecurity.isClockTampered}
+                              onClick={() => {
+                                if (clockSecurity.isClockTampered) {
+                                  setActionNotice({
+                                    text: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+                                    type: 'error',
+                                  });
+                                  return;
+                                }
+                                setExchangeInvoice(sale);
+                              }}
+                              className="px-2.5 py-1 rounded-xl bg-indigo-600/30 hover:bg-indigo-600 disabled:opacity-40 disabled:cursor-not-allowed text-indigo-200 hover:text-white text-xs font-bold border border-indigo-500/40 transition-colors flex items-center space-x-1"
+                              title={
+                                clockSecurity.isClockTampered
+                                  ? 'Locked: Enable Automatic Date & Time to process exchanges or refunds'
+                                  : 'Exchange Item (Square/Lightspeed POS item replacement without voiding receipt)'
+                              }
                             >
                               <ArrowLeftRight className="w-3 h-3" />
                               <span>Exchange</span>
@@ -692,9 +748,14 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
 
                             <button
                               type="button"
+                              disabled={clockSecurity.isClockTampered}
                               onClick={() => handleTriggerRefundVoid(sale)}
-                              className="px-2 py-1 rounded-xl bg-rose-950/60 hover:bg-rose-900 text-rose-300 hover:text-white text-xs font-semibold border border-rose-800/60 flex items-center space-x-1 transition-colors"
-                              title="Refund / Void Sale (Restocks inventory & reconciles cashier till)"
+                              className="px-2 py-1 rounded-xl bg-rose-950/60 hover:bg-rose-900 disabled:opacity-40 disabled:cursor-not-allowed text-rose-300 hover:text-white text-xs font-semibold border border-rose-800/60 flex items-center space-x-1 transition-colors"
+                              title={
+                                clockSecurity.isClockTampered
+                                  ? 'Locked: Enable Automatic Date & Time to process refunds or voids'
+                                  : 'Refund / Void Sale (Restocks inventory & reconciles cashier till)'
+                              }
                             >
                               <RotateCcw className="w-3 h-3" />
                               <span>Refund / Void</span>

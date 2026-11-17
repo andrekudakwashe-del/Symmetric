@@ -1010,6 +1010,14 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                       </span>
                     </div>
                   )}
+                  {(auditData.row.refunds ?? 0) > 0 && (
+                    <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
+                      <span className="text-slate-400 block text-[10px]">- Cash Refunds (F2)</span>
+                      <span className="font-mono-num font-bold text-rose-400">
+                        -${(auditData.row.refunds ?? 0).toFixed(2)}
+                      </span>
+                    </div>
+                  )}
                   <div className="p-2 rounded-xl bg-slate-900/60 border border-slate-800">
                     <span className="text-slate-400 block text-[10px]">- Deductions</span>
                     <span className="font-mono-num font-bold text-rose-400">
@@ -1019,7 +1027,8 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                   {(auditData.row.activeCurrencies || getActiveCurrencies()).map((c: any) => {
                     const wVal =
                       (auditData.row?.currencyWithdrawals &&
-                        auditData.row.currencyWithdrawals[c.currency]) ??
+                        (auditData.row.currencyWithdrawals[c.currency] ??
+                          auditData.row.currencyWithdrawals[c.code])) ??
                       (c.currency === 'EcoCash'
                         ? auditData.row?.ecocashWithdrawal
                         : c.currency === 'ZiG'
@@ -1051,7 +1060,8 @@ export const CashierShiftReportModal: React.FC<CashierShiftReportModalProps> = (
                     {(auditData.row.activeCurrencies || getActiveCurrencies()).map((c: any) => {
                       const sVal =
                         (auditData.row?.currencySales &&
-                          auditData.row.currencySales[c.currency]) ??
+                          (auditData.row.currencySales[c.currency] ??
+                            auditData.row.currencySales[c.code])) ??
                         (c.currency === 'EcoCash'
                           ? auditData.row?.ecocashSales
                           : c.currency === 'ZiG'

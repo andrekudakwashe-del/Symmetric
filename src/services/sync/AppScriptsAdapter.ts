@@ -203,6 +203,12 @@ export class AppScriptsAdapter implements SyncAdapter {
         id: d.id || envelope.entityId,
         entityType: envelope.entityType,
         updatedAt: envelope.updatedAt,
+        ...(envelope.version !== undefined || d.version !== undefined
+          ? { version: Number(envelope.version ?? d.version ?? 0) }
+          : {}),
+        ...(envelope.mutationSource || d.mutationSource
+          ? { mutationSource: envelope.mutationSource || d.mutationSource }
+          : {}),
         clientRequestId: d.clientRequestId || envelope.packetId,
         company_id: d.company_id || d.companyId || getCurrentCompany()?.company_id || 'COMP-001',
         branch_id: d.branch_id || d.branchId || envelope.targetBranchId || 'ALL',

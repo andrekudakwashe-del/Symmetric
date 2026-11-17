@@ -4,8 +4,10 @@ import {
   getUserPrimaryModules,
   getRoleDefinitionForUser,
   getModuleIcon,
+  isModuleAllowedForUser,
   ALL_SYSTEM_MODULES,
 } from '../../services/roleNavigationService';
+import { isTabAllowedUnderLockdownOrStocktake } from '../../services/stocktakeAccessService';
 import { prefetchAppModules } from '../../services/modulePrefetcher';
 import {
   LayoutGrid,
@@ -34,20 +36,28 @@ export const BottomNavigation: React.FC<BottomNavigationProps> = ({
   const primaryModules = useMemo(() => getUserPrimaryModules(currentUser || null), [currentUser]);
 
   const navItems = useMemo(() => {
-    // Take top 4 ranked primary modules for this user's role
-    const topPrimary = primaryModules.slice(0, 4);
+    const isKioskOnly =
+      Boolean(currentUser?.isCasual || currentUser?.isVisitingCounter) ||
+      (Boolean(currentUser) && !isTabAllowedUnderLockdownOrStocktake(currentUser || null, 'pos') && !isTabAllowedUnderLockdownOrStocktake(currentUser || null, 'dashboard'));
 
-    // If fewer than 4 primary modules, fill with allowed or default modules
-    if (topPrimary.length < 4) {
+    // Take up to top 4 ranked primary modules permitted for this user's current state
+    const topPrimary = primaryModules
+      .filter((m) => isModuleAllowedForUser(currentUser || null, m.id))
+      .slice(0, 4);
+
+    // If fewer than 4 primary modules and NOT in strict stocktake kiosk mode, fill with allowed modules
+    if (!isKioskOnly && topPrimary.length < 4) {
       const existingIds = new Set(topPrimary.map((m) => m.id));
       for (const mod of ALL_SYSTEM_MODULES) {
-        if (!existingIds.has(mod.id) && (roleDef.allowedModules.includes(mod.id) || !roleDef.allowedModules.length)) {
+        if (!existingIds.has(mod.id) && isModuleAllowedForUser(currentUser || null, mod.id)) {
           topPrimary.push(mod);
           existingIds.add(mod.id);
           if (topPrimary.length >= 4) break;
         }
       }
     }
+
+    const hasExplicitStocktake = topPrimary.some((m) => m.id === 'stocktake');
 
     const items = topPrimary.map((mod) => {
       const Icon = getModuleIcon(mod.iconName);
@@ -56,7 +66,12 @@ export const BottomNavigation: React.FC<BottomNavigationProps> = ({
       let isActive = activeTab === mod.id;
       if (mod.id === 'pos' && (activeTab === 'counter' || activeTab === 'home')) isActive = true;
       if (mod.id === 'cash_balancing' && activeTab === 'reconciliation') isActive = true;
-      if (mod.id === 'inventory' && (activeTab === 'goods_received' || activeTab === 'stocktake' || activeTab === 'stock_movement')) isActive = true;
+      if (
+        mod.id === 'inventory' &&
+        (activeTab === 'goods_received' || activeTab === 'stock_movement' || (!hasExplicitStocktake && activeTab === 'stocktake'))
+      ) {
+        isActive = true;
+      }
 
       // Badge: show cart count if on POS/Counter module
       let badge: number | undefined = undefined;
@@ -87,7 +102,7 @@ export const BottomNavigation: React.FC<BottomNavigationProps> = ({
     });
 
     return items;
-  }, [primaryModules, roleDef, activeTab, cartCount, pendingSyncCount]);
+  }, [primaryModules, roleDef, activeTab, cartCount, pendingSyncCount, currentUser]);
 
   const handleItemClick = (id: ActiveTab) => {
     if (id === 'more') {

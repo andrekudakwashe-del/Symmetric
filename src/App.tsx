@@ -53,9 +53,11 @@ import {
   isModuleAllowedForUser,
   getUserPrimaryModules,
 } from './services/roleNavigationService';
+import { isTabAllowedUnderLockdownOrStocktake } from './services/stocktakeAccessService';
 import { prefetchAppModules } from './services/modulePrefetcher';
 import { lazyWithRetry } from './utils/lazyWithRetry';
 import { P2PMeshSyncHub } from './components/sync/P2PMeshSyncHub';
+import { isDeviceTimeAutomatic } from './utils/clockSecurity';
 
 // Resilient lazy-loaded secondary admin & heavy setup modules (with automatic retry on network drops)
 const AuditLogView = lazyWithRetry(() => import('./components/admin/AuditLogView').then(m => ({ default: m.AuditLogView })), 'AuditLogView');
@@ -186,7 +188,15 @@ export default function App() {
   }, []);
 
   const handleNavigateTab = (newTab: ActiveTab) => {
-    if (isBranchInLockdown(currentUser?.branchId) && (newTab === 'pos' || newTab === 'home' || newTab === 'items' || newTab === 'counter')) {
+    const activeUser = currentUser || getSessionUser();
+    const userBranch = activeUser?.branchId || activeUser?.branch_id;
+    if (activeUser && !isTabAllowedUnderLockdownOrStocktake(activeUser, newTab, userBranch)) {
+      showToastNotification(
+        activeUser.isCasual || activeUser.isVisitingCounter
+          ? 'Counter Kiosk Mode: Access restricted to active Stocktake counting.'
+          : 'Branch Lockdown Active: All staff are routed directly to Stocktake.',
+        3500
+      );
       historyNavigationService.pushTab('stocktake');
       setActiveTab('stocktake');
       return;
@@ -194,7 +204,7 @@ export default function App() {
 
     // Day-Lock Gatekeeper: prevent opening new day sales/POS if previous business day was never closed with EOD
     if (newTab === 'pos' || newTab === 'items' || newTab === 'counter') {
-      const eodCheck = checkPreviousBusinessDayStatus(currentUser?.branchId);
+      const eodCheck = checkPreviousBusinessDayStatus(userBranch);
       if (eodCheck.requiresEod && eodCheck.unclosedDate) {
         showToastNotification(`Day-Lock Active: End-of-Day (Z-Report) has not been run for ${eodCheck.unclosedDate}. Please finalize reconciliation in Form 4 first.`, 4000);
         historyNavigationService.pushTab('form4');
@@ -207,22 +217,26 @@ export default function App() {
     setActiveTab(newTab);
   };
 
-  // Real-time Stocktake Lockdown Listener: Freeze POS and navigate to stocktake when lockdown is broadcasted
+  // Real-time Stocktake Lockdown Listener: Freeze POS and route all non-exempt staff to stocktake when lockdown broadcasts
   useEffect(() => {
     const handleLockdownEvent = (e: any) => {
-      const detail = e.detail;
-      if (detail && detail.isLocked) {
+      const detail = e?.detail;
+      const activeUser = getSessionUser();
+      if (detail && detail.isLocked && activeUser) {
         setActiveTab((prev) => {
-          if (prev === 'pos' || prev === 'home' || prev === 'items' || prev === 'counter') {
+          if (!isTabAllowedUnderLockdownOrStocktake(activeUser, prev, detail.branchId || activeUser.branchId || activeUser.branch_id)) {
             return 'stocktake';
           }
           return prev;
         });
       }
+      setDbVersion((v) => v + 1);
     };
     window.addEventListener('saimetric_stocktake_lockdown_updated', handleLockdownEvent);
+    window.addEventListener('saimetric_lockdown_updated', handleLockdownEvent);
     return () => {
       window.removeEventListener('saimetric_stocktake_lockdown_updated', handleLockdownEvent);
+      window.removeEventListener('saimetric_lockdown_updated', handleLockdownEvent);
     };
   }, []);
 
@@ -417,6 +431,32 @@ export default function App() {
     return () => unsubAlerts();
   }, []);
 
+  // Multi-layered clock tampering monitor (boot, focus, online, visibility, and 60s interval)
+  useEffect(() => {
+    const runClockCheck = () => {
+      isDeviceTimeAutomatic().catch(() => {});
+    };
+    runClockCheck();
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        runClockCheck();
+      }
+    };
+
+    window.addEventListener('focus', runClockCheck);
+    window.addEventListener('online', runClockCheck);
+    document.addEventListener('visibilitychange', handleVisibility);
+    const intervalId = setInterval(runClockCheck, 60000);
+
+    return () => {
+      window.removeEventListener('focus', runClockCheck);
+      window.removeEventListener('online', runClockCheck);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      clearInterval(intervalId);
+    };
+  }, []);
+
   const handleLoginSuccess = (user: Salesperson) => {
     lastActivityRef.current = Date.now();
     setWarningSeconds(null);
@@ -425,8 +465,14 @@ export default function App() {
     setCurrentUser(user);
     setLoggedInUser(user);
     const landingTab = getLandingTabForUser(user);
-    const eodCheck = checkPreviousBusinessDayStatus(user.branchId || user.branch_id);
-    if (isBranchInLockdown(user.branchId || user.branch_id)) {
+    const userBranch = user.branchId || user.branch_id;
+    const eodCheck = checkPreviousBusinessDayStatus(userBranch);
+    if (
+      user.isCasual ||
+      user.isVisitingCounter ||
+      isBranchInLockdown(userBranch) ||
+      !isTabAllowedUnderLockdownOrStocktake(user, landingTab, userBranch)
+    ) {
       setActiveTab('stocktake');
     } else if (eodCheck.requiresEod && (landingTab === 'pos' || landingTab === 'items' || landingTab === 'counter')) {
       showToastNotification(`Day-Lock Active: Prior business day (${eodCheck.unclosedDate}) requires End-of-Day closure before new sales can open.`, 4000);
@@ -489,7 +535,7 @@ export default function App() {
           onToggleOffline={() => setIsOfflineMode(!isOfflineMode)}
         />
         <LoginScreen onLoginSuccess={handleLoginSuccess} lockoutMessage={lockoutMessage} />
-        <OfflineIndicator isSimulatedOffline={isOfflineMode} />
+        <OfflineIndicator isSimulatedOffline={isOfflineMode} dockPosition="top" />
       </div>
     );
   }

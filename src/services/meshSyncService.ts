@@ -10,6 +10,7 @@ import {
   CashLogEntry,
   DirectGrv,
   InternalConsumption,
+  StocktakeSession,
 } from '../types';
 import mqtt, { MqttClient } from 'mqtt';
 import {
@@ -172,6 +173,11 @@ import { getMovements, addMovement, onCashMovementCreated, CashMovement } from '
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { getSyncMeta, setSyncMeta } from '../db/indexedDBService';
 import { LocalHubConfig, normalizeHubUrl } from '../utils/localHubConfig';
+import {
+  reportTrustedTimeSample,
+  triggerClockTamperLock,
+  recordSecurityAlert,
+} from '../utils/clockSecurity';
 import {
   hashPin,
   generatePinSalt,
@@ -977,6 +983,8 @@ class MeshSyncManager {
         this.handleReconPushBackfillRequest(parsed);
       } else if (pType === 'HUB_CLOUD_BROADCAST') {
         this.handleHubCloudBroadcast(parsed);
+      } else if (pType === 'SECURITY_ALERT') {
+        this.handleSecurityAlertPacket(parsed);
       }
     };
 
@@ -1634,7 +1642,16 @@ class MeshSyncManager {
     if (!this.syncCore) return;
     this.syncLocalHubContext();
     const cloudAdapter = this.getOrCreateSingleCloudAdapter();
-    const useLocalHub = this.isLocalHubActive() && !this.isCloudOnlyMode;
+    const activeStrategy = this.getActiveSyncStrategy();
+    const hasConfiguredHub = Boolean(LocalHubConfig.getLocalHubUrl().trim());
+    const inHubGraceWindow =
+      activeStrategy === 'HUB_CLOUD' &&
+      !this.isCloudOnlyMode &&
+      hasConfiguredHub &&
+      !this.isLocalHubConnected &&
+      this.localHubDisconnectedAt !== null &&
+      !this.isLocalHubLost;
+    const useLocalHub = (this.isLocalHubActive() && !this.isCloudOnlyMode) || inHubGraceWindow;
     if (useLocalHub) {
       this.syncCore.setAdapter(this.localHubAdapter);
       cloudAdapter.pause?.();
@@ -2012,9 +2029,14 @@ class MeshSyncManager {
           return ts > 0 ? { ...found, updatedAt: ts } : undefined;
         }
         case 'branch': {
+          const normCanon = (raw?: string) => {
+            const c = String(raw || '').trim().toUpperCase();
+            return c === '1' || c === 'BR001' || c === 'BR-MAIN' ? 'BR-MAIN' : c;
+          };
+          const targetUpper = normCanon(cleanUpper);
           const found = getAllBranches().find(
             (b: any) =>
-              String(b.branchId || b.id || '').trim().toUpperCase() === cleanUpper
+              normCanon(b.branchId || b.id || b.branch_id) === targetUpper
           );
           if (!found) return undefined;
           const ts = extractRecordTimestamp(found);
@@ -2629,14 +2651,18 @@ class MeshSyncManager {
         break;
 
       case 'branch':
-        if (d && isValidBranchRecord(d) && (d.branchId || d.id)) {
+        if (d && isValidBranchRecord(d) && (d.branchId || d.id || d.branch_id || d.BranchID)) {
+          const rawBrId = String(d.branchId || d.id || d.branch_id || d.BranchID || 'BR-MAIN').trim();
+          const lowerBr = rawBrId.toLowerCase();
+          const canonBrId = lowerBr === '1' || lowerBr === 'br-main' || lowerBr === 'br001' ? 'BR-MAIN' : rawBrId;
           const branchTime = extractRecordTimestamp(d) || envelope.updatedAt || 0;
-          saveBranch({ ...d, fromMesh: true }, { fromSync: true });
+          const normalizedBranch = { ...d, branchId: canonBrId, id: canonBrId, branch_id: canonBrId, fromMesh: true };
+          saveBranch(normalizedBranch, { fromSync: true });
           if (branchTime > 0) {
             setLastBranchSync(Math.max(getLastBranchSync(), branchTime));
           }
           if (!isSilent && typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('saimetric_branches_updated', { detail: d }));
+            window.dispatchEvent(new CustomEvent('saimetric_branches_updated', { detail: normalizedBranch }));
           }
         }
         break;
@@ -2747,6 +2773,7 @@ class MeshSyncManager {
           syncCasualWorkersFromHub(d, { fromSync: true });
           if (typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
           }
         }
         break;
@@ -2756,12 +2783,13 @@ class MeshSyncManager {
           branchId: d.branchId || this.config.branchId,
           isLocked: Boolean(d.isLocked),
           sessionId: d.sessionId,
+          lockedBy: d.lockedBy,
           lockedByName: d.lockedByName,
+          lockedAt: d.lockedAt,
           reason: d.reason,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+          lastUpdated: d.lastUpdated,
         });
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(new CustomEvent('saimetric_stocktake_lockdown_updated', { detail: d }));
-        }
         break;
 
       case 'stocktake_segment': {
@@ -2838,23 +2866,18 @@ class MeshSyncManager {
       }
 
       case 'stocktake_session': {
-        const sId = d?.sessionId || d?.id || envelope.entityId;
+        const sObj = d?.session && typeof d.session === 'object' ? { ...d, ...d.session } : d;
+        const sId = sObj?.sessionId || sObj?.id || envelope.entityId;
         if (sId) {
           ingestStocktakeSessionFromMesh({
+            ...sObj,
             sessionId: sId,
-            sessionName: d?.sessionName || d?.title || d?.session?.title,
-            title: d?.sessionName || d?.title || d?.session?.title,
-            segments: d?.segments || d?.session?.segments || [],
-            startedBy: d?.startedBy || d?.startedByName || d?.session?.createdByName,
-            startedAt: d?.startedAt || d?.timestamp || d?.session?.timestamp,
-            countType: d?.countType || d?.session?.countType,
-            branchId: d?.branchId || d?.session?.branchId,
-            branchName: d?.branchName || d?.session?.branchName,
-            isLockdownActive:
-              d?.isLockdownActive !== undefined
-                ? d.isLockdownActive
-                : d?.session?.isLockdownActive,
-            notes: d?.notes || d?.session?.notes,
+            sessionName: sObj?.sessionName || sObj?.title,
+            title: sObj?.title || sObj?.sessionName,
+            segments: sObj?.segments || [],
+            startedBy: sObj?.startedBy || sObj?.createdByName || sObj?.createdBy,
+            startedAt: sObj?.startedAt || sObj?.timestamp,
+            updatedAt: sObj?.updatedAt || envelope.updatedAt,
           });
         }
         break;
@@ -3267,6 +3290,7 @@ class MeshSyncManager {
           const downDuration = Date.now() - this.localHubDisconnectedAt;
           if (downDuration >= 120000) {
             this.isLocalHubLost = true;
+            this.syncActiveAdapter();
             this.notifyPeerSubscribers(true);
             this.notifyConnectionModeChange();
           }
@@ -3415,6 +3439,10 @@ class MeshSyncManager {
       LocalHubConfig.clearHubBranchIdentity();
     }
 
+    if (typeof packet.timestamp === 'number' && packet.timestamp > 1_600_000_000_000) {
+      reportTrustedTimeSample(packet.timestamp, 'LOCAL_HUB');
+    }
+
     this.addLog(
       'DISCOVERY',
       `Hub Handshake Verified: Tethered to [${this.hubBranchName}] (${branchId}).`,
@@ -3557,6 +3585,34 @@ class MeshSyncManager {
     this.syncActiveAdapter();
     this.evaluateConnectionPriority();
     this.notifyConnectionModeChange();
+  }
+
+  private handleSecurityAlertPacket(packet: any) {
+    if (!packet || typeof packet !== 'object') return;
+    const targetDeviceId = String(packet.targetDeviceId || packet.deviceId || '').trim();
+    const isForThisDevice = !targetDeviceId || targetDeviceId === this.config.deviceId;
+    const msg =
+      packet.message ||
+      `Security Lock: Backdated transaction rejected from ${targetDeviceId || 'terminal'}. Enable Automatic Date & Time.`;
+
+    triggerClockTamperLock(msg, {
+      deviceId: targetDeviceId || this.config.deviceId,
+      deviceName: packet.deviceName || targetDeviceId,
+      packetType: packet.packetType || packet.action || 'TRANSACTION',
+      invoiceId: packet.invoiceId || packet.entityId,
+      claimedTimestamp: typeof packet.claimedTimestamp === 'number' ? packet.claimedTimestamp : undefined,
+      hubTimestamp: typeof packet.hubTimestamp === 'number' ? packet.hubTimestamp : undefined,
+      lockCurrentDevice: isForThisDevice,
+    });
+
+    if (isForThisDevice) {
+      this.localHubAdapter.removePendingPacketById(packet.packetId, packet.entityId || packet.invoiceId);
+      if (packet.invoiceId && this.pendingSaleAcks.has(String(packet.invoiceId))) {
+        this.pendingSaleAcks.delete(String(packet.invoiceId));
+      }
+    }
+
+    this.addLog('SECURITY_DROP', msg, targetDeviceId || 'Local Hub', this.config.deviceName);
   }
 
   private async drainQueueToLocalHub() {
@@ -3799,9 +3855,9 @@ class MeshSyncManager {
         setLastStaffSync(Date.now());
       }
 
-      // 4.1 Branch Delta Sync on reconnect
+      // 4.1 Branch Delta Sync on reconnect (strictly scoped to current company)
       const lastBranchSync = getLastBranchSync();
-      const allBranches = getAllBranches();
+      const allBranches = getBranches();
       console.log('[HWM] Filtering branch. HWM:', lastBranchSync, 'Total records:', allBranches.length);
       const filteredBranches = lastBranchSync === 0
         ? allBranches
@@ -3878,7 +3934,7 @@ class MeshSyncManager {
       console.log(`[StocktakeSession] Delta sync on reconnect: ${filteredSessions.length} of ${allSessions.length} stocktake sessions broadcast (since ${new Date(lastStocktakeSync).toISOString()})`);
 
       for (const sess of filteredSessions) {
-        this.broadcastStocktakeSessionStarted(sess);
+        this.broadcastStocktakeSession(sess);
       }
       if (lastStocktakeSync === 0 && allSessions.length > 0) {
         setLastStocktakeSessionSync(Date.now());
@@ -4006,6 +4062,7 @@ class MeshSyncManager {
           updatedAt: stampedAt,
           hubTimestamp: stampedAt,
           lastUpdated,
+          isDirty: false,
         };
         setStored(STORAGE_KEYS.SALESPEOPLE, all);
       }
@@ -4188,6 +4245,7 @@ class MeshSyncManager {
           'inventory',
           'customers',
           'staff',
+          'branches',
         ],
         hubTimestamp: Date.now(),
         originDeviceId: this.config.deviceId,
@@ -4210,7 +4268,7 @@ class MeshSyncManager {
     const sweepId = packet.sweepId || `sweep-${Date.now()}`;
     const targetEntities: string[] = Array.isArray(packet.targetEntities)
       ? packet.targetEntities
-      : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'staff'];
+      : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'staff', 'branches'];
 
     if (isPosActiveCheckout()) {
       console.log(`[Recon Sweep] 🛒 POS terminal is active in checkout. Deferring sweep (${sweepId}) by 60s.`);
@@ -4340,6 +4398,8 @@ class MeshSyncManager {
       staff: 'staff',
       salespeople: 'staff',
       users: 'staff',
+      branches: 'branch',
+      branch: 'branch',
     };
     const canonEntity = canonMap[entityType];
     if (!canonEntity || !ENTITY_REGISTRY[canonEntity]) return;
@@ -4366,6 +4426,9 @@ class MeshSyncManager {
         const recId = String(
           rec.id ||
             rec.itemId ||
+            rec.branchId ||
+            rec.branch_id ||
+            rec.BranchID ||
             rec.customerId ||
             rec.grvNumber ||
             rec.changeId ||
@@ -4432,6 +4495,8 @@ class MeshSyncManager {
     } else if (norm === 'staff' || norm === 'salespeople' || norm === 'users') {
       window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+    } else if (norm === 'branches' || norm === 'branch') {
+      window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
     }
   }
 
@@ -4651,6 +4716,24 @@ class MeshSyncManager {
           delete cleanRec.fromSync;
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
           this.broadcastStaff(cleanRec, { isReconPush: true });
+          pushedCount++;
+        }
+      } else if (entityType === 'branches' || entityType === 'branch') {
+        const normCanon = (raw?: string) => {
+          const c = String(raw || '').trim().toUpperCase();
+          return c === '1' || c === 'BR001' || c === 'BR-MAIN' ? 'BR-MAIN' : c;
+        };
+        const targetCanon = normCanon(cleanUpper);
+        const rec = getBranches().find(
+          (b: any) => normCanon(b.branchId || b.id || b.branch_id) === targetCanon
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          delete cleanRec.fromMesh;
+          delete cleanRec.fromSync;
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.broadcastBranch(cleanRec, { isReconPush: true });
           pushedCount++;
         }
       }
@@ -5257,6 +5340,15 @@ class MeshSyncManager {
     this.seenPacketIds.add(packetId);
 
     const dataCloudSynced = Boolean(data && typeof data === 'object' && (data as any).isCloudSynced === true);
+    const resolvedVersion =
+      opts?.meta?.version !== undefined
+        ? Number(opts.meta.version)
+        : data && typeof data === 'object' && (data as any).version !== undefined
+        ? Number((data as any).version)
+        : undefined;
+    const resolvedMutationSource =
+      opts?.meta?.mutationSource ||
+      (data && typeof data === 'object' ? (data as any).mutationSource : undefined);
     const envelope: SyncEnvelope = {
       packetId,
       entityType,
@@ -5264,6 +5356,8 @@ class MeshSyncManager {
       action: opts?.action || (spec?.appendOnly ? 'APPEND' : 'UPSERT'),
       data,
       updatedAt: now,
+      ...(resolvedVersion !== undefined && !isNaN(resolvedVersion) ? { version: resolvedVersion } : {}),
+      ...(resolvedMutationSource ? { mutationSource: resolvedMutationSource } : {}),
       originDeviceId: this.config.deviceId,
       targetBranchId: opts?.targetBranchId || this.config.branchId || 'ALL',
       class: spec?.class || 'T1',
@@ -6058,6 +6152,7 @@ class MeshSyncManager {
         'cashTransfers',
         'salespeople',
         'customers',
+        'branches',
       ],
       includeInventory: true,
       timestamp: Date.now(),
@@ -6285,6 +6380,26 @@ class MeshSyncManager {
         }
       }
       overallProcessed += delta.tombstones.length;
+    }
+
+    if (Array.isArray(delta.securityAlerts) && delta.securityAlerts.length > 0) {
+      for (const sa of delta.securityAlerts) {
+        if (sa && sa.message) {
+          recordSecurityAlert({
+            id: sa.id,
+            type: 'HUB_REJECTED_BACKDATE',
+            deviceId: sa.deviceId || sa.targetDeviceId || 'UNKNOWN-DEVICE',
+            deviceName: sa.deviceName,
+            packetType: sa.packetType,
+            invoiceId: sa.invoiceId,
+            claimedTimestamp: sa.claimedTimestamp,
+            hubTimestamp: sa.hubTimestamp,
+            driftMs: sa.driftMs,
+            message: sa.message,
+            createdAt: sa.timestamp || sa.createdAt,
+          });
+        }
+      }
     }
 
     // 1. Ingest Sales (T1 - Append-Only Merge)
@@ -6655,12 +6770,27 @@ class MeshSyncManager {
       }
     }
 
+    // 8.2b Ingest Branch Lockdowns from Catch-up Delta (LWW)
+    const rawLockdowns = (delta as any).branchLockdowns;
+    if (rawLockdowns && typeof rawLockdowns === 'object') {
+      const lockdownEntries = Array.isArray(rawLockdowns)
+        ? rawLockdowns
+        : Object.values(rawLockdowns);
+      for (const lockRec of lockdownEntries) {
+        if (lockRec && (lockRec as any).branchId) {
+          syncLockdownFromHub(lockRec as any);
+        }
+      }
+    }
+
     // 8.3 Ingest Branches from Catch-up Delta (T2 via SyncCore)
     let branchesIngested = 0;
     if (Array.isArray(delta.branches)) {
       for (const br of delta.branches) {
-        const brId = String(br?.branchId || br?.id || '');
-        if (!brId || !isValidBranchRecord(br)) continue;
+        const rawBrId = String(br?.branchId || br?.id || br?.branch_id || br?.BranchID || '').trim();
+        if (!rawBrId || !isValidBranchRecord(br)) continue;
+        const lowerBr = rawBrId.toLowerCase();
+        const brId = lowerBr === '1' || lowerBr === 'br-main' || lowerBr === 'br001' ? 'BR-MAIN' : rawBrId;
         const ts = extractRecordTimestamp(br);
         if (
           await this.ingestEnvelopeThroughSyncCore(
@@ -6669,7 +6799,7 @@ class MeshSyncManager {
               entityType: 'branch',
               entityId: brId,
               action: 'UPSERT',
-              data: br,
+              data: { ...br, branchId: brId, id: brId, branch_id: brId },
               updatedAt: ts,
               originDeviceId: packetOrigin || 'MESH_CATCHUP',
               targetBranchId: 'ALL',
@@ -6719,6 +6849,7 @@ class MeshSyncManager {
       );
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
       }
     }
 
@@ -7156,6 +7287,11 @@ class MeshSyncManager {
       ...sanitizedStaff,
       password: effectivePassword,
       pin_hash: effectiveHash,
+      ...(staff.pin_salt ? { pin_salt: staff.pin_salt } : {}),
+      ...(staff.pinVersion !== undefined ? { pinVersion: Number(staff.pinVersion) } : {}),
+      ...(staff.pinUpdatedAt ? { pinUpdatedAt: staff.pinUpdatedAt } : {}),
+      version: Math.max(1, Number(staff.version || 1)),
+      mutationSource: staff.mutationSource || 'USER_EDIT',
       assignedBranchIds,
       updatedAt: staff.updatedAt,
       lastUpdated: staff.lastUpdated,
@@ -7168,7 +7304,11 @@ class MeshSyncManager {
       updatedAt: staff.updatedAt,
       topicSuffix: 'staff',
       packetId,
-      meta: { isReconPush },
+      meta: {
+        isReconPush,
+        version: staffPayload.version,
+        mutationSource: staffPayload.mutationSource,
+      },
     });
     this.addLog('BROADCAST', `Staff account ${staff.name} (${staff.id} - ${staff.role}) broadcasted to WiFi mesh (PIN protected)`, this.config.deviceName);
     this.notifyPeerSubscribers();
@@ -7419,24 +7559,28 @@ class MeshSyncManager {
   /**
    * Broadcast a branch creation or edit to peers & Hub
    */
-  public broadcastBranch(branch: any) {
-    if (this.isIngestingFromHub) return;
+  public broadcastBranch(branch: any, opts?: { isReconPush?: boolean }) {
+    if (this.isIngestingFromHub && !opts?.isReconPush) return;
     if (!branch) return;
-    if (branch.fromMesh || (branch as any).fromSync) return;
+    if (!opts?.isReconPush && (branch.fromMesh || (branch as any).fromSync)) return;
 
-    const bId = branch.branchId || branch.id || (branch as any).branch_id || 'BR-MAIN';
-    branch.updatedAt = branch.updatedAt || Date.now();
-    branch.lastUpdated = branch.lastUpdated || new Date().toISOString();
+    const rawId = String(branch.branchId || branch.id || (branch as any).branch_id || (branch as any).BranchID || 'BR-MAIN').trim();
+    const lowerId = rawId.toLowerCase();
+    const bId = lowerId === '1' || lowerId === 'br-main' || lowerId === 'br001' ? 'BR-MAIN' : rawId;
+    const cleanBranch = { ...branch, branchId: bId, id: bId, branch_id: bId };
+    cleanBranch.updatedAt = cleanBranch.updatedAt || Date.now();
+    cleanBranch.lastUpdated = cleanBranch.lastUpdated || new Date(cleanBranch.updatedAt).toISOString();
 
     const packetId = `BRANCH-PKT-${bId}-${Date.now()}`;
-    void this.dispatchEnvelope('branch', bId, branch, {
+    void this.dispatchEnvelope('branch', bId, cleanBranch, {
       action: 'UPSERT',
       targetBranchId: 'ALL',
-      updatedAt: branch.updatedAt,
+      updatedAt: cleanBranch.updatedAt,
       topicSuffix: 'branch',
       packetId,
+      ...(opts?.isReconPush ? { meta: { isReconPush: true } } : {}),
     });
-    this.addLog('BROADCAST', `Branch [${branch.branchName || bId}] broadcasted to WiFi mesh`, this.config.deviceName);
+    this.addLog('BROADCAST', `Branch [${cleanBranch.name || cleanBranch.branchName || bId}] broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 
@@ -8488,8 +8632,11 @@ class MeshSyncManager {
     sessionId: string,
     isLocked: boolean,
     lockedByName: string,
-    reason?: string
+    reason?: string,
+    lockedBy?: string
   ): void {
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
     void this.dispatchEnvelope(
       'branch_lockdown',
       sessionId || branchId,
@@ -8497,15 +8644,58 @@ class MeshSyncManager {
         branchId,
         sessionId,
         isLocked,
+        lockedBy,
         lockedByName,
+        lockedAt: isLocked ? nowIso : undefined,
         reason,
+        updatedAt: now,
+        lastUpdated: nowIso,
       },
       {
         action: 'UPSERT',
+        updatedAt: now,
         targetBranchId: branchId,
         topicSuffix: 'stocktake/lockdown_broadcast',
       }
     );
+  }
+
+  public broadcastStocktakeSession(session: StocktakeSession): void {
+    if (!session || !session.sessionId) return;
+    const recUpdatedAt =
+      typeof session.updatedAt === 'number' && session.updatedAt > 0
+        ? session.updatedAt
+        : session.lastUpdated
+        ? new Date(session.lastUpdated).getTime()
+        : session.timestamp
+        ? new Date(session.timestamp).getTime()
+        : Date.now();
+
+    void this.dispatchEnvelope(
+      'stocktake_session',
+      session.sessionId,
+      {
+        ...session,
+        sessionName: session.title,
+        startedBy: session.createdByName || session.createdBy,
+        startedAt: session.timestamp,
+        branchId: session.branchId || this.config.branchId,
+        updatedAt: recUpdatedAt,
+        lastUpdated: session.lastUpdated || new Date(recUpdatedAt).toISOString(),
+      },
+      {
+        action: 'UPSERT',
+        updatedAt: recUpdatedAt,
+        targetBranchId: session.branchId || this.config.branchId,
+        topicSuffix: 'stocktake/session_started',
+      }
+    );
+    this.addLog(
+      'BROADCAST',
+      `Stocktake session "${session.title}" [${session.sessionId}] (${session.status}) synced via SyncCore.`,
+      this.config.deviceName
+    );
+    this.notifyPeerSubscribers();
   }
 
   public broadcastStocktakeSessionStarted(data: {
@@ -8520,6 +8710,7 @@ class MeshSyncManager {
     isLockdownActive?: boolean;
     notes?: string;
     updatedAt?: number | string;
+    [key: string]: any;
   }): void {
     const recUpdatedAt = typeof (data as any).updatedAt === 'number' && (data as any).updatedAt > 0
       ? (data as any).updatedAt
@@ -8531,6 +8722,7 @@ class MeshSyncManager {
       {
         ...data,
         branchId: data.branchId || this.config.branchId,
+        updatedAt: recUpdatedAt,
       },
       {
         action: 'UPSERT',

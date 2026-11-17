@@ -51,6 +51,8 @@ import {
   verifyMobileMoneySale,
   flagFakeMobileMoneySale,
   getMobileMoneySaleKind,
+  getDuplicateSameNameStaffGroups,
+  deduplicateSameNameStaffProfiles,
 } from '../../db/roomDatabase';
 import {
   handoverTillToSafe,
@@ -427,8 +429,24 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     let totalZigSales = 0;
     let totalCreditExtended = 0;
     let totalCreditCashOut = 0;
+    let totalRefunds = 0;
 
-    const activeCurrenciesList = getActiveCurrencies();
+    const canonKeyFor = (c: { currency?: string; code?: string; name?: string }) => {
+      const combined = `${c.currency || ''} ${c.code || ''} ${c.name || ''}`.toLowerCase();
+      if (combined.includes('eco')) return 'EcoCash';
+      if (combined.includes('zig')) return 'ZiG';
+      return c.currency || c.code || 'MultiCurr';
+    };
+    const rawActiveCurrencies = getActiveCurrencies();
+    const activeCurrenciesDedup = new Map<string, (typeof rawActiveCurrencies)[number]>();
+    rawActiveCurrencies.forEach((c) => {
+      const k = canonKeyFor(c);
+      if (!activeCurrenciesDedup.has(k)) {
+        activeCurrenciesDedup.set(k, { ...c, currency: k });
+      }
+    });
+    const activeCurrenciesList = Array.from(activeCurrenciesDedup.values());
+
     const currencyWithdrawalTotals: Record<string, number> = {};
     const currencySalesTotals: Record<string, number> = {};
     activeCurrenciesList.forEach((c) => {
@@ -443,23 +461,63 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     let countOver = 0;
     let countActive = 0;
 
+    // Cross-row invoice deduplication guard: prevents any single invoice ID (e.g. un-ID'd orphan)
+    // from ever being counted twice in Form 4 Grand Totals.
+    const seenSaleIds = new Set<string>();
+
     balancingData.forEach((r) => {
+      let dupSalesAmount = 0;
+      let dupCashAmount = 0;
+      let dupEcoAmount = 0;
+      let dupZigAmount = 0;
+      const seenInRow = new Set<string>();
+
+      (r.staffSales || []).forEach((sale) => {
+        const sId = String(sale?.id || '').trim();
+        if (!sId || seenInRow.has(sId)) return;
+        seenInRow.add(sId);
+        if (seenSaleIds.has(sId)) {
+          const saleTotal = Number(sale.total) || 0;
+          dupSalesAmount += saleTotal;
+          const meth = (sale.paymentMethod || '').toLowerCase();
+          const curr = (sale.currency || '').toLowerCase();
+          if (meth.includes('eco') || curr.includes('eco')) {
+            dupEcoAmount += saleTotal;
+          } else if (meth.includes('zig') || curr.includes('zig')) {
+            dupZigAmount += saleTotal;
+          } else if (sale.paymentMethod === 'Cash' || (!sale.paymentMethod && (!sale.currency || sale.currency === 'USD'))) {
+            dupCashAmount += Math.max(0, saleTotal - (Number(sale.customerCreditUsed) || 0));
+          }
+        } else {
+          seenSaleIds.add(sId);
+        }
+      });
+
+      const effectiveRowSales = Math.max(0, (r.sales || 0) - dupSalesAmount);
+      const effectiveRowCashSales = Math.max(0, (r.cashSales || 0) - dupCashAmount);
+      const effectiveRowCashIn = Math.max(0, (r.cashInTotal || 0) - dupCashAmount);
+      const effectiveRowExpectedCash = (r.expectedCash || 0) - dupCashAmount;
+      const effectiveRowShouldHave = (r.shouldHave || 0) - dupCashAmount;
+      const effectiveRowVariance = (r.variance || 0) + dupCashAmount;
+      const effectiveRowEcoSales = Math.max(0, (r.ecocashSales || 0) - dupEcoAmount);
+      const effectiveRowZigSales = Math.max(0, (r.zigSales || 0) - dupZigAmount);
+
       totalForm2Net += r.form2Net;
       totalForm3Net += r.form3Net;
       totalSumForm2And3Net += r.sumForm2And3Net;
-      totalSales += r.sales;
-      totalShouldHave += r.shouldHave;
-      totalExpectedCash += r.expectedCash || 0;
+      totalSales += effectiveRowSales;
+      totalShouldHave += effectiveRowShouldHave;
+      totalExpectedCash += effectiveRowExpectedCash;
       if (r.actualCashCount !== null) {
         totalPhysicalCount += r.actualCashCount;
         hasAnyCount = true;
       }
-      totalVariance += r.variance;
-      totalCashIn += r.cashInTotal || 0;
+      totalVariance += effectiveRowVariance;
+      totalCashIn += effectiveRowCashIn;
       totalCashOut += r.cashOutTotal || 0;
 
       totalFloat += r.float || 0;
-      totalCashSales += r.cashSales || 0;
+      totalCashSales += effectiveRowCashSales;
       totalCreditPayments += r.creditPayments || 0;
       totalChangeIn += (r.changeReceived ?? r.changeIn) || 0;
       totalExpenses += r.expenses || 0;
@@ -469,19 +527,20 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       totalEcocashCashOut += r.ecocashWithdrawal || 0;
       totalZigCashOut += r.zigWithdrawal || 0;
       totalPettyCash += r.deductions || 0;
+      totalRefunds += r.refunds || 0;
 
-      totalEcocashSales += r.ecocashSales || 0;
-      totalZigSales += r.zigSales || 0;
+      totalEcocashSales += effectiveRowEcoSales;
+      totalZigSales += effectiveRowZigSales;
       totalCreditExtended += r.creditExtended || 0;
       totalCreditCashOut += r.creditCashOut || 0;
 
       activeCurrenciesList.forEach((c) => {
         const wVal =
-          (r.currencyWithdrawals && r.currencyWithdrawals[c.currency]) ??
+          (r.currencyWithdrawals && (r.currencyWithdrawals[c.currency] ?? r.currencyWithdrawals[c.code])) ??
           (c.currency === 'EcoCash' ? r.ecocashWithdrawal : c.currency === 'ZiG' ? r.zigWithdrawal : 0) ??
           0;
         const sVal =
-          (r.currencySales && r.currencySales[c.currency]) ??
+          (r.currencySales && (r.currencySales[c.currency] ?? r.currencySales[c.code])) ??
           (c.currency === 'EcoCash' ? r.ecocashSales : c.currency === 'ZiG' ? r.zigSales : 0) ??
           0;
         currencyWithdrawalTotals[c.currency] = (currencyWithdrawalTotals[c.currency] || 0) + wVal;
@@ -526,6 +585,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       totalZigSales: Math.round(totalZigSales * 100) / 100,
       totalCreditExtended: Math.round(totalCreditExtended * 100) / 100,
       totalCreditCashOut: Math.round(totalCreditCashOut * 100) / 100,
+      totalRefunds: Math.round(totalRefunds * 100) / 100,
       activeCurrencies: activeCurrenciesList,
       currencyWithdrawalTotals,
       currencySalesTotals,
@@ -2304,6 +2364,44 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       {/* ========================================================================= */}
       {activeTab === 'balancing' && (
         <div className="space-y-4">
+          {/* Diagnostic Alert: Duplicate Same-Name Staff Profiles */}
+          {(() => {
+            const dupGroups = getDuplicateSameNameStaffGroups(currentUser?.companyId);
+            if (dupGroups.length === 0) return null;
+            return (
+              <div className="p-3.5 rounded-2xl bg-amber-950/50 border border-amber-500/45 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+                <div className="flex items-start space-x-2.5">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="space-y-0.5">
+                    <div className="font-bold text-amber-200">
+                      Duplicate Staff Profiles Detected ({dupGroups.length})
+                    </div>
+                    <p className="text-[11px] text-amber-300/85">
+                      Same-name profiles found ({dupGroups.map((g) => `${g.displayName} ×${g.profiles.length}`).join(', ')}). Merging keeps all sales & Form 1 counts under each cashier&apos;s primary ID and tombstones duplicates.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const res = deduplicateSameNameStaffProfiles({
+                      companyId: currentUser?.companyId,
+                      broadcastTombstones: true,
+                    });
+                    setSalespeople(getSalespeople());
+                    setSalesList(getSales());
+                    setRefreshKey((k) => k + 1);
+                    setSaveSuccessBanner(
+                      `Merged ${res.mergedCount} duplicate staff profile(s) safely (${res.summary.map((s) => `${s.keptName} #${s.keptId}`).join(', ')}).`
+                    );
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs shrink-0 transition"
+                >
+                  Merge Duplicate Profiles
+                </button>
+              </div>
+            );
+          })()}
           {/* Summary Card Layout */}
           <div className="space-y-3">
             {/* Top Row: Expected Cash | Physical Count | Variance */}
@@ -2516,6 +2614,12 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
               })}
               {' − '}
               <span className="text-rose-400 font-bold">Petty Cash (${summaryTotals.totalPettyCash.toFixed(2)})</span>
+              {summaryTotals.totalRefunds > 0 && (
+                <>
+                  {' − '}
+                  <span className="text-rose-400 font-bold">Cash Refunds (${summaryTotals.totalRefunds.toFixed(2)})</span>
+                </>
+              )}
               <br className="my-1.5" />
               {' = '}
               <span className="text-indigo-300 font-black text-sm sm:text-base underline decoration-indigo-400">

@@ -219,6 +219,101 @@ function hasIncomingCloudSyncFlag(packet, ...records) {
   return records.some((r) => Boolean(r && r.isCloudSynced === true));
 }
 
+function parseHubTimestampMs(val) {
+  if (typeof val === 'number' && Number.isFinite(val) && val > 0) return val;
+  if (typeof val === 'string' && val.trim().length > 0) {
+    const asNum = Number(val.trim());
+    if (Number.isFinite(asNum) && asNum > 1_000_000_000_000) return asNum;
+    const parsed = Date.parse(val.trim());
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 0;
+}
+
+function validatePacketClock(ws, packet, recordObj, deviceId, packetTypeLabel) {
+  const originDev = String(deviceId || packet?.origin_device_id || packet?.originDeviceId || packet?.deviceId || 'UNKNOWN-DEVICE').trim();
+  const upperOrigin = originDev.toUpperCase();
+  if (
+    packet?.fromCloud === true ||
+    packet?.isReconPush === true ||
+    upperOrigin === 'CLOUD' ||
+    upperOrigin === 'SUPABASE_CLOUD' ||
+    upperOrigin === 'LOCAL_HUB'
+  ) {
+    return { accepted: true, bypassReason: 'CLOUD_OR_RECON' };
+  }
+
+  const isOfflineSync = Boolean(
+    packet?.isOfflineSync === true ||
+    packet?.isOfflineCatchup === true ||
+    packet?.payload?.isOfflineSync === true ||
+    packet?.sale?.isOfflineSync === true ||
+    packet?.cashLog?.isOfflineSync === true ||
+    recordObj?.isOfflineSync === true
+  );
+
+  const hubNow = Date.now();
+  const pktTs = parseHubTimestampMs(
+    packet?.timestamp ||
+    packet?.updatedAt ||
+    recordObj?.refundedAt ||
+    recordObj?.voidedAt ||
+    recordObj?.timestamp ||
+    recordObj?.updatedAt
+  );
+
+  if (isOfflineSync) {
+    if (pktTs > 0 && pktTs < hubNow - 300000) {
+      const minsAgo = Math.round((hubNow - pktTs) / 60000);
+      console.log(`[Termux Hub] ⏳ Accepted delayed offline sync (${packetTypeLabel}) from [${originDev}] (created ~${minsAgo}m ago).`);
+    }
+    return { accepted: true, delayedOfflineSync: true };
+  }
+
+  if (pktTs > 0 && pktTs < hubNow - 300000) {
+    console.warn(`[Termux Hub] 🛡️ SECURITY ALERT: Clock Tampering detected from [${originDev}]. Rejected backdated transaction.`);
+    const alertPacket = {
+      id: `SEC-${hubNow}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
+      type: 'SECURITY_ALERT',
+      action: 'SECURITY_ALERT',
+      reason: 'CLOCK_TAMPERING',
+      targetDeviceId: originDev,
+      deviceId: originDev,
+      deviceName: packet?.origin_device_name || packet?.originDeviceName || originDev,
+      packetType: packetTypeLabel,
+      packetId: packet?.packet_id || packet?.packetId || undefined,
+      invoiceId: recordObj?.id || packet?.invoice_id || packet?.id || undefined,
+      claimedTimestamp: pktTs,
+      hubTimestamp: hubNow,
+      driftMs: pktTs - hubNow,
+      origin_device_id: 'LOCAL_HUB',
+      origin_device_name: 'Termux Local Hub',
+      timestamp: new Date(hubNow).toISOString(),
+      message: `Security Lock: Backdated ${packetTypeLabel} rejected from ${originDev}. Please enable Automatic Date & Time.`,
+    };
+
+    securityAlertsStore.unshift(alertPacket);
+    if (securityAlertsStore.length > 200) {
+      securityAlertsStore = securityAlertsStore.slice(0, 200);
+    }
+    scheduleSave();
+
+    const serializedAlert = JSON.stringify(alertPacket);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(serializedAlert); } catch (e) {}
+    }
+    wss.clients.forEach((client) => {
+      if (client !== ws && client.readyState === WebSocket.OPEN) {
+        try { client.send(serializedAlert); } catch (e) {}
+      }
+    });
+
+    return { accepted: false, alert: alertPacket };
+  }
+
+  return { accepted: true };
+}
+
 function broadcastCloudSyncAck(wsSender, entityType, id) {
   const ackPayload = {
     type: 'T1_CLOUD_SYNC_ACK',
@@ -239,6 +334,67 @@ function broadcastCloudSyncAck(wsSender, entityType, id) {
       try { c.send(ackStr); } catch (e) {}
     }
   });
+}
+
+function annotateCloudBackdateFlag(entityType, record, serverHeaderDate) {
+  if (!record || typeof record !== 'object') return;
+  const serverMs = serverHeaderDate ? Date.parse(serverHeaderDate) : Date.now();
+  const validMs = Number.isFinite(serverMs) && serverMs > 1600000000000 ? serverMs : Date.now();
+  const serverIso = new Date(validMs).toISOString();
+  const serverDay = serverIso.slice(0, 10);
+  if (!record.server_received_at) record.server_received_at = serverIso;
+
+  let claimedDay = '';
+  if (typeof record.date === 'string' && /^\d{4}-\d{2}-\d{2}/.test(record.date.trim())) {
+    claimedDay = record.date.trim().slice(0, 10);
+  } else if (record.timestamp) {
+    const tMs = typeof record.timestamp === 'number' ? record.timestamp : Date.parse(String(record.timestamp));
+    if (Number.isFinite(tMs) && tMs > 0) claimedDay = new Date(tMs).toISOString().slice(0, 10);
+  }
+  const isSuspicious = Boolean(record.suspicious_backdate || (claimedDay && claimedDay < serverDay));
+  if (isSuspicious) {
+    record.suspicious_backdate = true;
+    const invId = record.id || record.invoice_id || '';
+    const alertId = `BACKDATE-${entityType}-${invId || validMs}`;
+    if (typeof securityAlertsStore !== 'undefined' && Array.isArray(securityAlertsStore)) {
+      const exists = securityAlertsStore.some((a) => a.id === alertId || (invId && a.invoiceId === invId && a.type === 'SUSPICIOUS_BACKDATE'));
+      if (!exists) {
+        const alertObj = {
+          id: alertId,
+          type: 'SUSPICIOUS_BACKDATE',
+          deviceId: record.deviceId || record.origin_device_id || 'LOCAL_HUB',
+          packetType: entityType,
+          invoiceId: invId,
+          claimedDate: claimedDay,
+          claimedTimestamp: record.timestamp,
+          serverReceivedAt: record.server_received_at,
+          message: `Cloud sync flagged backdated ${entityType} #${invId || 'record'} (Claimed: ${claimedDay}, Server received: ${serverDay}).`,
+          createdAt: serverIso,
+        };
+        securityAlertsStore.unshift(alertObj);
+        if (securityAlertsStore.length > 150) securityAlertsStore.length = 150;
+        const alertPkt = JSON.stringify({
+          type: 'SECURITY_ALERT',
+          action: 'SECURITY_ALERT',
+          alertType: 'SUSPICIOUS_BACKDATE',
+          targetDeviceId: '',
+          deviceId: alertObj.deviceId,
+          packetType: entityType,
+          invoiceId: invId,
+          claimedTimestamp: record.timestamp,
+          serverReceivedAt: record.server_received_at,
+          message: alertObj.message,
+          origin_device_id: 'LOCAL_HUB',
+          timestamp: validMs,
+        });
+        wss.clients.forEach((c) => {
+          if (c.readyState === WebSocket.OPEN) {
+            try { c.send(alertPkt); } catch (e) {}
+          }
+        });
+      }
+    }
+  }
 }
 
 function pushToCloud(entityType, record) {
@@ -262,6 +418,8 @@ function pushToCloud(entityType, record) {
           entityType,
           id: record.id || record.invoice_id || record.grvNumber,
           isCloudSynced: true,
+          server_received_at: record.server_received_at,
+          suspicious_backdate: record.suspicious_backdate,
           origin_device_id: 'LOCAL_HUB',
           timestamp: Date.now(),
         });
@@ -278,23 +436,38 @@ function pushToCloud(entityType, record) {
       const sbKey = String(adapterCfg.credentials.apiKey || adapterCfg.credentials.serviceRoleKey || adapterCfg.credentials.anonKey || '').trim();
       if (!sbUrl || !sbKey || typeof fetch !== 'function') return;
       const tbl = mapEntityTypeToTable(entityType);
-      fetch(`${sbUrl}/rest/v1/${tbl}`, {
-        method: 'POST',
-        headers: {
-          apikey: sbKey,
-          Authorization: `Bearer ${sbKey}`,
-          'Content-Type': 'application/json',
-          Prefer: 'resolution=merge-duplicates',
-        },
-        body: JSON.stringify([record]),
-      }).then((res) => {
-        if (res.ok || res.status === 201) {
-          console.log(`[Edge Gateway] ☁️ Pushed ${entityType} to Supabase table '${tbl}'`);
-          markCloudSyncedAndAck();
-        }
-      }).catch((err) => {
-        console.log(`[Edge Gateway] Supabase push notice for ${entityType}: ${err.message}`);
-      });
+      const needsServerClock = entityType === 'SALE' || entityType === 'SALE_UPDATE' || entityType === 'CASH_LOG';
+      if (needsServerClock) {
+        annotateCloudBackdateFlag(entityType, record, null);
+      }
+      const sendSupabase = (payloadRec, allowRetry) => {
+        fetch(`${sbUrl}/rest/v1/${tbl}`, {
+          method: 'POST',
+          headers: {
+            apikey: sbKey,
+            Authorization: `Bearer ${sbKey}`,
+            'Content-Type': 'application/json',
+            Prefer: 'resolution=merge-duplicates',
+          },
+          body: JSON.stringify([payloadRec]),
+        }).then((res) => {
+          if (res.ok || res.status === 201) {
+            if (needsServerClock) {
+              annotateCloudBackdateFlag(entityType, record, res.headers && res.headers.get ? res.headers.get('date') : null);
+            }
+            console.log(`[Edge Gateway] ☁️ Pushed ${entityType} to Supabase table '${tbl}'`);
+            markCloudSyncedAndAck();
+          } else if (res.status === 400 && allowRetry && needsServerClock) {
+            const stripped = { ...payloadRec };
+            delete stripped.server_received_at;
+            delete stripped.suspicious_backdate;
+            sendSupabase(stripped, false);
+          }
+        }).catch((err) => {
+          console.log(`[Edge Gateway] Supabase push notice for ${entityType}: ${err.message}`);
+        });
+      };
+      sendSupabase(record, true);
       return;
     }
 
@@ -381,10 +554,18 @@ function pushToCloud(entityType, record) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: postData,
-      }).then((res) => {
+      }).then(async (res) => {
         if (!res.ok) {
           console.log(`[Edge Gateway] Cloud bridge HTTP ${res.status} for ${entityType}`);
         } else {
+          try {
+            const json = await res.json();
+            if (json && json.server_received_at) record.server_received_at = json.server_received_at;
+            if (json && json.suspicious_backdate !== undefined) record.suspicious_backdate = Boolean(json.suspicious_backdate);
+          } catch (_) {}
+          if (entityType === 'SALE' || entityType === 'SALE_UPDATE' || entityType === 'CASH_LOG') {
+            annotateCloudBackdateFlag(entityType, record, res.headers && res.headers.get ? res.headers.get('date') : null);
+          }
           console.log(`[Edge Gateway] ☁️ Pushed ${entityType} (${record.id || record.customerId || record.name}) to Cloud Bridge`);
           markCloudSyncedAndAck();
         }
@@ -509,6 +690,9 @@ let cashAccountsStore = [];
 // Tombstones Store (Soft Deletes across multi-device Wi-Fi)
 let tombstonesStore = [];
 
+// Security Alerts Store (Clock tampering & rejected backdated transactions)
+let securityAlertsStore = [];
+
 // Business Day Closures & EOD Archives
 let businessDayClosuresStore = [];
 let electronicSettlementsStore = [];
@@ -606,8 +790,90 @@ function isValidBranchRecord(rec) {
     return false;
   }
   // Must have an identifier and not be empty
-  const bId = rec.branchId || rec.id || rec.branch_id;
+  const bId = rec.branchId || rec.id || rec.branch_id || rec.BranchID;
   return Boolean(bId);
+}
+
+function canonicalizeHubBranchId(rawId) {
+  const clean = String(rawId || '').trim();
+  if (!clean) return 'BR-MAIN';
+  const low = clean.toLowerCase();
+  return (low === '1' || low === 'br-main' || low === 'br001') ? 'BR-MAIN' : clean;
+}
+
+function normHubBranchTenant(val) {
+  const u = String(val || 'COMP-001').trim().toUpperCase();
+  return (!u || u === 'DEFAULT' || u === 'COMP-001' || u === 'COMP-MASTER') ? 'COMP-001' : u;
+}
+
+function isHubPlaceholderBranchName(name) {
+  const clean = String(name || '').trim().toLowerCase();
+  return !clean || clean === 'branch' || clean === 'main branch' || clean === 'unnamed branch';
+}
+
+function isHubPlaceholderBranchCode(code, id) {
+  const clean = String(code || '').trim().toLowerCase();
+  const cleanId = String(id || '').trim().toLowerCase();
+  return !clean || (cleanId.length > 0 && clean === cleanId) || clean === 'branch';
+}
+
+function normalizeAndDeduplicateHubBranches(list) {
+  if (!Array.isArray(list)) return [];
+  const byKey = new Map();
+  const codeToKey = new Map();
+  for (const b of list) {
+    if (!isValidBranchRecord(b)) {
+      console.warn(`[Termux Hub] 🧹 Purged contaminated non-branch record from Hub memory/disk: ${b?.name || b?.branchName || b?.branchId || b?.id}`);
+      continue;
+    }
+    const rawId = b.branchId || b.id || b.branch_id || b.BranchID;
+    const canonId = canonicalizeHubBranchId(rawId);
+    const comp = normHubBranchTenant(b.company_id || b.companyId || b.CompanyID || hubTenantId);
+    const name = String(b.name || b.branch_name || b.branchName || b.Name || '').trim();
+    const code = String(b.code || b.branch_code || b.branchCode || b.Code || '').trim();
+    const loc = String(b.location || b.address || b.Location || b.Address || '').trim();
+
+    const normRec = {
+      ...b,
+      branchId: canonId,
+      id: canonId,
+      branch_id: canonId,
+      company_id: comp,
+      companyId: comp,
+      ...(name ? { name } : {}),
+      ...(code ? { code } : {}),
+      ...(loc ? { location: loc, address: loc } : {}),
+    };
+
+    const idKey = `${comp}::${canonId.toUpperCase()}`;
+    const codeKey = !isHubPlaceholderBranchCode(code, canonId) ? `${comp}::CODE::${code.toUpperCase()}` : '';
+    const dupKey = byKey.has(idKey) ? idKey : (codeKey ? codeToKey.get(codeKey) : undefined);
+
+    if (dupKey && byKey.has(dupKey)) {
+      const prev = byKey.get(dupKey);
+      const prevTs = getTimestamp(prev);
+      const currTs = getTimestamp(normRec);
+      const preferCurr =
+        (canonId === 'BR-MAIN' && prev.branchId !== 'BR-MAIN') ||
+        (canonId === prev.branchId && currTs > prevTs) ||
+        (isHubPlaceholderBranchName(prev.name) && !isHubPlaceholderBranchName(normRec.name));
+      const winner = preferCurr ? normRec : prev;
+      const loser = preferCurr ? prev : normRec;
+      byKey.set(dupKey, {
+        ...loser,
+        ...winner,
+        name: !isHubPlaceholderBranchName(winner.name) ? winner.name : (loser.name || winner.name),
+        code: !isHubPlaceholderBranchCode(winner.code, winner.branchId) ? winner.code : (loser.code || winner.code),
+        location: winner.location || loser.location || '',
+        address: winner.address || winner.location || loser.address || loser.location || '',
+      });
+      continue;
+    }
+
+    byKey.set(idKey, normRec);
+    if (codeKey) codeToKey.set(codeKey, idKey);
+  }
+  return Array.from(byKey.values());
 }
 
 function isValidStaffRecord(rec) {
@@ -739,13 +1005,7 @@ function loadData() {
       }
       if (Array.isArray(parsed.customers)) customersStore = parsed.customers.filter(isValidCustomerRecord);
       if (Array.isArray(parsed.branches)) {
-        branchesStore = parsed.branches.filter((b) => {
-          const valid = isValidBranchRecord(b);
-          if (!valid) {
-            console.warn(`[Termux Hub] 🧹 Purged contaminated non-branch record from Hub memory/disk: ${b.name || b.branchName || b.branchId || b.id}`);
-          }
-          return valid;
-        });
+        branchesStore = normalizeAndDeduplicateHubBranches(parsed.branches);
       }
       if (Array.isArray(parsed.cashAccounts)) cashAccountsStore = parsed.cashAccounts;
       if (Array.isArray(parsed.businessDayClosures)) businessDayClosuresStore = parsed.businessDayClosures;
@@ -756,6 +1016,7 @@ function loadData() {
       if (Array.isArray(parsed.stocktakeSessions)) stocktakeSessionsStore = parsed.stocktakeSessions;
       if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
       if (Array.isArray(parsed.tombstones)) tombstonesStore = parsed.tombstones;
+      if (Array.isArray(parsed.securityAlerts)) securityAlertsStore = parsed.securityAlerts;
 
       // Purge any records already superseded by tombstones on startup
       if (tombstonesStore.length > 0) {
@@ -822,6 +1083,7 @@ function saveData() {
       stocktakeSessions: stocktakeSessionsStore,
       stocktakeSegments: stocktakeSegmentsStore,
       tombstones: tombstonesStore,
+      securityAlerts: securityAlertsStore,
       savedAt: new Date().toISOString(),
     };
 
@@ -1375,7 +1637,7 @@ function getEntityId(rec, norm) {
       return rec.supplierId || rec.SupplierID || rec.id;
     case 'branches':
     case 'branch':
-      return rec.branchId || rec.branch_id || rec.id;
+      return canonicalizeHubBranchId(rec.branchId || rec.branch_id || rec.BranchID || rec.id);
     case 'categories':
     case 'category':
     case 'inventory_category':
@@ -1729,6 +1991,7 @@ function triggerClientReconSweep(clientWs, isSod = false) {
       'inventory',
       'customers',
       'staff',
+      'branches',
     ],
     isSod: Boolean(isSod),
     useSnapshotFirst: true,
@@ -1985,7 +2248,7 @@ wss.on('connection', (ws, req) => {
         const sweepId = packet.sweepId || `sweep-${Date.now()}`;
         const targetEntities = Array.isArray(packet.targetEntities)
           ? packet.targetEntities
-          : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'staff'];
+          : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'staff', 'branches'];
         console.log(`[Termux Hub] 🧹 Client requested RECON_SWEEP_TRIGGER for entities: ${targetEntities.join(', ')}`);
         for (const ent of targetEntities) {
           const reqPacket = {
@@ -2322,23 +2585,35 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 0.4 STOCKTAKE BRANCH LOCKDOWN BROADCAST
+      // 0.4 STOCKTAKE BRANCH LOCKDOWN BROADCAST (LWW)
       // =====================================================================
       if (pType === 'STOCKTAKE_LOCKDOWN_BROADCAST') {
         const brId = packet.branchId || packet.branch_id || hubBranchId;
+        const hubNow = Date.now();
+        const hubIso = new Date(hubNow).toISOString();
+        const incomingTime = getTimestamp(packet) || hubNow;
+        const existingLock = branchLockdownsStore[brId];
+        const existingTime = existingLock ? getTimestamp(existingLock) : 0;
+        if (existingLock && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+          console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_LOCKDOWN_BROADCAST for ${brId}`);
+          return;
+        }
         branchLockdownsStore[brId] = {
           branchId: brId,
           isLocked: Boolean(packet.isLocked),
           sessionId: packet.sessionId,
-          lockedAt: packet.isLocked ? new Date().toISOString() : undefined,
+          lockedAt: packet.isLocked ? (packet.lockedAt || hubIso) : undefined,
+          lockedBy: packet.lockedBy,
           lockedByName: packet.lockedByName,
           reason: packet.reason,
+          updatedAt: incomingTime,
+          lastUpdated: packet.lastUpdated || hubIso,
         };
         scheduleSave();
         console.log(`[Termux Hub] 🔒 Branch Lockdown status changed: ${brId} isLocked=${packet.isLocked}`);
 
         wss.clients.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
             try {
               client.send(dataStr);
             } catch (e) {}
@@ -2348,7 +2623,7 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 0.45 STOCKTAKE SESSION & SEGMENT DISCOVERY (STRICT LWW)
+      // 0.45 STOCKTAKE SESSION & SEGMENT DISCOVERY (STRICT LWW + CANONICAL FIELDS)
       // =====================================================================
       const isStocktakeSession =
         pType === 'STOCKTAKE_SESSION_STARTED' ||
@@ -2360,16 +2635,16 @@ wss.on('connection', (ws, req) => {
         const sessionId = packet.sessionId || sess.sessionId;
         if (sessionId) {
           const hubNow = Date.now();
-          const hubIso = new Date().toISOString();
+          const hubIso = new Date(hubNow).toISOString();
           const incomingTime = getTimestamp(sess) || getTimestamp(packet);
           if (isTombstoned(sessionId, 'stocktake_session', incomingTime)) {
             console.log(`[Termux Hub] 🪦 Resurrection Blocked for tombstoned stocktake session #${sessionId}`);
             return;
           }
           const sIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+          const existing = sIdx >= 0 ? stocktakeSessionsStore[sIdx] : null;
 
-          if (sIdx >= 0) {
-            const existing = stocktakeSessionsStore[sIdx];
+          if (existing) {
             const existingTime = getTimestamp(existing);
             if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
               console.log(
@@ -2394,28 +2669,111 @@ wss.on('connection', (ws, req) => {
             }
           }
 
+          const incomingItems = Array.isArray(packet.consolidatedItems)
+            ? packet.consolidatedItems
+            : (Array.isArray(sess.consolidatedItems) ? sess.consolidatedItems : undefined);
+          let mergedConsolidated = existing?.consolidatedItems || [];
+          if (Array.isArray(incomingItems) && incomingItems.length > 0) {
+            const exItemMap = new Map();
+            (existing?.consolidatedItems || []).forEach((ci) => {
+              if (ci && ci.itemId) exItemMap.set(String(ci.itemId).toUpperCase(), ci);
+            });
+            mergedConsolidated = incomingItems.map((inc) => {
+              const ex = exItemMap.get(String(inc.itemId || '').toUpperCase());
+              if (!ex) return inc;
+              const exCT = ex.commentedAt ? new Date(ex.commentedAt).getTime() : 0;
+              const incCT = inc.commentedAt ? new Date(inc.commentedAt).getTime() : 0;
+              const keepEx = exCT > incCT && Boolean(ex.managerComment || ex.reasonCode);
+              return {
+                ...ex,
+                ...inc,
+                reasonCode: keepEx ? ex.reasonCode : (inc.reasonCode ?? ex.reasonCode),
+                managerComment: keepEx ? ex.managerComment : (inc.managerComment ?? ex.managerComment),
+                actionTaken: keepEx ? ex.actionTaken : (inc.actionTaken ?? ex.actionTaken),
+                commentedById: keepEx ? ex.commentedById : (inc.commentedById ?? ex.commentedById),
+                commentedByName: keepEx ? ex.commentedByName : (inc.commentedByName ?? ex.commentedByName),
+                commentedAt: keepEx ? ex.commentedAt : (inc.commentedAt ?? ex.commentedAt),
+                ownerAckStatus: inc.ownerAckStatus ?? ex.ownerAckStatus,
+              };
+            });
+          }
+
+          const incomingPasses = Array.isArray(packet.guestPasses)
+            ? packet.guestPasses
+            : (Array.isArray(sess.guestPasses) ? sess.guestPasses : undefined);
+
+          const resolvedLockdown =
+            packet.isLockdownActive !== undefined
+              ? Boolean(packet.isLockdownActive)
+              : (sess.isLockdownActive !== undefined ? Boolean(sess.isLockdownActive) : Boolean(existing?.isLockdownActive));
+
           const sessionObj = {
+            ...(existing || {}),
             ...sess,
             sessionId,
-            title: packet.sessionName || packet.title || sess.title || `Session ${sessionId}`,
-            sessionName: packet.sessionName || packet.title || sess.title || `Session ${sessionId}`,
-            segments: Array.isArray(packet.segments) ? packet.segments : (sess.segments || []),
-            startedBy: packet.startedBy || sess.startedBy || 'Manager',
-            startedAt: packet.startedAt || sess.startedAt || hubIso,
-            countType: packet.countType || sess.countType || 'DAILY_BLIND',
-            branchId: packet.branchId || sess.branchId || hubBranchId,
-            branchName: packet.branchName || sess.branchName || hubBranchName,
-            isLockdownActive: Boolean(packet.isLockdownActive || sess.isLockdownActive),
-            notes: packet.notes || sess.notes || '',
+            title: packet.sessionName || packet.title || sess.title || existing?.title || `Session ${sessionId}`,
+            sessionName: packet.sessionName || packet.title || sess.title || existing?.sessionName || `Session ${sessionId}`,
+            date: packet.date || sess.date || existing?.date || hubIso.split('T')[0],
+            status: packet.status || sess.status || existing?.status || 'COUNTING',
+            segments: Array.isArray(packet.segments) ? packet.segments : (Array.isArray(sess.segments) ? sess.segments : (existing?.segments || [])),
+            consolidatedItems: mergedConsolidated,
+            guestPasses: incomingPasses !== undefined ? incomingPasses : existing?.guestPasses,
+            startedBy: packet.startedBy || sess.startedBy || existing?.startedBy || 'Manager',
+            startedAt: packet.startedAt || sess.startedAt || existing?.startedAt || hubIso,
+            createdBy: packet.createdBy || sess.createdBy || existing?.createdBy || packet.startedBy || 'MANAGER',
+            createdByName: packet.createdByName || sess.createdByName || existing?.createdByName || packet.startedBy || 'Manager',
+            countType: packet.countType || sess.countType || existing?.countType || 'DAILY_BLIND',
+            branchId: packet.branchId || sess.branchId || existing?.branchId || hubBranchId,
+            branchName: packet.branchName || sess.branchName || existing?.branchName || hubBranchName,
+            companyId: packet.companyId || sess.companyId || existing?.companyId || hubTenantId,
+            company_id: packet.company_id || sess.company_id || existing?.company_id || hubTenantId,
+            isLockdownActive: resolvedLockdown,
+            stocktakeAuditorId: packet.stocktakeAuditorId !== undefined ? packet.stocktakeAuditorId : (sess.stocktakeAuditorId !== undefined ? sess.stocktakeAuditorId : existing?.stocktakeAuditorId),
+            stocktakeAuditorName: packet.stocktakeAuditorName !== undefined ? packet.stocktakeAuditorName : (sess.stocktakeAuditorName !== undefined ? sess.stocktakeAuditorName : existing?.stocktakeAuditorName),
+            stocktakeAuditorPhone: packet.stocktakeAuditorPhone !== undefined ? packet.stocktakeAuditorPhone : (sess.stocktakeAuditorPhone !== undefined ? sess.stocktakeAuditorPhone : existing?.stocktakeAuditorPhone),
+            predefinedDailyItemIds: packet.predefinedDailyItemIds || sess.predefinedDailyItemIds || existing?.predefinedDailyItemIds,
+            certifiedById: packet.certifiedById || sess.certifiedById || existing?.certifiedById,
+            certifiedByName: packet.certifiedByName || sess.certifiedByName || existing?.certifiedByName,
+            certifiedAt: packet.certifiedAt || sess.certifiedAt || existing?.certifiedAt,
+            approvedBy: packet.approvedBy || sess.approvedBy || existing?.approvedBy,
+            approvedByName: packet.approvedByName || sess.approvedByName || existing?.approvedByName,
+            approvedAt: packet.approvedAt || sess.approvedAt || existing?.approvedAt,
+            varianceReviewStatus: packet.varianceReviewStatus || sess.varianceReviewStatus || existing?.varianceReviewStatus,
+            varianceCommentDeadline: packet.varianceCommentDeadline || sess.varianceCommentDeadline || existing?.varianceCommentDeadline,
+            varianceMaterialityThreshold:
+              packet.varianceMaterialityThreshold !== undefined
+                ? packet.varianceMaterialityThreshold
+                : (sess.varianceMaterialityThreshold !== undefined ? sess.varianceMaterialityThreshold : existing?.varianceMaterialityThreshold),
+            varianceReviewedById: packet.varianceReviewedById || sess.varianceReviewedById || existing?.varianceReviewedById,
+            varianceReviewedByName: packet.varianceReviewedByName || sess.varianceReviewedByName || existing?.varianceReviewedByName,
+            varianceReviewedAt: packet.varianceReviewedAt || sess.varianceReviewedAt || existing?.varianceReviewedAt,
+            totalSystemUnits: packet.totalSystemUnits !== undefined ? packet.totalSystemUnits : (sess.totalSystemUnits !== undefined ? sess.totalSystemUnits : (existing?.totalSystemUnits || 0)),
+            totalCountedUnits: packet.totalCountedUnits !== undefined ? packet.totalCountedUnits : (sess.totalCountedUnits !== undefined ? sess.totalCountedUnits : (existing?.totalCountedUnits || 0)),
+            varianceUnits: packet.varianceUnits !== undefined ? packet.varianceUnits : (sess.varianceUnits !== undefined ? sess.varianceUnits : (existing?.varianceUnits || 0)),
+            varianceCostValue: packet.varianceCostValue !== undefined ? packet.varianceCostValue : (sess.varianceCostValue !== undefined ? sess.varianceCostValue : (existing?.varianceCostValue || 0)),
+            varianceRetailValue: packet.varianceRetailValue !== undefined ? packet.varianceRetailValue : (sess.varianceRetailValue !== undefined ? sess.varianceRetailValue : (existing?.varianceRetailValue || 0)),
+            notes: packet.notes !== undefined ? packet.notes : (sess.notes !== undefined ? sess.notes : (existing?.notes || '')),
+            version: Math.max(Number(packet.version || sess.version || 0), Number(existing?.version || 0), 1),
+            mutationSource: packet.mutationSource || sess.mutationSource || existing?.mutationSource || 'USER_EDIT',
             updatedAt: hubNow,
             hubTimestamp: hubNow,
             lastUpdated: hubIso,
           };
 
           if (sIdx >= 0) {
-            stocktakeSessionsStore[sIdx] = { ...stocktakeSessionsStore[sIdx], ...sessionObj };
+            stocktakeSessionsStore[sIdx] = sessionObj;
           } else {
             stocktakeSessionsStore.unshift(sessionObj);
+          }
+
+          if (sessionObj.status === 'APPROVED_POSTED') {
+            casualWorkersStore.forEach((cw) => {
+              if (cw && cw.sessionId === sessionId && cw.active) {
+                cw.active = false;
+                cw.updatedAt = hubNow;
+                cw.lastUpdated = hubIso;
+              }
+            });
           }
 
           if (Array.isArray(sessionObj.segments) && sessionObj.segments.length > 0) {
@@ -2435,7 +2793,7 @@ wss.on('connection', (ws, req) => {
 
           scheduleSave();
           console.log(
-            `[Termux Hub] 📋 Synced Stocktake Session [${sessionId}] "${sessionObj.sessionName}" with ${(sessionObj.segments || []).length} segments stamped at ${hubIso}.`
+            `[Termux Hub] 📋 Synced Stocktake Session [${sessionId}] "${sessionObj.sessionName}" (${sessionObj.status}) with ${(sessionObj.segments || []).length} segments stamped at ${hubIso}.`
           );
 
           // Send SYNC_ACK
@@ -3102,6 +3460,11 @@ wss.on('connection', (ws, req) => {
         (packet.data && (packet.data.invoice_id || packet.data.id));
 
       if (isSale && saleId) {
+        const senderDeviceId = packet.origin_device_id || packet.originDeviceId || packet.deviceId || 'UNKNOWN-DEVICE';
+        const saleClockCheck = validatePacketClock(ws, packet, saleObj, senderDeviceId, pType === 'SALE_UPDATE' ? 'SALE_UPDATE' : 'SALE');
+        if (!saleClockCheck.accepted) {
+          return;
+        }
         const isLegacyInv = String(saleId).toUpperCase().startsWith('INV-');
         const existingIdx = salesStore.findIndex((s) => s.id === saleId);
         const prevSale = existingIdx >= 0 ? salesStore[existingIdx] : null;
@@ -3648,6 +4011,11 @@ wss.on('connection', (ws, req) => {
       if (isCashLog) {
         const rawLog = packet.cashLog || payload;
         if (rawLog) {
+          const senderDeviceId = packet.origin_device_id || packet.originDeviceId || packet.deviceId || 'UNKNOWN-DEVICE';
+          const cashClockCheck = validatePacketClock(ws, packet, rawLog, senderDeviceId, 'CASH_LOG');
+          if (!cashClockCheck.accepted) {
+            return;
+          }
           const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, rawLog);
           const syncedKey = upsertHubCashLog(rawLog, incomingCloudSynced);
           if (syncedKey) {
@@ -4326,8 +4694,10 @@ wss.on('connection', (ws, req) => {
       const isValidBranchSchema = isValidBranchRecord(rawBranchObj);
       const isBranch = isExplicitBranchType && isValidBranchSchema;
 
-      if (isBranch && rawBranchObj && (rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id)) {
-        const bId = rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id;
+      if (isBranch && rawBranchObj && (rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id || rawBranchObj.BranchID)) {
+        const rawBId = rawBranchObj.branchId || rawBranchObj.id || rawBranchObj.branch_id || rawBranchObj.BranchID;
+        const bId = canonicalizeHubBranchId(rawBId);
+        const bComp = normHubBranchTenant(rawBranchObj.company_id || rawBranchObj.companyId || rawBranchObj.CompanyID || packet.companyId || packet.company_id || hubTenantId);
         const hubNow = Date.now();
         const hubIso = new Date().toISOString();
         const incomingTime = getTimestamp(rawBranchObj) || getTimestamp(packet);
@@ -4338,10 +4708,25 @@ wss.on('connection', (ws, req) => {
             try {
               ws.send(JSON.stringify({ type: 'TOMBSTONE_SYNC', action: 'TOMBSTONE_SYNC', entityType: 'tombstone', tombstone: tomb, payload: tomb, origin_device_id: 'LOCAL_HUB', timestamp: Date.now() }));
             } catch (e) {}
-            }
+          }
           return;
         }
-        const bIdx = branchesStore.findIndex((b) => (b.branchId || b.id || b.branch_id) === bId);
+        const incomingName = String(rawBranchObj.name || rawBranchObj.branch_name || rawBranchObj.branchName || rawBranchObj.Name || '').trim();
+        const incomingCode = String(rawBranchObj.code || rawBranchObj.branch_code || rawBranchObj.branchCode || rawBranchObj.Code || '').trim();
+        const incomingLoc = String(rawBranchObj.location || rawBranchObj.address || rawBranchObj.Location || rawBranchObj.Address || '').trim();
+
+        let bIdx = branchesStore.findIndex(
+          (b) =>
+            normHubBranchTenant(b.company_id || b.companyId || hubTenantId) === bComp &&
+            canonicalizeHubBranchId(b.branchId || b.id || b.branch_id).toUpperCase() === bId.toUpperCase()
+        );
+        if (bIdx < 0 && incomingCode && !isHubPlaceholderBranchCode(incomingCode, bId)) {
+          bIdx = branchesStore.findIndex(
+            (b) =>
+              normHubBranchTenant(b.company_id || b.companyId || hubTenantId) === bComp &&
+              String(b.code || '').trim().toUpperCase() === incomingCode.toUpperCase()
+          );
+        }
         let accepted = true;
 
         if (bIdx >= 0) {
@@ -4370,13 +4755,33 @@ wss.on('connection', (ws, req) => {
         }
 
         if (accepted) {
+          const existing = bIdx >= 0 ? branchesStore[bIdx] : null;
+          const resolvedId = existing ? canonicalizeHubBranchId(existing.branchId || bId) : bId;
+          const resolvedName = !isHubPlaceholderBranchName(incomingName)
+            ? incomingName
+            : existing && !isHubPlaceholderBranchName(existing.name)
+            ? existing.name
+            : (incomingName || existing?.name || 'Main Branch');
+          const resolvedCode = !isHubPlaceholderBranchCode(incomingCode, resolvedId)
+            ? incomingCode
+            : existing && !isHubPlaceholderBranchCode(existing.code, resolvedId)
+            ? existing.code
+            : (incomingCode || existing?.code || resolvedId);
+          const resolvedLoc = incomingLoc || existing?.location || existing?.address || '';
           const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, rawBranchObj);
-          const resolvedCloudSynced = incomingCloudSynced || (bIdx >= 0 && branchesStore[bIdx].isCloudSynced === true);
+          const resolvedCloudSynced = incomingCloudSynced || (existing && existing.isCloudSynced === true);
           const stamped = {
+            ...(existing || {}),
             ...rawBranchObj,
-            branchId: bId,
-            id: bId,
-            branch_id: bId,
+            branchId: resolvedId,
+            id: resolvedId,
+            branch_id: resolvedId,
+            company_id: bComp,
+            companyId: bComp,
+            name: resolvedName,
+            code: resolvedCode,
+            location: resolvedLoc,
+            address: resolvedLoc,
             updatedAt: hubNow,
             hubTimestamp: hubNow,
             lastUpdated: hubIso,
@@ -4384,12 +4789,13 @@ wss.on('connection', (ws, req) => {
           };
 
           if (bIdx >= 0) {
-            branchesStore[bIdx] = { ...branchesStore[bIdx], ...stamped };
+            branchesStore[bIdx] = stamped;
           } else {
             branchesStore.unshift(stamped);
           }
+          branchesStore = normalizeAndDeduplicateHubBranches(branchesStore);
           scheduleSave();
-          console.log(`[Termux Hub] 🏢 Synced Branch: ${stamped.branchName || bId} (${bId}) stamped at ${hubIso}`);
+          console.log(`[Termux Hub] 🏢 Synced Branch: ${stamped.name || stamped.branchName || resolvedId} (${resolvedId}) stamped at ${hubIso}`);
 
           // Send SYNC_ACK
           try {
@@ -4837,8 +5243,8 @@ wss.on('connection', (ws, req) => {
           .filter((item) => !isTombstoned(item.customerId || item.id, 'customer', getTimestamp(item)))
           .filter((c) => isMatch(c, reqComp, reqBranch) && (getTimestamp(c) >= sinceTime || packet.isForced || isExplicitZero));
         const missedBranches = branchesStore
-          .filter((item) => !isTombstoned(item.branchId || item.branch_id || item.id, 'branch', getTimestamp(item)))
-          .filter((b) => isValidBranchRecord(b) && isMatch(b, reqComp, reqBranch) && (getTimestamp(b) >= sinceTime || packet.isForced || isExplicitZero));
+          .filter((item) => !isTombstoned(canonicalizeHubBranchId(item.branchId || item.branch_id || item.id), 'branch', getTimestamp(item)))
+          .filter((b) => isValidBranchRecord(b) && isMatch(b, reqComp, 'ALL') && (getTimestamp(b) >= sinceTime || packet.isForced || isExplicitZero));
         const isGlobalCashAccRec = (a) => (
           a?.account_type === 'HQ_SAFE' ||
           a?.account_type === 'BANK_ACCOUNT' ||
@@ -4902,6 +5308,7 @@ wss.on('connection', (ws, req) => {
             stocktakeSessions: missedStocktakeSessions,
             stocktakeSegments: stocktakeSegmentsStore,
             tombstones: missedTombstones,
+            securityAlerts: securityAlertsStore.slice(0, 50),
           },
         };
 
@@ -5055,7 +5462,17 @@ async function syncEdgeToCloudSupabase() {
               timestamp: Date.now(),
             }),
           });
-          if (res.ok || res.status === 200 || res.status === 201) rec.isCloudSynced = true;
+          if (res.ok || res.status === 200 || res.status === 201) {
+            try {
+              const json = await res.json();
+              if (json && json.server_received_at) rec.server_received_at = json.server_received_at;
+              if (json && json.suspicious_backdate !== undefined) rec.suspicious_backdate = Boolean(json.suspicious_backdate);
+            } catch (_) {}
+            if (t.entityType === 'sales' || t.entityType === 'cash_logs') {
+              annotateCloudBackdateFlag(t.entityType === 'sales' ? 'SALE' : 'CASH_LOG', rec, res.headers && res.headers.get ? res.headers.get('date') : null);
+            }
+            rec.isCloudSynced = true;
+          }
         } catch (err) {
           console.warn(`[Edge-to-Cloud] Apps Script push notice for '${t.name}':`, err.message);
         }
@@ -5157,7 +5574,13 @@ async function syncEdgeToCloudSupabase() {
         });
 
         if (pushRes.ok || pushRes.status === 201) {
-          batchToPush.forEach((r) => { r.isCloudSynced = true; });
+          const hdrDate = pushRes.headers && pushRes.headers.get ? pushRes.headers.get('date') : null;
+          batchToPush.forEach((r) => {
+            if (t.entityType === 'sales' || t.entityType === 'cash_logs') {
+              annotateCloudBackdateFlag(t.entityType === 'sales' ? 'SALE' : 'CASH_LOG', r, hdrDate);
+            }
+            r.isCloudSynced = true;
+          });
           console.log(`[Edge-to-Cloud] 🚀 Pushed and upserted ${batchToPush.length} record(s) to Supabase table '${t.name}'`);
         }
       }

@@ -26,7 +26,11 @@ import {
   logEmergencyLockdownSale,
   getAuditLogs,
   verifySalespersonPin,
+  getSalespeople,
+  saveStocktakeSession,
 } from '../../db/roomDatabase';
+import { isStocktakeLeader, isStocktakeAuditor } from '../../services/stocktakeAccessService';
+import { meshSyncService } from '../../services/meshSyncService';
 
 interface LockdownEmergencySalesTabProps {
   session: StocktakeSession;
@@ -67,10 +71,16 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
     loadData();
   }, [session.sessionId, branchId]);
 
+  const canToggleLockdown = isStocktakeLeader(currentUser) || isStocktakeAuditor(currentUser, session);
+
   const handleToggleLockdown = () => {
+    if (!canToggleLockdown) return;
     const nextState = !isLocked;
     const staffId = currentUser?.id || '001';
     const staffName = currentUser?.name || 'Stocktake Auditor';
+    const reason = nextState
+      ? `Manual Store Lockdown for ${session.title}`
+      : `Lockdown released by ${staffName}`;
 
     setBranchLockdown(
       branchId,
@@ -78,8 +88,22 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
       session.sessionId,
       staffId,
       staffName,
-      nextState ? `Manual Store Lockdown for ${session.title}` : `Lockdown released by ${staffName}`
+      reason
     );
+
+    const updatedSession = saveStocktakeSession({
+      ...session,
+      isLockdownActive: nextState,
+    });
+    meshSyncService.broadcastStocktakeLockdown(
+      branchId,
+      session.sessionId,
+      nextState,
+      staffName,
+      reason,
+      staffId
+    );
+    meshSyncService.broadcastStocktakeSession(updatedSession);
 
     setIsLocked(nextState);
     loadData();
@@ -106,15 +130,41 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
     e.preventDefault();
     setPinError('');
 
-    if (supervisorPin.trim() !== '1234' && (!currentUser || !verifySalespersonPin(currentUser, supervisorPin.trim()))) {
-      setPinError('Invalid Supervisor Authorization PIN.');
+    const cleanPin = supervisorPin.trim();
+    if (!cleanPin) {
+      setPinError('Supervisor / Auditor Authorization PIN is required.');
+      return;
+    }
+
+    const eligibleApprovers = getSalespeople().filter((sp) => {
+      if (sp.active === 'N') return false;
+      const r = String(sp.role || '').toUpperCase();
+      return (
+        r === 'OWNER' ||
+        r === 'SUPER_ADMIN' ||
+        r === 'ADMIN' ||
+        r === 'MANAGER' ||
+        r === 'BRANCH_MANAGER' ||
+        r === 'SUPERVISOR' ||
+        Boolean(sp.permissions?.canAuditStocktake) ||
+        sp.id === session.stocktakeAuditorId
+      );
+    });
+
+    const verifiedApprover =
+      (currentUser && verifySalespersonPin(currentUser, cleanPin) ? currentUser : null) ||
+      eligibleApprovers.find((sp) => verifySalespersonPin(sp, cleanPin)) ||
+      null;
+
+    if (!verifiedApprover) {
+      setPinError('Invalid Supervisor / Auditor Authorization PIN.');
       return;
     }
 
     const matched = inventoryList.find((i) => i.itemId === selectedItemId);
     const itemName = matched?.itemName || selectedItemId;
-    const supervisorId = currentUser?.id || '001';
-    const supervisorName = currentUser?.name || 'Stocktake Auditor';
+    const supervisorId = verifiedApprover.id || currentUser?.id || '001';
+    const supervisorName = verifiedApprover.name || currentUser?.name || 'Stocktake Auditor';
 
     logEmergencyLockdownSale({
       sessionId: session.sessionId,
@@ -124,6 +174,7 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
       supervisorId,
       supervisorName,
       cashierName,
+      deductPolicy: deductDecision,
       overrideReason: `${overrideReason} [Deduction Policy: ${deductDecision}]`,
       wasCountedPriorToSale: Boolean(selectedItemStatus?.wasCounted),
     });
@@ -180,18 +231,20 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
         </div>
 
         <div className="flex items-center gap-3 shrink-0">
-          <button
-            type="button"
-            onClick={handleToggleLockdown}
-            className={`px-4 py-2.5 rounded-xl text-xs font-bold shadow-lg flex items-center gap-2 transition ${
-              isLocked
-                ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600'
-                : 'bg-rose-600 hover:bg-rose-500 text-white shadow-rose-900/30'
-            }`}
-          >
-            {isLocked ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
-            {isLocked ? 'Release Store Lockdown' : 'Engage Full Store Lockdown'}
-          </button>
+          {canToggleLockdown && (
+            <button
+              type="button"
+              onClick={handleToggleLockdown}
+              className={`px-4 py-2.5 rounded-xl text-xs font-bold shadow-lg flex items-center gap-2 transition ${
+                isLocked
+                  ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600'
+                  : 'bg-rose-600 hover:bg-rose-500 text-white shadow-rose-900/30'
+              }`}
+            >
+              {isLocked ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
+              {isLocked ? 'Release Store Lockdown' : 'Engage Full Store Lockdown'}
+            </button>
+          )}
 
           <button
             type="button"
@@ -380,14 +433,14 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
               </div>
 
               <div>
-                <label className="block text-slate-300 font-semibold mb-1">Supervisor PIN (Default: 1234) *</label>
+                <label className="block text-slate-300 font-semibold mb-1">Supervisor / Auditor Security PIN *</label>
                 <input
                   type="password"
                   maxLength={6}
                   required
                   value={supervisorPin}
                   onChange={(e) => setSupervisorPin(e.target.value)}
-                  placeholder="Enter 4-digit PIN"
+                  placeholder="Enter 6-digit staff PIN"
                   className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white font-mono text-center tracking-widest text-base focus:outline-none focus:ring-2 focus:ring-rose-500"
                 />
                 {pinError && <p className="text-xs text-rose-400 mt-1 font-medium">{pinError}</p>}

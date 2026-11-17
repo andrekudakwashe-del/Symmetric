@@ -54,7 +54,9 @@ import {
   Home,
   ArrowLeft,
   ArrowRight,
+  ShieldAlert,
 } from 'lucide-react';
+import { useClockSecurity, getTrustedTodayDateString, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
 import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
 import { CustomerAutocompleteInput } from '../common/CustomerAutocompleteInput';
@@ -181,6 +183,8 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
   onNavigateToHome,
   onNavigateToReconcile,
 }) => {
+  const clockSecurity = useClockSecurity();
+  const [securityErrorNotice, setSecurityErrorNotice] = useState<string | null>(null);
   const today = getTodayDateString();
   const [selectedDate, setSelectedDate] = useState<string>(today);
   const [selectedStaffId, setSelectedStaffId] = useState<string>(currentUser.id);
@@ -758,8 +762,14 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
 
   // ==================== SAVE SPREADSHEET BATCH ====================
   const handleSaveAllSheet = (targetAction: 'stay' | 'next' | 'home' = 'stay') => {
+    if (clockSecurity.isClockTampered && selectedDate < getTrustedTodayDateString()) {
+      setSecurityErrorNotice(
+        'Security Lock: Backdated customer change or credit entries are blocked while Automatic Date & Time is disabled.'
+      );
+      return;
+    }
     if (!isEditable) {
-      alert('Permission Denied: Non-admin staff cannot edit or save forms from previous days.');
+      setSecurityErrorNotice('Permission Denied: Non-admin staff cannot edit or save forms from previous days.');
       return;
     }
 
@@ -856,8 +866,14 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
   // ==================== SAVE SINGLE QUICK ENTRY ====================
   const handleSaveSingleEntry = (e: React.FormEvent) => {
     e.preventDefault();
+    if (clockSecurity.isClockTampered && selectedDate < getTrustedTodayDateString()) {
+      setSecurityErrorNotice(
+        'Security Lock: Backdated customer change or credit entries are blocked while Automatic Date & Time is disabled.'
+      );
+      return;
+    }
     if (!isEditable) {
-      alert('Permission Denied: Non-admin staff cannot save records for previous days.');
+      setSecurityErrorNotice('Permission Denied: Non-admin staff cannot save records for previous days.');
       return;
     }
     const custName = singleCustomerName.trim();
@@ -1160,6 +1176,31 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
         </div>
       )}
 
+      {(clockSecurity.isClockTampered || securityErrorNotice) && (
+        <div
+          role="alert"
+          className="rounded-2xl bg-red-600 border-2 border-red-400 text-white px-4 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shadow-xl animate-fadeIn"
+        >
+          <div className="flex items-start sm:items-center gap-2.5">
+            <ShieldAlert className="w-5 h-5 shrink-0 mt-0.5 sm:mt-0" />
+            <span className="font-bold">
+              {securityErrorNotice ||
+                'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds or backdated entries.'}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setSecurityErrorNotice(null);
+              isDeviceTimeAutomatic();
+            }}
+            className="px-3 py-1 rounded-lg bg-white text-red-700 font-black text-[11px] shrink-0"
+          >
+            Re-check Clock
+          </button>
+        </div>
+      )}
+
       {/* 3. Global Sheet Bar (Date, Staff & Filter) */}
       <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3.5 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-lg">
         <div className="flex flex-wrap items-center gap-3">
@@ -1170,7 +1211,17 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
             <input
               type="date"
               value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
+              onChange={(e) => {
+                const nextVal = e.target.value;
+                if (clockSecurity.isClockTampered && nextVal < getTrustedTodayDateString()) {
+                  setSecurityErrorNotice(
+                    'Security Lock: Backdated date selection is blocked while Automatic Date & Time is disabled.'
+                  );
+                  return;
+                }
+                setSecurityErrorNotice(null);
+                setSelectedDate(nextVal);
+              }}
               className="bg-transparent text-white font-mono-num font-bold outline-none cursor-pointer"
             />
           </div>

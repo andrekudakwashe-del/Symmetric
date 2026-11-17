@@ -8,9 +8,12 @@ import {
   getSyncQueue,
   updateSyncQueueItem,
   markRecordsCloudSynced,
+  parseTimestampMs,
+  annotateSaleCloudReceiptMetadata,
 } from '../../db/roomDatabase';
 import { getPendingSyncQueueItems, updateSyncItem } from '../../db/indexedDBService';
 import { persistentSyncEngine } from '../persistentSyncEngine';
+import { evaluateSuspiciousBackdate, reportTrustedTimeSample } from '../../utils/clockSecurity';
 
 export class SupabaseAdapter implements SyncAdapter {
   readonly name = 'SupabaseAdapter';
@@ -122,25 +125,70 @@ export class SupabaseAdapter implements SyncAdapter {
     const tableName = mapEntityTypeToCloudTable(envelope.entityType);
     const endpoint = `${sbUrl}/rest/v1/${tableName}`;
 
-    const recordPayload = {
+    const outboundTs = envelope.updatedAt && envelope.updatedAt > 0 ? envelope.updatedAt : Date.now();
+    const backdateEval = evaluateSuspiciousBackdate(
+      d.date || d.Date,
+      d.timestamp || d.Timestamp || outboundTs
+    );
+    const shouldIncludeServerFields =
+      envelope.entityType === 'sale' || envelope.entityType === 'cash_log';
+
+    const basePayload: Record<string, any> = {
       ...d,
       id: d.id || d.itemId || d.customerId || d.grvNumber || envelope.entityId,
       company_id: compId,
       branch_id: branchId,
-      updated_at: new Date(envelope.updatedAt || Date.now()).toISOString(),
+      updated_at: new Date(outboundTs).toISOString(),
+      ...(envelope.version !== undefined || d.version !== undefined
+        ? { version: Number(envelope.version ?? d.version ?? 0) }
+        : {}),
+      ...(envelope.mutationSource || d.mutationSource
+        ? { mutation_source: envelope.mutationSource || d.mutationSource }
+        : {}),
+      ...(d.pinVersion !== undefined ? { pin_version: Number(d.pinVersion) } : {}),
+      ...(d.pinUpdatedAt ? { pin_updated_at: new Date(d.pinUpdatedAt).toISOString() } : {}),
     };
 
-    const response = await fetch(endpoint, {
+    const recordPayload = shouldIncludeServerFields
+      ? {
+          ...basePayload,
+          server_received_at: backdateEval.server_received_at,
+          suspicious_backdate: backdateEval.suspicious_backdate,
+        }
+      : basePayload;
+
+    let response = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         apikey: sbKey,
         Authorization: `Bearer ${sbKey}`,
-        Prefer: 'resolution=merge-duplicates',
+        Prefer: 'resolution=merge-duplicates,return=representation',
       },
       body: JSON.stringify([recordPayload]),
       signal: AbortSignal.timeout(12000),
     });
+
+    if (response.status === 400 && shouldIncludeServerFields) {
+      const errPreview = await response.clone().text().catch(() => '');
+      if (
+        errPreview.includes('server_received_at') ||
+        errPreview.includes('suspicious_backdate') ||
+        errPreview.includes('PGRST204')
+      ) {
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: sbKey,
+            Authorization: `Bearer ${sbKey}`,
+            Prefer: 'resolution=merge-duplicates,return=representation',
+          },
+          body: JSON.stringify([basePayload]),
+          signal: AbortSignal.timeout(12000),
+        });
+      }
+    }
 
     if (!response.ok && response.status !== 200 && response.status !== 201) {
       const errText = await response.text().catch(() => '');
@@ -149,10 +197,46 @@ export class SupabaseAdapter implements SyncAdapter {
       );
     }
 
+    // Extract authoritative cloud server receipt time from HTTP Date header or returned Postgres row
+    const hdrDate = response.headers.get('date');
+    const returnedRows = await response.clone().json().catch(() => null);
+    const returnedRow = Array.isArray(returnedRows) ? returnedRows[0] : null;
+    const serverTsMs =
+      (returnedRow?.server_received_at ? Date.parse(returnedRow.server_received_at) : NaN) ||
+      (hdrDate ? Date.parse(hdrDate) : NaN) ||
+      Date.now();
+    if (Number.isFinite(serverTsMs) && serverTsMs > 1_600_000_000_000) {
+      reportTrustedTimeSample(serverTsMs, 'CLOUD_SERVER');
+    }
+    const cloudEval = evaluateSuspiciousBackdate(
+      d.date || d.Date,
+      d.timestamp || d.Timestamp || outboundTs,
+      Number.isFinite(serverTsMs) ? serverTsMs : Date.now()
+    );
+    const finalServerReceivedAt =
+      returnedRow?.server_received_at || cloudEval.server_received_at;
+    const finalSuspicious = Boolean(
+      returnedRow?.suspicious_backdate ?? cloudEval.suspicious_backdate
+    );
+
+    if (envelope.entityType === 'sale') {
+      const saleId = String(d.id || d.invoice_id || envelope.entityId || '');
+      if (saleId) {
+        annotateSaleCloudReceiptMetadata(saleId, {
+          server_received_at: finalServerReceivedAt,
+          suspicious_backdate: finalSuspicious,
+        });
+      }
+    }
+
     // ONLY confirm isCloudSynced = true after verified HTTP 200/201 response
     envelope.isCloudSynced = true;
     if (envelope.data && typeof envelope.data === 'object') {
       (envelope.data as any).isCloudSynced = true;
+      if (envelope.entityType === 'sale') {
+        (envelope.data as any).server_received_at = finalServerReceivedAt;
+        (envelope.data as any).suspicious_backdate = finalSuspicious;
+      }
     }
 
     const idList = [
@@ -247,15 +331,52 @@ export class SupabaseAdapter implements SyncAdapter {
         for (const row of rows) {
           const id = String(row?.id || row?.itemId || row?.customerId || '');
           if (!id) continue;
+          const incomingTs = parseTimestampMs(row?.updated_at || row?.updatedAt || row?.last_updated || row?.lastUpdated) || 0;
+          const incomingVersion = Number(row?.version || 0);
+          const mutationSource =
+            row?.mutation_source ||
+            row?.mutationSource ||
+            (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : 'MIGRATION');
+          const normalizedData: any = {
+            ...row,
+            id,
+            companyId: row?.company_id || row?.companyId,
+            branchId: row?.branch_id || row?.branchId,
+            version: incomingVersion,
+            mutationSource,
+            isCloudSynced: true,
+            ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
+            ...(entityType === 'staff'
+              ? {
+                  name: row?.full_name || row?.name,
+                  active: row?.is_active === false || row?.active === 'N' ? 'N' : 'Y',
+                  ...(row?.pin_version !== undefined || row?.pinVersion !== undefined
+                    ? { pinVersion: Number(row?.pin_version ?? row?.pinVersion ?? 0) }
+                    : {}),
+                  ...(row?.pin_updated_at || row?.pinUpdatedAt
+                    ? { pinUpdatedAt: parseTimestampMs(row?.pin_updated_at || row?.pinUpdatedAt) || undefined }
+                    : {}),
+                  ...(row?.branch_assignments || row?.branchAssignments
+                    ? { branchAssignments: row?.branch_assignments || row?.branchAssignments }
+                    : {}),
+                  ...(row?.assigned_branch_ids || row?.assignedBranchIds
+                    ? { assignedBranchIds: row?.assigned_branch_ids || row?.assignedBranchIds }
+                    : {}),
+                }
+              : {}),
+          };
+          const isDeletedRow = Boolean(row?.is_deleted === true || row?.deleted_at || row?.deletedAt);
           envelopes.push({
-            packetId: `SB-PULL-${entityType}-${id}-${Date.now()}`,
+            packetId: `SB-PULL-${entityType}-${id}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
             entityType,
             entityId: id,
-            action: spec?.appendOnly ? 'APPEND' : 'UPSERT',
-            data: { ...row, isCloudSynced: true },
-            updatedAt: row?.updated_at ? new Date(row.updated_at).getTime() : Date.now(),
+            action: isDeletedRow ? 'DELETE' : spec?.appendOnly ? 'APPEND' : 'UPSERT',
+            data: normalizedData,
+            updatedAt: incomingTs,
+            version: incomingVersion,
+            mutationSource,
             originDeviceId: 'SUPABASE_CLOUD',
-            targetBranchId: row?.branch_id || 'ALL',
+            targetBranchId: row?.branch_id || row?.branchId || 'ALL',
             class: spec?.class || 'T1',
             isCloudSynced: true,
           });

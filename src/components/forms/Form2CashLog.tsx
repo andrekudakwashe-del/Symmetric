@@ -81,7 +81,9 @@ import {
   CreditCard,
   Layers,
   Building2,
+  ShieldAlert,
 } from 'lucide-react';
+import { useClockSecurity, getTrustedTodayDateString, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
 import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
 import { ExchangeRatesModal } from '../common/ExchangeRatesModal';
@@ -198,6 +200,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   onNavigateToHome,
   onNavigateToDirectGrv,
 }) => {
+  const clockSecurity = useClockSecurity();
+  const [securityErrorNotice, setSecurityErrorNotice] = useState<string | null>(null);
   const today = getTodayDateString();
 
   // View mode: 'spreadsheet' (Daily Sheet Matrix) or 'single' (Quick Add)
@@ -1659,8 +1663,14 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     targetAction: 'stay' | 'next' | 'home' = 'stay'
   ) => {
     if (e) e.preventDefault();
+    if (clockSecurity.isClockTampered && sheetDate < getTrustedTodayDateString()) {
+      setSecurityErrorNotice(
+        'Security Lock: Backdated Cash Log entries are blocked while Automatic Date & Time is disabled. Please enable Automatic Date & Time in your phone settings.'
+      );
+      return;
+    }
     if (!isEditable) {
-      alert('Only administrators or current day reports can be edited.');
+      setSecurityErrorNotice('Only administrators or current day reports can be edited.');
       return;
     }
 
@@ -1794,8 +1804,14 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   // Quick Single Entry Submission
   const handleSaveSingleEntry = (e: React.FormEvent) => {
     e.preventDefault();
+    if (clockSecurity.isClockTampered && sheetDate < getTrustedTodayDateString()) {
+      setSecurityErrorNotice(
+        'Security Lock: Backdated Cash Log entries are blocked while Automatic Date & Time is disabled. Please enable Automatic Date & Time in your phone settings.'
+      );
+      return;
+    }
     if (!isEditable) {
-      alert('Only administrators or current day reports can be edited.');
+      setSecurityErrorNotice('Only administrators or current day reports can be edited.');
       return;
     }
 
@@ -2353,6 +2369,33 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         </div>
       )}
 
+      {(clockSecurity.isClockTampered || securityErrorNotice) && (
+        <div
+          role="alert"
+          className="rounded-2xl bg-red-600 border-2 border-red-400 text-white px-4 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shadow-xl animate-fadeIn"
+        >
+          <div className="flex items-start sm:items-center gap-2.5">
+            <ShieldAlert className="w-5 h-5 shrink-0 mt-0.5 sm:mt-0" />
+            <span className="font-bold">
+              {securityErrorNotice ||
+                'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds or backdated entries.'}
+            </span>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setSecurityErrorNotice(null);
+                isDeviceTimeAutomatic();
+              }}
+              className="px-3 py-1 rounded-lg bg-white text-red-700 font-black text-[11px]"
+            >
+              Re-check Clock
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 2A. DAILY SPREADSHEET MATRIX VIEW */}
       {activeView === 'spreadsheet' && (
         <form onSubmit={handleSaveSpreadsheet} className="space-y-4 animate-fadeIn">
@@ -2368,7 +2411,17 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
                 <input
                   type="date"
                   value={sheetDate}
-                  onChange={(e) => setSheetDate(e.target.value)}
+                  onChange={(e) => {
+                    const nextVal = e.target.value;
+                    if (clockSecurity.isClockTampered && nextVal < getTrustedTodayDateString()) {
+                      setSecurityErrorNotice(
+                        'Security Lock: Backdated date selection is blocked while Automatic Date & Time is disabled.'
+                      );
+                      return;
+                    }
+                    setSecurityErrorNotice(null);
+                    setSheetDate(nextVal);
+                  }}
                   className="py-1.5 px-3 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white font-mono-num outline-none focus:border-[#6A4DFF]"
                 />
               </div>

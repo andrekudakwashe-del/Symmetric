@@ -168,7 +168,15 @@ export class SyncCore {
         ...env,
         class: env.class || spec.class,
         originDeviceId: env.originDeviceId || this.deviceId,
-        updatedAt: env.updatedAt || Date.now(),
+        updatedAt: env.updatedAt !== undefined ? env.updatedAt : Date.now(),
+        ...(env.version !== undefined
+          ? { version: env.version }
+          : (env.data as any)?.version !== undefined
+          ? { version: Number((env.data as any).version) }
+          : {}),
+        ...(env.mutationSource || (env.data as any)?.mutationSource
+          ? { mutationSource: env.mutationSource || (env.data as any).mutationSource }
+          : {}),
         ...(envCloudSynced ? { isCloudSynced: true } : {}),
         packetId:
           env.packetId ||
@@ -188,6 +196,8 @@ export class SyncCore {
       (record as any)?.itemId ||
       'unknown';
     const packetId = `${entityType}-${recId}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    const recVersion = (record as any)?.version !== undefined ? Number((record as any).version) : undefined;
+    const recMutationSource = (record as any)?.mutationSource;
 
     const envelope: SyncEnvelope<T> = {
       packetId,
@@ -195,7 +205,9 @@ export class SyncCore {
       entityId: String(recId),
       action,
       data: record as T,
-      updatedAt: Date.now(),
+      updatedAt: (record as any)?.updatedAt || Date.now(),
+      ...(recVersion !== undefined && !isNaN(recVersion) ? { version: recVersion } : {}),
+      ...(recMutationSource ? { mutationSource: recMutationSource } : {}),
       originDeviceId: this.deviceId,
       targetBranchId: branchId || 'ALL',
       class: spec.class,
@@ -209,7 +221,7 @@ export class SyncCore {
   /**
    * Lesson 4 (No Re-Broadcast), Lesson 5 (Hub is Clock), Lesson 6 (Class Rule),
    * Lesson 8 (IndexedDB First), Lesson 10 (Cross-Device UI Events).
-   * Part A: Universal Tombstone Resurrection Guard for all T2 records.
+   * Part A: Universal Tombstone Resurrection Guard + Version/Seed/Dirty-Local Guard for all T2 records.
    */
   async ingest(
     envelope: SyncEnvelope,
@@ -244,7 +256,8 @@ export class SyncCore {
           const incomingTs = this.parseTimestampMs(
             envelope.hubTimestamp ?? envelope.updatedAt ?? envelope.data
           );
-          if (tombstoneDeletedAt > 0 && tombstoneDeletedAt >= incomingTs) {
+          // Seed/untimestamped rows (incomingTs === 0) must NEVER resurrect tombstoned records
+          if (tombstoneDeletedAt > 0 && (incomingTs === 0 || tombstoneDeletedAt >= incomingTs)) {
             console.warn(
               `[SyncCore Resurrection Guard] 🪦 Blocked resurrection of deleted ${envelope.entityType}:${envelope.entityId} ` +
                 `(tombstone.deletedAt=${tombstoneDeletedAt} >= incoming.updatedAt=${incomingTs})`
@@ -255,14 +268,61 @@ export class SyncCore {
 
         if (existingRecord !== undefined && existingRecord !== null) {
           const existingTs = this.parseTimestampMs(
-            existingRecord.hubTimestamp ?? existingRecord.updatedAt ?? existingRecord
+            existingRecord.hubTimestamp ?? existingRecord.updatedAt ?? existingRecord.lastUpdated ?? existingRecord
           );
           const incomingTs = this.parseTimestampMs(
-            envelope.hubTimestamp ?? envelope.updatedAt
+            envelope.hubTimestamp ?? envelope.updatedAt ?? envelope.data
           );
 
-          if (existingTs - incomingTs > 60000) {
+          const existingVersion = Number(existingRecord.version || 0);
+          const incomingVersion = Number(envelope.version ?? envelope.data?.version ?? 0);
+          const existingSource = String(
+            existingRecord.mutationSource || (existingVersion > 0 ? 'USER_EDIT' : '')
+          ).toUpperCase();
+          const incomingSource = String(
+            envelope.mutationSource || envelope.data?.mutationSource || (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : '')
+          ).toUpperCase();
+
+          // 1. Seed / Initial data must NEVER overwrite an existing user edit or timestamped local record
+          if (incomingSource === 'SEED' && (existingSource === 'USER_EDIT' || existingVersion > 0 || existingTs > 0)) {
+            return { accepted: false, reason: 'STALE_T2_SEED_BLOCKED' };
+          }
+
+          // 2. Untimestamped remote record (incomingTs === 0) must NEVER overwrite an existing timestamped/edited local record
+          if (incomingTs <= 0 && (existingTs > 0 || existingVersion > 0 || existingSource === 'USER_EDIT')) {
             return { accepted: false, reason: 'STALE_T2' };
+          }
+
+          // 3. Monotonic logical version comparison takes precedence over wall-clock skew
+          if (existingVersion > 0 && incomingVersion > 0) {
+            if (incomingVersion < existingVersion) {
+              return { accepted: false, reason: 'STALE_T2' };
+            }
+            if (incomingVersion === existingVersion && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
+              return { accepted: false, reason: 'STALE_T2' };
+            }
+          } else if (existingVersion > 0 && incomingVersion === 0 && existingSource === 'USER_EDIT') {
+            // An unversioned cloud/legacy row cannot blindly overwrite a versioned USER_EDIT unless strictly newer (> 60s)
+            if (incomingTs <= existingTs + 60000) {
+              return { accepted: false, reason: 'STALE_T2' };
+            }
+          } else if (existingTs - incomingTs > 60000) {
+            return { accepted: false, reason: 'STALE_T2' };
+          }
+
+          // 4. Dirty local edit protection against cloud/bootstrap pulls that haven't strictly beaten local state
+          const isCloudPull =
+            envelope.originDeviceId === 'APPS_SCRIPT_CLOUD' ||
+            envelope.originDeviceId === 'SUPABASE_CLOUD' ||
+            envelope.originDeviceId === 'MONGODB_CLOUD' ||
+            envelope.originDeviceId === 'SERVER_BOOTSTRAP';
+          const isLocalDirty = Boolean(existingRecord.isDirty || existingRecord.dirty || existingRecord.synced === false);
+          if (isCloudPull && isLocalDirty) {
+            const strictlyNewerVersion = incomingVersion > existingVersion && incomingVersion > 0;
+            const strictlyNewerTs = incomingVersion === existingVersion && incomingTs > existingTs + 60000;
+            if (!strictlyNewerVersion && !strictlyNewerTs) {
+              return { accepted: false, reason: 'STALE_T2_DIRTY_LOCAL' };
+            }
           }
         }
       }

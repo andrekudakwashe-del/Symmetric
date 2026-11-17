@@ -154,7 +154,14 @@ function doPost(e) {
     }
 
     // 4. ACTION: ADD SALE / INVOICE
-    if (action === "add_sale" || action === "sale" || action === "SALE_RECORD" || (action === "INSERT" && (sheetBaseName === "Sales" || sheetBaseName === TAB_SALES))) {
+    if (
+      action === "add_sale" ||
+      action === "sale" ||
+      action === "SALE_RECORD" ||
+      action === "sync_sale" ||
+      (action === "INSERT" && (sheetBaseName === "Sales" || sheetBaseName === TAB_SALES)) ||
+      (action === "sync_entity" && String(payload.entityType || "").toUpperCase() === "SALE")
+    ) {
       var saleResult = handleAddSale(ss, payload, companyId, branchId, branchName, userRole);
       lock.releaseLock();
       return jsonResponse(saleResult);
@@ -243,15 +250,18 @@ function doGet(e) {
   } catch (err) {}
 
   if (action === "ping") {
+    var nowPing = new Date();
     return jsonResponse({
       status: "active",
       success: true,
-      version: "5.1.0",
+      version: "5.2.0",
       tenant: compId,
       company: MASTER_COMPANY_NAME,
       isolationMode: DEFAULT_ISOLATION_MODE,
       sheet_name: ss ? ss.getName() : "Unknown",
       totalTabs: ss ? ss.getSheets().length : 0,
+      serverTime: nowPing.getTime(),
+      server_received_at: nowPing.toISOString(),
       service: "SAIMETRIC Dedicated Tenant Sheets Service (25 Tables Enabled)"
     });
   }
@@ -368,7 +378,7 @@ function checkWebhookStatus() {
  */
 function setupTenantSpreadsheetTabs(ss, company_id, company_name, initial_products) {
   var dataTabsConfig = [
-    { name: TAB_SALES, headers: ["SaleID", "CompanyID", "BranchID", "BranchName", "Date", "Customer", "PaymentMethod", "Subtotal", "Discount", "Tax", "Total", "CashierID", "CashierName", "ItemsCount", "Currency", "ExchangeRate", "ItemsSummary", "ItemsJSON", "Notes", "Status", "SyncedTimestamp"] },
+    { name: TAB_SALES, headers: ["SaleID", "CompanyID", "BranchID", "BranchName", "Date", "Customer", "PaymentMethod", "Subtotal", "Discount", "Tax", "Total", "CashierID", "CashierName", "ItemsCount", "Currency", "ExchangeRate", "ItemsSummary", "ItemsJSON", "Notes", "Status", "SyncedTimestamp", "server_received_at", "suspicious_backdate"] },
     { name: TAB_INVENTORY, headers: ["ItemID", "CompanyID", "BranchID", "ItemName", "UnitsPerCase", "CostPerCase", "CostPerUnit", "SellingPrice", "MarkupPercent", "StockCases", "StockSingles", "TotalUnits", "SKU", "Category", "MinStock"] },
     { name: TAB_GOODS_RECEIVED, headers: ["VoucherID", "CompanyID", "BranchID", "SupplierInvoiceNo", "SupplierID", "SupplierName", "DeliveryDate", "TotalAmount", "LandedCost", "PaymentStatus", "ReceivedByID", "ReceivedByName", "ItemsCount", "Notes", "SyncedTimestamp"] },
     { name: TAB_GOODS_RECEIVED_ITEMS, headers: ["GRNID", "CompanyID", "BranchID", "ItemID", "ItemName", "ReceivedCases", "ReceivedSingles", "UnitsPerCase", "CostPerCase", "CostPerUnit", "LineTotal", "BatchNumber", "ExpiryDate"] },
@@ -546,6 +556,40 @@ function handleSyncInventory(ss, payload, company_id, branch_id) {
   return { count: updated, items: items };
 }
 
+function evaluateServerTimestampMeta(ss, claimedDateVal, claimedTsVal) {
+  var now = new Date();
+  var serverIso = now.toISOString();
+  var tz = "UTC";
+  try {
+    tz = (ss && ss.getSpreadsheetTimeZone()) || Session.getScriptTimeZone() || "UTC";
+  } catch (e) {}
+  var serverToday = serverIso.slice(0, 10);
+  try {
+    serverToday = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+  } catch (e) {}
+
+  var claimedDay = "";
+  if (claimedDateVal && /^\d{4}-\d{2}-\d{2}/.test(String(claimedDateVal).trim())) {
+    claimedDay = String(claimedDateVal).trim().slice(0, 10);
+  } else if (claimedTsVal) {
+    var parsed = new Date(claimedTsVal);
+    if (!isNaN(parsed.getTime())) {
+      try {
+        claimedDay = Utilities.formatDate(parsed, tz, "yyyy-MM-dd");
+      } catch (e) {
+        claimedDay = parsed.toISOString().slice(0, 10);
+      }
+    }
+  }
+
+  var suspiciousBackdate = Boolean(claimedDay && claimedDay < serverToday);
+  return {
+    server_received_at: serverIso,
+    serverToday: serverToday,
+    suspicious_backdate: suspiciousBackdate
+  };
+}
+
 /**
  * Handle Appending Sales Invoices
  */
@@ -555,19 +599,21 @@ function handleAddSale(ss, payload, company_id, branch_id, branchName, userRole)
     setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
     sheet = ss.getSheetByName(TAB_SALES);
   }
-  var s = payload.data || payload.sale || payload;
+  var s = payload.data || payload.sale || payload.record || payload;
   var saleId = s.id || s.saleId || s.InvoiceID || ("SALE-" + Date.now());
   var itemsJson = "";
   try {
     itemsJson = Array.isArray(s.items) ? JSON.stringify(s.items) : "";
   } catch(e) {}
 
+  var tsMeta = evaluateServerTimestampMeta(ss, s.date || s.Date, s.timestamp || s.Timestamp);
+
   sheet.appendRow([
     saleId,
     company_id,
     branch_id,
     branchName,
-    s.date || s.Timestamp || new Date().toISOString(),
+    s.date || s.Timestamp || tsMeta.server_received_at,
     s.customerName || s.customer || "Walk-in",
     s.paymentMethod || "CASH",
     Number(s.subtotal || s.Subtotal) || 0,
@@ -583,9 +629,18 @@ function handleAddSale(ss, payload, company_id, branch_id, branchName, userRole)
     itemsJson,
     s.notes || "",
     s.status || "COMPLETED",
-    new Date().toISOString()
+    tsMeta.server_received_at,
+    tsMeta.server_received_at,
+    tsMeta.suspicious_backdate
   ]);
-  return { status: "success", success: true, sale_id: saleId, tab: TAB_SALES };
+  return {
+    status: "success",
+    success: true,
+    sale_id: saleId,
+    tab: TAB_SALES,
+    server_received_at: tsMeta.server_received_at,
+    suspicious_backdate: tsMeta.suspicious_backdate
+  };
 }
 
 /**
@@ -765,13 +820,20 @@ function appendRecordToSheet(ss, sheetBaseName, rowData, companyId, branchId, br
 
   var sheet = ss.getSheetByName(targetTab) || ss.getSheetByName(sheetBaseName);
   var enrichedData = Object.assign({}, rowData);
+  var tsMeta = evaluateServerTimestampMeta(
+    ss,
+    enrichedData.date || enrichedData.Date,
+    enrichedData.timestamp || enrichedData.Timestamp
+  );
   enrichedData.CompanyID = companyId;
   enrichedData.BranchID = branchId;
   enrichedData.BranchName = branchName;
   enrichedData.CreatedByUserID = userId;
   enrichedData.CreatedByRole = userRole;
+  enrichedData.server_received_at = tsMeta.server_received_at;
+  enrichedData.suspicious_backdate = tsMeta.suspicious_backdate;
   if (!enrichedData.SyncTimestamp) {
-    enrichedData.SyncTimestamp = new Date().toISOString();
+    enrichedData.SyncTimestamp = tsMeta.server_received_at;
   }
 
   if (!sheet) {
@@ -791,6 +853,14 @@ function appendRecordToSheet(ss, sheetBaseName, rowData, companyId, branchId, br
     existingHeaders = Object.keys(enrichedData);
     sheet.appendRow(existingHeaders);
   }
+  if (existingHeaders.indexOf("server_received_at") === -1) {
+    existingHeaders.push("server_received_at");
+    sheet.getRange(1, existingHeaders.length).setValue("server_received_at");
+  }
+  if (existingHeaders.indexOf("suspicious_backdate") === -1) {
+    existingHeaders.push("suspicious_backdate");
+    sheet.getRange(1, existingHeaders.length).setValue("suspicious_backdate");
+  }
 
   var newRow = [];
   for (var i = 0; i < existingHeaders.length; i++) {
@@ -809,7 +879,9 @@ function appendRecordToSheet(ss, sheetBaseName, rowData, companyId, branchId, br
     branch: branchId,
     tab: sheet.getName(),
     rowAdded: true,
-    timestamp: new Date().toISOString()
+    timestamp: tsMeta.server_received_at,
+    server_received_at: tsMeta.server_received_at,
+    suspicious_backdate: tsMeta.suspicious_backdate
   };
 }
 

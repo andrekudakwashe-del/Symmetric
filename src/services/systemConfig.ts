@@ -6,11 +6,109 @@ import {
   getBranches,
   saveBranch,
   getSalespeopleForCompany,
+  getAllSalespeople,
   saveSalesperson,
   getOwnerDefaultPermissions,
+  parseTimestampMs,
 } from '../db/roomDatabase';
 import { syncCompanyToCloud, fetchCompaniesFromMasterSheet } from './googleSheetsSync';
 import { Company } from '../data/saasData';
+import { routeCloudRecordThroughSyncCore } from './sync/syncIngestBridge';
+
+async function ingestBootstrapStaffRecord(su: any): Promise<void> {
+  if (!su) return;
+  console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(su));
+  const uComp = su.company_id || su.companyId;
+  if (!uComp) return;
+
+  const staffId = su.id || su.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+  const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
+  const incomingTs = parseTimestampMs(su.updatedAt || su.updated_at || su.lastUpdated) || 0;
+  const incomingVersion = Number(su.version || 0);
+  const incomingMutationSource =
+    su.mutationSource ||
+    su.mutation_source ||
+    (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : 'MIGRATION');
+  const incomingPinVersion = Number(su.pinVersion || su.pin_version || 0);
+  const incomingPinUpdatedAt = parseTimestampMs(su.pinUpdatedAt || su.pin_updated_at) || incomingTs;
+  const existingPinVersion = Number((existingStaff as any)?.pinVersion || 0);
+  const existingPinUpdatedAt = parseTimestampMs((existingStaff as any)?.pinUpdatedAt || existingStaff?.updatedAt);
+  const existingHasPin = Boolean(existingStaff?.pin_hash || existingStaff?.pin);
+  const shouldKeepExistingPin =
+    existingHasPin &&
+    (
+      !su.pin_hash ||
+      (existingPinVersion > 0 && incomingPinVersion === 0) ||
+      (existingPinVersion > 0 && incomingPinVersion > 0 && existingPinVersion > incomingPinVersion) ||
+      (existingPinUpdatedAt > 0 && incomingPinUpdatedAt > 0 && existingPinUpdatedAt - incomingPinUpdatedAt > 5000) ||
+      incomingTs === 0
+    );
+  const pinHash = shouldKeepExistingPin ? existingStaff?.pin_hash : (su.pin_hash || existingStaff?.pin_hash);
+  const pinSalt = shouldKeepExistingPin ? existingStaff?.pin_salt : (su.pin_salt || existingStaff?.pin_salt);
+  const effectivePinVersion = Math.max(existingPinVersion, incomingPinVersion);
+  const effectivePinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
+  const resolvedBranchId = su.branch_id || su.branchId || existingStaff?.branchId || 'BR-MAIN';
+  const resolvedBranchAssignments = su.branchAssignments || existingStaff?.branchAssignments;
+  const resolvedAssignedBranchIds =
+    su.assignedBranchIds ||
+    (Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
+      ? resolvedBranchAssignments.map((a: any) => a.branchId).filter(Boolean)
+      : (existingStaff as any)?.assignedBranchIds);
+
+  const staffPayload: any = {
+    id: staffId,
+    name: su.full_name || su.name || existingStaff?.name || 'Staff Member',
+    role: (su.role || existingStaff?.role || 'OWNER').toUpperCase() as any,
+    email: su.email || existingStaff?.email || '',
+    ...(pinHash
+      ? { pin_hash: pinHash, ...(pinSalt ? { pin_salt: pinSalt } : {}) }
+      : existingStaff?.pin
+      ? { pin: existingStaff.pin }
+      : { pin: String(su.pin || '1234') }),
+    phone: su.phone || existingStaff?.phone || '',
+    active: su.is_active === false || su.active === 'N' ? 'N' : 'Y',
+    companyId: uComp,
+    company_id: uComp,
+    branchId: resolvedBranchId,
+    branch_id: resolvedBranchId,
+    ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
+    ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
+    permissions: su.permissions || existingStaff?.permissions || getOwnerDefaultPermissions(),
+    version: incomingVersion,
+    mutationSource: incomingMutationSource,
+    ...(effectivePinVersion > 0 ? { pinVersion: effectivePinVersion } : {}),
+    ...(effectivePinUpdatedAt > 0 ? { pinUpdatedAt: effectivePinUpdatedAt } : {}),
+    ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
+  };
+
+  await routeCloudRecordThroughSyncCore(
+    {
+      packetId: `SERVER-BOOTSTRAP-STAFF-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
+      entityType: 'staff',
+      entityId: String(staffId),
+      action: 'UPSERT',
+      data: staffPayload,
+      updatedAt: incomingTs,
+      version: incomingVersion,
+      mutationSource: incomingMutationSource,
+      originDeviceId: 'SERVER_BOOTSTRAP',
+      targetBranchId: 'ALL',
+      class: 'T2',
+    },
+    existingStaff,
+    () => {
+      const savedStaff = saveSalesperson(staffPayload, { fromSync: true });
+      console.log(
+        '[STAFF TRACE] 7. Saved to DB. New Pin:',
+        savedStaff.pin_hash,
+        'New Branches:',
+        (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
+        'Role:',
+        savedStaff.role
+      );
+    }
+  );
+}
 
 export interface GlobalSystemConfig {
   masterWebhookUrl: string;
@@ -151,39 +249,16 @@ export async function pushAllLocalTenantsToCloud(
       }
       if (data && Array.isArray(data.branches)) {
         data.branches.forEach((sb: any) => {
-          if (sb && (sb.branch_id || sb.branchId || sb.id)) saveBranch(sb, { fromSync: true });
+          const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
+          if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
+            saveBranch(sb, { fromSync: true });
+          }
         });
       }
       if (data && Array.isArray(data.users)) {
-        data.users.forEach((su: any) => {
-          const cloudStaff = su;
-          console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
-          const uComp = su.company_id || su.companyId;
-          if (uComp) {
-            const savedStaff = saveSalesperson({
-              id: su.id || su.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
-              name: su.name || su.full_name || 'Staff Member',
-              role: (su.role || 'OWNER').toUpperCase() as any,
-              email: su.email || '',
-              ...(su.pin_hash ? { pin_hash: su.pin_hash, pin_salt: su.pin_salt } : { pin: String(su.pin || '1234') }),
-              phone: su.phone || '',
-              active: su.active === 'N' ? 'N' : 'Y',
-              companyId: uComp,
-              company_id: uComp,
-              branchId: su.branch_id || su.branchId || 'BR-MAIN',
-              branch_id: su.branch_id || su.branchId || 'BR-MAIN',
-              permissions: getOwnerDefaultPermissions(),
-            });
-            console.log(
-              '[STAFF TRACE] 7. Saved to DB. New Pin:',
-              savedStaff.pin_hash,
-              'New Branches:',
-              (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
-              'Role:',
-              savedStaff.role
-            );
-          }
-        });
+        for (const su of data.users) {
+          await ingestBootstrapStaffRecord(su);
+        }
       }
     }
   } catch (err) {
@@ -252,41 +327,16 @@ export async function initializeSystemConfigAndSync(): Promise<{
         }
         if (serverData && Array.isArray(serverData.branches)) {
           serverData.branches.forEach((sb: any) => {
-            if (sb && (sb.branch_id || sb.branchId || sb.id)) {
+            const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
+            if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
               saveBranch(sb, { fromSync: true });
             }
           });
         }
         if (serverData && Array.isArray(serverData.users)) {
-          serverData.users.forEach((su: any) => {
-            const cloudStaff = su;
-            console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
-            const uComp = su.company_id || su.companyId;
-            if (uComp) {
-              const savedStaff = saveSalesperson({
-                id: su.id || su.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
-                name: su.name || su.full_name || 'Staff Member',
-                role: (su.role || 'OWNER').toUpperCase() as any,
-                email: su.email || '',
-                ...(su.pin_hash ? { pin_hash: su.pin_hash, pin_salt: su.pin_salt } : { pin: String(su.pin || '1234') }),
-                phone: su.phone || '',
-                active: su.active === 'N' ? 'N' : 'Y',
-                companyId: uComp,
-                company_id: uComp,
-                branchId: su.branch_id || su.branchId || 'BR-MAIN',
-                branch_id: su.branch_id || su.branchId || 'BR-MAIN',
-                permissions: getOwnerDefaultPermissions(),
-              });
-              console.log(
-                '[STAFF TRACE] 7. Saved to DB. New Pin:',
-                savedStaff.pin_hash,
-                'New Branches:',
-                (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
-                'Role:',
-                savedStaff.role
-              );
-            }
-          });
+          for (const su of serverData.users) {
+            await ingestBootstrapStaffRecord(su);
+          }
         }
       }
     } catch {

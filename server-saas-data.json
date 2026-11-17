@@ -50,7 +50,8 @@
       },
       "webhook_url": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
       "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "branch_isolation_mode": "ROW_LEVEL"
+      "branch_isolation_mode": "ROW_LEVEL",
+      "package_id": "pkg_enterprise"
     },
     {
       "company_id": "COMP-002",
@@ -102,7 +103,8 @@
       },
       "webhook_url": "https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec",
       "sheet_id": "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE",
-      "branch_isolation_mode": "ROW_LEVEL"
+      "branch_isolation_mode": "ROW_LEVEL",
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTPNKKVJ",
@@ -257,7 +259,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.530Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_starter"
     },
     {
       "company_id": "COMP-MTSRBGFU",
@@ -361,7 +364,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.621Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTPOR09G",
@@ -477,7 +481,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.665Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_starter"
     },
     {
       "company_id": "COMP-MTUD4JH3",
@@ -552,7 +557,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.706Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_starter"
     },
     {
       "company_id": "COMP-MTVYXSAJ",
@@ -665,7 +671,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.753Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTWG8PU1",
@@ -780,7 +787,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.794Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTVO716V",
@@ -885,7 +893,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.839Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTVQOR7N",
@@ -990,7 +999,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.883Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTWHVQP9",
@@ -1106,7 +1116,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.928Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTVQGJN1",
@@ -1211,7 +1222,8 @@
           "lastPrunedAt": "2026-10-15T07:08:08.969Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTVJS6B8",
@@ -1316,7 +1328,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.012Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTPTQITW",
@@ -1421,7 +1434,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.055Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTR7CC6E",
@@ -1526,7 +1540,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.097Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTT1Z5V1",
@@ -1631,7 +1646,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.140Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_starter"
     },
     {
       "company_id": "COMP-MTWG4D2Y",
@@ -1736,7 +1752,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.182Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTWH988C",
@@ -1841,7 +1858,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.229Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTWGDL9V",
@@ -1946,7 +1964,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.272Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTVQGJYA",
@@ -2000,7 +2019,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.316Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTVJS6RU",
@@ -2054,7 +2074,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.356Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTPTQIMG",
@@ -2108,7 +2129,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.398Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTR7CCYB",
@@ -2162,7 +2184,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.442Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTT1Z5PN",
@@ -2216,7 +2239,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.483Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_starter"
     },
     {
       "company_id": "COMP-MTWG42E5",
@@ -2270,7 +2294,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.528Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTWH959K",
@@ -2324,7 +2349,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.569Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTWGD7WA",
@@ -2378,7 +2404,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.616Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MU2HG5C3",
@@ -2432,7 +2459,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.672Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_starter"
     },
     {
       "company_id": "COMP-MTWH6Q7O",
@@ -2486,7 +2514,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.728Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTWHCBC4",
@@ -2540,7 +2569,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.789Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MTX3UU1U",
@@ -2594,7 +2624,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.864Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MUFBCJAG",
@@ -2648,7 +2679,8 @@
           "lastPrunedAt": "2026-10-15T07:08:09.917Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MUGYS509",
@@ -2753,7 +2785,8 @@
         },
         "isMigrating": false
       },
-      "branch_isolation_mode": "ROW_LEVEL"
+      "branch_isolation_mode": "ROW_LEVEL",
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MUFLW4KL",
@@ -2807,7 +2840,8 @@
           "lastPrunedAt": "2026-10-15T07:08:10.028Z"
         },
         "isMigrating": false
-      }
+      },
+      "package_id": "pkg_professional"
     },
     {
       "company_id": "COMP-MUGZ6ZSM",
@@ -2912,7 +2946,8 @@
         },
         "isMigrating": false
       },
-      "branch_isolation_mode": "ROW_LEVEL"
+      "branch_isolation_mode": "ROW_LEVEL",
+      "package_id": "pkg_professional"
     }
   ],
   "branches": [
@@ -2930,7 +2965,9 @@
       "companyId": "COMP-001",
       "name": "Harare Main",
       "location": "4th Street Commercial Center, Harare",
-      "code": "HQ-01"
+      "code": "HQ-01",
+      "updatedAt": 1794922861268,
+      "lastUpdated": "2026-11-17T13:41:01.268Z"
     },
     {
       "branch_id": "BR-BYO-01",
@@ -2995,7 +3032,9 @@
       "company_id": "COMP-001",
       "companyId": "COMP-001",
       "is_active": true,
-      "branch_id": "BR-001"
+      "branch_id": "BR-001",
+      "updatedAt": 1794922861284,
+      "lastUpdated": "2026-11-17T13:41:01.284Z"
     },
     {
       "id": "BR-MTT1Z5V1-01",
@@ -3004,8 +3043,8 @@
       "code": "HQ-01",
       "location": "4th Street Commercial Center, Harare",
       "address": "4th Street Commercial Center, Harare",
-      "company_id": "COMP-MUFBCJAG",
-      "companyId": "COMP-MUFBCJAG",
+      "company_id": "COMP-MTT1Z5V1",
+      "companyId": "COMP-MTT1Z5V1",
       "is_active": false,
       "branch_id": "BR-MTT1Z5V1-01"
     },
@@ -3314,7 +3353,9 @@
       "company_id": "COMP-001",
       "id": "BR-002",
       "branch_id": "BR-002",
-      "address": "Westgate Shopping Complex, Harare"
+      "address": "Westgate Shopping Complex, Harare",
+      "updatedAt": 1794922861344,
+      "lastUpdated": "2026-11-17T13:41:01.344Z"
     },
     {
       "branchId": "BR-003",
@@ -3325,7 +3366,9 @@
       "company_id": "COMP-001",
       "id": "BR-003",
       "branch_id": "BR-003",
-      "address": "Highlands Square, Harare"
+      "address": "Highlands Square, Harare",
+      "updatedAt": 1794922861347,
+      "lastUpdated": "2026-11-17T13:41:01.347Z"
     }
   ],
   "users": [
@@ -3369,7 +3412,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchAssignments": [
         {
@@ -3379,7 +3432,12 @@
           "assignedAt": "2026-09-13T14:59:23.520Z",
           "isPrimary": true
         }
-      ]
+      ],
+      "pin_hash": "1e7cbfefc0ae8f176b4aaba3c3938d5efc14246529109cc16bbddc0e53642fb4",
+      "pin_salt": "ddb96d73b967b05a0700b597626b8740",
+      "updatedAt": 1794922861365,
+      "lastUpdated": "2026-11-17T13:41:01.365Z",
+      "password": "1e7cbfefc0ae8f176b4aaba3c3938d5efc14246529109cc16bbddc0e53642fb4"
     },
     {
       "id": "002",
@@ -3421,9 +3479,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchAssignments": []
+      "branchAssignments": [],
+      "pin_hash": "40ff6d991c203a4e29279cf18c4d5c9d277cc706f3f277b81948736e8f3b3257",
+      "pin_salt": "01100dcc65f4840a3887d864642d091f",
+      "updatedAt": 1794922861387,
+      "lastUpdated": "2026-11-17T13:41:01.387Z",
+      "password": "40ff6d991c203a4e29279cf18c4d5c9d277cc706f3f277b81948736e8f3b3257"
     },
     {
       "id": "003",
@@ -3465,9 +3538,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchAssignments": []
+      "branchAssignments": [],
+      "pin_hash": "e0e803e2fb215dda9cb1d4698fb45fc8e4e316983e548834d13017525743eebf",
+      "pin_salt": "0d31de44aa12ce3405340c44bc4634ec",
+      "updatedAt": 1794922861399,
+      "lastUpdated": "2026-11-17T13:41:01.399Z",
+      "password": "e0e803e2fb215dda9cb1d4698fb45fc8e4e316983e548834d13017525743eebf"
     },
     {
       "id": "USR-BYO-01",
@@ -3508,8 +3596,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "3c7abb24790cf2f99e765084e3f26ad37e1ffeb169715e32717aaa5403e4c1e3",
+      "pin_salt": "1fd0d696ae66f3a52d03ee1793f18f4d",
+      "updatedAt": 1794922861413,
+      "lastUpdated": "2026-11-17T13:41:01.413Z",
+      "password": "3c7abb24790cf2f99e765084e3f26ad37e1ffeb169715e32717aaa5403e4c1e3"
     },
     {
       "id": "004",
@@ -3550,9 +3653,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchAssignments": []
+      "branchAssignments": [],
+      "pin_hash": "2dd4e5ea68afced64789dec369a60c0036a4b335bc7fc3db2d5104bd79f62dc8",
+      "pin_salt": "b29d5e5d36985c0e906a1b0fa41a52aa",
+      "updatedAt": 1794922861428,
+      "lastUpdated": "2026-11-17T13:41:01.428Z",
+      "password": "2dd4e5ea68afced64789dec369a60c0036a4b335bc7fc3db2d5104bd79f62dc8"
     },
     {
       "name": "TINASHE",
@@ -3564,7 +3682,7 @@
       "company_id": "COMP-001",
       "branchId": "BR-MAIN",
       "branch_id": "BR-MAIN",
-      "branchName": "Head Office - Main Central Distribution & Warehouse",
+      "branchName": "Main Branch",
       "email": "",
       "phone": "",
       "permissions": {
@@ -3593,9 +3711,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchAssignments": []
+      "branchAssignments": [],
+      "pin_hash": "271e1cb35d092e5d9a8afe29be5a4c220b0686ef76070509896088dec2cb7c16",
+      "pin_salt": "1190c277d3902920bcbaf608717c52f8",
+      "updatedAt": 1794922861446,
+      "lastUpdated": "2026-11-17T13:41:01.446Z",
+      "password": "271e1cb35d092e5d9a8afe29be5a4c220b0686ef76070509896088dec2cb7c16"
     },
     {
       "id": "006",
@@ -3629,7 +3762,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "companyId": "COMP-001",
       "company_id": "COMP-001",
@@ -3646,7 +3789,12 @@
           "assignedAt": "2026-09-13T14:59:23.563Z",
           "isPrimary": true
         }
-      ]
+      ],
+      "pin_hash": "d474f1e7c2c6b9b6ce6fc716fc2e3d50cc942224d8858218cec7d172ac51cab5",
+      "pin_salt": "f0ab8bfbca01ea44ef8f81989710fbfc",
+      "updatedAt": 1794922861456,
+      "lastUpdated": "2026-11-17T13:41:01.456Z",
+      "password": "d474f1e7c2c6b9b6ce6fc716fc2e3d50cc942224d8858218cec7d172ac51cab5"
     },
     {
       "id": "USR-4OBX-01",
@@ -3687,7 +3835,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchAssignments": [
         {
@@ -3697,7 +3855,12 @@
           "isPrimary": true,
           "assignedAt": "2026-09-15T08:52:45.355Z"
         }
-      ]
+      ],
+      "pin_hash": "5111a147f0ed904bf5655b46dc0d6645c8c89049db456e8bf0e715970dd0d26b",
+      "pin_salt": "97cf91a866a2695b0b331829efa343a2",
+      "updatedAt": 1794922861465,
+      "lastUpdated": "2026-11-17T13:41:01.465Z",
+      "password": "5111a147f0ed904bf5655b46dc0d6645c8c89049db456e8bf0e715970dd0d26b"
     },
     {
       "id": "007",
@@ -3734,7 +3897,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "companyId": "COMP-MTPNKKVJ",
       "branchId": "BR-4OBX-01",
@@ -3748,7 +3921,15 @@
         }
       ],
       "branchName": "Main Branch",
-      "phone": ""
+      "phone": "",
+      "pin_hash": "75ede0706833414be581b6600060aa2e2b6c4c362f1a318178d4a1b390a4f4e8",
+      "pin_salt": "35bc68feee1694742d57d32fa002bc9d",
+      "updatedAt": 1794922861477,
+      "lastUpdated": "2026-11-17T13:41:01.477Z",
+      "password": "75ede0706833414be581b6600060aa2e2b6c4c362f1a318178d4a1b390a4f4e8",
+      "assignedBranchIds": [
+        "BR-4OBX-01"
+      ]
     },
     {
       "id": "USR-METRO-01",
@@ -3789,8 +3970,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "091b8ab40b60b8d5365036a8b3ec73571f455e3a1df55e31fd6abd5a3c34fb2b",
+      "pin_salt": "6c660ee38ae1d48d0e0c6731cd236252",
+      "updatedAt": 1794922861495,
+      "lastUpdated": "2026-11-17T13:41:01.495Z",
+      "password": "091b8ab40b60b8d5365036a8b3ec73571f455e3a1df55e31fd6abd5a3c34fb2b"
     },
     {
       "id": "USR-Y26R-01",
@@ -3831,8 +4027,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "0acdfecbcbfc1e1a5af6a5e1c9be47e2a339203b5f7f63fe479e01df08c1d374",
+      "pin_salt": "2cab46510a79ca8896b0b4549a29ff13",
+      "updatedAt": 1794922861506,
+      "lastUpdated": "2026-11-17T13:41:01.506Z",
+      "password": "0acdfecbcbfc1e1a5af6a5e1c9be47e2a339203b5f7f63fe479e01df08c1d374"
     },
     {
       "id": "USR-CMQJ-01",
@@ -3872,8 +4083,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "a29cb6a9b64eb83ee6920f65bd9656196eb1807462d422d102b3f9914e2ea69b",
+      "pin_salt": "d4a65babf0e0302f8ef4c750a4cd4ab4",
+      "updatedAt": 1794922861516,
+      "lastUpdated": "2026-11-17T13:41:01.516Z",
+      "password": "a29cb6a9b64eb83ee6920f65bd9656196eb1807462d422d102b3f9914e2ea69b"
     },
     {
       "id": "USR-ZGA3-01",
@@ -3913,10 +4139,25 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchName": "Main Branch",
-      "branchAssignments": []
+      "branchAssignments": [],
+      "pin_hash": "1f9dc65a7f323da1fea54c02533bf033931745415f56d5d0a68aec9c73e51941",
+      "pin_salt": "3ee4e9ff91507e0d377b63b433e46cca",
+      "updatedAt": 1794922861527,
+      "lastUpdated": "2026-11-17T13:41:01.527Z",
+      "password": "1f9dc65a7f323da1fea54c02533bf033931745415f56d5d0a68aec9c73e51941"
     },
     {
       "id": "USR-AB4Z-01",
@@ -3956,8 +4197,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "f1f26c20ac33c678e25b7cd48f984fe56a50f6447480ed1702403b7b49b3d8fe",
+      "pin_salt": "4169e1f250ed4bb8282d3d02fcf8929e",
+      "updatedAt": 1794922861536,
+      "lastUpdated": "2026-11-17T13:41:01.536Z",
+      "password": "f1f26c20ac33c678e25b7cd48f984fe56a50f6447480ed1702403b7b49b3d8fe"
     },
     {
       "id": "USR-IIN0-01",
@@ -3998,8 +4254,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "5a1b3dcad6b41ba40f4cb8f65685a8c844be847b9e9089a12ef7b336b0b80138",
+      "pin_salt": "d8b3188990df96110c43ba786862e6a4",
+      "updatedAt": 1794922861545,
+      "lastUpdated": "2026-11-17T13:41:01.545Z",
+      "password": "5a1b3dcad6b41ba40f4cb8f65685a8c844be847b9e9089a12ef7b336b0b80138"
     },
     {
       "id": "USR-LA17-01",
@@ -4039,9 +4310,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchName": "Main Branch"
+      "branchName": "Main Branch",
+      "pin_hash": "84390be164c1f5668d005234d50ef7fb55e08e398f0ddc529bb88ed3a294327b",
+      "pin_salt": "aa39d11800b7f43ae4fa777db1f6ae84",
+      "updatedAt": 1794922861556,
+      "lastUpdated": "2026-11-17T13:41:01.556Z",
+      "password": "84390be164c1f5668d005234d50ef7fb55e08e398f0ddc529bb88ed3a294327b"
     },
     {
       "id": "USR-1LAE-01",
@@ -4081,9 +4367,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchName": "Main Branch"
+      "branchName": "Main Branch",
+      "pin_hash": "22834ca3994a26269a14071537625878b681d2f86ebd89712104cde972bb9cd6",
+      "pin_salt": "549c8c477cc047df6e476507b5e64491",
+      "updatedAt": 1794922861576,
+      "lastUpdated": "2026-11-17T13:41:01.576Z",
+      "password": "22834ca3994a26269a14071537625878b681d2f86ebd89712104cde972bb9cd6"
     },
     {
       "id": "USR-D3LI-01",
@@ -4123,9 +4424,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchName": "Main Branch"
+      "branchName": "Main Branch",
+      "pin_hash": "003a06db974601db4d00281e0f532f9a3b9841dd15029fcaa790e1f7cf320683",
+      "pin_salt": "b0dc7a2a8e1fe26403b9950f917f014c",
+      "updatedAt": 1794922861588,
+      "lastUpdated": "2026-11-17T13:41:01.588Z",
+      "password": "003a06db974601db4d00281e0f532f9a3b9841dd15029fcaa790e1f7cf320683"
     },
     {
       "id": "USR-GJN1-01",
@@ -4165,8 +4481,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "ccdb79acb017729b238513f48876e927595eeda8463cccb6bb8682498748e9fe",
+      "pin_salt": "d6fff9210cdc6c8c285f2da99b98dac6",
+      "updatedAt": 1794922861601,
+      "lastUpdated": "2026-11-17T13:41:01.601Z",
+      "password": "ccdb79acb017729b238513f48876e927595eeda8463cccb6bb8682498748e9fe"
     },
     {
       "id": "USR-S6B8-01",
@@ -4206,8 +4537,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "03b1feaea031b14745c90386f28df1455765b86f5d75780ecd15a2b648b6c873",
+      "pin_salt": "9c1c6a9ae6b7bbf628786f37429c10b9",
+      "updatedAt": 1794922861615,
+      "lastUpdated": "2026-11-17T13:41:01.615Z",
+      "password": "03b1feaea031b14745c90386f28df1455765b86f5d75780ecd15a2b648b6c873"
     },
     {
       "id": "USR-QITW-01",
@@ -4247,8 +4593,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "a744020a82d7a8aa9220f88ffea06e744fbfe74b97bcb29394512eb535aaacee",
+      "pin_salt": "ab5756c7ef42e5ae2a4a9d60f08350e4",
+      "updatedAt": 1794922861625,
+      "lastUpdated": "2026-11-17T13:41:01.625Z",
+      "password": "a744020a82d7a8aa9220f88ffea06e744fbfe74b97bcb29394512eb535aaacee"
     },
     {
       "id": "USR-CC6E-01",
@@ -4288,8 +4649,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "39627488815d9777e761d9b0e681632a8886d0e86bf5bced850fe1ea6cbd7bf8",
+      "pin_salt": "ea309a6d4379cd97dc10287c90c9d5b7",
+      "updatedAt": 1794922861634,
+      "lastUpdated": "2026-11-17T13:41:01.634Z",
+      "password": "39627488815d9777e761d9b0e681632a8886d0e86bf5bced850fe1ea6cbd7bf8"
     },
     {
       "id": "USR-Z5V1-01",
@@ -4329,10 +4705,25 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchName": "Hit",
-      "branchAssignments": []
+      "branchAssignments": [],
+      "pin_hash": "988a2e1f8f1e3105d4cd9f9f80c005f4db8a5e218574b33dd238b29b62d4dfcc",
+      "pin_salt": "a50a5c75fa4b320f1c004b2f45ec93b0",
+      "updatedAt": 1794922861643,
+      "lastUpdated": "2026-11-17T13:41:01.643Z",
+      "password": "988a2e1f8f1e3105d4cd9f9f80c005f4db8a5e218574b33dd238b29b62d4dfcc"
     },
     {
       "id": "USR-001",
@@ -4372,8 +4763,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "f967ab94d8c146771678218b674044a0d5f8e6b7f63056ab765e4a80c6e4aa28",
+      "password": "f967ab94d8c146771678218b674044a0d5f8e6b7f63056ab765e4a80c6e4aa28",
+      "pin_salt": "d36bab15de0ed7a825f86fd50566391f",
+      "updatedAt": 1794922861652,
+      "lastUpdated": "2026-11-17T13:41:01.652Z"
     },
     {
       "id": "008",
@@ -4413,7 +4819,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchName": "Main Branch",
       "branchAssignments": [
@@ -4424,6 +4840,14 @@
           "isPrimary": true,
           "assignedAt": "2026-09-21T09:37:37.575Z"
         }
+      ],
+      "pin_hash": "a27b5e8a803de66946d4bef78e2fadbc8e588a2e35ee14d12b95b08913127b11",
+      "pin_salt": "e7ee42206b14a733b2af00a25374f20b",
+      "updatedAt": 1794922861661,
+      "lastUpdated": "2026-11-17T13:41:01.661Z",
+      "password": "a27b5e8a803de66946d4bef78e2fadbc8e588a2e35ee14d12b95b08913127b11",
+      "assignedBranchIds": [
+        "BR-MTT1Z5V1-01"
       ]
     },
     {
@@ -4464,7 +4888,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchAssignments": [
         {
@@ -4475,7 +4909,15 @@
           "assignedAt": "2026-09-23T05:20:37.972Z"
         }
       ],
-      "branchName": "Hit"
+      "branchName": "Hit",
+      "pin_hash": "d7c17d40766cbcb054591ba0a93f9872ea91ba6ba3f76093c5a8975375b4977a",
+      "pin_salt": "b2453936120492df587c5daa8f1166b7",
+      "updatedAt": 1794922861672,
+      "lastUpdated": "2026-11-17T13:41:01.672Z",
+      "password": "d7c17d40766cbcb054591ba0a93f9872ea91ba6ba3f76093c5a8975375b4977a",
+      "assignedBranchIds": [
+        "BR-MUDNL37R"
+      ]
     },
     {
       "id": "010",
@@ -4515,7 +4957,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchAssignments": [
         {
@@ -4526,7 +4978,15 @@
           "assignedAt": "2026-09-23T10:34:58.914Z"
         }
       ],
-      "branchName": "Hit"
+      "branchName": "Hit",
+      "pin_hash": "a561d8dffb62dfcdb499e4e1b82aadee1930a7a4fd80a98864d927988df86306",
+      "pin_salt": "bbcc9d20175e70b8dc8436bc7e2b513f",
+      "updatedAt": 1794922861685,
+      "lastUpdated": "2026-11-17T13:41:01.685Z",
+      "password": "a561d8dffb62dfcdb499e4e1b82aadee1930a7a4fd80a98864d927988df86306",
+      "assignedBranchIds": [
+        "BR-MUDNL37R"
+      ]
     },
     {
       "id": "USR-4D2Y-01",
@@ -4566,8 +5026,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "5f608ac3cbd7783b133a56cb57091dd30accc736c8cbbbd65f0e7447ffdf2c78",
+      "pin_salt": "25717ea3dc0b47d95a06e0e941b36b83",
+      "updatedAt": 1794922861694,
+      "lastUpdated": "2026-11-17T13:41:01.694Z",
+      "password": "5f608ac3cbd7783b133a56cb57091dd30accc736c8cbbbd65f0e7447ffdf2c78"
     },
     {
       "id": "USR-988C-01",
@@ -4607,8 +5082,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "580700e4cc3df6fa6e17ae9271dc4e10e00c77880bf00f9056a0958ec7728cc1",
+      "pin_salt": "7558bb0578421ec3d26a11daa0f5a427",
+      "updatedAt": 1794922861711,
+      "lastUpdated": "2026-11-17T13:41:01.711Z",
+      "password": "580700e4cc3df6fa6e17ae9271dc4e10e00c77880bf00f9056a0958ec7728cc1"
     },
     {
       "id": "USR-DL9V-01",
@@ -4648,8 +5138,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "1328c06117043defdb5a8c6d8f3cda4645a2589a3416b7a2b7b4e4dd63bd5e8f",
+      "pin_salt": "8fd2a41fc02cf6d282800e75357ef313",
+      "updatedAt": 1794922861723,
+      "lastUpdated": "2026-11-17T13:41:01.723Z",
+      "password": "1328c06117043defdb5a8c6d8f3cda4645a2589a3416b7a2b7b4e4dd63bd5e8f"
     },
     {
       "id": "USR-COMP-MTVQGJYA-001",
@@ -4689,8 +5194,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "ca76f553a9f664d1016ae0b77803c4b72a942a1468c10e9a674aa5c7c8d1211d",
+      "pin_salt": "1e8b3571f9f47dc6161487f97741634a",
+      "updatedAt": 1794922861734,
+      "lastUpdated": "2026-11-17T13:41:01.734Z",
+      "password": "ca76f553a9f664d1016ae0b77803c4b72a942a1468c10e9a674aa5c7c8d1211d"
     },
     {
       "id": "USR-COMP-MTVJS6RU-001",
@@ -4730,8 +5250,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "9a86b47b6079fbf3416111b74bc8aeac625b2893b3ffc97f98a682994f37aa10",
+      "pin_salt": "38bb091affcd96dc95f17e448cc62869",
+      "updatedAt": 1794922861745,
+      "lastUpdated": "2026-11-17T13:41:01.745Z",
+      "password": "9a86b47b6079fbf3416111b74bc8aeac625b2893b3ffc97f98a682994f37aa10"
     },
     {
       "id": "USR-COMP-MTPTQIMG-001",
@@ -4771,8 +5306,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "757546ea9e4ac2f14283ef27f55a343064744a55997c5fdaa45ec975815f2912",
+      "pin_salt": "e3ea9d39ca350a0cea8dddacd32423e5",
+      "updatedAt": 1794922861755,
+      "lastUpdated": "2026-11-17T13:41:01.755Z",
+      "password": "757546ea9e4ac2f14283ef27f55a343064744a55997c5fdaa45ec975815f2912"
     },
     {
       "id": "USR-COMP-MTR7CCYB-001",
@@ -4812,8 +5362,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "ffae17ab6823988e769b2b940bced59526a1cba09ed7825ca50db5d2aa9819a4",
+      "pin_salt": "0d72efe375f298d19b31784165c0ee46",
+      "updatedAt": 1794922861764,
+      "lastUpdated": "2026-11-17T13:41:01.764Z",
+      "password": "ffae17ab6823988e769b2b940bced59526a1cba09ed7825ca50db5d2aa9819a4"
     },
     {
       "id": "USR-COMP-MTT1Z5PN-001",
@@ -4853,8 +5418,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "a7184ace4d5d3b735f3704aad320f373528a5f74e1e4146a092ee359e56403e0",
+      "pin_salt": "4b673303e3f6b7b576ebab56df8e8bfc",
+      "updatedAt": 1794922861773,
+      "lastUpdated": "2026-11-17T13:41:01.773Z",
+      "password": "a7184ace4d5d3b735f3704aad320f373528a5f74e1e4146a092ee359e56403e0"
     },
     {
       "id": "USR-COMP-MTWG42E5-001",
@@ -4894,8 +5474,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "db04977834b8a0c943514cab5c196671a5664b12fb7b4fee988dea388689284c",
+      "pin_salt": "f63899b5110189e5aae5414373bb4ac8",
+      "updatedAt": 1794922861782,
+      "lastUpdated": "2026-11-17T13:41:01.782Z",
+      "password": "db04977834b8a0c943514cab5c196671a5664b12fb7b4fee988dea388689284c"
     },
     {
       "id": "USR-COMP-MTWH959K-001",
@@ -4935,8 +5530,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "d846d54730ce1f23101e48e3cab969f0af6a0cfa78c4650539bad1ec9a7a1256",
+      "pin_salt": "63b306c842d50115bf7c5e6cd1d33c2e",
+      "updatedAt": 1794922861804,
+      "lastUpdated": "2026-11-17T13:41:01.804Z",
+      "password": "d846d54730ce1f23101e48e3cab969f0af6a0cfa78c4650539bad1ec9a7a1256"
     },
     {
       "id": "USR-COMP-MTWGD7WA-001",
@@ -4976,8 +5586,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "5a5db8b6036751d09978e1de8c51464e4668adffd42094649241858c3c60fa9e",
+      "pin_salt": "68005dcc8ebde398731c8f0a56bb3669",
+      "updatedAt": 1794922861813,
+      "lastUpdated": "2026-11-17T13:41:01.813Z",
+      "password": "5a5db8b6036751d09978e1de8c51464e4668adffd42094649241858c3c60fa9e"
     },
     {
       "id": "USR-COMP-MU2HG5C3-001",
@@ -5017,8 +5642,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "324b1ae0064bee42b9903e6ca31f4b3ad2c5f80dc72e50c28d964c787d4bcee6",
+      "pin_salt": "bf95ef26a068331c09fb01b58f059162",
+      "updatedAt": 1794922861823,
+      "lastUpdated": "2026-11-17T13:41:01.823Z",
+      "password": "324b1ae0064bee42b9903e6ca31f4b3ad2c5f80dc72e50c28d964c787d4bcee6"
     },
     {
       "id": "USR-COMP-MTWH6Q7O-001",
@@ -5058,8 +5698,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "8d9d97a1b31ecc361c31b3fd72bd7975944b6864664cea117a47a4a2e509b388",
+      "pin_salt": "0ec860bb1349de89843fa2dfb21716a7",
+      "updatedAt": 1794922861834,
+      "lastUpdated": "2026-11-17T13:41:01.834Z",
+      "password": "8d9d97a1b31ecc361c31b3fd72bd7975944b6864664cea117a47a4a2e509b388"
     },
     {
       "id": "USR-COMP-MTWHCBC4-001",
@@ -5099,8 +5754,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "6a3b64329c3f0431e200f7528e7e1abeabc0eb7de8d6a212e3e43a71f6ee07dc",
+      "pin_salt": "dab1570cac2df5e49c62b393cd0decef",
+      "updatedAt": 1794922861843,
+      "lastUpdated": "2026-11-17T13:41:01.843Z",
+      "password": "6a3b64329c3f0431e200f7528e7e1abeabc0eb7de8d6a212e3e43a71f6ee07dc"
     },
     {
       "id": "USR-COMP-MTX3UU1U-001",
@@ -5140,8 +5810,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "8759501dc8dc693e2136d013c129af6c7542202db4ccfe73395219287ebd9d10",
+      "pin_salt": "2b44c167109301d8685c2a144aafcb51",
+      "updatedAt": 1794922861854,
+      "lastUpdated": "2026-11-17T13:41:01.854Z",
+      "password": "8759501dc8dc693e2136d013c129af6c7542202db4ccfe73395219287ebd9d10"
     },
     {
       "id": "USR-2F0N-01",
@@ -5182,9 +5867,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchAssignments": []
+      "branchAssignments": [],
+      "pin_hash": "3b061260f0d2afab2f1befc7e5e24f020f5c39be5ac286aa77dbcf0d379be69b",
+      "pin_salt": "02932be2be9a6a3aff5b7701ee5c22ab",
+      "updatedAt": 1794922861863,
+      "lastUpdated": "2026-11-17T13:41:01.863Z",
+      "password": "3b061260f0d2afab2f1befc7e5e24f020f5c39be5ac286aa77dbcf0d379be69b"
     },
     {
       "id": "011",
@@ -5223,7 +5923,17 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
       "branchAssignments": [
         {
@@ -5242,7 +5952,16 @@
         }
       ],
       "phone": "",
-      "branchName": "HQ"
+      "branchName": "HQ",
+      "pin_hash": "61d293cc58d95ad9fc4aa4795b3acf959020a1119e02c17ced779101583d2ea3",
+      "pin_salt": "d2c48535078a1572009fc4a6876224d7",
+      "updatedAt": 1794922861876,
+      "lastUpdated": "2026-11-17T13:41:01.876Z",
+      "password": "61d293cc58d95ad9fc4aa4795b3acf959020a1119e02c17ced779101583d2ea3",
+      "assignedBranchIds": [
+        "BR-MUFBCKZI",
+        "BR-2F0N-01"
+      ]
     },
     {
       "id": "USR-KFVQ-01",
@@ -5282,9 +6001,24 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchName": "Main Branch"
+      "branchName": "Main Branch",
+      "pin_hash": "eeaa4ebf917713ff99deec9cd1ec9712fe1b1dde74ab25a2b83bba3f1dced11e",
+      "pin_salt": "2d7a54c5cf2dd60d43d5293b95dd6f14",
+      "updatedAt": 1794922861886,
+      "lastUpdated": "2026-11-17T13:41:01.886Z",
+      "password": "eeaa4ebf917713ff99deec9cd1ec9712fe1b1dde74ab25a2b83bba3f1dced11e"
     },
     {
       "id": "USR-COMP-MUFLW4KL-001",
@@ -5324,8 +6058,23 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
-      }
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "049a1e8f5a0c3d849b14fb6280791e4262656590d1f4a11ae4b8a1488e835ad5",
+      "pin_salt": "6487cee48f06cab974bd69940d01a739",
+      "updatedAt": 1794922861896,
+      "lastUpdated": "2026-11-17T13:41:01.896Z",
+      "password": "049a1e8f5a0c3d849b14fb6280791e4262656590d1f4a11ae4b8a1488e835ad5"
     },
     {
       "id": "USR-OE1E-01",
@@ -5365,9 +6114,80 @@
         "canManageCompany": true,
         "canEditMasterPrice": true,
         "canEditExchangeRate": true,
-        "canSeeMargin": true
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
       },
-      "branchName": "Main Branch"
+      "branchName": "Main Branch",
+      "pin_hash": "194d81212bae857131c42e8b9f695f4fee4db6460a2fd864e7ab86c5a1e5f3e5",
+      "pin_salt": "054a202af4e26a20962356242a9dcf01",
+      "updatedAt": 1794922861907,
+      "lastUpdated": "2026-11-17T13:41:01.907Z",
+      "password": "194d81212bae857131c42e8b9f695f4fee4db6460a2fd864e7ab86c5a1e5f3e5"
+    },
+    {
+      "id": "USR-MASTER-001",
+      "name": "Andre Kudakwashe",
+      "role": "SUPER_ADMIN",
+      "email": "andrekudakwashe@gmail.com",
+      "active": "Y",
+      "companyId": "COMP-MASTER",
+      "company_id": "COMP-MASTER",
+      "branchId": "BR-MAIN",
+      "branch_id": "BR-MAIN",
+      "branchName": "Head Office",
+      "permissions": {
+        "canEditCartPrice": true,
+        "canApplyCartDiscount": true,
+        "canDeleteCartItem": true,
+        "canClearCart": true,
+        "canManageInventory": true,
+        "canEditPriceCost": true,
+        "canSellNegativeStock": true,
+        "canReceiveGRN": true,
+        "canBreakCases": true,
+        "canAccessReports": true,
+        "canManageExpenses": true,
+        "canPerformShiftEnd": true,
+        "canManageStaff": true,
+        "canCreateDirectGrv": true,
+        "canApproveDirectGrv": true,
+        "canUseCustomerChange": true,
+        "canIssueCustomerCredit": true,
+        "canSubmitEOD": true,
+        "canApproveEOD": true,
+        "canViewVarianceInvestigation": true,
+        "canViewAuditLog": true,
+        "canPinOverride": true,
+        "canManageCompany": true,
+        "canEditMasterPrice": true,
+        "canEditExchangeRate": true,
+        "canSeeMargin": true,
+        "canCreateCashTransferFloat": true,
+        "canCollectTillTransfer": true,
+        "canPaySupplierTransfer": true,
+        "canCreateBankDepositTransfer": true,
+        "canReceiveHqTransfer": true,
+        "canExecuteOwnerOverride": true,
+        "canAccessWhereIsMyMoney": true,
+        "canAccessDualCashCustody": true,
+        "canStocktake": true,
+        "canManageStocktake": true
+      },
+      "pin_hash": "1c6ff435d582761e1d881cae612f8a7854bcc6319c31136f0d1e85273b2b0b51",
+      "pin_salt": "0bca82023e550683ae58ad351fe7f4cc",
+      "updatedAt": 1794904573367,
+      "lastUpdated": "2026-11-17T08:36:13.367Z",
+      "password": "1c6ff435d582761e1d881cae612f8a7854bcc6319c31136f0d1e85273b2b0b51",
+      "phone": ""
     }
   ],
   "inventory": [],

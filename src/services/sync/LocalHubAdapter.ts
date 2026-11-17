@@ -36,6 +36,7 @@ const CONTROL_PACKET_TYPES = new Set([
   'PING',
   'HEARTBEAT',
   'PONG',
+  'SECURITY_ALERT',
 ]);
 
 export class LocalHubAdapter implements SyncAdapter {
@@ -140,7 +141,8 @@ export class LocalHubAdapter implements SyncAdapter {
               pType === 'RECON_BACKFILL_PAYLOAD' ||
               pType === 'RECON_PUSH_BACKFILL_REQUEST' ||
               pType === 'HUB_CLOUD_BROADCAST' ||
-              pType === 'SYNC_CLOUD_CONFIG_ACK'
+              pType === 'SYNC_CLOUD_CONFIG_ACK' ||
+              pType === 'SECURITY_ALERT'
             ) {
               this.onControlPacketCallback?.(pType, parsed);
               return;
@@ -517,6 +519,34 @@ export class LocalHubAdapter implements SyncAdapter {
     return removed;
   }
 
+  public removePendingPacketById(packetId?: string, entityId?: string): number {
+    if (!packetId && !entityId) return 0;
+    const cleanPktId = packetId ? String(packetId).trim() : '';
+    const cleanEntId = entityId ? String(entityId).trim().toUpperCase() : '';
+    const initialLen = this.pendingQueue.length;
+    this.pendingQueue = this.pendingQueue.filter((p) => {
+      const pId = String(p?.packet_id || p?.packetId || '').trim();
+      const eId = String(
+        p?.entityId ||
+          p?.sale?.id ||
+          p?.cashLog?.id ||
+          p?.payload?.id ||
+          p?.id ||
+          ''
+      )
+        .trim()
+        .toUpperCase();
+      if (cleanPktId && pId === cleanPktId) return false;
+      if (cleanEntId && eId === cleanEntId) return false;
+      return true;
+    });
+    const removed = initialLen - this.pendingQueue.length;
+    if (removed > 0) {
+      this.savePendingQueue();
+    }
+    return removed;
+  }
+
   public drainMatchedPendingPackets(hubBranchId: string): {
     flushedCount: number;
     pausedForeignCount: number;
@@ -558,7 +588,22 @@ export class LocalHubAdapter implements SyncAdapter {
     let flushedCount = 0;
     for (const queuedPacket of matchingPackets) {
       try {
-        this.ws.send(JSON.stringify(queuedPacket));
+        // Offline Exception: Mark genuine offline queued packets with isOfflineSync: true
+        // so the Hub accepts delayed transactions created while disconnected.
+        const offlinePacket = {
+          ...queuedPacket,
+          isOfflineSync: true,
+          ...(queuedPacket.sale && typeof queuedPacket.sale === 'object'
+            ? { sale: { ...queuedPacket.sale, isOfflineSync: true } }
+            : {}),
+          ...(queuedPacket.cashLog && typeof queuedPacket.cashLog === 'object'
+            ? { cashLog: { ...queuedPacket.cashLog, isOfflineSync: true } }
+            : {}),
+          ...(queuedPacket.payload && typeof queuedPacket.payload === 'object' && !Array.isArray(queuedPacket.payload)
+            ? { payload: { ...queuedPacket.payload, isOfflineSync: true } }
+            : {}),
+        };
+        this.ws.send(JSON.stringify(offlinePacket));
         flushedCount++;
       } catch {
         this.pendingQueue.push(queuedPacket);
@@ -643,6 +688,7 @@ export class LocalHubAdapter implements SyncAdapter {
       updatedAt: envelope.updatedAt,
       timestamp: envelope.updatedAt || Date.now(),
       isReconPush: Boolean(meta.isReconPush),
+      ...(meta.isOfflineSync || meta.isOfflineCatchup || d?.isOfflineSync ? { isOfflineSync: true } : {}),
       ...(isCloudSynced ? { isCloudSynced: true } : {}),
       ttl: 5,
     };
@@ -931,25 +977,63 @@ export class LocalHubAdapter implements SyncAdapter {
           branchId: d.branchId || ctx.branchId,
           sessionId: d.sessionId,
           isLocked: Boolean(d.isLocked),
+          lockedBy: d.lockedBy,
           lockedByName: d.lockedByName,
+          lockedAt: d.lockedAt,
           reason: d.reason,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+          lastUpdated: d.lastUpdated || new Date(d.updatedAt || envelope.updatedAt || Date.now()).toISOString(),
         };
 
       case 'stocktake_session':
         return {
           ...base,
+          ...d,
           type: 'STOCKTAKE_SESSION_STARTED',
           action: 'STOCKTAKE_SESSION_STARTED',
           sessionId: d.sessionId || envelope.entityId,
           sessionName: d.sessionName || d.title,
           title: d.sessionName || d.title,
+          date: d.date,
+          status: d.status,
           segments: d.segments || [],
-          startedBy: d.startedBy,
-          startedAt: d.startedAt,
+          consolidatedItems: d.consolidatedItems || [],
+          guestPasses: d.guestPasses,
+          startedBy: d.startedBy || d.createdByName || d.createdBy,
+          startedAt: d.startedAt || d.timestamp,
+          createdBy: d.createdBy || d.startedBy,
+          createdByName: d.createdByName || d.startedBy,
           countType: d.countType,
           branchId: d.branchId || ctx.branchId,
           branchName: d.branchName,
+          companyId: d.companyId || d.company_id || ctx.companyId,
+          company_id: d.company_id || d.companyId || ctx.companyId,
           isLockdownActive: d.isLockdownActive,
+          stocktakeAuditorId: d.stocktakeAuditorId,
+          stocktakeAuditorName: d.stocktakeAuditorName,
+          stocktakeAuditorPhone: d.stocktakeAuditorPhone,
+          predefinedDailyItemIds: d.predefinedDailyItemIds,
+          certifiedById: d.certifiedById,
+          certifiedByName: d.certifiedByName,
+          certifiedAt: d.certifiedAt,
+          approvedBy: d.approvedBy,
+          approvedByName: d.approvedByName,
+          approvedAt: d.approvedAt,
+          varianceReviewStatus: d.varianceReviewStatus,
+          varianceCommentDeadline: d.varianceCommentDeadline,
+          varianceMaterialityThreshold: d.varianceMaterialityThreshold,
+          varianceReviewedById: d.varianceReviewedById,
+          varianceReviewedByName: d.varianceReviewedByName,
+          varianceReviewedAt: d.varianceReviewedAt,
+          totalSystemUnits: d.totalSystemUnits,
+          totalCountedUnits: d.totalCountedUnits,
+          varianceUnits: d.varianceUnits,
+          varianceCostValue: d.varianceCostValue,
+          varianceRetailValue: d.varianceRetailValue,
+          version: d.version,
+          mutationSource: d.mutationSource,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+          lastUpdated: d.lastUpdated || new Date(d.updatedAt || envelope.updatedAt || Date.now()).toISOString(),
           notes: d.notes,
           deviceName: ctx.deviceName,
         };
@@ -1337,10 +1421,16 @@ export class LocalHubAdapter implements SyncAdapter {
       data = unwrapped;
       entityId = String(unwrapped.zoneId || '');
       action = 'APPEND';
-    } else if (pTypeUpper === 'STOCKTAKE_SESSION_STARTED') {
+    } else if (
+      pTypeUpper === 'STOCKTAKE_SESSION_STARTED' ||
+      pTypeUpper === 'STOCKTAKE_SESSION_SYNC' ||
+      pTypeUpper === 'STOCKTAKE_SESSION'
+    ) {
       entityType = 'stocktake_session';
-      data = unwrapped;
-      entityId = String(unwrapped.sessionId || unwrapped.session?.sessionId || '');
+      data = unwrapped.session && typeof unwrapped.session === 'object'
+        ? { ...unwrapped, ...unwrapped.session }
+        : unwrapped;
+      entityId = String(data.sessionId || unwrapped.sessionId || unwrapped.id || '');
     } else if (ENTITY_REGISTRY[pTypeLower]) {
       entityType = pTypeLower;
       entityId = String(unwrapped.entityId || unwrapped.id || data?.id || 'UNKNOWN');

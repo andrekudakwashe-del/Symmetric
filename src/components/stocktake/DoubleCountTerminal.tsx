@@ -44,6 +44,7 @@ import {
   authenticateCasualWorker,
   getTemporaryCasuals,
 } from '../../db/roomDatabase';
+import { resolveStocktakePersona } from '../../services/stocktakeAccessService';
 
 interface DoubleCountTerminalProps {
   session: StocktakeSession;
@@ -67,7 +68,11 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   onSaveCount,
   onBack,
 }) => {
-  const [counterSlot, setCounterSlot] = useState<'A' | 'B'>(initialCounterSlot);
+  const [counterSlot, setCounterSlot] = useState<'A' | 'B'>(() => {
+    if (currentUser?.assignedGroup === 'GROUP_1') return 'A';
+    if (currentUser?.assignedGroup === 'GROUP_2') return 'B';
+    return initialCounterSlot;
+  });
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
   const [onlyFastMovers, setOnlyFastMovers] = useState<boolean>(
@@ -81,11 +86,12 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   const [counterStaffId, setCounterStaffId] = useState<string>(
     currentUser?.id || (counterSlot === 'A' ? '002' : '003')
   );
-  const [counterPhone, setCounterPhone] = useState<string>('');
+  const [counterPhone, setCounterPhone] = useState<string>(currentUser?.phone || '');
   const [activeCasual, setActiveCasual] = useState<TemporaryCasualAccount | null>(null);
 
   // Casual PIN login modal
   const [showCasualPinModal, setShowCasualPinModal] = useState<boolean>(false);
+  const [selectedCasualId, setSelectedCasualId] = useState<string>('');
   const [casualPinInput, setCasualPinInput] = useState<string>('');
   const [casualPinError, setCasualPinError] = useState<string>('');
 
@@ -100,8 +106,16 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   // Collapsible top header (sticky search stays frozen at top; extra header section collapses to maximize screen)
   const [isHeaderExpanded, setIsHeaderExpanded] = useState<boolean>(true);
 
+  const persona = resolveStocktakePersona(currentUser, session);
+  const isBlindCounter = persona === 'COUNTER' || Boolean(currentUser?.isCasual || currentUser?.isVisitingCounter);
+  const isGroupLocked = isBlindCounter && Boolean(currentUser?.assignedGroup);
   const isDailyBlind = session.countType === 'DAILY_BLIND';
-  const isSpotCheck = session.countType === 'SPOT_CHECK';
+  const isSpotCheck = session.countType === 'SPOT_CHECK' && !isBlindCounter;
+
+  const sessionCasuals = useMemo(
+    () => getTemporaryCasuals(session.sessionId).filter((c) => c.active),
+    [session.sessionId, showCasualPinModal]
+  );
 
   // Helper to get local draft key
   const getDraftKey = (slot: 'A' | 'B') =>
@@ -135,11 +149,15 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     } catch (e) {}
   };
 
-  // Fast-moving checklist item IDs
+  // Fast-moving checklist item IDs (merged with session-predefined Daily Blind SKUs)
   const fastMovingItemIds = useMemo(() => {
     const list = getFastMovingChecklist();
-    return new Set(list.map((i) => i.itemId.toUpperCase()));
-  }, []);
+    const set = new Set(list.map((i) => i.itemId.toUpperCase()));
+    if (Array.isArray(session.predefinedDailyItemIds)) {
+      session.predefinedDailyItemIds.forEach((id) => set.add(String(id).toUpperCase()));
+    }
+    return set;
+  }, [session.predefinedDailyItemIds]);
 
   // Map of inventory item by ID for fast lookup
   const inventoryItemMap = useMemo(() => {
@@ -274,20 +292,22 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     return ['ALL', ...Array.from(set)];
   }, [inventoryList]);
 
-  // Casual PIN authentication handler
+  // Casual PIN authentication handler (supports targeted casualId to eliminate 4-digit PIN collisions)
   const handleCasualPinLogin = (e: React.FormEvent) => {
     e.preventDefault();
     setCasualPinError('');
-    const found = authenticateCasualWorker(casualPinInput);
+    const found = authenticateCasualWorker(casualPinInput, selectedCasualId || undefined);
     if (found) {
       setActiveCasual(found);
       setCounterStaffName(found.name);
       setCounterStaffId(found.id);
       setCounterPhone(found.phone);
+      if (found.assignedGroup === 'GROUP_1') handleSlotChange('A');
+      if (found.assignedGroup === 'GROUP_2') handleSlotChange('B');
       setShowCasualPinModal(false);
       setCasualPinInput('');
     } else {
-      setCasualPinError('Invalid 4-digit Casual PIN. Please verify with supervisor.');
+      setCasualPinError('Invalid 4-digit Casual PIN. Select your name and verify with supervisor.');
     }
   };
 
@@ -511,8 +531,9 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                 <div className="flex items-center gap-0.5 bg-slate-950 p-0.5 rounded-lg border border-slate-700">
                   <button
                     type="button"
+                    disabled={isGroupLocked && currentUser?.assignedGroup !== 'GROUP_1'}
                     onClick={() => handleSlotChange('A')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition ${
+                    className={`px-2.5 py-1 rounded text-xs font-bold transition disabled:opacity-40 disabled:cursor-not-allowed ${
                       counterSlot === 'A'
                         ? 'bg-blue-600 text-white shadow-xs'
                         : 'text-slate-400 hover:text-white'
@@ -522,8 +543,9 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                   </button>
                   <button
                     type="button"
+                    disabled={isGroupLocked && currentUser?.assignedGroup !== 'GROUP_2'}
                     onClick={() => handleSlotChange('B')}
-                    className={`px-2.5 py-1 rounded text-xs font-bold transition ${
+                    className={`px-2.5 py-1 rounded text-xs font-bold transition disabled:opacity-40 disabled:cursor-not-allowed ${
                       counterSlot === 'B'
                         ? 'bg-purple-600 text-white shadow-xs'
                         : 'text-slate-400 hover:text-white'
@@ -577,8 +599,8 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
               </div>
             </div>
 
-            {/* Mode alerts if applicable */}
-            {isDailyBlind && (
+            {/* Mode alerts if applicable (never leak live SOH to blind counters) */}
+            {isDailyBlind && !isBlindCounter && (
               <div className="max-w-7xl mx-auto bg-amber-950/30 border border-amber-800/40 px-3 py-1.5 rounded-lg text-xs text-amber-200 flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
@@ -587,6 +609,14 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                   </span>
                 </div>
                 <span className="text-[10px] font-mono text-amber-300">Armed</span>
+              </div>
+            )}
+            {isBlindCounter && (
+              <div className="max-w-7xl mx-auto bg-blue-950/40 border border-blue-800/50 px-3 py-1.5 rounded-lg text-xs text-blue-200 flex items-center gap-2">
+                <EyeOff className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                <span>
+                  <strong>True Blind Count Mode:</strong> System Stock-On-Hand and financial values are hidden for independent physical accuracy.
+                </span>
               </div>
             )}
             {isSpotCheck && (
@@ -680,8 +710,8 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                       </div>
                     )}
 
-                    {/* Daily Blind Active Freeze Timestamp & Variance */}
-                    {isDailyBlind && line.frozenTimestamp && (
+                    {/* Daily Blind Active Freeze Timestamp & Variance (hidden from Blind Counters) */}
+                    {isDailyBlind && !isBlindCounter && line.frozenTimestamp && (
                       <div className="mt-2 bg-amber-950/30 border border-amber-800/40 px-2.5 py-1.5 rounded-lg text-xs space-y-0.5">
                         <div className="flex items-center justify-between gap-2 text-[11px]">
                           <span className="text-amber-300 flex items-center gap-1">
@@ -914,13 +944,33 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
             </div>
 
             <form onSubmit={handleCasualPinLogin} className="space-y-3.5">
+              {sessionCasuals.length > 0 && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-300 mb-1">
+                    Select Casual Worker Profile *
+                  </label>
+                  <select
+                    value={selectedCasualId}
+                    onChange={(e) => setSelectedCasualId(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  >
+                    <option value="">-- Any Matching PIN --</option>
+                    {sessionCasuals.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name} ({c.badgeNumber || c.id}) • {c.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B'}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-semibold text-slate-300 mb-1">
                   Enter 4-Digit Security PIN *
                 </label>
                 <input
                   type="password"
-                  maxLength={4}
+                  maxLength={6}
                   autoFocus
                   required
                   value={casualPinInput}

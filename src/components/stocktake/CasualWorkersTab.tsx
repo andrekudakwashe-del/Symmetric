@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Users,
   Plus,
@@ -7,11 +7,11 @@ import {
   Shield,
   Trash2,
   CheckCircle,
-  Copy,
-  Clock,
-  Layers,
   Search,
-  BadgeAlert,
+  Share2,
+  Building2,
+  UserPlus,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -22,14 +22,22 @@ import {
   getTemporaryCasuals,
   addTemporaryCasual,
   deleteTemporaryCasual,
+  getBranches,
+  getSalespeople,
+  isStaffAssignedToBranch,
+  addStocktakeGuestPass,
+  revokeStocktakeGuestPass,
 } from '../../db/roomDatabase';
+import {
+  isStocktakeLeader,
+  isStocktakeAuditor,
+} from '../../services/stocktakeAccessService';
 import { meshSyncService } from '../../services/meshSyncService';
-import { Share2 } from 'lucide-react';
 
 interface CasualWorkersTabProps {
   session: StocktakeSession;
   currentUser: Salesperson | null;
-  onRefreshSession: () => void;
+  onRefreshSession: (updated?: StocktakeSession) => void;
 }
 
 export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
@@ -37,18 +45,59 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
   currentUser,
   onRefreshSession,
 }) => {
+  const canManage = isStocktakeLeader(currentUser) || isStocktakeAuditor(currentUser, session);
+
   const [casuals, setCasuals] = useState<TemporaryCasualAccount[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAddModal, setShowAddModal] = useState(false);
+  const [pendingDeleteCasualId, setPendingDeleteCasualId] = useState<string | null>(null);
+  const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
 
-  // Form State
+  // Casual Form State
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [pin, setPin] = useState(String(Math.floor(1000 + Math.random() * 9000)));
   const [badgeNumber, setBadgeNumber] = useState('');
   const [assignedSegmentId, setAssignedSegmentId] = useState('');
   const [assignedGroup, setAssignedGroup] = useState<'GROUP_1' | 'GROUP_2'>('GROUP_1');
-  const [copiedPinId, setCopiedPinId] = useState<string | null>(null);
+
+  // Cross-Branch Visiting Counter Guest Pass State (Phase 2)
+  const [showGuestModal, setShowGuestModal] = useState(false);
+  const allBranches = useMemo(() => getBranches(), []);
+  const allStaff = useMemo(
+    () => getSalespeople().filter((s) => s.active !== 'N'),
+    [showGuestModal]
+  );
+  const otherBranches = useMemo(
+    () =>
+      allBranches.filter(
+        (b) =>
+          String(b.branchId || b.id || '').trim().toUpperCase() !==
+          String(session.branchId || '').trim().toUpperCase()
+      ),
+    [allBranches, session.branchId]
+  );
+
+  const [guestHomeBranchId, setGuestHomeBranchId] = useState<string>(() => {
+    const firstOther = otherBranches[0];
+    return firstOther ? firstOther.branchId || firstOther.id : '';
+  });
+  const [guestStaffId, setGuestStaffId] = useState<string>('');
+  const [guestGroup, setGuestGroup] = useState<'GROUP_1' | 'GROUP_2'>('GROUP_1');
+  const [guestSegmentId, setGuestSegmentId] = useState<string>('');
+
+  const availableVisitingStaff = useMemo(() => {
+    if (guestHomeBranchId) {
+      const assigned = allStaff.filter((s) => isStaffAssignedToBranch(s, guestHomeBranchId));
+      if (assigned.length > 0) return assigned;
+    }
+    return allStaff;
+  }, [allStaff, guestHomeBranchId]);
+
+  const showNotice = (msg: string) => {
+    setFeedbackMessage(msg);
+    setTimeout(() => setFeedbackMessage(null), 4500);
+  };
 
   const loadData = () => {
     const list = getTemporaryCasuals(session.sessionId);
@@ -61,10 +110,12 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
 
   const handleCreateCasual = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canManage) return;
     if (!name.trim() || !phone.trim() || !pin.trim()) return;
 
     addTemporaryCasual({
       sessionId: session.sessionId,
+      branchId: session.branchId,
       name: name.trim(),
       phone: phone.trim(),
       pin: pin.trim(),
@@ -84,28 +135,68 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
     setAssignedSegmentId('');
     setPin(String(Math.floor(1000 + Math.random() * 9000)));
     onRefreshSession();
+    showNotice('Casual worker registered and synced to Local Hub.');
   };
 
-  const handleDelete = (id: string) => {
-    if (confirm('Delete this temporary casual worker account?')) {
-      deleteTemporaryCasual(id);
-      const updated = getTemporaryCasuals();
-      meshSyncService.broadcastCasualWorkers(updated);
-      loadData();
-      onRefreshSession();
-    }
+  const handleConfirmDeleteCasual = (id: string) => {
+    if (!canManage) return;
+    deleteTemporaryCasual(id);
+    const updated = getTemporaryCasuals();
+    meshSyncService.broadcastCasualWorkers(updated);
+    setPendingDeleteCasualId(null);
+    loadData();
+    onRefreshSession();
+    showNotice('Casual worker account removed.');
   };
 
   const handleSyncToHub = () => {
     const list = getTemporaryCasuals();
     meshSyncService.broadcastCasualWorkers(list);
-    alert(`Synced ${list.length} casual worker accounts to the Local Wi-Fi Hub! All tablets can now authenticate these PINs.`);
+    meshSyncService.broadcastStocktakeSession(session);
+    showNotice(
+      `Synced ${list.length} casual account(s) and ${(session.guestPasses || []).length} guest pass(es) to Local Wi-Fi Hub.`
+    );
   };
 
-  const handleCopyPin = (cPin: string, cId: string) => {
-    navigator.clipboard.writeText(cPin);
-    setCopiedPinId(cId);
-    setTimeout(() => setCopiedPinId(null), 2000);
+  const handleGrantGuestPass = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canManage || !guestStaffId) return;
+    const staffMember = allStaff.find((s) => s.id === guestStaffId);
+    if (!staffMember) return;
+    const homeBranch = allBranches.find(
+      (b) => (b.branchId || b.id) === guestHomeBranchId
+    );
+
+    const res = addStocktakeGuestPass(session.sessionId, {
+      staffId: staffMember.id,
+      staffName: staffMember.name,
+      staffRole: staffMember.role,
+      homeBranchId: guestHomeBranchId || staffMember.branchId || 'HQ',
+      homeBranchName: homeBranch?.name || guestHomeBranchId || 'Other Branch',
+      assignedGroup: guestGroup,
+      assignedSegmentIds: guestSegmentId ? [guestSegmentId] : undefined,
+      grantedById: currentUser?.id || 'AUD-LOCAL',
+      grantedByName: currentUser?.name || 'Stocktake Auditor',
+    });
+
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      onRefreshSession(res.session);
+      setShowGuestModal(false);
+      setGuestStaffId('');
+      setGuestSegmentId('');
+      showNotice(res.message);
+    }
+  };
+
+  const handleRevokeGuestPass = (passId: string) => {
+    if (!canManage) return;
+    const res = revokeStocktakeGuestPass(session.sessionId, passId);
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      onRefreshSession(res.session);
+      showNotice('Visiting counter guest pass revoked.');
+    }
   };
 
   const q = searchQuery.trim().toLowerCase();
@@ -118,6 +209,8 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
     );
   });
 
+  const guestPasses = session.guestPasses || [];
+
   return (
     <div className="space-y-6">
       {/* Banner */}
@@ -128,63 +221,179 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
           </div>
           <div>
             <h3 className="text-base font-bold text-white flex items-center gap-2">
-              Temporary Casual Staff & PIN Access Control
+              Temporary Casual Staff & Cross-Branch Visiting Team Passes
             </h3>
             <p className="text-xs text-slate-300 mt-1 max-w-3xl leading-relaxed">
-              Casual workers hired for stocktake are assigned 4-digit PINs to log into organizational counting terminals. Their real names and phone numbers are registered so if any discrepancy or audit question arises later, supervisors can identify exactly who counted that segment.
+              Manage 4-digit PIN casual counters and time-boxed Cross-Branch Visiting Stocktake Passes. All casual accounts and guest passes automatically deactivate when the Store Owner commits this stocktake.
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           <button
             type="button"
             onClick={handleSyncToHub}
             className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-600/40 rounded-xl text-xs font-bold shadow flex items-center gap-1.5 transition"
-            title="Broadcast casual worker PINs to all tablets via Local Hub"
+            title="Broadcast casual worker PINs and visiting passes to all tablets via Local Hub"
           >
             <Share2 className="w-4 h-4 text-amber-400" />
             Sync to Hub
           </button>
-          <button
-            type="button"
-            onClick={() => setShowAddModal(true)}
-            className="px-4 py-2.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/30 flex items-center gap-2 transition"
-          >
-            <Plus className="w-4 h-4" />
-            Register Casual Worker
-          </button>
+          {canManage && (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  const firstOther = otherBranches[0];
+                  setGuestHomeBranchId(firstOther ? firstOther.branchId || firstOther.id : '');
+                  setShowGuestModal(true);
+                }}
+                className="px-3.5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-indigo-900/30 flex items-center gap-1.5 transition"
+              >
+                <UserPlus className="w-4 h-4" />
+                Grant Visiting Pass
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowAddModal(true)}
+                className="px-4 py-2.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/30 flex items-center gap-2 transition"
+              >
+                <Plus className="w-4 h-4" />
+                Register Casual Worker
+              </button>
+            </>
+          )}
         </div>
       </div>
+
+      {feedbackMessage && (
+        <div className="bg-emerald-950/60 border border-emerald-700/70 rounded-xl p-3 text-xs text-emerald-200 font-semibold flex items-center gap-2">
+          <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span>{feedbackMessage}</span>
+        </div>
+      )}
 
       {/* KPI Stats */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div className="bg-slate-900/80 p-4 rounded-xl border border-slate-800">
           <div className="text-xs text-slate-400 font-medium">Active Casual Accounts</div>
-          <div className="text-2xl font-bold font-mono text-white mt-1">{casuals.length}</div>
-          <div className="text-[11px] text-slate-500 mt-0.5">Assigned to floor count terminals</div>
+          <div className="text-2xl font-bold font-mono text-white mt-1">
+            {casuals.filter((c) => c.active).length}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Local stocktake floor counters</div>
         </div>
 
         <div className="bg-slate-900/80 p-4 rounded-xl border border-slate-800">
-          <div className="text-xs text-slate-400 font-medium">Group 1 & 2 Distribution</div>
-          <div className="text-sm font-semibold text-slate-200 mt-1.5 flex items-center gap-2">
-            <span className="text-blue-400">
-              G1: {casuals.filter((c) => c.assignedGroup === 'GROUP_1').length}
-            </span>
-            <span>•</span>
-            <span className="text-purple-400">
-              G2: {casuals.filter((c) => c.assignedGroup === 'GROUP_2').length}
-            </span>
+          <div className="text-xs text-slate-400 font-medium">Cross-Branch Visiting Passes</div>
+          <div className="text-2xl font-bold font-mono text-indigo-400 mt-1">
+            {guestPasses.filter((g) => g.active).length}
           </div>
-          <div className="text-[11px] text-slate-500 mt-0.5">Paired blind counter allocation</div>
+          <div className="text-[11px] text-slate-500 mt-0.5">External branch staff on temporary pass</div>
         </div>
 
         <div className="bg-slate-900/80 p-4 rounded-xl border border-slate-800">
           <div className="text-xs text-slate-400 font-medium">Post-Audit Expiry</div>
           <div className="text-sm font-semibold text-emerald-400 mt-1.5 flex items-center gap-1.5">
-            <Shield className="w-4 h-4" /> Temporary Session Scope
+            <Shield className="w-4 h-4" /> Auto-Revoke on Commit
           </div>
-          <div className="text-[11px] text-slate-500 mt-0.5">Automatically archived after commit</div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Home branch rosters remain untouched</div>
+        </div>
+      </div>
+
+      {/* Cross-Branch Visiting Counter Passes Section */}
+      <div className="bg-slate-900/90 rounded-2xl border border-indigo-800/40 overflow-hidden shadow-lg">
+        <div className="px-5 py-3.5 bg-slate-950/70 border-b border-slate-800 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Building2 className="w-4 h-4 text-indigo-400" />
+            <h4 className="text-sm font-bold text-white">
+              Cross-Branch Visiting Stocktake Passes ({guestPasses.filter((g) => g.active).length} Active)
+            </h4>
+          </div>
+          <span className="text-[11px] text-slate-400">
+            Staff log in via "Visiting Stocktake Team" on Host Branch terminal using their normal 6-digit PIN
+          </span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-slate-950/50 border-b border-slate-800 text-slate-400 uppercase font-mono text-[11px]">
+              <tr>
+                <th className="py-2.5 px-4">Pass ID</th>
+                <th className="py-2.5 px-4">Visiting Staff</th>
+                <th className="py-2.5 px-4">Home Branch</th>
+                <th className="py-2.5 px-4">Count Team & Scope</th>
+                <th className="py-2.5 px-4">Status</th>
+                <th className="py-2.5 px-4 text-right">Action</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800/60 text-slate-200">
+              {guestPasses.map((gp) => {
+                const segNames = (gp.assignedSegmentIds || [])
+                  .map((id) => session.segments.find((s) => s.segmentId === id)?.name || id)
+                  .join(', ');
+                return (
+                  <tr key={gp.id} className="hover:bg-slate-800/40 transition">
+                    <td className="py-2.5 px-4 font-mono font-bold text-indigo-400">{gp.id}</td>
+                    <td className="py-2.5 px-4">
+                      <div className="font-semibold text-white">{gp.staffName}</div>
+                      <div className="text-[10px] text-slate-400">{gp.staffRole || 'STAFF'} • ID #{gp.staffId}</div>
+                    </td>
+                    <td className="py-2.5 px-4 text-slate-300">
+                      {gp.homeBranchName || gp.homeBranchId}
+                    </td>
+                    <td className="py-2.5 px-4">
+                      <span
+                        className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                          gp.assignedGroup === 'GROUP_2'
+                            ? 'bg-purple-950 text-purple-300 border-purple-800'
+                            : 'bg-blue-950 text-blue-300 border-blue-800'
+                        }`}
+                      >
+                        {gp.assignedGroup === 'GROUP_2' ? 'Group 2 (Team B)' : 'Group 1 (Team A)'}
+                      </span>
+                      <span className="ml-2 text-[11px] text-slate-400">
+                        {segNames || 'All Segments (Blind)'}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-4">
+                      {gp.active ? (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-300 border border-emerald-800">
+                          ACTIVE PASS
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
+                          REVOKED
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-4 text-right">
+                      {canManage && gp.active && (
+                        <button
+                          type="button"
+                          onClick={() => handleRevokeGuestPass(gp.id)}
+                          className="px-2.5 py-1 rounded-lg bg-rose-950/60 hover:bg-rose-900 text-rose-300 border border-rose-800 text-[11px] font-semibold transition"
+                        >
+                          Revoke
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+
+              {guestPasses.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="py-8 text-center text-slate-500">
+                    <Building2 className="w-8 h-8 mx-auto mb-1.5 opacity-40" />
+                    <p className="font-semibold text-slate-400">No cross-branch visiting passes issued</p>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      Grant a Visiting Pass when permanent staff from other branches assist with this lockdown stocktake.
+                    </p>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -196,7 +405,7 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search casual by name, phone, PIN, badge..."
+            placeholder="Search casual by name, phone, badge..."
             className="w-full pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-amber-500"
           />
         </div>
@@ -224,7 +433,14 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                 return (
                   <tr key={`${c.id}-${cIdx}`} className="hover:bg-slate-800/40 transition">
                     <td className="py-3 px-4 font-mono font-bold text-amber-400">{c.id}</td>
-                    <td className="py-3 px-4 font-semibold text-white">{c.name}</td>
+                    <td className="py-3 px-4 font-semibold text-white">
+                      {c.name}
+                      {!c.active && (
+                        <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
+                          EXPIRED
+                        </span>
+                      )}
+                    </td>
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-1.5 font-mono text-slate-300">
                         <Phone className="w-3.5 h-3.5 text-slate-400" />
@@ -260,14 +476,34 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                       </div>
                     </td>
                     <td className="py-3 px-4 text-right">
-                      <button
-                        type="button"
-                        onClick={() => handleDelete(c.id)}
-                        className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-slate-800 rounded transition"
-                        title="Delete casual account"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      {canManage &&
+                        (pendingDeleteCasualId === c.id ? (
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleConfirmDeleteCasual(c.id)}
+                              className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded text-[10px] font-bold"
+                            >
+                              Confirm
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setPendingDeleteCasualId(null)}
+                              className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[10px]"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setPendingDeleteCasualId(c.id)}
+                            className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-slate-800 rounded transition"
+                            title="Delete casual account"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        ))}
                     </td>
                   </tr>
                 );
@@ -417,6 +653,128 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                   className="px-5 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold shadow-lg"
                 >
                   Create & Issue PIN
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Grant Cross-Branch Visiting Counter Guest Pass Modal */}
+      {showGuestModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-slate-900 border border-indigo-700/70 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-lg bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
+                  <UserPlus className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">Grant Visiting Stocktake Pass</h3>
+                  <p className="text-xs text-slate-400">
+                    Temporary blind-counter access on {session.branchName || session.branchId}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowGuestModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleGrantGuestPass} className="space-y-3.5 text-xs">
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1">Staff Member Home Branch</label>
+                <select
+                  value={guestHomeBranchId}
+                  onChange={(e) => {
+                    setGuestHomeBranchId(e.target.value);
+                    setGuestStaffId('');
+                  }}
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                >
+                  <option value="">-- All Branches --</option>
+                  {allBranches.map((b) => {
+                    const bid = b.branchId || b.id;
+                    return (
+                      <option key={bid} value={bid}>
+                        {b.name || b.code} ({bid})
+                      </option>
+                    );
+                  })}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1">Select Visiting Staff Member *</label>
+                <select
+                  required
+                  value={guestStaffId}
+                  onChange={(e) => setGuestStaffId(e.target.value)}
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                >
+                  <option value="">-- Choose Staff Member --</option>
+                  {availableVisitingStaff.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.role} • #{s.id})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">Assigned Count Group</label>
+                  <select
+                    value={guestGroup}
+                    onChange={(e) => setGuestGroup(e.target.value as any)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  >
+                    <option value="GROUP_1">Group 1 (Team A)</option>
+                    <option value="GROUP_2">Group 2 (Team B)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">Assigned Segment</label>
+                  <select
+                    value={guestSegmentId}
+                    onChange={(e) => setGuestSegmentId(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  >
+                    <option value="">-- Floating / All --</option>
+                    {session.segments.map((s) => (
+                      <option key={s.segmentId} value={s.segmentId}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="bg-indigo-950/40 border border-indigo-800/60 rounded-xl p-3 text-[11px] text-indigo-200 flex items-start gap-2">
+                <ShieldAlert className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
+                <span>
+                  Pass grants Blind Counter access to this session only and expires automatically on committal without altering their home branch roster.
+                </span>
+              </div>
+
+              <div className="pt-3 border-t border-slate-800 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowGuestModal(false)}
+                  className="px-3.5 py-2 rounded-lg text-slate-300 hover:bg-slate-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold shadow-lg"
+                >
+                  Issue Visiting Pass
                 </button>
               </div>
             </form>

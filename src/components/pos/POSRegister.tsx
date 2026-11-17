@@ -68,7 +68,9 @@ import {
   RefreshCw,
   Clock,
   Settings,
+  ShieldAlert,
 } from 'lucide-react';
+import { useClockSecurity, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
 import { POSHomeView } from './POSHomeView';
 import { POSItemsView } from './POSItemsView';
 import { POSCounterView } from './POSCounterView';
@@ -95,6 +97,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
   activeGlobalTab,
   onLogout,
 }) => {
+  const clockSecurity = useClockSecurity();
   // Recover till cart draft immediately from multi-tier storage
   const initialDraft = useMemo(() => loadPOSCartDraft(), []);
 
@@ -886,6 +889,36 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
 
   return (
     <div className="relative">
+      {/* Clock Tampering Defense Security Lock Banner */}
+      {clockSecurity.isClockTampered && (
+        <div
+          role="alert"
+          className="mb-3 rounded-2xl bg-red-600 border-2 border-red-400 text-white px-4 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shadow-xl z-40 animate-fadeIn"
+        >
+          <div className="flex items-start sm:items-center gap-2.5">
+            <ShieldAlert className="w-5 h-5 text-white shrink-0 animate-pulse mt-0.5 sm:mt-0" />
+            <div>
+              <div className="font-black text-xs sm:text-sm tracking-tight">
+                Security Lock: Please enable Automatic Date &amp; Time in your phone settings to process refunds.
+              </div>
+              {clockSecurity.reason && (
+                <div className="text-[11px] text-red-100 font-medium mt-0.5">
+                  {clockSecurity.reason} (Normal POS sales remain enabled; refunds, voids &amp; backdating are locked.)
+                </div>
+              )}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => isDeviceTimeAutomatic()}
+            className="px-3 py-1.5 rounded-xl bg-white text-red-700 hover:bg-red-50 font-black text-[11px] shrink-0 self-start sm:self-center shadow-sm transition active:scale-95 flex items-center gap-1.5"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Re-check Clock</span>
+          </button>
+        </div>
+      )}
+
       {/* Branch Full Stocktake Lockdown Alert Banner */}
       {isLockedDown && (
         <div className="bg-rose-950/95 border-b border-rose-800 text-rose-200 px-4 py-2 text-xs flex items-center justify-between gap-3 shadow-lg z-30">

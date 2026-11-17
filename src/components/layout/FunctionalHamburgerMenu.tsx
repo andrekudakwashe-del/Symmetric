@@ -33,7 +33,7 @@ import {
   Crown,
   Layers,
 } from 'lucide-react';
-import { getCurrentCompany, getCurrentBranchId, getBranches } from '../../db/roomDatabase';
+import { getCurrentCompany, getCurrentBranchId, getBranches, isBranchInLockdown } from '../../db/roomDatabase';
 import { prefetchAppModules } from '../../services/modulePrefetcher';
 
 interface FunctionalHamburgerMenuProps {
@@ -234,16 +234,34 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
             </button>
           </div>
 
-          {/* Quick Notice of Role Filter */}
-          <div className="bg-black/30 rounded-xl px-3 py-1.5 text-[11px] text-white/90 flex items-center justify-between border border-white/15">
-            <span className="flex items-center gap-1.5 font-medium">
-              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
-              <span>Menu arranged for <strong>{roleDef.roleName}</strong></span>
-            </span>
-            <span className="text-[10px] text-amber-200 font-bold bg-amber-500/20 px-2 py-0.5 rounded-md">
-              {roleDef.primaryModules.length} Primary Functions
-            </span>
-          </div>
+          {/* Quick Notice of Role Filter / Stocktake Lockdown */}
+          {(currentUser?.isCasual || currentUser?.isVisitingCounter || isBranchInLockdown(currentUser?.branchId || currentUser?.branch_id || getCurrentBranchId())) ? (
+            <div className="bg-rose-950/60 rounded-xl px-3 py-1.5 text-[11px] text-rose-100 flex items-center justify-between border border-rose-400/40">
+              <span className="flex items-center gap-1.5 font-bold">
+                <Lock className="w-3.5 h-3.5 text-rose-300 shrink-0" />
+                <span>
+                  {currentUser?.isCasual
+                    ? 'Casual Counter Session (Stocktake Only)'
+                    : currentUser?.isVisitingCounter
+                    ? `Visiting Counter from ${currentUser.homeBranchName || currentUser.homeBranchId}`
+                    : 'Branch Lockdown Mode Active'}
+                </span>
+              </span>
+              <span className="text-[10px] text-rose-200 font-bold bg-rose-500/30 px-2 py-0.5 rounded-md">
+                {currentUser?.assignedGroup === 'GROUP_1' ? 'Team A' : currentUser?.assignedGroup === 'GROUP_2' ? 'Team B' : 'Restricted'}
+              </span>
+            </div>
+          ) : (
+            <div className="bg-black/30 rounded-xl px-3 py-1.5 text-[11px] text-white/90 flex items-center justify-between border border-white/15">
+              <span className="flex items-center gap-1.5 font-medium">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
+                <span>Menu arranged for <strong>{roleDef.roleName}</strong></span>
+              </span>
+              <span className="text-[10px] text-amber-200 font-bold bg-amber-500/20 px-2 py-0.5 rounded-md">
+                {roleDef.primaryModules.length} Primary Functions
+              </span>
+            </div>
+          )}
 
           {/* Search Bar */}
           <div className="mt-3 relative">
@@ -312,7 +330,7 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
           )}
 
           {/* THERMAL PRINTER HARDWARE SETUP & PAIRING */}
-          {onOpenPrinterModal && (
+          {onOpenPrinterModal && !currentUser?.isCasual && !currentUser?.isVisitingCounter && (
             <div className="bg-slate-950/70 border border-slate-800 rounded-2xl p-3 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-2.5">
                 <div className="w-8 h-8 rounded-xl bg-indigo-500/20 text-indigo-400 flex items-center justify-center shrink-0">

@@ -104,6 +104,13 @@ export interface Salesperson {
   pin?: string;          // Deprecated: stripped on boot migration
   pin_hash?: string;     // One-way SHA-256 hash (salt:pin)
   pin_salt?: string;     // Cryptographic salt
+  pinVersion?: number;   // Monotonic counter incremented only on explicit PIN change
+  pinUpdatedAt?: number; // Timestamp of last explicit PIN change
+  version?: number;      // Monotonic logical version (0 = seed, >= 1 = user edits)
+  mutationSource?: 'SEED' | 'USER_EDIT' | 'MIGRATION';
+  updatedAt?: number;
+  lastUpdated?: string;
+  isDirty?: boolean;
   companyId?: string;
   company_id?: string;
   branchId?: string;
@@ -114,6 +121,17 @@ export interface Salesperson {
   active?: 'Y' | 'N';
   permissions?: StaffPermissions;
   branchAssignments?: StaffBranchAssignment[];
+  // Runtime Stocktake Session Isolation Flags (T3 session-local)
+  isCasual?: boolean;
+  isVisitingCounter?: boolean;
+  restrictedToSessionId?: string;
+  guestPassId?: string;
+  homeBranchId?: string;
+  homeBranchName?: string;
+  assignedGroup?: 'GROUP_1' | 'GROUP_2';
+  assignedSegmentId?: string;
+  assignedSegmentIds?: string[];
+  badgeNumber?: string;
   [key: string]: any;
 }
 export type SavedReportTemplate = any;
@@ -158,19 +176,186 @@ export interface StaffPermissions {
   canAccessWhereIsMyMoney?: boolean;         // Explicit access to Where Is My Money report
   canAccessDualCashCustody?: boolean;        // Explicit access to Dual Cash Custody / Safe
 
+  // Stocktake Accessibility & Governance Permissions
+  canAuditStocktake?: boolean;               // Can supervise & certify stocktakes without necessarily owning committal
+  canPerformDailyBlindCount?: boolean;       // Can run Daily Blind Counts (Fast Movers) without full admin access
+
   [key: string]: any;
 }
 export type StockBatch = any;
 export type StockMovementEntry = any;
 export type StockPromptResponse = any;
 export type StockTxnType = any;
-export type StocktakeConsolidatedItem = any;
-export type StocktakeCountType = any;
+
+export type StocktakeCountType =
+  | 'DAILY_BLIND'
+  | 'SPOT_CHECK'
+  | 'WEEKLY_STRATEGIC'
+  | 'FULL_LOCKDOWN'
+  | string;
+
+export type StocktakeStatus =
+  | 'DRAFT'
+  | 'SCHEDULED'
+  | 'IN_PROGRESS'
+  | 'COUNTING'
+  | 'RECOUNTING'
+  | 'AUDIT_REVIEW'
+  | 'CONSOLIDATED'
+  | 'READY_FOR_COMMITTAL'
+  | 'APPROVED_POSTED'
+  | 'CANCELLED'
+  | string;
+
+export type StocktakeVarianceReasonCode =
+  | 'THEFT_SHRINKAGE'
+  | 'DAMAGED_EXPIRED'
+  | 'GRN_RECEIVING_ERROR'
+  | 'CASHIER_SKU_SWAP'
+  | 'UNRECORDED_SHOP_USE'
+  | 'PREVIOUS_COUNT_ERROR'
+  | 'SUPPLIER_SHORT_DELIVERY'
+  | 'OTHER'
+  | string;
+
+export type StocktakeVarianceReviewStatus =
+  | 'NOT_REQUIRED'
+  | 'PENDING_MANAGER_COMMENTS'
+  | 'COMMENTS_SUBMITTED'
+  | 'CLOSED';
+
+export interface StocktakeGuestPass {
+  id: string;
+  sessionId: string;
+  staffId: string;
+  staffName: string;
+  staffRole?: string;
+  homeBranchId: string;
+  homeBranchName?: string;
+  hostBranchId: string;
+  hostBranchName?: string;
+  assignedGroup?: 'GROUP_1' | 'GROUP_2';
+  assignedSegmentIds?: string[];
+  grantedById: string;
+  grantedByName: string;
+  createdAt: string;
+  updatedAt?: number;
+  active: boolean;
+  revokedAt?: string;
+}
+
+export interface StocktakeConsolidatedItem {
+  itemId: string;
+  itemName: string;
+  category?: string;
+  sku?: string;
+  barcode?: string;
+  unitsPerCase: number;
+  costPerUnit: number;
+  costPerCase?: number;
+  sellPriceUnit: number;
+  sellPriceCase?: number;
+  systemCases: number;
+  systemSingles: number;
+  systemTotalUnits: number;
+  systemCostValue?: number;
+  systemRetailValue?: number;
+  countedCases: number;
+  countedSingles: number;
+  countedTotalUnits: number;
+  countedCostValue?: number;
+  countedRetailValue?: number;
+  customerHeldStockUnits?: number;
+  emergencySoldUnits?: number;
+  adjustedPhysicalUnits?: number;
+  trueVarianceUnits?: number;
+  varianceCases: number;
+  varianceSingles: number;
+  varianceTotalUnits: number;
+  varianceCostValue: number;
+  varianceRetailValue: number;
+  status: 'MATCH' | 'SHORTAGE' | 'OVERAGE' | 'RECOUNT_FLAGGED' | string;
+  wasCountedInSession?: boolean;
+  recountRequested?: boolean;
+  recountNotes?: string;
+  recountCases?: number;
+  recountSingles?: number;
+  recountTotalUnits?: number;
+  recountedBy?: string;
+  recountedAt?: string;
+  segmentBreakdown?: {
+    segmentId: string;
+    segmentName: string;
+    cases: number;
+    singles: number;
+    totalUnits: number;
+  }[];
+  // Post-Commit Manager Variance Commentary
+  reasonCode?: StocktakeVarianceReasonCode;
+  managerComment?: string;
+  actionTaken?: string;
+  commentedById?: string;
+  commentedByName?: string;
+  commentedAt?: string;
+  ownerAckStatus?: 'PENDING' | 'ACKNOWLEDGED' | 'DISPUTED';
+  requiresExplanation?: boolean;
+  [key: string]: any;
+}
+
 export type StocktakeLineCount = any;
 export type StocktakeSegment = any;
-export type StocktakeSession = any;
-export type StocktakeStatus = any;
 export type StocktakeVerifiedLine = any;
+
+export interface StocktakeSession {
+  sessionId: string;
+  title: string;
+  date: string;
+  countType: StocktakeCountType;
+  status: StocktakeStatus;
+  branchId: string;
+  branchName: string;
+  isLockdownActive?: boolean;
+  stocktakeAuditorId?: string;
+  stocktakeAuditorName?: string;
+  stocktakeAuditorPhone?: string;
+  predefinedDailyItemIds?: string[];
+  createdBy: string;
+  createdByName: string;
+  segments: StocktakeSegment[];
+  consolidatedItems: StocktakeConsolidatedItem[];
+  totalSystemUnits: number;
+  totalCountedUnits: number;
+  varianceUnits: number;
+  varianceCostValue: number;
+  varianceRetailValue: number;
+  notes?: string;
+  timestamp: string;
+  synced?: boolean;
+  companyId?: string;
+  company_id?: string;
+  // Auditor Certification vs Owner/Leader Committal
+  certifiedById?: string;
+  certifiedByName?: string;
+  certifiedAt?: string;
+  approvedBy?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  // Cross-Branch Visiting Counter Guest Passes
+  guestPasses?: StocktakeGuestPass[];
+  // Post-Commit Mandatory Manager Variance Review
+  varianceReviewStatus?: StocktakeVarianceReviewStatus;
+  varianceCommentDeadline?: string;
+  varianceMaterialityThreshold?: number;
+  varianceReviewedById?: string;
+  varianceReviewedByName?: string;
+  varianceReviewedAt?: string;
+  // SyncCore L3/L6 versioning metadata
+  version?: number;
+  mutationSource?: 'SEED' | 'USER_EDIT' | 'MIGRATION';
+  updatedAt?: number;
+  lastUpdated?: string;
+  [key: string]: any;
+}
 
 export interface StocktakeZoneAssignment {
   zoneId: string;
@@ -265,8 +450,15 @@ export interface TemporaryCasualAccount {
   branchId: string;
   phone?: string;
   idNumber?: string;
+  badgeNumber?: string;
+  assignedSegmentId?: string;
+  assignedGroup?: 'GROUP_1' | 'GROUP_2';
   active: boolean;
   createdAt: string;
+  updatedAt?: number;
+  lastUpdated?: string;
+  version?: number;
+  mutationSource?: 'SEED' | 'USER_EDIT' | 'MIGRATION';
   [key: string]: any;
 }
 export type TripGrnAllocationSummary = any;
@@ -542,5 +734,11 @@ export interface CashGovernanceConfig {
   defaultSupplierApprovalThreshold: number; // e.g. $50.00
   bankList: string[];                // Configured banks
   autoIssueOpeningFloatOnShiftStart?: boolean; // If false, operator/clerk must confirm float before issuance
+}
+
+export interface SaleSecurityMetadata {
+  server_received_at?: string;
+  suspicious_backdate?: boolean;
+  isOfflineSync?: boolean;
 }
 

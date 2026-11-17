@@ -4,8 +4,10 @@ import {
   getSales,
   getProducts,
   getInventoryItems,
+  getTodayDateString,
   subscribeToDatabase,
 } from '../../db/roomDatabase';
+import { isSameDaySafe } from '../../utils/dateUtils';
 import { useScrollDirection } from '../../hooks/useScrollDirection';
 import { resolveItemCost } from '../../utils/costResolver';
 import {
@@ -96,7 +98,7 @@ export const SalesReport: React.FC<SalesReportProps> = ({
   const [sortBy, setSortBy] = useState<'revenue' | 'profit_avg' | 'profit_latest' | 'quantity' | 'margin_avg'>('profit_avg');
 
   // Custom date selection state
-  const todayStr = useMemo(() => new Date().toISOString().split('T')[0], []);
+  const todayStr = useMemo(() => getTodayDateString(), []);
   const [activeDateCursor, setActiveDateCursor] = useState<string>(todayStr);
   const [customStartDate, setCustomStartDate] = useState<string>(todayStr);
   const [customEndDate, setCustomEndDate] = useState<string>(todayStr);
@@ -122,13 +124,13 @@ export const SalesReport: React.FC<SalesReportProps> = ({
     const tomorrowStart = todayStart + 86400000;
 
     return sales.filter((s) => {
-      if (s.status === 'Refunded') return false;
+      if (s.status === 'Refunded' || s.status === 'Voided' || (s as any).isDeleted) return false;
       const saleDateStr = s.date || (s.timestamp ? new Date(s.timestamp).toISOString().split('T')[0] : '');
       const saleTime = new Date(s.timestamp || (s.date + 'T12:00:00')).getTime();
 
       switch (dateFilter) {
         case 'today':
-          return saleDateStr === todayStr || (saleTime >= todayStart && saleTime < tomorrowStart);
+          return isSameDaySafe(s.date, s.timestamp, todayStr) || (saleTime >= todayStart && saleTime < tomorrowStart);
 
         case 'yesterday': {
           const yDate = new Date();

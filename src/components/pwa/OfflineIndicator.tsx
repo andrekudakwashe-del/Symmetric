@@ -6,11 +6,13 @@ import { LocalHubSettingsModal } from '../sync/LocalHubSettingsModal';
 interface OfflineIndicatorProps {
   isSimulatedOffline?: boolean;
   onOpenHubSettings?: () => void;
+  dockPosition?: 'top' | 'bottom';
 }
 
 export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
   isSimulatedOffline,
   onOpenHubSettings,
+  dockPosition = 'bottom',
 }) => {
   const [isBrowserOnline, setIsBrowserOnline] = useState(
     typeof navigator !== 'undefined' ? navigator.onLine : true
@@ -116,7 +118,11 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
         <aside
           id="pwa-offline-banner"
           aria-label="Offline Mode: Reconnecting in background"
-          className="fixed bottom-4 left-4 right-4 sm:right-auto sm:max-w-md z-50 flex items-center justify-between gap-3 rounded-2xl bg-slate-900/95 text-white px-4 py-3 text-xs font-bold shadow-2xl backdrop-blur-md border border-amber-500/40 transition-all duration-300 animate-in fade-in slide-in-from-bottom-2"
+          className={`fixed ${
+            dockPosition === 'top'
+              ? 'top-3 left-3 right-3 sm:left-auto sm:right-4 sm:max-w-md slide-in-from-top-2'
+              : 'bottom-4 left-4 right-4 sm:right-auto sm:max-w-md slide-in-from-bottom-2'
+          } z-50 flex items-center justify-between gap-3 rounded-2xl bg-slate-900/95 text-white px-4 py-3 text-xs font-bold shadow-2xl backdrop-blur-md border border-amber-500/40 transition-all duration-300 animate-in fade-in`}
         >
           <div className="flex items-center space-x-2.5 min-w-0">
             <div className="w-7 h-7 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center shrink-0">
@@ -166,7 +172,11 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
         <aside
           id="pwa-offline-banner"
           aria-label="Local WebSocket Hub status"
-          className="fixed bottom-4 left-4 right-4 sm:right-auto sm:max-w-md z-50 flex items-center justify-between gap-3 rounded-2xl bg-blue-600/95 text-white px-4 py-2.5 text-xs font-bold shadow-2xl backdrop-blur-md border border-blue-400/60 transition-all animate-in fade-in slide-in-from-bottom-2"
+          className={`fixed ${
+            dockPosition === 'top'
+              ? 'top-3 left-3 right-3 sm:left-auto sm:right-4 sm:max-w-md slide-in-from-top-2'
+              : 'bottom-4 left-4 right-4 sm:right-auto sm:max-w-md slide-in-from-bottom-2'
+          } z-50 flex items-center justify-between gap-3 rounded-2xl bg-blue-600/95 text-white px-4 py-2.5 text-xs font-bold shadow-2xl backdrop-blur-md border border-blue-400/60 transition-all animate-in fade-in`}
         >
           <div className="flex items-center space-x-2.5 min-w-0">
             <div className="w-6 h-6 rounded-full bg-black/25 flex items-center justify-center shrink-0">

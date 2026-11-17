@@ -26,6 +26,7 @@ import {
   Share2,
   Shield,
   Eye,
+  MessageSquare,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -41,6 +42,7 @@ import {
   consolidateStocktakeSession,
   requestSkuVarianceRecount,
   submitSkuVarianceRecount,
+  certifyStocktakeReady,
   approveAndCommitStocktake,
   getStocktakeSessionById,
   getAllStocktakeSessions,
@@ -54,6 +56,12 @@ import {
   recordBlindSubmissionLocal,
   getZoneAssignments,
 } from '../../db/roomDatabase';
+import {
+  resolveStocktakePersona,
+  sanitizeSessionForCounter,
+  isStocktakeLeader,
+  isStocktakeAuditor,
+} from '../../services/stocktakeAccessService';
 import { meshSyncService } from '../../services/meshSyncService';
 import { DoubleCountTerminal } from './DoubleCountTerminal';
 import { SegmentRecountModal } from './SegmentRecountModal';
@@ -65,6 +73,7 @@ import { CasualWorkersTab } from './CasualWorkersTab';
 import { FastMovingChecklistTab } from './FastMovingChecklistTab';
 import { LockdownEmergencySalesTab } from './LockdownEmergencySalesTab';
 import { P2PMeshSyncTab } from './P2PMeshSyncTab';
+import { VarianceCommentaryTab } from './VarianceCommentaryTab';
 
 interface StocktakeSessionDetailScreenProps {
   session: StocktakeSession;
@@ -81,6 +90,7 @@ export type DetailTab =
   | 'FAST_MOVERS'
   | 'LOCKDOWN'
   | 'P2P_SYNC'
+  | 'VARIANCE_COMMENTS'
   | 'AUDIT_CERT';
 
 export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreenProps> = ({
@@ -90,7 +100,60 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   onUpdateSession,
 }) => {
   const [session, setSession] = useState<StocktakeSession>(initialSession);
-  const [activeTab, setActiveTab] = useState<DetailTab>('SEGMENTS');
+  const persona = resolveStocktakePersona(currentUser, session);
+  const isApproved = session.status === 'APPROVED_POSTED';
+  const isBlindCounter = persona === 'COUNTER';
+  const canManageStructure = persona === 'LEADER' || persona === 'AUDITOR';
+
+  const allowedTabs: DetailTab[] = (() => {
+    if (persona === 'COUNTER') {
+      return session.countType === 'DAILY_BLIND'
+        ? ['SEGMENTS', 'FAST_MOVERS']
+        : ['SEGMENTS'];
+    }
+    if (persona === 'AUDITED_MANAGER') {
+      const base: DetailTab[] = ['SEGMENTS', 'GOODS_LEFT_BEHIND', 'FAST_MOVERS', 'LOCKDOWN'];
+      if (isApproved) {
+        base.push('VARIANCE_COMMENTS', 'AUDIT_CERT');
+      }
+      return base;
+    }
+    const full: DetailTab[] = [
+      'SEGMENTS',
+      'VARIANCE',
+      'GOODS_LEFT_BEHIND',
+      'CASUALS',
+      'FAST_MOVERS',
+      'LOCKDOWN',
+      'P2P_SYNC',
+    ];
+    if (isApproved) {
+      full.push('VARIANCE_COMMENTS', 'AUDIT_CERT');
+    }
+    return full;
+  })();
+
+  const [activeTab, setActiveTab] = useState<DetailTab>(() => {
+    if (persona === 'COUNTER') return 'SEGMENTS';
+    if (
+      persona === 'AUDITED_MANAGER' &&
+      isApproved &&
+      session.varianceReviewStatus === 'PENDING_MANAGER_COMMENTS'
+    ) {
+      return 'VARIANCE_COMMENTS';
+    }
+    if (persona === 'LEADER' && session.status === 'READY_FOR_COMMITTAL') {
+      return 'VARIANCE';
+    }
+    return 'SEGMENTS';
+  });
+
+  // Ensure activeTab remains legal whenever persona or status changes
+  useEffect(() => {
+    if (!allowedTabs.includes(activeTab)) {
+      setActiveTab(allowedTabs[0] || 'SEGMENTS');
+    }
+  }, [persona, isApproved, session.countType]);
 
   // Terminal state
   const [activeTerminalSegment, setActiveTerminalSegment] = useState<StocktakeSegment | null>(null);
@@ -102,8 +165,9 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   // Admin Approval Modal
   const [showApprovalModal, setShowApprovalModal] = useState(false);
 
-  // New segment form state
+  // New segment form state & inline delete confirmation
   const [showAddSegmentModal, setShowAddSegmentModal] = useState(false);
+  const [pendingDeleteSegmentId, setPendingDeleteSegmentId] = useState<string | null>(null);
   const [newSegmentName, setNewSegmentName] = useState('');
   const [newSegmentLocation, setNewSegmentLocation] = useState('');
   const [newSegmentDesc, setNewSegmentDesc] = useState('');
@@ -112,12 +176,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   const [goodsLeftBehindCount, setGoodsLeftBehindCount] = useState<number>(0);
   const [casualsCount, setCasualsCount] = useState<number>(0);
 
-  // Toast / notification
+  // Toast / notification (no native alert)
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastIsError, setToastIsError] = useState<boolean>(false);
 
-  const showToast = (msg: string) => {
+  const showToast = (msg: string, isError: boolean = false) => {
+    setToastIsError(isError);
     setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4000);
+    setTimeout(() => setToastMessage(null), 4500);
   };
 
   const refreshSession = (updated?: StocktakeSession) => {
@@ -129,7 +195,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     setGoodsLeftBehindCount(cgl.filter((i) => !i.collected).length);
 
     const cas = getTemporaryCasuals(latest.sessionId);
-    setCasualsCount(cas.length);
+    setCasualsCount(cas.filter((c) => c.active).length);
   };
 
   useEffect(() => {
@@ -139,6 +205,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   // Add Segment Handler
   const handleAddSegment = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!canManageStructure) return;
     if (!newSegmentName.trim()) return;
 
     const nextNum = (session.segments?.length || 0) + 1;
@@ -156,17 +223,16 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
       sessionId: session.sessionId,
     };
 
-    console.log('[Stocktake] Segment created locally:', newSegment.segmentId);
-
     // 1. Save to IndexedDB via roomDatabase.saveStocktakeSegment BEFORE updating React state
     saveStocktakeSegment(newSegment, session.sessionId);
 
     // 2. Broadcast to Mesh / Hub
     meshSyncService.broadcastStocktakeSegmentCreated(session.sessionId, newSegment);
 
-    // 3. Update React state from IndexedDB
+    // 3. Update React state from IndexedDB & broadcast full session
     const refreshed = getStocktakeSessionById(session.sessionId);
     if (refreshed) {
+      meshSyncService.broadcastStocktakeSession(refreshed);
       refreshSession(refreshed);
     }
 
@@ -174,17 +240,18 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     setNewSegmentName('');
     setNewSegmentLocation('');
     setNewSegmentDesc('');
-    showToast('New segment added successfully.');
+    showToast('New segment added and synced across terminals.');
   };
 
-  // Delete Segment Handler
-  const handleDeleteSegment = (segmentId: string) => {
-    if (confirm('Are you sure you want to delete this segment?')) {
-      const res = deleteStocktakeSegment(session.sessionId, segmentId);
-      if (res) {
-        refreshSession(res);
-        showToast('Segment removed.');
-      }
+  // Delete Segment Handler (inline confirm, no browser confirm())
+  const handleConfirmDeleteSegment = (segmentId: string) => {
+    if (!canManageStructure) return;
+    const res = deleteStocktakeSegment(session.sessionId, segmentId);
+    setPendingDeleteSegmentId(null);
+    if (res) {
+      meshSyncService.broadcastStocktakeSession(res);
+      refreshSession(res);
+      showToast('Segment removed and synced.');
     }
   };
 
@@ -288,7 +355,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
       showToast(`Count saved to IndexedDB and submitted for Team ${slot}.`);
       setActiveTerminalSegment(null);
     } catch (err: any) {
-      alert(err.message || 'Error submitting count.');
+      showToast(err.message || 'Error submitting count.', true);
     }
   };
 
@@ -307,11 +374,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
         staffId,
         staffName
       );
+      if (res.session) {
+        meshSyncService.broadcastStocktakeSession(res.session);
+      }
       refreshSession(res.session);
       setActiveRecountSegment(null);
       showToast(res.message);
     } catch (err: any) {
-      alert(err.message || 'Error resolving recount.');
+      showToast(err.message || 'Error resolving recount.', true);
     }
   };
 
@@ -319,15 +389,18 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   const handleConsolidate = () => {
     try {
       const res = consolidateStocktakeSession(session.sessionId);
+      if (res.session) {
+        meshSyncService.broadcastStocktakeSession(res.session);
+      }
       refreshSession(res.session);
       if (res.success) {
         setActiveTab('VARIANCE');
         showToast(res.message);
       } else {
-        alert(res.message);
+        showToast(res.message, true);
       }
     } catch (err: any) {
-      alert(err.message || 'Error during consolidation.');
+      showToast(err.message || 'Error during consolidation.', true);
     }
   };
 
@@ -335,6 +408,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   const handleRequestSkuRecount = (itemId: string, notes?: string) => {
     const res = requestSkuVarianceRecount(session.sessionId, itemId, notes);
     if (res) {
+      meshSyncService.broadcastStocktakeSession(res);
       refreshSession(res);
       showToast(`Flagged ${itemId} for secondary floor recount.`);
     }
@@ -346,21 +420,47 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     const staffName = currentUser?.name || 'Supervisor';
     const res = submitSkuVarianceRecount(session.sessionId, itemId, cases, singles, staffId, staffName);
     if (res) {
+      meshSyncService.broadcastStocktakeSession(res);
       refreshSession(res);
       showToast(`Updated physical recount for item. Variances recalculated.`);
     }
   };
 
-  // Final Admin Approval
+  // Auditor Certification Step (Two-Man Integrity Phase 1)
+  const handleCertifyReady = (auditorId: string, auditorName: string, notes?: string) => {
+    const res = certifyStocktakeReady(session.sessionId, auditorId, auditorName, notes);
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      refreshSession(res.session);
+      setShowApprovalModal(false);
+      showToast(res.message);
+    } else {
+      showToast(res.message, true);
+    }
+  };
+
+  // Final Leader/Owner Committal
   const handleApprove = (adminId: string, adminName: string, notes?: string) => {
     const res = approveAndCommitStocktake(session.sessionId, adminId, adminName, notes);
     if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      meshSyncService.broadcastCasualWorkers(getTemporaryCasuals());
+      if (session.isLockdownActive || session.countType === 'FULL_LOCKDOWN') {
+        meshSyncService.broadcastStocktakeLockdown(
+          res.session.branchId,
+          res.session.sessionId,
+          false,
+          adminName,
+          `Stocktake ${res.session.sessionId} committed & lockdown released.`,
+          adminId
+        );
+      }
       refreshSession(res.session);
       setShowApprovalModal(false);
       setActiveTab('AUDIT_CERT');
       showToast(res.message);
     } else {
-      alert(res.message);
+      showToast(res.message, true);
     }
   };
 
@@ -368,11 +468,13 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     window.print();
   };
 
+  const displaySession = isBlindCounter ? sanitizeSessionForCounter(session) : session;
+
   // If in Double-Count Terminal mode, render full-screen terminal
   if (activeTerminalSegment) {
     return (
       <DoubleCountTerminal
-        session={session}
+        session={displaySession}
         segment={activeTerminalSegment}
         currentUser={currentUser}
         initialCounterSlot={terminalCounterSlot}
@@ -386,7 +488,19 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     session.segments.length > 0 && session.segments.every((s) => s.status === 'VERIFIED');
   const hasDiscrepancy = session.segments.some((s) => s.status === 'DISCREPANCY_RECOUNT');
   const verifiedCount = session.segments.filter((s) => s.status === 'VERIFIED').length;
-  const isApproved = session.status === 'APPROVED_POSTED';
+
+  // Segment visibility for blind counters assigned to specific segment(s)
+  const visibleSegments = (() => {
+    if (!isBlindCounter) return session.segments;
+    const assignedSet = new Set<string>();
+    if (currentUser?.assignedSegmentId) assignedSet.add(currentUser.assignedSegmentId);
+    if (Array.isArray(currentUser?.assignedSegmentIds)) {
+      currentUser.assignedSegmentIds.forEach((id) => assignedSet.add(id));
+    }
+    if (assignedSet.size === 0) return session.segments;
+    const filtered = session.segments.filter((s) => assignedSet.has(s.segmentId));
+    return filtered.length > 0 ? filtered : session.segments;
+  })();
 
   const countTypeBadge =
     session.countType === 'DAILY_BLIND'
@@ -455,9 +569,16 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
             </div>
           </div>
 
-          {/* Action Hub */}
-          <div className="flex items-center gap-2">
-            {!isApproved && allSegmentsVerified && (
+          {/* Action Hub (Strict Two-Man Integrity) */}
+          <div className="flex flex-wrap items-center gap-2">
+            {session.certifiedByName && !isApproved && (
+              <span className="px-3 py-1.5 rounded-xl bg-amber-950/70 border border-amber-700/70 text-amber-200 text-xs font-bold flex items-center gap-1.5">
+                <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                Certified Ready by {session.certifiedByName}
+              </span>
+            )}
+
+            {!isApproved && allSegmentsVerified && canManageStructure && (
               <button
                 onClick={handleConsolidate}
                 className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-900/30 flex items-center gap-2 transition"
@@ -467,17 +588,38 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
               </button>
             )}
 
-            {!isApproved && session.consolidatedItems && session.consolidatedItems.length > 0 && (
-              <button
-                onClick={() => setShowApprovalModal(true)}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-emerald-900/30 flex items-center gap-2 transition"
-              >
-                <ShieldCheck className="w-4 h-4" />
-                Owner / Auditor Committal
-              </button>
-            )}
+            {!isApproved &&
+              session.consolidatedItems &&
+              session.consolidatedItems.length > 0 &&
+              persona === 'AUDITOR' &&
+              session.status !== 'READY_FOR_COMMITTAL' && (
+                <button
+                  onClick={() => setShowApprovalModal(true)}
+                  className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-amber-900/30 flex items-center gap-2 transition"
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  Certify Counts Ready
+                </button>
+              )}
 
-            {isApproved && (
+            {!isApproved &&
+              session.consolidatedItems &&
+              session.consolidatedItems.length > 0 &&
+              persona === 'LEADER' && (
+                <button
+                  onClick={() => setShowApprovalModal(true)}
+                  className={`px-4 py-2 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-2 transition ${
+                    session.status === 'READY_FOR_COMMITTAL'
+                      ? 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/40 ring-2 ring-emerald-400/50'
+                      : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/30'
+                  }`}
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  Authorize & Commit Stock
+                </button>
+              )}
+
+            {isApproved && allowedTabs.includes('AUDIT_CERT') && (
               <button
                 onClick={() => setActiveTab('AUDIT_CERT')}
                 className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-800/40 rounded-xl text-xs font-bold flex items-center gap-2 transition"
@@ -490,112 +632,145 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
         </div>
       </header>
 
-      {/* Navigation Tabs Bar */}
+      {/* Navigation Tabs Bar (Persona-Filtered) */}
       <div className="bg-slate-900/80 border-b border-slate-800 px-6 overflow-x-auto">
         <div className="max-w-7xl mx-auto flex items-center gap-4 text-xs font-semibold whitespace-nowrap min-w-max">
-          <button
-            onClick={() => setActiveTab('SEGMENTS')}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
-              activeTab === 'SEGMENTS'
-                ? 'border-blue-500 text-blue-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Layers className="w-4 h-4" />
-            Floor Segments ({verifiedCount}/{session.segments.length})
-          </button>
+          {allowedTabs.includes('SEGMENTS') && (
+            <button
+              onClick={() => setActiveTab('SEGMENTS')}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'SEGMENTS'
+                  ? 'border-blue-500 text-blue-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Layers className="w-4 h-4" />
+              Floor Segments ({verifiedCount}/{session.segments.length})
+            </button>
+          )}
 
-          <button
-            onClick={() => {
-              setActiveTab('VARIANCE');
-              try {
-                if ((session.segments || []).some((s) => s.status === 'VERIFIED')) {
-                  const res = consolidateStocktakeSession(session.sessionId, true);
-                  if (res && res.session) refreshSession(res.session);
-                }
-              } catch {}
-            }}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
-              activeTab === 'VARIANCE'
-                ? 'border-blue-500 text-blue-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <FileSpreadsheet className="w-4 h-4" />
-            Consolidated Variance ({session.consolidatedItems?.length || 0})
-          </button>
+          {allowedTabs.includes('VARIANCE') && (
+            <button
+              onClick={() => {
+                setActiveTab('VARIANCE');
+                try {
+                  if ((session.segments || []).some((s) => s.status === 'VERIFIED')) {
+                    const res = consolidateStocktakeSession(session.sessionId, true);
+                    if (res && res.session) refreshSession(res.session);
+                  }
+                } catch {}
+              }}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'VARIANCE'
+                  ? 'border-blue-500 text-blue-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <FileSpreadsheet className="w-4 h-4" />
+              Consolidated Variance ({session.consolidatedItems?.length || 0})
+            </button>
+          )}
 
-          <button
-            onClick={() => setActiveTab('GOODS_LEFT_BEHIND')}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
-              activeTab === 'GOODS_LEFT_BEHIND'
-                ? 'border-blue-500 text-blue-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <PackageOpen className="w-4 h-4" />
-            Customer Goods Left Behind
-            {goodsLeftBehindCount > 0 && (
-              <span className="px-1.5 py-0.2 bg-amber-500 text-slate-950 font-bold rounded-full text-[10px]">
-                {goodsLeftBehindCount}
-              </span>
-            )}
-          </button>
+          {allowedTabs.includes('GOODS_LEFT_BEHIND') && (
+            <button
+              onClick={() => setActiveTab('GOODS_LEFT_BEHIND')}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'GOODS_LEFT_BEHIND'
+                  ? 'border-blue-500 text-blue-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <PackageOpen className="w-4 h-4" />
+              Customer Goods Left Behind
+              {goodsLeftBehindCount > 0 && (
+                <span className="px-1.5 py-0.2 bg-amber-500 text-slate-950 font-bold rounded-full text-[10px]">
+                  {goodsLeftBehindCount}
+                </span>
+              )}
+            </button>
+          )}
 
-          <button
-            onClick={() => setActiveTab('CASUALS')}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
-              activeTab === 'CASUALS'
-                ? 'border-amber-500 text-amber-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Users className="w-4 h-4" />
-            Casual Accounts & PINs
-            {casualsCount > 0 && (
-              <span className="px-1.5 py-0.2 bg-amber-950 text-amber-300 border border-amber-800 font-bold rounded-full text-[10px]">
-                {casualsCount}
-              </span>
-            )}
-          </button>
+          {allowedTabs.includes('CASUALS') && (
+            <button
+              onClick={() => setActiveTab('CASUALS')}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'CASUALS'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Users className="w-4 h-4" />
+              Casuals & Visiting Passes
+              {casualsCount > 0 && (
+                <span className="px-1.5 py-0.2 bg-amber-950 text-amber-300 border border-amber-800 font-bold rounded-full text-[10px]">
+                  {casualsCount}
+                </span>
+              )}
+            </button>
+          )}
 
-          <button
-            onClick={() => setActiveTab('FAST_MOVERS')}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
-              activeTab === 'FAST_MOVERS'
-                ? 'border-amber-500 text-amber-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Zap className="w-4 h-4" />
-            Fast Movers Airtime Checklist
-          </button>
+          {allowedTabs.includes('FAST_MOVERS') && (
+            <button
+              onClick={() => setActiveTab('FAST_MOVERS')}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'FAST_MOVERS'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Zap className="w-4 h-4" />
+              Fast Movers Checklist
+            </button>
+          )}
 
-          <button
-            onClick={() => setActiveTab('LOCKDOWN')}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
-              activeTab === 'LOCKDOWN'
-                ? 'border-rose-500 text-rose-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Lock className="w-4 h-4" />
-            Lockdown & Emergency Sales
-          </button>
+          {allowedTabs.includes('LOCKDOWN') && (
+            <button
+              onClick={() => setActiveTab('LOCKDOWN')}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'LOCKDOWN'
+                  ? 'border-rose-500 text-rose-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Lock className="w-4 h-4" />
+              Lockdown & Emergency Sales
+            </button>
+          )}
 
-          <button
-            onClick={() => setActiveTab('P2P_SYNC')}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
-              activeTab === 'P2P_SYNC'
-                ? 'border-emerald-500 text-emerald-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Share2 className="w-4 h-4" />
-            P2P Mesh & Cloud Throttler
-          </button>
+          {allowedTabs.includes('P2P_SYNC') && (
+            <button
+              onClick={() => setActiveTab('P2P_SYNC')}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'P2P_SYNC'
+                  ? 'border-emerald-500 text-emerald-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Share2 className="w-4 h-4" />
+              P2P Mesh & Cloud Throttler
+            </button>
+          )}
 
-          {isApproved && (
+          {allowedTabs.includes('VARIANCE_COMMENTS') && isApproved && (
+            <button
+              onClick={() => setActiveTab('VARIANCE_COMMENTS')}
+              className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
+                activeTab === 'VARIANCE_COMMENTS'
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <MessageSquare className="w-4 h-4" />
+              Variance Commentary
+              {session.varianceReviewStatus === 'PENDING_MANAGER_COMMENTS' && (
+                <span className="px-1.5 py-0.2 bg-amber-500 text-slate-950 font-bold rounded-full text-[10px]">
+                  Action Due
+                </span>
+              )}
+            </button>
+          )}
+
+          {allowedTabs.includes('AUDIT_CERT') && isApproved && (
             <button
               onClick={() => setActiveTab('AUDIT_CERT')}
               className={`py-3 border-b-2 flex items-center gap-1.5 transition ${
@@ -613,8 +788,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
 
       {/* Notification Toast */}
       {toastMessage && (
-        <div className="bg-blue-900/90 text-blue-100 border-b border-blue-700 px-4 py-2 text-center text-xs font-semibold flex items-center justify-center gap-2 animate-fadeIn">
-          <Info className="w-4 h-4 text-blue-300" />
+        <div
+          className={`px-4 py-2 text-center text-xs font-semibold flex items-center justify-center gap-2 animate-fadeIn border-b ${
+            toastIsError
+              ? 'bg-rose-900/90 text-rose-100 border-rose-700'
+              : 'bg-blue-900/90 text-blue-100 border-blue-700'
+          }`}
+        >
+          <Info className={`w-4 h-4 ${toastIsError ? 'text-rose-300' : 'text-blue-300'}`} />
           {toastMessage}
         </div>
       )}
@@ -638,7 +819,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                 </div>
               </div>
 
-              {!isApproved && (
+              {!isApproved && canManageStructure && (
                 <button
                   onClick={() => setShowAddSegmentModal(true)}
                   className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-bold flex items-center gap-1.5 transition"
@@ -649,9 +830,21 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
               )}
             </div>
 
+            {isBlindCounter && (
+              <div className="bg-blue-950/40 border border-blue-800/60 rounded-xl p-3 text-xs text-blue-200 flex items-center gap-2">
+                <Shield className="w-4 h-4 text-blue-400 shrink-0" />
+                <span>
+                  <strong>Counter Isolation Active:</strong> Select your assigned floor segment below to enter Blind Count quantities
+                  {currentUser?.assignedGroup
+                    ? ` (${currentUser.assignedGroup === 'GROUP_1' ? 'Group 1 / Team A' : 'Group 2 / Team B'}).`
+                    : '.'}
+                </span>
+              </div>
+            )}
+
             {/* Segments Cards Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {session.segments.map((seg, segIdx) => {
+              {visibleSegments.map((seg, segIdx) => {
                 const zoneAssignments = getZoneAssignments(session.sessionId);
                 const zone = zoneAssignments.find((z) => z.zoneId === seg.segmentId);
 
@@ -777,7 +970,13 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                             ) : null}
                           </div>
                           <div className="text-sm font-bold font-mono text-white mt-1">
-                            {count1Units > 0
+                            {isBlindCounter
+                              ? isCount1Submitted
+                                ? 'Count Submitted (Blind)'
+                                : isTeamAClaimed
+                                ? 'Counting in Progress...'
+                                : 'Not Started'
+                              : count1Units > 0
                               ? `${count1Units} units`
                               : isCount1Submitted
                               ? effectiveStatus === 'VERIFIED' && verifiedUnits > 0
@@ -807,7 +1006,13 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                             ) : null}
                           </div>
                           <div className="text-sm font-bold font-mono text-white mt-1">
-                            {count2Units > 0
+                            {isBlindCounter
+                              ? isCount2Submitted
+                                ? 'Count Submitted (Blind)'
+                                : isTeamBClaimed
+                                ? 'Counting in Progress...'
+                                : 'Not Started'
+                              : count2Units > 0
                               ? `${count2Units} units`
                               : isCount2Submitted
                               ? effectiveStatus === 'VERIFIED' && verifiedUnits > 0
@@ -846,13 +1051,15 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                               <RotateCcw className="w-3.5 h-3.5" />
                               Joint Dual-Signature Recount
                             </button>
-                            <button
-                              type="button"
-                              onClick={() => setActiveRecountSegment({ ...seg, discrepancies: discrepancyList, discrepancyCount })}
-                              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold border border-slate-700 transition"
-                            >
-                              Manual Override
-                            </button>
+                            {canManageStructure && (
+                              <button
+                                type="button"
+                                onClick={() => setActiveRecountSegment({ ...seg, discrepancies: discrepancyList, discrepancyCount })}
+                                className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold border border-slate-700 transition"
+                              >
+                                Manual Override
+                              </button>
+                            )}
                           </div>
                         </div>
                       )}
@@ -862,8 +1069,9 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                           <div className="flex items-center gap-2">
                             <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
                             <span>
-                              Verified Count: <strong>{verifiedUnits} units</strong> across{' '}
-                              {verifiedList.length} SKUs.
+                              {isBlindCounter
+                                ? 'Segment Blind Double-Count Verified'
+                                : `Verified Count: ${verifiedUnits} units across ${verifiedList.length} SKUs.`}
                             </span>
                           </div>
                           {seg.recountedAt && (
@@ -878,70 +1086,93 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                     {/* Terminal Action Buttons & Self-Service Claiming */}
                     <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
                       <div className="flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (isCount1Submitted || isTeamAClaimed) {
-                              handleLaunchTerminal(seg, 'A');
-                            } else {
-                              handleClaimZone(seg, 'A');
-                            }
-                          }}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
-                            isCount1Submitted
-                              ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30 hover:bg-blue-600 hover:text-white'
+                        {(!isBlindCounter || !currentUser?.assignedGroup || currentUser.assignedGroup === 'GROUP_1') && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (isCount1Submitted || isTeamAClaimed) {
+                                handleLaunchTerminal(seg, 'A');
+                              } else {
+                                handleClaimZone(seg, 'A');
+                              }
+                            }}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                              isCount1Submitted
+                                ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30 hover:bg-blue-600 hover:text-white'
+                                : isTeamAClaimed
+                                ? 'bg-blue-900/40 text-blue-200 border border-blue-700 hover:bg-blue-700 hover:text-white'
+                                : 'bg-blue-600 text-white hover:bg-blue-500 shadow-sm'
+                            }`}
+                          >
+                            <UserCheck className="w-3.5 h-3.5" />
+                            {isCount1Submitted
+                              ? 'View/Edit Count 1 (Team A)'
                               : isTeamAClaimed
-                              ? 'bg-blue-900/40 text-blue-200 border border-blue-700 hover:bg-blue-700 hover:text-white'
-                              : 'bg-blue-600 text-white hover:bg-blue-500 shadow-sm'
-                          }`}
-                        >
-                          <UserCheck className="w-3.5 h-3.5" />
-                          {isCount1Submitted
-                            ? 'View/Edit Count 1 (Team A)'
-                            : isTeamAClaimed
-                            ? `Enter Count 1 (${teamAName})`
-                            : 'Claim Zone as Team A'}
-                        </button>
+                              ? `Enter Count 1 (${teamAName})`
+                              : 'Claim Zone as Team A'}
+                          </button>
+                        )}
 
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (isCount2Submitted || isTeamBClaimed) {
-                              handleLaunchTerminal(seg, 'B');
-                            } else {
-                              handleClaimZone(seg, 'B');
-                            }
-                          }}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
-                            isCount2Submitted
-                              ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600 hover:text-white'
+                        {(!isBlindCounter || !currentUser?.assignedGroup || currentUser.assignedGroup === 'GROUP_2') && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (isCount2Submitted || isTeamBClaimed) {
+                                handleLaunchTerminal(seg, 'B');
+                              } else {
+                                handleClaimZone(seg, 'B');
+                              }
+                            }}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 ${
+                              isCount2Submitted
+                                ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600 hover:text-white'
+                                : isTeamBClaimed
+                                ? 'bg-purple-900/40 text-purple-200 border border-purple-700 hover:bg-purple-700 hover:text-white'
+                                : isCount1Submitted
+                                ? 'bg-amber-600 text-white hover:bg-amber-500 shadow-sm animate-pulse'
+                                : 'bg-purple-600 text-white hover:bg-purple-500 shadow-sm'
+                            }`}
+                          >
+                            <UserCheck className="w-3.5 h-3.5" />
+                            {isCount2Submitted
+                              ? 'View/Edit Count 2 (Team B)'
                               : isTeamBClaimed
-                              ? 'bg-purple-900/40 text-purple-200 border border-purple-700 hover:bg-purple-700 hover:text-white'
+                              ? `Enter Count 2 (${teamBName})`
                               : isCount1Submitted
-                              ? 'bg-amber-600 text-white hover:bg-amber-500 shadow-sm animate-pulse'
-                              : 'bg-purple-600 text-white hover:bg-purple-500 shadow-sm'
-                          }`}
-                        >
-                          <UserCheck className="w-3.5 h-3.5" />
-                          {isCount2Submitted
-                            ? 'View/Edit Count 2 (Team B)'
-                            : isTeamBClaimed
-                            ? `Enter Count 2 (${teamBName})`
-                            : isCount1Submitted
-                            ? 'Claim Double-Count as Team B'
-                            : 'Claim as Team B'}
-                        </button>
+                              ? 'Claim Double-Count as Team B'
+                              : 'Claim as Team B'}
+                          </button>
+                        )}
                       </div>
 
-                      {!isApproved && (
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteSegment(seg.segmentId)}
-                          className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition"
-                          title="Remove Segment"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                      {!isApproved && canManageStructure && (
+                        pendingDeleteSegmentId === seg.segmentId ? (
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => handleConfirmDeleteSegment(seg.segmentId)}
+                              className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded text-[10px] font-bold"
+                            >
+                              Delete
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setPendingDeleteSegmentId(null)}
+                              className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[10px]"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setPendingDeleteSegmentId(seg.segmentId)}
+                            className="p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-slate-800 transition"
+                            title="Remove Segment"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )
                       )}
                     </div>
                   </div>
@@ -1003,8 +1234,17 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
           <P2PMeshSyncTab session={session} />
         )}
 
-        {/* TAB 8: AUDIT COMMITTAL CERTIFICATE */}
-        {activeTab === 'AUDIT_CERT' && (
+        {/* TAB 8: POST-COMMIT MANAGER VARIANCE COMMENTARY */}
+        {activeTab === 'VARIANCE_COMMENTS' && isApproved && allowedTabs.includes('VARIANCE_COMMENTS') && (
+          <VarianceCommentaryTab
+            session={session}
+            currentUser={currentUser}
+            onRefreshSession={refreshSession}
+          />
+        )}
+
+        {/* TAB 9: AUDIT COMMITTAL CERTIFICATE */}
+        {activeTab === 'AUDIT_CERT' && allowedTabs.includes('AUDIT_CERT') && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 max-w-4xl mx-auto shadow-2xl space-y-6 print:bg-white print:text-black print:border-none print:shadow-none">
             {/* Header */}
             <div className="border-b border-slate-800 pb-5 flex items-center justify-between">
@@ -1177,12 +1417,13 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
         />
       )}
 
-      {/* Admin Committal Modal */}
+      {/* Admin Committal / Auditor Certification Modal */}
       {showApprovalModal && (
         <StocktakeApprovalModal
           session={session}
           currentUser={currentUser}
           onApprove={handleApprove}
+          onCertifyReady={handleCertifyReady}
           onClose={() => setShowApprovalModal(false)}
         />
       )}

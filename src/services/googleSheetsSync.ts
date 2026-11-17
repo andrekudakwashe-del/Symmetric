@@ -40,11 +40,13 @@ import {
   getRawStoredInventoryItems,
   parseTimestampMs,
   markRecordsCloudSynced,
+  annotateSaleCloudReceiptMetadata,
 } from '../db/roomDatabase';
 import { getActiveCloudConfig } from './sync/cloudConfigResolver';
 import { SyncQueueItem, SheetName, StaffPermissions, InventoryItem } from '../types';
 import { Company, SaaSBranch } from '../data/saasData';
 import { persistentSyncEngine } from './persistentSyncEngine';
+import { evaluateSuspiciousBackdate, reportTrustedTimeSample } from '../utils/clockSecurity';
 import { runtimeSyncDispatcher } from './backendAdapter/runtimeSyncDispatcher';
 import { getTenantBackendConfig } from './backendAdapter/adapterRegistry';
 import {
@@ -406,7 +408,25 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
     if (srvRes.status === 200 || srvRes.status === 201 || srvRes.ok) {
       const srvData = await srvRes.json().catch(() => null);
       if (srvData && srvData.success !== false && srvData.status !== 'error') {
-        const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
+        const recId = String(item.payload?.id || item.payload?.itemId || item.payload?.InvoiceID || item.id || '');
+        const srvTsMs = srvData.server_received_at ? Date.parse(srvData.server_received_at) : Date.now();
+        if (Number.isFinite(srvTsMs) && srvTsMs > 1_600_000_000_000) {
+          reportTrustedTimeSample(srvTsMs, 'CLOUD_SERVER');
+        }
+        if (item.sheetName === 'Sales' && recId) {
+          const fallbackEval = evaluateSuspiciousBackdate(
+            item.payload?.date || item.payload?.Date,
+            item.payload?.Timestamp || item.payload?.timestamp,
+            Number.isFinite(srvTsMs) ? srvTsMs : Date.now()
+          );
+          annotateSaleCloudReceiptMetadata(recId, {
+            server_received_at: srvData.server_received_at || fallbackEval.server_received_at,
+            suspicious_backdate:
+              srvData.suspicious_backdate !== undefined
+                ? Boolean(srvData.suspicious_backdate)
+                : fallbackEval.suspicious_backdate,
+          });
+        }
         markRecordsCloudSynced(
           [recId, item.id].filter(Boolean),
           [payloadData.clientRequestId].filter(Boolean),
@@ -444,7 +464,29 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
     throw new Error(`Google Apps Script webhook failed with HTTP ${directRes.status}`);
   }
 
-  const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
+  const directData = await directRes.json().catch(() => null);
+  const directTsMs = directData?.server_received_at
+    ? Date.parse(directData.server_received_at)
+    : Date.now();
+  if (Number.isFinite(directTsMs) && directTsMs > 1_600_000_000_000) {
+    reportTrustedTimeSample(directTsMs, 'CLOUD_SERVER');
+  }
+
+  const recId = String(item.payload?.id || item.payload?.itemId || item.payload?.InvoiceID || item.id || '');
+  if (item.sheetName === 'Sales' && recId) {
+    const fallbackEval = evaluateSuspiciousBackdate(
+      item.payload?.date || item.payload?.Date,
+      item.payload?.Timestamp || item.payload?.timestamp,
+      Number.isFinite(directTsMs) ? directTsMs : Date.now()
+    );
+    annotateSaleCloudReceiptMetadata(recId, {
+      server_received_at: directData?.server_received_at || fallbackEval.server_received_at,
+      suspicious_backdate:
+        directData?.suspicious_backdate !== undefined
+          ? Boolean(directData.suspicious_backdate)
+          : fallbackEval.suspicious_backdate,
+    });
+  }
   markRecordsCloudSynced(
     [recId, item.id].filter(Boolean),
     [payloadData.clientRequestId].filter(Boolean),
@@ -2271,23 +2313,32 @@ export const fetchCompaniesFromMasterSheet = async (
           trial_days_remaining: c.trial_days_remaining,
         });
 
-        // Ensure newly synced company has an owner salesperson so users can log in across devices
+        // Ensure newly synced company has an owner salesperson only when NO staff records (active or deleted) exist for that company
         const existingStaff = getSalespeopleForCompany(c.company_id);
-        if (existingStaff.length === 0 && (c.owner_name || c.owner_email)) {
-          saveSalesperson({
-            id: `USR-${c.company_id}-001`,
-            name: c.owner_name || 'Business Owner',
-            role: 'OWNER',
-            email: c.owner_email || '',
-            pin: '1234',
-            phone: c.phone || '',
-            active: 'Y',
-            companyId: c.company_id,
-            company_id: c.company_id,
-            branchId: 'BR-MAIN',
-            branch_id: 'BR-MAIN',
-            permissions: getOwnerDefaultPermissions(),
-          });
+        const existingAllCompanyStaff = getAllSalespeople().filter(
+          (s) => String(s.companyId || (s as any).company_id || '').toUpperCase() === String(c.company_id || '').toUpperCase()
+        );
+        if (existingStaff.length === 0 && existingAllCompanyStaff.length === 0 && (c.owner_name || c.owner_email)) {
+          saveSalesperson(
+            {
+              id: `USR-${c.company_id}-001`,
+              name: c.owner_name || 'Business Owner',
+              role: 'OWNER',
+              email: c.owner_email || '',
+              pin: '1234',
+              phone: c.phone || '',
+              active: 'Y',
+              companyId: c.company_id,
+              company_id: c.company_id,
+              branchId: 'BR-MAIN',
+              branch_id: 'BR-MAIN',
+              permissions: getOwnerDefaultPermissions(),
+              version: 0,
+              mutationSource: 'SEED',
+              updatedAt: 0,
+            },
+            { fromSync: true }
+          );
         }
       });
     }
@@ -2301,21 +2352,61 @@ export const fetchCompaniesFromMasterSheet = async (
         if (uComp) {
           const staffId = u.id || u.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
           const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
-          const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || Date.now();
+          const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || 0;
+          const incomingVersion = Number(u.version || 0);
+          const incomingMutationSource =
+            u.mutationSource ||
+            u.mutation_source ||
+            (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : 'MIGRATION');
+          const incomingPinVersion = Number(u.pinVersion || u.pin_version || 0);
+          const incomingPinUpdatedAt = parseTimestampMs(u.pinUpdatedAt || u.pin_updated_at) || incomingTs;
+          const existingPinVersion = Number((existingStaff as any)?.pinVersion || 0);
+          const existingPinUpdatedAt = parseTimestampMs((existingStaff as any)?.pinUpdatedAt || existingStaff?.updatedAt);
+          const existingHasPin = Boolean(existingStaff?.pin_hash || existingStaff?.pin);
+          const shouldKeepExistingPin =
+            existingHasPin &&
+            (
+              !u.pin_hash ||
+              (existingPinVersion > 0 && incomingPinVersion === 0) ||
+              (existingPinVersion > 0 && incomingPinVersion > 0 && existingPinVersion > incomingPinVersion) ||
+              (existingPinUpdatedAt > 0 && incomingPinUpdatedAt > 0 && existingPinUpdatedAt - incomingPinUpdatedAt > 5000) ||
+              incomingTs === 0
+            );
+          const pinHash = shouldKeepExistingPin ? existingStaff?.pin_hash : (u.pin_hash || existingStaff?.pin_hash);
+          const pinSalt = shouldKeepExistingPin ? existingStaff?.pin_salt : (u.pin_salt || existingStaff?.pin_salt);
+          const effectivePinVersion = Math.max(existingPinVersion, incomingPinVersion);
+          const effectivePinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
+          const resolvedBranchId = u.branch_id || u.branchId || existingStaff?.branchId || 'BR-MAIN';
+          const resolvedBranchAssignments = u.branchAssignments || existingStaff?.branchAssignments;
+          const resolvedAssignedBranchIds =
+            u.assignedBranchIds ||
+            (Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
+              ? resolvedBranchAssignments.map((a: any) => a.branchId).filter(Boolean)
+              : (existingStaff as any)?.assignedBranchIds);
           const staffObj: any = {
             id: staffId,
-            name: u.name || u.full_name || 'Staff Member',
-            role: (u.role || 'OWNER').toUpperCase() as any,
-            email: u.email || '',
-            ...(u.pin_hash ? { pin_hash: u.pin_hash, pin_salt: u.pin_salt } : { pin: String(u.pin || '1234') }),
-            phone: u.phone || '',
-            active: u.active === 'N' ? 'N' : 'Y',
+            name: u.full_name || u.name || existingStaff?.name || 'Staff Member',
+            role: (u.role || existingStaff?.role || 'OWNER').toUpperCase() as any,
+            email: u.email || existingStaff?.email || '',
+            ...(pinHash
+              ? { pin_hash: pinHash, ...(pinSalt ? { pin_salt: pinSalt } : {}) }
+              : existingStaff?.pin
+              ? { pin: existingStaff.pin }
+              : { pin: String(u.pin || '1234') }),
+            phone: u.phone || existingStaff?.phone || '',
+            active: u.is_active === false || u.active === 'N' ? 'N' : 'Y',
             companyId: uComp,
             company_id: uComp,
-            branchId: u.branch_id || u.branchId || 'BR-MAIN',
-            branch_id: u.branch_id || u.branchId || 'BR-MAIN',
-            permissions: getOwnerDefaultPermissions(),
-            ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
+            branchId: resolvedBranchId,
+            branch_id: resolvedBranchId,
+            ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
+            ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
+            permissions: u.permissions || existingStaff?.permissions || getOwnerDefaultPermissions(),
+            version: incomingVersion,
+            mutationSource: incomingMutationSource,
+            ...(effectivePinVersion > 0 ? { pinVersion: effectivePinVersion } : {}),
+            ...(effectivePinUpdatedAt > 0 ? { pinUpdatedAt: effectivePinUpdatedAt } : {}),
+            ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
           };
           await routeCloudRecordThroughSyncCore(
             {
@@ -2325,13 +2416,15 @@ export const fetchCompaniesFromMasterSheet = async (
               action: 'UPSERT',
               data: staffObj,
               updatedAt: incomingTs,
+              version: incomingVersion,
+              mutationSource: incomingMutationSource,
               originDeviceId: 'APPS_SCRIPT_CLOUD',
               targetBranchId: 'ALL',
               class: 'T2',
             },
             existingStaff,
             () => {
-              const savedStaff = saveSalesperson(staffObj);
+              const savedStaff = saveSalesperson(staffObj, { fromSync: true });
               console.log(
                 '[STAFF TRACE] 7. Saved to DB. New Pin:',
                 savedStaff.pin_hash,

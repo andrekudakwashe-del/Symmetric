@@ -37,6 +37,9 @@ import {
   StocktakeLineCount,
   StocktakeVerifiedLine,
   StocktakeConsolidatedItem,
+  StocktakeGuestPass,
+  StocktakeVarianceReasonCode,
+  StocktakeVarianceReviewStatus,
   CustomerGoodsLeftBehind,
   TemporaryCasualAccount,
   FastMovingChecklistItem,
@@ -78,6 +81,7 @@ import {
   getShiftLedgerBreakdown,
   ShiftLedgerBreakdown,
   matchesShift,
+  reassignMovementsStaffId,
 } from './cashLedger';
 import {
   addCustomerLedgerEntry,
@@ -103,6 +107,12 @@ import {
   SEED_BRANCHES,
   SEED_USERS,
 } from '../data/saasData';
+import {
+  getClockSecurityState,
+  getTrustedTodayDateString,
+  recordSecurityAlert,
+  reportTrustedTimeSample,
+} from '../utils/clockSecurity';
 import {
   INITIAL_SALESPEOPLE,
   INITIAL_CUSTOMERS,
@@ -1275,7 +1285,13 @@ export const initRoomDatabase = () => {
     setStored(STORAGE_KEYS.EXCHANGE_RATES, DEFAULT_MULTI_CURRENCY_CONFIG, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.SALESPEOPLE)) {
-    setStored(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE, { skipIdbOverwriteIfExisting: true });
+    const seededStaff = INITIAL_SALESPEOPLE.map((s) => ({
+      ...s,
+      version: (s as any).version ?? 0,
+      mutationSource: (s as any).mutationSource || ('SEED' as const),
+      updatedAt: (s as any).updatedAt ?? 0,
+    }));
+    setStored(STORAGE_KEYS.SALESPEOPLE, seededStaff, { skipIdbOverwriteIfExisting: true });
   }
   if (!localStorage.getItem(STORAGE_KEYS.CUSTOMERS)) {
     setStored(STORAGE_KEYS.CUSTOMERS, INITIAL_CUSTOMERS, { skipIdbOverwriteIfExisting: true });
@@ -1446,26 +1462,40 @@ export const initRoomDatabase = () => {
   // Ensure initial branches for demo companies exist only if not previously deleted
   sanitizeBranchesTable();
   const branchList = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
-  const existingBranchIds = new Set(branchList.map((b) => b.branchId));
-  const deletedBranchSet = new Set(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
-  const missingBranches = INITIAL_BRANCHES.filter(
-    (b) => !existingBranchIds.has(b.branchId) && !deletedBranchSet.has(b.branchId)
+  const existingBranchIds = new Set(
+    branchList.map((b) => canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase())
   );
+  const deletedBranchSet = new Set(
+    getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []).map((id) => canonicalizeBranchId(id).toUpperCase())
+  );
+  const missingBranches = INITIAL_BRANCHES.filter((b) => {
+    const cId = canonicalizeBranchId(b.branchId).toUpperCase();
+    return !existingBranchIds.has(cId) && !deletedBranchSet.has(cId);
+  });
   if (missingBranches.length > 0) {
     setStored(STORAGE_KEYS.BRANCHES, [...branchList, ...missingBranches]);
   }
 
-  // Clean phantom duplicates leaving HQ + at most 1 clean other branch across all tenants
+  // Clean phantom duplicates across all tenants
   cleanPhantomBranchDuplicates();
 
-  // Ensure initial salespeople for all demo companies exist in salespeople store and deduplicate
+  // Ensure initial salespeople for all demo companies exist (excluding deleted tombstones) and deduplicate
   const staffList = getStored<Salesperson[]>(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE);
+  const staffTombstoneIds = new Set(
+    getTombstones()
+      .filter((t) => normalizeRoomTombstoneType(t.entityType) === 'staff')
+      .map((t) => String(t.entityId || '').trim().toUpperCase())
+  );
   const seenStaffIds = new Set<string>();
   const sanitizedStaff: Salesperson[] = [];
   let staffCleaned = false;
   for (const s of staffList) {
     if (!s || !s.id) continue;
     const cleanId = String(s.id).trim();
+    if (staffTombstoneIds.has(cleanId.toUpperCase())) {
+      staffCleaned = true;
+      continue;
+    }
     if (!seenStaffIds.has(cleanId)) {
       seenStaffIds.add(cleanId);
       sanitizedStaff.push(s);
@@ -1473,7 +1503,15 @@ export const initRoomDatabase = () => {
       staffCleaned = true;
     }
   }
-  const missingStaff = INITIAL_SALESPEOPLE.filter((s) => !seenStaffIds.has(String(s.id).trim()));
+  const missingStaff = INITIAL_SALESPEOPLE.filter((s) => {
+    const cleanUpper = String(s.id).trim().toUpperCase();
+    return !seenStaffIds.has(String(s.id).trim()) && !staffTombstoneIds.has(cleanUpper);
+  }).map((s) => ({
+    ...s,
+    version: (s as any).version ?? 0,
+    mutationSource: (s as any).mutationSource || ('SEED' as const),
+    updatedAt: (s as any).updatedAt ?? 0,
+  }));
   if (missingStaff.length > 0 || staffCleaned) {
     setStored(STORAGE_KEYS.SALESPEOPLE, [...sanitizedStaff, ...missingStaff]);
   }
@@ -1609,6 +1647,9 @@ export const initRoomDatabase = () => {
 
   // Self-heal any multi-currency (ZiG & EcoCash) sales missing movements
   healMultiCurrencySalesAndMovements();
+
+  // Deduplicate same-name duplicate staff profiles (e.g. USR-MASTER-001 vs #001, UUID sync duplicate vs #005)
+  deduplicateSameNameStaffProfiles({ broadcastTombstones: false });
 
   if (!localStorage.getItem(STORAGE_KEYS.SHEETS_CONFIG)) {
     const defaultConfig: GoogleSheetsConfig = {
@@ -2270,14 +2311,48 @@ export const addAuditLog = (
   return newLog;
 };
 
+const TERMINAL_LAST_LOGIN_KEY = 'saimetric_terminal_last_login_map';
+
+export const getTerminalLastLoginMap = (branchId?: string): Record<string, number> => {
+  try {
+    const raw = localStorage.getItem(TERMINAL_LAST_LOGIN_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    const branchKey = String(branchId || getCurrentBranchId() || 'BR-MAIN').trim().toUpperCase();
+    const map = parsed?.[branchKey];
+    return map && typeof map === 'object' ? map : {};
+  } catch {
+    return {};
+  }
+};
+
+export const recordTerminalLogin = (staffId: string, branchId?: string): void => {
+  if (!staffId) return;
+  try {
+    const raw = localStorage.getItem(TERMINAL_LAST_LOGIN_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    const branchKey = String(branchId || getCurrentBranchId() || 'BR-MAIN').trim().toUpperCase();
+    const prevBranchMap = parsed[branchKey] && typeof parsed[branchKey] === 'object' ? parsed[branchKey] : {};
+    parsed[branchKey] = {
+      ...prevBranchMap,
+      [staffId]: Date.now(),
+    };
+    localStorage.setItem(TERMINAL_LAST_LOGIN_KEY, JSON.stringify(parsed));
+  } catch {
+    // ignore storage errors
+  }
+};
+
 export const logLogin = (staff: Salesperson): void => {
+  recordTerminalLogin(staff.id, staff.branchId || staff.branch_id);
+  const pinLabel = staff.isCasual ? '4-digit casual PIN' : '6-digit security PIN';
   addAuditLog({
     action: 'LOGIN',
     severity: 'INFO',
     staffId: staff.id,
     staffName: staff.name,
     staffRole: staff.role,
-    details: `User ${staff.name} (${staff.role}) successfully authenticated with 4-digit PIN.`,
+    details: `User ${staff.name} (${staff.role}) successfully authenticated with ${pinLabel}.`,
   });
 };
 
@@ -2427,6 +2502,362 @@ export const getSalespeopleForCompany = (companyId?: string): Salesperson[] => {
   });
 };
 
+const normStaffTenant = (c?: string): string =>
+  !c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase();
+
+const normalizeStaffIdToken = (rawId?: string): string => {
+  const clean = String(rawId || '').trim().toLowerCase();
+  if (!clean) return '';
+  return clean.replace(/^usr-|^staff-|^0+/i, '');
+};
+
+const normalizeStaffNameKey = (rawName?: string): string =>
+  String(rawName || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+
+const normalizeStaffEmailKey = (rawEmail?: string): string =>
+  String(rawEmail || '')
+    .trim()
+    .toLowerCase();
+
+const normalizeStaffPhoneKey = (rawPhone?: string): string => {
+  const digits = String(rawPhone || '').replace(/\D/g, '');
+  if (!digits) return '';
+  return digits.length >= 9 ? digits.slice(-9) : digits;
+};
+
+const getKnownStaffIdSets = (companyId?: string): { exactIds: Set<string>; normIds: Set<string> } => {
+  const staff = getSalespeopleForCompany(companyId);
+  const exactIds = new Set<string>();
+  const normIds = new Set<string>();
+  for (const s of staff) {
+    const cid = String(s.id || '').trim().toLowerCase();
+    if (!cid) continue;
+    exactIds.add(cid);
+    const nid = normalizeStaffIdToken(cid);
+    if (nid) normIds.add(nid);
+  }
+  return { exactIds, normIds };
+};
+
+/**
+ * Exclusive 1-to-1 staff matching for financial & shift ledgers.
+ * Prevents a duplicate/secondary staff ID (e.g. #USR-MASTER-001 or UUID) from claiming
+ * another existing staff member's records (e.g. #001 or #005) solely by matching display name.
+ * Name fallback is ONLY permitted when recStaffId is absent or does NOT map to any known staff profile.
+ */
+const matchesStaffExclusive = (
+  recStaffId?: string,
+  recStaffName?: string,
+  targetStaffId?: string,
+  targetStaffName?: string,
+  knownSets?: { exactIds: Set<string>; normIds: Set<string> }
+): boolean => {
+  const cleanTargetId = String(targetStaffId || '').trim().toLowerCase();
+  if (!cleanTargetId || cleanTargetId === 'all') return true;
+
+  const cleanRecId = String(recStaffId || '').trim().toLowerCase();
+  if (cleanRecId && cleanRecId === cleanTargetId) return true;
+
+  const normTarget = normalizeStaffIdToken(cleanTargetId);
+  const normRec = normalizeStaffIdToken(cleanRecId);
+  if (normTarget && normRec && normRec === normTarget) return true;
+
+  const sets = knownSets || getKnownStaffIdSets();
+  if (cleanRecId && (sets.exactIds.has(cleanRecId) || (normRec && sets.normIds.has(normRec)))) {
+    // Record explicitly belongs to a different known salesperson ID — never hijack by name!
+    return false;
+  }
+
+  const cleanTargetName = normalizeStaffNameKey(targetStaffName);
+  const cleanRecName = normalizeStaffNameKey(recStaffName);
+  if (cleanTargetName && cleanRecName && cleanRecName === cleanTargetName) {
+    return true;
+  }
+  return false;
+};
+
+const hasConflictingContactIdentity = (a: Partial<Salesperson>, b: Partial<Salesperson>): boolean => {
+  const eA = normalizeStaffEmailKey(a.email);
+  const eB = normalizeStaffEmailKey(b.email);
+  if (eA && eB && eA !== eB) return true;
+
+  const pA = normalizeStaffPhoneKey(a.phone);
+  const pB = normalizeStaffPhoneKey(b.phone);
+  if (pA.length >= 6 && pB.length >= 6 && pA !== pB) return true;
+
+  return false;
+};
+
+const migrateStaffReferencesInStore = (oldStaffId: string, newStaffId: string, canonicalName?: string): number => {
+  const cleanOld = String(oldStaffId || '').trim();
+  const cleanNew = String(newStaffId || '').trim();
+  if (!cleanOld || !cleanNew || cleanOld === cleanNew) return 0;
+
+  let migrated = 0;
+
+  const rewriteList = <T extends Record<string, any>>(key: string, fields: string[], defaultVal: T[] = []): void => {
+    const raw = getStored<T[]>(key, defaultVal);
+    if (!Array.isArray(raw) || raw.length === 0) return;
+    let changed = false;
+    const next = raw.map((item) => {
+      if (!item) return item;
+      let itemChanged = false;
+      const copy: Record<string, any> = { ...item };
+      for (const f of fields) {
+        if (String(copy[f] || '').trim() === cleanOld) {
+          copy[f] = cleanNew;
+          itemChanged = true;
+          migrated++;
+        }
+      }
+      if (itemChanged && canonicalName && 'staffName' in copy && !copy.staffName) {
+        copy.staffName = canonicalName;
+      }
+      if (itemChanged) changed = true;
+      return copy as T;
+    });
+    if (changed) {
+      setStored(key, next);
+    }
+  };
+
+  rewriteList(STORAGE_KEYS.SALES, ['staffId', 'staff_id'], INITIAL_SALES as any[]);
+  rewriteList(STORAGE_KEYS.CASH_COUNTS, ['staffId', 'staff_id'], []);
+  rewriteList(STORAGE_KEYS.CASH_LOGS, ['staffId', 'staff_id'], INITIAL_CASH_LOGS as any[]);
+  rewriteList(STORAGE_KEYS.CUSTOMER_CHANGES, ['staffId', 'staff_id'], INITIAL_CUSTOMER_CHANGES as any[]);
+  rewriteList(STORAGE_KEYS.CREDIT_SALES, ['staffId', 'staff_id'], INITIAL_CREDIT_SALES as any[]);
+  rewriteList(STORAGE_KEYS.EXPENSES, ['staffId', 'staff_id'], INITIAL_EXPENSES as any[]);
+  rewriteList(STORAGE_KEYS.CASH_LIFTS, ['cashierId', 'staffId'], []);
+  rewriteList(STORAGE_KEYS.ADMIN_SALES, ['staffId'], []);
+
+  // Direct GRVs can also reference receivedByStaffId or payments[].userId
+  const grvs = getStored<DirectGrv[]>(STORAGE_KEYS.DIRECT_GRVS, INITIAL_DIRECT_GRVS);
+  if (Array.isArray(grvs) && grvs.length > 0) {
+    let grvChanged = false;
+    const nextGrvs = grvs.map((g) => {
+      if (!g) return g;
+      let changed = false;
+      const copy: DirectGrv = { ...g };
+      if (String(copy.receivedByStaffId || '').trim() === cleanOld) {
+        copy.receivedByStaffId = cleanNew;
+        changed = true;
+        migrated++;
+      }
+      if (Array.isArray(copy.payments)) {
+        const nextPayments = copy.payments.map((p) => {
+          if (String(p.userId || '').trim() === cleanOld) {
+            changed = true;
+            migrated++;
+            return { ...p, userId: cleanNew };
+          }
+          return p;
+        });
+        if (changed) copy.payments = nextPayments;
+      }
+      if (changed) grvChanged = true;
+      return copy;
+    });
+    if (grvChanged) {
+      setStored(STORAGE_KEYS.DIRECT_GRVS, nextGrvs);
+    }
+  }
+
+  migrated += reassignMovementsStaffId(cleanOld, cleanNew);
+  return migrated;
+};
+
+export interface DuplicateStaffGroup {
+  companyKey: string;
+  normalizedName: string;
+  displayName: string;
+  profiles: Salesperson[];
+}
+
+export const getDuplicateSameNameStaffGroups = (companyId?: string): DuplicateStaffGroup[] => {
+  const all = companyId ? getSalespeopleForCompany(companyId) : getRawStoredSalespeople();
+  const buckets = new Map<string, Salesperson[]>();
+  for (const s of all) {
+    if (!s || !s.id) continue;
+    const nName = normalizeStaffNameKey(s.name);
+    if (!nName) continue;
+    const cKey = normStaffTenant(s.companyId || s.company_id);
+    const key = `${cKey}::${nName}`;
+    const list = buckets.get(key) || [];
+    list.push(s);
+    buckets.set(key, list);
+  }
+
+  const groups: DuplicateStaffGroup[] = [];
+  buckets.forEach((profiles, key) => {
+    if (profiles.length < 2) return;
+    // Partition into sub-clusters of compatible identities (no conflicting non-empty email/phone)
+    const clusters: Salesperson[][] = [];
+    for (const p of profiles) {
+      const targetCluster = clusters.find((cl) => cl.every((member) => !hasConflictingContactIdentity(member, p)));
+      if (targetCluster) {
+        targetCluster.push(p);
+      } else {
+        clusters.push([p]);
+      }
+    }
+    for (const cluster of clusters) {
+      if (cluster.length >= 2) {
+        const [companyKey, normalizedName] = key.split('::');
+        groups.push({
+          companyKey,
+          normalizedName,
+          displayName: cluster[0].name,
+          profiles: cluster,
+        });
+      }
+    }
+  });
+  return groups;
+};
+
+export const deduplicateSameNameStaffProfiles = (options?: {
+  companyId?: string;
+  broadcastTombstones?: boolean;
+}): {
+  mergedCount: number;
+  absorbedIds: string[];
+  summary: Array<{ keptId: string; keptName: string; absorbedIds: string[] }>;
+} => {
+  const groups = getDuplicateSameNameStaffGroups(options?.companyId);
+  if (groups.length === 0) {
+    return { mergedCount: 0, absorbedIds: [], summary: [] };
+  }
+
+  // Build exact-ID activity counter once across stores
+  const activityCounts = new Map<string, number>();
+  const bumpActivity = (rawId?: string, weight: number = 1) => {
+    const cid = String(rawId || '').trim();
+    if (!cid) return;
+    activityCounts.set(cid, (activityCounts.get(cid) || 0) + weight);
+  };
+
+  getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, INITIAL_SALES).forEach((s) => bumpActivity(s.staffId, 3));
+  getStored<CashCountRecord[]>(STORAGE_KEYS.CASH_COUNTS, []).forEach((c) => bumpActivity(c.staffId, 5));
+  getStored<CashLogEntry[]>(STORAGE_KEYS.CASH_LOGS, INITIAL_CASH_LOGS).forEach((l) => bumpActivity(l.staffId, 2));
+  getStored<CustomerChangeEntry[]>(STORAGE_KEYS.CUSTOMER_CHANGES, INITIAL_CUSTOMER_CHANGES).forEach((c) => bumpActivity(c.staffId, 1));
+  getStored<CreditSaleEntry[]>(STORAGE_KEYS.CREDIT_SALES, INITIAL_CREDIT_SALES).forEach((c) => bumpActivity(c.staffId, 1));
+  getStored<ExpenseEntry[]>(STORAGE_KEYS.EXPENSES, INITIAL_EXPENSES).forEach((e) => bumpActivity(e.staffId, 1));
+  getStored<CashLiftRecord[]>(STORAGE_KEYS.CASH_LIFTS, []).forEach((l) => bumpActivity(l.cashierId, 2));
+  getAllMovements().forEach((m) => bumpActivity(m.staffId, 1));
+
+  const scoreProfile = (s: Salesperson): number => {
+    const idStr = String(s.id || '').trim();
+    const act = activityCounts.get(idStr) || 0;
+    const isMasterShadow = idStr.toUpperCase() === 'USR-MASTER-001' ? 0 : 1;
+    const isActive = s.active === 'Y' ? 1 : 0;
+    const isShortLegacyId = idStr.length <= 12 && !/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(idStr) ? 1 : 0;
+    const ver = Number(s.version || 0);
+    return act * 100000 + isMasterShadow * 10000 + isActive * 1000 + isShortLegacyId * 100 + Math.min(ver, 99);
+  };
+
+  let allStaff = getRawStoredSalespeople();
+  const absorbedIdsAll: string[] = [];
+  const summary: Array<{ keptId: string; keptName: string; absorbedIds: string[] }> = [];
+  const sessionUser = getSessionUser();
+
+  for (const group of groups) {
+    const sorted = [...group.profiles].sort((a, b) => scoreProfile(b) - scoreProfile(a));
+    let canonical = sorted[0];
+    const duplicates = sorted.slice(1);
+    const absorbedForGroup: string[] = [];
+
+    for (const dup of duplicates) {
+      migrateStaffReferencesInStore(dup.id, canonical.id, canonical.name);
+
+      // Preserve newer PIN hash if duplicate had a newer custom PIN
+      const canonPinVer = Number(canonical.pinVersion || 0);
+      const dupPinVer = Number(dup.pinVersion || 0);
+      const canonPinTs = Number(canonical.pinUpdatedAt || canonical.updatedAt || 0);
+      const dupPinTs = Number(dup.pinUpdatedAt || dup.updatedAt || 0);
+      const useDupPin =
+        dup.pin_hash &&
+        (!canonical.pin_hash ||
+          dupPinVer > canonPinVer ||
+          (dupPinVer === canonPinVer && dupPinTs > canonPinTs));
+
+      // Merge branch assignments cleanly
+      const mergedAssignments = [...(canonical.branchAssignments || [])];
+      if (Array.isArray(dup.branchAssignments)) {
+        for (const ba of dup.branchAssignments) {
+          if (!mergedAssignments.some((existingBa) => existingBa.branchId === ba.branchId)) {
+            mergedAssignments.push(ba);
+          }
+        }
+      }
+
+      canonical = {
+        ...canonical,
+        email: canonical.email || dup.email,
+        phone: canonical.phone || dup.phone,
+        ...(mergedAssignments.length > 0 ? { branchAssignments: mergedAssignments } : {}),
+        ...(useDupPin
+          ? {
+              pin_hash: dup.pin_hash,
+              password: dup.pin_hash,
+              pin_salt: dup.pin_salt || canonical.pin_salt,
+              pinVersion: Math.max(canonPinVer, dupPinVer),
+              pinUpdatedAt: Math.max(canonPinTs, dupPinTs),
+            }
+          : {}),
+        version: Math.max(Number(canonical.version || 0), Number(dup.version || 0), 1),
+        mutationSource: 'USER_EDIT',
+        updatedAt: Math.max(Number(canonical.updatedAt || 0), Number(dup.updatedAt || 0), Date.now()),
+      };
+
+      allStaff = allStaff.filter((s) => String(s.id || '').trim() !== String(dup.id || '').trim());
+      absorbedForGroup.push(dup.id);
+      absorbedIdsAll.push(dup.id);
+
+      const tomb = recordTombstone('staff', dup.id, { fromSync: !options?.broadcastTombstones });
+      if (options?.broadcastTombstones) {
+        enqueueSync('Salespeople', 'DELETE', {
+          id: dup.id,
+          company_id: dup.company_id || dup.companyId || getCurrentCompanyId(),
+        });
+        dispatchTombstoneThroughSyncCore(tomb);
+      }
+
+      if (sessionUser && sessionUser.id === dup.id) {
+        setSessionUser(canonical);
+      }
+    }
+
+    // Update canonical entry in allStaff
+    allStaff = allStaff.map((s) => (String(s.id || '').trim() === String(canonical.id || '').trim() ? canonical : s));
+    if (options?.broadcastTombstones) {
+      notifyStaffChanged(canonical);
+    }
+    summary.push({
+      keptId: canonical.id,
+      keptName: canonical.name,
+      absorbedIds: absorbedForGroup,
+    });
+  }
+
+  if (absorbedIdsAll.length > 0) {
+    setStored(STORAGE_KEYS.SALESPEOPLE, allStaff);
+    notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_staff_updated'));
+    }
+  }
+
+  return {
+    mergedCount: absorbedIdsAll.length,
+    absorbedIds: absorbedIdsAll,
+    summary,
+  };
+};
+
 export const getNextSalespersonId = (): string => {
   return generateUUID();
 };
@@ -2465,6 +2896,11 @@ export const addSalesperson = (person: Omit<Salesperson, 'id'> & { id?: string }
     pin_hash: pinHash,
     password: pinHash,
     pin_salt: salt,
+    pinVersion: Number((person as any).pinVersion ?? 1),
+    pinUpdatedAt: Number((person as any).pinUpdatedAt ?? now),
+    version: Number((person as any).version ?? 1),
+    mutationSource: (person as any).mutationSource || 'USER_EDIT',
+    isDirty: true,
     updatedAt: (person as any).updatedAt || now,
     lastUpdated: (person as any).lastUpdated || new Date(now).toISOString(),
   } as Salesperson;
@@ -2531,25 +2967,117 @@ export const getOwnerDefaultPermissions = () => ({
   canManageStocktake: true,
 });
 
+const shouldRejectStaleStaffSync = (existingPerson: Salesperson | null, incoming: Partial<Salesperson>): boolean => {
+  const targetId = String(incoming.id || existingPerson?.id || '').trim().toUpperCase();
+  if (targetId) {
+    const incomingTsForTomb = parseTimestampMs(
+      (incoming as any).hubTimestamp ?? incoming.updatedAt ?? (incoming as any).updated_at ?? incoming.lastUpdated
+    );
+    const matchingTomb = getTombstones().find(
+      (t) =>
+        normalizeRoomTombstoneType(t.entityType) === 'staff' &&
+        String(t.entityId || '').trim().toUpperCase() === targetId
+    );
+    if (matchingTomb) {
+      const tombTs = Number(matchingTomb.deletedAt || 0);
+      if (tombTs > 0 && (incomingTsForTomb === 0 || tombTs >= incomingTsForTomb)) {
+        return true;
+      }
+    }
+  }
+
+  if (!existingPerson) return false;
+
+  const existingTs = parseTimestampMs(
+    (existingPerson as any).hubTimestamp ?? existingPerson.updatedAt ?? (existingPerson as any).updated_at ?? existingPerson.lastUpdated
+  );
+  const incomingTs = parseTimestampMs(
+    (incoming as any).hubTimestamp ?? incoming.updatedAt ?? (incoming as any).updated_at ?? incoming.lastUpdated
+  );
+  const existingVersion = Number(existingPerson.version || 0);
+  const incomingVersion = Number((incoming as any).version || 0);
+  const existingSource = String(
+    existingPerson.mutationSource || (existingVersion > 0 ? 'USER_EDIT' : '')
+  ).toUpperCase();
+  const incomingSource = String(
+    (incoming as any).mutationSource || (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : '')
+  ).toUpperCase();
+
+  // Seed or untimestamped payloads must NEVER overwrite user-edited or timestamped local staff
+  if (incomingSource === 'SEED' && (existingSource === 'USER_EDIT' || existingVersion > 0 || existingTs > 0)) {
+    return true;
+  }
+  if (incomingTs <= 0 && (existingTs > 0 || existingVersion > 0 || existingSource === 'USER_EDIT')) {
+    return true;
+  }
+  if (existingVersion > 0 && incomingVersion > 0) {
+    if (incomingVersion < existingVersion) return true;
+    if (incomingVersion === existingVersion && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
+      return true;
+    }
+    return false;
+  }
+  if (existingVersion > 0 && incomingVersion === 0 && existingSource === 'USER_EDIT') {
+    return incomingTs <= existingTs + 60000;
+  }
+  if (existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
+    return true;
+  }
+  return false;
+};
+
 export const saveSalesperson = (
   person: Salesperson,
   options?: { fromSync?: boolean; silent?: boolean; silentBroadcast?: boolean }
 ): Salesperson => {
   const all = getRawStoredSalespeople();
   const compId = person.companyId || person.company_id || getCurrentCompanyId();
-  const normalizedEmail = (person.email || '').trim().toLowerCase();
-  
-  // Find by ID, or by same email within same company
-  const index = all.findIndex((s) => {
-    if (s.id === person.id) return true;
-    const sComp = s.companyId || s.company_id;
-    if (normalizedEmail && s.email && s.email.trim().toLowerCase() === normalizedEmail && sComp === compId) {
-      return true;
-    }
-    return false;
-  });
+  const normComp = normStaffTenant(compId);
+  const normalizedEmail = normalizeStaffEmailKey(person.email);
+  const normalizedName = normalizeStaffNameKey(person.name);
+
+  // 1. Match by exact ID
+  let index = all.findIndex((s) => String(s.id || '').trim() === String(person.id || '').trim());
+
+  // 2. Match by email within same normalized company
+  if (index === -1 && normalizedEmail) {
+    index = all.findIndex((s) => {
+      const sComp = normStaffTenant(s.companyId || s.company_id);
+      return normalizeStaffEmailKey(s.email) === normalizedEmail && sComp === normComp;
+    });
+  }
+
+  // 3. When syncing from hub/cloud (or reconciling USR-MASTER-001), match compatible same-name profile in same company
+  // to prevent duplicate staff rows (e.g. UUID duplicate of seeded #005 TINASHE, or USR-MASTER-001 vs #001)
+  if (
+    index === -1 &&
+    normalizedName &&
+    (options?.fromSync || String(person.id || '').trim().toUpperCase() === 'USR-MASTER-001')
+  ) {
+    index = all.findIndex((s) => {
+      const sComp = normStaffTenant(s.companyId || s.company_id);
+      if (sComp !== normComp) return false;
+      if (normalizeStaffNameKey(s.name) !== normalizedName) return false;
+      return !hasConflictingContactIdentity(s, person);
+    });
+  }
 
   const existingPerson = index >= 0 ? all[index] : null;
+  const incomingAlternateId =
+    existingPerson && String(existingPerson.id || '').trim() !== String(person.id || '').trim()
+      ? String(person.id || '').trim()
+      : '';
+
+  // Defense-in-depth: block stale/seed/tombstoned overwrites even on direct fromSync saves
+  if (options?.fromSync && shouldRejectStaleStaffSync(existingPerson, person)) {
+    if (existingPerson) {
+      if (incomingAlternateId) {
+        migrateStaffReferencesInStore(incomingAlternateId, existingPerson.id, existingPerson.name);
+        recordTombstone('staff', incomingAlternateId, { fromSync: true });
+      }
+      return existingPerson;
+    }
+  }
 
   // Preserve existing permissions if sync did not provide new ones.
   // Never overwrite cashier permissions with owner defaults when pulling staff delta from server.
@@ -2560,22 +3088,74 @@ export const saveSalesperson = (
       ? getOwnerDefaultPermissions()
       : {});
 
-  // Secure One-Way PIN Hashing (SHA-256 with Salt)
-  const salt = person.pin_salt || existingPerson?.pin_salt || generatePinSalt();
-  let pinHash = (options?.fromSync && person.pin_hash) ? person.pin_hash : (person.pin_hash || existingPerson?.pin_hash);
+  const now = Date.now();
+  const incomingTs = parseTimestampMs(
+    (person as any).hubTimestamp ?? person.updatedAt ?? (person as any).updated_at ?? person.lastUpdated
+  );
+
+  // Secure One-Way PIN Hashing (SHA-256 with Salt) & Credential Isolation
+  const existingPinVersion = Number(existingPerson?.pinVersion || 0);
+  const incomingPinVersion = Number((person as any).pinVersion || 0);
+  const existingPinUpdatedAt = Number(existingPerson?.pinUpdatedAt || existingPerson?.updatedAt || 0);
+  const incomingPinUpdatedAt = Number((person as any).pinUpdatedAt || incomingTs || 0);
+
+  let salt = existingPerson?.pin_salt || person.pin_salt || generatePinSalt();
+  let pinHash = existingPerson?.pin_hash || person.pin_hash;
+  let pinVersion = existingPinVersion;
+  let pinUpdatedAt = existingPinUpdatedAt;
   let hasExplicitPinUpdate = false;
+
   if (person.pin && !options?.fromSync) {
     const rawPin = String(person.pin).trim();
     if (rawPin) {
+      salt = person.pin_salt || existingPerson?.pin_salt || generatePinSalt();
       pinHash = hashPin(rawPin, salt);
       hasExplicitPinUpdate = true;
+      pinVersion = Math.max(1, existingPinVersion + 1);
+      pinUpdatedAt = now;
+    }
+  } else if (options?.fromSync) {
+    if (!existingPerson?.pin_hash) {
+      // Brand new staff synced from peer/cloud
+      if (person.pin_hash) {
+        salt = person.pin_salt || generatePinSalt();
+        pinHash = person.pin_hash;
+      } else if (person.pin) {
+        salt = person.pin_salt || generatePinSalt();
+        pinHash = hashPin(String(person.pin).trim(), salt);
+      } else {
+        salt = person.pin_salt || generatePinSalt();
+        pinHash = hashPin('123456', salt);
+      }
+      pinVersion = incomingPinVersion || 1;
+      pinUpdatedAt = incomingPinUpdatedAt || incomingTs;
+    } else if (person.pin_hash) {
+      // Existing local staff: accept remote PIN hash ONLY if pinVersion/pinUpdatedAt is strictly not older
+      const canAcceptRemotePin =
+        incomingPinVersion > existingPinVersion ||
+        (incomingPinVersion === existingPinVersion &&
+          existingPinVersion > 0 &&
+          incomingPinUpdatedAt >= existingPinUpdatedAt) ||
+        (incomingPinVersion === 0 &&
+          existingPinVersion === 0 &&
+          incomingTs >= (Number(existingPerson.updatedAt) || 0));
+      if (canAcceptRemotePin) {
+        salt = person.pin_salt || existingPerson.pin_salt || salt;
+        pinHash = person.pin_hash;
+        pinVersion = Math.max(existingPinVersion, incomingPinVersion);
+        pinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
+      } else {
+        salt = existingPerson.pin_salt || salt;
+        pinHash = existingPerson.pin_hash;
+      }
     }
   } else if (!pinHash) {
     pinHash = hashPin('123456', salt);
     hasExplicitPinUpdate = true;
+    pinVersion = Math.max(1, existingPinVersion + 1);
+    pinUpdatedAt = now;
   }
 
-  const now = Date.now();
   const resolvedBranchId =
     person.branchId || person.branch_id || existingPerson?.branchId || existingPerson?.branch_id;
   const resolvedBranchAssignments =
@@ -2584,9 +3164,23 @@ export const saveSalesperson = (
     ? resolvedBranchAssignments.map((a) => a.branchId)
     : ((person as any).assignedBranchIds ?? (existingPerson as any)?.assignedBranchIds);
 
+  const nextVersion = options?.fromSync
+    ? Math.max(Number(existingPerson?.version || 0), Number((person as any).version || 0))
+    : Math.max(1, Number(existingPerson?.version || 0) + 1);
+  const nextMutationSource: 'SEED' | 'USER_EDIT' | 'MIGRATION' = options?.fromSync
+    ? ((person as any).mutationSource ||
+        existingPerson?.mutationSource ||
+        (incomingTs > 0 || nextVersion > 0 ? 'USER_EDIT' : 'SEED'))
+    : 'USER_EDIT';
+  const effectiveUpdatedAt = options?.fromSync
+    ? (incomingTs > 0 ? incomingTs : (Number(existingPerson?.updatedAt) || 0))
+    : now;
+
   const merged: Salesperson = {
     ...(existingPerson || {}),
     ...person,
+    // Preserve canonical existing ID whenever matched by email or same-name sync coalesce
+    id: existingPerson ? existingPerson.id : person.id,
     companyId: compId,
     company_id: compId,
     ...(resolvedBranchId ? { branchId: resolvedBranchId, branch_id: resolvedBranchId } : {}),
@@ -2596,13 +3190,20 @@ export const saveSalesperson = (
     password: hasExplicitPinUpdate
       ? pinHash
       : (options?.fromSync
-          ? ((person as any).password || pinHash)
+          ? pinHash
           : ((person as any).password || (person.pin_hash ? pinHash : (existingPerson as any)?.password) || pinHash)),
     pin_salt: salt,
+    pinVersion,
+    pinUpdatedAt,
+    version: nextVersion,
+    mutationSource: nextMutationSource,
+    isDirty: options?.fromSync ? false : true,
     active: person.active || existingPerson?.active || 'Y',
     permissions: resolvedPermissions,
-    updatedAt: options?.fromSync ? ((person as any).updatedAt || now) : now,
-    lastUpdated: options?.fromSync ? ((person as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
+    updatedAt: effectiveUpdatedAt,
+    lastUpdated: effectiveUpdatedAt > 0
+      ? ((options?.fromSync && person.lastUpdated) || new Date(effectiveUpdatedAt).toISOString())
+      : (existingPerson?.lastUpdated || ''),
   };
   // Permanently strip plain-text PIN and transient sync flags so future local edits always broadcast
   delete (merged as any).pin;
@@ -2614,6 +3215,16 @@ export const saveSalesperson = (
     delete (all[index] as any).fromMesh;
     delete (all[index] as any).fromSync;
     setStored(STORAGE_KEYS.SALESPEOPLE, all);
+    if (incomingAlternateId) {
+      migrateStaffReferencesInStore(incomingAlternateId, all[index].id, all[index].name);
+      recordTombstone('staff', incomingAlternateId, { fromSync: true });
+    }
+    if (!options?.fromSync) {
+      const currentSession = getSessionUser();
+      if (currentSession && currentSession.id === all[index].id) {
+        setSessionUser(all[index]);
+      }
+    }
     if (!options?.fromSync && !options?.silentBroadcast) {
       notifyStaffChanged(all[index]);
     }
@@ -2648,28 +3259,72 @@ export const updateSalesperson = (
   if (index === -1) return null;
 
   const current = all[index];
-  const salt = updates.pin_salt || current.pin_salt || generatePinSalt();
-  let pinHash = updates.pin_hash || current.pin_hash;
+  if (options?.fromSync && shouldRejectStaleStaffSync(current, { ...updates, id })) {
+    return current;
+  }
+
+  const now = Date.now();
+  const incomingTs = parseTimestampMs(
+    (updates as any).hubTimestamp ?? updates.updatedAt ?? (updates as any).updated_at ?? updates.lastUpdated
+  );
+  const existingPinVersion = Number(current.pinVersion || 0);
+  const incomingPinVersion = Number((updates as any).pinVersion || 0);
+  const existingPinUpdatedAt = Number(current.pinUpdatedAt || current.updatedAt || 0);
+  const incomingPinUpdatedAt = Number((updates as any).pinUpdatedAt || incomingTs || 0);
+
+  let salt = current.pin_salt || updates.pin_salt || generatePinSalt();
+  let pinHash = current.pin_hash || updates.pin_hash;
+  let pinVersion = existingPinVersion;
+  let pinUpdatedAt = existingPinUpdatedAt;
   let hasExplicitPinUpdate = false;
 
-  if (updates.pin) {
+  if (updates.pin && !options?.fromSync) {
     const rawPin = String(updates.pin).trim();
     if (rawPin) {
+      salt = updates.pin_salt || current.pin_salt || generatePinSalt();
       pinHash = hashPin(rawPin, salt);
       hasExplicitPinUpdate = true;
+      pinVersion = Math.max(1, existingPinVersion + 1);
+      pinUpdatedAt = now;
+    }
+  } else if (options?.fromSync && updates.pin_hash && current.pin_hash) {
+    const canAcceptRemotePin =
+      incomingPinVersion > existingPinVersion ||
+      (incomingPinVersion === existingPinVersion &&
+        existingPinVersion > 0 &&
+        incomingPinUpdatedAt >= existingPinUpdatedAt) ||
+      (incomingPinVersion === 0 &&
+        existingPinVersion === 0 &&
+        incomingTs >= (Number(current.updatedAt) || 0));
+    if (canAcceptRemotePin) {
+      salt = updates.pin_salt || current.pin_salt || salt;
+      pinHash = updates.pin_hash;
+      pinVersion = Math.max(existingPinVersion, incomingPinVersion);
+      pinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
+    } else {
+      salt = current.pin_salt || salt;
+      pinHash = current.pin_hash;
     }
   } else if (!pinHash) {
     pinHash = hashPin('123456', salt);
     hasExplicitPinUpdate = true;
+    pinVersion = Math.max(1, existingPinVersion + 1);
+    pinUpdatedAt = now;
   }
 
-  const now = Date.now();
   const nextBranchId = updates.branchId || updates.branch_id || current.branchId || current.branch_id;
   const nextAssignments =
     updates.branchAssignments !== undefined ? updates.branchAssignments : current.branchAssignments;
   const nextAssignedBranchIds = Array.isArray(nextAssignments) && nextAssignments.length > 0
     ? nextAssignments.map((a) => a.branchId)
     : ((updates as any).assignedBranchIds ?? (current as any).assignedBranchIds);
+
+  const nextVersion = options?.fromSync
+    ? Math.max(Number(current.version || 0), Number((updates as any).version || 0))
+    : Math.max(1, Number(current.version || 0) + 1);
+  const effectiveUpdatedAt = options?.fromSync
+    ? (incomingTs > 0 ? incomingTs : (Number(current.updatedAt) || 0))
+    : now;
 
   const updatedPerson: Salesperson = {
     ...current,
@@ -2680,10 +3335,19 @@ export const updateSalesperson = (
     pin_hash: pinHash,
     password: hasExplicitPinUpdate
       ? pinHash
-      : ((updates as any).password || (updates.pin_hash ? pinHash : (current as any)?.password) || pinHash),
+      : (options?.fromSync ? pinHash : ((updates as any).password || (updates.pin_hash ? pinHash : (current as any)?.password) || pinHash)),
     pin_salt: salt,
-    updatedAt: options?.fromSync ? ((updates as any).updatedAt || now) : now,
-    lastUpdated: options?.fromSync ? ((updates as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
+    pinVersion,
+    pinUpdatedAt,
+    version: nextVersion,
+    mutationSource: options?.fromSync
+      ? ((updates as any).mutationSource || current.mutationSource || 'USER_EDIT')
+      : 'USER_EDIT',
+    isDirty: options?.fromSync ? false : true,
+    updatedAt: effectiveUpdatedAt,
+    lastUpdated: effectiveUpdatedAt > 0
+      ? ((options?.fromSync && updates.lastUpdated) || new Date(effectiveUpdatedAt).toISOString())
+      : (current.lastUpdated || ''),
   };
   delete (updatedPerson as any).pin;
   delete (updatedPerson as any).fromMesh;
@@ -3599,7 +4263,7 @@ export const isValidBranchRecord = (rec: any): boolean => {
   }
 
   // Must have an identifier
-  const bId = rec.branchId || rec.id || rec.branch_id;
+  const bId = rec.branchId || rec.id || rec.branch_id || rec.BranchID;
   return Boolean(bId);
 };
 
@@ -3630,24 +4294,62 @@ export const sanitizeBranchesTable = (): void => {
   }
 };
 
-// Clean duplicate branch entries without deleting genuine secondary or tertiary branches
+const isMainBranchIdAlias = (rawId?: string): boolean => {
+  const clean = String(rawId || '').trim().toLowerCase();
+  return clean === '1' || clean === 'br-main' || clean === 'br001';
+};
+
+const canonicalizeBranchId = (rawId?: string): string => {
+  const clean = String(rawId || '').trim();
+  if (!clean) return 'BR-MAIN';
+  return isMainBranchIdAlias(clean) ? 'BR-MAIN' : clean;
+};
+
+const normBranchTenant = (comp?: string): string => {
+  const clean = String(comp || '').trim().toUpperCase();
+  if (!clean || clean === 'COMP-001' || clean === 'COMP-MASTER' || clean === 'DEFAULT') {
+    return 'COMP-001';
+  }
+  return clean;
+};
+
+const isPlaceholderBranchName = (name?: string): boolean => {
+  const clean = String(name || '').trim().toLowerCase();
+  return !clean || clean === 'branch' || clean === 'main branch' || clean === 'unnamed branch';
+};
+
+const isPlaceholderBranchCode = (code?: string, id?: string): boolean => {
+  const clean = String(code || '').trim().toLowerCase();
+  const cleanId = String(id || '').trim().toLowerCase();
+  return !clean || (cleanId.length > 0 && clean === cleanId) || clean === 'branch';
+};
+
+const extractBranchName = (b: any): string =>
+  String(b?.name || b?.branch_name || b?.branchName || b?.Name || '').trim();
+
+const extractBranchCode = (b: any): string =>
+  String(b?.code || b?.branch_code || b?.branchCode || b?.Code || '').trim();
+
+const extractBranchLocation = (b: any): string =>
+  String(b?.location || b?.address || b?.branch_address || b?.Location || b?.Address || '').trim();
+
+const findSeedBranch = (canonicalId: string, normComp: string): Branch | undefined =>
+  INITIAL_BRANCHES.find(
+    (ib) =>
+      canonicalizeBranchId(ib.branchId).toUpperCase() === canonicalId.toUpperCase() &&
+      normBranchTenant(ib.company_id || ib.companyId) === normComp
+  );
+
+// Clean duplicate branch entries without deleting genuine secondary or tertiary branches or resurrecting tombstoned ones
 export const cleanPhantomBranchDuplicates = (): void => {
   sanitizeBranchesTable();
   const stored = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
-  const deletedRegistry = new Set<string>(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
+  const deletedRegistry = new Set<string>(
+    getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []).map((d) => canonicalizeBranchId(d).toUpperCase())
+  );
 
-  // Remove valid initial branches from deletedRegistry if they were wrongfully added previously
-  let registryChanged = false;
-  for (const initB of INITIAL_BRANCHES) {
-    if (deletedRegistry.has(initB.branchId)) {
-      deletedRegistry.delete(initB.branchId);
-      registryChanged = true;
-    }
-  }
-
-  // Deduplicate only duplicate branch IDs and discard invalid schemas
-  const seenIds = new Set<string>();
-  const keptBranches: Branch[] = [];
+  const byId = new Map<string, Branch>();
+  const codeKeyToIdKey = new Map<string, string>();
   let hadDuplicates = false;
 
   for (const b of stored) {
@@ -3655,42 +4357,111 @@ export const cleanPhantomBranchDuplicates = (): void => {
       hadDuplicates = true;
       continue;
     }
-    const rawId = (b.branchId || b.id || (b as any).branch_id || '').trim();
+    const rawId = String(b.branchId || b.id || (b as any).branch_id || (b as any).BranchID || '').trim();
     if (!rawId) continue;
-    const isMainAlias = rawId === '1' || rawId.toLowerCase() === 'br-main';
-    const canonicalId = isMainAlias ? 'BR-MAIN' : rawId;
-    const bId = canonicalId.toLowerCase();
-    if (seenIds.has(bId)) {
+    const isMainAlias = isMainBranchIdAlias(rawId);
+    const canonicalId = canonicalizeBranchId(rawId);
+    if (canonicalId !== rawId) hadDuplicates = true;
+
+    if (deletedRegistry.has(canonicalId.toUpperCase()) || deletedRegistry.has(rawId.toUpperCase())) {
       hadDuplicates = true;
       continue;
     }
-    seenIds.add(bId);
-    keptBranches.push({
+
+    const rawComp = b.company_id || b.companyId || (b as any).CompanyID || 'COMP-001';
+    const normComp = normBranchTenant(rawComp);
+    const seedMatch = findSeedBranch(canonicalId, normComp);
+
+    const rawName = extractBranchName(b);
+    const rawCode = extractBranchCode(b);
+    const rawLoc = extractBranchLocation(b);
+
+    const resolvedName =
+      rawName && !(seedMatch && isPlaceholderBranchName(rawName))
+        ? rawName
+        : seedMatch?.name || (isMainAlias ? 'Head Office - Main Central Distribution & Warehouse' : rawName || 'Main Branch');
+    const resolvedCode =
+      rawCode && !(seedMatch && (isPlaceholderBranchCode(rawCode, canonicalId) || (!isMainAlias && rawCode.toUpperCase() === 'HQ-01' && seedMatch.code !== 'HQ-01')))
+        ? rawCode
+        : seedMatch?.code || (isMainAlias ? 'HQ-01' : canonicalId);
+    const resolvedLoc =
+      rawLoc || seedMatch?.location || '4th Street Commercial Center, Harare';
+
+    const normalizedRec: Branch = {
       ...b,
       branchId: canonicalId,
       id: canonicalId,
       branch_id: canonicalId,
-      name: isMainAlias ? (b.name || 'Head Office - Main Central Distribution & Warehouse') : b.name,
-      code: isMainAlias ? (b.code || 'HQ-01') : b.code,
-    });
+      companyId: normComp,
+      company_id: normComp,
+      name: resolvedName,
+      code: resolvedCode,
+      location: resolvedLoc,
+      address: resolvedLoc,
+    };
+
+    const idKey = `${normComp}::${canonicalId.toUpperCase()}`;
+    const codeKey = !isPlaceholderBranchCode(resolvedCode, canonicalId)
+      ? `${normComp}::CODE::${resolvedCode.toUpperCase()}`
+      : '';
+
+    const dupIdKey = byId.has(idKey) ? idKey : (codeKey ? codeKeyToIdKey.get(codeKey) : undefined);
+    if (dupIdKey && byId.has(dupIdKey)) {
+      hadDuplicates = true;
+      const prev = byId.get(dupIdKey)!;
+      const prevTime = parseTimestampMs(prev.updatedAt || prev.lastUpdated);
+      const currTime = parseTimestampMs(normalizedRec.updatedAt || normalizedRec.lastUpdated);
+      const prevIsMain = prev.branchId === 'BR-MAIN';
+      const currIsMain = normalizedRec.branchId === 'BR-MAIN';
+      const preferCurrent =
+        (currIsMain && !prevIsMain) ||
+        (currIsMain === prevIsMain && currTime > prevTime) ||
+        (isPlaceholderBranchName(prev.name) && !isPlaceholderBranchName(normalizedRec.name));
+
+      const winner = preferCurrent ? normalizedRec : prev;
+      const loser = preferCurrent ? prev : normalizedRec;
+      const mergedName = !isPlaceholderBranchName(winner.name)
+        ? winner.name
+        : !isPlaceholderBranchName(loser.name)
+        ? loser.name
+        : winner.name;
+      const mergedCode = !isPlaceholderBranchCode(winner.code, winner.branchId)
+        ? winner.code
+        : !isPlaceholderBranchCode(loser.code, loser.branchId)
+        ? loser.code
+        : winner.code;
+      const mergedLoc = winner.location || loser.location || '4th Street Commercial Center, Harare';
+
+      const targetKey = dupIdKey;
+      byId.set(targetKey, {
+        ...loser,
+        ...winner,
+        name: mergedName,
+        code: mergedCode,
+        location: mergedLoc,
+        address: mergedLoc,
+      });
+      continue;
+    }
+
+    byId.set(idKey, normalizedRec);
+    if (codeKey) codeKeyToIdKey.set(codeKey, idKey);
   }
 
-  if (hadDuplicates || registryChanged) {
-    if (registryChanged) {
-      setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, Array.from(deletedRegistry));
-    }
-    if (hadDuplicates) {
-      setStored(STORAGE_KEYS.BRANCHES, keptBranches);
-    }
+  const keptBranches = Array.from(byId.values());
+  if (hadDuplicates || keptBranches.length !== stored.length) {
+    setStored(STORAGE_KEYS.BRANCHES, keptBranches);
     notifyListeners();
   }
 };
 
 export const getAllBranches = (): Branch[] => {
   const stored = getStored<Branch[]>(STORAGE_KEYS.BRANCHES, INITIAL_BRANCHES);
-  const deletedIds = new Set<string>(getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []));
-  const seenIds = new Set<string>();
-  const deduplicated: Branch[] = [];
+  const deletedIds = new Set<string>(
+    getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []).map((d) => canonicalizeBranchId(d).toUpperCase())
+  );
+  const byId = new Map<string, Branch>();
+  const codeKeyToIdKey = new Map<string, string>();
   let hadDuplicates = false;
 
   for (const b of stored) {
@@ -3698,28 +4469,36 @@ export const getAllBranches = (): Branch[] => {
       hadDuplicates = true;
       continue;
     }
-    const rawId = (b.branchId || b.id || (b as any).branch_id || '').trim();
+    const rawId = String(b.branchId || b.id || (b as any).branch_id || (b as any).BranchID || '').trim();
     if (!rawId) continue;
-    const isMainAlias = rawId === '1' || rawId.toLowerCase() === 'br-main';
-    const id = isMainAlias ? 'BR-MAIN' : rawId;
-    // Discard any permanently deleted branch
-    if (deletedIds.has(id) || deletedIds.has(rawId)) {
-      hadDuplicates = true;
-      continue;
-    }
-    if (seenIds.has(id.toLowerCase())) {
-      hadDuplicates = true;
-      continue;
-    }
-    seenIds.add(id.toLowerCase());
-    const branchName = isMainAlias
-      ? (b.name || 'Head Office - Main Central Distribution & Warehouse')
-      : (b.name || (b as any).branch_name || (b as any).branchName || 'Main Branch');
-    const branchAddress = b.location || (b as any).address || (b as any).branch_address || '4th Street Commercial Center, Harare';
-    const branchCode = isMainAlias ? (b.code || 'HQ-01') : (b.code || (b as any).branch_code || 'HQ-01');
-    const compId = b.company_id || b.companyId || 'COMP-001';
+    const isMainAlias = isMainBranchIdAlias(rawId);
+    const id = canonicalizeBranchId(rawId);
+    if (id !== rawId) hadDuplicates = true;
 
-    deduplicated.push({
+    // Discard any permanently deleted branch
+    if (deletedIds.has(id.toUpperCase()) || deletedIds.has(rawId.toUpperCase())) {
+      hadDuplicates = true;
+      continue;
+    }
+
+    const compId = normBranchTenant(b.company_id || b.companyId || (b as any).CompanyID);
+    const seedMatch = findSeedBranch(id, compId);
+
+    const rawName = extractBranchName(b);
+    const rawCode = extractBranchCode(b);
+    const rawLoc = extractBranchLocation(b);
+
+    const branchName =
+      rawName && !(seedMatch && isPlaceholderBranchName(rawName))
+        ? rawName
+        : seedMatch?.name || (isMainAlias ? 'Head Office - Main Central Distribution & Warehouse' : rawName || id);
+    const branchCode =
+      rawCode && !(seedMatch && (isPlaceholderBranchCode(rawCode, id) || (!isMainAlias && rawCode.toUpperCase() === 'HQ-01' && seedMatch.code !== 'HQ-01')))
+        ? rawCode
+        : seedMatch?.code || (isMainAlias ? 'HQ-01' : id);
+    const branchAddress = rawLoc || seedMatch?.location || '4th Street Commercial Center, Harare';
+
+    const hydrated: Branch = {
       ...b,
       branchId: id,
       id: id,
@@ -3730,23 +4509,56 @@ export const getAllBranches = (): Branch[] => {
       code: branchCode,
       companyId: compId,
       company_id: compId,
-    });
+    };
+
+    const idKey = `${compId}::${id.toUpperCase()}`;
+    const codeKey = !isPlaceholderBranchCode(branchCode, id)
+      ? `${compId}::CODE::${branchCode.toUpperCase()}`
+      : '';
+    const dupKey = byId.has(idKey) ? idKey : (codeKey ? codeKeyToIdKey.get(codeKey) : undefined);
+
+    if (dupKey && byId.has(dupKey)) {
+      hadDuplicates = true;
+      const prev = byId.get(dupKey)!;
+      const prevTime = parseTimestampMs(prev.updatedAt || prev.lastUpdated);
+      const currTime = parseTimestampMs(hydrated.updatedAt || hydrated.lastUpdated);
+      const preferCurrent =
+        (hydrated.branchId === 'BR-MAIN' && prev.branchId !== 'BR-MAIN') ||
+        (hydrated.branchId === prev.branchId && currTime > prevTime) ||
+        (isPlaceholderBranchName(prev.name) && !isPlaceholderBranchName(hydrated.name));
+      const winner = preferCurrent ? hydrated : prev;
+      const loser = preferCurrent ? prev : hydrated;
+      byId.set(dupKey, {
+        ...loser,
+        ...winner,
+        name: !isPlaceholderBranchName(winner.name) ? winner.name : loser.name,
+        code: !isPlaceholderBranchCode(winner.code, winner.branchId) ? winner.code : loser.code,
+        location: winner.location || loser.location,
+        address: winner.location || loser.location,
+      });
+      continue;
+    }
+
+    byId.set(idKey, hydrated);
+    if (codeKey) codeKeyToIdKey.set(codeKey, idKey);
   }
 
   // Ensure initial seed branches are included only if not explicitly deleted
   for (const initB of INITIAL_BRANCHES) {
-    const rawId = (initB.branchId || initB.id || '').trim();
-    const isMainAlias = rawId === '1' || rawId.toLowerCase() === 'br-main';
-    const id = isMainAlias ? 'BR-MAIN' : rawId;
-    if (!seenIds.has(id.toLowerCase()) && !deletedIds.has(id) && !deletedIds.has(rawId)) {
-      seenIds.add(id.toLowerCase());
+    const rawId = String(initB.branchId || initB.id || '').trim();
+    const id = canonicalizeBranchId(rawId);
+    const compId = normBranchTenant(initB.company_id || initB.companyId);
+    const idKey = `${compId}::${id.toUpperCase()}`;
+    if (!byId.has(idKey) && !deletedIds.has(id.toUpperCase()) && !deletedIds.has(rawId.toUpperCase())) {
       const branchName = initB.name || (initB as any).branch_name || 'Main Branch';
       const branchAddress = initB.location || (initB as any).address || '4th Street Commercial Center, Harare';
-      deduplicated.push({
+      byId.set(idKey, {
         ...initB,
         branchId: id,
         id: id,
         branch_id: id,
+        companyId: compId,
+        company_id: compId,
         name: branchName,
         location: branchAddress,
         address: branchAddress,
@@ -3755,6 +4567,7 @@ export const getAllBranches = (): Branch[] => {
     }
   }
 
+  const deduplicated = Array.from(byId.values());
   if (hadDuplicates || deduplicated.length !== stored.length) {
     setStored(STORAGE_KEYS.BRANCHES, deduplicated);
   }
@@ -3762,38 +4575,53 @@ export const getAllBranches = (): Branch[] => {
 };
 
 export const getBranches = (): Branch[] => {
-  const currentCompany = getCurrentCompanyId();
-  const sessionUser = getSessionUser();
+  const targetNorm = normBranchTenant(getCurrentCompanyId());
   const all = getAllBranches();
-  if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
-    return all;
-  }
+  const seenIds = new Set<string>();
+  const seenCodes = new Set<string>();
   return all.filter((b) => {
-    const compId = b.company_id || b.companyId;
-    if (!compId) return currentCompany === 'COMP-001' || currentCompany === 'COMP-MASTER';
-    return compId === currentCompany;
+    const compNorm = normBranchTenant(b.company_id || b.companyId);
+    if (compNorm !== targetNorm) return false;
+    const id = canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase();
+    if (seenIds.has(id)) return false;
+    seenIds.add(id);
+    const codeUpper = String(b.code || '').trim().toUpperCase();
+    if (codeUpper && !isPlaceholderBranchCode(b.code, id)) {
+      if (seenCodes.has(codeUpper)) return false;
+      seenCodes.add(codeUpper);
+    }
+    return true;
   });
 };
 
 export const getBranchesForCompany = (companyId?: string): Branch[] => {
-  const targetCompany = companyId || getCurrentCompanyId();
+  const targetNorm = normBranchTenant(companyId || getCurrentCompanyId());
   const all = getAllBranches();
   const seenIds = new Set<string>();
+  const seenCodes = new Set<string>();
   return all.filter((b) => {
-    const compId = b.company_id || b.companyId;
-    const matchesCompany = !compId
-      ? targetCompany === 'COMP-001' || targetCompany === 'COMP-MASTER'
-      : compId === targetCompany;
-    if (!matchesCompany) return false;
-    const id = b.branchId || b.id || (b as any).branch_id;
+    const compNorm = normBranchTenant(b.company_id || b.companyId);
+    if (compNorm !== targetNorm) return false;
+    const id = canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase();
     if (seenIds.has(id)) return false;
     seenIds.add(id);
+    const codeUpper = String(b.code || '').trim().toUpperCase();
+    if (codeUpper && !isPlaceholderBranchCode(b.code, id)) {
+      if (seenCodes.has(codeUpper)) return false;
+      seenCodes.add(codeUpper);
+    }
     return true;
   });
 };
 
 export const getBranchById = (branchId: string): Branch | undefined => {
-  return getAllBranches().find((b) => b.branchId === branchId || b.code === branchId);
+  const cleanCanonical = canonicalizeBranchId(branchId).toUpperCase();
+  const cleanRaw = String(branchId || '').trim().toUpperCase();
+  return getAllBranches().find(
+    (b) =>
+      canonicalizeBranchId(b.branchId).toUpperCase() === cleanCanonical ||
+      String(b.code || '').trim().toUpperCase() === cleanRaw
+  );
 };
 
 /**
@@ -3801,7 +4629,7 @@ export const getBranchById = (branchId: string): Branch | undefined => {
  * Ensures complete reliability across all transaction queries (Sales, CashLogs, CashCounts, CreditSales, Reconciliations, GRVs).
  * 1. If targetBranchId is 'ALL', all tenant records match without leakage.
  * 2. If the company only has 1 branch (single-branch business), all records belonging to this company match (zero lost transactions).
- * 3. Handles all canonical aliases ('1', 'BR-MAIN', 'HQ-01', 'SAI-01', lowercase, whitespace trimmed).
+ * 3. Handles all canonical aliases ('1', 'BR-MAIN', 'BR001', 'HQ-01', 'SAI-01', lowercase, whitespace trimmed).
  * 4. Unassigned legacy records match the main/HQ branch.
  */
 export const isRecordInBranchScope = (
@@ -3815,9 +4643,9 @@ export const isRecordInBranchScope = (
 
   // Strict company isolation: if both companies are present and neither is COMP-MASTER, they must match
   if (recordCompanyId && targetCompanyId) {
-    const cleanRecComp = recordCompanyId.trim().toUpperCase();
-    const cleanTgtComp = targetCompanyId.trim().toUpperCase();
-    if (cleanRecComp !== 'COMP-MASTER' && cleanTgtComp !== 'COMP-MASTER' && cleanRecComp !== cleanTgtComp) {
+    const cleanRecComp = normBranchTenant(recordCompanyId);
+    const cleanTgtComp = normBranchTenant(targetCompanyId);
+    if (cleanRecComp !== cleanTgtComp) {
       return false;
     }
   }
@@ -3849,15 +4677,18 @@ export const isRecordInBranchScope = (
   // Main / HQ canonical aliases (ONLY apply if the target itself is a canonical main branch)
   const isTargetMain =
     cleanTarget === 'br-main' ||
+    cleanTarget === 'br001' ||
     cleanTarget === 'hq-01' ||
     cleanTarget === '1' ||
     cleanTarget === 'sai-01' ||
     targetAliases.has('br-main') ||
+    targetAliases.has('br001') ||
     targetAliases.has('hq-01') ||
     targetAliases.has('sai-01');
 
   if (isTargetMain) {
     targetAliases.add('br-main');
+    targetAliases.add('br001');
     targetAliases.add('hq-01');
     targetAliases.add('1');
     targetAliases.add('sai-01');
@@ -3868,6 +4699,7 @@ export const isRecordInBranchScope = (
     if (
       isTargetMain &&
       (cleanRecord === 'br-main' ||
+        cleanRecord === 'br001' ||
         cleanRecord === 'hq-01' ||
         cleanRecord === '1' ||
         cleanRecord === 'sai-01')
@@ -3891,35 +4723,105 @@ export const saveBranch = (
   }
   const branches = getAllBranches();
   const currentCompany = getCurrentCompanyId();
-  const compId = branch.company_id || branch.companyId || currentCompany;
-  const id = branch.branchId || branch.id || (branch as any).branch_id || 'BR-MAIN';
+  const rawComp = branch.company_id || branch.companyId || (branch as any).CompanyID || currentCompany;
+  const compId = normBranchTenant(rawComp);
+  const rawId = String(branch.branchId || branch.id || (branch as any).branch_id || (branch as any).BranchID || 'BR-MAIN').trim();
+  const id = canonicalizeBranchId(rawId);
   const now = Date.now();
-  const normalized: Branch = {
-    ...branch,
-    branchId: id,
-    id: id,
-    branch_id: id,
-    company_id: compId,
-    companyId: compId,
-    updatedAt: options?.fromSync ? ((branch as any).updatedAt || now) : now,
-    lastUpdated: options?.fromSync ? ((branch as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
-  };
+  const incomingTs = parseTimestampMs((branch as any).updatedAt || (branch as any).updated_at || (branch as any).lastUpdated || (branch as any).hubTimestamp);
 
-  // If saved explicitly by user, remove from deletion tombstone
-  if (!options?.fromSync) {
+  if (options?.fromSync) {
     const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
-    if (deletedList.includes(id)) {
-      const filteredDeleted = deletedList.filter((d) => d !== id);
+    const isInDeleted = deletedList.some((d) => canonicalizeBranchId(d).toUpperCase() === id.toUpperCase());
+    const tomb = getTombstones().find(
+      (t) =>
+        normalizeRoomTombstoneType(t.entityType) === 'branch' &&
+        canonicalizeBranchId(t.entityId).toUpperCase() === id.toUpperCase()
+    );
+    const tombDelAt = tomb ? Number(tomb.deletedAt || 0) : 0;
+    if (isInDeleted && (incomingTs === 0 || tombDelAt >= incomingTs)) {
+      return;
+    }
+  } else {
+    const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
+    if (deletedList.some((d) => canonicalizeBranchId(d).toUpperCase() === id.toUpperCase())) {
+      const filteredDeleted = deletedList.filter((d) => canonicalizeBranchId(d).toUpperCase() !== id.toUpperCase());
       setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, filteredDeleted);
     }
   }
 
-  const index = branches.findIndex(
+  const incomingName = extractBranchName(branch);
+  const incomingCode = extractBranchCode(branch);
+  const incomingLoc = extractBranchLocation(branch);
+
+  // Match existing record by canonical ID (in same tenant) OR same non-placeholder code in the same tenant
+  let index = branches.findIndex(
     (b) =>
-      b.branchId === id ||
-      b.id === id ||
-      (b as any).branch_id === id
+      normBranchTenant(b.company_id || b.companyId) === compId &&
+      canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase() === id.toUpperCase()
   );
+  if (index < 0 && incomingCode && !isPlaceholderBranchCode(incomingCode, id)) {
+    index = branches.findIndex(
+      (b) =>
+        normBranchTenant(b.company_id || b.companyId) === compId &&
+        String(b.code || '').trim().toUpperCase() === incomingCode.toUpperCase()
+    );
+  }
+  // Fallback cross-id check for non-COMP-001 custom IDs only if tenant matches or was unspecified
+  if (index < 0) {
+    index = branches.findIndex(
+      (b) =>
+        canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase() === id.toUpperCase() &&
+        normBranchTenant(b.company_id || b.companyId) === compId
+    );
+  }
+
+  const existing = index >= 0 ? branches[index] : undefined;
+  const seedMatch = findSeedBranch(id, compId);
+
+  const resolvedId = existing ? canonicalizeBranchId(existing.branchId || id) : id;
+  const resolvedName = options?.fromSync
+    ? (!isPlaceholderBranchName(incomingName)
+        ? incomingName
+        : existing && !isPlaceholderBranchName(existing.name)
+        ? existing.name
+        : seedMatch?.name || incomingName || existing?.name || 'Main Branch')
+    : (incomingName || existing?.name || seedMatch?.name || 'Main Branch');
+
+  const resolvedCode = options?.fromSync
+    ? (!isPlaceholderBranchCode(incomingCode, resolvedId)
+        ? incomingCode
+        : existing && !isPlaceholderBranchCode(existing.code, resolvedId)
+        ? existing.code
+        : seedMatch?.code || incomingCode || existing?.code || resolvedId)
+    : (incomingCode || existing?.code || seedMatch?.code || resolvedId);
+
+  const resolvedLoc =
+    incomingLoc || existing?.location || existing?.address || seedMatch?.location || '4th Street Commercial Center, Harare';
+
+  const existingTs = existing ? parseTimestampMs(existing.updatedAt || existing.lastUpdated) : 0;
+  const effectiveTs = options?.fromSync ? (incomingTs || existingTs || 0) : now;
+
+  const normalized: Branch = {
+    ...(existing || {}),
+    ...branch,
+    branchId: resolvedId,
+    id: resolvedId,
+    branch_id: resolvedId,
+    name: resolvedName,
+    code: resolvedCode,
+    location: resolvedLoc,
+    address: resolvedLoc,
+    company_id: compId,
+    companyId: compId,
+    ...(effectiveTs > 0
+      ? {
+          updatedAt: effectiveTs,
+          lastUpdated: new Date(effectiveTs).toISOString(),
+        }
+      : {}),
+  };
+
   let updated: Branch[];
   if (index >= 0) {
     updated = [...branches];
@@ -3945,23 +4847,23 @@ export const saveBranch = (
 };
 
 export const deleteBranch = (branchId: string, options?: { fromSync?: boolean }): boolean => {
-  const cleanId = String(branchId || '').trim();
+  const cleanId = canonicalizeBranchId(branchId);
   const cleanUpper = cleanId.toUpperCase();
+  const rawUpper = String(branchId || '').trim().toUpperCase();
   // 1. Add to permanent deleted tombstones
   const tomb = recordTombstone('branch', cleanId, options);
   const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
-  if (!deletedList.includes(cleanId)) {
+  if (!deletedList.some((d) => canonicalizeBranchId(d).toUpperCase() === cleanUpper)) {
     setStored(STORAGE_KEYS.DELETED_BRANCH_IDS, [...deletedList, cleanId]);
   }
 
   // 2. Remove from local store
   const branches = getAllBranches();
-  const filtered = branches.filter(
-    (b) =>
-      String(b.branchId || '').trim().toUpperCase() !== cleanUpper &&
-      String(b.id || '').trim().toUpperCase() !== cleanUpper &&
-      String((b as any).branch_id || '').trim().toUpperCase() !== cleanUpper
-  );
+  const filtered = branches.filter((b) => {
+    const bCanon = canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase();
+    const bRaw = String(b.branchId || b.id || (b as any).branch_id || '').trim().toUpperCase();
+    return bCanon !== cleanUpper && bRaw !== cleanUpper && bRaw !== rawUpper;
+  });
   const removed = filtered.length !== branches.length;
   if (removed) {
     setStored(STORAGE_KEYS.BRANCHES, filtered);
@@ -3973,7 +4875,7 @@ export const deleteBranch = (branchId: string, options?: { fromSync?: boolean })
       branch_id: cleanId,
       branchId: cleanId,
       id: cleanId,
-      company_id: getCurrentCompanyId(),
+      company_id: normBranchTenant(getCurrentCompanyId()),
     });
     dispatchTombstoneThroughSyncCore(tomb);
   }
@@ -4681,8 +5583,20 @@ export const extractCashLogRef = (log: any): string => {
 export const isCashLogWithdrawal = (log: any): boolean => {
   if (!log || typeof log !== 'object') return false;
   if (log.isWithdrawal === true || log.isWithdrawal === 'true') return true;
+  if (log.isWithdrawal === false || log.isWithdrawal === 'false') return false;
+  const idStr = String(log.id || '').toUpperCase();
+  if (
+    idStr.startsWith('CL-SALE-') ||
+    idStr.startsWith('CL-REF-') ||
+    idStr.startsWith('CL-VOID-') ||
+    idStr.startsWith('CL-CSH-') ||
+    idStr.startsWith('CL-CRDEP-')
+  ) {
+    return false;
+  }
   const line = String(log.line || log.Line || '').toLowerCase();
   const cat = String(log.category || '').toLowerCase();
+  if (line.includes('refund') || line.includes('void') || cat === 'refund') return false;
   const desc = String(log.description || log.Description || '').toLowerCase();
   return (
     line.includes('withdrawal') ||
@@ -4932,6 +5846,18 @@ export const addCashLog = (
   entry: Omit<CashLogEntry, 'id' | 'synced'> & { id?: string; company_id?: string; companyId?: string; branch_id?: string; branchId?: string; skipSync?: boolean; fromMesh?: boolean },
   options?: { fromSync?: boolean }
 ): CashLogEntry => {
+  const securityState = getClockSecurityState();
+  const isManualClientWrite = !options?.fromSync && !entry.fromMesh && !entry.skipSync;
+  const trustedToday = getTrustedTodayDateString();
+  if (
+    securityState.isClockTampered &&
+    isManualClientWrite &&
+    entry.date &&
+    entry.date < trustedToday
+  ) {
+    throw new Error('Security Lock: Please enable Automatic Date & Time in your phone settings to process backdated cash entries.');
+  }
+
   const all = getRawStoredCashLogs();
   const normInput = normalizeCashLogRecord(entry);
   const currentCompany = getCurrentCompanyId();
@@ -5148,19 +6074,7 @@ const matchesStaffRecord = (
   targetStaffId?: string,
   targetStaffName?: string
 ): boolean => {
-  const cleanTargetId = String(targetStaffId || '').trim().toLowerCase();
-  const normTarget = cleanTargetId.replace(/^usr-|^staff-|^0+/i, '');
-  const cleanTargetName = (targetStaffName || '').trim().toLowerCase();
-
-  const cleanRecId = String(recStaffId || '').trim().toLowerCase();
-  const normRec = cleanRecId.replace(/^usr-|^staff-|^0+/i, '');
-  const cleanRecName = (recStaffName || '').trim().toLowerCase();
-
-  if (!cleanTargetId || cleanTargetId === 'all') return true;
-  if (cleanRecId && cleanRecId === cleanTargetId) return true;
-  if (normTarget && normRec && normRec === normTarget) return true;
-  if (cleanTargetName && cleanRecName && cleanRecName === cleanTargetName) return true;
-  return false;
+  return matchesStaffExclusive(recStaffId, recStaffName, targetStaffId, targetStaffName);
 };
 
 const matchesBusinessDate = (recDate?: string, recTimestamp?: string, targetDate?: string): boolean => {
@@ -6017,12 +6931,22 @@ export const addCustomerChange = (
   },
   options?: { fromSync?: boolean; skipCashMovement?: boolean; isManual?: boolean }
 ): CustomerChangeEntry => {
+  const securityState = getClockSecurityState();
+  const isManualEntry = Boolean(options?.isManual || (entry as any).isManual);
+  if (
+    securityState.isClockTampered &&
+    !options?.fromSync &&
+    isManualEntry &&
+    entry.date &&
+    entry.date < getTrustedTodayDateString()
+  ) {
+    throw new Error('Security Lock: Please enable Automatic Date & Time in your phone settings to process backdated change entries.');
+  }
   const all = getRawStoredCustomerChanges();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
   const brId = entry.branch_id || entry.branchId || currentBranch;
-  const isManualEntry = Boolean(options?.isManual || (entry as any).isManual);
   const created: CustomerChangeEntry = {
     ...entry,
     id: entry.id || getNextCustomerChangeId(),
@@ -6378,6 +7302,17 @@ export const addCreditSale = (
   },
   options?: { fromSync?: boolean }
 ): CreditSaleEntry => {
+  const securityState = getClockSecurityState();
+  if (
+    securityState.isClockTampered &&
+    !options?.fromSync &&
+    !entry.fromMesh &&
+    entry.isManual &&
+    entry.date &&
+    entry.date < getTrustedTodayDateString()
+  ) {
+    throw new Error('Security Lock: Please enable Automatic Date & Time in your phone settings to process backdated credit entries.');
+  }
   const all = getRawStoredCreditSales();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
@@ -8653,12 +9588,26 @@ export const addSale = (
   registerSeenSaleId(invId);
 
   // Fire-and-forget push to server central store for multi-tier persistence
-  if (typeof fetch !== 'undefined') {
+  if (typeof fetch !== 'undefined' && !saleData.fromMesh) {
     fetch('/api/sales', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(created),
-    }).catch(() => {});
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((srvJson) => {
+        if (srvJson && srvJson.server_received_at) {
+          const parsedSrvMs = Date.parse(srvJson.server_received_at);
+          if (Number.isFinite(parsedSrvMs)) {
+            reportTrustedTimeSample(parsedSrvMs, 'SERVER_PING');
+          }
+          annotateSaleCloudReceiptMetadata(invId, {
+            server_received_at: srvJson.server_received_at,
+            suspicious_backdate: Boolean(srvJson.suspicious_backdate),
+          });
+        }
+      })
+      .catch(() => {});
   }
 
   // 1. Decrement product stock in inventory and log audit trail
@@ -9156,12 +10105,60 @@ export const addSale = (
   return created;
 };
 
+export const annotateSaleCloudReceiptMetadata = (
+  saleId: string,
+  meta: {
+    server_received_at?: string;
+    suspicious_backdate?: boolean;
+    isOfflineSync?: boolean;
+  }
+): void => {
+  if (!saleId) return;
+  const allSales = getRawStoredSales();
+  const idx = allSales.findIndex((s) => s.id === saleId);
+  if (idx < 0) return;
+
+  const target = allSales[idx];
+  const prevSuspicious = Boolean((target as any).suspicious_backdate);
+  const nextSuspicious =
+    meta.suspicious_backdate !== undefined ? Boolean(meta.suspicious_backdate) : prevSuspicious;
+
+  allSales[idx] = {
+    ...target,
+    ...(meta.server_received_at ? { server_received_at: meta.server_received_at } : {}),
+    ...(meta.suspicious_backdate !== undefined ? { suspicious_backdate: nextSuspicious } : {}),
+    ...(meta.isOfflineSync !== undefined ? { isOfflineSync: meta.isOfflineSync } : {}),
+  };
+  setStored(STORAGE_KEYS.SALES, allSales);
+
+  if (nextSuspicious && !prevSuspicious) {
+    recordSecurityAlert({
+      type: 'SUSPICIOUS_BACKDATE',
+      deviceId: (target as any).origin_device_id || (target as any).deviceId || 'UNKNOWN-DEVICE',
+      staffName: target.staffName,
+      invoiceId: target.id,
+      claimedDate: target.date,
+      claimedTimestamp: target.timestamp,
+      serverReceivedAt: meta.server_received_at,
+      message: `Suspicious backdated sale #${target.id}: claimed date ${target.date || 'unknown'}, received by Cloud at ${meta.server_received_at || new Date().toISOString()}.`,
+    });
+  }
+
+  notifyListeners();
+};
+
 export const refundSaleInvoice = (params: {
   invoiceId: string;
   manager: Salesperson;
   cashier?: Salesperson;
   reason: string;
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
+  if (getClockSecurityState().isClockTampered) {
+    return {
+      success: false,
+      message: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+    };
+  }
   const allSales = getRawStoredSales();
   const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
@@ -9325,6 +10322,12 @@ export const voidSaleInvoice = (params: {
   cashier?: Salesperson;
   reason: string;
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
+  if (getClockSecurityState().isClockTampered) {
+    return {
+      success: false,
+      message: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+    };
+  }
   const allSales = getRawStoredSales();
   const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
@@ -9906,6 +10909,12 @@ export const editSaleInvoice = (params: {
     notes?: string;
   };
 }): { success: boolean; message: string; invoice?: SaleInvoice } => {
+  if (getClockSecurityState().isClockTampered) {
+    return {
+      success: false,
+      message: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+    };
+  }
   const allSales = getRawStoredSales();
   const invoice = allSales.find((s) => s.id === params.invoiceId);
   if (!invoice) {
@@ -10676,9 +11685,7 @@ export const getAllSalesForStaffAndDate = (
 ): SaleInvoice[] => {
   const currentCompany = getCurrentCompanyId();
   const allSales = getAllSales();
-  const targetStaffId = String(staffId || '').trim().toLowerCase();
-  const normTarget = targetStaffId.replace(/^usr-|^staff-|^0+/, '');
-  const targetName = staffName ? staffName.trim().toLowerCase() : '';
+  const knownStaffSets = getKnownStaffIdSets(currentCompany);
 
   const filtered = allSales.filter((s) => {
     const compId = (s.company_id || s.companyId || '').trim();
@@ -10690,17 +11697,13 @@ export const getAllSalesForStaffAndDate = (
       (!currentCompany && (compId === 'COMP-001' || compId === 'COMP-MASTER'));
     if (!matchesComp) return false;
 
-    const saleStaffId = s.staffId ? String(s.staffId).trim().toLowerCase() : '';
-    const normSaleStaff = saleStaffId.replace(/^usr-|^staff-|^0+/, '');
-    const saleStaffName = s.staffName ? s.staffName.trim().toLowerCase() : '';
-
-    const isSameStaff =
-      !targetStaffId ||
-      targetStaffId === 'all' ||
-      saleStaffId === targetStaffId ||
-      (normTarget && normSaleStaff === normTarget) ||
-      (targetName && saleStaffName === targetName) ||
-      (saleStaffName && targetStaffId && saleStaffName.toLowerCase().includes(targetStaffId));
+    const isSameStaff = matchesStaffExclusive(
+      s.staffId,
+      s.staffName,
+      staffId,
+      staffName,
+      knownStaffSets
+    );
 
     const isSameDate = isSameDaySafe(s.date, s.timestamp, date);
     if (!isSameStaff || !isSameDate) return false;
@@ -10980,70 +11983,105 @@ export const calculateForm4 = (
 
   // 5. Multi-Currency Cash-Outs / Withdrawals (Physical USD Cash OUT from till)
   // NOTE: Exclude refunded/voided multi-currency goods from active sales, while retaining actual physical USD cash handed out!
-  const activeCurrenciesList = getActiveCurrencies();
+  // Canonicalize currency keys (e.g. 'ECO'/'ECOCASH' -> 'EcoCash', 'ZIG' -> 'ZiG') so we NEVER double-count a currency under both code and name!
+  const toCanonicalCurrencyKey = (rawCurrency?: string, rawCode?: string, rawName?: string): string => {
+    const combined = `${rawCurrency || ''} ${rawCode || ''} ${rawName || ''}`.toLowerCase();
+    if (combined.includes('eco')) return 'EcoCash';
+    if (combined.includes('zig')) return 'ZiG';
+    return String(rawCurrency || rawCode || 'MultiCurr').trim();
+  };
+
+  const rawActiveCurrencies = getActiveCurrencies();
+  const activeCurrenciesMap = new Map<string, CurrencyRateConfig>();
+  rawActiveCurrencies.forEach((c) => {
+    const canon = toCanonicalCurrencyKey(c.currency, c.code, c.name);
+    if (!activeCurrenciesMap.has(canon)) {
+      activeCurrenciesMap.set(canon, { ...c, currency: canon });
+    }
+  });
+  const activeCurrenciesList = Array.from(activeCurrenciesMap.values());
+
   const currencyWithdrawalsMap: Record<string, number> = {};
   const currencySalesMap: Record<string, number> = {};
   const salesForWithdrawals = allStaffSalesSorted.filter(
     (s) => s.status !== 'Voided' || Boolean(s.cashWithdrawalAmount && Number(s.cashWithdrawalAmount) > 0)
   );
 
+  const saleMatchesCurrencyConfig = (s: SaleInvoice, c: CurrencyRateConfig, canonKey: string): boolean => {
+    const sMeth = (s.paymentMethod || '').toLowerCase();
+    const sCurr = (s.currency || '').toLowerCase();
+    if (canonKey === 'EcoCash') {
+      return (sMeth.includes('eco') || sCurr.includes('eco')) && s.paymentMethod !== 'Cash';
+    }
+    if (canonKey === 'ZiG') {
+      return (sMeth.includes('zig') || sCurr.includes('zig')) && s.paymentMethod !== 'Cash';
+    }
+    const lowerKey = canonKey.toLowerCase();
+    const lowerCode = (c.code || '').toLowerCase();
+    const lowerName = (c.name || '').toLowerCase();
+    return (
+      sMeth === lowerKey ||
+      sCurr === lowerKey ||
+      (Boolean(lowerCode) && (sMeth === lowerCode || sCurr === lowerCode)) ||
+      (Boolean(lowerName) && (sMeth === lowerName || sCurr === lowerName))
+    );
+  };
+
   activeCurrenciesList.forEach((c) => {
-    const code = c.code;
-    const name = c.name || code;
+    const canonKey = toCanonicalCurrencyKey(c.currency, c.code, c.name);
+    const code = c.code || canonKey;
+    const name = c.name || canonKey;
+    const lowerKey = canonKey.toLowerCase();
     const lowerCode = code.toLowerCase();
     const lowerName = name.toLowerCase();
 
     const logWithdrawals = form2Logs
       .filter((l) => {
-        if ((l.out || 0) <= 0) return false;
+        if ((l.out || 0) <= 0 || !isCashLogWithdrawal(l)) return false;
+        const bucket = getCashLogCurrencyBucket(l);
+        if (canonKey === 'EcoCash') return bucket === 'ECOCASH';
+        if (canonKey === 'ZiG') return bucket === 'ZIG';
         const line = (l.line || '').toLowerCase();
         const desc = (l.description || '').toLowerCase();
         const cat = (l.category || '').toLowerCase();
         const curr = (l.currency || '').toLowerCase();
-        const matchesCurr =
+        return (
+          curr === lowerKey ||
           curr === lowerCode ||
+          line.includes(lowerKey) ||
           line.includes(lowerCode) ||
+          cat.includes(lowerKey) ||
           cat.includes(lowerCode) ||
+          desc.includes(lowerKey) ||
           desc.includes(lowerCode) ||
-          desc.includes(lowerName) ||
-          (lowerCode.includes('eco') && getCashLogCurrencyBucket(l) === 'ECOCASH') ||
-          (lowerCode.includes('zig') && getCashLogCurrencyBucket(l) === 'ZIG');
-        return matchesCurr && isCashLogWithdrawal(l);
+          (Boolean(lowerName) && desc.includes(lowerName))
+        );
       })
-      .reduce((sum, l) => sum + (l.out || 0), 0);
+      .reduce((sum, l) => sum + (Number(l.out) || 0), 0);
 
     const salesWithdrawals = salesForWithdrawals
-      .filter((s) => {
-        const sMeth = (s.paymentMethod || '').toLowerCase();
-        const sCurr = (s.currency || '').toLowerCase();
-        const matchesCurr = sMeth === lowerCode || sCurr === lowerCode || sCurr === lowerName;
-        return matchesCurr && s.cashWithdrawalAmount && Number(s.cashWithdrawalAmount) > 0;
-      })
+      .filter((s) => saleMatchesCurrencyConfig(s, c, canonKey) && s.cashWithdrawalAmount && Number(s.cashWithdrawalAmount) > 0)
       .reduce((sum, s) => {
         const adj = getMobileSaleGoodsAdjustment(s);
         if (adj.isFlaggedShortage) return sum;
         return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
       }, 0);
 
-    currencyWithdrawalsMap[code] = Math.max(logWithdrawals, salesWithdrawals);
+    currencyWithdrawalsMap[canonKey] = Math.round(Math.max(logWithdrawals, salesWithdrawals) * 100) / 100;
 
     const currSales = staffSales
-      .filter((s) => {
-        const sMeth = (s.paymentMethod || '').toLowerCase();
-        const sCurr = (s.currency || '').toLowerCase();
-        return (sMeth === lowerCode || sCurr === lowerCode || sCurr === lowerName) && (s.total || 0) > 0;
-      })
+      .filter((s) => saleMatchesCurrencyConfig(s, c, canonKey) && (s.total || 0) > 0)
       .reduce((sum, s) => {
         const adj = getMobileSaleGoodsAdjustment(s);
         if (adj.isFlaggedShortage) return sum;
         return sum + Math.max(0, (s.total || 0) - adj.goodsShortfallUsd);
       }, 0);
-    currencySalesMap[code] = currSales;
+    currencySalesMap[canonKey] = Math.round(currSales * 100) / 100;
   });
 
   const ecoWithdrawalLogs = form2Logs
     .filter((l) => (l.out || 0) > 0 && getCashLogCurrencyBucket(l) === 'ECOCASH' && isCashLogWithdrawal(l))
-    .reduce((sum, l) => sum + (l.out || 0), 0);
+    .reduce((sum, l) => sum + (Number(l.out) || 0), 0);
 
   const ecoWithdrawalSales = salesForWithdrawals
     .filter(
@@ -11066,19 +12104,18 @@ export const calculateForm4 = (
       return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
     }, 0);
 
-  const ecocashWithdrawal = Math.max(
-    currencyWithdrawalsMap['EcoCash'] || currencyWithdrawalsMap['ECO'] || currencyWithdrawalsMap['ECOCASH'] || 0,
-    Math.max(ecoWithdrawalLogs, ecoWithdrawalSales)
-  );
+  const ecocashWithdrawal =
+    Math.round(Math.max(currencyWithdrawalsMap['EcoCash'] || 0, ecoWithdrawalLogs, ecoWithdrawalSales) * 100) / 100;
 
   const zigWithdrawalLogs = form2Logs
     .filter((l) => (l.out || 0) > 0 && getCashLogCurrencyBucket(l) === 'ZIG' && isCashLogWithdrawal(l))
-    .reduce((sum, l) => sum + (l.out || 0), 0);
+    .reduce((sum, l) => sum + (Number(l.out) || 0), 0);
 
   const zigWithdrawalSales = salesForWithdrawals
     .filter(
       (s) =>
-        (s.paymentMethod === 'ZiG' || s.currency === 'ZiG') &&
+        (s.paymentMethod?.toLowerCase().includes('zig') || s.currency?.toLowerCase().includes('zig')) &&
+        s.paymentMethod !== 'Cash' &&
         s.cashWithdrawalAmount &&
         Number(s.cashWithdrawalAmount) > 0
     )
@@ -11088,14 +12125,16 @@ export const calculateForm4 = (
       return sum + Math.max(0, Number(s.cashWithdrawalAmount) - adj.wdrReductionUsd);
     }, 0);
 
-  const zigWithdrawal = Math.max(
-    currencyWithdrawalsMap['ZiG'] || currencyWithdrawalsMap['ZIG'] || 0,
-    Math.max(zigWithdrawalLogs, zigWithdrawalSales)
-  );
+  const zigWithdrawal =
+    Math.round(Math.max(currencyWithdrawalsMap['ZiG'] || 0, zigWithdrawalLogs, zigWithdrawalSales) * 100) / 100;
 
   currencyWithdrawalsMap['EcoCash'] = ecocashWithdrawal;
   currencyWithdrawalsMap['ZiG'] = zigWithdrawal;
-  const totalMultiCurrencyWithdrawals = Object.values(currencyWithdrawalsMap).reduce((sum, v) => sum + v, 0);
+  currencySalesMap['EcoCash'] = Math.round(Math.max(currencySalesMap['EcoCash'] || 0, ecocashSales) * 100) / 100;
+  currencySalesMap['ZiG'] = Math.round(Math.max(currencySalesMap['ZiG'] || 0, zigSales) * 100) / 100;
+
+  const totalMultiCurrencyWithdrawals =
+    Math.round(Object.values(currencyWithdrawalsMap).reduce((sum, v) => sum + (Number(v) || 0), 0) * 100) / 100;
 
   // 6. Explicit Form 2 Cash Refunds / Returns
   const isForm2RefundLog = (l: CashLogEntry): boolean => {
@@ -13746,33 +14785,83 @@ export const ingestMeshBranch = (branch: Branch): boolean => {
     return false;
   }
   const currentCompany = getCurrentCompanyId();
-  const compId = (branch.company_id || branch.companyId || currentCompany).trim().toUpperCase();
-  if (compId && compId !== currentCompany.trim().toUpperCase()) {
-    console.warn(`[ingestMeshBranch] Discarded branch for other tenant: ${compId} vs ${currentCompany}`);
+  const rawComp = branch.company_id || branch.companyId || (branch as any).CompanyID || currentCompany;
+  const compId = normBranchTenant(rawComp);
+  if (compId !== normBranchTenant(currentCompany)) {
+    console.warn(`[ingestMeshBranch] Discarded branch for other tenant: ${rawComp} vs ${currentCompany}`);
     return false;
   }
   const branches = getAllBranches();
-  const id = branch.branchId || branch.id || (branch as any).branch_id || 'BR-MAIN';
+  const rawId = String(branch.branchId || branch.id || (branch as any).branch_id || (branch as any).BranchID || 'BR-MAIN').trim();
+  const id = canonicalizeBranchId(rawId);
+
+  const incomingTime = parseTimestampMs(branch.updatedAt || branch.lastUpdated || (branch as any).hubTimestamp);
+  const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
+  const isInDeleted = deletedList.some((d) => canonicalizeBranchId(d).toUpperCase() === id.toUpperCase());
+  const tomb = getTombstones().find(
+    (t) =>
+      normalizeRoomTombstoneType(t.entityType) === 'branch' &&
+      canonicalizeBranchId(t.entityId).toUpperCase() === id.toUpperCase()
+  );
+  const tombDelAt = tomb ? Number(tomb.deletedAt || 0) : 0;
+  if (isInDeleted && (incomingTime === 0 || tombDelAt >= incomingTime)) {
+    return false;
+  }
+
+  const incomingName = extractBranchName(branch);
+  const incomingCode = extractBranchCode(branch);
+  const incomingLoc = extractBranchLocation(branch);
+
+  let index = branches.findIndex(
+    (b) =>
+      normBranchTenant(b.company_id || b.companyId) === compId &&
+      canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase() === id.toUpperCase()
+  );
+  if (index < 0 && incomingCode && !isPlaceholderBranchCode(incomingCode, id)) {
+    index = branches.findIndex(
+      (b) =>
+        normBranchTenant(b.company_id || b.companyId) === compId &&
+        String(b.code || '').trim().toUpperCase() === incomingCode.toUpperCase()
+    );
+  }
+
+  const existing = index >= 0 ? branches[index] : undefined;
+  const seedMatch = findSeedBranch(id, compId);
+  const resolvedId = existing ? canonicalizeBranchId(existing.branchId || id) : id;
+  const resolvedName = !isPlaceholderBranchName(incomingName)
+    ? incomingName
+    : existing && !isPlaceholderBranchName(existing.name)
+    ? existing.name
+    : seedMatch?.name || incomingName || existing?.name || 'Main Branch';
+  const resolvedCode = !isPlaceholderBranchCode(incomingCode, resolvedId)
+    ? incomingCode
+    : existing && !isPlaceholderBranchCode(existing.code, resolvedId)
+    ? existing.code
+    : seedMatch?.code || incomingCode || existing?.code || resolvedId;
+  const resolvedLoc =
+    incomingLoc || existing?.location || existing?.address || seedMatch?.location || '4th Street Commercial Center, Harare';
+
   const normalized: Branch = {
+    ...(existing || {}),
     ...branch,
-    branchId: id,
-    id: id,
+    branchId: resolvedId,
+    id: resolvedId,
+    branch_id: resolvedId,
+    name: resolvedName,
+    code: resolvedCode,
+    location: resolvedLoc,
+    address: resolvedLoc,
     company_id: compId,
     companyId: compId,
   };
-  const index = branches.findIndex(
-    (b) => b.branchId === id || b.id === id || (b as any).branch_id === id
-  );
-  let updated: Branch[];
-  if (index >= 0) {
-    const existing = branches[index];
 
+  let updated: Branch[];
+  if (existing) {
     // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
-    const incomingTime = parseTimestampMs(branch.updatedAt || branch.lastUpdated || (branch as any).hubTimestamp);
     if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
-        `[LWW Client] 🛡️ Rejected stale branch update for ${id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+        `[LWW Client] 🛡️ Rejected stale branch update for ${resolvedId} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
       return false;
     }
@@ -13781,7 +14870,8 @@ export const ingestMeshBranch = (branch: Branch): boolean => {
       existing.name === normalized.name &&
       existing.code === normalized.code &&
       existing.location === normalized.location &&
-      (existing as any).status === (normalized as any).status
+      (existing as any).status === (normalized as any).status &&
+      (existing as any).is_active === (normalized as any).is_active
     ) {
       return false;
     }
@@ -13813,10 +14903,39 @@ export const ingestMeshStaff = (
   const incoming = staff;
   console.log('[STAFF TRACE] 5. LocalHub Ingest. Incoming:', JSON.stringify(incoming), 'Existing:', JSON.stringify(existing));
 
-  // Explicitly copy pin_hash / password from incoming packet or preserve existing credentials
-  let salt = (staff as any).pin_salt || existing?.pin_salt || generatePinSalt();
-  let hash = (staff as any).pin_hash || (staff as any).password || existing?.pin_hash || (existing as any)?.password;
-  if (!hash) {
+  // Strictly block tombstoned, SEED, untimestamped, or lower-version overwrites
+  if (shouldRejectStaleStaffSync(existing || null, staff)) {
+    console.warn(
+      `[LWW Client] 🛡️ Rejected stale/seed/tombstoned staff update for ${staff.name || staff.id}`
+    );
+    return false;
+  }
+
+  const incomingTimeCheck = parseTimestampMs(
+    (staff as any).hubTimestamp ?? staff.updatedAt ?? (staff as any).updated_at ?? staff.lastUpdated
+  );
+
+  // Explicitly copy pin_hash / password from incoming packet ONLY if newer or existing has no hash
+  let salt = existing?.pin_salt || (staff as any).pin_salt || generatePinSalt();
+  let hash = existing?.pin_hash || (staff as any).pin_hash || (staff as any).password;
+  const existingPinVer = Number(existing?.pinVersion || 0);
+  const incomingPinVer = Number((staff as any).pinVersion || 0);
+  const existingPinTs = Number(existing?.pinUpdatedAt || existing?.updatedAt || 0);
+  const incomingPinTs = Number((staff as any).pinUpdatedAt || incomingTimeCheck || 0);
+
+  if (existing?.pin_hash && (staff as any).pin_hash) {
+    const acceptRemotePin =
+      incomingPinVer > existingPinVer ||
+      (incomingPinVer === existingPinVer && existingPinVer > 0 && incomingPinTs >= existingPinTs) ||
+      (incomingPinVer === 0 && existingPinVer === 0 && incomingTimeCheck >= (Number(existing.updatedAt) || 0));
+    if (acceptRemotePin) {
+      salt = (staff as any).pin_salt || existing.pin_salt || salt;
+      hash = (staff as any).pin_hash;
+    } else {
+      salt = existing.pin_salt || salt;
+      hash = existing.pin_hash;
+    }
+  } else if (!hash) {
     const rawPin = (staff as any).pin ? String((staff as any).pin).trim() : '123456';
     hash = hashPin(rawPin, salt);
   }
@@ -13831,8 +14950,7 @@ export const ingestMeshStaff = (
           ? (staff as any).assignedBranchIds
           : (existing as any)?.assignedBranchIds);
 
-  const incomingTime = extractRecordTimestamp(staff);
-  const now = Date.now();
+  const incomingTime = incomingTimeCheck;
   const normalized: Salesperson = {
     ...staff,
     companyId: compId,
@@ -13840,27 +14958,23 @@ export const ingestMeshStaff = (
     ...(resolvedAssignments !== undefined ? { branchAssignments: resolvedAssignments } : {}),
     ...(resolvedAssignedBranchIds !== undefined ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
     pin_hash: hash,
-    password: (staff as any).password || hash,
+    password: hash,
     pin_salt: salt,
-    updatedAt: incomingTime || now,
-    lastUpdated: staff.lastUpdated || new Date(incomingTime || now).toISOString(),
+    pinVersion: Math.max(existingPinVer, incomingPinVer || 1),
+    pinUpdatedAt: Math.max(existingPinTs, incomingPinTs),
+    version: Math.max(Number(existing?.version || 0), Number((staff as any).version || 0)),
+    mutationSource:
+      (staff as any).mutationSource ||
+      existing?.mutationSource ||
+      (incomingTime > 0 || Number((staff as any).version || 0) > 0 ? 'USER_EDIT' : 'SEED'),
+    updatedAt: incomingTime > 0 ? incomingTime : (Number(existing?.updatedAt) || 0),
+    lastUpdated:
+      staff.lastUpdated ||
+      (incomingTime > 0 ? new Date(incomingTime).toISOString() : existing?.lastUpdated || ''),
   } as any;
   delete (normalized as any).pin;
   delete (normalized as any).fromMesh;
   delete (normalized as any).fromSync;
-
-  if (existing) {
-    // Strict Last-Write-Wins (LWW) check (60000ms skew tolerance):
-    const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
-    const incomingTimeCheck = parseTimestampMs(staff.updatedAt || staff.lastUpdated || (staff as any).hubTimestamp);
-
-    if (existingTime > 0 && incomingTimeCheck > 0 && existingTime > incomingTimeCheck + 60000) {
-      console.warn(
-        `[LWW Client] 🛡️ Rejected stale staff update for ${staff.name || staff.id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTimeCheck).toISOString()})`
-      );
-      return false;
-    }
-  }
 
   const savedStaff = saveSalesperson(normalized, { fromSync: true });
   console.log(
@@ -14521,6 +15635,20 @@ export const getTransactionsDigest = (
     }
   }
 
+  // 11. Branches (T2 - scoped to current tenant so another tenant's seed branch never leaks across Hub)
+  else if (norm === 'branches' || norm === 'branch') {
+    const tenantBranches = getBranches();
+    for (const b of tenantBranches) {
+      const id = b.branchId || b.id || (b as any).branch_id;
+      if (!id) continue;
+      const up = parseTimestampMs(b.updatedAt || b.lastUpdated);
+      items.push({
+        id: canonicalizeBranchId(id),
+        updatedAt: up,
+      });
+    }
+  }
+
   return {
     entityType: norm,
     startDate,
@@ -14883,7 +16011,7 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
             return rId && iId && rId === iId;
           });
 
-          const ts = parseTimestampMs(remote.hubTimestamp ?? remote.updatedAt ?? remote.lastUpdated) || Date.now();
+          const ts = parseTimestampMs(remote.hubTimestamp ?? remote.updatedAt ?? remote.updated_at ?? remote.lastUpdated) || 0;
           await routeCloudRecordThroughSyncCore(
             {
               packetId: `CLOUD-TENANT-INV-${rId}-${ts}-${Math.random().toString(36).substring(2, 6)}`,
@@ -14892,6 +16020,8 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
               action: 'UPSERT',
               data: remote,
               updatedAt: ts,
+              ...(remote.version !== undefined ? { version: Number(remote.version) } : {}),
+              mutationSource: remote.mutationSource || (ts === 0 ? 'SEED' : 'MIGRATION'),
               originDeviceId: 'APPS_SCRIPT_CLOUD',
               targetBranchId: 'ALL',
               class: 'T2',
@@ -14936,7 +16066,7 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
             const existing = existingAll.find(
               (ex) => String(ex.itemId || (ex as any).id || '').trim().toUpperCase() === rId
             );
-            const ts = parseTimestampMs(item.hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
+            const ts = parseTimestampMs(item.hubTimestamp ?? item.updatedAt ?? item.updated_at ?? item.lastUpdated) || 0;
             await routeCloudRecordThroughSyncCore(
               {
                 packetId: `CLOUD-GAS-INV-${rId}-${ts}-${Math.random().toString(36).substring(2, 6)}`,
@@ -14945,6 +16075,8 @@ export async function pullTenantInventory(companyId?: string): Promise<{ added: 
                 action: 'UPSERT',
                 data: item,
                 updatedAt: ts,
+                ...(item.version !== undefined ? { version: Number(item.version) } : {}),
+                mutationSource: item.mutationSource || (ts === 0 ? 'SEED' : 'MIGRATION'),
                 originDeviceId: 'APPS_SCRIPT_CLOUD',
                 targetBranchId: 'ALL',
                 class: 'T2',
@@ -17677,16 +18809,26 @@ export const saveStocktakeSession = (
   const compId = (session as any).company_id || (session as any).companyId || currentCompany;
   const brId = (session as any).branch_id || (session as any).branchId || currentBranch;
   const now = Date.now();
+  const index = sessions.findIndex((s) => s.sessionId.toUpperCase() === session.sessionId.toUpperCase());
+  const existing = index >= 0 ? sessions[index] : undefined;
+  const nextVersion = options?.fromSync
+    ? Number((session as any).version || existing?.version || 1)
+    : Math.max(Number(existing?.version || 0), Number((session as any).version || 0)) + 1;
   const normalized: StocktakeSession = {
     ...session,
     company_id: compId,
     companyId: compId,
     branch_id: brId,
     branchId: brId,
+    version: nextVersion,
+    mutationSource: options?.fromSync
+      ? ((session as any).mutationSource || existing?.mutationSource || 'USER_EDIT')
+      : 'USER_EDIT',
     updatedAt: options?.fromSync ? ((session as any).updatedAt || now) : now,
-    lastUpdated: options?.fromSync ? ((session as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
+    lastUpdated: options?.fromSync
+      ? ((session as any).lastUpdated || new Date((session as any).updatedAt || now).toISOString())
+      : new Date(now).toISOString(),
   } as any;
-  const index = sessions.findIndex((s) => s.sessionId.toUpperCase() === session.sessionId.toUpperCase());
   if (index >= 0) {
     sessions[index] = normalized;
   } else {
@@ -17741,6 +18883,8 @@ export interface BranchLockdownState {
   lockedByName?: string;
   reason?: string;
   sessionId?: string;
+  updatedAt?: number;
+  lastUpdated?: string;
 }
 
 export const getBranchLockdowns = (): Record<string, BranchLockdownState> => {
@@ -17761,18 +18905,27 @@ export const setBranchLockdown = (
   staffName?: string,
   reason?: string
 ): void => {
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
   const lockdowns = getBranchLockdowns();
-  lockdowns[branchId] = {
+  const nextState: BranchLockdownState = {
     branchId,
     isLocked: locked,
-    lockedAt: locked ? new Date().toISOString() : undefined,
+    lockedAt: locked ? nowIso : undefined,
     lockedBy: staffId,
     lockedByName: staffName,
     reason,
     sessionId,
+    updatedAt: now,
+    lastUpdated: nowIso,
   };
+  lockdowns[branchId] = nextState;
   setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_lockdown_updated', { detail: nextState }));
+    window.dispatchEvent(new CustomEvent('saimetric_lockdown_updated', { detail: nextState }));
+  }
 };
 
 // ============================================================================
@@ -17827,15 +18980,21 @@ export const addTemporaryCasual = (
   const rawPin = (casual as any).pin ? String((casual as any).pin).trim() : '1234';
   const pinHash = (casual as any).pin_hash || hashPin(rawPin, salt);
   const now = Date.now();
+  const existingForBranch = all.filter((c) => c.sessionId === casual.sessionId).length;
+  const badgeNumber =
+    (casual as any).badgeNumber || `TMP-${String(existingForBranch + 1).padStart(2, '0')}`;
 
   const created: TemporaryCasualAccount = {
     ...casual,
-    id: `CAS-${Date.now().toString().slice(-4)}`,
+    id: `CAS-${Date.now().toString().slice(-4)}-${Math.random().toString(36).slice(2, 4).toUpperCase()}`,
+    badgeNumber,
     pin_hash: pinHash,
     pin_salt: salt,
     createdAt: (casual as any).createdAt || new Date(now).toISOString(),
     updatedAt: now,
     lastUpdated: new Date(now).toISOString(),
+    version: 1,
+    mutationSource: 'USER_EDIT',
     active: true,
   } as unknown as TemporaryCasualAccount;
   delete (created as any).pin;
@@ -17845,6 +19004,7 @@ export const addTemporaryCasual = (
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated', { detail: created }));
+    window.dispatchEvent(new CustomEvent('saimetric_casuals_updated', { detail: created }));
   }
   return created;
 };
@@ -17855,12 +19015,22 @@ export const saveTemporaryCasualAccount = (
 ): TemporaryCasualAccount => {
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
   const now = Date.now();
+  const idx = all.findIndex((c) => c.id === casual.id);
+  const existing = idx >= 0 ? all[idx] : undefined;
+  const nextVersion = options?.fromSync
+    ? Number((casual as any).version || existing?.version || 1)
+    : Math.max(Number(existing?.version || 0), Number((casual as any).version || 0)) + 1;
   const normalized: TemporaryCasualAccount = {
     ...casual,
+    version: nextVersion,
+    mutationSource: options?.fromSync
+      ? ((casual as any).mutationSource || existing?.mutationSource || 'USER_EDIT')
+      : 'USER_EDIT',
     updatedAt: options?.fromSync ? ((casual as any).updatedAt || now) : now,
-    lastUpdated: options?.fromSync ? ((casual as any).lastUpdated || new Date(now).toISOString()) : new Date(now).toISOString(),
+    lastUpdated: options?.fromSync
+      ? ((casual as any).lastUpdated || new Date((casual as any).updatedAt || now).toISOString())
+      : new Date(now).toISOString(),
   };
-  const idx = all.findIndex((c) => c.id === casual.id);
   let updated: TemporaryCasualAccount[];
   if (idx >= 0) {
     updated = [...all];
@@ -17872,6 +19042,7 @@ export const saveTemporaryCasualAccount = (
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_casuals_updated', { detail: normalized }));
   }
   return normalized;
 };
@@ -17885,6 +19056,10 @@ export const deleteTemporaryCasual = (id: string, options?: { fromSync?: boolean
   if (removed) {
     setStored(STORAGE_KEYS.TEMPORARY_CASUALS, filtered);
     notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
+    }
   }
   if (!options?.fromSync) {
     try {
@@ -17898,22 +19073,33 @@ export const deleteTemporaryCasual = (id: string, options?: { fromSync?: boolean
   return removed;
 };
 
-export const authenticateCasualWorker = (pin: string): TemporaryCasualAccount | null => {
+export const authenticateCasualWorker = (
+  pin: string,
+  casualId?: string
+): TemporaryCasualAccount | null => {
   const cleanPin = pin.trim();
   if (!cleanPin) return null;
   const all = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
-  return (
-    all.find((c) => {
-      if (!c.active) return false;
-      if (c.pin_hash && c.pin_salt) {
-        return verifyPinHash(cleanPin, c.pin_hash, c.pin_salt);
-      }
-      if (c.pin) {
-        return String(c.pin).trim() === cleanPin;
-      }
-      return false;
-    }) || null
-  );
+
+  const verifyMatch = (c: TemporaryCasualAccount): boolean => {
+    if (!c.active) return false;
+    if (c.pin_hash && c.pin_salt) {
+      return verifyPinHash(cleanPin, c.pin_hash, c.pin_salt);
+    }
+    if (c.pin) {
+      return String(c.pin).trim() === cleanPin;
+    }
+    return false;
+  };
+
+  if (casualId) {
+    const cleanId = casualId.trim().toUpperCase();
+    const target = all.find((c) => String(c.id || '').trim().toUpperCase() === cleanId);
+    if (!target) return null;
+    return verifyMatch(target) ? target : null;
+  }
+
+  return all.find(verifyMatch) || null;
 };
 
 export const syncCasualWorkersFromHub = (
@@ -17957,14 +19143,41 @@ export const syncCasualWorkersFromHub = (
   });
   setStored(STORAGE_KEYS.TEMPORARY_CASUALS, Array.from(map.values()));
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
+  }
 };
 
 export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
   if (!lockdown || !lockdown.branchId) return;
   const lockdowns = getBranchLockdowns();
-  lockdowns[lockdown.branchId] = lockdown;
+  const existing = lockdowns[lockdown.branchId];
+  const existingTime = parseTimestampMs(
+    existing?.updatedAt || existing?.lastUpdated || existing?.lockedAt || 0
+  );
+  const incomingTime = parseTimestampMs(
+    lockdown.updatedAt || lockdown.lastUpdated || lockdown.lockedAt || 0
+  );
+  if (existing && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+    console.warn(
+      `[LWW Client] 🛡️ Rejected stale branch_lockdown update for ${lockdown.branchId}`
+    );
+    return;
+  }
+  const now = incomingTime || Date.now();
+  const normalized: BranchLockdownState = {
+    ...lockdown,
+    updatedAt: now,
+    lastUpdated: lockdown.lastUpdated || new Date(now).toISOString(),
+  };
+  lockdowns[lockdown.branchId] = normalized;
   setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
   notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_lockdown_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_lockdown_updated', { detail: normalized }));
+  }
 };
 
 export const ingestStocktakeSessionFromMesh = (data: {
@@ -17974,6 +19187,8 @@ export const ingestStocktakeSessionFromMesh = (data: {
   segments?: StocktakeSegment[];
   startedBy?: string;
   startedAt?: string;
+  createdBy?: string;
+  createdByName?: string;
   date?: string;
   countType?: StocktakeCountType;
   branchId?: string;
@@ -17983,12 +19198,34 @@ export const ingestStocktakeSessionFromMesh = (data: {
   status?: StocktakeStatus;
   companyId?: string;
   company_id?: string;
+  stocktakeAuditorId?: string;
+  stocktakeAuditorName?: string;
+  stocktakeAuditorPhone?: string;
+  predefinedDailyItemIds?: string[];
+  certifiedById?: string;
+  certifiedByName?: string;
+  certifiedAt?: string;
+  approvedBy?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  guestPasses?: StocktakeGuestPass[];
+  varianceReviewStatus?: StocktakeVarianceReviewStatus;
+  varianceCommentDeadline?: string;
+  varianceMaterialityThreshold?: number;
+  varianceReviewedById?: string;
+  varianceReviewedByName?: string;
+  varianceReviewedAt?: string;
   consolidatedItems?: StocktakeConsolidatedItem[];
   totalSystemUnits?: number;
   totalCountedUnits?: number;
   varianceUnits?: number;
   varianceCostValue?: number;
   varianceRetailValue?: number;
+  version?: number;
+  mutationSource?: 'SEED' | 'USER_EDIT' | 'MIGRATION';
+  updatedAt?: number;
+  lastUpdated?: string;
+  timestamp?: string;
 }): StocktakeSession => {
   const existing = getStocktakeSessionById(data.sessionId);
   if (existing) {
@@ -18092,47 +19329,81 @@ export const ingestStocktakeSessionFromMesh = (data: {
     mergedSegments = existing?.segments || [];
   }
 
-  const consolidatedItems =
-    (data as any).consolidatedItems && (data as any).consolidatedItems.length > 0
-      ? (data as any).consolidatedItems
-      : (existing?.consolidatedItems || []);
+  // Merge consolidatedItems preserving newest manager comments & leader acks via LWW timestamp
+  let consolidatedItems: StocktakeConsolidatedItem[] = existing?.consolidatedItems || [];
+  if (Array.isArray(data.consolidatedItems) && data.consolidatedItems.length > 0) {
+    const existingByItem = new Map<string, StocktakeConsolidatedItem>();
+    (existing?.consolidatedItems || []).forEach((ci) => {
+      if (ci?.itemId) existingByItem.set(ci.itemId.toUpperCase(), ci);
+    });
+    consolidatedItems = data.consolidatedItems.map((inc) => {
+      const ex = existingByItem.get(String(inc.itemId || '').toUpperCase());
+      if (!ex) return inc;
+      const exCommentTs = parseTimestampMs(ex.commentedAt || 0);
+      const incCommentTs = parseTimestampMs(inc.commentedAt || 0);
+      const keepExistingComment = exCommentTs > incCommentTs && Boolean(ex.managerComment || ex.reasonCode);
+      return {
+        ...ex,
+        ...inc,
+        reasonCode: keepExistingComment ? ex.reasonCode : (inc.reasonCode ?? ex.reasonCode),
+        managerComment: keepExistingComment ? ex.managerComment : (inc.managerComment ?? ex.managerComment),
+        actionTaken: keepExistingComment ? ex.actionTaken : (inc.actionTaken ?? ex.actionTaken),
+        commentedById: keepExistingComment ? ex.commentedById : (inc.commentedById ?? ex.commentedById),
+        commentedByName: keepExistingComment ? ex.commentedByName : (inc.commentedByName ?? ex.commentedByName),
+        commentedAt: keepExistingComment ? ex.commentedAt : (inc.commentedAt ?? ex.commentedAt),
+        ownerAckStatus: inc.ownerAckStatus ?? ex.ownerAckStatus,
+      };
+    });
+  }
+
+  // Merge Guest Passes LWW by pass.id
+  let mergedGuestPasses: StocktakeGuestPass[] | undefined = existing?.guestPasses;
+  if (Array.isArray(data.guestPasses)) {
+    const gpMap = new Map<string, StocktakeGuestPass>();
+    (existing?.guestPasses || []).forEach((gp) => {
+      if (gp?.id) gpMap.set(gp.id, gp);
+    });
+    data.guestPasses.forEach((incGp) => {
+      if (!incGp?.id) return;
+      const exGp = gpMap.get(incGp.id);
+      const exTs = parseTimestampMs(exGp?.updatedAt || exGp?.revokedAt || exGp?.createdAt || 0);
+      const incTs = parseTimestampMs(incGp.updatedAt || incGp.revokedAt || incGp.createdAt || 0);
+      if (!exGp || incTs >= exTs) {
+        gpMap.set(incGp.id, { ...exGp, ...incGp });
+      }
+    });
+    mergedGuestPasses = Array.from(gpMap.values());
+  }
 
   const totalSystemUnits =
-    (data as any).totalSystemUnits !== undefined
-      ? Number((data as any).totalSystemUnits)
-      : (existing?.totalSystemUnits || 0);
-
+    data.totalSystemUnits !== undefined ? Number(data.totalSystemUnits) : (existing?.totalSystemUnits || 0);
   const totalCountedUnits =
-    (data as any).totalCountedUnits !== undefined
-      ? Number((data as any).totalCountedUnits)
-      : (existing?.totalCountedUnits || 0);
-
+    data.totalCountedUnits !== undefined ? Number(data.totalCountedUnits) : (existing?.totalCountedUnits || 0);
   const varianceUnits =
-    (data as any).varianceUnits !== undefined
-      ? Number((data as any).varianceUnits)
-      : (existing?.varianceUnits || 0);
-
+    data.varianceUnits !== undefined ? Number(data.varianceUnits) : (existing?.varianceUnits || 0);
   const varianceCostValue =
-    (data as any).varianceCostValue !== undefined
-      ? Number((data as any).varianceCostValue)
-      : (existing?.varianceCostValue || 0);
-
+    data.varianceCostValue !== undefined ? Number(data.varianceCostValue) : (existing?.varianceCostValue || 0);
   const varianceRetailValue =
-    (data as any).varianceRetailValue !== undefined
-      ? Number((data as any).varianceRetailValue)
-      : (existing?.varianceRetailValue || 0);
+    data.varianceRetailValue !== undefined ? Number(data.varianceRetailValue) : (existing?.varianceRetailValue || 0);
+
+  const syncedTime = parseTimestampMs(data.updatedAt || data.lastUpdated || data.startedAt || data.timestamp || Date.now());
 
   const session: StocktakeSession = {
+    ...(existing || {}),
     sessionId: data.sessionId,
     title: data.sessionName || data.title || existing?.title || `Stocktake Audit ${data.sessionId}`,
-    date: data.startedAt ? data.startedAt.split('T')[0] : (data.date || existing?.date || new Date().toISOString().split('T')[0]),
+    date: data.date || (data.startedAt ? String(data.startedAt).split('T')[0] : existing?.date || new Date().toISOString().split('T')[0]),
     countType: data.countType || existing?.countType || 'DAILY_BLIND',
     status: data.status || existing?.status || 'COUNTING',
     branchId: data.branchId || existing?.branchId || currentBranch,
     branchName: data.branchName || existing?.branchName || 'Main Central Distribution & Warehouse',
     isLockdownActive: data.isLockdownActive !== undefined ? Boolean(data.isLockdownActive) : Boolean(existing?.isLockdownActive),
-    createdBy: data.startedBy || existing?.createdBy || 'MANAGER',
-    createdByName: data.startedBy || existing?.createdByName || 'Manager',
+    stocktakeAuditorId: data.stocktakeAuditorId !== undefined ? data.stocktakeAuditorId : existing?.stocktakeAuditorId,
+    stocktakeAuditorName: data.stocktakeAuditorName !== undefined ? data.stocktakeAuditorName : existing?.stocktakeAuditorName,
+    stocktakeAuditorPhone: data.stocktakeAuditorPhone !== undefined ? data.stocktakeAuditorPhone : existing?.stocktakeAuditorPhone,
+    predefinedDailyItemIds: data.predefinedDailyItemIds || existing?.predefinedDailyItemIds,
+    createdBy: data.createdBy || data.startedBy || existing?.createdBy || 'MANAGER',
+    createdByName: data.createdByName || data.startedBy || existing?.createdByName || 'Manager',
     segments: mergedSegments,
     consolidatedItems,
     totalSystemUnits,
@@ -18140,14 +19411,54 @@ export const ingestStocktakeSessionFromMesh = (data: {
     varianceUnits,
     varianceCostValue,
     varianceRetailValue,
-    notes: data.notes || existing?.notes || '',
-    timestamp: data.startedAt || existing?.timestamp || new Date().toISOString(),
+    notes: data.notes !== undefined ? data.notes : (existing?.notes || ''),
+    timestamp: data.timestamp || data.startedAt || existing?.timestamp || new Date().toISOString(),
     synced: true,
     company_id: data.companyId || data.company_id || existing?.company_id || currentCompany,
     companyId: data.companyId || data.company_id || existing?.companyId || currentCompany,
+    certifiedById: data.certifiedById || existing?.certifiedById,
+    certifiedByName: data.certifiedByName || existing?.certifiedByName,
+    certifiedAt: data.certifiedAt || existing?.certifiedAt,
+    approvedBy: data.approvedBy || existing?.approvedBy,
+    approvedByName: data.approvedByName || existing?.approvedByName,
+    approvedAt: data.approvedAt || existing?.approvedAt,
+    guestPasses: mergedGuestPasses,
+    varianceReviewStatus: data.varianceReviewStatus || existing?.varianceReviewStatus,
+    varianceCommentDeadline: data.varianceCommentDeadline || existing?.varianceCommentDeadline,
+    varianceMaterialityThreshold:
+      data.varianceMaterialityThreshold !== undefined
+        ? Number(data.varianceMaterialityThreshold)
+        : existing?.varianceMaterialityThreshold,
+    varianceReviewedById: data.varianceReviewedById || existing?.varianceReviewedById,
+    varianceReviewedByName: data.varianceReviewedByName || existing?.varianceReviewedByName,
+    varianceReviewedAt: data.varianceReviewedAt || existing?.varianceReviewedAt,
+    version: Math.max(Number(data.version || 0), Number(existing?.version || 0), 1),
+    mutationSource: data.mutationSource || existing?.mutationSource || 'USER_EDIT',
+    updatedAt: syncedTime,
+    lastUpdated: data.lastUpdated || new Date(syncedTime).toISOString(),
   };
 
   saveStocktakeSession(session, { fromSync: true });
+
+  // If session completed via mesh, ensure its casuals/passes stay deactivated locally too
+  if (session.status === 'APPROVED_POSTED') {
+    const allCasuals = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+    let changedCasuals = false;
+    const updatedCasuals = allCasuals.map((c) => {
+      if (c.sessionId === session.sessionId && c.active) {
+        changedCasuals = true;
+        return { ...c, active: false, updatedAt: syncedTime, lastUpdated: new Date(syncedTime).toISOString() };
+      }
+      return c;
+    });
+    if (changedCasuals) {
+      setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updatedCasuals);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
+      }
+    }
+  }
 
   // Initialize zone assignments in a single batch for each segment if not already present
   if (Array.isArray(session.segments) && session.segments.length > 0) {
@@ -19287,6 +20598,40 @@ export const consolidateStocktakeSession = (
     }
   });
 
+  // Emergency lockdown sales reconciliation (only DEDUCT_COUNT entries tagged for this session)
+  const emergencySoldMap = new Map<string, number>();
+  try {
+    const logs = getAuditLogs();
+    logs.forEach((l: any) => {
+      if (l.referenceId !== sessionId) return;
+      const isLockdownSale =
+        l.module === 'STOCKTAKE_LOCKDOWN' ||
+        String(l.details || '').includes('[STOCKTAKE_LOCKDOWN]');
+      if (!isLockdownSale) return;
+      const detailsStr = String(l.details || '');
+      const deductPolicy = l.deductPolicy || (detailsStr.includes('DEDUCT_COUNT') ? 'DEDUCT_COUNT' : 'SYSTEM_STANDARD');
+      if (deductPolicy !== 'DEDUCT_COUNT') return;
+
+      let itemId = l.itemId ? String(l.itemId).toUpperCase() : '';
+      let qty = Number(l.quantity) || 0;
+      if (!itemId || !qty) {
+        const m = detailsStr.match(/for\s+(\d+(?:\.\d+)?)x\s+.*?\(([^)]+)\)\./i);
+        if (m) {
+          qty = Number(m[1]) || 0;
+          itemId = String(m[2] || '').toUpperCase();
+        }
+      }
+      if (itemId && qty > 0) {
+        emergencySoldMap.set(itemId, (emergencySoldMap.get(itemId) || 0) + qty);
+      }
+    });
+  } catch {}
+
+  const previousByItemId = new Map<string, StocktakeConsolidatedItem>();
+  (session.consolidatedItems || []).forEach((prev) => {
+    if (prev?.itemId) previousByItemId.set(prev.itemId.toUpperCase(), prev);
+  });
+
   // For FULL_LOCKDOWN: include all catalog inventory items (uncounted items default to 0 count)
   // For DAILY_BLIND, SPOT_CHECK, WEEKLY_STRATEGIC: only consolidate items that were actually counted
   const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
@@ -19311,7 +20656,7 @@ export const consolidateStocktakeSession = (
     });
   }
 
-  // 2. Build consolidated items with SOH comparisons & Customer Goods Left Behind adjustments
+  // 2. Build consolidated items with SOH comparisons & Customer Goods Left Behind / Emergency Sale adjustments
   const consolidatedItems: StocktakeConsolidatedItem[] = [];
   let totalSystemUnits = 0;
   let totalCountedUnits = 0;
@@ -19339,15 +20684,14 @@ export const consolidateStocktakeSession = (
     const countedCostValue = countedTotalUnits * costPerUnit;
     const countedRetailValue = countedTotalUnits * sellPriceUnit;
 
-    // Customer Goods Left Behind reconciliation:
-    // If customers paid for goods but physically left them in store awaiting transport/pickup,
-    // this stock sits on the floor. It must be deducted from counted stock to obtain true available stock!
-    const customerHeldStockUnits = customerHeldMap.get(accum.itemId.toUpperCase()) || 0;
-    const adjustedPhysicalUnits = Math.max(0, countedTotalUnits - customerHeldStockUnits);
+    const itemKey = accum.itemId.toUpperCase();
+    const customerHeldStockUnits = customerHeldMap.get(itemKey) || 0;
+    const emergencySoldUnits = emergencySoldMap.get(itemKey) || 0;
+    const adjustedPhysicalUnits = Math.max(0, countedTotalUnits - customerHeldStockUnits - emergencySoldUnits);
     const trueVarianceUnits = adjustedPhysicalUnits - systemTotalUnits;
 
-    // Standard variance uses adjustedPhysicalUnits to avoid false overage
-    const effectivePhysicalUnits = customerHeldStockUnits > 0 ? adjustedPhysicalUnits : countedTotalUnits;
+    const effectivePhysicalUnits =
+      customerHeldStockUnits > 0 || emergencySoldUnits > 0 ? adjustedPhysicalUnits : countedTotalUnits;
     const effectivePhysicalCases = Math.floor(effectivePhysicalUnits / unitsPerCase);
     const effectivePhysicalSingles = effectivePhysicalUnits % unitsPerCase;
 
@@ -19365,6 +20709,7 @@ export const consolidateStocktakeSession = (
     }
 
     const wasCountedInSession = accum.segmentBreakdown.length > 0;
+    const prev = previousByItemId.get(itemKey);
 
     totalSystemUnits += systemTotalUnits;
     totalCountedUnits += countedTotalUnits;
@@ -19394,6 +20739,7 @@ export const consolidateStocktakeSession = (
       countedCostValue,
       countedRetailValue,
       customerHeldStockUnits,
+      emergencySoldUnits,
       adjustedPhysicalUnits,
       trueVarianceUnits,
       varianceCases,
@@ -19404,6 +20750,13 @@ export const consolidateStocktakeSession = (
       status,
       wasCountedInSession,
       segmentBreakdown: accum.segmentBreakdown,
+      ...(prev?.reasonCode ? { reasonCode: prev.reasonCode } : {}),
+      ...(prev?.managerComment ? { managerComment: prev.managerComment } : {}),
+      ...(prev?.actionTaken ? { actionTaken: prev.actionTaken } : {}),
+      ...(prev?.commentedById ? { commentedById: prev.commentedById } : {}),
+      ...(prev?.commentedByName ? { commentedByName: prev.commentedByName } : {}),
+      ...(prev?.commentedAt ? { commentedAt: prev.commentedAt } : {}),
+      ...(prev?.ownerAckStatus ? { ownerAckStatus: prev.ownerAckStatus } : {}),
     });
   });
 
@@ -19419,6 +20772,7 @@ export const consolidateStocktakeSession = (
   session.totalCountedUnits = totalCountedUnits;
   session.varianceUnits = totalVarianceUnits;
   session.varianceCostValue = totalVarianceCostValue;
+  session.varianceRetailValue = totalVarianceRetailValue;
   if (unverifiedSegments.length === 0) {
     session.status = 'CONSOLIDATED';
   } else if (!session.status || session.status === 'DRAFT' || session.status === 'SCHEDULED') {
@@ -19537,10 +20891,63 @@ export const submitSkuVarianceRecount = (
 };
 
 /**
- * ADMIN SUPER USER APPROVAL & INVENTORY MASTER STOCK COMMITTAL
- * - Updates master InventoryItem stockCases, stockSingles, totalUnits to match the physical count
- * - Automatically logs immutable StockMovementEntry records for audit trail
- * - Marks session as 'APPROVED_POSTED'
+ * AUDITOR CERTIFICATION STEP (Two-Man Integrity Phase 1):
+ * - Allows non-Owner Auditors to lock counts and submit READY_FOR_COMMITTAL
+ * - Does NOT alter Inventory Master; only the Leader/Owner commits inventory.
+ */
+export const certifyStocktakeReady = (
+  sessionId: string,
+  auditorId: string,
+  auditorName: string,
+  notes?: string
+): { success: boolean; message: string; session?: StocktakeSession } => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session) {
+    return { success: false, message: `Session ${sessionId} not found.` };
+  }
+  if (session.status === 'APPROVED_POSTED') {
+    return { success: false, message: `Session ${sessionId} is already approved and posted.` };
+  }
+
+  const unverified = (session.segments || []).filter((s) => s.status !== 'VERIFIED');
+  if (unverified.length > 0) {
+    return {
+      success: false,
+      message: `${unverified.length} segment(s) are not yet verified. Resolve double-counts/recounts before certifying.`,
+    };
+  }
+
+  if (!session.consolidatedItems || session.consolidatedItems.length === 0) {
+    const consRes = consolidateStocktakeSession(sessionId, false);
+    if (!consRes.success) {
+      return { success: false, message: consRes.message };
+    }
+  }
+
+  const refreshed = getStocktakeSessionById(sessionId) || session;
+  refreshed.status = 'READY_FOR_COMMITTAL';
+  refreshed.certifiedById = auditorId;
+  refreshed.certifiedByName = auditorName;
+  refreshed.certifiedAt = new Date().toISOString();
+  if (notes) {
+    refreshed.notes = (refreshed.notes ? `${refreshed.notes}\n` : '') + `[Auditor Certification]: ${notes}`;
+  }
+
+  const saved = saveStocktakeSession(refreshed);
+  return {
+    success: true,
+    message: `Stocktake certified as READY FOR COMMITTAL by ${auditorName}. Awaiting Owner / Leader PIN authorization.`,
+    session: saved,
+  };
+};
+
+/**
+ * LEADER (OWNER) APPROVAL & INVENTORY MASTER STOCK COMMITTAL
+ * - Strictly restricted to Owner / Leader (SUPER_ADMIN / OWNER / ADMIN)
+ * - Updates master InventoryItem stockCases, stockSingles, totalUnits to match physical count
+ * - Automatically logs immutable StockMovementEntry records
+ * - Deactivates all session Casuals & Cross-Branch Guest Passes
+ * - Opens Post-Commit Mandatory Manager Variance Review when variances exist
  */
 export const approveAndCommitStocktake = (
   sessionId: string,
@@ -19548,61 +20955,93 @@ export const approveAndCommitStocktake = (
   adminName: string,
   notes?: string
 ): { success: boolean; message: string; adjustmentsCount: number; session?: StocktakeSession } => {
-  const session = getStocktakeSessionById(sessionId);
-  if (!session) {
+  const initialSession = getStocktakeSessionById(sessionId);
+  if (!initialSession) {
     return { success: false, message: `Session ${sessionId} not found.`, adjustmentsCount: 0 };
   }
 
-  if (session.status === 'APPROVED_POSTED') {
+  if (initialSession.status === 'APPROVED_POSTED') {
     return { success: false, message: `This stocktake session was already approved and posted.`, adjustmentsCount: 0 };
   }
 
-  // Authorization check: Only the Store Owner (SUPER_ADMIN / ADMIN) or the expressly assigned Stocktake Auditor can commit to inventory!
+  // Two-Man Integrity Check: ONLY Store Owner / Leader can commit to Inventory Master
   const sessionUser = getSessionUser();
-  const isOwner = sessionUser?.role === 'SUPER_ADMIN' || sessionUser?.role === 'ADMIN' || adminId === '001';
-  const isAssignedAuditor = Boolean(
-    session.stocktakeAuditorId &&
-    (adminId === session.stocktakeAuditorId || sessionUser?.id === session.stocktakeAuditorId)
+  const userRole = String(sessionUser?.role || '').toUpperCase().trim();
+  const userEmail = String(sessionUser?.email || '').toLowerCase().trim();
+  const matchedAdmin = getSalespeople().find(
+    (sp) => String(sp.id || '').trim().toUpperCase() === String(adminId || '').trim().toUpperCase()
   );
+  const adminRole = String(matchedAdmin?.role || '').toUpperCase().trim();
+  const adminEmail = String(matchedAdmin?.email || '').toLowerCase().trim();
 
-  if (!isOwner && !isAssignedAuditor) {
+  const isLeaderByUser =
+    userRole === 'OWNER' ||
+    userRole === 'SUPER_ADMIN' ||
+    userRole === 'SUPER_ADMINISTRATOR' ||
+    userRole === 'ADMIN' ||
+    userEmail === 'andrekudakwashe@gmail.com';
+  const isLeaderByAdmin =
+    adminId === '001' ||
+    adminRole === 'OWNER' ||
+    adminRole === 'SUPER_ADMIN' ||
+    adminRole === 'SUPER_ADMINISTRATOR' ||
+    adminRole === 'ADMIN' ||
+    adminEmail === 'andrekudakwashe@gmail.com';
+
+  if (!isLeaderByUser && !isLeaderByAdmin) {
     return {
       success: false,
-      message: `Access Restricted: During stocktakes, even branch managers are audited. Only the Store Owner or Assigned Stocktake Auditor (${session.stocktakeAuditorName || 'Assigned Auditor'}) has authority to commit stock updates.`,
+      message: `Access Restricted: Two-Man Integrity requires the Store Owner / Leader to authorize Inventory Master committal. Auditors may certify readiness cleanly, but cannot overwrite stock.`,
       adjustmentsCount: 0,
     };
   }
 
-  if (!session.consolidatedItems || session.consolidatedItems.length === 0) {
-    // Attempt auto-consolidation first if needed
-    const consResult = consolidateStocktakeSession(sessionId);
+  // Always refresh consolidation so latest customer holds and emergency lockdown sales are included
+  if (!initialSession.consolidatedItems || initialSession.consolidatedItems.length === 0) {
+    const consResult = consolidateStocktakeSession(sessionId, true);
     if (!consResult.success) {
       return { success: false, message: consResult.message, adjustmentsCount: 0 };
     }
   }
 
+  const session = getStocktakeSessionById(sessionId) || initialSession;
   const timestamp = new Date().toISOString();
+  const nowMs = Date.now();
   const dateStr = session.date || timestamp.split('T')[0];
   let adjustmentsCount = 0;
   const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
+  const thresholdUsd = Number(session.varianceMaterialityThreshold || 10);
+  let hasVariancesRequiringExplanation = false;
 
   // Process items:
   // For FULL_LOCKDOWN: all items with variance (including uncounted items defaulted to 0) are committed.
   // For DAILY_BLIND, SPOT_CHECK, WEEKLY_STRATEGIC: ONLY items actually counted are committed!
   session.consolidatedItems.forEach((cItem) => {
-    // In targeted counts, do NOT alter uncounted catalog items:
     if (!isFullLockdown && cItem.wasCountedInSession === false) {
       return;
     }
 
     if (cItem.varianceTotalUnits !== 0) {
+      hasVariancesRequiringExplanation = true;
+      const absCost = Math.abs(Number(cItem.varianceCostValue || 0));
+      const absUnits = Math.abs(Number(cItem.varianceTotalUnits || 0));
+      cItem.requiresExplanation = absCost >= thresholdUsd || absUnits >= 5;
+      cItem.ownerAckStatus = cItem.requiresExplanation ? 'PENDING' : 'ACKNOWLEDGED';
+
       const invItem = getInventoryItemById(cItem.itemId);
       if (invItem) {
+        const upc = Math.max(1, invItem.unitsPerCase || cItem.unitsPerCase || 1);
+        const effectiveUnits = Math.max(
+          0,
+          cItem.adjustedPhysicalUnits !== undefined
+            ? Number(cItem.adjustedPhysicalUnits)
+            : Number(cItem.countedTotalUnits || 0)
+        );
         const prevCases = invItem.stockCases;
         const prevSingles = invItem.stockSingles;
-        const newCases = cItem.countedCases;
-        const newSingles = cItem.countedSingles;
-        const newTotalUnits = (newCases * invItem.unitsPerCase) + newSingles;
+        const newCases = Math.floor(effectiveUnits / upc);
+        const newSingles = effectiveUnits % upc;
+        const newTotalUnits = effectiveUnits;
 
         // 1. Update Inventory Master Stock Levels
         const updatedMaster: InventoryItem = {
@@ -19616,7 +21055,7 @@ export const approveAndCommitStocktake = (
 
         // 2. Log StockMovementEntry (ADJUSTMENT)
         const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
-        const txnId = `TXN-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-6)}-${cItem.itemId}-${randSuffix}`;
+        const txnId = `TXN-${dateStr.replace(/-/g, '')}-${nowMs.toString().slice(-6)}-${cItem.itemId}-${randSuffix}`;
         const movement: StockMovementEntry = {
           id: txnId,
           txnId,
@@ -19638,7 +21077,7 @@ export const approveAndCommitStocktake = (
           promptShown: `Stocktake Audit Approval #${sessionId} (${session.countType})`,
           actionTaken: cItem.varianceTotalUnits < 0 ? 'STOCKTAKE_SHRINKAGE_ADJUSTMENT' : 'STOCKTAKE_OVERAGE_ADJUSTMENT',
           referenceId: `${sessionId} (Approved by ${adminName})`,
-          triggerRule: 'Super User Stocktake Committal',
+          triggerRule: 'Leader Stocktake Committal',
           reason: `Physical count variance adjustment: ${cItem.varianceTotalUnits >= 0 ? `+${cItem.varianceTotalUnits}` : cItem.varianceTotalUnits} units. Previous: ${prevCases}cs/${prevSingles}ea -> New: ${newCases}cs/${newSingles}ea`,
           timestamp,
           synced: false,
@@ -19653,8 +21092,50 @@ export const approveAndCommitStocktake = (
   session.approvedBy = adminId;
   session.approvedByName = adminName;
   session.approvedAt = timestamp;
+  session.varianceMaterialityThreshold = thresholdUsd;
+  session.varianceReviewStatus = hasVariancesRequiringExplanation
+    ? 'PENDING_MANAGER_COMMENTS'
+    : 'NOT_REQUIRED';
+  if (hasVariancesRequiringExplanation) {
+    session.varianceCommentDeadline = new Date(nowMs + 48 * 60 * 60 * 1000).toISOString();
+  }
   if (notes) {
     session.notes = (session.notes ? `${session.notes}\n` : '') + `[Approval Note]: ${notes}`;
+  }
+
+  // Deactivate all Cross-Branch Visiting Counter Guest Passes bound to this session
+  if (Array.isArray(session.guestPasses) && session.guestPasses.length > 0) {
+    session.guestPasses = session.guestPasses.map((gp) => ({
+      ...gp,
+      active: false,
+      revokedAt: gp.revokedAt || timestamp,
+      updatedAt: nowMs,
+    }));
+  }
+
+  // Auto-deactivate all Temporary Casual Worker accounts bound to this session
+  const allCasuals = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  let casualsChanged = false;
+  const updatedCasuals = allCasuals.map((c) => {
+    if (c.sessionId === sessionId && c.active) {
+      casualsChanged = true;
+      return {
+        ...c,
+        active: false,
+        updatedAt: nowMs,
+        lastUpdated: timestamp,
+        version: Number(c.version || 0) + 1,
+        mutationSource: 'USER_EDIT' as const,
+      };
+    }
+    return c;
+  });
+  if (casualsChanged) {
+    setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updatedCasuals);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
+    }
   }
 
   // Release branch lockdown if this session held the store in lockdown
@@ -19670,7 +21151,7 @@ export const approveAndCommitStocktake = (
     session.isLockdownActive = false;
   }
 
-  saveStocktakeSession(session);
+  const savedSession = saveStocktakeSession(session);
 
   const scopeMsg = isFullLockdown
     ? 'Full Storewide Lockdown inventory overwrite committed'
@@ -19678,9 +21159,182 @@ export const approveAndCommitStocktake = (
 
   return {
     success: true,
-    message: `Stocktake approved successfully! ${adjustmentsCount} inventory item(s) updated in Inventory Master. ${scopeMsg}. Audit ledger entries logged.`,
+    message: `Stocktake approved successfully! ${adjustmentsCount} inventory item(s) updated in Inventory Master. ${scopeMsg}. Temporary casuals & guest passes deactivated.`,
     adjustmentsCount,
-    session,
+    session: savedSession,
+  };
+};
+
+// ============================================================================
+// PHASE 2: CROSS-BRANCH VISITING COUNTER GUEST PASSES
+// ============================================================================
+export const addStocktakeGuestPass = (
+  sessionId: string,
+  input: {
+    staffId: string;
+    staffName: string;
+    staffRole?: string;
+    homeBranchId: string;
+    homeBranchName?: string;
+    assignedGroup?: 'GROUP_1' | 'GROUP_2';
+    assignedSegmentIds?: string[];
+    grantedById: string;
+    grantedByName: string;
+  }
+): { success: boolean; message: string; pass?: StocktakeGuestPass; session?: StocktakeSession } => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session) {
+    return { success: false, message: `Stocktake session ${sessionId} not found.` };
+  }
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const currentPasses = Array.isArray(session.guestPasses) ? [...session.guestPasses] : [];
+
+  const existingIdx = currentPasses.findIndex(
+    (p) => p.active && String(p.staffId).trim().toUpperCase() === String(input.staffId).trim().toUpperCase()
+  );
+
+  const pass: StocktakeGuestPass = {
+    id: existingIdx >= 0 ? currentPasses[existingIdx].id : `GP-${now.toString().slice(-6)}`,
+    sessionId: session.sessionId,
+    staffId: input.staffId,
+    staffName: input.staffName,
+    staffRole: input.staffRole,
+    homeBranchId: input.homeBranchId,
+    homeBranchName: input.homeBranchName,
+    hostBranchId: session.branchId,
+    hostBranchName: session.branchName,
+    assignedGroup: input.assignedGroup,
+    assignedSegmentIds: input.assignedSegmentIds,
+    grantedById: input.grantedById,
+    grantedByName: input.grantedByName,
+    createdAt: existingIdx >= 0 ? currentPasses[existingIdx].createdAt : nowIso,
+    updatedAt: now,
+    active: true,
+  };
+
+  if (existingIdx >= 0) {
+    currentPasses[existingIdx] = pass;
+  } else {
+    currentPasses.push(pass);
+  }
+
+  session.guestPasses = currentPasses;
+  const saved = saveStocktakeSession(session);
+  return {
+    success: true,
+    message: `Visiting Stocktake Pass issued for ${input.staffName}. They can now log in on ${session.branchName || session.branchId} terminals.`,
+    pass,
+    session: saved,
+  };
+};
+
+export const revokeStocktakeGuestPass = (
+  sessionId: string,
+  passId: string
+): { success: boolean; session?: StocktakeSession } => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session || !Array.isArray(session.guestPasses)) return { success: false };
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  session.guestPasses = session.guestPasses.map((gp) =>
+    gp.id === passId
+      ? { ...gp, active: false, revokedAt: nowIso, updatedAt: now }
+      : gp
+  );
+  const saved = saveStocktakeSession(session);
+  return { success: true, session: saved };
+};
+
+// ============================================================================
+// PHASE 3: POST-COMMIT MANDATORY MANAGER VARIANCE COMMENTARY
+// ============================================================================
+export const submitPostCommitVarianceComments = (
+  sessionId: string,
+  entries: Array<{
+    itemId: string;
+    reasonCode: StocktakeVarianceReasonCode;
+    managerComment: string;
+    actionTaken?: string;
+  }>,
+  managerId: string,
+  managerName: string
+): { success: boolean; message: string; session?: StocktakeSession } => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session) {
+    return { success: false, message: `Session ${sessionId} not found.` };
+  }
+  if (session.status !== 'APPROVED_POSTED') {
+    return { success: false, message: `Manager commentary is submitted after the stocktake has been committed.` };
+  }
+
+  const nowIso = new Date().toISOString();
+  const entryMap = new Map<string, (typeof entries)[number]>();
+  entries.forEach((e) => {
+    if (e.itemId) entryMap.set(e.itemId.toUpperCase(), e);
+  });
+
+  session.consolidatedItems = (session.consolidatedItems || []).map((item) => {
+    const upd = entryMap.get(String(item.itemId || '').toUpperCase());
+    if (!upd) return item;
+    return {
+      ...item,
+      reasonCode: upd.reasonCode,
+      managerComment: upd.managerComment.trim(),
+      actionTaken: upd.actionTaken?.trim() || item.actionTaken,
+      commentedById: managerId,
+      commentedByName: managerName,
+      commentedAt: nowIso,
+      ownerAckStatus: 'PENDING',
+    };
+  });
+
+  session.varianceReviewStatus = 'COMMENTS_SUBMITTED';
+  const saved = saveStocktakeSession(session);
+  return {
+    success: true,
+    message: `Manager variance explanations saved for ${entries.length} SKU(s) and queued for Owner review.`,
+    session: saved,
+  };
+};
+
+export const acknowledgePostCommitVariance = (
+  sessionId: string,
+  decision: 'CLOSED' | 'DISPUTED',
+  leaderId: string,
+  leaderName: string,
+  itemStatuses?: Record<string, 'ACKNOWLEDGED' | 'DISPUTED'>
+): { success: boolean; message: string; session?: StocktakeSession } => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session) {
+    return { success: false, message: `Session ${sessionId} not found.` };
+  }
+
+  const nowIso = new Date().toISOString();
+  if (itemStatuses) {
+    session.consolidatedItems = (session.consolidatedItems || []).map((ci) => {
+      const st = itemStatuses[ci.itemId] || itemStatuses[ci.itemId.toUpperCase()];
+      return st ? { ...ci, ownerAckStatus: st } : ci;
+    });
+  } else if (decision === 'CLOSED') {
+    session.consolidatedItems = (session.consolidatedItems || []).map((ci) =>
+      ci.varianceTotalUnits !== 0 ? { ...ci, ownerAckStatus: 'ACKNOWLEDGED' } : ci
+    );
+  }
+
+  session.varianceReviewStatus = decision === 'CLOSED' ? 'CLOSED' : 'PENDING_MANAGER_COMMENTS';
+  session.varianceReviewedById = leaderId;
+  session.varianceReviewedByName = leaderName;
+  session.varianceReviewedAt = nowIso;
+
+  const saved = saveStocktakeSession(session);
+  return {
+    success: true,
+    message:
+      decision === 'CLOSED'
+        ? `Variance review signed off and CLOSED by ${leaderName}.`
+        : `Variance explanations flagged for follow-up by ${leaderName}. Manager notified.`,
+    session: saved,
   };
 };
 
@@ -19694,11 +21348,20 @@ export const logEmergencyLockdownSale = (params: {
   cashierName: string;
   overrideReason: string;
   wasCountedPriorToSale: boolean;
+  deductPolicy?: 'DEDUCT_COUNT' | 'SYSTEM_STANDARD';
 }): void => {
   const timestamp = new Date().toISOString();
+  const deductPolicy =
+    params.deductPolicy ||
+    (String(params.overrideReason || '').includes('DEDUCT_COUNT') ? 'DEDUCT_COUNT' : 'SYSTEM_STANDARD');
   addAuditLog({
     action: 'PIN_OVERRIDE',
     severity: 'WARNING',
+    module: 'STOCKTAKE_LOCKDOWN',
+    itemId: params.itemId,
+    itemName: params.itemName,
+    quantity: params.quantity,
+    deductPolicy,
     staffId: params.supervisorId,
     staffName: params.supervisorName,
     staffRole: 'ADMIN',
@@ -19707,7 +21370,7 @@ export const logEmergencyLockdownSale = (params: {
     companyId: getCurrentCompanyId(),
     branchId: getCurrentBranchId(),
     timestamp,
-  });
+  } as any);
 };
 
 // ============================================================================
@@ -20568,21 +22231,10 @@ export const getDirectGrvPaymentsForStaff = (
 }> => {
   const grvs = getDirectGrvs();
   const results: Array<{ grv: DirectGrv; payment: DirectGrvTillPayment }> = [];
-  const targetId = String(staffId || '').trim().toLowerCase();
-  const normTarget = targetId.replace(/^usr-|^staff-|^0+/, '');
-  const normTargetName = String(staffName || '').trim().toLowerCase();
+  const knownStaffSets = getKnownStaffIdSets();
 
   const matchesOperator = (opId?: string, opName?: string): boolean => {
-    const cleanId = String(opId || '').trim().toLowerCase();
-    const normOp = cleanId.replace(/^usr-|^staff-|^0+/, '');
-    if (cleanId && targetId && (cleanId === targetId || (normTarget && normOp === normTarget))) {
-      return true;
-    }
-    const cleanName = String(opName || '').trim().toLowerCase();
-    if (normTargetName && cleanName && cleanName === normTargetName) {
-      return true;
-    }
-    return false;
+    return matchesStaffExclusive(opId, opName, staffId, staffName, knownStaffSets);
   };
 
   grvs.forEach((grv) => {
@@ -20632,21 +22284,10 @@ export const getDirectGrvsForStaffAndDate = (
   staffName?: string
 ): DirectGrv[] => {
   const grvs = getDirectGrvs();
-  const targetId = String(staffId || '').trim().toLowerCase();
-  const normTarget = targetId.replace(/^usr-|^staff-|^0+/, '');
-  const normTargetName = String(staffName || '').trim().toLowerCase();
+  const knownStaffSets = getKnownStaffIdSets();
 
   const matchesOperator = (opId?: string, opName?: string): boolean => {
-    const cleanId = String(opId || '').trim().toLowerCase();
-    const normOp = cleanId.replace(/^usr-|^staff-|^0+/, '');
-    if (cleanId && targetId && (cleanId === targetId || (normTarget && normOp === normTarget))) {
-      return true;
-    }
-    const cleanName = String(opName || '').trim().toLowerCase();
-    if (normTargetName && cleanName && cleanName === normTargetName) {
-      return true;
-    }
-    return false;
+    return matchesStaffExclusive(opId, opName, staffId, staffName, knownStaffSets);
   };
 
   return grvs.filter((g) => {

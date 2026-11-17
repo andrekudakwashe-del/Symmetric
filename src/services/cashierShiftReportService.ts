@@ -462,12 +462,21 @@ export const buildCashierShiftReportData = (params: {
   const multiCurrencyTransactions: ShiftReportMultiCurrencyTx[] = [];
   const summaryMap = new Map<string, ShiftReportMultiCurrencySummary>();
 
+  const canonicalizeCurrLabel = (curr: string): string => {
+    const clean = String(curr || '').trim();
+    const low = clean.toLowerCase();
+    if (low.includes('eco')) return 'EcoCash';
+    if (low.includes('zig')) return 'ZiG';
+    return clean || 'MultiCurr';
+  };
+
   const ensureCurrSummary = (curr: string): ShiftReportMultiCurrencySummary => {
-    const key = curr.toUpperCase();
+    const canon = canonicalizeCurrLabel(curr);
+    const key = canon.toUpperCase();
     const existing = summaryMap.get(key);
     if (existing) return existing;
     const created: ShiftReportMultiCurrencySummary = {
-      currency: curr,
+      currency: canon,
       goodsTotalUsd: 0,
       cashOutUsd: 0,
       nativeExpected: 0,
@@ -496,8 +505,9 @@ export const buildCashierShiftReportData = (params: {
         return;
       }
 
-      const currLabel =
+      const rawLabel =
         s.currency && s.currency !== 'USD' ? s.currency : s.paymentMethod || 'Mobile';
+      const currLabel = canonicalizeCurrLabel(rawLabel);
       const goodsUsd = isReversed ? 0 : Number(s.total || 0);
       const rate = Number(s.exchangeRate || 1);
       const nativeAmount = isReversed

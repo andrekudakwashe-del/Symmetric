@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Salesperson, ActiveTab, ParkedSale } from '../../types';
-import { getParkedSales, getSales, getCashLogs } from '../../db/roomDatabase';
+import { getParkedSales, getSales, getCashLogs, getTodayDateString, subscribeToDatabase } from '../../db/roomDatabase';
+import { isSameDaySafe } from '../../utils/dateUtils';
 import {
   Menu,
   ChevronDown,
@@ -69,22 +70,35 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
   const [showStoreDropdown, setShowStoreDropdown] = useState(false);
   const [peerCount, setPeerCount] = useState(0);
   const [meshConfig, setMeshConfig] = useState(() => meshSyncService.getConfig());
+  const [, setDbTick] = useState(0);
 
   React.useEffect(() => {
     setMeshConfig(meshSyncService.getConfig());
-    const unsub = meshSyncService.subscribePeers((count) => {
+    const unsubPeers = meshSyncService.subscribePeers((count) => {
       setPeerCount(count);
     });
-    return () => unsub();
+    const unsubDb = subscribeToDatabase(() => {
+      setDbTick((t) => t + 1);
+    });
+    return () => {
+      unsubPeers();
+      unsubDb();
+    };
   }, []);
 
   const parkedSales = getParkedSales();
   const sales = getSales();
   const cashLogs = getCashLogs();
 
-  const todayStr = new Date().toISOString().split('T')[0];
-  const todaySales = sales.filter((s) => s.date === todayStr);
-  const todayRevenue = todaySales.reduce((sum, s) => sum + s.total, 0);
+  const todayStr = getTodayDateString();
+  const todaySales = sales.filter(
+    (s) =>
+      isSameDaySafe(s.date, s.timestamp, todayStr) &&
+      s.status !== 'Refunded' &&
+      s.status !== 'Voided' &&
+      !(s as any).isDeleted
+  );
+  const todayRevenue = Math.round(todaySales.reduce((sum, s) => sum + (Number(s.total) || 0), 0) * 100) / 100;
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();

@@ -774,8 +774,30 @@ class PersistentSyncEngine {
           console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
           const staffId = u.id || u.user_id;
           const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
-          const pinHash = u.pin_hash || existingStaff?.pin_hash;
-          const pinSalt = u.pin_salt || existingStaff?.pin_salt;
+          const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || 0;
+          const incomingVersion = Number(u.version || 0);
+          const incomingMutationSource =
+            u.mutationSource ||
+            u.mutation_source ||
+            (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : 'MIGRATION');
+          const incomingPinVersion = Number(u.pinVersion || u.pin_version || 0);
+          const incomingPinUpdatedAt = parseTimestampMs(u.pinUpdatedAt || u.pin_updated_at) || incomingTs;
+          const existingPinVersion = Number((existingStaff as any)?.pinVersion || 0);
+          const existingPinUpdatedAt = parseTimestampMs((existingStaff as any)?.pinUpdatedAt || existingStaff?.updatedAt);
+          const existingHasPin = Boolean(existingStaff?.pin_hash || existingStaff?.pin);
+          const shouldKeepExistingPin =
+            existingHasPin &&
+            (
+              !u.pin_hash ||
+              (existingPinVersion > 0 && incomingPinVersion === 0) ||
+              (existingPinVersion > 0 && incomingPinVersion > 0 && existingPinVersion > incomingPinVersion) ||
+              (existingPinUpdatedAt > 0 && incomingPinUpdatedAt > 0 && existingPinUpdatedAt - incomingPinUpdatedAt > 5000) ||
+              incomingTs === 0
+            );
+          const pinHash = shouldKeepExistingPin ? existingStaff?.pin_hash : (u.pin_hash || existingStaff?.pin_hash);
+          const pinSalt = shouldKeepExistingPin ? existingStaff?.pin_salt : (u.pin_salt || existingStaff?.pin_salt);
+          const effectivePinVersion = Math.max(existingPinVersion, incomingPinVersion);
+          const effectivePinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
           const resolvedBranchId = u.branch_id || u.branchId || existingStaff?.branchId || 'BR-MAIN';
           const resolvedBranchAssignments = u.branchAssignments || existingStaff?.branchAssignments;
           const resolvedAssignedBranchIds =
@@ -785,10 +807,14 @@ class PersistentSyncEngine {
               : (existingStaff as any)?.assignedBranchIds);
           const userPerson: Salesperson = {
             id: staffId,
-            name: u.full_name || u.name || 'Staff',
-            email: u.email || '',
-            role: (u.role || 'CASHIER').toUpperCase() as any,
-            ...(pinHash ? { pin_hash: pinHash, pin_salt: pinSalt } : { pin: String(u.pin || '1234') }),
+            name: u.full_name || u.name || existingStaff?.name || 'Staff',
+            email: u.email || existingStaff?.email || '',
+            role: (u.role || existingStaff?.role || 'CASHIER').toUpperCase() as any,
+            ...(pinHash
+              ? { pin_hash: pinHash, ...(pinSalt ? { pin_salt: pinSalt } : {}) }
+              : existingStaff?.pin
+              ? { pin: existingStaff.pin }
+              : { pin: String(u.pin || '1234') }),
             active: (u.is_active !== false && u.active !== 'N' && u.active !== false) ? 'Y' : 'N',
             companyId: u.company_id || companyId,
             branchId: resolvedBranchId,
@@ -796,10 +822,13 @@ class PersistentSyncEngine {
             ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
             ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
             ...(u.permissions || existingStaff?.permissions ? { permissions: u.permissions || existingStaff?.permissions } : {}),
-            ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
+            version: incomingVersion,
+            mutationSource: incomingMutationSource,
+            ...(effectivePinVersion > 0 ? { pinVersion: effectivePinVersion } : {}),
+            ...(effectivePinUpdatedAt > 0 ? { pinUpdatedAt: effectivePinUpdatedAt } : {}),
+            ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
           } as any;
 
-          const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || Date.now();
           const resIngest = await routeCloudRecordThroughSyncCore(
             {
               packetId: `CLOUD-STAFF-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
@@ -808,6 +837,8 @@ class PersistentSyncEngine {
               action: 'UPSERT',
               data: userPerson,
               updatedAt: incomingTs,
+              version: incomingVersion,
+              mutationSource: incomingMutationSource,
               originDeviceId: 'APPS_SCRIPT_CLOUD',
               targetBranchId: 'ALL',
               class: 'T2',
@@ -826,7 +857,7 @@ class PersistentSyncEngine {
               usersCount++;
             }
           );
-          if (!resIngest.accepted && resIngest.reason === 'STALE_T2') {
+          if (!resIngest.accepted && String(resIngest.reason || '').startsWith('STALE_T2')) {
             console.warn(`[SyncCore Gate] 🛡️ Rejected stale AppScripts staff update for ${staffId} (${resIngest.reason})`);
           }
         }
@@ -844,20 +875,37 @@ class PersistentSyncEngine {
 
       if (branchesRes && branchesRes.success && Array.isArray(branchesRes.branches)) {
         for (const b of branchesRes.branches) {
-          const brId = b.branch_id || b.branchId || 'BR-MAIN';
-          const existingBranch = getBranches().find((eb) => eb.branchId === brId || eb.id === brId);
-          const incomingTs = parseTimestampMs(b.updatedAt || b.updated_at || b.lastUpdated) || Date.now();
+          const rawBrId = String(b.branch_id || b.branchId || b.BranchID || b.id || 'BR-MAIN').trim();
+          const lowerBr = rawBrId.toLowerCase();
+          const brId = lowerBr === '1' || lowerBr === 'br-main' || lowerBr === 'br001' ? 'BR-MAIN' : rawBrId;
+          const existingBranch = getBranches().find((eb) => {
+            const eId = String(eb.branchId || eb.id || '').trim().toLowerCase();
+            return eId === brId.toLowerCase() || (brId === 'BR-MAIN' && (eId === '1' || eId === 'br001' || eId === 'br-main'));
+          });
+          const incomingTs = parseTimestampMs(b.updatedAt || b.updated_at || b.lastUpdated || b.UpdatedAt) || 0;
+          const rawName = String(b.name || b.branch_name || b.branchName || b.Name || '').trim();
+          const rawCode = String(b.code || b.branch_code || b.branchCode || b.Code || '').trim();
+          const rawLoc = String(b.location || b.address || b.Location || b.Address || '').trim();
+          const existingName = existingBranch?.name && !['branch', 'main branch', 'unnamed branch'].includes(existingBranch.name.trim().toLowerCase()) ? existingBranch.name : '';
+          const existingCode = existingBranch?.code && existingBranch.code.trim().toLowerCase() !== brId.toLowerCase() ? existingBranch.code : '';
+          const incomingBranchVersion = Number(b.version || 0);
+          const incomingBranchSource =
+            b.mutationSource ||
+            b.mutation_source ||
+            (incomingTs === 0 && incomingBranchVersion === 0 ? 'SEED' : 'MIGRATION');
           const branchObj: Branch = {
             id: brId,
             branchId: brId,
-            name: b.name || b.branch_name || 'Branch',
-            code: b.code || b.branch_code || brId,
-            location: b.location || b.address || '',
-            address: b.location || b.address || '',
-            company_id: b.company_id || companyId,
-            companyId: b.company_id || companyId,
+            name: (rawName && !['branch', 'unnamed branch'].includes(rawName.toLowerCase())) ? rawName : (existingName || rawName || 'Main Branch'),
+            code: (rawCode && rawCode.toLowerCase() !== brId.toLowerCase()) ? rawCode : (existingCode || rawCode || brId),
+            location: rawLoc || existingBranch?.location || '',
+            address: rawLoc || existingBranch?.address || existingBranch?.location || '',
+            company_id: b.company_id || b.companyId || b.CompanyID || companyId,
+            companyId: b.company_id || b.companyId || b.CompanyID || companyId,
             is_active: b.is_active !== false,
-            ...(b.updatedAt || b.updated_at ? { updatedAt: b.updatedAt || b.updated_at } : {}),
+            version: incomingBranchVersion,
+            mutationSource: incomingBranchSource,
+            ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
           } as any;
 
           await routeCloudRecordThroughSyncCore(
@@ -868,6 +916,8 @@ class PersistentSyncEngine {
               action: 'UPSERT',
               data: branchObj,
               updatedAt: incomingTs,
+              version: incomingBranchVersion,
+              mutationSource: incomingBranchSource,
               originDeviceId: 'APPS_SCRIPT_CLOUD',
               targetBranchId: 'ALL',
               class: 'T2',
@@ -910,8 +960,30 @@ class PersistentSyncEngine {
         console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
         const staffId = u.id || u.user_id;
         const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
-        const pinHash = u.pin_hash || existingStaff?.pin_hash;
-        const pinSalt = u.pin_salt || existingStaff?.pin_salt;
+        const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || 0;
+        const incomingVersion = Number(u.version || 0);
+        const incomingMutationSource =
+          u.mutationSource ||
+          u.mutation_source ||
+          (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : 'MIGRATION');
+        const incomingPinVersion = Number(u.pinVersion || u.pin_version || 0);
+        const incomingPinUpdatedAt = parseTimestampMs(u.pinUpdatedAt || u.pin_updated_at) || incomingTs;
+        const existingPinVersion = Number((existingStaff as any)?.pinVersion || 0);
+        const existingPinUpdatedAt = parseTimestampMs((existingStaff as any)?.pinUpdatedAt || existingStaff?.updatedAt);
+        const existingHasPin = Boolean(existingStaff?.pin_hash || existingStaff?.pin);
+        const shouldKeepExistingPin =
+          existingHasPin &&
+          (
+            !u.pin_hash ||
+            (existingPinVersion > 0 && incomingPinVersion === 0) ||
+            (existingPinVersion > 0 && incomingPinVersion > 0 && existingPinVersion > incomingPinVersion) ||
+            (existingPinUpdatedAt > 0 && incomingPinUpdatedAt > 0 && existingPinUpdatedAt - incomingPinUpdatedAt > 5000) ||
+            incomingTs === 0
+          );
+        const pinHash = shouldKeepExistingPin ? existingStaff?.pin_hash : (u.pin_hash || existingStaff?.pin_hash);
+        const pinSalt = shouldKeepExistingPin ? existingStaff?.pin_salt : (u.pin_salt || existingStaff?.pin_salt);
+        const effectivePinVersion = Math.max(existingPinVersion, incomingPinVersion);
+        const effectivePinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
         const resolvedBranchId = u.branch_id || u.branchId || existingStaff?.branchId || 'BR-MAIN';
         const resolvedBranchAssignments = u.branchAssignments || existingStaff?.branchAssignments;
         const resolvedAssignedBranchIds =
@@ -921,10 +993,14 @@ class PersistentSyncEngine {
             : (existingStaff as any)?.assignedBranchIds);
         const userObj: any = {
           id: staffId,
-          name: u.full_name || u.name || 'Staff',
-          email: u.email || '',
-          role: (u.role || 'CASHIER').toUpperCase() as any,
-          ...(pinHash ? { pin_hash: pinHash, pin_salt: pinSalt } : { pin: String(u.pin || '1234') }),
+          name: u.full_name || u.name || existingStaff?.name || 'Staff',
+          email: u.email || existingStaff?.email || '',
+          role: (u.role || existingStaff?.role || 'CASHIER').toUpperCase() as any,
+          ...(pinHash
+            ? { pin_hash: pinHash, ...(pinSalt ? { pin_salt: pinSalt } : {}) }
+            : existingStaff?.pin
+            ? { pin: existingStaff.pin }
+            : { pin: String(u.pin || '1234') }),
           active: (u.is_active !== false && u.active !== 'N' && u.active !== false) ? 'Y' : 'N',
           companyId: u.company_id || currentCompany.company_id,
           branchId: resolvedBranchId,
@@ -932,9 +1008,12 @@ class PersistentSyncEngine {
           ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
           ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
           ...(u.permissions || existingStaff?.permissions ? { permissions: u.permissions || existingStaff?.permissions } : {}),
-          ...(u.updatedAt || u.updated_at ? { updatedAt: u.updatedAt || u.updated_at } : {}),
+          version: incomingVersion,
+          mutationSource: incomingMutationSource,
+          ...(effectivePinVersion > 0 ? { pinVersion: effectivePinVersion } : {}),
+          ...(effectivePinUpdatedAt > 0 ? { pinUpdatedAt: effectivePinUpdatedAt } : {}),
+          ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
         };
-        const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || Date.now();
         await routeCloudRecordThroughSyncCore(
           {
             packetId: `CLOUD-STAFF-FULL-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
@@ -943,6 +1022,8 @@ class PersistentSyncEngine {
             action: 'UPSERT',
             data: userObj,
             updatedAt: incomingTs,
+            version: incomingVersion,
+            mutationSource: incomingMutationSource,
             originDeviceId: 'APPS_SCRIPT_CLOUD',
             targetBranchId: 'ALL',
             class: 'T2',
@@ -981,20 +1062,37 @@ class PersistentSyncEngine {
     let count = 0;
     if (res && res.success && Array.isArray(res.branches)) {
       for (const b of res.branches) {
-        const brId = b.branch_id || b.branchId || 'BR-MAIN';
-        const existingBranch = getBranches().find((eb) => eb.branchId === brId || eb.id === brId);
-        const incomingTs = parseTimestampMs(b.updatedAt || b.updated_at || b.lastUpdated) || Date.now();
+        const rawBrId = String(b.branch_id || b.branchId || b.BranchID || b.id || 'BR-MAIN').trim();
+        const lowerBr = rawBrId.toLowerCase();
+        const brId = lowerBr === '1' || lowerBr === 'br-main' || lowerBr === 'br001' ? 'BR-MAIN' : rawBrId;
+        const existingBranch = getBranches().find((eb) => {
+          const eId = String(eb.branchId || eb.id || '').trim().toLowerCase();
+          return eId === brId.toLowerCase() || (brId === 'BR-MAIN' && (eId === '1' || eId === 'br001' || eId === 'br-main'));
+        });
+        const incomingTs = parseTimestampMs(b.updatedAt || b.updated_at || b.lastUpdated || b.UpdatedAt) || 0;
+        const rawName = String(b.name || b.branch_name || b.branchName || b.Name || '').trim();
+        const rawCode = String(b.code || b.branch_code || b.branchCode || b.Code || '').trim();
+        const rawLoc = String(b.location || b.address || b.Location || b.Address || '').trim();
+        const existingName = existingBranch?.name && !['branch', 'main branch', 'unnamed branch'].includes(existingBranch.name.trim().toLowerCase()) ? existingBranch.name : '';
+        const existingCode = existingBranch?.code && existingBranch.code.trim().toLowerCase() !== brId.toLowerCase() ? existingBranch.code : '';
+        const incomingBranchVersion = Number(b.version || 0);
+        const incomingBranchSource =
+          b.mutationSource ||
+          b.mutation_source ||
+          (incomingTs === 0 && incomingBranchVersion === 0 ? 'SEED' : 'MIGRATION');
         const branchObj: any = {
           id: brId,
           branchId: brId,
-          name: b.name || b.branch_name || 'Branch',
-          code: b.code || b.branch_code || brId,
-          location: b.location || b.address || '',
-          address: b.location || b.address || '',
-          company_id: b.company_id || currentCompany.company_id,
-          companyId: b.company_id || currentCompany.company_id,
+          name: (rawName && !['branch', 'unnamed branch'].includes(rawName.toLowerCase())) ? rawName : (existingName || rawName || 'Main Branch'),
+          code: (rawCode && rawCode.toLowerCase() !== brId.toLowerCase()) ? rawCode : (existingCode || rawCode || brId),
+          location: rawLoc || existingBranch?.location || '',
+          address: rawLoc || existingBranch?.address || existingBranch?.location || '',
+          company_id: b.company_id || b.companyId || b.CompanyID || currentCompany.company_id,
+          companyId: b.company_id || b.companyId || b.CompanyID || currentCompany.company_id,
           is_active: b.is_active !== false,
-          ...(b.updatedAt || b.updated_at ? { updatedAt: b.updatedAt || b.updated_at } : {}),
+          version: incomingBranchVersion,
+          mutationSource: incomingBranchSource,
+          ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
         };
         await routeCloudRecordThroughSyncCore(
           {
@@ -1004,6 +1102,8 @@ class PersistentSyncEngine {
             action: 'UPSERT',
             data: branchObj,
             updatedAt: incomingTs,
+            version: incomingBranchVersion,
+            mutationSource: incomingBranchSource,
             originDeviceId: 'APPS_SCRIPT_CLOUD',
             targetBranchId: 'ALL',
             class: 'T2',

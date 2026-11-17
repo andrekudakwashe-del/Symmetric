@@ -33,7 +33,9 @@ import {
   Search,
   Coins,
   Banknote,
+  ShieldAlert,
 } from 'lucide-react';
+import { useClockSecurity, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
 
 interface POSCounterViewProps {
   cart: CartItem[];
@@ -318,9 +320,18 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
     }
   };
 
+  const clockSecurity = useClockSecurity();
+  const [clockLockNotice, setClockLockNotice] = useState<string | null>(null);
+
   // Void Cart Security Handler
   const handleClearCartWithSecurity = () => {
     if (cart.length === 0) return;
+    if (clockSecurity.isClockTampered) {
+      setClockLockNotice(
+        'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.'
+      );
+      return;
+    }
     const isManagerOrAdmin = isSupervisorOrAbove(currentUser?.role) || isAdminUnlocked;
 
     if (isManagerOrAdmin) {
@@ -795,13 +806,43 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
         </div>
       </div>
 
+      {(clockSecurity.isClockTampered || clockLockNotice) && (
+        <div
+          role="alert"
+          className="rounded-2xl bg-red-600 border-2 border-red-400 text-white px-3.5 py-2.5 text-xs flex items-center justify-between gap-2 shadow-lg"
+        >
+          <div className="flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 shrink-0" />
+            <span className="font-bold">
+              {clockLockNotice ||
+                'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.'}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              setClockLockNotice(null);
+              isDeviceTimeAutomatic();
+            }}
+            className="px-2.5 py-1 rounded-lg bg-white text-red-700 font-black text-[11px] shrink-0"
+          >
+            Re-check
+          </button>
+        </div>
+      )}
+
       {/* 5. "Clear" (Salmon/Red) and "Save for later" (Amber/Orange) buttons (Desired 2) */}
       <div className="grid grid-cols-2 gap-2.5">
         <button
           type="button"
           onClick={handleClearCartWithSecurity}
-          disabled={cart.length === 0}
-          className="py-3 px-4 rounded-2xl bg-[#EF5350] hover:bg-[#E53935] disabled:opacity-40 text-white font-black text-xs sm:text-sm tracking-wide shadow-sm transition transform active:scale-95"
+          disabled={cart.length === 0 || clockSecurity.isClockTampered}
+          title={
+            clockSecurity.isClockTampered
+              ? 'Locked: Enable Automatic Date & Time to void transactions'
+              : 'Void & Clear Cart'
+          }
+          className="py-3 px-4 rounded-2xl bg-[#EF5350] hover:bg-[#E53935] disabled:opacity-40 disabled:cursor-not-allowed text-white font-black text-xs sm:text-sm tracking-wide shadow-sm transition transform active:scale-95"
         >
           Clear
         </button>

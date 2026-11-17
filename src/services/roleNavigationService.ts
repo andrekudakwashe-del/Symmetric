@@ -1,5 +1,9 @@
 import { ActiveTab, Role, Salesperson } from '../types';
 import {
+  canAccessStocktakeModule,
+  isTabAllowedUnderLockdownOrStocktake,
+} from './stocktakeAccessService';
+import {
   ShoppingBag,
   Receipt,
   Scale,
@@ -685,6 +689,7 @@ export const getRoleDefinitionForUser = (user: Salesperson | null): RoleDefiniti
 
 export const getLandingTabForUser = (user: Salesperson | null): ActiveTab => {
   if (!user) return 'home';
+  if (user.isCasual || user.isVisitingCounter) return 'stocktake';
   const roleDef = getRoleDefinitionForUser(user);
   return roleDef.defaultLandingModule || roleDef.primaryModules[0] || 'pos';
 };
@@ -694,6 +699,12 @@ export const isModuleAllowedForUser = (
   tab: ActiveTab
 ): boolean => {
   if (!user) return false;
+
+  // Enforce Casual / Visiting Counter / Full-Lockdown restriction first
+  if (!isTabAllowedUnderLockdownOrStocktake(user, tab, user.branchId || user.branch_id)) {
+    return false;
+  }
+
   // Super Admin / Owner has access to everything
   const normRole = (user.role || '').toUpperCase();
   if (
@@ -705,7 +716,12 @@ export const isModuleAllowedForUser = (
     return true;
   }
 
-  // Home / more / common utility tabs are always accessible
+  // Dynamic Stocktake Access (Active Branch Session / Visiting Guest Pass / Daily Blind Permission)
+  if (tab === 'stocktake' && canAccessStocktakeModule(user, user.branchId || user.branch_id)) {
+    return true;
+  }
+
+  // Home / more / common utility tabs are accessible when not under strict stocktake lockdown
   if (tab === 'home' || tab === 'more') return true;
 
   const roleDef = getRoleDefinitionForUser(user);
@@ -763,15 +779,34 @@ export const getModuleIcon = (iconName: string): React.ComponentType<{ className
 
 export const getUserPrimaryModules = (user: Salesperson | null): SystemModuleInfo[] => {
   if (!user) return [];
-  const roleDef = getRoleDefinitionForUser(user);
   const moduleMap = new Map<ActiveTab, SystemModuleInfo>();
   ALL_SYSTEM_MODULES.forEach((m) => moduleMap.set(m.id, m));
 
+  if (user.isCasual || user.isVisitingCounter) {
+    const stMod = moduleMap.get('stocktake');
+    return stMod ? [stMod] : [];
+  }
+
+  const roleDef = getRoleDefinitionForUser(user);
   const list: SystemModuleInfo[] = [];
+  const seen = new Set<ActiveTab>();
+
   roleDef.primaryModules.forEach((modId) => {
     const mod = moduleMap.get(modId);
-    if (mod) list.push(mod);
+    if (mod && isModuleAllowedForUser(user, mod.id)) {
+      list.push(mod);
+      seen.add(mod.id);
+    }
   });
+
+  // Dynamically promote Stocktake into quick workflow when branch has active stocktake or user has daily blind count access
+  if (!seen.has('stocktake') && canAccessStocktakeModule(user, user.branchId || user.branch_id)) {
+    const stMod = moduleMap.get('stocktake');
+    if (stMod && isModuleAllowedForUser(user, 'stocktake')) {
+      list.push(stMod);
+    }
+  }
+
   return list;
 };
 

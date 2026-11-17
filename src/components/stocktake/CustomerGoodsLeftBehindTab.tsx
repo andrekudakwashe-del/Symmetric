@@ -53,6 +53,7 @@ export const CustomerGoodsLeftBehindTab: React.FC<CustomerGoodsLeftBehindTabProp
   const [quantity, setQuantity] = useState<number>(1);
   const [holdType, setHoldType] = useState<'SAME_DAY' | 'DAY_END_FORMAL'>('SAME_DAY');
   const [notes, setNotes] = useState('');
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const loadData = () => {
     const data = getCustomerGoodsLeftBehind(session.sessionId);
@@ -95,12 +96,11 @@ export const CustomerGoodsLeftBehindTab: React.FC<CustomerGoodsLeftBehindTabProp
     onRefreshSession();
   };
 
-  const handleDelete = (id: string) => {
-    if (confirm('Delete this Customer Goods Left Behind record?')) {
-      deleteCustomerGoodsLeftBehind(id);
-      loadData();
-      onRefreshSession();
-    }
+  const handleConfirmDelete = (id: string) => {
+    deleteCustomerGoodsLeftBehind(id);
+    setPendingDeleteId(null);
+    loadData();
+    onRefreshSession();
   };
 
   // Filter items
@@ -241,14 +241,33 @@ export const CustomerGoodsLeftBehindTab: React.FC<CustomerGoodsLeftBehindTabProp
                     {item.notes && <p className="text-slate-300 truncate">{item.notes}</p>}
                   </td>
                   <td className="py-3 px-4 text-right">
-                    <button
-                      type="button"
-                      onClick={() => handleDelete(item.id)}
-                      className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-slate-800 rounded transition"
-                      title="Remove record"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
+                    {pendingDeleteId === item.id ? (
+                      <div className="inline-flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => handleConfirmDelete(item.id)}
+                          className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded text-[10px] font-bold"
+                        >
+                          Confirm
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPendingDeleteId(null)}
+                          className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[10px]"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setPendingDeleteId(item.id)}
+                        className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-slate-800 rounded transition"
+                        title="Remove record"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}

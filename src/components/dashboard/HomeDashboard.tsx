@@ -13,7 +13,10 @@ import {
   getCustomerCreditReport,
   getInventoryItems,
   getProducts,
+  getTodayDateString,
+  subscribeToDatabase,
 } from '../../db/roomDatabase';
+import { isSameDaySafe } from '../../utils/dateUtils';
 import { resolveItemCost } from '../../utils/costResolver';
 import {
   Coins,
@@ -39,7 +42,14 @@ import {
   Banknote,
   Boxes,
   Wifi,
+  ShieldAlert,
 } from 'lucide-react';
+import { useClockSecurity } from '../../utils/clockSecurity';
+import {
+  getPostCommitPendingVarianceSessions,
+  isStocktakeLeader,
+  isStocktakeAuditor,
+} from '../../services/stocktakeAccessService';
 
 interface HomeDashboardProps {
   currentUser: Salesperson;
@@ -66,25 +76,40 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
   const [, setTick] = useState(0);
   useEffect(() => {
     const handleSyncUpdate = () => setTick((t) => t + 1);
+    const unsubDb = subscribeToDatabase(handleSyncUpdate);
     window.addEventListener('saimetric_customer_changes_updated', handleSyncUpdate);
     window.addEventListener('saimetric_credit_sales_updated', handleSyncUpdate);
     window.addEventListener('saimetric_sales_updated', handleSyncUpdate);
+    window.addEventListener('mesh-catchup-completed', handleSyncUpdate);
     return () => {
+      unsubDb();
       window.removeEventListener('saimetric_customer_changes_updated', handleSyncUpdate);
       window.removeEventListener('saimetric_credit_sales_updated', handleSyncUpdate);
       window.removeEventListener('saimetric_sales_updated', handleSyncUpdate);
+      window.removeEventListener('mesh-catchup-completed', handleSyncUpdate);
     };
   }, []);
 
-  const todayStr = new Date().toISOString().split('T')[0];
+  const todayStr = getTodayDateString();
 
-  // Today's metrics
-  const todaySales = useMemo(() => {
-    return sales.filter((s) => s.date === todayStr);
+  // Today's metrics (exclude Refunded, Voided, and deleted invoices so Revenue & Sales Snapshot match Cash Balancing & Sales Report)
+  const todaySalesAll = useMemo(() => {
+    return sales.filter((s) => isSameDaySafe(s.date, s.timestamp, todayStr));
   }, [sales, todayStr]);
 
+  const todaySales = useMemo(() => {
+    return todaySalesAll.filter(
+      (s) => s.status !== 'Refunded' && s.status !== 'Voided' && !(s as any).isDeleted
+    );
+  }, [todaySalesAll]);
+
+  const todayRefundedOrVoidedCount = useMemo(() => {
+    return todaySalesAll.length - todaySales.length;
+  }, [todaySalesAll.length, todaySales.length]);
+
   const todayRevenue = useMemo(() => {
-    return todaySales.reduce((acc, s) => acc + s.total, 0);
+    const sum = todaySales.reduce((acc, s) => acc + (Number(s.total) || 0), 0);
+    return Math.round(sum * 100) / 100;
   }, [todaySales]);
 
   const todayCashCount = useMemo(() => {
@@ -100,9 +125,36 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
     (currentUser?.role as string) === 'super_admin' ||
     currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
 
+  const clockSecurity = useClockSecurity();
+
+  const suspiciousSales = useMemo(() => {
+    return sales.filter((s) => Boolean(s.suspicious_backdate) && !(s as any).isDeleted);
+  }, [sales]);
+
+  const unacknowledgedSecurityAlerts = useMemo(() => {
+    return (clockSecurity.alerts || []).filter((a) => !a.acknowledged);
+  }, [clockSecurity.alerts]);
+
   const pendingSyncCount = syncQueue.filter((i) => i.status === 'pending' || i.status === 'failed').length;
 
   const isAdmin = currentUser.role === 'Admin';
+
+  const canSeeVarianceBanner = (() => {
+    if (!currentUser || currentUser.isCasual || currentUser.isVisitingCounter) return false;
+    const r = String(currentUser.role || '').toUpperCase().trim();
+    return (
+      isStocktakeLeader(currentUser) ||
+      isStocktakeAuditor(currentUser) ||
+      r === 'MANAGER' ||
+      r === 'BRANCH_MANAGER' ||
+      r === 'SUPERVISOR'
+    );
+  })();
+
+  const pendingVarianceReviews = useMemo(() => {
+    if (!canSeeVarianceBanner) return [];
+    return getPostCommitPendingVarianceSessions(currentUser?.branchId || currentUser?.branch_id);
+  }, [canSeeVarianceBanner, currentUser?.branchId, currentUser?.branch_id]);
 
   const changeReport = getCustomerChangeReport();
   const creditReport = getCustomerCreditReport();
@@ -160,7 +212,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
       fastestProduct: fastest,
       topProfitProduct: topProfit,
     };
-  }, [todaySales, inventoryItems]);
+  }, [todaySales, inventoryItems, products]);
 
   const allQuickActions = [
     {
@@ -320,7 +372,10 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
             <div className="text-lg font-black font-mono-num text-emerald-400 mt-0.5">
               ${(Number(todayRevenue) || 0).toFixed(2)}
             </div>
-            <span className="text-[10px] text-slate-500 font-medium font-mono-num">{todaySales.length} invoices</span>
+            <span className="text-[10px] text-slate-500 font-medium font-mono-num">
+              {todaySales.length} {todaySales.length === 1 ? 'invoice' : 'invoices'}
+              {todayRefundedOrVoidedCount > 0 ? ` (${todayRefundedOrVoidedCount} refunded/voided excluded)` : ''}
+            </span>
           </div>
 
           {/* Customers */}
@@ -349,6 +404,143 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Super Admin Security Review Panel: Clock Tampering & Suspicious Backdated Transactions */}
+      {isSuperAdmin &&
+        (clockSecurity.isClockTampered ||
+          unacknowledgedSecurityAlerts.length > 0 ||
+          suspiciousSales.length > 0) && (
+          <div className="bg-gradient-to-br from-rose-950/90 via-slate-900 to-amber-950/60 border-2 border-rose-500/60 rounded-3xl p-4 sm:p-5 shadow-2xl space-y-3 animate-fadeIn">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-rose-500/30 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-2xl bg-rose-600/30 border border-rose-400/50 text-rose-200 flex items-center justify-center shrink-0">
+                  <ShieldAlert className="w-5 h-5 animate-pulse" />
+                </div>
+                <div>
+                  <h3 className="text-sm sm:text-base font-black text-white flex items-center gap-2">
+                    <span>Clock Tampering &amp; Backdate Security Review</span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-rose-500 text-white font-mono">
+                      SUPER ADMIN
+                    </span>
+                  </h3>
+                  <p className="text-xs text-rose-200/80">
+                    Hub-rejected backdated packets and Cloud-flagged transactions where claimed date predates server receipt day.
+                  </p>
+                </div>
+              </div>
+              {clockSecurity.alerts.some((a) => a.acknowledged) && (
+                <button
+                  type="button"
+                  onClick={() => clockSecurity.clearAcknowledgedAlerts()}
+                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold border border-slate-700 shrink-0"
+                >
+                  Clear Acknowledged
+                </button>
+              )}
+            </div>
+
+            {unacknowledgedSecurityAlerts.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-rose-300">
+                  Active Security Alerts ({unacknowledgedSecurityAlerts.length})
+                </div>
+                {unacknowledgedSecurityAlerts.slice(0, 6).map((alert) => (
+                  <div
+                    key={alert.id}
+                    className="p-3 rounded-2xl bg-slate-950/80 border border-rose-500/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                  >
+                    <div className="space-y-0.5">
+                      <div className="font-bold text-white flex items-center gap-2 flex-wrap">
+                        <span className="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-mono text-[10px]">
+                          {alert.type}
+                        </span>
+                        <span>Device: {alert.deviceId}</span>
+                        {alert.invoiceId && (
+                          <span className="text-amber-300 font-mono">#{alert.invoiceId}</span>
+                        )}
+                      </div>
+                      <div className="text-rose-200/90">{alert.message}</div>
+                      <div className="text-[10px] text-slate-400 font-mono">
+                        Logged: {new Date(alert.createdAt).toLocaleString()}
+                        {alert.serverReceivedAt ? ` • Cloud Receipt: ${alert.serverReceivedAt}` : ''}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => clockSecurity.acknowledgeAlert(alert.id)}
+                      className="px-3 py-1.5 rounded-xl bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/40 font-bold text-[11px] shrink-0 self-start sm:self-center"
+                    >
+                      Acknowledge
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {suspiciousSales.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-amber-300">
+                  Cloud-Flagged Suspicious Backdated Sales ({suspiciousSales.length})
+                </div>
+                <div className="space-y-2">
+                  {suspiciousSales.slice(0, 6).map((s) => (
+                    <div
+                      key={s.id}
+                      className="p-3 rounded-2xl bg-slate-950/80 border border-amber-500/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                    >
+                      <div>
+                        <div className="font-bold text-white flex items-center gap-2 flex-wrap">
+                          <span className="font-mono text-amber-300">#{s.id}</span>
+                          <span>{s.customerName}</span>
+                          <span className="text-slate-400">by {s.staffName}</span>
+                        </div>
+                        <div className="text-[11px] text-amber-200/90 font-mono mt-0.5">
+                          Claimed Date: {s.date} • Cloud server_received_at:{' '}
+                          {s.server_received_at
+                            ? new Date(s.server_received_at).toLocaleString()
+                            : 'Recorded'}
+                        </div>
+                      </div>
+                      <div className="text-right font-mono font-black text-amber-300 shrink-0">
+                        ${(Number(s.total) || 0).toFixed(2)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+      {/* Post-Commit Mandatory Stocktake Variance Commentary Alert */}
+      {pendingVarianceReviews.length > 0 && (
+        <div className="bg-gradient-to-r from-amber-950/90 via-slate-900 to-amber-950/60 border-2 border-amber-500/60 rounded-3xl p-4 sm:p-5 shadow-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 animate-fadeIn">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 rounded-2xl bg-amber-500/20 border border-amber-400/50 text-amber-300 flex items-center justify-center shrink-0">
+              <AlertCircle className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm sm:text-base font-black text-white flex flex-wrap items-center gap-2">
+                <span>Action Required: Stocktake Variance Explanations Pending</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500 text-slate-950 font-mono">
+                  {pendingVarianceReviews.length} SESSION(S)
+                </span>
+              </h3>
+              <p className="text-xs text-amber-200/90 mt-0.5">
+                Committed stocktake(s) ({pendingVarianceReviews.map((s) => s.sessionId).join(', ')}) require Manager root-cause comments & Owner review.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => onNavigateTab('stocktake')}
+            className="px-4 py-2.5 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-xs shadow-lg flex items-center gap-1.5 shrink-0 transition"
+          >
+            <span>Open Variance Commentary</span>
+            <ArrowRight className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* 4 Core Data Entry Forms Launcher Grid */}
       <div>
