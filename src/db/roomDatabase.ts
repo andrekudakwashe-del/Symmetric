@@ -40,6 +40,8 @@ import {
   StocktakeGuestPass,
   StocktakeVarianceReasonCode,
   StocktakeVarianceReviewStatus,
+  StocktakeVarianceCommentEntry,
+  BranchFloorSegment,
   CustomerGoodsLeftBehind,
   TemporaryCasualAccount,
   FastMovingChecklistItem,
@@ -4885,6 +4887,73 @@ export const deleteBranch = (branchId: string, options?: { fromSync?: boolean })
     window.dispatchEvent(new CustomEvent('saimetric_branches_updated'));
   }
   return removed || true;
+};
+
+export const DEFAULT_BRANCH_FLOOR_SEGMENTS: BranchFloorSegment[] = [
+  { segmentId: 'SEG-001', name: 'Aisle 1 - Beverages & Coolers', locationCode: 'LOC-01', description: 'Shop floor physical count location #1', sortOrder: 1 },
+  { segmentId: 'SEG-002', name: 'Aisle 2 - Groceries, Sugar & Oils', locationCode: 'LOC-02', description: 'Shop floor physical count location #2', sortOrder: 2 },
+  { segmentId: 'SEG-003', name: 'Aisle 3 - Bulk Rice & Flours', locationCode: 'LOC-03', description: 'Shop floor physical count location #3', sortOrder: 3 },
+  { segmentId: 'SEG-004', name: 'Front Counter - Toiletries & Razors', locationCode: 'LOC-04', description: 'Shop floor physical count location #4', sortOrder: 4 },
+];
+
+export const getBranchFloorSegments = (branchId?: string): {
+  segments: BranchFloorSegment[];
+  finalized: boolean;
+  finalizedAt?: string;
+  finalizedBy?: string;
+  version: number;
+} => {
+  const targetBranchId = branchId || getCurrentBranchId();
+  const branch = getBranchById(targetBranchId) || getBranches()[0];
+  const configured = Array.isArray(branch?.stocktakeFloorSegments) && branch.stocktakeFloorSegments.length > 0
+    ? branch.stocktakeFloorSegments
+    : DEFAULT_BRANCH_FLOOR_SEGMENTS;
+  return {
+    segments: configured.map((s: any, idx: number) => ({
+      segmentId: s.segmentId || `SEG-${String(idx + 1).padStart(3, '0')}`,
+      name: String(s.name || `Segment ${idx + 1}`).trim(),
+      locationCode: String(s.locationCode || `LOC-${String(idx + 1).padStart(2, '0')}`).trim(),
+      description: s.description || `Shop floor physical count location #${idx + 1}`,
+      sortOrder: Number(s.sortOrder ?? idx + 1),
+    })),
+    finalized: Boolean(branch?.stocktakeSegmentsFinalized),
+    finalizedAt: branch?.stocktakeSegmentsFinalizedAt,
+    finalizedBy: branch?.stocktakeSegmentsFinalizedBy,
+    version: Number(branch?.stocktakeSegmentsVersion || 0),
+  };
+};
+
+export const saveBranchFloorSegments = (
+  branchId: string,
+  segments: BranchFloorSegment[],
+  finalize: boolean,
+  actorName: string
+): Branch | null => {
+  const targetBranchId = branchId || getCurrentBranchId();
+  const existing = getBranchById(targetBranchId) || getBranches()[0];
+  if (!existing) return null;
+
+  const nowIso = new Date().toISOString();
+  const normalized: BranchFloorSegment[] = (segments || [])
+    .filter((s) => String(s.name || '').trim().length > 0)
+    .map((s, idx) => ({
+      segmentId: s.segmentId || `SEG-${String(idx + 1).padStart(3, '0')}`,
+      name: String(s.name).trim(),
+      locationCode: String(s.locationCode || `LOC-${String(idx + 1).padStart(2, '0')}`).trim(),
+      description: String(s.description || `Shop floor physical count location #${idx + 1}`).trim(),
+      sortOrder: idx + 1,
+    }));
+
+  const updatedBranch: Branch = {
+    ...existing,
+    stocktakeFloorSegments: normalized,
+    stocktakeSegmentsFinalized: finalize,
+    stocktakeSegmentsFinalizedAt: finalize ? nowIso : undefined,
+    stocktakeSegmentsFinalizedBy: finalize ? actorName : undefined,
+    stocktakeSegmentsVersion: Number(existing.stocktakeSegmentsVersion || 0) + 1,
+  };
+  saveBranch(updatedBranch);
+  return getBranchById(targetBranchId) || updatedBranch;
 };
 
 // ==================== PRODUCT DAO (POS INVENTORY UNIFIED BRIDGE) ====================
@@ -19201,6 +19270,9 @@ export const ingestStocktakeSessionFromMesh = (data: {
   stocktakeAuditorId?: string;
   stocktakeAuditorName?: string;
   stocktakeAuditorPhone?: string;
+  auditorType?: 'BRANCH_STAFF' | 'VISITING_STAFF' | 'EXTERNAL_CONSULTANT';
+  auditorGuestPassId?: string;
+  auditorCasualId?: string;
   predefinedDailyItemIds?: string[];
   certifiedById?: string;
   certifiedByName?: string;
@@ -19212,6 +19284,8 @@ export const ingestStocktakeSessionFromMesh = (data: {
   varianceReviewStatus?: StocktakeVarianceReviewStatus;
   varianceCommentDeadline?: string;
   varianceMaterialityThreshold?: number;
+  varianceMinUnitThreshold?: number;
+  varianceReviewWindowHours?: number;
   varianceReviewedById?: string;
   varianceReviewedByName?: string;
   varianceReviewedAt?: string;
@@ -19242,7 +19316,7 @@ export const ingestStocktakeSessionFromMesh = (data: {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
 
-  // Merge incoming segments with existing segments to preserve local counts, claims, and verified lines
+  // Merge incoming segments with existing segments to preserve local counts, claims, locks, and verified lines
   let mergedSegments: StocktakeSegment[] = [];
   const existingAssignments = getZoneAssignments(data.sessionId);
 
@@ -19265,10 +19339,23 @@ export const ingestStocktakeSessionFromMesh = (data: {
         zone?.teamB?.submitted
       );
 
-      const counterAName = incomingSeg.counterAName || localSeg?.counterAName || zone?.teamA?.staffName;
-      const counterAId = incomingSeg.counterAId || localSeg?.counterAId || zone?.teamA?.staffId;
-      const counterBName = incomingSeg.counterBName || localSeg?.counterBName || zone?.teamB?.staffName;
-      const counterBId = incomingSeg.counterBId || localSeg?.counterBId || zone?.teamB?.staffId;
+      const counterAName = incomingSeg.counterAName !== undefined ? incomingSeg.counterAName : (localSeg?.counterAName || zone?.teamA?.staffName);
+      const counterAId = incomingSeg.counterAId !== undefined ? incomingSeg.counterAId : (localSeg?.counterAId || zone?.teamA?.staffId);
+      const counterBName = incomingSeg.counterBName !== undefined ? incomingSeg.counterBName : (localSeg?.counterBName || zone?.teamB?.staffName);
+      const counterBId = incomingSeg.counterBId !== undefined ? incomingSeg.counterBId : (localSeg?.counterBId || zone?.teamB?.staffId);
+
+      const count1Finalized =
+        incomingSeg.count1Finalized !== undefined
+          ? Boolean(incomingSeg.count1Finalized)
+          : Boolean(localSeg?.count1Finalized ?? zone?.teamA?.finalized);
+      const count2Finalized =
+        incomingSeg.count2Finalized !== undefined
+          ? Boolean(incomingSeg.count2Finalized)
+          : Boolean(localSeg?.count2Finalized ?? zone?.teamB?.finalized);
+      const comparisonFinalized =
+        incomingSeg.comparisonFinalized !== undefined
+          ? Boolean(incomingSeg.comparisonFinalized)
+          : Boolean(localSeg?.comparisonFinalized ?? zone?.comparisonFinalized);
 
       const verifiedCounts =
         (incomingSeg.verifiedCounts && incomingSeg.verifiedCounts.length > 0)
@@ -19317,6 +19404,14 @@ export const ingestStocktakeSessionFromMesh = (data: {
         hasCountB,
         count1Submitted: hasCountA,
         count2Submitted: hasCountB,
+        count1Finalized,
+        count1FinalizedAt: incomingSeg.count1FinalizedAt ?? localSeg?.count1FinalizedAt ?? zone?.teamA?.finalizedAt,
+        count2Finalized,
+        count2FinalizedAt: incomingSeg.count2FinalizedAt ?? localSeg?.count2FinalizedAt ?? zone?.teamB?.finalizedAt,
+        comparisonFinalized,
+        comparisonFinalizedAt: incomingSeg.comparisonFinalizedAt ?? localSeg?.comparisonFinalizedAt ?? zone?.comparisonFinalizedAt,
+        comparisonFinalizedBy: incomingSeg.comparisonFinalizedBy ?? localSeg?.comparisonFinalizedBy ?? zone?.comparisonFinalizedBy,
+        unlockHistory: Array.isArray(incomingSeg.unlockHistory) ? incomingSeg.unlockHistory : localSeg?.unlockHistory,
         count1: (localSeg?.count1 && localSeg.count1.length > 0) ? localSeg.count1 : (incomingSeg.count1 || []),
         count2: (localSeg?.count2 && localSeg.count2.length > 0) ? localSeg.count2 : (incomingSeg.count2 || []),
         verifiedCounts,
@@ -19329,7 +19424,7 @@ export const ingestStocktakeSessionFromMesh = (data: {
     mergedSegments = existing?.segments || [];
   }
 
-  // Merge consolidatedItems preserving newest manager comments & leader acks via LWW timestamp
+  // Merge consolidatedItems preserving collaborative varianceComments union & recount trail
   let consolidatedItems: StocktakeConsolidatedItem[] = existing?.consolidatedItems || [];
   if (Array.isArray(data.consolidatedItems) && data.consolidatedItems.length > 0) {
     const existingByItem = new Map<string, StocktakeConsolidatedItem>();
@@ -19342,15 +19437,49 @@ export const ingestStocktakeSessionFromMesh = (data: {
       const exCommentTs = parseTimestampMs(ex.commentedAt || 0);
       const incCommentTs = parseTimestampMs(inc.commentedAt || 0);
       const keepExistingComment = exCommentTs > incCommentTs && Boolean(ex.managerComment || ex.reasonCode);
+
+      // Union-merge varianceComments by id so concurrent Manager + Supervisor notes are never lost
+      const commentMap = new Map<string, StocktakeVarianceCommentEntry>();
+      (ex.varianceComments || []).forEach((c) => {
+        if (c?.id) commentMap.set(c.id, c);
+      });
+      (inc.varianceComments || []).forEach((c) => {
+        if (c?.id) commentMap.set(c.id, c);
+      });
+      const mergedComments = Array.from(commentMap.values()).sort(
+        (a, b) => parseTimestampMs(a.createdAt) - parseTimestampMs(b.createdAt)
+      );
+
+      const exRecTs = parseTimestampMs(ex.recountedAt || 0);
+      const incRecTs = parseTimestampMs(inc.recountedAt || 0);
+      const keepExRecount = exRecTs > incRecTs && ex.recountSheetStatus === 'COMPLETED';
+
       return {
         ...ex,
         ...inc,
+        originalCountedCases: inc.originalCountedCases ?? ex.originalCountedCases,
+        originalCountedSingles: inc.originalCountedSingles ?? ex.originalCountedSingles,
+        originalCountedTotalUnits: inc.originalCountedTotalUnits ?? ex.originalCountedTotalUnits,
+        originalVarianceTotalUnits: inc.originalVarianceTotalUnits ?? ex.originalVarianceTotalUnits,
+        originalVarianceCostValue: inc.originalVarianceCostValue ?? ex.originalVarianceCostValue,
+        recountSheetStatus: keepExRecount ? ex.recountSheetStatus : (inc.recountSheetStatus ?? ex.recountSheetStatus),
+        recountCases: keepExRecount ? ex.recountCases : (inc.recountCases ?? ex.recountCases),
+        recountSingles: keepExRecount ? ex.recountSingles : (inc.recountSingles ?? ex.recountSingles),
+        recountTotalUnits: keepExRecount ? ex.recountTotalUnits : (inc.recountTotalUnits ?? ex.recountTotalUnits),
+        recountedBy: keepExRecount ? ex.recountedBy : (inc.recountedBy ?? ex.recountedBy),
+        recountedById: keepExRecount ? ex.recountedById : (inc.recountedById ?? ex.recountedById),
+        recountWitnessId: keepExRecount ? ex.recountWitnessId : (inc.recountWitnessId ?? ex.recountWitnessId),
+        recountWitnessName: keepExRecount ? ex.recountWitnessName : (inc.recountWitnessName ?? ex.recountWitnessName),
+        recountedAt: keepExRecount ? ex.recountedAt : (inc.recountedAt ?? ex.recountedAt),
+        recountReason: keepExRecount ? ex.recountReason : (inc.recountReason ?? ex.recountReason),
+        recountReversalAlert: keepExRecount ? ex.recountReversalAlert : (inc.recountReversalAlert ?? ex.recountReversalAlert),
         reasonCode: keepExistingComment ? ex.reasonCode : (inc.reasonCode ?? ex.reasonCode),
         managerComment: keepExistingComment ? ex.managerComment : (inc.managerComment ?? ex.managerComment),
         actionTaken: keepExistingComment ? ex.actionTaken : (inc.actionTaken ?? ex.actionTaken),
         commentedById: keepExistingComment ? ex.commentedById : (inc.commentedById ?? ex.commentedById),
         commentedByName: keepExistingComment ? ex.commentedByName : (inc.commentedByName ?? ex.commentedByName),
         commentedAt: keepExistingComment ? ex.commentedAt : (inc.commentedAt ?? ex.commentedAt),
+        ...(mergedComments.length > 0 ? { varianceComments: mergedComments } : {}),
         ownerAckStatus: inc.ownerAckStatus ?? ex.ownerAckStatus,
       };
     });
@@ -19401,6 +19530,9 @@ export const ingestStocktakeSessionFromMesh = (data: {
     stocktakeAuditorId: data.stocktakeAuditorId !== undefined ? data.stocktakeAuditorId : existing?.stocktakeAuditorId,
     stocktakeAuditorName: data.stocktakeAuditorName !== undefined ? data.stocktakeAuditorName : existing?.stocktakeAuditorName,
     stocktakeAuditorPhone: data.stocktakeAuditorPhone !== undefined ? data.stocktakeAuditorPhone : existing?.stocktakeAuditorPhone,
+    auditorType: data.auditorType !== undefined ? data.auditorType : existing?.auditorType,
+    auditorGuestPassId: data.auditorGuestPassId !== undefined ? data.auditorGuestPassId : existing?.auditorGuestPassId,
+    auditorCasualId: data.auditorCasualId !== undefined ? data.auditorCasualId : existing?.auditorCasualId,
     predefinedDailyItemIds: data.predefinedDailyItemIds || existing?.predefinedDailyItemIds,
     createdBy: data.createdBy || data.startedBy || existing?.createdBy || 'MANAGER',
     createdByName: data.createdByName || data.startedBy || existing?.createdByName || 'Manager',
@@ -19429,6 +19561,14 @@ export const ingestStocktakeSessionFromMesh = (data: {
       data.varianceMaterialityThreshold !== undefined
         ? Number(data.varianceMaterialityThreshold)
         : existing?.varianceMaterialityThreshold,
+    varianceMinUnitThreshold:
+      data.varianceMinUnitThreshold !== undefined
+        ? Number(data.varianceMinUnitThreshold)
+        : existing?.varianceMinUnitThreshold,
+    varianceReviewWindowHours:
+      data.varianceReviewWindowHours !== undefined
+        ? Number(data.varianceReviewWindowHours)
+        : existing?.varianceReviewWindowHours,
     varianceReviewedById: data.varianceReviewedById || existing?.varianceReviewedById,
     varianceReviewedByName: data.varianceReviewedByName || existing?.varianceReviewedByName,
     varianceReviewedAt: data.varianceReviewedAt || existing?.varianceReviewedAt,
@@ -19782,6 +19922,33 @@ export const claimZoneSlot = (
   const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
   let zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
   const currentBranch = getCurrentBranchId();
+  const cleanStaff = String(staffId || '').trim().toUpperCase();
+
+  // Check locks & cross-slot blind isolation against both zone & session segment
+  const linkedSess = sessionId ? getStocktakeSessionById(sessionId) : undefined;
+  const linkedSeg = linkedSess?.segments?.find((s: any) => (s.segmentId || s.id) === zoneId);
+
+  if (zone?.comparisonFinalized || linkedSeg?.comparisonFinalized) {
+    throw new Error('This segment joint comparison is finalized & locked. Auditor unlock is required.');
+  }
+
+  if (slot === 'A') {
+    if (zone?.teamA?.finalized || linkedSeg?.count1Finalized) {
+      throw new Error('Team A count is finalized & locked. Ask the Auditor to unlock if changes are needed.');
+    }
+    const oppositeId = String(zone?.teamB?.staffId || linkedSeg?.counterBId || '').trim().toUpperCase();
+    if (cleanStaff && oppositeId && oppositeId === cleanStaff) {
+      throw new Error('Blind double-count isolation: You already claimed/counted Team B on this segment.');
+    }
+  } else {
+    if (zone?.teamB?.finalized || linkedSeg?.count2Finalized) {
+      throw new Error('Team B count is finalized & locked. Ask the Auditor to unlock if changes are needed.');
+    }
+    const oppositeId = String(zone?.teamA?.staffId || linkedSeg?.counterAId || '').trim().toUpperCase();
+    if (cleanStaff && oppositeId && oppositeId === cleanStaff) {
+      throw new Error('Blind double-count isolation: You already claimed/counted Team A on this segment.');
+    }
+  }
 
   if (!zone) {
     zone = {
@@ -19801,6 +19968,7 @@ export const claimZoneSlot = (
       staffName,
       claimedAt: new Date().toISOString(),
       submitted: false,
+      finalized: false,
     };
     if (zone.status === 'AVAILABLE') {
       zone.status = 'IN_PROGRESS';
@@ -19812,6 +19980,7 @@ export const claimZoneSlot = (
       staffName,
       claimedAt: new Date().toISOString(),
       submitted: false,
+      finalized: false,
     };
     if (zone.status === 'AVAILABLE' || zone.status === 'IN_PROGRESS') {
       zone.status = 'IN_PROGRESS';
@@ -19833,6 +20002,7 @@ export const recordBlindSubmissionLocal = (
   const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
   const zone = all.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
   if (!zone) return null;
+  const nowIso = new Date().toISOString();
 
   if (slot === 'A') {
     zone.teamA = {
@@ -19840,7 +20010,9 @@ export const recordBlindSubmissionLocal = (
       staffId,
       staffName,
       submitted: true,
-      submittedAt: new Date().toISOString(),
+      submittedAt: nowIso,
+      finalized: true,
+      finalizedAt: nowIso,
       lineCount: lines.length,
     };
     zone.count1 = lines;
@@ -19853,7 +20025,9 @@ export const recordBlindSubmissionLocal = (
       staffId,
       staffName,
       submitted: true,
-      submittedAt: new Date().toISOString(),
+      submittedAt: nowIso,
+      finalized: true,
+      finalizedAt: nowIso,
       lineCount: lines.length,
     };
     zone.count2 = lines;
@@ -19875,6 +20049,11 @@ export const updateZoneFromHubStatus = (
   options?: {
     hasCountA?: boolean;
     hasCountB?: boolean;
+    teamAFinalized?: boolean;
+    teamBFinalized?: boolean;
+    comparisonFinalized?: boolean;
+    teamAStaffId?: string;
+    teamBStaffId?: string;
     teamAStaffName?: string;
     teamBStaffName?: string;
   }
@@ -19898,20 +20077,33 @@ export const updateZoneFromHubStatus = (
 
   if (options) {
     if (options.hasCountA) {
-      if (!zone.teamA) zone.teamA = { staffId: '002', staffName: options.teamAStaffName || 'Counter A', submitted: true };
+      if (!zone.teamA) zone.teamA = { staffId: options.teamAStaffId || '002', staffName: options.teamAStaffName || 'Counter A', submitted: true };
       zone.teamA.submitted = true;
+      zone.teamA.finalized = options.teamAFinalized ?? true;
     }
     if (options.hasCountB) {
-      if (!zone.teamB) zone.teamB = { staffId: '003', staffName: options.teamBStaffName || 'Counter B', submitted: true };
+      if (!zone.teamB) zone.teamB = { staffId: options.teamBStaffId || '003', staffName: options.teamBStaffName || 'Counter B', submitted: true };
       zone.teamB.submitted = true;
+      zone.teamB.finalized = options.teamBFinalized ?? true;
+    }
+    if (options.teamAStaffId) {
+      if (!zone.teamA) zone.teamA = { staffId: options.teamAStaffId, staffName: options.teamAStaffName || 'Counter A', submitted: false };
+      zone.teamA.staffId = options.teamAStaffId;
+    }
+    if (options.teamBStaffId) {
+      if (!zone.teamB) zone.teamB = { staffId: options.teamBStaffId, staffName: options.teamBStaffName || 'Counter B', submitted: false };
+      zone.teamB.staffId = options.teamBStaffId;
     }
     if (options.teamAStaffName) {
-      if (!zone.teamA) zone.teamA = { staffId: '002', staffName: options.teamAStaffName, submitted: false };
+      if (!zone.teamA) zone.teamA = { staffId: options.teamAStaffId || '002', staffName: options.teamAStaffName, submitted: false };
       zone.teamA.staffName = options.teamAStaffName;
     }
     if (options.teamBStaffName) {
-      if (!zone.teamB) zone.teamB = { staffId: '003', staffName: options.teamBStaffName, submitted: false };
+      if (!zone.teamB) zone.teamB = { staffId: options.teamBStaffId || '003', staffName: options.teamBStaffName, submitted: false };
       zone.teamB.staffName = options.teamBStaffName;
+    }
+    if (options.comparisonFinalized !== undefined) {
+      zone.comparisonFinalized = options.comparisonFinalized;
     }
   }
 
@@ -19934,13 +20126,18 @@ export const updateZoneFromHubStatus = (
         if (options?.hasCountA) {
           seg.hasCountA = true;
           seg.count1Submitted = true;
+          seg.count1Finalized = options.teamAFinalized ?? true;
         }
         if (options?.hasCountB) {
           seg.hasCountB = true;
           seg.count2Submitted = true;
+          seg.count2Finalized = options.teamBFinalized ?? true;
         }
+        if (options?.teamAStaffId) seg.counterAId = options.teamAStaffId;
+        if (options?.teamBStaffId) seg.counterBId = options.teamBStaffId;
         if (options?.teamAStaffName) seg.counterAName = options.teamAStaffName;
         if (options?.teamBStaffName) seg.counterBName = options.teamBStaffName;
+        if (options?.comparisonFinalized !== undefined) seg.comparisonFinalized = options.comparisonFinalized;
         saveStocktakeSession(session);
       }
     }
@@ -19958,6 +20155,15 @@ export const applyJointRecountSignature = (
 ): { zone: StocktakeZoneAssignment; isComplete: boolean } => {
   const all = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
   let zone = all.find((z) => (!sessionId || z.sessionId === sessionId) && z.zoneId === zoneId);
+  if (zone?.comparisonFinalized) {
+    throw new Error('This segment joint comparison is already finalized & locked. Ask an Auditor/Owner to unlock it.');
+  }
+  const linkedSess = sessionId ? getStocktakeSessionById(sessionId) : undefined;
+  const linkedSeg = linkedSess?.segments?.find((s: any) => (s.segmentId || s.id) === zoneId);
+  if (linkedSeg?.comparisonFinalized) {
+    throw new Error('This segment joint comparison is already finalized & locked. Ask an Auditor/Owner to unlock it.');
+  }
+
   if (!zone) {
     zone = {
       zoneId,
@@ -19993,8 +20199,12 @@ export const applyJointRecountSignature = (
 
   const isComplete = Boolean(zone.jointRecount.signedByA && zone.jointRecount.signedByB);
   if (isComplete) {
+    const resolvedIso = new Date().toISOString();
     zone.status = 'VERIFIED';
-    zone.jointRecount.resolvedAt = new Date().toISOString();
+    zone.comparisonFinalized = true;
+    zone.comparisonFinalizedAt = resolvedIso;
+    zone.comparisonFinalizedBy = staffName;
+    zone.jointRecount.resolvedAt = resolvedIso;
     zone.jointRecount.resolvedByName = staffName;
     zone.verifiedCounts = (zone.jointRecount.lines || []).map((l: any) => {
       const upc = Math.max(1, Number(l.unitsPerCase || 1));
@@ -20027,6 +20237,9 @@ export const applyJointRecountSignature = (
           seg.discrepancyCount = 0;
           seg.recount = [];
           seg.jointRecount = zone.jointRecount;
+          seg.comparisonFinalized = true;
+          seg.comparisonFinalizedAt = resolvedIso;
+          seg.comparisonFinalizedBy = staffName;
           saveStocktakeSession(session);
           try {
             consolidateStocktakeSession(targetSessionId, true);
@@ -20111,6 +20324,12 @@ export const createStocktakeSession = (params: {
   stocktakeAuditorId?: string;
   stocktakeAuditorName?: string;
   stocktakeAuditorPhone?: string;
+  auditorType?: 'BRANCH_STAFF' | 'VISITING_STAFF' | 'EXTERNAL_CONSULTANT';
+  auditorGuestPassId?: string;
+  auditorCasualId?: string;
+  varianceMaterialityThreshold?: number;
+  varianceMinUnitThreshold?: number;
+  varianceReviewWindowHours?: number;
   notes?: string;
   segmentNames?: string[];
   predefinedDailyItemIds?: string[];
@@ -20119,39 +20338,89 @@ export const createStocktakeSession = (params: {
 }): StocktakeSession => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
+  const targetBranch = params.branchId || currentBranch;
+
+  // Enforce Single Active Floor Stocktake Rule per Branch
+  const activeStatuses = new Set([
+    'DRAFT',
+    'SCHEDULED',
+    'IN_PROGRESS',
+    'COUNTING',
+    'RECOUNTING',
+    'AUDIT_REVIEW',
+    'CONSOLIDATED',
+    'READY_FOR_COMMITTAL',
+  ]);
+  const branches = getBranches();
+  const existingActive = getRawStoredStocktakeSessions().find((s) => {
+    const sBranch = (s as any).branch_id || s.branchId;
+    const sComp = (s as any).company_id || s.companyId;
+    const inScope = isRecordInBranchScope(sBranch, targetBranch, branches, currentCompany, sComp);
+    return inScope && activeStatuses.has(String(s.status || '').toUpperCase().trim());
+  });
+  if (existingActive) {
+    throw new Error(
+      `Only 1 active stocktake session is permitted per branch. Active session "${existingActive.title}" (${existingActive.sessionId}) is currently ${existingActive.status}. Commit or cancel it before starting a new stocktake.`
+    );
+  }
+
   const sessionId = getNextStocktakeSessionId();
   const timestamp = new Date().toISOString();
   const date = params.date || timestamp.split('T')[0];
   const countType: StocktakeCountType = params.countType || 'FULL_LOCKDOWN';
-  const targetBranch = params.branchId || currentBranch;
 
-  let defaultSegments = params.segmentNames && params.segmentNames.length > 0
-    ? params.segmentNames
-    : [
-        'Aisle 1 - Beverages & Coolers',
-        'Aisle 2 - Groceries, Sugar & Oils',
-        'Aisle 3 - Bulk Rice & Flours',
-        'Front Counter - Toiletries & Razors',
-      ];
-
-  // If daily fast-mover count, set single fast-mover focus segment if none provided
-  if (countType === 'DAILY_BLIND' && (!params.segmentNames || params.segmentNames.length === 0)) {
-    defaultSegments = ['Fast-Movers Daily Shelf & Tills'];
-  } else if (countType === 'SPOT_CHECK' && (!params.segmentNames || params.segmentNames.length === 0)) {
-    defaultSegments = ['Supervisor Spot-Check Verification Bay'];
+  let segments: StocktakeSegment[] = [];
+  if (params.segmentNames && params.segmentNames.length > 0) {
+    segments = params.segmentNames.map((name, idx) => ({
+      segmentId: `SEG-${String(idx + 1).padStart(3, '0')}`,
+      name,
+      description: `Shop floor physical count location #${idx + 1}`,
+      locationCode: `LOC-${String(idx + 1).padStart(2, '0')}`,
+      status: 'PENDING',
+      count1: [],
+      count2: [],
+      verifiedCounts: [],
+      discrepancyCount: 0,
+    }));
+  } else if (countType === 'DAILY_BLIND') {
+    segments = [{
+      segmentId: 'SEG-001',
+      name: 'Fast-Movers Daily Shelf & Tills',
+      description: 'Daily high-velocity items focus bay',
+      locationCode: 'LOC-01',
+      status: 'PENDING',
+      count1: [],
+      count2: [],
+      verifiedCounts: [],
+      discrepancyCount: 0,
+    }];
+  } else if (countType === 'SPOT_CHECK') {
+    segments = [{
+      segmentId: 'SEG-001',
+      name: 'Supervisor Spot-Check Verification Bay',
+      description: 'Targeted SKU verification bay',
+      locationCode: 'LOC-01',
+      status: 'PENDING',
+      count1: [],
+      count2: [],
+      verifiedCounts: [],
+      discrepancyCount: 0,
+    }];
+  } else {
+    // Hydrate from Persistent Branch Floor Map (pre-configured by Branch Manager / Auditor)
+    const branchFloor = getBranchFloorSegments(targetBranch);
+    segments = branchFloor.segments.map((bf, idx) => ({
+      segmentId: bf.segmentId || `SEG-${String(idx + 1).padStart(3, '0')}`,
+      name: bf.name,
+      description: bf.description || `Shop floor physical count location #${idx + 1}`,
+      locationCode: bf.locationCode || `LOC-${String(idx + 1).padStart(2, '0')}`,
+      status: 'PENDING',
+      count1: [],
+      count2: [],
+      verifiedCounts: [],
+      discrepancyCount: 0,
+    }));
   }
-
-  const segments: StocktakeSegment[] = defaultSegments.map((name, idx) => ({
-    segmentId: `SEG-${String(idx + 1).padStart(3, '0')}`,
-    name,
-    description: `Shop floor physical count location #${idx + 1}`,
-    locationCode: `LOC-0${idx + 1}`,
-    status: 'PENDING',
-    count1: [],
-    count2: [],
-    verifiedCounts: [],
-    discrepancyCount: 0,
-  }));
 
   const session: StocktakeSession = {
     sessionId,
@@ -20165,6 +20434,12 @@ export const createStocktakeSession = (params: {
     stocktakeAuditorId: params.stocktakeAuditorId,
     stocktakeAuditorName: params.stocktakeAuditorName,
     stocktakeAuditorPhone: params.stocktakeAuditorPhone,
+    auditorType: params.auditorType || 'BRANCH_STAFF',
+    auditorGuestPassId: params.auditorGuestPassId,
+    auditorCasualId: params.auditorCasualId,
+    varianceMaterialityThreshold: Number(params.varianceMaterialityThreshold ?? 10),
+    varianceMinUnitThreshold: Number(params.varianceMinUnitThreshold ?? 5),
+    varianceReviewWindowHours: Number(params.varianceReviewWindowHours ?? 72),
     predefinedDailyItemIds: params.predefinedDailyItemIds,
     createdBy: params.staffId,
     createdByName: params.staffName,
@@ -20235,10 +20510,11 @@ export const deleteStocktakeSegment = (sessionId: string, segmentId: string): St
 
 /**
  * SUBMIT DOUBLE-BLIND SEGMENT COUNT (Counter A or Counter B)
- * - Records Count 1 or Count 2
+ * - Records & Finalizes Count 1 or Count 2 (irreversible until Auditor/Owner unlock)
+ * - Enforces cross-slot blind isolation (counterAId !== counterBId)
  * - When BOTH Counter A & B have completed their independent counts:
  *   - Compares every line item
- *   - If identical (Cases & Singles match): marks verified directly
+ *   - If identical: marks VERIFIED & locks comparisonFinalized
  *   - If quantities differ: flags as DISCREPANCY_RECOUNT and creates recount list!
  */
 export const submitSegmentCount = (
@@ -20260,6 +20536,29 @@ export const submitSegmentCount = (
   }
 
   const segment = session.segments[segmentIndex];
+  const cleanStaff = String(staffId || '').trim().toUpperCase();
+
+  if (segment.comparisonFinalized) {
+    throw new Error('This segment joint comparison is finalized & locked. An Auditor or Owner must unlock it before edits.');
+  }
+  if (counterSlot === 'A') {
+    if (segment.count1Finalized) {
+      throw new Error('Team A count for this segment is already finalized & locked. Ask the Auditor to unlock if corrections are required.');
+    }
+    const oppositeB = String(segment.counterBId || '').trim().toUpperCase();
+    if (cleanStaff && oppositeB && oppositeB === cleanStaff) {
+      throw new Error('Blind double-count isolation violation: You already submitted Team B on this segment.');
+    }
+  } else {
+    if (segment.count2Finalized) {
+      throw new Error('Team B count for this segment is already finalized & locked. Ask the Auditor to unlock if corrections are required.');
+    }
+    const oppositeA = String(segment.counterAId || '').trim().toUpperCase();
+    if (cleanStaff && oppositeA && oppositeA === cleanStaff) {
+      throw new Error('Blind double-count isolation violation: You already submitted Team A on this segment.');
+    }
+  }
+
   const timestamp = new Date().toISOString();
 
   // Normalize lines
@@ -20285,11 +20584,19 @@ export const submitSegmentCount = (
     segment.counterAName = staffName;
     segment.counterATimestamp = timestamp;
     segment.count1 = normalizedLines;
+    segment.hasCountA = true;
+    segment.count1Submitted = true;
+    segment.count1Finalized = true;
+    segment.count1FinalizedAt = timestamp;
   } else {
     segment.counterBId = staffId;
     segment.counterBName = staffName;
     segment.counterBTimestamp = timestamp;
     segment.count2 = normalizedLines;
+    segment.hasCountB = true;
+    segment.count2Submitted = true;
+    segment.count2Finalized = true;
+    segment.count2FinalizedAt = timestamp;
   }
 
   let discrepanciesCount = 0;
@@ -20327,13 +20634,11 @@ export const submitSegmentCount = (
         ? Number(itemB.totalUnits)
         : (bCases * upc + bSingles);
 
-      // If both counted 0 units, not a discrepancy
       if (aTotal === 0 && bTotal === 0) {
         return;
       }
 
       if (aTotal === bTotal) {
-        // MATCHED! Both Counter A and B agree in normalized total base units (e.g. 5 cases of 10 vs 50 units)
         matchedVerified.push({
           itemId: baseItem.itemId,
           itemName: baseItem.itemName,
@@ -20348,7 +20653,6 @@ export const submitSegmentCount = (
           count2TotalUnits: bTotal,
         });
       } else {
-        // DISCREPANCY! Mismatch between Count 1 and Count 2
         discrepanciesCount++;
         recountNeeded.push({
           itemId: baseItem.itemId,
@@ -20377,13 +20681,16 @@ export const submitSegmentCount = (
       segment.status = 'VERIFIED';
       segment.verifiedCounts = matchedVerified;
       segment.recount = [];
+      segment.comparisonFinalized = true;
+      segment.comparisonFinalizedAt = timestamp;
+      segment.comparisonFinalizedBy = 'DOUBLE_COUNT_MATCH';
     } else {
       segment.status = 'DISCREPANCY_RECOUNT';
       segment.recount = recountNeeded;
-      segment.verifiedCounts = matchedVerified; // keep verified matches
+      segment.verifiedCounts = matchedVerified;
     }
   } else {
-    segment.status = 'COUNTING';
+    segment.status = hasCount1 && !hasCount2 ? 'AWAITING_DOUBLE_COUNT' : 'COUNTING';
   }
 
   session.segments[segmentIndex] = segment;
@@ -20402,10 +20709,10 @@ export const submitSegmentCount = (
 
   saveStocktakeSession(session);
 
-  let message = `Recorded Counter ${counterSlot} submission (${normalizedLines.length} products).`;
+  let message = `Finalized & locked Counter ${counterSlot} submission (${normalizedLines.length} products).`;
   if (hasCount1 && hasCount2) {
     if (discrepanciesCount === 0) {
-      message = `Double-count verified! All product quantities matched between Counter A and B. Segment marked VERIFIED.`;
+      message = `Double-count verified! All product quantities matched between Counter A and B. Segment finalized & VERIFIED.`;
     } else {
       message = `Double-count compared: ${discrepanciesCount} item(s) have mismatched quantities between Counter A and B. A Recount List has been generated!`;
     }
@@ -20421,9 +20728,6 @@ export const submitSegmentCount = (
 
 /**
  * RESOLVE SEGMENT RECOUNT
- * - Applies the supervisor/recounter's verified physical count for discrepancy items
- * - Combines with matched items to complete verifiedCounts
- * - Marks segment as VERIFIED
  */
 export const resolveSegmentRecount = (
   sessionId: string,
@@ -20439,22 +20743,24 @@ export const resolveSegmentRecount = (
   if (segIndex < 0) throw new Error(`Segment ${segmentId} not found.`);
 
   const segment = session.segments[segIndex];
+  if (segment.comparisonFinalized) {
+    throw new Error(`Segment '${segment.name}' joint comparison is already finalized & locked.`);
+  }
+
   const timestamp = new Date().toISOString();
 
   segment.recounterId = staffId;
   segment.recounterName = staffName;
   segment.recountedAt = timestamp;
 
-  // Map of existing matched lines
   const verifiedMap = new Map<string, StocktakeVerifiedLine>();
-  segment.verifiedCounts.forEach((v) => verifiedMap.set(v.itemId.toUpperCase(), v));
+  (segment.verifiedCounts || []).forEach((v) => verifiedMap.set(v.itemId.toUpperCase(), v));
 
   const mapA = new Map<string, StocktakeLineCount>();
   const mapB = new Map<string, StocktakeLineCount>();
-  segment.count1.forEach((l) => mapA.set(l.itemId.toUpperCase(), l));
-  segment.count2.forEach((l) => mapB.set(l.itemId.toUpperCase(), l));
+  (segment.count1 || []).forEach((l) => mapA.set(l.itemId.toUpperCase(), l));
+  (segment.count2 || []).forEach((l) => mapB.set(l.itemId.toUpperCase(), l));
 
-  // Merge recount lines
   resolvedRecountLines.forEach((r) => {
     const upc = Math.max(1, Number(r.unitsPerCase) || 1);
     const cs = Math.max(0, Number(r.cases) || 0);
@@ -20484,10 +20790,12 @@ export const resolveSegmentRecount = (
   segment.discrepancyCount = 0;
   segment.status = 'VERIFIED';
   segment.recount = resolvedRecountLines;
+  segment.comparisonFinalized = true;
+  segment.comparisonFinalizedAt = timestamp;
+  segment.comparisonFinalizedBy = staffName;
 
   session.segments[segIndex] = segment;
 
-  // Check if all segments are now verified
   const allVerified = session.segments.every((s) => s.status === 'VERIFIED');
   if (allVerified && session.status === 'RECOUNTING') {
     session.status = 'COUNTING';
@@ -20497,9 +20805,85 @@ export const resolveSegmentRecount = (
 
   return {
     success: true,
-    message: `Recount resolved for ${resolvedRecountLines.length} item(s). Segment '${segment.name}' is now fully VERIFIED.`,
+    message: `Recount finalized for ${resolvedRecountLines.length} item(s). Segment '${segment.name}' is now VERIFIED & LOCKED.`,
     session,
   };
+};
+
+/**
+ * AUDITOR / LEADER UNLOCK FINALIZED SEGMENT SLOT OR COMPARISON (With Mandatory Audit Reason)
+ */
+export const reopenFinalizedSegmentSlot = (
+  sessionId: string,
+  segmentId: string,
+  target: 'A' | 'B' | 'COMPARISON' | 'ALL',
+  actorId: string,
+  actorName: string,
+  reason: string
+): StocktakeSession | null => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session) return null;
+  const segIndex = (session.segments || []).findIndex((s) => s.segmentId === segmentId);
+  if (segIndex < 0) return null;
+
+  const nowIso = new Date().toISOString();
+  const seg = session.segments[segIndex];
+
+  if (target === 'A' || target === 'ALL') {
+    seg.count1Finalized = false;
+    seg.count1FinalizedAt = undefined;
+    seg.hasCountA = false;
+    seg.count1Submitted = false;
+  }
+  if (target === 'B' || target === 'ALL') {
+    seg.count2Finalized = false;
+    seg.count2FinalizedAt = undefined;
+    seg.hasCountB = false;
+    seg.count2Submitted = false;
+  }
+  if (target === 'COMPARISON' || target === 'ALL' || target === 'A' || target === 'B') {
+    seg.comparisonFinalized = false;
+    seg.comparisonFinalizedAt = undefined;
+    seg.comparisonFinalizedBy = undefined;
+  }
+
+  if (target === 'COMPARISON' && (seg.discrepancies?.length > 0 || seg.recount?.length > 0)) {
+    seg.status = 'DISCREPANCY_RECOUNT';
+  } else {
+    seg.status = 'COUNTING';
+  }
+
+  seg.unlockHistory = [
+    ...(Array.isArray(seg.unlockHistory) ? seg.unlockHistory : []),
+    { target, actorId, actorName, reason: reason.trim() || 'Auditor correction unlock', unlockedAt: nowIso },
+  ];
+
+  session.segments[segIndex] = seg;
+  if (session.status === 'CONSOLIDATED' || session.status === 'READY_FOR_COMMITTAL') {
+    session.status = 'COUNTING';
+  }
+
+  // Update zone assignment store
+  const allZones = getStored<StocktakeZoneAssignment[]>(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, []);
+  const zIdx = allZones.findIndex((z) => z.sessionId === sessionId && z.zoneId === segmentId);
+  if (zIdx >= 0) {
+    const z = { ...allZones[zIdx] };
+    if ((target === 'A' || target === 'ALL') && z.teamA) {
+      z.teamA = { ...z.teamA, submitted: false, finalized: false };
+    }
+    if ((target === 'B' || target === 'ALL') && z.teamB) {
+      z.teamB = { ...z.teamB, submitted: false, finalized: false };
+    }
+    z.comparisonFinalized = false;
+    z.unlockedReason = reason;
+    z.unlockedByName = actorName;
+    z.unlockedAt = nowIso;
+    z.status = seg.status === 'DISCREPANCY_RECOUNT' ? 'VARIANCE_FLAGGED' : 'IN_PROGRESS';
+    allZones[zIdx] = z;
+    setStored(STORAGE_KEYS.STOCKTAKE_ZONE_ASSIGNMENTS, allZones);
+  }
+
+  return saveStocktakeSession(session);
 };
 
 /**
@@ -20750,12 +21134,31 @@ export const consolidateStocktakeSession = (
       status,
       wasCountedInSession,
       segmentBreakdown: accum.segmentBreakdown,
+      ...(prev?.originalCountedCases !== undefined ? { originalCountedCases: prev.originalCountedCases } : {}),
+      ...(prev?.originalCountedSingles !== undefined ? { originalCountedSingles: prev.originalCountedSingles } : {}),
+      ...(prev?.originalCountedTotalUnits !== undefined ? { originalCountedTotalUnits: prev.originalCountedTotalUnits } : {}),
+      ...(prev?.originalVarianceTotalUnits !== undefined ? { originalVarianceTotalUnits: prev.originalVarianceTotalUnits } : {}),
+      ...(prev?.originalVarianceCostValue !== undefined ? { originalVarianceCostValue: prev.originalVarianceCostValue } : {}),
+      ...(prev?.recountRequested ? { recountRequested: prev.recountRequested } : {}),
+      ...(prev?.recountSheetStatus ? { recountSheetStatus: prev.recountSheetStatus } : {}),
+      ...(prev?.recountNotes ? { recountNotes: prev.recountNotes } : {}),
+      ...(prev?.recountReason ? { recountReason: prev.recountReason } : {}),
+      ...(prev?.recountCases !== undefined ? { recountCases: prev.recountCases } : {}),
+      ...(prev?.recountSingles !== undefined ? { recountSingles: prev.recountSingles } : {}),
+      ...(prev?.recountTotalUnits !== undefined ? { recountTotalUnits: prev.recountTotalUnits } : {}),
+      ...(prev?.recountedBy ? { recountedBy: prev.recountedBy } : {}),
+      ...(prev?.recountedById ? { recountedById: prev.recountedById } : {}),
+      ...(prev?.recountWitnessId ? { recountWitnessId: prev.recountWitnessId } : {}),
+      ...(prev?.recountWitnessName ? { recountWitnessName: prev.recountWitnessName } : {}),
+      ...(prev?.recountedAt ? { recountedAt: prev.recountedAt } : {}),
+      ...(prev?.recountReversalAlert ? { recountReversalAlert: prev.recountReversalAlert } : {}),
       ...(prev?.reasonCode ? { reasonCode: prev.reasonCode } : {}),
       ...(prev?.managerComment ? { managerComment: prev.managerComment } : {}),
       ...(prev?.actionTaken ? { actionTaken: prev.actionTaken } : {}),
       ...(prev?.commentedById ? { commentedById: prev.commentedById } : {}),
       ...(prev?.commentedByName ? { commentedByName: prev.commentedByName } : {}),
       ...(prev?.commentedAt ? { commentedAt: prev.commentedAt } : {}),
+      ...(prev?.varianceComments ? { varianceComments: prev.varianceComments } : {}),
       ...(prev?.ownerAckStatus ? { ownerAckStatus: prev.ownerAckStatus } : {}),
     });
   });
@@ -20789,22 +21192,46 @@ export const consolidateStocktakeSession = (
 };
 
 /**
- * REQUEST TARGETED VARIANCE RECOUNT FOR A SPECIFIC SKU
- * - Allows supervisor to flag high-variance items for a quick double-check before final approval
+ * REQUEST TARGETED VARIANCE RECOUNT FOR SPECIFIC SKU(s) (Populates Blind Recount Sheet)
+ * - Snapshots immutable Original Count & Original Variance before sending to Blind Recount Sheet
  */
 export const requestSkuVarianceRecount = (
   sessionId: string,
   itemId: string,
   notes?: string
 ): StocktakeSession | null => {
-  const session = getStocktakeSessionById(sessionId);
-  if (!session) return null;
+  return requestBatchVarianceRecount(sessionId, [itemId], notes);
+};
 
-  const item = session.consolidatedItems.find((i) => i.itemId.toUpperCase() === itemId.toUpperCase());
-  if (item) {
-    item.recountRequested = true;
-    item.status = 'RECOUNT_FLAGGED';
-    item.recountNotes = notes || 'Floor recount requested to verify variance.';
+export const requestBatchVarianceRecount = (
+  sessionId: string,
+  itemIds: string[],
+  notes?: string
+): StocktakeSession | null => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session || !Array.isArray(itemIds) || itemIds.length === 0) return null;
+
+  const targetSet = new Set(itemIds.map((id) => String(id || '').toUpperCase()));
+  let flagged = 0;
+
+  session.consolidatedItems = (session.consolidatedItems || []).map((item) => {
+    if (!targetSet.has(String(item.itemId || '').toUpperCase())) return item;
+    flagged++;
+    return {
+      ...item,
+      originalCountedCases: item.originalCountedCases ?? item.countedCases,
+      originalCountedSingles: item.originalCountedSingles ?? item.countedSingles,
+      originalCountedTotalUnits: item.originalCountedTotalUnits ?? item.countedTotalUnits,
+      originalVarianceTotalUnits: item.originalVarianceTotalUnits ?? item.varianceTotalUnits,
+      originalVarianceCostValue: item.originalVarianceCostValue ?? item.varianceCostValue,
+      recountRequested: true,
+      recountSheetStatus: 'REQUESTED',
+      status: 'RECOUNT_FLAGGED',
+      recountNotes: notes || 'Dispatched to Blind Recount Sheet for independent physical verification.',
+    };
+  });
+
+  if (flagged > 0) {
     session.status = 'AUDIT_REVIEW';
     return saveStocktakeSession(session);
   }
@@ -20812,68 +21239,89 @@ export const requestSkuVarianceRecount = (
 };
 
 /**
- * SUBMIT TARGETED VARIANCE RECOUNT FOR A SPECIFIC SKU
+ * APPLY RECOUNT SHEET MUTATION TO A SINGLE CONSOLIDATED ITEM (Preserves Original Baseline + Flags Reversal Fraud)
  */
-export const submitSkuVarianceRecount = (
-  sessionId: string,
-  itemId: string,
+const applyRecountToConsolidatedItem = (
+  item: StocktakeConsolidatedItem,
   recountCases: number,
   recountSingles: number,
   staffId: string,
-  staffName: string
-): StocktakeSession | null => {
-  const session = getStocktakeSessionById(sessionId);
-  if (!session) return null;
-
-  const itemIndex = session.consolidatedItems.findIndex((i) => i.itemId.toUpperCase() === itemId.toUpperCase());
-  if (itemIndex < 0) return null;
-
-  const item = session.consolidatedItems[itemIndex];
-  const unitsPerCase = item.unitsPerCase || 1;
+  staffName: string,
+  options?: { reason?: string; witnessId?: string; witnessName?: string }
+): StocktakeConsolidatedItem => {
+  const unitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
   const rcCases = Math.max(0, Number(recountCases) || 0);
   const rcSingles = Math.max(0, Number(recountSingles) || 0);
   const rcTotalUnits = (rcCases * unitsPerCase) + rcSingles;
 
-  item.countedCases = rcCases;
-  item.countedSingles = rcSingles;
-  item.countedTotalUnits = rcTotalUnits;
-  item.countedCostValue = rcTotalUnits * item.costPerUnit;
-  item.countedRetailValue = rcTotalUnits * item.sellPriceUnit;
+  // Preserve immutable original snapshot before recount overwrite
+  const origCases = item.originalCountedCases ?? item.countedCases;
+  const origSingles = item.originalCountedSingles ?? item.countedSingles;
+  const origTotal = item.originalCountedTotalUnits ?? item.countedTotalUnits;
+  const origVarUnits = item.originalVarianceTotalUnits ?? item.varianceTotalUnits;
+  const origVarCost = item.originalVarianceCostValue ?? item.varianceCostValue;
 
-  item.varianceCases = rcCases - item.systemCases;
-  item.varianceSingles = rcSingles - item.systemSingles;
-  item.varianceTotalUnits = rcTotalUnits - item.systemTotalUnits;
-  item.varianceCostValue = item.varianceTotalUnits * item.costPerUnit;
-  item.varianceRetailValue = item.varianceTotalUnits * item.sellPriceUnit;
+  const newVarUnits = rcTotalUnits - item.systemTotalUnits;
+  const newVarCost = newVarUnits * item.costPerUnit;
 
-  item.recountRequested = false;
-  item.recountCases = rcCases;
-  item.recountSingles = rcSingles;
-  item.recountTotalUnits = rcTotalUnits;
-  item.recountedBy = staffName;
-  item.recountedAt = new Date().toISOString();
+  // Anti-Fraud Reversal Check: flag when a material shortage shrinks >= 50% toward zero (or hits 0 match)
+  const isMaterialOrigShortage = origVarUnits <= -3 || origVarCost <= -10;
+  const shiftDelta = Math.abs(origVarUnits - newVarUnits);
+  const shrankTowardZero = Math.abs(newVarUnits) <= Math.abs(origVarUnits) * 0.5 && shiftDelta >= 3;
+  const reversalAlert = isMaterialOrigShortage && (newVarUnits >= 0 || shrankTowardZero);
 
-  if (item.varianceTotalUnits === 0) {
-    item.status = 'MATCH';
-  } else if (item.varianceTotalUnits < 0) {
-    item.status = 'SHORTAGE';
-  } else {
-    item.status = 'OVERAGE';
-  }
+  let nextStatus: StocktakeConsolidatedItem['status'] = 'MATCH';
+  if (newVarUnits < 0) nextStatus = 'SHORTAGE';
+  else if (newVarUnits > 0) nextStatus = 'OVERAGE';
 
-  // Recalculate session totals
+  return {
+    ...item,
+    originalCountedCases: origCases,
+    originalCountedSingles: origSingles,
+    originalCountedTotalUnits: origTotal,
+    originalVarianceTotalUnits: origVarUnits,
+    originalVarianceCostValue: origVarCost,
+    countedCases: rcCases,
+    countedSingles: rcSingles,
+    countedTotalUnits: rcTotalUnits,
+    countedCostValue: rcTotalUnits * item.costPerUnit,
+    countedRetailValue: rcTotalUnits * item.sellPriceUnit,
+    adjustedPhysicalUnits: rcTotalUnits,
+    trueVarianceUnits: newVarUnits,
+    varianceCases: rcCases - item.systemCases,
+    varianceSingles: rcSingles - item.systemSingles,
+    varianceTotalUnits: newVarUnits,
+    varianceCostValue: newVarCost,
+    varianceRetailValue: newVarUnits * item.sellPriceUnit,
+    recountRequested: false,
+    recountSheetStatus: 'COMPLETED',
+    recountCases: rcCases,
+    recountSingles: rcSingles,
+    recountTotalUnits: rcTotalUnits,
+    recountedBy: staffName,
+    recountedById: staffId,
+    recountWitnessId: options?.witnessId || item.recountWitnessId,
+    recountWitnessName: options?.witnessName || item.recountWitnessName,
+    recountReason: options?.reason || item.recountReason || 'Blind Recount Sheet verification',
+    recountedAt: new Date().toISOString(),
+    recountReversalAlert: reversalAlert,
+    status: nextStatus,
+  };
+};
+
+const recalculateSessionTotalsFromItems = (session: StocktakeSession): void => {
   let totSys = 0;
   let totCnt = 0;
   let totVar = 0;
   let totVarCost = 0;
   let totVarRetail = 0;
 
-  session.consolidatedItems.forEach((ci) => {
-    totSys += ci.systemTotalUnits;
-    totCnt += ci.countedTotalUnits;
-    totVar += ci.varianceTotalUnits;
-    totVarCost += ci.varianceCostValue;
-    totVarRetail += ci.varianceRetailValue;
+  (session.consolidatedItems || []).forEach((ci) => {
+    totSys += Number(ci.systemTotalUnits || 0);
+    totCnt += Number(ci.countedTotalUnits || 0);
+    totVar += Number(ci.varianceTotalUnits || 0);
+    totVarCost += Number(ci.varianceCostValue || 0);
+    totVarRetail += Number(ci.varianceRetailValue || 0);
   });
 
   session.totalSystemUnits = totSys;
@@ -20881,6 +21329,77 @@ export const submitSkuVarianceRecount = (
   session.varianceUnits = totVar;
   session.varianceCostValue = totVarCost;
   session.varianceRetailValue = totVarRetail;
+};
+
+/**
+ * SUBMIT TARGETED VARIANCE RECOUNT FOR A SPECIFIC SKU (Preserves Original Column + Anti-Fraud Flag)
+ */
+export const submitSkuVarianceRecount = (
+  sessionId: string,
+  itemId: string,
+  recountCases: number,
+  recountSingles: number,
+  staffId: string,
+  staffName: string,
+  options?: { reason?: string; witnessId?: string; witnessName?: string }
+): StocktakeSession | null => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session) return null;
+
+  const itemIndex = session.consolidatedItems.findIndex((i) => i.itemId.toUpperCase() === itemId.toUpperCase());
+  if (itemIndex < 0) return null;
+
+  session.consolidatedItems[itemIndex] = applyRecountToConsolidatedItem(
+    session.consolidatedItems[itemIndex],
+    recountCases,
+    recountSingles,
+    staffId,
+    staffName,
+    options
+  );
+
+  recalculateSessionTotalsFromItems(session);
+
+  const anyRecountsPending = session.consolidatedItems.some((i) => i.recountRequested);
+  if (!anyRecountsPending) {
+    session.status = 'CONSOLIDATED';
+  }
+
+  return saveStocktakeSession(session);
+};
+
+/**
+ * SUBMIT BLIND RECOUNT SHEET BATCH (Zero SOH / Zero Cost Shown to Recounter)
+ */
+export const submitBlindRecountSheet = (
+  sessionId: string,
+  entries: Array<{ itemId: string; cases: number; singles: number; reason?: string }>,
+  staffId: string,
+  staffName: string,
+  witnessName?: string
+): StocktakeSession | null => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session || !Array.isArray(entries) || entries.length === 0) return null;
+
+  const entryMap = new Map<string, (typeof entries)[number]>();
+  entries.forEach((e) => {
+    if (e.itemId) entryMap.set(String(e.itemId).toUpperCase(), e);
+  });
+
+  session.consolidatedItems = (session.consolidatedItems || []).map((item) => {
+    const upd = entryMap.get(String(item.itemId || '').toUpperCase());
+    if (!upd) return item;
+    return applyRecountToConsolidatedItem(
+      item,
+      upd.cases,
+      upd.singles,
+      staffId,
+      staffName,
+      { reason: upd.reason, witnessName }
+    );
+  });
+
+  recalculateSessionTotalsFromItems(session);
 
   const anyRecountsPending = session.consolidatedItems.some((i) => i.recountRequested);
   if (!anyRecountsPending) {
@@ -21010,7 +21529,9 @@ export const approveAndCommitStocktake = (
   const dateStr = session.date || timestamp.split('T')[0];
   let adjustmentsCount = 0;
   const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
-  const thresholdUsd = Number(session.varianceMaterialityThreshold || 10);
+  const thresholdUsd = Number(session.varianceMaterialityThreshold ?? 10);
+  const minUnits = Number(session.varianceMinUnitThreshold ?? 5);
+  const reviewWindowHours = Math.max(1, Number(session.varianceReviewWindowHours ?? 72));
   let hasVariancesRequiringExplanation = false;
 
   // Process items:
@@ -21025,7 +21546,7 @@ export const approveAndCommitStocktake = (
       hasVariancesRequiringExplanation = true;
       const absCost = Math.abs(Number(cItem.varianceCostValue || 0));
       const absUnits = Math.abs(Number(cItem.varianceTotalUnits || 0));
-      cItem.requiresExplanation = absCost >= thresholdUsd || absUnits >= 5;
+      cItem.requiresExplanation = absCost >= thresholdUsd || absUnits >= minUnits;
       cItem.ownerAckStatus = cItem.requiresExplanation ? 'PENDING' : 'ACKNOWLEDGED';
 
       const invItem = getInventoryItemById(cItem.itemId);
@@ -21093,11 +21614,13 @@ export const approveAndCommitStocktake = (
   session.approvedByName = adminName;
   session.approvedAt = timestamp;
   session.varianceMaterialityThreshold = thresholdUsd;
+  session.varianceMinUnitThreshold = minUnits;
+  session.varianceReviewWindowHours = reviewWindowHours;
   session.varianceReviewStatus = hasVariancesRequiringExplanation
     ? 'PENDING_MANAGER_COMMENTS'
     : 'NOT_REQUIRED';
   if (hasVariancesRequiringExplanation) {
-    session.varianceCommentDeadline = new Date(nowMs + 48 * 60 * 60 * 1000).toISOString();
+    session.varianceCommentDeadline = new Date(nowMs + reviewWindowHours * 60 * 60 * 1000).toISOString();
   }
   if (notes) {
     session.notes = (session.notes ? `${session.notes}\n` : '') + `[Approval Note]: ${notes}`;
@@ -21174,6 +21697,7 @@ export const addStocktakeGuestPass = (
     staffId: string;
     staffName: string;
     staffRole?: string;
+    passRole?: 'COUNTER' | 'AUDITOR';
     homeBranchId: string;
     homeBranchName?: string;
     assignedGroup?: 'GROUP_1' | 'GROUP_2';
@@ -21200,6 +21724,7 @@ export const addStocktakeGuestPass = (
     staffId: input.staffId,
     staffName: input.staffName,
     staffRole: input.staffRole,
+    passRole: input.passRole || 'COUNTER',
     homeBranchId: input.homeBranchId,
     homeBranchName: input.homeBranchName,
     hostBranchId: session.branchId,
@@ -21223,7 +21748,7 @@ export const addStocktakeGuestPass = (
   const saved = saveStocktakeSession(session);
   return {
     success: true,
-    message: `Visiting Stocktake Pass issued for ${input.staffName}. They can now log in on ${session.branchName || session.branchId} terminals.`,
+    message: `Visiting ${pass.passRole === 'AUDITOR' ? 'Auditor' : 'Stocktake'} Pass issued for ${input.staffName}. They can now log in on ${session.branchName || session.branchId} terminals.`,
     pass,
     session: saved,
   };
@@ -21247,8 +21772,47 @@ export const revokeStocktakeGuestPass = (
 };
 
 // ============================================================================
-// PHASE 3: POST-COMMIT MANDATORY MANAGER VARIANCE COMMENTARY
+// PHASE 3: POST-COMMIT COLLABORATIVE MANAGER VARIANCE COMMENTARY & DEADLINE
 // ============================================================================
+export const updateSessionVarianceSettings = (
+  sessionId: string,
+  settings: { thresholdUsd?: number; minUnits?: number; windowHours?: number }
+): StocktakeSession | null => {
+  const session = getStocktakeSessionById(sessionId);
+  if (!session) return null;
+
+  const thresholdUsd = settings.thresholdUsd !== undefined ? Math.max(0, Number(settings.thresholdUsd)) : Number(session.varianceMaterialityThreshold ?? 10);
+  const minUnits = settings.minUnits !== undefined ? Math.max(1, Number(settings.minUnits)) : Number(session.varianceMinUnitThreshold ?? 5);
+  const windowHours = settings.windowHours !== undefined ? Math.max(1, Number(settings.windowHours)) : Number(session.varianceReviewWindowHours ?? 72);
+
+  session.varianceMaterialityThreshold = thresholdUsd;
+  session.varianceMinUnitThreshold = minUnits;
+  session.varianceReviewWindowHours = windowHours;
+
+  const baseMs = session.approvedAt ? new Date(session.approvedAt).getTime() : Date.now();
+  if (session.status === 'APPROVED_POSTED') {
+    session.varianceCommentDeadline = new Date(baseMs + windowHours * 60 * 60 * 1000).toISOString();
+    let anyMandatory = false;
+    session.consolidatedItems = (session.consolidatedItems || []).map((ci) => {
+      if (ci.wasCountedInSession === false || Number(ci.varianceTotalUnits || 0) === 0) {
+        return { ...ci, requiresExplanation: false };
+      }
+      const req = Math.abs(Number(ci.varianceCostValue || 0)) >= thresholdUsd || Math.abs(Number(ci.varianceTotalUnits || 0)) >= minUnits;
+      if (req) anyMandatory = true;
+      return {
+        ...ci,
+        requiresExplanation: req,
+        ownerAckStatus: req ? (ci.ownerAckStatus === 'ACKNOWLEDGED' && session.varianceReviewStatus === 'CLOSED' ? 'ACKNOWLEDGED' : (ci.ownerAckStatus || 'PENDING')) : 'ACKNOWLEDGED',
+      };
+    });
+    if (session.varianceReviewStatus !== 'CLOSED') {
+      session.varianceReviewStatus = anyMandatory ? (session.varianceReviewStatus === 'COMMENTS_SUBMITTED' ? 'COMMENTS_SUBMITTED' : 'PENDING_MANAGER_COMMENTS') : 'NOT_REQUIRED';
+    }
+  }
+
+  return saveStocktakeSession(session);
+};
+
 export const submitPostCommitVarianceComments = (
   sessionId: string,
   entries: Array<{
@@ -21258,7 +21822,8 @@ export const submitPostCommitVarianceComments = (
     actionTaken?: string;
   }>,
   managerId: string,
-  managerName: string
+  managerName: string,
+  options?: { mode?: 'DRAFT' | 'SUBMIT'; authorRole?: string }
 ): { success: boolean; message: string; session?: StocktakeSession } => {
   const session = getStocktakeSessionById(sessionId);
   if (!session) {
@@ -21269,31 +21834,86 @@ export const submitPostCommitVarianceComments = (
   }
 
   const nowIso = new Date().toISOString();
+  const mode = options?.mode || 'SUBMIT';
+  const authorRole = options?.authorRole || 'MANAGER';
   const entryMap = new Map<string, (typeof entries)[number]>();
   entries.forEach((e) => {
     if (e.itemId) entryMap.set(e.itemId.toUpperCase(), e);
   });
 
+  let updatedCount = 0;
   session.consolidatedItems = (session.consolidatedItems || []).map((item) => {
     const upd = entryMap.get(String(item.itemId || '').toUpperCase());
     if (!upd) return item;
+    const cleanComment = (upd.managerComment || '').trim();
+    const cleanAction = upd.actionTaken?.trim() || item.actionTaken;
+    const existingTimeline: StocktakeVarianceCommentEntry[] = Array.isArray(item.varianceComments)
+      ? [...item.varianceComments]
+      : [];
+
+    // Backfill legacy single-author note if timeline was empty & legacy comment existed from a different note
+    if (
+      existingTimeline.length === 0 &&
+      item.managerComment &&
+      item.commentedByName &&
+      item.managerComment.trim() !== cleanComment
+    ) {
+      existingTimeline.push({
+        id: `VC-LEGACY-${item.itemId}-${Date.parse(item.commentedAt || nowIso) || 0}`,
+        authorId: item.commentedById || 'STAFF',
+        authorName: item.commentedByName,
+        authorRole: 'SUPERVISOR',
+        reasonCode: item.reasonCode || 'OTHER',
+        comment: item.managerComment.trim(),
+        actionTaken: item.actionTaken,
+        createdAt: item.commentedAt || nowIso,
+      });
+    }
+
+    // Append an attributed collaborative entry whenever new text is provided and differs from the last entry by the same author
+    const lastEntry = existingTimeline[existingTimeline.length - 1];
+    const isDuplicateLast =
+      lastEntry &&
+      String(lastEntry.authorId).toUpperCase() === String(managerId).toUpperCase() &&
+      lastEntry.comment === cleanComment &&
+      lastEntry.reasonCode === upd.reasonCode &&
+      (lastEntry.actionTaken || '') === (cleanAction || '');
+
+    if (cleanComment && !isDuplicateLast) {
+      updatedCount++;
+      existingTimeline.push({
+        id: `VC-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
+        authorId: managerId,
+        authorName: managerName,
+        authorRole,
+        reasonCode: upd.reasonCode,
+        comment: cleanComment,
+        ...(cleanAction ? { actionTaken: cleanAction } : {}),
+        createdAt: nowIso,
+      });
+    }
+
     return {
       ...item,
       reasonCode: upd.reasonCode,
-      managerComment: upd.managerComment.trim(),
-      actionTaken: upd.actionTaken?.trim() || item.actionTaken,
+      managerComment: cleanComment,
+      actionTaken: cleanAction,
       commentedById: managerId,
       commentedByName: managerName,
       commentedAt: nowIso,
+      varianceComments: existingTimeline,
       ownerAckStatus: 'PENDING',
     };
   });
 
-  session.varianceReviewStatus = 'COMMENTS_SUBMITTED';
+  session.varianceReviewStatus = mode === 'DRAFT' ? 'PENDING_MANAGER_COMMENTS' : 'COMMENTS_SUBMITTED';
   const saved = saveStocktakeSession(session);
   return {
     success: true,
-    message: `Manager variance explanations saved for ${entries.length} SKU(s) and queued for Owner review.`,
+    message:
+      mode === 'DRAFT'
+        ? `Saved draft variance explanations by ${managerName} (${updatedCount || entries.length} SKU note(s) preserved). You can return and collaborate before final submission.`
+        : `Variance explanations submitted by ${managerName} for ${entries.length} SKU(s) and queued for Owner review.`,
     session: saved,
   };
 };

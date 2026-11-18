@@ -17,6 +17,9 @@ import {
   Save,
   Boxes,
   Package,
+  EyeOff,
+  ClipboardCheck,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -30,6 +33,8 @@ interface ConsolidatedVarianceViewProps {
   onRequestSkuRecount: (itemId: string, notes?: string) => void;
   onSubmitSkuRecount: (itemId: string, cases: number, singles: number) => void;
   onConsolidateAgain: () => void;
+  onOpenBlindRecountSheet?: () => void;
+  onBatchRequestRecount?: (itemIds: string[]) => void;
 }
 
 export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> = ({
@@ -38,10 +43,13 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
   onRequestSkuRecount,
   onSubmitSkuRecount,
   onConsolidateAgain,
+  onOpenBlindRecountSheet,
+  onBatchRequestRecount,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterType, setFilterType] = useState<'ALL' | 'VARIANCES' | 'SHORTAGES' | 'OVERAGES' | 'MATCH' | 'FLAGGED'>('ALL');
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
+  const [selectedForRecount, setSelectedForRecount] = useState<string[]>([]);
 
   // Active SKU being recounted inline
   const [editingSkuId, setEditingSkuId] = useState<string | null>(null);
@@ -51,6 +59,10 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
   const consolidated = session.consolidatedItems || [];
   const verifiedSegmentsCount = (session.segments || []).filter((s) => s.status === 'VERIFIED').length;
   const totalSegmentsCount = (session.segments || []).length;
+  const queuedRecountCount = consolidated.filter(
+    (i) => i.recountSheetStatus === 'REQUESTED' || Boolean(i.recountRequested)
+  ).length;
+  const reversalAlertsCount = consolidated.filter((i) => Boolean(i.recountReversalAlert)).length;
 
   // Auto-consolidate on mount if verified segments exist but consolidatedItems is empty
   useEffect(() => {
@@ -114,6 +126,13 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
       'System SOH (Singles)',
       'System Total Units',
       'System Cost Value ($)',
+      'Original First-Pass Units',
+      'Original Variance Units',
+      'Recount Sheet Status',
+      'Recount Total Units',
+      'Recounted By',
+      'Recount Witness',
+      'Anti-Fraud Reversal Flag',
       'Counted (Cases)',
       'Counted (Singles)',
       'Counted Total Units',
@@ -126,7 +145,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
 
     const rows = consolidated.map((i) => [
       `"${i.sku}"`,
-      `"${i.itemName.replace(/"/g, '""')}"`,
+      `"${String(i.itemName || '').replace(/"/g, '""')}"`,
       `"${i.category}"`,
       i.unitsPerCase,
       i.costPerUnit.toFixed(2),
@@ -135,6 +154,13 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
       i.systemSingles,
       i.systemTotalUnits,
       i.systemCostValue.toFixed(2),
+      i.originalCountedTotalUnits ?? i.countedTotalUnits,
+      i.originalVarianceTotalUnits ?? i.varianceTotalUnits,
+      `"${i.recountSheetStatus || 'NONE'}"`,
+      i.recountTotalUnits ?? '',
+      `"${(i.recountedBy || '').replace(/"/g, '""')}"`,
+      `"${(i.recountWitnessName || '').replace(/"/g, '""')}"`,
+      i.recountReversalAlert ? 'ALERT_REVERSAL' : 'OK',
       i.countedCases,
       i.countedSingles,
       i.countedTotalUnits,
@@ -153,6 +179,28 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const toggleSelectForRecount = (itemId: string) => {
+    setSelectedForRecount((prev) =>
+      prev.includes(itemId) ? prev.filter((id) => id !== itemId) : [...prev, itemId]
+    );
+  };
+
+  const handleDispatchBlindRecount = () => {
+    const targetIds =
+      selectedForRecount.length > 0
+        ? selectedForRecount
+        : consolidated
+            .filter((i) => i.varianceTotalUnits !== 0 && i.recountSheetStatus !== 'REQUESTED')
+            .map((i) => i.itemId);
+    if (targetIds.length === 0) return;
+    if (onBatchRequestRecount) {
+      onBatchRequestRecount(targetIds);
+    } else {
+      targetIds.forEach((id) => onRequestSkuRecount(id, 'Dispatched to Blind Recount Sheet'));
+    }
+    setSelectedForRecount([]);
   };
 
   const totalCustomerHeld = consolidated.reduce((acc, i) => acc + (i.customerHeldStockUnits || 0), 0);
@@ -235,6 +283,21 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
           </div>
         )}
       </div>
+
+      {/* Anti-Fraud Zero-Out / Masking Alert Banner */}
+      {reversalAlertsCount > 0 && (
+        <div className="bg-rose-950/50 border border-rose-700/70 rounded-xl p-3.5 text-xs text-rose-100 flex items-start gap-3">
+          <ShieldAlert className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+          <div>
+            <strong className="text-white block">
+              Anti-Fraud Alert: {reversalAlertsCount} SKU(s) showed &gt;=50% Shortage Shrinkage During Recount
+            </strong>
+            <p className="text-[11px] text-rose-200/90 mt-0.5">
+              Original first-pass counts and original variances remain permanently preserved alongside Recount Sheet results for Owner/Auditor verification before committal.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* KPI Metric Summary Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
@@ -382,7 +445,30 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {session.status !== 'APPROVED_POSTED' && queuedRecountCount > 0 && onOpenBlindRecountSheet && (
+            <button
+              type="button"
+              onClick={onOpenBlindRecountSheet}
+              className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-sm animate-pulse"
+            >
+              <EyeOff className="w-3.5 h-3.5" />
+              Open Blind Recount Sheet ({queuedRecountCount})
+            </button>
+          )}
+          {session.status !== 'APPROVED_POSTED' && (shortageCount + overageCount > 0 || selectedForRecount.length > 0) && (
+            <button
+              type="button"
+              onClick={handleDispatchBlindRecount}
+              className="px-3 py-1.5 bg-amber-600/90 hover:bg-amber-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-sm"
+              title="Send selected SKUs (or all variance SKUs) to strict Blind Recount Sheet"
+            >
+              <ClipboardCheck className="w-3.5 h-3.5" />
+              {selectedForRecount.length > 0
+                ? `Dispatch Selected (${selectedForRecount.length}) to Blind Sheet`
+                : 'Dispatch Variances to Blind Recount Sheet'}
+            </button>
+          )}
           <button
             onClick={onConsolidateAgain}
             className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
@@ -407,10 +493,15 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
           <table className="w-full text-left text-xs border-collapse">
             <thead>
               <tr className="bg-slate-800 border-b border-slate-700 text-slate-400 uppercase tracking-wider text-[10px]">
+                {session.status !== 'APPROVED_POSTED' && (
+                  <th className="py-3 px-2.5 text-center">Sel</th>
+                )}
                 <th className="py-3 px-3">SKU & Item Name</th>
                 <th className="py-3 px-3 text-center">Packaging</th>
                 <th className="py-3 px-3 text-right">System SOH</th>
-                <th className="py-3 px-3 text-right">Physical Count</th>
+                <th className="py-3 px-3 text-right">Original Count / Var</th>
+                <th className="py-3 px-3 text-left">Recount Sheet</th>
+                <th className="py-3 px-3 text-right">Net Physical Count</th>
                 <th className="py-3 px-3 text-center">Unit Variance</th>
                 <th className="py-3 px-3 text-right">Cost Variance ($)</th>
                 <th className="py-3 px-3 text-right">Retail Variance ($)</th>
@@ -423,14 +514,33 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                 const isExpanded = expandedItemId === item.itemId;
                 const isEditing = editingSkuId === item.itemId;
                 const upc = item.unitsPerCase || 1;
+                const origUnits = item.originalCountedTotalUnits ?? item.countedTotalUnits;
+                const origVar = item.originalVarianceTotalUnits ?? item.varianceTotalUnits;
+                const isSelected = selectedForRecount.includes(item.itemId);
 
                 return (
                   <React.Fragment key={`${item.itemId}-${idx}`}>
                     <tr
                       className={`hover:bg-slate-800/50 transition ${
-                        item.recountRequested ? 'bg-purple-950/20' : ''
+                        item.recountReversalAlert
+                          ? 'bg-rose-950/20'
+                          : item.recountRequested
+                          ? 'bg-purple-950/20'
+                          : ''
                       }`}
                     >
+                      {session.status !== 'APPROVED_POSTED' && (
+                        <td className="py-2.5 px-2.5 text-center">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleSelectForRecount(item.itemId)}
+                            className="w-3.5 h-3.5 rounded bg-slate-900 border-slate-600 text-purple-600"
+                            title="Select for Blind Recount Sheet"
+                          />
+                        </td>
+                      )}
+
                       {/* SKU & Name */}
                       <td className="py-2.5 px-3">
                         <div className="font-semibold text-white text-xs">{item.itemName}</div>
@@ -452,6 +562,44 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                         <div className="text-[10px] text-slate-400">
                           {item.systemCases} cs + {item.systemSingles} ea
                         </div>
+                      </td>
+
+                      {/* Original Baseline Count & Variance */}
+                      <td className="py-2.5 px-3 text-right font-mono">
+                        <div className="font-semibold text-slate-300">{origUnits} u</div>
+                        <div
+                          className={`text-[10px] ${
+                            origVar === 0 ? 'text-slate-500' : origVar < 0 ? 'text-rose-400' : 'text-emerald-400'
+                          }`}
+                        >
+                          Orig Var: {origVar > 0 ? `+${origVar}` : origVar} u
+                        </div>
+                      </td>
+
+                      {/* Recount Sheet Separate Audit Column */}
+                      <td className="py-2.5 px-3 text-left">
+                        {item.recountSheetStatus === 'REQUESTED' || item.recountRequested ? (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-700 inline-block">
+                            QUEUED BLIND SHEET
+                          </span>
+                        ) : item.recountSheetStatus === 'COMPLETED' ? (
+                          <div className="text-[10px] space-y-0.5">
+                            <div className="font-mono font-bold text-purple-300">
+                              Recount: {item.recountTotalUnits} u
+                            </div>
+                            <div className="text-slate-400 truncate max-w-[140px]">
+                              By {item.recountedBy || 'Counter'}
+                              {item.recountWitnessName ? ` + ${item.recountWitnessName}` : ''}
+                            </div>
+                            {item.recountReason && (
+                              <div className="text-slate-500 italic truncate max-w-[140px]">
+                                {item.recountReason}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-[11px] text-slate-600 font-mono">—</span>
+                        )}
                       </td>
 
                       {/* Physical Count */}
@@ -499,19 +647,29 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                         )}
                       </td>
 
-                      {/* Unit Variance */}
+                      {/* Unit Variance + Anti-Fraud Alert */}
                       <td className="py-2.5 px-3 text-center font-mono">
-                        {item.varianceTotalUnits === 0 ? (
-                          <span className="text-slate-400 font-bold">0</span>
-                        ) : item.varianceTotalUnits < 0 ? (
-                          <span className="text-rose-400 font-extrabold bg-rose-950/60 border border-rose-800/40 px-2 py-0.5 rounded text-xs">
-                            {item.varianceTotalUnits} u
-                          </span>
-                        ) : (
-                          <span className="text-emerald-400 font-extrabold bg-emerald-950/60 border border-emerald-800/40 px-2 py-0.5 rounded text-xs">
-                            +{item.varianceTotalUnits} u
-                          </span>
-                        )}
+                        <div className="flex flex-col items-center gap-1">
+                          {item.varianceTotalUnits === 0 ? (
+                            <span className="text-slate-400 font-bold">0</span>
+                          ) : item.varianceTotalUnits < 0 ? (
+                            <span className="text-rose-400 font-extrabold bg-rose-950/60 border border-rose-800/40 px-2 py-0.5 rounded text-xs">
+                              {item.varianceTotalUnits} u
+                            </span>
+                          ) : (
+                            <span className="text-emerald-400 font-extrabold bg-emerald-950/60 border border-emerald-800/40 px-2 py-0.5 rounded text-xs">
+                              +{item.varianceTotalUnits} u
+                            </span>
+                          )}
+                          {item.recountReversalAlert && (
+                            <span
+                              className="text-[9px] font-sans font-bold px-1.5 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-600/70 flex items-center gap-1"
+                              title="Material shortage shrank >=50% during recount — verify audit trail"
+                            >
+                              <ShieldAlert className="w-2.5 h-2.5 text-rose-400" /> Zero-Out Fraud Alert
+                            </span>
+                          )}
+                        </div>
                       </td>
 
                       {/* Cost Variance */}
@@ -600,7 +758,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                     {/* Segment Breakdown Expandable Row */}
                     {isExpanded && item.segmentBreakdown && item.segmentBreakdown.length > 0 && (
                       <tr className="bg-slate-950/60">
-                        <td colSpan={9} className="py-2.5 px-6 border-b border-slate-800">
+                        <td colSpan={session.status !== 'APPROVED_POSTED' ? 12 : 11} className="py-2.5 px-6 border-b border-slate-800">
                           <div className="text-[11px] font-semibold text-slate-300 mb-1 flex items-center gap-1.5">
                             <Info className="w-3.5 h-3.5 text-blue-400" />
                             Segment Contributions for {item.itemName}:
@@ -627,7 +785,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
 
               {filteredItems.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="py-12 text-center text-slate-400 text-xs">
+                  <td colSpan={session.status !== 'APPROVED_POSTED' ? 12 : 11} className="py-12 text-center text-slate-400 text-xs">
                     {consolidated.length === 0 ? (
                       <div className="max-w-md mx-auto space-y-3">
                         <AlertTriangle className="w-8 h-8 text-amber-400 mx-auto" />

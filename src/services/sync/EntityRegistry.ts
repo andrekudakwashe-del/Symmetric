@@ -220,6 +220,16 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     uiEventName: 'saimetric_stocktake_updated',
     description: 'Dual-signature verified joint recount resolution',
   },
+  stocktake_segment_unlock: {
+    entityType: 'stocktake_segment_unlock',
+    class: 'T1',
+    appendOnly: true,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: false,
+    uiEventName: 'saimetric_stocktake_updated',
+    description: 'Auditor/Owner unlock event for a finalized stocktake segment slot or comparison',
+  },
   sync_receipt: {
     entityType: 'sync_receipt',
     class: 'T1',

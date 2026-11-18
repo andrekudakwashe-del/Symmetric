@@ -9,6 +9,9 @@ import {
   Send,
   XCircle,
   Lock,
+  Save,
+  Sliders,
+  User,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -19,6 +22,7 @@ import {
 import {
   submitPostCommitVarianceComments,
   acknowledgePostCommitVariance,
+  updateSessionVarianceSettings,
 } from '../../db/roomDatabase';
 import {
   isStocktakeLeader,
@@ -62,7 +66,15 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
   const canEditComments = (isManager || isAuditor || isLeader) && session.varianceReviewStatus !== 'CLOSED';
   const canOwnerSignOff = isLeader || (isAuditor && !isManager);
 
-  const thresholdUsd = Number(session.varianceMaterialityThreshold || 10);
+  const thresholdUsd = Number(session.varianceMaterialityThreshold ?? 10);
+  const minUnitsThreshold = Number(session.varianceMinUnitThreshold ?? 5);
+  const reviewWindowHours = Number(session.varianceReviewWindowHours ?? 72);
+
+  const [showRulesPanel, setShowRulesPanel] = useState(false);
+  const [rulesThresholdUsd, setRulesThresholdUsd] = useState<number>(thresholdUsd);
+  const [rulesMinUnits, setRulesMinUnits] = useState<number>(minUnitsThreshold);
+  const [rulesWindowHours, setRulesWindowHours] = useState<number>(reviewWindowHours);
+
   const varianceItems = (session.consolidatedItems || []).filter(
     (item) =>
       Number(item.varianceTotalUnits || 0) !== 0 &&
@@ -73,6 +85,12 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
   const [ackStatuses, setAckStatuses] = useState<Record<string, 'ACKNOWLEDGED' | 'DISPUTED'>>({});
   const [feedbackBanner, setFeedbackBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [filterMode, setFilterMode] = useState<'ALL' | 'MANDATORY' | 'UNCOMMENTED'>('ALL');
+
+  useEffect(() => {
+    setRulesThresholdUsd(Number(session.varianceMaterialityThreshold ?? 10));
+    setRulesMinUnits(Number(session.varianceMinUnitThreshold ?? 5));
+    setRulesWindowHours(Number(session.varianceReviewWindowHours ?? 72));
+  }, [session.varianceMaterialityThreshold, session.varianceMinUnitThreshold, session.varianceReviewWindowHours]);
 
   useEffect(() => {
     const initialDrafts: Record<string, DraftEntry> = {};
@@ -95,18 +113,18 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
   }, [session.sessionId, session.updatedAt, session.varianceReviewStatus]);
 
   const mandatoryItems = varianceItems.filter((item) =>
-    isVarianceItemMandatoryForComment(item, thresholdUsd)
+    isVarianceItemMandatoryForComment(item, thresholdUsd, minUnitsThreshold)
   );
   const explainedMandatoryCount = mandatoryItems.filter(
-    (item) => Boolean(item.managerComment && item.managerComment.trim().length > 0)
+    (item) => Boolean((item.managerComment && item.managerComment.trim().length > 0) || (item.varianceComments && item.varianceComments.length > 0))
   ).length;
 
   const filteredItems = varianceItems.filter((item) => {
     if (filterMode === 'MANDATORY') {
-      return isVarianceItemMandatoryForComment(item, thresholdUsd);
+      return isVarianceItemMandatoryForComment(item, thresholdUsd, minUnitsThreshold);
     }
     if (filterMode === 'UNCOMMENTED') {
-      return !item.managerComment || !item.managerComment.trim();
+      return (!item.managerComment || !item.managerComment.trim()) && (!item.varianceComments || item.varianceComments.length === 0);
     }
     return true;
   });
@@ -125,24 +143,25 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
     }));
   };
 
-  const handleSubmitExplanations = (e: React.FormEvent) => {
-    e.preventDefault();
-    setFeedbackBanner(null);
-
-    const missingMandatory = mandatoryItems.filter((item) => {
-      const entry = drafts[item.itemId];
-      return !entry || !entry.managerComment || entry.managerComment.trim().length < 5;
+  const handleSaveRules = () => {
+    const updated = updateSessionVarianceSettings(session.sessionId, {
+      thresholdUsd: rulesThresholdUsd,
+      minUnits: rulesMinUnits,
+      windowHours: rulesWindowHours,
     });
-
-    if (missingMandatory.length > 0) {
+    if (updated) {
+      meshSyncService.broadcastStocktakeSession(updated);
+      onRefreshSession(updated);
+      setShowRulesPanel(false);
       setFeedbackBanner({
-        type: 'error',
-        text: `Please enter a detailed explanation (min 5 characters) for all ${missingMandatory.length} mandatory high-variance SKU(s) highlighted in amber.`,
+        type: 'success',
+        text: `Updated materiality rules: >=$${rulesThresholdUsd.toFixed(2)} or >=${rulesMinUnits} units • Review window: ${rulesWindowHours}h.`,
       });
-      return;
     }
+  };
 
-    const entries = varianceItems
+  const buildDraftEntries = () =>
+    varianceItems
       .map((item) => {
         const d = drafts[item.itemId];
         if (!d || !d.managerComment.trim()) return null;
@@ -154,6 +173,54 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
         };
       })
       .filter((x): x is NonNullable<typeof x> => Boolean(x));
+
+  const handleSaveDraft = () => {
+    setFeedbackBanner(null);
+    const entries = buildDraftEntries();
+    if (entries.length === 0) {
+      setFeedbackBanner({
+        type: 'error',
+        text: 'Enter at least one variance note before saving a draft.',
+      });
+      return;
+    }
+
+    const res = submitPostCommitVarianceComments(
+      session.sessionId,
+      entries,
+      currentUser?.id || 'MGR-LOCAL',
+      currentUser?.name || 'Branch Manager',
+      { mode: 'DRAFT', authorRole: currentUser?.role || 'MANAGER' }
+    );
+
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      onRefreshSession(res.session);
+      setFeedbackBanner({ type: 'success', text: res.message });
+    } else {
+      setFeedbackBanner({ type: 'error', text: res.message });
+    }
+  };
+
+  const handleSubmitExplanations = (e: React.FormEvent) => {
+    e.preventDefault();
+    setFeedbackBanner(null);
+
+    const missingMandatory = mandatoryItems.filter((item) => {
+      const entry = drafts[item.itemId];
+      const hasExistingComment = Boolean(item.varianceComments && item.varianceComments.length > 0);
+      return (!entry || !entry.managerComment || entry.managerComment.trim().length < 5) && !hasExistingComment;
+    });
+
+    if (missingMandatory.length > 0) {
+      setFeedbackBanner({
+        type: 'error',
+        text: `Please enter a detailed explanation (min 5 characters) for all ${missingMandatory.length} mandatory high-variance SKU(s) highlighted in amber.`,
+      });
+      return;
+    }
+
+    const entries = buildDraftEntries();
 
     if (entries.length === 0) {
       setFeedbackBanner({
@@ -167,7 +234,8 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
       session.sessionId,
       entries,
       currentUser?.id || 'MGR-LOCAL',
-      currentUser?.name || 'Branch Manager'
+      currentUser?.name || 'Branch Manager',
+      { mode: 'SUBMIT', authorRole: currentUser?.role || 'MANAGER' }
     );
 
     if (res.success && res.session) {
@@ -201,7 +269,7 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
   const reviewStatus = session.varianceReviewStatus || 'NOT_REQUIRED';
   const deadlineStr = session.varianceCommentDeadline
     ? new Date(session.varianceCommentDeadline).toLocaleString()
-    : '48h post-commit';
+    : `${reviewWindowHours}h post-commit`;
 
   return (
     <div className="space-y-5">
@@ -232,12 +300,22 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
             </div>
             <p className="text-xs text-slate-300 mt-1 max-w-3xl leading-relaxed">
               Every variance above <strong className="text-white">${thresholdUsd.toFixed(2)}</strong> or{' '}
-              <strong className="text-white">5 units</strong> requires a formal root-cause code and corrective action from the Branch Manager / Supervisor before audit closure.
+              <strong className="text-white">{minUnitsThreshold} units</strong> requires a formal root-cause code and corrective action from the Branch Manager / Supervisor within <strong className="text-white">{reviewWindowHours}h</strong> before Owner audit closure.
             </p>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-3 text-xs shrink-0">
+          {canOwnerSignOff && reviewStatus !== 'CLOSED' && (
+            <button
+              type="button"
+              onClick={() => setShowRulesPanel(!showRulesPanel)}
+              className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-indigo-300 border border-indigo-700/60 font-bold flex items-center gap-1.5 transition"
+            >
+              <Sliders className="w-3.5 h-3.5" />
+              Rules
+            </button>
+          )}
           <div className="bg-slate-950/80 px-3.5 py-2 rounded-xl border border-slate-800">
             <div className="text-[10px] text-slate-400 uppercase font-bold">Mandatory Covered</div>
             <div className="font-mono font-bold text-white text-sm">
@@ -254,6 +332,52 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
           )}
         </div>
       </div>
+
+      {/* Owner/Auditor Configurable Thresholds & Review Window */}
+      {showRulesPanel && canOwnerSignOff && (
+        <div className="bg-slate-900/95 border border-indigo-700/60 rounded-2xl p-4 text-xs flex flex-wrap items-end gap-4 animate-fadeIn">
+          <div>
+            <label className="block text-slate-300 font-semibold mb-1">Materiality Threshold ($)</label>
+            <input
+              type="number"
+              min={0}
+              step="1"
+              value={rulesThresholdUsd}
+              onChange={(e) => setRulesThresholdUsd(Math.max(0, Number(e.target.value) || 0))}
+              className="w-32 px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white font-mono"
+            />
+          </div>
+          <div>
+            <label className="block text-slate-300 font-semibold mb-1">Min Unit Variance</label>
+            <input
+              type="number"
+              min={1}
+              value={rulesMinUnits}
+              onChange={(e) => setRulesMinUnits(Math.max(1, Number(e.target.value) || 1))}
+              className="w-28 px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white font-mono"
+            />
+          </div>
+          <div>
+            <label className="block text-slate-300 font-semibold mb-1">Review Window (Hours)</label>
+            <input
+              type="number"
+              min={1}
+              value={rulesWindowHours}
+              onChange={(e) => setRulesWindowHours(Math.max(1, Number(e.target.value) || 72))}
+              className="w-32 px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white font-mono"
+            />
+            <span className="text-[10px] text-slate-400 ml-2">({Math.round(rulesWindowHours / 24)} day(s))</span>
+          </div>
+          <button
+            type="button"
+            onClick={handleSaveRules}
+            className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold flex items-center gap-1.5"
+          >
+            <Save className="w-3.5 h-3.5" />
+            Save Threshold Rules
+          </button>
+        </div>
+      )}
 
       {feedbackBanner && (
         <div
@@ -343,13 +467,14 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
         <form onSubmit={handleSubmitExplanations} className="space-y-4">
           <div className="space-y-3">
             {filteredItems.map((item: StocktakeConsolidatedItem, idx: number) => {
-              const isMandatory = isVarianceItemMandatoryForComment(item, thresholdUsd);
+              const isMandatory = isVarianceItemMandatoryForComment(item, thresholdUsd, minUnitsThreshold);
               const draft = drafts[item.itemId] || {
                 reasonCode: (item.reasonCode as StocktakeVarianceReasonCode) || 'OTHER',
                 managerComment: item.managerComment || '',
                 actionTaken: item.actionTaken || '',
               };
               const isDisputed = item.ownerAckStatus === 'DISPUTED' || ackStatuses[item.itemId] === 'DISPUTED';
+              const timeline = Array.isArray(item.varianceComments) ? item.varianceComments : [];
 
               return (
                 <div
@@ -480,7 +605,39 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
                     </div>
                   </div>
 
-                  {item.commentedByName && (
+                  {/* Attributed Collaborative Comment Timeline */}
+                  {timeline.length > 0 && (
+                    <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3 space-y-2">
+                      <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        Collaborative Audit Thread ({timeline.length})
+                      </div>
+                      {timeline.map((entry) => (
+                        <div key={entry.id} className="text-xs border-l-2 border-indigo-500/70 pl-2.5 py-0.5 space-y-0.5">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-bold text-indigo-300 flex items-center gap-1">
+                              <User className="w-3 h-3" />
+                              {entry.authorName}
+                            </span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
+                              {entry.authorRole}
+                            </span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-950/70 text-blue-300 border border-blue-800/50 font-mono">
+                              {entry.reasonCode}
+                            </span>
+                            <span className="text-[10px] text-slate-500 font-mono">
+                              {new Date(entry.createdAt).toLocaleString()}
+                            </span>
+                          </div>
+                          <p className="text-slate-200">{entry.comment}</p>
+                          {entry.actionTaken && (
+                            <p className="text-[11px] text-emerald-300/90">Action: {entry.actionTaken}</p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {!timeline.length && item.commentedByName && (
                     <div className="text-[10px] text-slate-500 font-mono flex items-center gap-2">
                       <FileText className="w-3 h-3 text-slate-400" />
                       <span>
@@ -496,18 +653,28 @@ export const VarianceCommentaryTab: React.FC<VarianceCommentaryTabProps> = ({
           {/* Action Footer */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
             <div className="text-xs text-slate-400">
-              Changes sync across POS terminals and Cloud Ledger automatically on save.
+              Signing as <strong className="text-white">{currentUser?.name || 'Manager'}</strong> • Changes sync across POS terminals and Cloud Ledger automatically.
             </div>
 
             <div className="flex flex-wrap items-center gap-2.5">
               {canEditComments && (
-                <button
-                  type="submit"
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-1.5 transition"
-                >
-                  <Send className="w-3.5 h-3.5" />
-                  Submit Manager Variance Explanations
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={handleSaveDraft}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-600 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                  >
+                    <Save className="w-3.5 h-3.5 text-amber-400" />
+                    Pause & Save Draft
+                  </button>
+                  <button
+                    type="submit"
+                    className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-1.5 transition"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    Submit Explanations for Owner Closure
+                  </button>
+                </>
               )}
 
               {canOwnerSignOff && reviewStatus !== 'CLOSED' && (

@@ -28,6 +28,8 @@ import {
   ChevronUp,
   Check,
   RefreshCw,
+  Lock,
+  ShieldAlert,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -44,7 +46,10 @@ import {
   authenticateCasualWorker,
   getTemporaryCasuals,
 } from '../../db/roomDatabase';
-import { resolveStocktakePersona } from '../../services/stocktakeAccessService';
+import {
+  resolveStocktakePersona,
+  canClaimSegmentSlot,
+} from '../../services/stocktakeAccessService';
 
 interface DoubleCountTerminalProps {
   session: StocktakeSession;
@@ -103,6 +108,9 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   const [lastDraftSavedAt, setLastDraftSavedAt] = useState<number | null>(null);
   const [draftRestoredMessage, setDraftRestoredMessage] = useState<string | null>(null);
 
+  // Finalize confirmation modal
+  const [confirmFinalizeOpen, setConfirmFinalizeOpen] = useState<boolean>(false);
+
   // Collapsible top header (sticky search stays frozen at top; extra header section collapses to maximize screen)
   const [isHeaderExpanded, setIsHeaderExpanded] = useState<boolean>(true);
 
@@ -111,6 +119,14 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   const isGroupLocked = isBlindCounter && Boolean(currentUser?.assignedGroup);
   const isDailyBlind = session.countType === 'DAILY_BLIND';
   const isSpotCheck = session.countType === 'SPOT_CHECK' && !isBlindCounter;
+
+  const isSlotFinalized = Boolean(
+    segment.comparisonFinalized ||
+      (counterSlot === 'A' ? segment.count1Finalized : segment.count2Finalized)
+  );
+  const actorStaffId = counterStaffId || currentUser?.id || '';
+  const slotCheckA = canClaimSegmentSlot(segment, 'A', actorStaffId);
+  const slotCheckB = canClaimSegmentSlot(segment, 'B', actorStaffId);
 
   const sessionCasuals = useMemo(
     () => getTemporaryCasuals(session.sessionId).filter((c) => c.active),
@@ -319,6 +335,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     exactCases?: number,
     exactSingles?: number
   ) => {
+    if (isSlotFinalized) return;
     const freezeSnapshot = captureLiveInventoryFreeze(itemId, session.branchId);
 
     setLines((prev) => {
@@ -383,13 +400,22 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
   const totalCountedSingles = lines.reduce((acc, l) => acc + l.singles, 0);
   const totalCountedUnits = lines.reduce((acc, l) => acc + l.totalUnits, 0);
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (isSlotFinalized) return;
     onSaveCount(counterSlot, lines, counterStaffId, counterStaffName);
     // Clear draft after successful broadcast submission
     clearDraftLocally(counterSlot);
+    setConfirmFinalizeOpen(false);
     setSavedSuccess(true);
     setTimeout(() => setSavedSuccess(false), 3000);
+  };
+
+  const handlePauseAndExit = () => {
+    if (!isSlotFinalized) {
+      saveDraftLocally(lines, counterSlot);
+    }
+    onBack();
   };
 
   return (
@@ -418,9 +444,10 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
           {/* Left: Back & Location Identifier */}
           <div className="flex items-center gap-2 shrink-0">
             <button
-              onClick={onBack}
+              type="button"
+              onClick={handlePauseAndExit}
               className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition"
-              title="Return to Session Overview (Draft is auto-saved)"
+              title="Pause & Exit (Draft is auto-saved)"
             >
               <ArrowLeft className="w-4 h-4" />
             </button>
@@ -440,6 +467,11 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
               >
                 Team {counterSlot}
               </span>
+              {isSlotFinalized && (
+                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-700 flex items-center gap-1">
+                  <Lock className="w-3 h-3" /> Finalized
+                </span>
+              )}
             </div>
           </div>
 
@@ -464,10 +496,10 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
             )}
           </div>
 
-          {/* Right: Auto-Save Status, Save Button, and Dropdown Header Toggle */}
+          {/* Right: Auto-Save Status, Finalize Button, and Dropdown Header Toggle */}
           <div className="flex items-center gap-2 shrink-0">
             {/* Live Auto-Save Indicator */}
-            {lastDraftSavedAt && (
+            {lastDraftSavedAt && !isSlotFinalized && (
               <div
                 className="hidden md:flex items-center gap-1.5 text-[11px] text-emerald-300 bg-emerald-950/60 border border-emerald-800/50 px-2 py-0.5 rounded"
                 title="Every line count is auto-saved as a local draft continuously"
@@ -477,18 +509,19 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
               </div>
             )}
 
-            {/* Save Count Submit Button */}
+            {/* Finalize Count Submit Button */}
             <button
               type="button"
-              onClick={handleSubmit}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-md transition ${
+              disabled={isSlotFinalized}
+              onClick={() => setConfirmFinalizeOpen(true)}
+              className={`px-3.5 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-md transition disabled:opacity-45 disabled:cursor-not-allowed ${
                 counterSlot === 'A'
                   ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/30'
                   : 'bg-purple-600 hover:bg-purple-500 text-white shadow-purple-900/30'
               }`}
             >
-              <Save className="w-3.5 h-3.5" />
-              <span>Save Count {counterSlot}</span>
+              {isSlotFinalized ? <Lock className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
+              <span>{isSlotFinalized ? `Count ${counterSlot} Finalized` : `Finalize Count ${counterSlot}`}</span>
             </button>
 
             {/* Dropdown Toggle: Lets user collapse/expand the top section for more screen space */}
@@ -527,11 +560,19 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                   )}
                 </button>
 
-                {/* Counter Slot Switcher */}
+                {/* Counter Slot Switcher (Blind Cross-Slot Isolation Enforced) */}
                 <div className="flex items-center gap-0.5 bg-slate-950 p-0.5 rounded-lg border border-slate-700">
                   <button
                     type="button"
-                    disabled={isGroupLocked && currentUser?.assignedGroup !== 'GROUP_1'}
+                    disabled={
+                      (isGroupLocked && currentUser?.assignedGroup !== 'GROUP_1') ||
+                      (counterSlot !== 'A' && !slotCheckA.allowed && Boolean(segment.counterBId && String(segment.counterBId).toUpperCase() === actorStaffId.toUpperCase()))
+                    }
+                    title={
+                      !slotCheckA.allowed && segment.counterBId && String(segment.counterBId).toUpperCase() === actorStaffId.toUpperCase()
+                        ? slotCheckA.reason
+                        : 'Switch to Count 1 (Team A)'
+                    }
                     onClick={() => handleSlotChange('A')}
                     className={`px-2.5 py-1 rounded text-xs font-bold transition disabled:opacity-40 disabled:cursor-not-allowed ${
                       counterSlot === 'A'
@@ -539,11 +580,19 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                         : 'text-slate-400 hover:text-white'
                     }`}
                   >
-                    Count 1 (Team A)
+                    Count 1 (Team A) {segment.count1Finalized ? '🔒' : ''}
                   </button>
                   <button
                     type="button"
-                    disabled={isGroupLocked && currentUser?.assignedGroup !== 'GROUP_2'}
+                    disabled={
+                      (isGroupLocked && currentUser?.assignedGroup !== 'GROUP_2') ||
+                      (counterSlot !== 'B' && !slotCheckB.allowed && Boolean(segment.counterAId && String(segment.counterAId).toUpperCase() === actorStaffId.toUpperCase()))
+                    }
+                    title={
+                      !slotCheckB.allowed && segment.counterAId && String(segment.counterAId).toUpperCase() === actorStaffId.toUpperCase()
+                        ? slotCheckB.reason
+                        : 'Switch to Count 2 (Team B)'
+                    }
                     onClick={() => handleSlotChange('B')}
                     className={`px-2.5 py-1 rounded text-xs font-bold transition disabled:opacity-40 disabled:cursor-not-allowed ${
                       counterSlot === 'B'
@@ -551,7 +600,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                         : 'text-slate-400 hover:text-white'
                     }`}
                   >
-                    Count 2 (Team B)
+                    Count 2 (Team B) {segment.count2Finalized ? '🔒' : ''}
                   </button>
                 </div>
 
@@ -634,10 +683,18 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
       {savedSuccess && (
         <div className="bg-emerald-900/90 text-emerald-100 border-b border-emerald-700 px-4 py-2 text-center text-xs font-semibold flex items-center justify-center gap-2">
           <CheckCircle className="w-4 h-4 text-emerald-300" />
-          Counter {counterSlot} count successfully saved to system!
+          Counter {counterSlot} count finalized and locked in system!
         </div>
       )}
 
+      {isSlotFinalized && (
+        <div className="bg-amber-950/90 text-amber-100 border-b border-amber-700/80 px-4 py-2.5 text-xs font-semibold flex items-center justify-center gap-2">
+          <Lock className="w-4 h-4 text-amber-400 shrink-0" />
+          <span>
+            Count {counterSlot} Finalized & Locked — Only Stocktake Auditor / Owner Can Unlock this segment for further edits.
+          </span>
+        </div>
+      )}
 
       {/* Main Counting Matrix */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-4">
@@ -755,32 +812,36 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                       <div className="flex items-center gap-1.5">
                         <button
                           type="button"
+                          disabled={isSlotFinalized}
                           onClick={() => updateQuantity(line.itemId, -1, 0)}
-                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded flex items-center justify-center font-bold"
+                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 rounded flex items-center justify-center font-bold"
                         >
                           -
                         </button>
                         <input
                           type="number"
                           min="0"
+                          disabled={isSlotFinalized}
                           value={line.cases === 0 ? '' : line.cases}
                           onChange={(e) =>
                             updateQuantity(line.itemId, 0, 0, Number(e.target.value) || 0, line.singles)
                           }
                           placeholder="0"
-                          className="w-14 text-center font-mono font-bold bg-slate-950 border border-slate-700 text-white rounded py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
+                          className="w-14 text-center font-mono font-bold bg-slate-950 border border-slate-700 disabled:opacity-60 text-white rounded py-1 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
                         />
                         <button
                           type="button"
+                          disabled={isSlotFinalized}
                           onClick={() => updateQuantity(line.itemId, 1, 0)}
-                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded flex items-center justify-center font-bold"
+                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 rounded flex items-center justify-center font-bold"
                         >
                           +
                         </button>
                         <button
                           type="button"
+                          disabled={isSlotFinalized}
                           onClick={() => updateQuantity(line.itemId, 5, 0)}
-                          className="px-1.5 h-7 bg-slate-800 hover:bg-slate-700 text-blue-300 rounded text-[11px] font-bold"
+                          className="px-1.5 h-7 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-blue-300 rounded text-[11px] font-bold"
                         >
                           +5
                         </button>
@@ -799,32 +860,36 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                       <div className="flex items-center gap-1.5">
                         <button
                           type="button"
+                          disabled={isSlotFinalized}
                           onClick={() => updateQuantity(line.itemId, 0, -1)}
-                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded flex items-center justify-center font-bold"
+                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 rounded flex items-center justify-center font-bold"
                         >
                           -
                         </button>
                         <input
                           type="number"
                           min="0"
+                          disabled={isSlotFinalized}
                           value={line.singles === 0 ? '' : line.singles}
                           onChange={(e) =>
                             updateQuantity(line.itemId, 0, 0, line.cases, Number(e.target.value) || 0)
                           }
                           placeholder="0"
-                          className="w-14 text-center font-mono font-bold bg-slate-950 border border-slate-700 text-white rounded py-1 text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                          className="w-14 text-center font-mono font-bold bg-slate-950 border border-slate-700 disabled:opacity-60 text-white rounded py-1 text-sm focus:outline-none focus:ring-1 focus:ring-emerald-500"
                         />
                         <button
                           type="button"
+                          disabled={isSlotFinalized}
                           onClick={() => updateQuantity(line.itemId, 0, 1)}
-                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded flex items-center justify-center font-bold"
+                          className="w-7 h-7 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 rounded flex items-center justify-center font-bold"
                         >
                           +
                         </button>
                         <button
                           type="button"
+                          disabled={isSlotFinalized}
                           onClick={() => updateQuantity(line.itemId, 0, 5)}
-                          className="px-1.5 h-7 bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded text-[11px] font-bold"
+                          className="px-1.5 h-7 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed text-emerald-300 rounded text-[11px] font-bold"
                         >
                           +5
                         </button>
@@ -845,7 +910,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                           </div>
                         )}
                       </div>
-                      {line.totalUnits > 0 && (
+                      {line.totalUnits > 0 && !isSlotFinalized && (
                         <button
                           type="button"
                           onClick={() => updateQuantity(line.itemId, 0, 0, 0, 0)}
@@ -899,26 +964,79 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={onBack}
-              className="px-3.5 py-1.5 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-700 transition"
+              onClick={handlePauseAndExit}
+              className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-900 border border-slate-700 text-slate-200 hover:bg-slate-700 transition"
             >
-              Cancel
+              Pause & Exit (Draft Saved)
             </button>
             <button
               type="button"
-              onClick={handleSubmit}
-              className={`px-5 py-2 rounded-lg text-sm font-bold shadow-lg flex items-center gap-2 transition ${
+              disabled={isSlotFinalized}
+              onClick={() => setConfirmFinalizeOpen(true)}
+              className={`px-5 py-2 rounded-lg text-sm font-bold shadow-lg flex items-center gap-2 transition disabled:opacity-45 disabled:cursor-not-allowed ${
                 counterSlot === 'A'
                   ? 'bg-blue-600 hover:bg-blue-500 text-white shadow-blue-900/30'
                   : 'bg-purple-600 hover:bg-purple-500 text-white shadow-purple-900/30'
               }`}
             >
-              <Save className="w-4 h-4" />
-              Submit Count {counterSlot}
+              {isSlotFinalized ? <Lock className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+              {isSlotFinalized ? `Count ${counterSlot} Finalized & Locked` : `Finalize Count ${counterSlot}`}
             </button>
           </div>
         </div>
       </footer>
+
+      {/* Irreversible Finalize Confirmation Modal */}
+      {confirmFinalizeOpen && !isSlotFinalized && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-slate-900 border border-amber-600/60 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-amber-500/15 border border-amber-500/40 text-amber-400 flex items-center justify-center shrink-0">
+                <ShieldAlert className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-white">Finalize Count {counterSlot} Permanently?</h3>
+                <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                  Once finalized, counts become immutable and cannot be edited by counters. Ask an Auditor or Owner if an emergency unlock is ever needed.
+                </p>
+              </div>
+            </div>
+
+            <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 text-xs space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Segment:</span>
+                <strong className="text-white">{segment.name}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Products Counted:</span>
+                <strong className="text-emerald-400 font-mono">{countedItemsCount} / {lines.length} SKUs</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Total Physical Units:</span>
+                <strong className="text-blue-300 font-mono">{totalCountedUnits} units</strong>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setConfirmFinalizeOpen(false)}
+                className="px-4 py-2 rounded-xl text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 transition"
+              >
+                Go Back & Edit
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSubmit()}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg flex items-center gap-1.5 transition"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                Yes, Finalize & Lock Count {counterSlot}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Casual Worker 4-Digit PIN Modal */}
       {showCasualPinModal && (

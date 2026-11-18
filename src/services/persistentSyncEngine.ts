@@ -49,8 +49,6 @@ import {
   getSalespeople,
   getAllSalespeople,
   getBranches,
-  pullTenantInventory,
-  pullTenantSales,
   clearAllSyncQueueItems,
   markReceiptAsSynced,
   markRecordsCloudSynced,
@@ -64,6 +62,13 @@ import {
   isAppScriptsIngestPaused,
   routeCloudRecordThroughSyncCore,
 } from './sync/syncIngestBridge';
+import {
+  getTenantAuthToken,
+  setTenantAuthToken,
+  getRoutingEpoch,
+  setRoutingEpoch,
+  resetCloudCatchupCursors,
+} from './sync/highWaterMarks';
 
 // Exponential backoff schedule in milliseconds: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s (cap)
 const BACKOFF_SCHEDULE_MS = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 300000];
@@ -197,11 +202,9 @@ class PersistentSyncEngine {
     if (!this.isOutboundSyncPaused && !isAppScriptsIngestPaused()) {
       this.drainSyncQueue().catch((err) => console.warn('[SyncEngine] Initial queue drain error:', err));
 
-      // 5. Force initial delta refresh & tenant context refresh
+      // 5. Force initial delta refresh & tenant context refresh (operational catch-up handled by AppScriptsAdapter)
       this.performDeltaSync().catch((err) => console.warn('[SyncEngine] Initial delta sync error:', err));
       this.refreshTenantContext().catch((err) => console.warn('[SyncEngine] Initial tenant context error:', err));
-      pullTenantInventory().catch(() => {});
-      pullTenantSales().catch(() => {});
     }
 
     // 6. Start Background Workers
@@ -933,9 +936,7 @@ class PersistentSyncEngine {
         await setSyncMeta('branches', serverTime, serverTime);
       }
 
-      // 3. Delta Refresh Tenant Inventory and Sales across all devices
-      await pullTenantInventory(companyId).catch(() => {});
-      await pullTenantSales(companyId).catch(() => {});
+      // 3. Operational entities (inventory, sales, stocktake, cash, wallets) are synced via AppScriptsAdapter.requestCatchUp()
     } catch (err) {
       console.warn('[SyncEngine] Delta sync non-fatal error:', err);
     }
@@ -1177,6 +1178,13 @@ class PersistentSyncEngine {
             });
           }
 
+          const remoteEpoch = Number(tenantData.routing_epoch || tenantData.current_routing_epoch || 0);
+          const localEpoch = getRoutingEpoch(companyId);
+          if (remoteEpoch > localEpoch) {
+            setRoutingEpoch(companyId, remoteEpoch);
+            resetCloudCatchupCursors(companyId, getCurrentBranchId());
+          }
+
           // 2. Sheet ID changed -> switch writes immediately
           if (localContext && localContext.sheet_id !== record.sheet_id && record.sheet_id) {
             console.warn(`[SyncEngine] Tenant sheet_id changed: ${localContext.sheet_id} -> ${record.sheet_id}. Switching writes immediately.`);
@@ -1186,6 +1194,7 @@ class PersistentSyncEngine {
             });
             const config = getSheetsConfig();
             saveSheetsConfig({ ...config, spreadsheetId: record.sheet_id });
+            resetCloudCatchupCursors(companyId, getCurrentBranchId());
             this.emitAlert({
               type: 'SHEET_CHANGED',
               message: `Tenant sheet ID updated. All writes redirected to ${record.sheet_id}`,
@@ -1426,9 +1435,25 @@ class PersistentSyncEngine {
 
   // ==================== INTERNAL SERVER DISPATCHER ====================
 
-  private async fetchServerAction(action: string, params: Record<string, any>): Promise<any> {
+  private async fetchServerAction(
+    action: string,
+    params: Record<string, any>,
+    allowRefreshRetry: boolean = true
+  ): Promise<any> {
     const currentComp = getCurrentCompany();
     const config = getSheetsConfig();
+    const compId = String(params?.company_id || currentComp.company_id || 'COMP-001').trim();
+    const jwt = getTenantAuthToken(compId);
+    const routingEpoch = getRoutingEpoch(compId);
+    const sheetId = String(currentComp.sheet_id || config.spreadsheetId || '').trim();
+
+    const fullParams: Record<string, string> = {};
+    Object.entries(params || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null) fullParams[k] = String(v);
+    });
+    if (sheetId) fullParams.spreadsheet_id = sheetId;
+    if (routingEpoch > 0) fullParams.routing_epoch = String(routingEpoch);
+    if (jwt) fullParams.jwt = jwt;
 
     const targetUrl =
       currentComp.webhook_url ||
@@ -1436,14 +1461,39 @@ class PersistentSyncEngine {
       config.masterWebhookUrl ||
       '';
 
-    // 1. Direct GET/POST to Google Apps Script if URL available
+    const handleControlResponse = async (json: any): Promise<any> => {
+      if (!json || typeof json !== 'object') return json;
+      const code = String(json.code || '').toUpperCase().trim();
+      if (
+        (code === 'JWT_EXPIRED' || code === 'JWT_INVALID' || code === 'JWT_MISSING') &&
+        allowRefreshRetry &&
+        action !== 'refresh_token'
+      ) {
+        const ref = await this.fetchServerAction('refresh_token', { company_id: compId }, false);
+        if (ref?.token) {
+          setTenantAuthToken(compId, ref.token);
+          if (typeof ref.routing_epoch === 'number' && ref.routing_epoch > 0) {
+            setRoutingEpoch(compId, ref.routing_epoch);
+          }
+          return await this.fetchServerAction(action, params, false);
+        }
+      }
+      if (code === 'ROUTING_EPOCH_STALE') {
+        const nextEp = Number(json.current_routing_epoch || json.routing_epoch || 0);
+        if (nextEp > 0) setRoutingEpoch(compId, nextEp);
+        resetCloudCatchupCursors(compId, getCurrentBranchId());
+      }
+      return json;
+    };
+
+    // 1. Direct GET to Google Apps Script if URL available
     if (targetUrl && targetUrl.startsWith('http')) {
       try {
-        const queryUrl = `${targetUrl}${targetUrl.includes('?') ? '&' : '?'}action=${encodeURIComponent(action)}&${new URLSearchParams(params).toString()}`;
+        const queryUrl = `${targetUrl}${targetUrl.includes('?') ? '&' : '?'}action=${encodeURIComponent(action)}&${new URLSearchParams(fullParams).toString()}`;
         const res = await fetch(queryUrl, { signal: AbortSignal.timeout(8000) });
         if (res.ok) {
           const json = await res.json().catch(() => null);
-          if (json) return json;
+          if (json) return await handleControlResponse(json);
         }
       } catch (e) {
         // Fallback to proxy
@@ -1452,10 +1502,14 @@ class PersistentSyncEngine {
 
     // 2. Server proxy fallback
     try {
-      const proxyRes = await fetch(`/api/saas/call-action?action=${encodeURIComponent(action)}&${new URLSearchParams(params).toString()}`);
-      if (proxyRes.ok) {
-        return await proxyRes.json();
-      }
+      const proxyRes = await fetch(
+        `/api/saas/call-action?action=${encodeURIComponent(action)}&${new URLSearchParams(fullParams).toString()}`,
+        {
+          headers: jwt ? { Authorization: `Bearer ${jwt}` } : undefined,
+        }
+      );
+      const json = await proxyRes.json().catch(() => null);
+      if (json) return await handleControlResponse(json);
     } catch {
       // ignore
     }

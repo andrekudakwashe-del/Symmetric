@@ -13,6 +13,7 @@ import {
   Search,
   Check,
   RefreshCw,
+  Lock,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -20,7 +21,11 @@ import {
   StocktakeLineCount,
   Salesperson,
 } from '../../types';
-import { applyJointRecountSignature, getZoneAssignments } from '../../db/roomDatabase';
+import {
+  applyJointRecountSignature,
+  getStocktakeSessionById,
+  getZoneAssignments,
+} from '../../db/roomDatabase';
 import { meshSyncService } from '../../services/meshSyncService';
 
 interface JointRecountModalProps {
@@ -41,6 +46,7 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
   // Determine if this user is acting as Counter A, Counter B, or BOTH (single shared device)
   const [actingSlot, setActingSlot] = useState<'A' | 'B' | 'BOTH'>('A');
   const [searchQuery, setSearchQuery] = useState('');
+  const isComparisonFinalized = Boolean(segment.comparisonFinalized);
 
   // Draft auto-save state
   const draftKey = `saimetric_stocktake_joint_draft_${session.sessionId}_${segment.segmentId}`;
@@ -282,6 +288,7 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
   }, [segment.segmentId, session.sessionId, onClose, onResolved]);
 
   const handleUpdateLine = (itemId: string, field: 'cases' | 'singles', delta: number) => {
+    if (isComparisonFinalized) return;
     setDiscrepancyLines((prev) => {
       const updated = prev.map((item) => {
         if (item.itemId !== itemId) return item;
@@ -299,6 +306,7 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
   };
 
   const handleSetExactLine = (itemId: string, cases: number, singles: number) => {
+    if (isComparisonFinalized) return;
     setDiscrepancyLines((prev) => {
       const updated = prev.map((item) => {
         if (item.itemId !== itemId) return item;
@@ -315,6 +323,7 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
   };
 
   const toggleLineResolved = (itemId: string) => {
+    if (isComparisonFinalized) return;
     setDiscrepancyLines((prev) => {
       const updated = prev.map((item) => {
         if (item.itemId !== itemId) return item;
@@ -358,6 +367,7 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
   const pendingCount = discrepancyLines.length - resolvedCount;
 
   const handleDualSignBoth = () => {
+    if (isComparisonFinalized) return;
     const staffName = currentUser?.name || 'Dual Counters (A & B)';
     const linesToSubmit: StocktakeLineCount[] = discrepancyLines.map((d) => ({
       itemId: d.itemId,
@@ -389,9 +399,14 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
       linesToSubmit
     );
 
+    const latest = getStocktakeSessionById(session.sessionId);
+    if (latest) {
+      meshSyncService.broadcastStocktakeSession(latest);
+    }
+
     // Finalize across Local Hub & peers
     meshSyncService.finalizeJointRecount(session.sessionId, segment.segmentId, linesToSubmit, staffName);
-    setStatusMessage('Dual-Signature Complete! Both Counters agreed on 1 Device. Zone Verified.');
+    setStatusMessage('Dual-Signature Complete! Both Counters agreed on 1 Device. Zone Verified & Locked.');
     setTimeout(() => {
       onResolved();
       onClose();
@@ -399,6 +414,7 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
   };
 
   const handleProposeOrSign = () => {
+    if (isComparisonFinalized) return;
     if (actingSlot === 'BOTH') {
       handleDualSignBoth();
       return;
@@ -432,6 +448,11 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
       staffName,
       linesToSubmit
     );
+
+    const latest = getStocktakeSessionById(session.sessionId);
+    if (latest) {
+      meshSyncService.broadcastStocktakeSession(latest);
+    }
 
     if (isComplete || otherTeamAlreadySigned) {
       // Clear draft upon successful completion
@@ -489,8 +510,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
             <div className="flex items-center bg-slate-800 rounded-xl p-0.5 border border-slate-700">
               <button
                 type="button"
+                disabled={isComparisonFinalized}
                 onClick={() => setActingSlot('A')}
-                className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition disabled:opacity-50 ${
                   actingSlot === 'A' ? 'bg-blue-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
                 }`}
               >
@@ -498,8 +520,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
               </button>
               <button
                 type="button"
+                disabled={isComparisonFinalized}
                 onClick={() => setActingSlot('B')}
-                className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition disabled:opacity-50 ${
                   actingSlot === 'B' ? 'bg-purple-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
                 }`}
               >
@@ -507,8 +530,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
               </button>
               <button
                 type="button"
+                disabled={isComparisonFinalized}
                 onClick={() => setActingSlot('BOTH')}
-                className={`px-3 py-1 rounded-lg text-xs font-bold transition ${
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition disabled:opacity-50 ${
                   actingSlot === 'BOTH' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-400 hover:text-white'
                 }`}
                 title="Single device used by both teams together at the shelf"
@@ -519,7 +543,12 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
           </div>
 
           <div className="flex items-center space-x-2 text-[11px] font-mono">
-            {lastDraftSavedAt && (
+            {isComparisonFinalized && (
+              <span className="text-amber-300 bg-amber-950/80 border border-amber-700 px-2 py-0.5 rounded flex items-center gap-1 font-sans font-bold">
+                <Lock className="w-3 h-3" /> Finalized & Locked
+              </span>
+            )}
+            {lastDraftSavedAt && !isComparisonFinalized && (
               <span className="text-emerald-400 bg-emerald-950/70 border border-emerald-800/50 px-2 py-0.5 rounded flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                 Draft Saved {new Date(lastDraftSavedAt).toLocaleTimeString()}
@@ -533,6 +562,15 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
             </span>
           </div>
         </div>
+
+        {isComparisonFinalized && (
+          <div className="bg-amber-950/80 border-b border-amber-700/70 px-6 py-2.5 text-xs text-amber-100 font-semibold flex items-center gap-2">
+            <Lock className="w-4 h-4 text-amber-400 shrink-0" />
+            <span>
+              Comparison Finalized & Locked — Both teams have signed off. Only the Stocktake Auditor or Owner can unlock this segment for edits.
+            </span>
+          </div>
+        )}
 
         {/* Search Bar & Red/Green Legend */}
         <div className="px-4 sm:px-6 py-2.5 bg-slate-900 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3">
@@ -618,15 +656,17 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
                       <span className="text-purple-400">Team B: {item.teamBCases} cs, {item.teamBSingles} ea ({item.teamBTotalUnits} u)</span>
                       <button
                         type="button"
+                        disabled={isComparisonFinalized}
                         onClick={() => handleSetExactLine(item.itemId, item.teamACases, item.teamASingles)}
-                        className="text-[10px] text-blue-300 hover:text-white underline font-sans ml-2"
+                        className="text-[10px] text-blue-300 hover:text-white disabled:opacity-40 underline font-sans ml-2"
                       >
                         Use A
                       </button>
                       <button
                         type="button"
+                        disabled={isComparisonFinalized}
                         onClick={() => handleSetExactLine(item.itemId, item.teamBCases, item.teamBSingles)}
-                        className="text-[10px] text-purple-300 hover:text-white underline font-sans"
+                        className="text-[10px] text-purple-300 hover:text-white disabled:opacity-40 underline font-sans"
                       >
                         Use B
                       </button>
@@ -639,8 +679,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
                       <span className="text-[10px] text-slate-400 font-bold uppercase mr-1">Cases</span>
                       <button
                         type="button"
+                        disabled={isComparisonFinalized}
                         onClick={() => handleUpdateLine(item.itemId, 'cases', -1)}
-                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center"
+                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white font-bold flex items-center justify-center"
                       >
                         -
                       </button>
@@ -649,8 +690,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
                       </span>
                       <button
                         type="button"
+                        disabled={isComparisonFinalized}
                         onClick={() => handleUpdateLine(item.itemId, 'cases', 1)}
-                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center"
+                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white font-bold flex items-center justify-center"
                       >
                         +
                       </button>
@@ -662,8 +704,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
                       <span className="text-[10px] text-slate-400 font-bold uppercase mr-1">Singles</span>
                       <button
                         type="button"
+                        disabled={isComparisonFinalized}
                         onClick={() => handleUpdateLine(item.itemId, 'singles', -1)}
-                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center"
+                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white font-bold flex items-center justify-center"
                       >
                         -
                       </button>
@@ -672,8 +715,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
                       </span>
                       <button
                         type="button"
+                        disabled={isComparisonFinalized}
                         onClick={() => handleUpdateLine(item.itemId, 'singles', 1)}
-                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center"
+                        className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white font-bold flex items-center justify-center"
                       >
                         +
                       </button>
@@ -685,8 +729,9 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
 
                     <button
                       type="button"
+                      disabled={isComparisonFinalized}
                       onClick={() => toggleLineResolved(item.itemId)}
-                      className={`px-2 py-1 rounded text-[10px] font-bold transition ${
+                      className={`px-2 py-1 rounded text-[10px] font-bold transition disabled:opacity-50 ${
                         isResolved
                           ? 'bg-emerald-900/80 text-emerald-200 border border-emerald-700'
                           : 'bg-rose-900/80 text-rose-200 border border-rose-700 hover:bg-emerald-900'
@@ -705,7 +750,11 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
         {/* Footer */}
         <div className="bg-slate-950 p-4 sm:p-5 border-t border-slate-800 flex flex-wrap items-center justify-between gap-3">
           <div className="text-xs text-slate-400">
-            {signedByA && signedByB ? (
+            {isComparisonFinalized ? (
+              <span className="text-amber-400 font-bold flex items-center gap-1">
+                <Lock className="w-4 h-4" /> Locked: Joint Recount finalized
+              </span>
+            ) : signedByA && signedByB ? (
               <span className="text-emerald-400 font-bold flex items-center gap-1">
                 <CheckCircle className="w-4 h-4" /> Ready to finalize: both counters have signed
               </span>
@@ -717,13 +766,16 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={onClose}
-              className="px-4 py-2.5 rounded-xl text-xs font-bold text-slate-400 hover:text-white transition"
+              onClick={() => {
+                if (!isComparisonFinalized) persistDraft(discrepancyLines);
+                onClose();
+              }}
+              className="px-4 py-2.5 rounded-xl text-xs font-bold text-slate-300 bg-slate-900 border border-slate-700 hover:text-white transition"
             >
-              Cancel
+              Pause & Exit (Draft Saved)
             </button>
 
-            {actingSlot !== 'BOTH' && (
+            {actingSlot !== 'BOTH' && !isComparisonFinalized && (
               <button
                 type="button"
                 onClick={handleDualSignBoth}
@@ -731,14 +783,15 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
                 title="Both teams standing together with this one device agree on these numbers"
               >
                 <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                <span>Dual-Sign (Both Agree Here)</span>
+                <span>Dual-Sign & Lock (Both Agree)</span>
               </button>
             )}
 
             <button
               type="button"
+              disabled={isComparisonFinalized}
               onClick={handleProposeOrSign}
-              className={`px-5 py-2.5 rounded-xl text-xs font-black flex items-center space-x-2 shadow-lg transition active:scale-95 ${
+              className={`px-5 py-2.5 rounded-xl text-xs font-black flex items-center space-x-2 shadow-lg transition active:scale-95 disabled:opacity-45 disabled:cursor-not-allowed ${
                 actingSlot === 'BOTH'
                   ? 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-900/30'
                   : actingSlot === 'A'
@@ -746,13 +799,17 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
                   : 'bg-purple-600 hover:bg-purple-500 text-white shadow-purple-900/30'
               }`}
             >
-              {actingSlot === 'BOTH' ? (
+              {isComparisonFinalized ? (
+                <Lock className="w-4 h-4" />
+              ) : actingSlot === 'BOTH' ? (
                 <ShieldCheck className="w-4 h-4" />
               ) : (
                 <Send className="w-4 h-4" />
               )}
               <span>
-                {actingSlot === 'BOTH'
+                {isComparisonFinalized
+                  ? 'Comparison Finalized & Locked'
+                  : actingSlot === 'BOTH'
                   ? 'Dual-Sign & Finalize (Both Agree)'
                   : actingSlot === 'A'
                   ? signedByB

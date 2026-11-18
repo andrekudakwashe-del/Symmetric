@@ -141,6 +141,7 @@ import {
   saveZoneAssignment,
   saveZoneAssignmentsBatch,
   applyJointRecountSignature,
+  reopenFinalizedSegmentSlot,
   onSaleUpdated,
   onStaffChanged,
   onCustomerChanged,
@@ -212,6 +213,10 @@ import {
   setLastMultiCurrencySync,
   markMultiCurrencySyncComplete,
   SAIMETRIC_LAST_MULTI_CURRENCY_SYNC,
+  getTenantAuthToken,
+  getRoutingEpoch,
+  setRoutingEpoch,
+  resetCloudCatchupCursors,
 } from './sync/highWaterMarks';
 import { SyncEnvelope, SyncAction, EntitySnapshot } from './sync/SyncEnvelope';
 import { ENTITY_REGISTRY } from './sync/EntityRegistry';
@@ -503,6 +508,7 @@ class MeshSyncManager {
     | (SyncAdapter & { pause?: () => void; resume?: () => void; isPaused?: () => boolean })
     | null = null;
   private activeCloudAdapterType: ActiveDatabaseType | null = null;
+  private cloudReceiveUnsubscribe: (() => void) | null = null;
   private syncCore: SyncCore;
 
   // Local WebSocket Hub state tracking
@@ -985,6 +991,20 @@ class MeshSyncManager {
         this.handleHubCloudBroadcast(parsed);
       } else if (pType === 'SECURITY_ALERT') {
         this.handleSecurityAlertPacket(parsed);
+      } else if (pType === 'HUB_ROUTING_EPOCH_UPDATED') {
+        const compId = String(parsed.company_id || this.config.companyId || 'COMP-001').trim();
+        const nextEp = Number(parsed.routing_epoch || parsed.current_routing_epoch || 0);
+        if (nextEp > 0) setRoutingEpoch(compId, nextEp);
+        resetCloudCatchupCursors(compId, this.config.branchId);
+      } else if (pType === 'CLOUD_AUTH_REFRESH_REQUIRED') {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('saimetric_cloud_auth_required', { detail: parsed }));
+        }
+        setTimeout(() => {
+          if (this.getActiveSyncStrategy() === 'HUB_CLOUD' && this.isLocalHubConnected) {
+            this.sendAndPurgeCloudConfigIfHubCloud();
+          }
+        }, 1500);
       }
     };
 
@@ -1592,6 +1612,13 @@ class MeshSyncManager {
       return this.activeCloudAdapter;
     }
 
+    if (this.cloudReceiveUnsubscribe) {
+      try {
+        this.cloudReceiveUnsubscribe();
+      } catch {}
+      this.cloudReceiveUnsubscribe = null;
+    }
+
     if (this.activeCloudAdapter) {
       try {
         this.activeCloudAdapter.pause?.();
@@ -1607,7 +1634,12 @@ class MeshSyncManager {
     } else if (databaseType === 'mongodb') {
       this.activeCloudAdapter = new MongoDBAdapter();
     } else if (databaseType === 'appscripts') {
-      this.activeCloudAdapter = new AppScriptsAdapter();
+      const asAdapter = new AppScriptsAdapter();
+      asAdapter.registerCloudRelayChecker(() => this.shouldThisTerminalRelayToCloud());
+      asAdapter.registerCloudReceiptBroadcaster((receipt) => {
+        void this.broadcastSyncReceipt(receipt);
+      });
+      this.activeCloudAdapter = asAdapter;
     } else {
       // Passive disabled adapter for 'room' / 'none' / 'firebase' when LocalHub is off
       this.activeCloudAdapter = {
@@ -1628,6 +1660,10 @@ class MeshSyncManager {
         drainOfflineQueue: async () => {},
       };
     }
+
+    this.cloudReceiveUnsubscribe = this.activeCloudAdapter.onReceive((env) => {
+      void this.ingestEnvelopeThroughSyncCore(env, 'CLOUD_SYNC');
+    });
 
     return this.activeCloudAdapter;
   }
@@ -1797,6 +1833,9 @@ class MeshSyncManager {
       const sheetFolderId = String(sheetsCfg?.sheetFolderId || comp?.sheet_folder_id || '').trim();
 
       if (webhookUrl || masterWebhookUrl || spreadsheetId) {
+        const compIdForTok = comp?.company_id;
+        const jwtToken = getTenantAuthToken(compIdForTok);
+        const routingEpoch = getRoutingEpoch(compIdForTok);
         return {
           strategy: 'HUB_CLOUD',
           databaseType: 'appscripts',
@@ -1805,15 +1844,47 @@ class MeshSyncManager {
             ...(masterWebhookUrl ? { masterWebhookUrl } : {}),
             ...(spreadsheetId ? { spreadsheetId } : {}),
             ...(sheetFolderId ? { sheetFolderId } : {}),
+            ...(jwtToken ? { token: jwtToken, jwt: jwtToken } : {}),
+            routingEpoch,
             isolationMode: sheetsCfg?.isolationMode || comp?.branch_isolation_mode || 'ROW_LEVEL',
           },
-          companyId: comp?.company_id,
+          companyId: compIdForTok,
         };
       }
     } catch (err) {
       console.warn('[MeshSync] Error reading cloud configuration for Hub handshake:', err);
     }
     return null;
+  }
+
+  public getElectedCloudRelayLeaderId(): string | null {
+    const isSelfOnline = typeof navigator === 'undefined' ? true : navigator.onLine;
+    if (!isSelfOnline) return null;
+
+    const candidates: string[] = [this.config.deviceId];
+    const now = Date.now();
+    for (const peer of this.discoveredPeers.values()) {
+      if (now - peer.lastSeen <= 35000 && peer.isOnline && peer.hasInternet !== false) {
+        candidates.push(peer.id);
+      }
+    }
+    candidates.sort();
+    return candidates[0] || this.config.deviceId;
+  }
+
+  public isCloudRelayLeader(): boolean {
+    const leaderId = this.getElectedCloudRelayLeaderId();
+    return leaderId === null ? false : leaderId === this.config.deviceId;
+  }
+
+  public shouldThisTerminalRelayToCloud(): boolean {
+    if (this.isLocalHubActive() && !this.isCloudOnlyMode) {
+      return false;
+    }
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      return false;
+    }
+    return this.isCloudRelayLeader();
   }
 
   private sendAndPurgeCloudConfigIfHubCloud(): void {
@@ -3078,6 +3149,11 @@ class MeshSyncManager {
         updateZoneFromHubStatus(packet.sessionId, zoneId, packet.status, undefined, undefined, {
           hasCountA: packet.hasCountA,
           hasCountB: packet.hasCountB,
+          teamAFinalized: packet.teamAFinalized,
+          teamBFinalized: packet.teamBFinalized,
+          comparisonFinalized: packet.comparisonFinalized,
+          teamAStaffId: packet.teamAStaffId,
+          teamBStaffId: packet.teamBStaffId,
           teamAStaffName: packet.teamAStaffName,
           teamBStaffName: packet.teamBStaffName,
         });
@@ -3091,6 +3167,11 @@ class MeshSyncManager {
 
     if (pTypeUpper === 'STOCKTAKE_MATCH_VERIFIED') {
       markZoneVerified(packet.zoneId, packet.verifiedCounts || [], packet.sessionId);
+      if (packet.comparisonFinalized && packet.sessionId && packet.zoneId) {
+        updateZoneFromHubStatus(packet.sessionId, packet.zoneId, 'VERIFIED', undefined, packet.verifiedCounts || [], {
+          comparisonFinalized: true,
+        });
+      }
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new Event('saimetric_stocktake_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: packet }));
@@ -3111,16 +3192,52 @@ class MeshSyncManager {
 
     if (pTypeUpper === 'STOCKTAKE_ACK_SUBMIT') {
       if (packet.sessionId && packet.zoneId) {
-        updateZoneFromHubStatus(packet.sessionId, packet.zoneId, 'VAULTED');
-        const sess = getStocktakeSessionById(packet.sessionId);
-        if (sess) {
-          sess.status = 'VAULTED';
-          saveStocktakeSession(sess);
+        const currentSess = getStocktakeSessionById(packet.sessionId);
+        const existingSeg = currentSess?.segments?.find((s: any) => (s.segmentId || s.id) === packet.zoneId);
+        if (!existingSeg || (existingSeg.status !== 'VERIFIED' && existingSeg.status !== 'DISCREPANCY_RECOUNT')) {
+          updateZoneFromHubStatus(packet.sessionId, packet.zoneId, 'VAULTED', undefined, undefined, {
+            hasCountA: packet.slot === 'A' ? true : undefined,
+            hasCountB: packet.slot === 'B' ? true : undefined,
+            teamAFinalized: packet.slot === 'A' ? true : undefined,
+            teamBFinalized: packet.slot === 'B' ? true : undefined,
+          });
         }
       }
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new Event('saimetric_stocktake_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_stocktake_ack_submit', { detail: packet }));
+      }
+      return;
+    }
+
+    if (pTypeUpper === 'STOCKTAKE_SEGMENT_UNLOCKED') {
+      const segId = packet.segmentId || packet.zoneId;
+      if (packet.sessionId && segId) {
+        reopenFinalizedSegmentSlot(
+          packet.sessionId,
+          segId,
+          packet.target || 'ALL',
+          packet.actorId || 'AUDITOR',
+          packet.actorName || 'Stocktake Auditor',
+          packet.reason || 'Unlocked via Hub'
+        );
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated', { detail: packet }));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_segment_unlocked', { detail: packet }));
+      }
+      return;
+    }
+
+    if (
+      pTypeUpper === 'STOCKTAKE_CLAIM_REJECTED' ||
+      pTypeUpper === 'STOCKTAKE_SLOT_LOCKED' ||
+      pTypeUpper === 'STOCKTAKE_SESSION_CONFLICT'
+    ) {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_rejected', { detail: packet }));
+        window.dispatchEvent(new Event('saimetric_stocktake_updated'));
       }
       return;
     }
@@ -4501,7 +4618,34 @@ class MeshSyncManager {
   }
 
   public handleHubCloudBroadcast(packet: any): void {
-    if (!packet || !Array.isArray(packet.records)) return;
+    if (!packet) return;
+    if (Array.isArray(packet.envelopes) && packet.envelopes.length > 0) {
+      console.log(`[Auto-Heal] ☁️ Hub broadcasted ${packet.envelopes.length} canonical cloud envelope(s) to this terminal.`);
+      (async () => {
+        for (const rawEnv of packet.envelopes) {
+          if (!rawEnv || !rawEnv.entityType) continue;
+          const eType = String(rawEnv.entityType).trim().toLowerCase() as any;
+          const spec = ENTITY_REGISTRY[eType as keyof typeof ENTITY_REGISTRY];
+          const env: SyncEnvelope = {
+            packetId: rawEnv.packetId || `HUB-CLOUD-${eType}-${rawEnv.entityId}-${Date.now()}`,
+            entityType: eType,
+            entityId: String(rawEnv.entityId || ''),
+            action: rawEnv.action === 'DELETE' ? 'DELETE' : 'UPSERT',
+            data: rawEnv.data,
+            updatedAt: Number(rawEnv.updatedAt || Date.now()),
+            version: Number(rawEnv.version || 1),
+            mutationSource: rawEnv.mutationSource || 'HUB_CLOUD_CATCHUP',
+            originDeviceId: rawEnv.originDeviceId || 'LOCAL_HUB_CLOUD',
+            targetBranchId: rawEnv.targetBranchId || this.config.branchId || 'ALL',
+            class: spec ? spec.class : (rawEnv.class === 'T2' ? 'T2' : 'T1'),
+            isCloudSynced: true,
+          };
+          await this.ingestEnvelopeThroughSyncCore(env, 'HUB_CLOUD', { isReconBackfill: true });
+        }
+      })().catch(() => {});
+      return;
+    }
+    if (!Array.isArray(packet.records)) return;
     console.log(`[Auto-Heal] ☁️ Hub broadcasted ${packet.records.length} upstream cloud record(s) to this terminal.`);
     this.handleIncomingReconBackfill({
       sweepId: `cloud-broadcast-${Date.now()}`,
@@ -5244,6 +5388,7 @@ class MeshSyncManager {
     const isMobile = typeof navigator !== 'undefined' && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     const isTablet = typeof navigator !== 'undefined' && /iPad|tablet|(android(?!.*mobile))/i.test(navigator.userAgent);
     const deviceType = isTablet ? 'tablet' : isMobile ? 'mobile' : 'desktop';
+    const hasInternet = typeof navigator !== 'undefined' ? navigator.onLine : true;
 
     const heartbeatPacket = {
       type: 'heartbeat',
@@ -5256,6 +5401,8 @@ class MeshSyncManager {
       branchCode: this.config.branchCode,
       branchName: this.config.branchName,
       deviceType,
+      hasInternet,
+      isCloudRelayLeader: this.isCloudRelayLeader(),
       timestamp: Date.now(),
       salesCount: getSales().length,
       pendingCount: getSyncQueue().length,
@@ -5530,7 +5677,7 @@ class MeshSyncManager {
         id: packetOrigin,
         name: packet.deviceName || originName,
         isOnline: true,
-        hasInternet: true,
+        hasInternet: typeof packet.hasInternet === 'boolean' ? packet.hasInternet : true,
         lastSeen: Date.now(),
         pendingCount: packet.pendingCount || 0,
         totalSalesCount: packet.salesCount || 0,
@@ -5560,6 +5707,7 @@ class MeshSyncManager {
       const peer = this.discoveredPeers.get(packetOrigin)!;
       peer.lastSeen = Date.now();
       peer.isOnline = true;
+      if (typeof packet.hasInternet === 'boolean') peer.hasInternet = packet.hasInternet;
       if (packet.pendingCount !== undefined) peer.pendingCount = packet.pendingCount;
       if (packet.salesCount !== undefined) peer.totalSalesCount = packet.salesCount;
     }
@@ -5921,8 +6069,11 @@ class MeshSyncManager {
 
     if (clientReqIds.length === 0 && ids.length === 0) return;
 
-    // 1. Mark in RoomDatabase sync queue & sales
+    // 1. Mark in RoomDatabase sync queue & sales + entity records
     const roomMarked = markSyncItemsAsSynced(clientReqIds, ids);
+    try {
+      markRecordsCloudSynced(ids, clientReqIds, packet.entityType, false);
+    } catch {}
 
     // 2. Mark in PersistentSyncEngine / IndexedDB queue
     const idbMarked = await persistentSyncEngine.markReceiptAsSynced(clientReqIds, ids);
@@ -6163,6 +6314,16 @@ class MeshSyncManager {
       this.localHubAdapter.sendControlPacket(packet);
     }
     this.mirrorToSecondaryP2PTransports('catchup_request', packet);
+
+    if (this.isCloudOnlyMode || !this.isLocalHubConnected) {
+      this.syncActiveAdapter();
+      const cloudAdapter = this.getOrCreateSingleCloudAdapter();
+      if (!cloudAdapter.isPaused?.()) {
+        const sinceMs = force ? 0 : (sinceTimestamp ? Date.parse(sinceTimestamp) || 0 : 0);
+        void cloudAdapter.drainOfflineQueue().catch(() => {});
+        void cloudAdapter.requestCatchUp(sinceMs).catch(() => {});
+      }
+    }
 
     const sinceHuman = new Date(sinceTimestamp).toLocaleString();
     this.addLog(
@@ -8283,9 +8444,13 @@ class MeshSyncManager {
       if ((this.isLocalHubActive() && !this.isCloudOnlyMode) || cloudAdapter.isPaused?.()) {
         return;
       }
+      if (!this.shouldThisTerminalRelayToCloud()) {
+        return;
+      }
       if (typeof navigator !== 'undefined' && navigator.onLine) {
         try {
           await cloudAdapter.drainOfflineQueue();
+          await cloudAdapter.requestCatchUp(Date.now() - 3600 * 1000);
         } catch (e) {}
       }
     }, 120000);
@@ -8600,6 +8765,43 @@ class MeshSyncManager {
         topicSuffix: 'stocktake/joint_finalized',
       }
     );
+  }
+
+  public unlockStocktakeSegment(
+    sessionId: string,
+    segmentId: string,
+    target: 'A' | 'B' | 'COMPARISON' | 'ALL',
+    actorId: string,
+    actorName: string,
+    reason: string
+  ): void {
+    const now = Date.now();
+    void this.dispatchEnvelope(
+      'stocktake_segment_unlock',
+      `${sessionId}:${segmentId}:${now}`,
+      {
+        sessionId,
+        zoneId: segmentId,
+        segmentId,
+        target,
+        actorId,
+        actorName,
+        reason,
+        branchId: this.config.branchId,
+      },
+      {
+        action: 'APPEND',
+        updatedAt: now,
+        topicSuffix: 'stocktake/segment_unlock',
+      }
+    );
+    if (this.localHubAdapter.isConnected()) {
+      this.addLog(
+        'EPIDEMIC_HOP',
+        `Segment ${segmentId} (${target}) unlocked by ${actorName}: ${reason}`,
+        this.config.deviceName
+      );
+    }
   }
 
   public broadcastCasualWorkers(casuals: any[]): void {

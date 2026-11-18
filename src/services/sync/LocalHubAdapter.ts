@@ -1012,6 +1012,9 @@ export class LocalHubAdapter implements SyncAdapter {
           stocktakeAuditorId: d.stocktakeAuditorId,
           stocktakeAuditorName: d.stocktakeAuditorName,
           stocktakeAuditorPhone: d.stocktakeAuditorPhone,
+          auditorType: d.auditorType,
+          auditorGuestPassId: d.auditorGuestPassId,
+          auditorCasualId: d.auditorCasualId,
           predefinedDailyItemIds: d.predefinedDailyItemIds,
           certifiedById: d.certifiedById,
           certifiedByName: d.certifiedByName,
@@ -1022,6 +1025,8 @@ export class LocalHubAdapter implements SyncAdapter {
           varianceReviewStatus: d.varianceReviewStatus,
           varianceCommentDeadline: d.varianceCommentDeadline,
           varianceMaterialityThreshold: d.varianceMaterialityThreshold,
+          varianceMinUnitThreshold: d.varianceMinUnitThreshold,
+          varianceReviewWindowHours: d.varianceReviewWindowHours,
           varianceReviewedById: d.varianceReviewedById,
           varianceReviewedByName: d.varianceReviewedByName,
           varianceReviewedAt: d.varianceReviewedAt,
@@ -1093,6 +1098,21 @@ export class LocalHubAdapter implements SyncAdapter {
           signedByA: true,
           signedByB: true,
           resolvedByName: d.resolvedByName,
+        };
+
+      case 'stocktake_segment_unlock':
+        return {
+          ...base,
+          type: 'STOCKTAKE_SEGMENT_UNLOCK',
+          action: 'STOCKTAKE_SEGMENT_UNLOCK',
+          sessionId: d.sessionId,
+          segmentId: d.segmentId,
+          zoneId: d.segmentId,
+          target: d.target || 'ALL',
+          actorId: d.actorId,
+          actorName: d.actorName,
+          reason: d.reason,
+          unlockedAt: d.unlockedAt || new Date().toISOString(),
         };
 
       case 'sheet_mutation':
@@ -1420,6 +1440,11 @@ export class LocalHubAdapter implements SyncAdapter {
       entityType = 'stocktake_joint_finalized';
       data = unwrapped;
       entityId = String(unwrapped.zoneId || '');
+      action = 'APPEND';
+    } else if (pTypeUpper === 'STOCKTAKE_SEGMENT_UNLOCK' || pTypeUpper === 'STOCKTAKE_SEGMENT_UNLOCKED') {
+      entityType = 'stocktake_segment_unlock';
+      data = unwrapped;
+      entityId = String(unwrapped.segmentId || unwrapped.zoneId || '');
       action = 'APPEND';
     } else if (
       pTypeUpper === 'STOCKTAKE_SESSION_STARTED' ||

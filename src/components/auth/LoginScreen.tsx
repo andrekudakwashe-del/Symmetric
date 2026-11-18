@@ -20,7 +20,9 @@ import {
   authenticateCasualWorker,
   getTerminalLastLoginMap,
   addAuditLog,
+  updateTenantSheetBinding,
 } from '../../db/roomDatabase';
+import { setTenantAuthToken, setRoutingEpoch } from '../../services/sync/highWaterMarks';
 import {
   getActiveGuestPassesForBranch,
   getActiveCasualsForBranch,
@@ -56,6 +58,7 @@ import {
   Shuffle,
   Radio,
   Wifi,
+  WifiOff,
   Server,
   ClipboardCheck,
   BadgeCheck,
@@ -85,6 +88,13 @@ const generateScrambledDigits = (): string[] => {
 };
 
 const LAST_SELECTED_BRANCH_KEY = 'saimetric_last_selected_branch_id';
+
+const canonicalizeBranchKey = (id?: string | null): string => {
+  const clean = String(id || '').trim().toUpperCase();
+  if (!clean) return '';
+  if (clean === '1' || clean === 'BR-MAIN' || clean === 'BR001') return 'BR-MAIN';
+  return clean;
+};
 
 const formatLastLoginRelative = (ts?: number): string => {
   if (!ts || ts <= 0) return '';
@@ -220,21 +230,35 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setHubBranchName(LocalHubConfig.getHubBranchName());
       setIsCloudOnly(LocalHubConfig.isCloudOnlyMode());
       setConnMode(meshSyncService.getConnectionMode());
+      setConnDetails(meshSyncService.getConnectionStatus());
     };
 
-    const unsubMesh = meshSyncService.subscribeConnectionMode((mode) => {
+    const unsubMesh = meshSyncService.subscribeConnectionMode((mode, details) => {
       setConnMode(mode);
-      handleHubIdentity();
+      if (details) {
+        setConnDetails(details);
+      }
+      setHubBranchId(LocalHubConfig.getHubBranchId());
+      setHubBranchName(LocalHubConfig.getHubBranchName());
+      setIsCloudOnly(LocalHubConfig.isCloudOnlyMode());
     });
 
     const unsubConfig = LocalHubConfig.subscribe(() => {
       handleHubIdentity();
     });
 
+    const handleOnlineOffline = () => {
+      setConnMode(meshSyncService.getConnectionMode());
+      setConnDetails(meshSyncService.getConnectionStatus());
+    };
+
     const handleStaffUpdate = () => {
       setStaffVersion((v) => v + 1);
     };
 
+    window.addEventListener('online', handleOnlineOffline);
+    window.addEventListener('offline', handleOnlineOffline);
+    window.addEventListener('mesh-connection-state-changed', handleHubIdentity);
     window.addEventListener('saimetric_hub_identity_updated', handleHubIdentity);
     window.addEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
     window.addEventListener('saimetric_salespeople_updated', handleStaffUpdate);
@@ -250,6 +274,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       unsub();
       unsubMesh();
       unsubConfig();
+      window.removeEventListener('online', handleOnlineOffline);
+      window.removeEventListener('offline', handleOnlineOffline);
+      window.removeEventListener('mesh-connection-state-changed', handleHubIdentity);
       window.removeEventListener('saimetric_hub_identity_updated', handleHubIdentity);
       window.removeEventListener('saimetric_cloud_only_mode_changed', handleHubIdentity);
       window.removeEventListener('saimetric_salespeople_updated', handleStaffUpdate);
@@ -265,16 +292,19 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
   const [staffVersion, setStaffVersion] = useState<number>(0);
 
-  // Hub Branch Identity & Roaming Owner Safeguard
+  // Hub Branch Identity & Live Connection State (single source of truth matching TopHeader & OfflineIndicator)
   const [hubBranchId, setHubBranchId] = useState<string | null>(() => LocalHubConfig.getHubBranchId());
   const [hubBranchName, setHubBranchName] = useState<string | null>(() => LocalHubConfig.getHubBranchName());
   const [connMode, setConnMode] = useState(() => meshSyncService.getConnectionMode());
+  const [connDetails, setConnDetails] = useState<any>(() => meshSyncService.getConnectionStatus());
   const [isCloudOnly, setIsCloudOnly] = useState(() => LocalHubConfig.isCloudOnlyMode());
+
+  const isHubLiveConnected = connMode === 'LOCAL_HUB' || Boolean(connDetails?.isLocalHubConnected);
 
   const handleCompleteLogin = (user: Salesperson) => {
     // Branch-Scoped Isolation & Roaming Owner Safeguard:
-    // If user's branch does not match current Local Hub branch, activate Cloud-Only Mode —
-    // EXCEPT for visiting cross-branch counters & casuals who are legally operating inside this host branch's stocktake hub!
+    // Only engage Cloud-Only Mode when actually connected to a Local Hub whose branch differs from user's branch —
+    // EXCEPT for visiting cross-branch counters & casuals operating inside this host branch's stocktake hub.
     const curHubBranch = LocalHubConfig.getHubBranchId();
     const userBranch = user.branchId || user.branch_id || selectedBranchId;
     if (userBranch && userBranch !== 'ALL') {
@@ -283,11 +313,16 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       } catch {}
     }
 
+    const liveHubConnected =
+      meshSyncService.getConnectionMode() === 'LOCAL_HUB' ||
+      Boolean(meshSyncService.getConnectionStatus()?.isLocalHubConnected);
+
     if (
+      liveHubConnected &&
       curHubBranch &&
       curHubBranch !== 'UNASSIGNED' &&
       userBranch &&
-      userBranch !== curHubBranch &&
+      canonicalizeBranchKey(userBranch) !== canonicalizeBranchKey(curHubBranch) &&
       userBranch !== 'ALL' &&
       !user.isVisitingCounter &&
       !user.isCasual
@@ -535,13 +570,27 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     visitingPasses.forEach((p) => {
       const ts = terminalLastLoginMap[p.staffId] || 0;
       if (ts > 0) {
-        items.push({ key: `visiting:${p.id}`, label: p.staffName.split(' ')[0], badge: 'VISITING', lastAt: ts, kind: 'visiting', pass: p });
+        items.push({
+          key: `visiting:${p.id}`,
+          label: p.staffName.split(' ')[0],
+          badge: p.passRole === 'AUDITOR' ? 'AUDITOR PASS' : 'VISITING',
+          lastAt: ts,
+          kind: 'visiting',
+          pass: p,
+        });
       }
     });
     branchCasuals.forEach((c) => {
       const ts = terminalLastLoginMap[c.id] || 0;
       if (ts > 0) {
-        items.push({ key: `casual:${c.id}`, label: c.name.split(' ')[0], badge: 'CASUAL', lastAt: ts, kind: 'casual', casual: c });
+        items.push({
+          key: `casual:${c.id}`,
+          label: c.name.split(' ')[0],
+          badge: c.tempRole === 'AUDITOR' ? 'EXT AUDITOR' : 'CASUAL',
+          lastAt: ts,
+          kind: 'casual',
+          casual: c,
+        });
       }
     });
     return items.sort((a, b) => b.lastAt - a.lastAt).slice(0, 2);
@@ -731,6 +780,17 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         setSelectedBranchId(branchId);
         setCurrentBranchId(branchId);
 
+        if (response.token) {
+          setTenantAuthToken(busId, response.token);
+        }
+        if (typeof response.routing_epoch === 'number' && response.routing_epoch > 0) {
+          setRoutingEpoch(busId, response.routing_epoch);
+        }
+        const resolvedSheetId = response.sheet_id || response.spreadsheet_id;
+        if (resolvedSheetId && resolvedSheetId.length >= 10) {
+          updateTenantSheetBinding(busId, resolvedSheetId);
+        }
+
         // If Super Admin, allow instant administrative sign-in without spawning duplicate staff profiles
         if (role === 'SUPER_ADMIN' || cleanEmail === 'andrekudakwashe@gmail.com') {
           const targetNameLower = String(response.full_name || 'Andre Kudakwashe')
@@ -830,11 +890,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setPinLockoutUntil(0);
 
       const targetBranch = companyBranches.find((b) => (b.branchId || b.id) === selectedBranchId);
+      const isAuditorTemp = authenticated.tempRole === 'AUDITOR';
       const groupLabel = authenticated.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B';
       const casualUser: Salesperson = {
         id: authenticated.id,
-        name: `${authenticated.name} (${groupLabel})`,
-        role: 'CASHIER',
+        name: isAuditorTemp ? authenticated.name : `${authenticated.name} (${groupLabel})`,
+        role: isAuditorTemp ? 'STOCKTAKE_AUDITOR' : 'CASHIER',
         phone: authenticated.phone,
         companyId: selectedCompanyId,
         company_id: selectedCompanyId,
@@ -843,10 +904,19 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         branchName: targetBranch?.name || 'Main Branch',
         active: 'Y',
         isCasual: true,
+        isExternalConsultant: isAuditorTemp || Boolean(authenticated.isExternalConsultant),
+        tempRole: authenticated.tempRole || 'COUNTER',
         restrictedToSessionId: authenticated.sessionId,
         assignedGroup: authenticated.assignedGroup,
         assignedSegmentId: authenticated.assignedSegmentId,
         badgeNumber: authenticated.badgeNumber,
+        permissions: isAuditorTemp
+          ? ({
+              canStocktake: true,
+              canAuditStocktake: true,
+              canManageStocktake: false,
+            } as any)
+          : undefined,
       };
 
       setCurrentCompanyId(selectedCompanyId);
@@ -925,23 +995,32 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         const targetBranch = companyBranches.find((b) => (b.branchId || b.id) === selectedBranchId);
 
         if (selectedGuestPass) {
+          const isAuditorPass = selectedGuestPass.passRole === 'AUDITOR';
           const visitingUser: Salesperson = {
             ...staff,
             id: authenticatedUser?.id || staff.id,
             name: authenticatedUser?.name || staff.name,
-            role: 'CASHIER',
+            role: isAuditorPass ? 'STOCKTAKE_AUDITOR' : 'CASHIER',
             companyId: authenticatedUser?.companyId || authenticatedUser?.company_id || staff.companyId || selectedCompanyId,
             company_id: authenticatedUser?.company_id || authenticatedUser?.companyId || staff.company_id || selectedCompanyId,
             branchId: selectedBranchId,
             branch_id: selectedBranchId,
             branchName: targetBranch?.name || selectedGuestPass.hostBranchName || 'Host Branch',
             isVisitingCounter: true,
+            tempRole: isAuditorPass ? 'AUDITOR' : 'COUNTER',
             restrictedToSessionId: selectedGuestPass.sessionId,
             guestPassId: selectedGuestPass.id,
             homeBranchId: selectedGuestPass.homeBranchId,
             homeBranchName: selectedGuestPass.homeBranchName,
             assignedGroup: selectedGuestPass.assignedGroup,
             assignedSegmentIds: selectedGuestPass.assignedSegmentIds,
+            permissions: isAuditorPass
+              ? ({
+                  ...(staff.permissions || {}),
+                  canStocktake: true,
+                  canAuditStocktake: true,
+                } as any)
+              : staff.permissions,
           };
 
           setCurrentCompanyId(visitingUser.companyId || selectedCompanyId);
@@ -983,7 +1062,19 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           );
         }
 
-        setCurrentCompanyId(fullStaffUser.companyId || selectedCompanyId);
+        const targetCompId = fullStaffUser.companyId || selectedCompanyId;
+        if (response.token) {
+          setTenantAuthToken(targetCompId, response.token);
+        }
+        if (typeof response.routing_epoch === 'number' && response.routing_epoch > 0) {
+          setRoutingEpoch(targetCompId, response.routing_epoch);
+        }
+        const resolvedStaffSheetId = response.sheet_id || response.spreadsheet_id;
+        if (resolvedStaffSheetId && resolvedStaffSheetId.length >= 10) {
+          updateTenantSheetBinding(targetCompId, resolvedStaffSheetId);
+        }
+
+        setCurrentCompanyId(targetCompId);
         setCurrentBranchId(selectedBranchId);
         setSessionUser(fullStaffUser);
         logLogin(fullStaffUser);
@@ -1205,33 +1296,47 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               </div>
             </div>
 
-            {hubBranchId && hubBranchId !== 'UNASSIGNED' ? (
+            {isHubLiveConnected ? (
+              hubBranchId && hubBranchId !== 'UNASSIGNED' ? (
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-500/15 border border-blue-400/40 text-blue-200 text-[11px] font-semibold shrink-0">
+                  <Radio className="w-3 h-3 text-blue-300 animate-pulse" />
+                  <span className="max-w-[115px] truncate">{hubBranchName || hubBranchId} Hub</span>
+                  <span className="text-[9px] px-1 py-0.2 rounded bg-blue-500/25 text-blue-100 font-mono font-bold">
+                    {hubBranchId}
+                  </span>
+                </div>
+              ) : (
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-500/15 border border-blue-400/40 text-blue-200 text-[11px] font-semibold shrink-0">
+                  <Radio className="w-3 h-3 text-blue-300 animate-pulse" />
+                  <span>Local Hub Connected</span>
+                </div>
+              )
+            ) : connMode === 'CLOUD_MESH' ? (
               <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-[11px] font-semibold shrink-0">
-                <Radio className="w-3 h-3 text-emerald-400 animate-pulse" />
-                <span className="max-w-[110px] truncate">{hubBranchName || hubBranchId} Hub</span>
-                <span className="text-[9px] px-1 py-0.2 rounded bg-emerald-500/20 text-emerald-200 font-mono font-bold">
-                  {hubBranchId}
-                </span>
-              </div>
-            ) : connMode === 'LOCAL_HUB' ? (
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-300 text-[11px] font-semibold shrink-0">
-                <Radio className="w-3 h-3 text-blue-400 animate-pulse" />
-                <span>Local Hub</span>
+                <span className="w-2 h-2 rounded-full bg-emerald-400 shrink-0" />
+                <span>{connDetails?.isLocalHubLost ? 'Hub Offline • Cloud' : 'Online (Cloud)'}</span>
               </div>
             ) : (
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900/80 border border-slate-800 text-slate-400 text-[11px] font-medium shrink-0">
-                <Wifi className="w-3 h-3 text-slate-500" />
-                <span>Offline / Cloud</span>
+              <div
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold shrink-0 border ${
+                  connDetails?.isLocalHubLost
+                    ? 'bg-rose-500/15 border-rose-500/40 text-rose-200'
+                    : 'bg-amber-500/15 border-amber-500/40 text-amber-200'
+                }`}
+              >
+                <WifiOff className={`w-3 h-3 shrink-0 ${connDetails?.isLocalHubLost ? 'text-rose-400' : 'text-amber-300'}`} />
+                <span>{connDetails?.isLocalHubLost ? 'Hub Disconnected' : 'Offline (Queueing)'}</span>
               </div>
             )}
           </div>
         )}
 
-        {/* Roaming Owner / Branch Mismatch Warning */}
-        {hubBranchId &&
+        {/* Roaming Owner / Branch Mismatch Warning (only when live-connected to a Local Hub on a different branch) */}
+        {isHubLiveConnected &&
+          hubBranchId &&
           hubBranchId !== 'UNASSIGNED' &&
           selectedBranchId &&
-          selectedBranchId !== hubBranchId &&
+          canonicalizeBranchKey(selectedBranchId) !== canonicalizeBranchKey(hubBranchId) &&
           !selectedGuestPass &&
           !selectedCasual && (
             <div className="w-full p-2 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-[11px] font-medium flex items-center gap-2 text-left">
@@ -1454,12 +1559,11 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                       {companyBranches.map((br, brIdx) => {
                         const id = br.branchId || br.id || (br as any).branch_id || `BR-${brIdx}`;
                         const codeTag = br.code ? ` (${br.code})` : '';
-                        const curHubLower = String(hubBranchId || '').trim().toLowerCase();
-                        const canonicalHub =
-                          curHubLower === '1' || curHubLower === 'br-main' || curHubLower === 'br001'
-                            ? 'BR-MAIN'
-                            : hubBranchId;
-                        const isHubBr = canonicalHub && canonicalHub === id;
+                        const isHubBr =
+                          isHubLiveConnected &&
+                          hubBranchId &&
+                          hubBranchId !== 'UNASSIGNED' &&
+                          canonicalizeBranchKey(hubBranchId) === canonicalizeBranchKey(id);
                         return (
                           <option key={`${id}-${brIdx}`} value={id} className="bg-slate-950 text-white">
                             {br.name || br.code || id}
@@ -1625,9 +1729,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                           {visitingPasses.map((pass) => {
                             const lastTs = terminalLastLoginMap[pass.staffId];
                             const rel = formatLastLoginRelative(lastTs);
+                            const roleTag = pass.passRole === 'AUDITOR' ? 'Auditor' : (pass.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B');
                             return (
                               <option key={`visiting-${pass.id}`} value={`visiting:${pass.id}`} className="bg-slate-950 text-cyan-200">
-                                ✈ {pass.staffName} • {pass.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B'} ({pass.homeBranchName || pass.homeBranchId})
+                                ✈ {pass.staffName} • {roleTag} ({pass.homeBranchName || pass.homeBranchId})
                                 {rel ? ` • ${rel}` : ''}
                               </option>
                             );
@@ -1636,14 +1741,15 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                       )}
 
                       {(staffCategoryFilter === 'all' || staffCategoryFilter === 'casual') && branchCasuals.length > 0 && (
-                        <optgroup label="Casual Stocktake Counters (4-Digit PIN)" className="bg-slate-950 text-emerald-300">
+                        <optgroup label="Casual Counters & External Consultants (4-6 Digit PIN)" className="bg-slate-950 text-emerald-300">
                           {branchCasuals.map((casual) => {
                             const lastTs = terminalLastLoginMap[casual.id];
                             const rel = formatLastLoginRelative(lastTs);
+                            const roleTag = casual.tempRole === 'AUDITOR' ? 'External Auditor' : (casual.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B');
                             return (
                               <option key={`casual-${casual.id}`} value={`casual:${casual.id}`} className="bg-slate-950 text-emerald-200">
                                 📋 {casual.name}
-                                {casual.badgeNumber ? ` #${casual.badgeNumber}` : ''} • {casual.assignedGroup === 'GROUP_1' ? 'Team A' : 'Team B'}
+                                {casual.badgeNumber ? ` #${casual.badgeNumber}` : ''} • {roleTag}
                                 {rel ? ` • ${rel}` : ''}
                               </option>
                             );

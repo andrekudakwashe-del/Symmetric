@@ -53,13 +53,14 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
   const [pendingDeleteCasualId, setPendingDeleteCasualId] = useState<string | null>(null);
   const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
 
-  // Casual Form State
+  // Casual / External Consultant Form State
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
   const [pin, setPin] = useState(String(Math.floor(1000 + Math.random() * 9000)));
   const [badgeNumber, setBadgeNumber] = useState('');
   const [assignedSegmentId, setAssignedSegmentId] = useState('');
   const [assignedGroup, setAssignedGroup] = useState<'GROUP_1' | 'GROUP_2'>('GROUP_1');
+  const [tempRole, setTempRole] = useState<'COUNTER' | 'AUDITOR'>('COUNTER');
 
   // Cross-Branch Visiting Counter Guest Pass State (Phase 2)
   const [showGuestModal, setShowGuestModal] = useState(false);
@@ -84,6 +85,7 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
   });
   const [guestStaffId, setGuestStaffId] = useState<string>('');
   const [guestGroup, setGuestGroup] = useState<'GROUP_1' | 'GROUP_2'>('GROUP_1');
+  const [guestPassRole, setGuestPassRole] = useState<'COUNTER' | 'AUDITOR'>('COUNTER');
   const [guestSegmentId, setGuestSegmentId] = useState<string>('');
 
   const availableVisitingStaff = useMemo(() => {
@@ -120,8 +122,10 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
       phone: phone.trim(),
       pin: pin.trim(),
       badgeNumber: badgeNumber.trim() || undefined,
-      assignedSegmentId: assignedSegmentId || undefined,
-      assignedGroup,
+      assignedSegmentId: tempRole === 'AUDITOR' ? undefined : assignedSegmentId || undefined,
+      assignedGroup: tempRole === 'AUDITOR' ? undefined : assignedGroup,
+      tempRole,
+      isExternalConsultant: tempRole === 'AUDITOR',
     });
 
     const updated = getTemporaryCasuals();
@@ -133,9 +137,14 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
     setPhone('');
     setBadgeNumber('');
     setAssignedSegmentId('');
+    setTempRole('COUNTER');
     setPin(String(Math.floor(1000 + Math.random() * 9000)));
     onRefreshSession();
-    showNotice('Casual worker registered and synced to Local Hub.');
+    showNotice(
+      tempRole === 'AUDITOR'
+        ? 'External Consultant Auditor registered and synced to Local Hub.'
+        : 'Casual worker registered and synced to Local Hub.'
+    );
   };
 
   const handleConfirmDeleteCasual = (id: string) => {
@@ -171,10 +180,11 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
       staffId: staffMember.id,
       staffName: staffMember.name,
       staffRole: staffMember.role,
+      passRole: guestPassRole,
       homeBranchId: guestHomeBranchId || staffMember.branchId || 'HQ',
       homeBranchName: homeBranch?.name || guestHomeBranchId || 'Other Branch',
-      assignedGroup: guestGroup,
-      assignedSegmentIds: guestSegmentId ? [guestSegmentId] : undefined,
+      assignedGroup: guestPassRole === 'AUDITOR' ? undefined : guestGroup,
+      assignedSegmentIds: guestPassRole === 'AUDITOR' ? undefined : (guestSegmentId ? [guestSegmentId] : undefined),
       grantedById: currentUser?.id || 'AUD-LOCAL',
       grantedByName: currentUser?.name || 'Stocktake Auditor',
     });
@@ -185,6 +195,7 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
       setShowGuestModal(false);
       setGuestStaffId('');
       setGuestSegmentId('');
+      setGuestPassRole('COUNTER');
       showNotice(res.message);
     }
   };
@@ -342,18 +353,26 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                       {gp.homeBranchName || gp.homeBranchId}
                     </td>
                     <td className="py-2.5 px-4">
-                      <span
-                        className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-                          gp.assignedGroup === 'GROUP_2'
-                            ? 'bg-purple-950 text-purple-300 border-purple-800'
-                            : 'bg-blue-950 text-blue-300 border-blue-800'
-                        }`}
-                      >
-                        {gp.assignedGroup === 'GROUP_2' ? 'Group 2 (Team B)' : 'Group 1 (Team A)'}
-                      </span>
-                      <span className="ml-2 text-[11px] text-slate-400">
-                        {segNames || 'All Segments (Blind)'}
-                      </span>
+                      {gp.passRole === 'AUDITOR' ? (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-950 text-amber-300 border-amber-700">
+                          AUDITOR PASS
+                        </span>
+                      ) : (
+                        <>
+                          <span
+                            className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                              gp.assignedGroup === 'GROUP_2'
+                                ? 'bg-purple-950 text-purple-300 border-purple-800'
+                                : 'bg-blue-950 text-blue-300 border-blue-800'
+                            }`}
+                          >
+                            {gp.assignedGroup === 'GROUP_2' ? 'Group 2 (Team B)' : 'Group 1 (Team A)'}
+                          </span>
+                          <span className="ml-2 text-[11px] text-slate-400">
+                            {segNames || 'All Segments (Blind)'}
+                          </span>
+                        </>
+                      )}
                     </td>
                     <td className="py-2.5 px-4">
                       {gp.active ? (
@@ -461,18 +480,26 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                     </td>
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-2">
-                        <span
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-                            c.assignedGroup === 'GROUP_1'
-                              ? 'bg-blue-950 text-blue-300 border-blue-800'
-                              : 'bg-purple-950 text-purple-300 border-purple-800'
-                          }`}
-                        >
-                          {c.assignedGroup === 'GROUP_1' ? 'Group 1 (Count 1)' : 'Group 2 (Count 2)'}
-                        </span>
-                        <span className="text-slate-400 text-[11px]">
-                          {seg ? seg.name : 'Floating / All'}
-                        </span>
+                        {c.tempRole === 'AUDITOR' || c.isExternalConsultant ? (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full border bg-amber-950 text-amber-300 border-amber-700">
+                            EXTERNAL AUDITOR
+                          </span>
+                        ) : (
+                          <>
+                            <span
+                              className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                                c.assignedGroup === 'GROUP_1'
+                                  ? 'bg-blue-950 text-blue-300 border-blue-800'
+                                  : 'bg-purple-950 text-purple-300 border-purple-800'
+                              }`}
+                            >
+                              {c.assignedGroup === 'GROUP_1' ? 'Group 1 (Count 1)' : 'Group 2 (Count 2)'}
+                            </span>
+                            <span className="text-slate-400 text-[11px]">
+                              {seg ? seg.name : 'Floating / All'}
+                            </span>
+                          </>
+                        )}
                       </div>
                     </td>
                     <td className="py-3 px-4 text-right">
@@ -550,7 +577,43 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
 
             <form onSubmit={handleCreateCasual} className="space-y-3.5 text-xs">
               <div>
-                <label className="block text-slate-300 font-semibold mb-1">Casual Full Name *</label>
+                <label className="block text-slate-300 font-semibold mb-1">Temporary Account Role *</label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTempRole('COUNTER');
+                      setPin(String(Math.floor(1000 + Math.random() * 9000)));
+                    }}
+                    className={`py-2 px-3 rounded-lg border font-bold text-xs transition ${
+                      tempRole === 'COUNTER'
+                        ? 'bg-amber-600/20 border-amber-500 text-amber-200'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    Floor Counter (4-Digit PIN)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTempRole('AUDITOR');
+                      setPin(String(Math.floor(100000 + Math.random() * 900000)));
+                    }}
+                    className={`py-2 px-3 rounded-lg border font-bold text-xs transition ${
+                      tempRole === 'AUDITOR'
+                        ? 'bg-emerald-600/20 border-emerald-500 text-emerald-200'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
+                  >
+                    External Consultant / Auditor
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1">
+                  {tempRole === 'AUDITOR' ? 'Consultant Full Name *' : 'Casual Full Name *'}
+                </label>
                 <input
                   type="text"
                   required
@@ -576,20 +639,28 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-slate-300 font-semibold mb-1">4-Digit Security PIN *</label>
+                  <label className="block text-slate-300 font-semibold mb-1">
+                    {tempRole === 'AUDITOR' ? '4–6 Digit Security PIN *' : '4-Digit Security PIN *'}
+                  </label>
                   <div className="flex items-center gap-1.5">
                     <input
                       type="text"
-                      maxLength={4}
+                      maxLength={tempRole === 'AUDITOR' ? 6 : 4}
                       required
                       value={pin}
-                      onChange={(e) => setPin(e.target.value)}
-                      placeholder="e.g. 4821"
+                      onChange={(e) => setPin(e.target.value.replace(/\D/g, ''))}
+                      placeholder={tempRole === 'AUDITOR' ? 'e.g. 482910' : 'e.g. 4821'}
                       className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-amber-500 font-mono font-bold tracking-widest text-center"
                     />
                     <button
                       type="button"
-                      onClick={() => setPin(String(Math.floor(1000 + Math.random() * 9000)))}
+                      onClick={() =>
+                        setPin(
+                          tempRole === 'AUDITOR'
+                            ? String(Math.floor(100000 + Math.random() * 900000))
+                            : String(Math.floor(1000 + Math.random() * 9000))
+                        )
+                      }
                       className="px-2 py-2 bg-slate-800 hover:bg-slate-700 rounded text-[10px] text-amber-300 font-semibold shrink-0"
                       title="Generate new PIN"
                     >
@@ -611,34 +682,42 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                   />
                 </div>
 
-                <div>
-                  <label className="block text-slate-300 font-semibold mb-1">Assigned Count Group</label>
-                  <select
-                    value={assignedGroup}
-                    onChange={(e) => setAssignedGroup(e.target.value as any)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
-                  >
-                    <option value="GROUP_1">Group 1 (First Blind Pass)</option>
-                    <option value="GROUP_2">Group 2 (Second Blind Pass)</option>
-                  </select>
-                </div>
+                {tempRole === 'COUNTER' ? (
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1">Assigned Count Group</label>
+                    <select
+                      value={assignedGroup}
+                      onChange={(e) => setAssignedGroup(e.target.value as any)}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
+                    >
+                      <option value="GROUP_1">Group 1 (First Blind Pass)</option>
+                      <option value="GROUP_2">Group 2 (Second Blind Pass)</option>
+                    </select>
+                  </div>
+                ) : (
+                  <div className="bg-amber-950/30 border border-amber-800/50 rounded-lg p-2 flex items-center text-[11px] text-amber-200">
+                    Can supervise segments, view consolidated variance & certify readiness. Cannot commit stock.
+                  </div>
+                )}
               </div>
 
-              <div>
-                <label className="block text-slate-300 font-semibold mb-1">Assigned Segment (Optional)</label>
-                <select
-                  value={assignedSegmentId}
-                  onChange={(e) => setAssignedSegmentId(e.target.value)}
-                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
-                >
-                  <option value="">-- Floating across all segments --</option>
-                  {session.segments.map((s) => (
-                    <option key={s.segmentId} value={s.segmentId}>
-                      {s.name} ({s.locationCode || s.segmentId})
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {tempRole === 'COUNTER' && (
+                <div>
+                  <label className="block text-slate-300 font-semibold mb-1">Assigned Segment (Optional)</label>
+                  <select
+                    value={assignedSegmentId}
+                    onChange={(e) => setAssignedSegmentId(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
+                  >
+                    <option value="">-- Floating across all segments --</option>
+                    {session.segments.map((s) => (
+                      <option key={s.segmentId} value={s.segmentId}>
+                        {s.name} ({s.locationCode || s.segmentId})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
               <div className="pt-3 border-t border-slate-800 flex justify-end gap-2">
                 <button
@@ -725,40 +804,72 @@ export const CasualWorkersTab: React.FC<CasualWorkersTabProps> = ({
                 </select>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-slate-300 font-semibold mb-1">Assigned Count Group</label>
-                  <select
-                    value={guestGroup}
-                    onChange={(e) => setGuestGroup(e.target.value as any)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1">Pass Role on Host Branch *</label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setGuestPassRole('COUNTER')}
+                    className={`py-2 px-3 rounded-lg border font-bold text-xs transition ${
+                      guestPassRole === 'COUNTER'
+                        ? 'bg-indigo-600/20 border-indigo-500 text-indigo-200'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
                   >
-                    <option value="GROUP_1">Group 1 (Team A)</option>
-                    <option value="GROUP_2">Group 2 (Team B)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-slate-300 font-semibold mb-1">Assigned Segment</label>
-                  <select
-                    value={guestSegmentId}
-                    onChange={(e) => setGuestSegmentId(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    Blind Floor Counter
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setGuestPassRole('AUDITOR')}
+                    className={`py-2 px-3 rounded-lg border font-bold text-xs transition ${
+                      guestPassRole === 'AUDITOR'
+                        ? 'bg-amber-600/20 border-amber-500 text-amber-200'
+                        : 'bg-slate-950 border-slate-700 text-slate-400'
+                    }`}
                   >
-                    <option value="">-- Floating / All --</option>
-                    {session.segments.map((s) => (
-                      <option key={s.segmentId} value={s.segmentId}>
-                        {s.name}
-                      </option>
-                    ))}
-                  </select>
+                    Visiting Stocktake Auditor
+                  </button>
                 </div>
               </div>
+
+              {guestPassRole === 'COUNTER' && (
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1">Assigned Count Group</label>
+                    <select
+                      value={guestGroup}
+                      onChange={(e) => setGuestGroup(e.target.value as any)}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    >
+                      <option value="GROUP_1">Group 1 (Team A)</option>
+                      <option value="GROUP_2">Group 2 (Team B)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-300 font-semibold mb-1">Assigned Segment</label>
+                    <select
+                      value={guestSegmentId}
+                      onChange={(e) => setGuestSegmentId(e.target.value)}
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                    >
+                      <option value="">-- Floating / All --</option>
+                      {session.segments.map((s) => (
+                        <option key={s.segmentId} value={s.segmentId}>
+                          {s.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
 
               <div className="bg-indigo-950/40 border border-indigo-800/60 rounded-xl p-3 text-[11px] text-indigo-200 flex items-start gap-2">
                 <ShieldAlert className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
                 <span>
-                  Pass grants Blind Counter access to this session only and expires automatically on committal without altering their home branch roster.
+                  {guestPassRole === 'AUDITOR'
+                    ? 'Grants temporary Stocktake Auditor supervision & variance access on this session only. Expires automatically on Owner committal.'
+                    : 'Pass grants Blind Counter access to this session only and expires automatically on committal without altering their home branch roster.'}
                 </span>
               </div>
 

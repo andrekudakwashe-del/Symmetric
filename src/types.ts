@@ -97,6 +97,25 @@ export type ReportPermission = any;
 export type Role = any;
 export type RoleId = any;
 export type SaleInvoice = any;
+export interface BranchFloorSegment {
+  segmentId: string;
+  name: string;
+  locationCode: string;
+  description?: string;
+  sortOrder?: number;
+}
+
+export interface StocktakeVarianceCommentEntry {
+  id: string;
+  authorId: string;
+  authorName: string;
+  authorRole: string;
+  reasonCode: StocktakeVarianceReasonCode;
+  comment: string;
+  actionTaken?: string;
+  createdAt: string;
+}
+
 export interface Salesperson {
   id: string;
   name: string;
@@ -124,6 +143,8 @@ export interface Salesperson {
   // Runtime Stocktake Session Isolation Flags (T3 session-local)
   isCasual?: boolean;
   isVisitingCounter?: boolean;
+  isExternalConsultant?: boolean;
+  tempRole?: 'COUNTER' | 'AUDITOR';
   restrictedToSessionId?: string;
   guestPassId?: string;
   homeBranchId?: string;
@@ -230,6 +251,7 @@ export interface StocktakeGuestPass {
   staffId: string;
   staffName: string;
   staffRole?: string;
+  passRole?: 'COUNTER' | 'AUDITOR';
   homeBranchId: string;
   homeBranchName?: string;
   hostBranchId: string;
@@ -276,13 +298,24 @@ export interface StocktakeConsolidatedItem {
   varianceRetailValue: number;
   status: 'MATCH' | 'SHORTAGE' | 'OVERAGE' | 'RECOUNT_FLAGGED' | string;
   wasCountedInSession?: boolean;
+  originalCountedCases?: number;
+  originalCountedSingles?: number;
+  originalCountedTotalUnits?: number;
+  originalVarianceTotalUnits?: number;
+  originalVarianceCostValue?: number;
   recountRequested?: boolean;
+  recountSheetStatus?: 'REQUESTED' | 'COMPLETED';
   recountNotes?: string;
+  recountReason?: string;
   recountCases?: number;
   recountSingles?: number;
   recountTotalUnits?: number;
   recountedBy?: string;
+  recountedById?: string;
+  recountWitnessId?: string;
+  recountWitnessName?: string;
   recountedAt?: string;
+  recountReversalAlert?: boolean;
   segmentBreakdown?: {
     segmentId: string;
     segmentName: string;
@@ -297,6 +330,7 @@ export interface StocktakeConsolidatedItem {
   commentedById?: string;
   commentedByName?: string;
   commentedAt?: string;
+  varianceComments?: StocktakeVarianceCommentEntry[];
   ownerAckStatus?: 'PENDING' | 'ACKNOWLEDGED' | 'DISPUTED';
   requiresExplanation?: boolean;
   [key: string]: any;
@@ -318,6 +352,9 @@ export interface StocktakeSession {
   stocktakeAuditorId?: string;
   stocktakeAuditorName?: string;
   stocktakeAuditorPhone?: string;
+  auditorType?: 'BRANCH_STAFF' | 'VISITING_STAFF' | 'EXTERNAL_CONSULTANT';
+  auditorGuestPassId?: string;
+  auditorCasualId?: string;
   predefinedDailyItemIds?: string[];
   createdBy: string;
   createdByName: string;
@@ -346,6 +383,8 @@ export interface StocktakeSession {
   varianceReviewStatus?: StocktakeVarianceReviewStatus;
   varianceCommentDeadline?: string;
   varianceMaterialityThreshold?: number;
+  varianceMinUnitThreshold?: number;
+  varianceReviewWindowHours?: number;
   varianceReviewedById?: string;
   varianceReviewedByName?: string;
   varianceReviewedAt?: string;
@@ -370,6 +409,8 @@ export interface StocktakeZoneAssignment {
     claimedAt?: string;
     submitted: boolean;
     submittedAt?: string;
+    finalized?: boolean;
+    finalizedAt?: string;
     lineCount?: number;
   };
   teamB?: {
@@ -379,6 +420,8 @@ export interface StocktakeZoneAssignment {
     claimedAt?: string;
     submitted: boolean;
     submittedAt?: string;
+    finalized?: boolean;
+    finalizedAt?: string;
     lineCount?: number;
   };
   jointRecount?: {
@@ -391,6 +434,12 @@ export interface StocktakeZoneAssignment {
     resolvedByName?: string;
     lines: any[];
   };
+  comparisonFinalized?: boolean;
+  comparisonFinalizedAt?: string;
+  comparisonFinalizedBy?: string;
+  unlockedReason?: string;
+  unlockedByName?: string;
+  unlockedAt?: string;
   count1?: any[];
   count2?: any[];
   verifiedCounts?: any[];
@@ -453,6 +502,8 @@ export interface TemporaryCasualAccount {
   badgeNumber?: string;
   assignedSegmentId?: string;
   assignedGroup?: 'GROUP_1' | 'GROUP_2';
+  tempRole?: 'COUNTER' | 'AUDITOR';
+  isExternalConsultant?: boolean;
   active: boolean;
   createdAt: string;
   updatedAt?: number;

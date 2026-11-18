@@ -15,6 +15,9 @@ export interface AuthResult {
   authProvider: BackendType;
   authModeUsed: BackendAuthMode;
   token?: string;
+  sheet_id?: string;
+  spreadsheet_id?: string;
+  routing_epoch?: number;
   businessId?: string;
   company_id?: string;
   company_name?: string;
@@ -122,6 +125,9 @@ export class BackendAuthService {
             authModeUsed: 'hybrid',
             message: data.message || 'Owner authenticated successfully.',
             token: data.token,
+            sheet_id: data.sheet_id || data.spreadsheet_id,
+            spreadsheet_id: data.spreadsheet_id || data.sheet_id,
+            routing_epoch: typeof data.routing_epoch === 'number' ? data.routing_epoch : undefined,
             businessId: data.company_id || data.businessId,
             company_id: data.company_id || data.businessId,
             company_name: data.company_name,
@@ -157,6 +163,10 @@ export class BackendAuthService {
           authProvider: 'sheets_appscript',
           authModeUsed: 'pin_6_digit',
           message: appsScriptRes.message || 'Owner verified via Google Apps Script.',
+          token: appsScriptRes.token,
+          sheet_id: appsScriptRes.sheet_id || appsScriptRes.spreadsheet_id,
+          spreadsheet_id: appsScriptRes.spreadsheet_id || appsScriptRes.sheet_id,
+          routing_epoch: typeof appsScriptRes.routing_epoch === 'number' ? appsScriptRes.routing_epoch : undefined,
           businessId: appsScriptRes.businessId || companyId || 'COMP-001',
           company_id: appsScriptRes.businessId || companyId || 'COMP-001',
           company_name: appsScriptRes.company_name,
@@ -222,6 +232,10 @@ export class BackendAuthService {
           success: true,
           authProvider: backendType,
           authModeUsed: 'pin_6_digit',
+          token: response.token,
+          sheet_id: response.sheet_id || response.spreadsheet_id,
+          spreadsheet_id: response.spreadsheet_id || response.sheet_id,
+          routing_epoch: typeof response.routing_epoch === 'number' ? response.routing_epoch : undefined,
           message: response.message || 'Staff authenticated successfully.',
           user: (response.user as any) || localUser,
         };

@@ -75,7 +75,18 @@ export const isStocktakeAuditor = (
   session?: StocktakeSession | null
 ): boolean => {
   if (!user) return false;
-  if (user.isCasual || user.isVisitingCounter) return false;
+  const role = String(user.role || '').toUpperCase().trim();
+  const isAuditorTempRole = user.tempRole === 'AUDITOR' || role === 'STOCKTAKE_AUDITOR' || role === 'AUDITOR';
+
+  // Casual counters & visiting counters cannot audit unless explicitly designated AUDITOR via pass or temp account
+  if ((user.isCasual || user.isVisitingCounter) && !isAuditorTempRole && !user.permissions?.canAuditStocktake) {
+    // Also check if an active guest pass grants AUDITOR privileges
+    if (user.isVisitingCounter && user.id) {
+      const gp = hasActiveGuestPass(user.id, user.branchId || user.branch_id);
+      if (gp?.passRole === 'AUDITOR') return true;
+    }
+    return false;
+  }
 
   if (session?.stocktakeAuditorId && user.id) {
     if (String(session.stocktakeAuditorId).trim().toUpperCase() === String(user.id).trim().toUpperCase()) {
@@ -83,8 +94,7 @@ export const isStocktakeAuditor = (
     }
   }
 
-  const role = String(user.role || '').toUpperCase().trim();
-  if (role === 'STOCKTAKE_AUDITOR' || role === 'AUDITOR') {
+  if (isAuditorTempRole) {
     return true;
   }
 
@@ -125,9 +135,9 @@ export const isStocktakeCounter = (
   session?: StocktakeSession | null
 ): boolean => {
   if (!user) return false;
-  if (user.isCasual || user.isVisitingCounter) return true;
   if (isStocktakeLeader(user)) return false;
   if (isStocktakeAuditor(user, session)) return false;
+  if (user.isCasual || user.isVisitingCounter) return true;
   if (isAuditedManager(user, session)) return false;
   return true;
 };
@@ -140,9 +150,9 @@ export const resolveStocktakePersona = (
   session?: StocktakeSession | null
 ): StocktakePersona => {
   if (!user) return 'COUNTER';
-  if (user.isCasual || user.isVisitingCounter) return 'COUNTER';
   if (isStocktakeLeader(user)) return 'LEADER';
   if (isStocktakeAuditor(user, session)) return 'AUDITOR';
+  if (user.isCasual || user.isVisitingCounter) return 'COUNTER';
   if (isAuditedManager(user, session)) return 'AUDITED_MANAGER';
   return 'COUNTER';
 };
@@ -155,6 +165,45 @@ export const getActiveBranchStocktakeSessions = (branchId?: string): StocktakeSe
     const branchMatches = !targetBranch || !sessBranch || sessBranch === targetBranch;
     return branchMatches && isActiveStocktakeStatus(s.status);
   });
+};
+
+export const hasActiveBranchStocktakeSession = (branchId?: string): boolean => {
+  return getActiveBranchStocktakeSessions(branchId).length > 0;
+};
+
+/**
+ * Cross-Slot Blind Isolation Check:
+ * Prevents the same user from claiming or submitting both Slot A and Slot B on any segment,
+ * and blocks access to finalized/locked slots.
+ */
+export const canClaimSegmentSlot = (
+  segment: any,
+  slot: 'A' | 'B',
+  staffId?: string
+): { allowed: boolean; reason?: string } => {
+  if (!segment) return { allowed: false, reason: 'Segment not found.' };
+  if (segment.comparisonFinalized) {
+    return { allowed: false, reason: 'Segment joint comparison is finalized & locked. Auditor unlock required.' };
+  }
+  const cleanStaff = String(staffId || '').trim().toUpperCase();
+  if (slot === 'A') {
+    if (segment.count1Finalized) {
+      return { allowed: false, reason: 'Team A count is finalized & locked. Ask Auditor to unlock if correction is needed.' };
+    }
+    const bOwner = String(segment.counterBId || '').trim().toUpperCase();
+    if (cleanStaff && bOwner && bOwner === cleanStaff) {
+      return { allowed: false, reason: 'Blind isolation rule: You already counted Team B on this segment and cannot count Team A.' };
+    }
+  } else {
+    if (segment.count2Finalized) {
+      return { allowed: false, reason: 'Team B count is finalized & locked. Ask Auditor to unlock if correction is needed.' };
+    }
+    const aOwner = String(segment.counterAId || '').trim().toUpperCase();
+    if (cleanStaff && aOwner && aOwner === cleanStaff) {
+      return { allowed: false, reason: 'Blind isolation rule: You already counted Team A on this segment and cannot count Team B.' };
+    }
+  }
+  return { allowed: true };
 };
 
 export const getActiveLockdownSession = (branchId?: string): StocktakeSession | null => {
@@ -329,14 +378,15 @@ export const getPostCommitPendingVarianceSessions = (branchId?: string): Stockta
 
 export const isVarianceItemMandatoryForComment = (
   item: StocktakeConsolidatedItem,
-  thresholdUsd: number = 10
+  thresholdUsd: number = 10,
+  minUnits: number = 5
 ): boolean => {
   if (item.wasCountedInSession === false) return false;
   if (Number(item.varianceTotalUnits || 0) === 0) return false;
   if (item.requiresExplanation) return true;
   const absCost = Math.abs(Number(item.varianceCostValue || 0));
   const absUnits = Math.abs(Number(item.varianceTotalUnits || 0));
-  return absCost >= thresholdUsd || absUnits >= 5;
+  return absCost >= thresholdUsd || absUnits >= minUnits;
 };
 
 /**

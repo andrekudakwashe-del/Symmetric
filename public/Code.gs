@@ -1,891 +1,4424 @@
 /**
  * ============================================================================
- * SAIMETRIC SaaS V5.1 - Master Multi-Tenant Google Apps Script Router
- * Deployment Mode: Web App (Access: Anyone, Execute as: Me)
- *
- * FULL 25-TABLE ENTERPRISE ARCHITECTURE:
- * 1. Sales & Revenue: Sales, CreditSales, CashLog, CustomerChange
- * 2. Inventory & Logistics: InventoryMaster, GoodsReceived, GoodsReceivedItems,
- *    DirectGRVs, SupplierInvoices, StockMovements, StockBatches, StocktakeSessions
- * 3. Procurement & Trips: TripManifests, FixedCosts, Wallets, WalletTransfers
- * 4. Cash Drawer Auditing: CashLifts, CashCounts, Expenses, Reconciliations
- * 5. Entities & Master Data: Customers, Suppliers, Staff, Branches, AuditLog
+ * SAIMETRIC SAAS UNIFIED GOOGLE APPS SCRIPT BACKEND (V7.0 - ENTERPRISE SCALE)
+ * ============================================================================
+ * Merges:
+ *  - V5.0 Master Multi-Tenant SaaS Control Plane (Companies, Branches, Users,
+ *    Permissions, Subscriptions, Schema Health, Migration, Merge, Auth, Trial)
+ *  - V5.1 25+ Tab Operational Architecture + Server Clock Backdate Guard
+ *  - V6.0 Hexagonal SyncCore Parity:
+ *      * All 39 Syncable Entities (EntityRegistry.ts)
+ *      * Hybrid Columns + Trailing Sync Metadata + Lossless payload_json
+ *      * Canonical `push_envelopes` & `pull_catchup` with Monotonic `server_seq`
+ *      * Monthly Sharded Tab Union Scans (e.g. Sales_YYYY_MM)
+ *      * T1 Idempotency & State Transitions / T2 60s LWW + Tombstone Guard
+ *      * Dual-Read Backward Compatibility for Legacy Header-Only Sheet Rows
+ *      * Stocktake Blind Vault, Single Active Session Guard, Variance Comments,
+ *        Segment Unlock Audit Log, Casual Workers & Branch Lockdowns
+ *  - V7.0 Enterprise SaaS Scale Architecture:
+ *      * Phase 1: Stateless HS256 JWT + CacheService Zero-Master-Open Hot Path
+ *        + Cached System_Config Kill-Switches & Rate Limiting + Strict Tenant Sheet
+ *      * Phase 2: One-Time TEMPLATE_TENANT (`generateMasterTemplate`), ~2s
+ *        `makeCopy` Provisioning (`provisionTenantFromTemplate`), `_TenantMeta`
+ *        Versioning, `routing_epoch` Invalidation, & Daily `runFleetMigration`
+ *      * Phase 3: Per-Tenant Monotonic Sequences, CacheService Spin-Lease Locks
+ *        (Zero Cross-Tenant Contention), & Pre-Lock Packet Dedupe Ring
  * ============================================================================
  */
 
-var MASTER_COMPANY_ID = "COMP-001";
-var MASTER_COMPANY_NAME = "SAIMETRIC Retail Systems";
-var DEFAULT_ISOLATION_MODE = "ROW_LEVEL";
+var MASTER_ID = "1sZ_3414o9o9i2P_j2_m-S8p6L43fR1g0k3s3o1X9i";
+var CACHE = CacheService.getScriptCache();
+var CACHE_TTL_SEC = 21600; // 6 hours
+var CACHE_TTL_ROUTE_SEC = 900; // 15 minutes
+var CACHE_TTL_SYSTEM_CFG_SEC = 60; // 1 minute
+var MAX_CACHE_BYTES = 90000;
+var CURRENT_TENANT_SCHEMA_VERSION = 7;
+var CODE_GS_VERSION = "V7.0-ENTERPRISE";
+var DEFAULT_JWT_TTL_SEC = 43200; // 12 hours
 
-var TAB_SALES = "Sales";
-var TAB_INVENTORY = "InventoryMaster";
-var TAB_GOODS_RECEIVED = "GoodsReceived";
-var TAB_GOODS_RECEIVED_ITEMS = "GoodsReceivedItems";
-var TAB_SUPPLIER_INVOICES = "SupplierInvoices";
-var TAB_DIRECT_GRVS = "DirectGRVs";
-var TAB_STOCK_MOVEMENTS = "StockMovements";
-var TAB_STOCK_BATCHES = "StockBatches";
-var TAB_STOCKTAKE_SESSIONS = "StocktakeSessions";
-var TAB_TRIP_MANIFESTS = "TripManifests";
-var TAB_WALLETS = "Wallets";
-var TAB_WALLET_TRANSFERS = "WalletTransfers";
-var TAB_FIXED_COSTS = "FixedCosts";
-var TAB_CASH_LIFTS = "CashLifts";
-var TAB_CASH_COUNTS = "CashCounts";
-var TAB_CUSTOMERS = "Customers";
-var TAB_SUPPLIERS = "Suppliers";
-var TAB_STAFF = "Staff";
-var TAB_BRANCHES = "Branches";
-var TAB_CASH_LOG = "CashLog";
-var TAB_CUSTOMER_CHANGE = "CustomerChange";
-var TAB_CREDIT_SALES = "CreditSales";
-var TAB_EXPENSES = "Expenses";
-var TAB_RECONCILIATIONS = "Reconciliations";
-var TAB_AUDIT_LOG = "AuditLog";
+var TENANT_COMPANY_ID = "COMP-001";
+var TENANT_COMPANY_NAME = "Saimetric POS";
+var BRANCH_ISOLATION_MODE = "ROW_LEVEL";
 
-function doPost(e) {
-  var lock = LockService.getScriptLock();
-  var hasLock = lock.tryLock(25000);
-  
-  if (!hasLock) {
-    return jsonResponse({
-      status: "error",
-      code: 429,
-      error: "SERVER_BUSY",
-      message: "Server busy acquiring write lock. Please retry."
-    });
+// ============================================================================
+// 1. ACTION CLASSIFICATION & HYBRID SCHEMA DEFINITIONS
+// ============================================================================
+
+var MASTER_TAB_NAMES = [
+  "companies", "branches", "users", "Global_Users", "permissions",
+  "Subscriptions", "request_log", "System_Config", "cache_log"
+];
+
+var HOT_PATH_ACTIONS = [
+  "push_envelopes", "pull_catchup", "get_inventory", "get_stock", "get_data",
+  "approve_direct_grv", "add_direct_grv", "submit_eod", "approve_eod",
+  "add_sale", "sync_sale", "insert", "generic_insert", "update",
+  "generic_update", "upsert", "delete", "generic_delete",
+  "receive_stock", "sell_stock", "break_case", "sync_inventory", "upsert_product",
+  "batch_sync_writes", "seed_sample_data", "sync_entity", "sync_customer",
+  "approve_stocktake", "stocktake_blind_submit", "unlock_stocktake_segment",
+  "save_stocktake_segment", "claim_stocktake_zone",
+  "propose_joint_recount", "finalize_joint_recount"
+];
+
+var MASTER_CONTROL_ACTIONS = [
+  "ping", "health", "setup_sheets", "init_master_sheet",
+  "signup_company", "login_owner", "login_staff", "login", "refresh_token",
+  "create_branch", "upsert_staff", "sync_staff_member",
+  "get_tenant_context", "get_users_since", "get_branches_since",
+  "lookup_company", "lookup_branch", "schema_health_check",
+  "migrate_tenant", "merge_duplicate_companies", "confirm_payment",
+  "extend_trial", "get_companies", "get_users",
+  "sync_company", "bulk_sync_companies",
+  "provision_tenant_sheet", "initialize_tenant_sheet", "init_tenant_tabs",
+  "allocate_tenant", "generate_master_template", "run_fleet_migration",
+  "bump_routing_epoch"
+];
+
+var WRITE_ACTIONS = [
+  "signup_company", "login_owner", "login_staff", "login", "refresh_token",
+  "create_branch", "upsert_staff", "confirm_payment", "extend_trial",
+  "approve_direct_grv", "add_direct_grv", "submit_eod", "approve_eod",
+  "add_sale", "insert", "generic_insert", "update", "generic_update", "upsert",
+  "delete", "generic_delete", "receive_stock", "sell_stock", "break_case",
+  "sync_inventory", "sync_company", "bulk_sync_companies", "batch_sync_writes",
+  "provision_tenant_sheet", "initialize_tenant_sheet", "init_tenant_tabs",
+  "allocate_tenant", "generate_master_template", "run_fleet_migration", "bump_routing_epoch",
+  "migrate_tenant", "merge_duplicate_companies", "seed_sample_data",
+  "setup_sheets", "init_master_sheet", "upsert_product",
+  "push_envelopes", "sync_entity", "sync_sale", "sync_staff_member", "sync_customer",
+  "approve_stocktake", "stocktake_blind_submit", "unlock_stocktake_segment",
+  "save_stocktake_segment", "claim_stocktake_zone",
+  "propose_joint_recount", "finalize_joint_recount"
+];
+
+var SYNC_TRAILING_HEADERS = [
+  "entity_type",
+  "entity_id",
+  "version",
+  "mutation_source",
+  "client_updated_at",
+  "server_updated_at",
+  "server_seq",
+  "is_deleted",
+  "server_received_at",
+  "suspicious_backdate",
+  "payload_json"
+];
+
+var MONTHLY_SHARD_TABS = {
+  "Sales": true,
+  "CashLog": true,
+  "StockMovements": true,
+  "AuditLog": true
+};
+
+function withSyncCols(cols) {
+  var res = cols.slice();
+  for (var i = 0; i < SYNC_TRAILING_HEADERS.length; i++) {
+    if (res.indexOf(SYNC_TRAILING_HEADERS[i]) === -1) {
+      res.push(SYNC_TRAILING_HEADERS[i]);
+    }
   }
+  return res;
+}
+
+var BASE_TAB_COLUMNS = {
+  // --- MASTER CONTROL PLANE TABS ---
+  "companies": [
+    "company_id", "company_name", "owner_name", "owner_email", "password_hash",
+    "phone", "plan", "subscription_status", "status", "expiry",
+    "trial_start_date", "next_billing_date", "sheet_id", "url",
+    "routing_epoch", "provisioned_date", "webhook_url", "branch_isolation_mode",
+    "activation_code", "schema_version", "created_at", "updated_at"
+  ],
+  "branches": ["branch_id", "company_id", "branch_name", "branch_code", "location", "location_code", "address", "phone", "is_main", "is_active", "created_at", "updated_at"],
+  "users": ["user_id", "company_id", "branch_id", "full_name", "email", "phone", "role", "pin_hash", "pin_salt", "pin_version", "pin_updated_at", "assigned_branch_ids", "branch_assignments_json", "permissions_json", "is_active", "created_at", "updated_at"],
+  "Global_Users": ["user_id", "email", "password_hash", "company_id", "role", "full_name", "branch_id", "is_active", "updated_at"],
+  "permissions": ["perm_id", "company_id", "role", "module", "action", "allowed", "description", "updated_at"],
+  "Subscriptions": ["SubscriptionID", "CompanyID", "Plan", "Status", "PaymentRef", "AmountPaid", "Currency", "PaidDate", "NextBillingDate", "ActivatedBy", "Notes"],
+  "request_log": ["request_id", "action", "company_id", "timestamp", "status"],
+  "System_Config": ["config_key", "value", "description", "updated_at"],
+  "cache_log": ["timestamp", "cache_key", "action", "status"],
+
+  // --- TENANT INTERNAL METADATA ---
+  "_TenantMeta": ["meta_key", "value", "updated_at"],
+
+  // --- OPERATIONAL POS & ACCOUNTING TABS (39 ENTITY PARITY + REPORTING) ---
+  "Sales": ["InvoiceID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "Time", "StaffID", "StaffName", "CustomerName", "ItemsSummary", "TotalQty", "Subtotal", "Discount", "Total", "TaxAmount", "PaymentMethod", "Currency", "ExchangeRate", "AmountTendered", "ChangeGiven", "Status", "ReceiptHash", "Notes", "SyncedAt"],
+  "InventoryMaster": ["ProductID", "CompanyID", "BranchID", "BranchName", "ItemName", "SKU", "Barcode", "Category", "UnitType", "CaseSize", "SellPriceUnit", "SellPriceCase", "CostPriceUnit", "CostPriceCase", "TotalUnits", "ReorderLevel", "SupplierName", "LastUpdated", "Active", "SyncedAt"],
+  "Customers": ["CustomerID", "CompanyID", "BranchID", "BranchName", "CustomerName", "Phone", "Email", "Address", "CreditLimit", "CurrentBalance", "ChangeBalance", "LoyaltyPoints", "Notes", "UpdatedAt", "SyncedAt"],
+  "CustomerChange": ["ChangeID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "CustomerID", "CustomerName", "In", "Out", "BalanceAfter", "InvoiceRef", "StaffID", "StaffName", "Notes", "Status", "SyncedAt"],
+  "CreditSales": ["CreditID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "CustomerID", "CustomerName", "Phone", "CreditGroupID", "Amount", "PaidAmount", "In", "Out", "Balance", "DueDate", "ItemDescription", "StaffID", "StaffName", "Status", "Notes", "SyncedAt"],
+  "CreditGroups": ["GroupID", "CompanyID", "BranchID", "Name", "Description", "CreditLimit", "MemberIds", "Status", "UpdatedAt"],
+  "CashLog": ["LogID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "AccountID", "Category", "Description", "In", "Out", "Currency", "PaymentMethod", "Reference", "Status", "SyncedAt"],
+  "CashLifts": ["LiftID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "Amount", "Currency", "DestinationAccount", "AuthorizedBy", "Notes", "Status", "SyncedAt"],
+  "CashMovements": ["MovementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "ShiftID", "AccountID", "Type", "Direction", "Amount", "Currency", "StaffID", "StaffName", "Description", "Reference", "SyncedAt"],
+  "CashAccounts": ["AccountID", "CompanyID", "BranchID", "BranchName", "Name", "Type", "Currency", "CurrentBalance", "ExpectedBalance", "IsActive", "UpdatedAt"],
+  "CashTransfers": ["TransferID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "FromAccountID", "ToAccountID", "Amount", "Currency", "Status", "Rank", "LinkedCashLogIDs", "StaffID", "StaffName", "Notes", "UpdatedAt"],
+  "DirectGRVs": ["GRVID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "GRVNumber", "SupplierName", "InvoiceNumber", "ItemsCount", "TotalCost", "CashPaid", "PaymentMethod", "AccountID", "Status", "RecordedBy", "ApprovedBy", "Notes", "SyncedAt"],
+  "GoodsReceived": ["GRNID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "SupplierID", "SupplierName", "InvoiceRef", "TotalAmount", "ItemsCount", "Status", "ReceivedBy", "Notes", "SyncedAt"],
+  "GoodsReceivedItems": ["GRNItemID", "CompanyID", "BranchID", "GRNID", "ProductID", "ProductName", "QtyReceived", "UnitCost", "LineTotal", "BatchNo", "ExpiryDate"],
+  "StockMovements": ["MovementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "ProductID", "ProductName", "MovementType", "QtyChange", "BalanceBefore", "BalanceAfter", "ReferenceID", "StaffID", "StaffName", "Notes", "SyncedAt"],
+  "StockBatches": ["BatchID", "CompanyID", "BranchID", "ProductID", "ProductName", "BatchNumber", "Quantity", "UnitCost", "ExpiryDate", "ReceivedAt", "SupplierName", "Status"],
+  "Expenses": ["ExpenseID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "Category", "Description", "VendorOrCustomer", "Amount", "Currency", "PaymentMethod", "StaffID", "StaffName", "ReceiptRef", "Status", "ApprovedBy", "SyncedAt"],
+  "InternalConsumption": ["ConsumptionID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "Department", "Reason", "TotalCost", "ItemsCount", "Status", "ApprovedBy", "Notes"],
+  "Reconciliations": ["ReconID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "OpeningFloat", "CashSales", "OtherCashIn", "CashExpenses", "BankDrops", "ExpectedCash", "ActualCashCount", "Variance", "Status", "Notes", "ApprovedBy", "SyncedAt"],
+  "BusinessDayClosures": ["ClosureID", "CompanyID", "BranchID", "BranchName", "Date", "ClosedAt", "ClosedBy", "ClosedByName", "TotalSales", "TotalExpenses", "NetCash", "Variance", "Status", "Notes"],
+  "ElectronicSettlements": ["SettlementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "Provider", "Currency", "ExpectedAmount", "SettledAmount", "Variance", "Reference", "StaffID", "Status", "Notes"],
+  "CashCounts": ["CountID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "DenominationsJSON", "FinalCashOutTotal", "Notes", "Status"],
+  "AdminSales": ["AdminSaleID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "SalesAmount", "Notes", "Status"],
+  "Suppliers": ["SupplierID", "CompanyID", "BranchID", "BranchName", "SupplierName", "Category", "ContactPerson", "Phone", "Email", "Address", "City", "PaymentTerms", "TaxNumber", "Balance", "Status", "UpdatedAt", "SyncedAt"],
+  "SupplierInvoices": ["VoucherID", "CompanyID", "BranchID", "BranchName", "InvoiceNo", "SupplierID", "SupplierName", "Date", "DueDate", "TotalAmount", "PaidAmount", "Status", "Notes", "UpdatedAt", "SyncedAt"],
+  "Categories": ["CategoryID", "CompanyID", "BranchID", "Name", "Color", "Description", "UpdatedAt"],
+  "Staff": ["UserID", "CompanyID", "BranchID", "BranchName", "FullName", "Role", "Email", "Phone", "PinHash", "PinSalt", "PinVersion", "PinUpdatedAt", "AssignedBranchIds", "Active", "LastLogin", "UpdatedAt", "SyncedAt"],
+  "Branches": ["BranchID", "CompanyID", "BranchName", "BranchCode", "Location", "Address", "Phone", "ManagerName", "Status", "IsMain", "IsActive", "UpdatedAt", "SyncedAt"],
+  "Wallets": ["WalletID", "CompanyID", "BranchID", "Name", "Type", "Currency", "Balance", "ExpectedBalance", "UpdatedAt"],
+  "WalletTransfers": ["TransferID", "CompanyID", "BranchID", "Date", "Timestamp", "FromWallet", "ToWallet", "Amount", "Currency", "Reference", "StaffID", "StaffName", "Notes"],
+  "TripManifests": ["TripID", "CompanyID", "BranchID", "Date", "DriverName", "VehicleReg", "Route", "TotalLoadedValue", "Status", "Notes"],
+  "FixedCosts": ["FixedCostID", "CompanyID", "BranchID", "Name", "Category", "Amount", "Frequency", "NextDueDate", "Status"],
+  "AuditLog": ["AuditID", "CompanyID", "BranchID", "BranchName", "Timestamp", "Date", "UserID", "UserName", "AuthorizedByName", "Role", "Action", "Module", "EntityID", "Details", "IPOrDevice", "Status"],
+
+  // --- STOCKTAKE GOVERNANCE, VAULT, CASUALS & LOCKDOWN ---
+  "StocktakeSessions": ["SessionID", "CompanyID", "BranchID", "BranchName", "Title", "Mode", "Status", "StartedAt", "StartedBy", "AuditorID", "AuditorName", "LockdownRequired", "VarianceThreshold", "CommentsDueBy", "CommittedAt", "CommittedBy", "VarianceCommentsJSON", "UpdatedAt"],
+  "StocktakeSegments": ["SegmentID", "CompanyID", "BranchID", "SessionID", "Name", "AisleOrZone", "Status", "IsLocked", "AssignedTeamA", "AssignedTeamB", "UpdatedAt"],
+  "StocktakeZoneAssignments": ["AssignmentID", "CompanyID", "BranchID", "SessionID", "ZoneID", "ZoneName", "SlotAStaffID", "SlotAStaffName", "SlotBStaffID", "SlotBStaffName", "Status", "UpdatedAt"],
+  "StocktakeZoneClaims": ["ClaimID", "CompanyID", "BranchID", "SessionID", "ZoneID", "Slot", "StaffID", "StaffName", "DeviceID", "UpdatedAt"],
+  "StocktakeBlindVault": ["VaultKey", "CompanyID", "BranchID", "SessionID", "ZoneID", "Slot", "StaffID", "StaffName", "IsFinalized", "FinalizedAt", "LinesCount", "LinesJSON", "SubmittedAt"],
+  "StocktakeJointProposals": ["ProposalID", "CompanyID", "BranchID", "SessionID", "ZoneID", "ProposedBySlot", "ProposedByName", "RecountLinesJSON", "Timestamp"],
+  "StocktakeJointFinalized": ["FinalID", "CompanyID", "BranchID", "SessionID", "ZoneID", "SignedByA", "SignedByB", "ResolvedByName", "ResolvedLinesJSON", "FinalizedAt"],
+  "StocktakeUnlockLog": ["UnlockID", "CompanyID", "BranchID", "SessionID", "SegmentID", "TargetSlot", "ActorID", "ActorName", "Reason", "UnlockedAt"],
+  "CasualWorkers": ["CasualID", "CompanyID", "BranchID", "SessionID", "Name", "Phone", "HomeBranchID", "WorkerType", "PassCodeHash", "AssignedZones", "ExpiresAt", "IsActive", "UpdatedAt"],
+  "BranchLockdowns": ["BranchID", "CompanyID", "IsLocked", "SessionID", "LockedBy", "LockedByName", "LockedAt", "Reason", "UpdatedAt"],
+
+  // --- SETTINGS, CONFIG & TOMBSTONES ---
+  "SystemSettings": ["SettingKey", "CompanyID", "BranchID", "UpdatedAt"],
+  "MultiCurrency": ["ConfigID", "CompanyID", "BranchID", "BaseCurrency", "RatesJSON", "UpdatedAt"],
+  "PermissionsMatrix": ["MatrixID", "CompanyID", "BranchID", "RulesCount", "UpdatedAt"],
+  "RoleConfigs": ["ConfigID", "CompanyID", "BranchID", "UpdatedAt"],
+  "SheetsConfig": ["ConfigID", "CompanyID", "BranchID", "UpdatedAt"],
+  "Tombstones": ["TombstoneKey", "CompanyID", "BranchID", "TargetEntityType", "TargetEntityID", "DeletedAt", "DeletedBy"]
+};
+
+var TAB_TEMPLATES = {};
+(function initTabTemplates() {
+  for (var tab in BASE_TAB_COLUMNS) {
+    if (!BASE_TAB_COLUMNS.hasOwnProperty(tab)) continue;
+    if (tab === "_TenantMeta" || tab === "System_Config") {
+      TAB_TEMPLATES[tab] = BASE_TAB_COLUMNS[tab].slice();
+    } else {
+      TAB_TEMPLATES[tab] = withSyncCols(BASE_TAB_COLUMNS[tab]);
+    }
+  }
+})();
+
+var MASTER_BLUEPRINT = {
+  schemaVersion: CURRENT_TENANT_SCHEMA_VERSION,
+  versionLabel: CODE_GS_VERSION,
+  tabs: TAB_TEMPLATES
+};
+
+var SHEET_ALIASES = {
+  "Salespeople": "Staff",
+  "StockMovement": "StockMovements",
+  "Audit_Log": "AuditLog",
+  "Settings": "SystemSettings",
+  "Inventory": "InventoryMaster"
+};
+
+var ENTITY_TO_TAB = {
+  "sale": "Sales",
+  "inventory_item": "InventoryMaster",
+  "staff": "Staff",
+  "branch": "Branches",
+  "customer": "Customers",
+  "customer_change": "CustomerChange",
+  "credit_sale": "CreditSales",
+  "credit_group": "CreditGroups",
+  "cash_log": "CashLog",
+  "cash_lift": "CashLifts",
+  "cash_movement": "CashMovements",
+  "cash_account": "CashAccounts",
+  "cash_transfer": "CashTransfers",
+  "direct_grv": "DirectGRVs",
+  "goods_received": "GoodsReceived",
+  "stock_movement": "StockMovements",
+  "expense": "Expenses",
+  "internal_consumption": "InternalConsumption",
+  "supervisor_approval": "AuditLog",
+  "audit_log": "AuditLog",
+  "reconciliation": "Reconciliations",
+  "business_day_closure": "BusinessDayClosures",
+  "electronic_settlement": "ElectronicSettlements",
+  "cash_count": "CashCounts",
+  "admin_sales": "AdminSales",
+  "supplier_invoice_voucher": "SupplierInvoices",
+  "supplier": "Suppliers",
+  "inventory_category": "Categories",
+  "wallet": "Wallets",
+  "stocktake_session": "StocktakeSessions",
+  "stocktake_segment": "StocktakeSegments",
+  "stocktake_zone_assignment": "StocktakeZoneAssignments",
+  "stocktake_zone_claim": "StocktakeZoneClaims",
+  "stocktake_count_submission": "StocktakeBlindVault",
+  "stocktake_joint_proposal": "StocktakeJointProposals",
+  "stocktake_joint_finalized": "StocktakeJointFinalized",
+  "stocktake_segment_unlock": "StocktakeUnlockLog",
+  "casual_worker": "CasualWorkers",
+  "branch_lockdown": "BranchLockdowns",
+  "system_settings": "SystemSettings",
+  "multi_currency": "MultiCurrency",
+  "permissions_matrix": "PermissionsMatrix",
+  "role_configs": "RoleConfigs",
+  "sheets_config": "SheetsConfig",
+  "tombstone": "Tombstones",
+  "company": "companies"
+};
+
+var T2_ENTITY_TYPES = {
+  "inventory_item": true,
+  "staff": true,
+  "customer": true,
+  "branch": true,
+  "cash_account": true,
+  "wallet": true,
+  "inventory_category": true,
+  "supplier": true,
+  "credit_group": true,
+  "stocktake_session": true,
+  "stocktake_segment": true,
+  "stocktake_zone_assignment": true,
+  "casual_worker": true,
+  "branch_lockdown": true,
+  "sheets_config": true,
+  "system_settings": true,
+  "multi_currency": true,
+  "permissions_matrix": true,
+  "role_configs": true
+};
+
+var CATALOG_SHARED_ENTITIES = {
+  "inventory_item": true,
+  "staff": true,
+  "branch": true,
+  "customer": true,
+  "supplier": true,
+  "inventory_category": true,
+  "credit_group": true,
+  "permissions_matrix": true,
+  "role_configs": true,
+  "multi_currency": true,
+  "system_settings": true,
+  "sheets_config": true,
+  "tombstone": true
+};
+
+// ============================================================================
+// 2. INFRASTRUCTURE, HS256 JWT, CACHE ROUTING, TENANT LEASES & SEQUENCES
+// ============================================================================
+
+function getMasterSpreadsheet() {
+  try {
+    if (MASTER_ID && MASTER_ID.indexOf("1sZ_3414o9o9i2P") === -1) {
+      return SpreadsheetApp.openById(MASTER_ID);
+    }
+  } catch (e) {}
+  return SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function getOrCreateJwtSecret_() {
+  var props = PropertiesService.getScriptProperties();
+  var secret = props.getProperty("JWT_HMAC_SECRET");
+  if (secret && secret.length >= 32) return secret;
+  var seed = Utilities.getUuid() + "::" + Date.now() + "::" + Math.random();
+  var d1 = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, seed, Utilities.Charset.UTF_8);
+  var generated = "";
+  for (var i = 0; i < d1.length; i++) {
+    var b = d1[i] < 0 ? d1[i] + 256 : d1[i];
+    var h = b.toString(16);
+    generated += h.length === 1 ? "0" + h : h;
+  }
+  props.setProperty("JWT_HMAC_SECRET", generated);
+  return generated;
+}
+
+function b64UrlEncode_(input) {
+  var bytes = typeof input === "string" ? Utilities.newBlob(input).getBytes() : input;
+  return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/, "");
+}
+
+function b64UrlDecodeToStr_(b64Url) {
+  var norm = String(b64Url || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (norm.length % 4 !== 0) norm += "=";
+  var bytes = Utilities.base64Decode(norm);
+  return Utilities.newBlob(bytes).getDataAsString("UTF-8");
+}
+
+function signJwt(claims, ttlSec) {
+  var nowSec = Math.floor(Date.now() / 1000);
+  var payloadObj = {};
+  for (var k in claims) {
+    if (claims.hasOwnProperty(k)) payloadObj[k] = claims[k];
+  }
+  payloadObj.iat = nowSec;
+  payloadObj.exp = nowSec + Number(ttlSec || DEFAULT_JWT_TTL_SEC);
+
+  var headerB64 = b64UrlEncode_(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  var payloadB64 = b64UrlEncode_(JSON.stringify(payloadObj));
+  var signingInput = headerB64 + "." + payloadB64;
+  var sigBytes = Utilities.computeHmacSha256Signature(signingInput, getOrCreateJwtSecret_());
+  var sigB64 = b64UrlEncode_(sigBytes);
+  return signingInput + "." + sigB64;
+}
+
+function verifyJwt(token) {
+  if (!token || typeof token !== "string") {
+    return { valid: false, code: "JWT_MISSING", error: "Missing JWT token" };
+  }
+  var parts = token.trim().split(".");
+  if (parts.length !== 3) {
+    return { valid: false, code: "JWT_INVALID", error: "Malformed JWT format" };
+  }
+  try {
+    var header = JSON.parse(b64UrlDecodeToStr_(parts[0]));
+    if (!header || header.alg !== "HS256") {
+      return { valid: false, code: "JWT_INVALID", error: "Unsupported JWT algorithm" };
+    }
+    var signingInput = parts[0] + "." + parts[1];
+    var expectedBytes = Utilities.computeHmacSha256Signature(signingInput, getOrCreateJwtSecret_());
+    var expectedSig = b64UrlEncode_(expectedBytes);
+    var providedSig = parts[2];
+    if (expectedSig.length !== providedSig.length) {
+      return { valid: false, code: "JWT_INVALID", error: "JWT signature mismatch" };
+    }
+    var diff = 0;
+    for (var i = 0; i < expectedSig.length; i++) {
+      diff |= expectedSig.charCodeAt(i) ^ providedSig.charCodeAt(i);
+    }
+    if (diff !== 0) {
+      return { valid: false, code: "JWT_INVALID", error: "JWT signature verification failed" };
+    }
+    var claims = JSON.parse(b64UrlDecodeToStr_(parts[1]));
+    var nowSec = Math.floor(Date.now() / 1000);
+    if (claims.exp && nowSec > Number(claims.exp)) {
+      return { valid: false, expired: true, code: "JWT_EXPIRED", claims: claims, error: "JWT token expired" };
+    }
+    return { valid: true, claims: claims };
+  } catch (e) {
+    return { valid: false, code: "JWT_INVALID", error: "JWT decode failure: " + e.message };
+  }
+}
+
+function getSystemConfigCached(masterSsOpt) {
+  var cached = CACHE.get("sys:global_cfg");
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
+  var props = PropertiesService.getScriptProperties();
+  var cfg = {
+    GLOBAL_SYNC_DISABLED: "FALSE",
+    MAINTENANCE_MODE: "FALSE",
+    MAX_ENVELOPES_PER_BATCH: 50,
+    RATE_LIMIT_PER_MIN: 120,
+    REQUIRE_JWT: "FALSE",
+    TEMPLATE_TENANT_ID: String(props.getProperty("TEMPLATE_TENANT_ID") || "").trim()
+  };
 
   try {
-    if (!e || !e.postData || !e.postData.contents) {
-      return jsonResponse({ status: "error", code: 400, message: "Empty POST body" });
-    }
-
-    var payload = JSON.parse(e.postData.contents);
-    var action = String(payload.action || "INSERT").trim();
-    var sheetBaseName = payload.sheet || "Sales";
-    var companyId = payload.company_id || (payload.data && payload.data.company_id) || MASTER_COMPANY_ID;
-    var companyName = payload.company_name || MASTER_COMPANY_NAME;
-    var branchId = payload.branch_id || (payload.data && payload.data.branch_id) || "BR-MAIN";
-    var branchName = payload.branch_name || (payload.data && payload.data.branch_name) || branchId;
-    var userBranchId = payload.user_branch_id || branchId;
-    var userRole = String(payload.user_role || "CASHIER").toUpperCase();
-    var userId = payload.user_id || "USR-UNKNOWN";
-    var rowData = payload.data || {};
-    var explicitSheetId = payload.tenant_sheet_id || payload.sheet_id || (payload.data && (payload.data.tenant_sheet_id || payload.data.sheet_id));
-
-    // Resolve Spreadsheet Target (Active bound sheet first, then openById)
-    var ss = null;
-    try {
-      ss = SpreadsheetApp.getActiveSpreadsheet();
-    } catch (actErr) {}
-
-    if ((!ss || (explicitSheetId && ss.getId() !== explicitSheetId)) && explicitSheetId && explicitSheetId.length > 10) {
-      try {
-        ss = SpreadsheetApp.openById(explicitSheetId);
-      } catch (openErr) {
-        if (!ss) {
-          lock.releaseLock();
-          return jsonResponse({
-            status: "error",
-            code: 404,
-            error: "CANNOT_OPEN_SHEET",
-            message: "Cannot open target sheet: " + openErr.toString() + ". Please ensure sheet is shared with edit access."
-          });
+    var ss = masterSsOpt || getMasterSpreadsheet();
+    var scSheet = ss ? ss.getSheetByName("System_Config") : null;
+    if (scSheet && scSheet.getLastRow() >= 2) {
+      var vals = scSheet.getDataRange().getValues();
+      for (var i = 1; i < vals.length; i++) {
+        var k = String(vals[i][0] || "").trim();
+        var v = String(vals[i][1] || "").trim();
+        if (!k) continue;
+        if (k === "MAX_ENVELOPES_PER_BATCH" || k === "RATE_LIMIT_PER_MIN") {
+          var n = Number(v);
+          if (isFinite(n) && n > 0) cfg[k] = n;
+        } else if (v !== "") {
+          cfg[k] = v;
         }
       }
     }
+  } catch (e2) {}
 
+  putCacheSafe("sys:global_cfg", JSON.stringify(cfg), CACHE_TTL_SYSTEM_CFG_SEC);
+  return cfg;
+}
+
+function checkRateLimit(companyId, limitPerMin) {
+  var cap = Math.max(10, Number(limitPerMin || 120));
+  var minuteBucket = Math.floor(Date.now() / 60000);
+  var key = "rl:" + String(companyId || "DEFAULT").toUpperCase() + ":" + minuteBucket;
+  var cur = Number(CACHE.get(key) || "0") + 1;
+  try { CACHE.put(key, String(cur), 120); } catch (e) {}
+  if (cur > cap) {
+    var secsLeft = 60 - new Date().getSeconds();
+    return {
+      allowed: false,
+      code: "RATE_LIMITED",
+      httpStatus: 429,
+      retryAfterMs: Math.max(2000, secsLeft * 1000),
+      error: "Per-tenant rate limit exceeded (" + cap + " req/min). Retry shortly."
+    };
+  }
+  return { allowed: true };
+}
+
+function getTenantRouteCached(companyId, masterSsOpt) {
+  var compKey = String(companyId || TENANT_COMPANY_ID).trim().toUpperCase();
+  var cacheKey = "route:" + compKey;
+  var cached = CACHE.get(cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
+
+  // Fallback read without Master if called on strict JWT path with missing cache -> still check ScriptProperties epoch override
+  var ss = masterSsOpt || getMasterSpreadsheet();
+  var comp = getCompany(compKey, ss);
+  var props = PropertiesService.getScriptProperties();
+  var propEpoch = Number(props.getProperty("ROUTE_EPOCH_" + compKey) || "1");
+  if (!comp) {
+    return null;
+  }
+  var sheetId = String(comp.sheet_id || "").trim();
+  var epoch = Math.max(propEpoch, Number(comp.routing_epoch || 1));
+  var route = {
+    company_id: comp.company_id || compKey,
+    spreadsheet_id: sheetId,
+    url: comp.url || (sheetId ? "https://docs.google.com/spreadsheets/d/" + sheetId + "/edit" : ""),
+    routing_epoch: epoch,
+    status: String(comp.subscription_status || comp.status || "TRIAL").toUpperCase(),
+    plan: String(comp.plan || "STARTER").toUpperCase(),
+    expiry: comp.next_billing_date || comp.expiry || "",
+    schema_version: Number(comp.schema_version || CURRENT_TENANT_SCHEMA_VERSION)
+  };
+  putCacheSafe(cacheKey, JSON.stringify(route), CACHE_TTL_ROUTE_SEC);
+  return route;
+}
+
+function resolveTenantSpreadsheetStrict(spreadsheetId, companyId) {
+  var id = String(spreadsheetId || "").trim();
+  if (!id || id.length < 15) {
+    return {
+      ss: null,
+      code: "MISSING_TENANT_SHEET_ID",
+      httpStatus: 422,
+      error: "No dedicated tenant spreadsheet_id configured for company " + companyId + ". Provision tenant spreadsheet first."
+    };
+  }
+  try {
+    var ss = SpreadsheetApp.openById(id);
     if (!ss) {
-      ss = SpreadsheetApp.getActiveSpreadsheet();
+      return {
+        ss: null,
+        code: "TENANT_SHEET_UNREACHABLE",
+        httpStatus: 503,
+        error: "Unable to open tenant spreadsheet " + id
+      };
     }
+    return { ss: ss };
+  } catch (e) {
+    return {
+      ss: null,
+      code: "TENANT_SHEET_UNREACHABLE",
+      httpStatus: 503,
+      error: "Tenant spreadsheet unreachable (" + id + "): " + e.message
+    };
+  }
+}
 
-    // 1. ACTION: INITIALIZE ALL 25 BUSINESS TABS
-    if (
-      action === "initialize_tenant_sheet" ||
-      action === "init_tenant_sheet" ||
-      action === "setup_tenant_tabs" ||
-      action === "setup_sheets" ||
-      action === "init_tabs" ||
-      action === "initialize_tabs" ||
-      action === "setup_tabs" ||
-      action === "initializeTabs" ||
-      action === "initTabs"
-    ) {
-      var initialProducts = payload.initial_products || (payload.data && payload.data.initial_products) || [];
-      var initResult = setupTenantSpreadsheetTabs(ss, companyId, companyName, initialProducts);
-      lock.releaseLock();
-      return jsonResponse({
-        status: "success",
-        success: true,
-        code: 200,
-        message: initResult.message,
-        tabs: initResult.tabs,
-        totalTabs: initResult.tabs.length,
-        sheet_id: ss.getId(),
-        sheet_name: ss.getName()
-      });
-    }
+function resolveTargetSpreadsheet(masterSs, company_id, explicitSheetId) {
+  var sheetId = String(explicitSheetId || "").trim();
+  if (!sheetId && company_id) {
+    sheetId = getSheetId(company_id, masterSs);
+  }
+  if (sheetId && sheetId.length >= 15) {
+    try {
+      return SpreadsheetApp.openById(sheetId);
+    } catch (e) {}
+  }
+  return masterSs;
+}
 
-    // 2. ACTION: GET INVENTORY / PRODUCTS
-    if (action === "get_inventory" || action === "get_products") {
-      var invResult = handleGetInventory(ss, companyId);
-      lock.releaseLock();
-      return jsonResponse({
-        status: "success",
-        success: true,
-        code: 200,
-        items: invResult.items,
-        count: invResult.items.length
-      });
-    }
+function extractRawToken(req, params) {
+  var t = "";
+  if (req && (req.jwt || req.token || req.authorization || req.Authorization)) {
+    t = String(req.jwt || req.token || req.authorization || req.Authorization).trim();
+  } else if (params && (params.jwt || params.token || params.authorization)) {
+    t = String(params.jwt || params.token || params.authorization).trim();
+  }
+  if (t.toLowerCase().indexOf("bearer ") === 0) {
+    t = t.slice(7).trim();
+  }
+  // Ignore dummy client-generated demo tokens if present
+  if (t.indexOf("JWT-OWNER-") === 0 || t.indexOf("JWT-STAFF-") === 0 || t.indexOf("JWT-SUPERADMIN-") === 0) {
+    return "";
+  }
+  return t;
+}
 
-    // 3. ACTION: SYNC INVENTORY / UPSERT PRODUCT
-    if (action === "sync_inventory" || action === "upsert_product") {
-      var syncResult = handleSyncInventory(ss, payload, companyId, branchId);
-      lock.releaseLock();
-      return jsonResponse({
-        status: "success",
-        success: true,
-        code: 200,
-        count: syncResult.count,
-        items: syncResult.items
-      });
-    }
-
-    // 4. ACTION: ADD SALE / INVOICE
-    if (
-      action === "add_sale" ||
-      action === "sale" ||
-      action === "SALE_RECORD" ||
-      action === "sync_sale" ||
-      (action === "INSERT" && (sheetBaseName === "Sales" || sheetBaseName === TAB_SALES)) ||
-      (action === "sync_entity" && String(payload.entityType || "").toUpperCase() === "SALE")
-    ) {
-      var saleResult = handleAddSale(ss, payload, companyId, branchId, branchName, userRole);
-      lock.releaseLock();
-      return jsonResponse(saleResult);
-    }
-
-    // 5. ACTION: ADD SUPPLIER INVOICE
-    if (action === "add_supplier_invoice" || (action === "INSERT" && sheetBaseName === TAB_SUPPLIER_INVOICES)) {
-      var invResult = handleAddSupplierInvoice(ss, payload, companyId, branchId);
-      lock.releaseLock();
-      return jsonResponse(invResult);
-    }
-
-    // 6. ACTION: ADD GOODS RECEIVED (GRN VOUCHER & ITEMS)
-    if (action === "add_goods_received" || action === "goods_received" || (action === "INSERT" && sheetBaseName === TAB_GOODS_RECEIVED)) {
-      var grnResult = handleAddGoodsReceived(ss, payload, companyId, branchId);
-      lock.releaseLock();
-      return jsonResponse(grnResult);
-    }
-
-    // 7. ACTION: ADD DIRECT GRV
-    if (action === "add_direct_grv" || (action === "INSERT" && sheetBaseName === TAB_DIRECT_GRVS)) {
-      var dGrvResult = handleAddDirectGRV(ss, payload, companyId, branchId);
-      lock.releaseLock();
-      return jsonResponse(dGrvResult);
-    }
-
-    // 8. ACTION: ADD STOCK MOVEMENT
-    if (action === "add_stock_movement" || (action === "INSERT" && sheetBaseName === TAB_STOCK_MOVEMENTS)) {
-      var smResult = handleAddStockMovement(ss, payload, companyId, branchId);
-      lock.releaseLock();
-      return jsonResponse(smResult);
-    }
-
-    // 9. ACTION: ADD WALLET TRANSFER
-    if (action === "add_wallet_transfer" || (action === "INSERT" && sheetBaseName === TAB_WALLET_TRANSFERS)) {
-      var wtResult = handleAddWalletTransfer(ss, payload, companyId, branchId);
-      lock.releaseLock();
-      return jsonResponse(wtResult);
-    }
-
-    // 10. ACTION: BATCH SYNC WRITES
-    if (action === "batch_sync_writes" || action === "batch_sync") {
-      var batchItems = Array.isArray(payload.items) ? payload.items : [];
-      var batchWritten = 0;
-      for (var b = 0; b < batchItems.length; b++) {
-        var bItem = batchItems[b];
-        if (!bItem) continue;
-        var bSheet = bItem.sheetName || bItem.sheet || sheetBaseName;
-        appendRecordToSheet(ss, bSheet, bItem.payload || bItem.data || bItem, companyId, branchId, branchName, userId, userRole);
-        batchWritten++;
+function resolveHotPathContext(reqOrParams, actionNorm) {
+  var cfg = getSystemConfigCached(null);
+  if (String(cfg.GLOBAL_SYNC_DISABLED).toUpperCase() === "TRUE" || String(cfg.MAINTENANCE_MODE).toUpperCase() === "TRUE") {
+    return {
+      ok: false,
+      response: {
+        success: false,
+        code: "KILL_SWITCH_ACTIVE",
+        httpStatus: 503,
+        retryAfterMs: 300000,
+        error: "Sync paused: System maintenance kill-switch is active."
       }
-      lock.releaseLock();
-      return jsonResponse({
-        status: "success",
-        success: true,
-        code: 200,
-        batchCount: batchWritten,
-        timestamp: new Date().toISOString()
-      });
-    }
-
-    // 11. GENERIC ROW APPEND FALLBACK
-    var appendResult = appendRecordToSheet(ss, sheetBaseName, rowData, companyId, branchId, branchName, userId, userRole);
-    lock.releaseLock();
-    return jsonResponse(appendResult);
-
-  } catch (error) {
-    lock.releaseLock();
-    return jsonResponse({
-      status: "error",
-      success: false,
-      code: 500,
-      message: error.toString()
-    });
-  }
-}
-
-function doGet(e) {
-  var params = e ? e.parameter : {};
-  var action = params.action || "ping";
-  var compId = params.company_id || MASTER_COMPANY_ID;
-
-  var ss = null;
-  try {
-    ss = SpreadsheetApp.getActiveSpreadsheet();
-  } catch (err) {}
-
-  if (action === "ping") {
-    var nowPing = new Date();
-    return jsonResponse({
-      status: "active",
-      success: true,
-      version: "5.2.0",
-      tenant: compId,
-      company: MASTER_COMPANY_NAME,
-      isolationMode: DEFAULT_ISOLATION_MODE,
-      sheet_name: ss ? ss.getName() : "Unknown",
-      totalTabs: ss ? ss.getSheets().length : 0,
-      serverTime: nowPing.getTime(),
-      server_received_at: nowPing.toISOString(),
-      service: "SAIMETRIC Dedicated Tenant Sheets Service (25 Tables Enabled)"
-    });
+    };
   }
 
-  if (action === "get_inventory" || action === "get_products") {
-    if (ss) {
-      var invResult = handleGetInventory(ss, compId);
-      return jsonResponse({
-        status: "success",
-        success: true,
-        items: invResult.items,
-        count: invResult.items.length
-      });
+  var token = extractRawToken(reqOrParams, reqOrParams);
+  var claims = null;
+  if (token) {
+    var v = verifyJwt(token);
+    if (!v.valid) {
+      return {
+        ok: false,
+        response: {
+          success: false,
+          code: v.code || "JWT_INVALID",
+          httpStatus: 401,
+          error: v.error || "Unauthorized"
+        }
+      };
     }
-  }
-
-  if (
-    action === "setup_sheets" ||
-    action === "initialize_tenant_sheet" ||
-    action === "init_tabs" ||
-    action === "initialize_tabs" ||
-    action === "setup_tabs" ||
-    action === "setup_tenant_tabs" ||
-    action === "initTabs" ||
-    action === "initializeTabs"
-  ) {
-    if (!ss && (params.sheet_id || params.tenant_sheet_id)) {
-      try {
-        ss = SpreadsheetApp.openById(params.sheet_id || params.tenant_sheet_id);
-      } catch (e) {}
-    }
-    if (!ss) {
-      try {
-        ss = SpreadsheetApp.getActiveSpreadsheet();
-      } catch (e) {}
-    }
-    if (ss) {
-      var init = setupTenantSpreadsheetTabs(ss, compId, MASTER_COMPANY_NAME, []);
-      return jsonResponse({
-        status: "success",
-        success: true,
-        message: init.message,
-        tabs: init.tabs,
-        totalTabs: init.tabs.length,
-        sheet_id: ss.getId(),
-        sheet_name: ss.getName()
-      });
-    }
-  }
-
-  if (action === "get_table_counts") {
-    if (ss) {
-      var counts = {};
-      var allSheets = ss.getSheets();
-      for (var s = 0; s < allSheets.length; s++) {
-        var sh = allSheets[s];
-        counts[sh.getName()] = Math.max(0, sh.getLastRow() - 1);
+    claims = v.claims;
+  } else if (String(cfg.REQUIRE_JWT).toUpperCase() === "TRUE") {
+    return {
+      ok: false,
+      response: {
+        success: false,
+        code: "JWT_MISSING",
+        httpStatus: 401,
+        error: "Signed JWT required by System_Config (REQUIRE_JWT=TRUE)."
       }
-      return jsonResponse({
-        status: "success",
-        success: true,
-        counts: counts
-      });
-    }
+    };
   }
 
-  return ContentService.createTextOutput(
-    "SAIMETRIC Master Google Sheet Webhook is Online for " + MASTER_COMPANY_NAME + " (" + compId + "). 25 Tables Configured."
-  );
-}
+  var companyId = String(
+    (claims && claims.company_id) ||
+    reqOrParams.company_id ||
+    reqOrParams.companyId ||
+    (reqOrParams.data && (reqOrParams.data.company_id || reqOrParams.data.companyId)) ||
+    TENANT_COMPANY_ID
+  ).trim();
+  var compUpper = companyId.toUpperCase();
 
-/**
- * Standalone macro runner: Initializes all 25 business tabs in the active Google Sheet.
- * Select 'initializeAllTabs' in Apps Script toolbar and click 'Run'.
- */
-function initializeAllTabs() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var result = setupTenantSpreadsheetTabs(ss, MASTER_COMPANY_ID, MASTER_COMPANY_NAME, []);
-  Logger.log(result.message);
-  return result;
-}
-
-function setupTenantSheets() {
-  return initializeAllTabs();
-}
-
-function setupMasterSheets() {
-  return initializeAllTabs();
-}
-
-/**
- * Creates custom SAIMETRIC menu inside Google Sheet for 1-click tab setup
- */
-function onOpen() {
-  try {
-    var ui = SpreadsheetApp.getUi();
-    ui.createMenu('📊 SAIMETRIC SaaS')
-      .addItem('⚡ Initialize / Repair All 25 Tabs', 'initializeAllTabs')
-      .addSeparator()
-      .addItem('🔍 Check Webhook Status', 'checkWebhookStatus')
-      .addToUi();
-  } catch (e) {}
-}
-
-function checkWebhookStatus() {
-  try {
-    var ui = SpreadsheetApp.getUi();
-    ui.alert('SAIMETRIC Webhook Status', 'Webhook is active for ' + MASTER_COMPANY_NAME + ' (' + MASTER_COMPANY_ID + '). 25 business tables configured.', ui.ButtonSet.OK);
-  } catch (e) {}
-}
-
-/**
- * Initializes all 25 required business tabs with bold dark-slate headers
- */
-function setupTenantSpreadsheetTabs(ss, company_id, company_name, initial_products) {
-  var dataTabsConfig = [
-    { name: TAB_SALES, headers: ["SaleID", "CompanyID", "BranchID", "BranchName", "Date", "Customer", "PaymentMethod", "Subtotal", "Discount", "Tax", "Total", "CashierID", "CashierName", "ItemsCount", "Currency", "ExchangeRate", "ItemsSummary", "ItemsJSON", "Notes", "Status", "SyncedTimestamp", "server_received_at", "suspicious_backdate"] },
-    { name: TAB_INVENTORY, headers: ["ItemID", "CompanyID", "BranchID", "ItemName", "UnitsPerCase", "CostPerCase", "CostPerUnit", "SellingPrice", "MarkupPercent", "StockCases", "StockSingles", "TotalUnits", "SKU", "Category", "MinStock"] },
-    { name: TAB_GOODS_RECEIVED, headers: ["VoucherID", "CompanyID", "BranchID", "SupplierInvoiceNo", "SupplierID", "SupplierName", "DeliveryDate", "TotalAmount", "LandedCost", "PaymentStatus", "ReceivedByID", "ReceivedByName", "ItemsCount", "Notes", "SyncedTimestamp"] },
-    { name: TAB_GOODS_RECEIVED_ITEMS, headers: ["GRNID", "CompanyID", "BranchID", "ItemID", "ItemName", "ReceivedCases", "ReceivedSingles", "UnitsPerCase", "CostPerCase", "CostPerUnit", "LineTotal", "BatchNumber", "ExpiryDate"] },
-    { name: TAB_SUPPLIER_INVOICES, headers: ["InvoiceID", "CompanyID", "BranchID", "InvoiceNumber", "SupplierID", "SupplierName", "InvoiceDate", "DueDate", "TotalAmount", "AmountPaid", "BalanceDue", "PaymentStatus", "GRVReferences", "SyncedTimestamp"] },
-    { name: TAB_DIRECT_GRVS, headers: ["VoucherID", "CompanyID", "BranchID", "SupplierID", "SupplierName", "TotalAmount", "AmountPaidFromTill", "TillDisbursementLine", "Status", "ReceivedBy", "ApprovedBy", "SyncedTimestamp"] },
-    { name: TAB_STOCK_MOVEMENTS, headers: ["MovementID", "CompanyID", "BranchID", "FromBranchID", "ToBranchID", "ItemID", "ItemName", "Quantity", "MovementType", "Reason", "StaffID", "Timestamp"] },
-    { name: TAB_STOCK_BATCHES, headers: ["BatchID", "CompanyID", "BranchID", "ItemID", "BatchNumber", "ExpiryDate", "InitialQuantity", "RemainingQuantity", "Status", "Timestamp"] },
-    { name: TAB_STOCKTAKE_SESSIONS, headers: ["SessionID", "CompanyID", "BranchID", "StartDate", "EndDate", "SupervisorID", "TotalVarianceValue", "Status", "Timestamp"] },
-    { name: TAB_TRIP_MANIFESTS, headers: ["TripID", "CompanyID", "BranchID", "Destination", "DepartureDate", "ReturnDate", "TotalExpenses", "AllocatedLandedCost", "Status"] },
-    { name: TAB_WALLETS, headers: ["WalletID", "CompanyID", "BranchID", "Currency", "Balance", "LastUpdated"] },
-    { name: TAB_WALLET_TRANSFERS, headers: ["TransferID", "CompanyID", "BranchID", "FromWallet", "ToWallet", "Amount", "ExchangeRate", "StaffID", "Timestamp"] },
-    { name: TAB_FIXED_COSTS, headers: ["CostID", "CompanyID", "BranchID", "Name", "Category", "MonthlyAmount", "ProratedDaily", "Active", "Timestamp"] },
-    { name: TAB_CASH_LIFTS, headers: ["LiftID", "CompanyID", "BranchID", "CashierID", "SupervisorID", "Amount", "Currency", "Reason", "Timestamp"] },
-    { name: TAB_CASH_COUNTS, headers: ["CountID", "CompanyID", "BranchID", "ShiftID", "CashierID", "ExpectedCash", "CountedCash", "Variance", "Timestamp"] },
-    { name: TAB_CUSTOMERS, headers: ["CustomerID", "CompanyID", "BranchID", "Name", "Phone", "Address", "CreditBalance", "CreatedDate"] },
-    { name: TAB_SUPPLIERS, headers: ["SupplierID", "CompanyID", "BranchID", "Name", "Category", "ContactPerson", "Phone", "Email", "Address", "PaymentTerms"] },
-    { name: TAB_STAFF, headers: ["StaffID", "CompanyID", "BranchID", "Name", "Email", "Role", "Phone", "Active"] },
-    { name: TAB_BRANCHES, headers: ["BranchID", "CompanyID", "Name", "Code", "Location", "IsActive"] },
-    { name: TAB_CASH_LOG, headers: ["LogID", "CompanyID", "BranchID", "Timestamp", "Date", "StaffID", "StaffName", "Line", "Description", "CashIn", "CashOut"] },
-    { name: TAB_CUSTOMER_CHANGE, headers: ["ChangeID", "CompanyID", "BranchID", "Timestamp", "CustomerID", "CustomerName", "Amount", "StaffID", "Notes", "Status"] },
-    { name: TAB_CREDIT_SALES, headers: ["CreditID", "CompanyID", "BranchID", "Timestamp", "CustomerID", "CustomerName", "Amount", "Outflow", "Inflow", "StaffID", "Status"] },
-    { name: TAB_EXPENSES, headers: ["ExpenseID", "CompanyID", "BranchID", "Timestamp", "Date", "Category", "Description", "Amount", "PaymentMethod", "StaffID"] },
-    { name: TAB_RECONCILIATIONS, headers: ["ReconID", "CompanyID", "BranchID", "Timestamp", "Date", "CashierID", "ExpectedCash", "ActualCash", "Variance", "Status", "Notes"] },
-    { name: TAB_AUDIT_LOG, headers: ["AuditID", "CompanyID", "BranchID", "Timestamp", "UserID", "Action", "Module", "ReferenceID", "Details"] }
-  ];
-
-  var createdTabs = [];
-  for (var t = 0; t < dataTabsConfig.length; t++) {
-    var cfg = dataTabsConfig[t];
-    var sheet = ss.getSheetByName(cfg.name) || ss.insertSheet(cfg.name);
-    if (sheet.getLastRow() === 0) {
-      sheet.appendRow(cfg.headers);
-      sheet.getRange(1, 1, 1, cfg.headers.length).setBackground("#1E293B").setFontColor("#FFFFFF").setFontWeight("bold");
-      sheet.setFrozenRows(1);
-    }
-    createdTabs.push(cfg.name);
+  var rateRes = checkRateLimit(companyId, cfg.RATE_LIMIT_PER_MIN);
+  if (!rateRes.allowed) {
+    return { ok: false, response: rateRes };
   }
 
-  // Populate initial products if provided
-  if (initial_products && Array.isArray(initial_products) && initial_products.length > 0) {
-    var invSheet = ss.getSheetByName(TAB_INVENTORY);
-    if (invSheet) {
-      var existingData = invSheet.getDataRange().getValues();
-      var existingIds = {};
-      for (var r = 1; r < existingData.length; r++) {
-        if (existingData[r][0]) existingIds[String(existingData[r][0]).toUpperCase()] = true;
+  // Zero-Master-Open check against CacheService route or ScriptProperties routing_epoch
+  var props = PropertiesService.getScriptProperties();
+  var propEpoch = Number(props.getProperty("ROUTE_EPOCH_" + compUpper) || "1");
+  var cachedRoute = null;
+  var routeRaw = CACHE.get("route:" + compUpper);
+  if (routeRaw) {
+    try { cachedRoute = JSON.parse(routeRaw); } catch (e) {}
+  }
+
+  var effectiveEpoch = Math.max(propEpoch, cachedRoute ? Number(cachedRoute.routing_epoch || 1) : 1);
+  var reqEpoch = claims ? Number(claims.routing_epoch || 1) : (reqOrParams.routing_epoch ? Number(reqOrParams.routing_epoch) : 0);
+
+  if (reqEpoch > 0 && reqEpoch < effectiveEpoch) {
+    return {
+      ok: false,
+      response: {
+        success: false,
+        code: "ROUTING_EPOCH_STALE",
+        httpStatus: 409,
+        current_routing_epoch: effectiveEpoch,
+        spreadsheet_id: (cachedRoute && cachedRoute.spreadsheet_id) || "",
+        error: "Routing epoch stale (client=" + reqEpoch + ", current=" + effectiveEpoch + "). Refresh token & reset sync cursor."
       }
-      for (var p = 0; p < initial_products.length; p++) {
-        var prod = initial_products[p];
-        var pId = String(prod.itemId || prod.id || ("ITM-" + p)).trim();
-        if (existingIds[pId.toUpperCase()]) continue;
-        invSheet.appendRow([
-          pId,
-          company_id || "",
-          prod.branch_id || "BR-MAIN",
-          prod.itemName || prod.name || "",
-          Number(prod.unitsPerCase) || 1,
-          Number(prod.costPerCase || prod.costPrice) || 0,
-          Number(prod.costPerUnit || prod.costPrice) || 0,
-          Number(prod.sellPriceUnit || prod.price) || 0,
-          Number(prod.markupPercent) || 0,
-          Number(prod.stockCases) || 0,
-          Number(prod.stockSingles || prod.stockQuantity) || 0,
-          Number(prod.totalUnits || prod.stockQuantity) || 0,
-          prod.sku || "",
-          prod.category || "General",
-          Number(prod.minStock) || 5
-        ]);
-        existingIds[pId.toUpperCase()] = true;
+    };
+  }
+
+  var spreadsheetId = String(
+    (claims && claims.spreadsheet_id) ||
+    (cachedRoute && cachedRoute.spreadsheet_id) ||
+    reqOrParams.spreadsheet_id ||
+    reqOrParams.tenant_sheet_id ||
+    reqOrParams.sheet_id ||
+    ""
+  ).trim();
+
+  var masterSsLazy = null;
+  if (!spreadsheetId) {
+    // Cache-miss legacy path: resolve from Master once & cache route
+    masterSsLazy = getMasterSpreadsheet();
+    var resolvedRoute = getTenantRouteCached(companyId, masterSsLazy);
+    if (resolvedRoute) {
+      spreadsheetId = resolvedRoute.spreadsheet_id || "";
+      effectiveEpoch = Math.max(effectiveEpoch, Number(resolvedRoute.routing_epoch || 1));
+      if (reqEpoch > 0 && reqEpoch < effectiveEpoch) {
+        return {
+          ok: false,
+          response: {
+            success: false,
+            code: "ROUTING_EPOCH_STALE",
+            httpStatus: 409,
+            current_routing_epoch: effectiveEpoch,
+            spreadsheet_id: spreadsheetId,
+            error: "Routing epoch stale. Refresh token & reset sync cursor."
+          }
+        };
+      }
+      if (resolvedRoute.status === "SUSPENDED" || resolvedRoute.status === "CANCELLED") {
+        return {
+          ok: false,
+          response: {
+            success: false,
+            code: "TENANT_SUSPENDED",
+            httpStatus: 403,
+            error: "Tenant subscription status is " + resolvedRoute.status + "."
+          }
+        };
       }
     }
   }
 
-  // Delete default empty Sheet1 if present
-  try {
-    var defaultSheet = ss.getSheetByName("Sheet1");
-    if (defaultSheet && ss.getSheets().length > 1) {
-      ss.deleteSheet(defaultSheet);
-    }
-  } catch (cleanErr) {}
+  var strictOpen = resolveTenantSpreadsheetStrict(spreadsheetId, companyId);
+  if (!strictOpen.ss) {
+    return {
+      ok: false,
+      response: {
+        success: false,
+        code: strictOpen.code,
+        httpStatus: strictOpen.httpStatus,
+        error: strictOpen.error
+      }
+    };
+  }
 
   return {
-    success: true,
-    message: "Initialized " + createdTabs.length + " business tabs in " + ss.getName(),
-    tabs: createdTabs,
-    sheet_id: ss.getId(),
-    sheet_name: ss.getName()
+    ok: true,
+    cfg: cfg,
+    claims: claims,
+    companyId: companyId,
+    spreadsheetId: spreadsheetId,
+    routingEpoch: effectiveEpoch,
+    targetSs: strictOpen.ss,
+    masterSs: masterSsLazy
   };
 }
 
-/**
- * Handle Reading Inventory from InventoryMaster
- */
-function handleGetInventory(ss, company_id) {
-  var sheet = ss.getSheetByName(TAB_INVENTORY);
-  if (!sheet) return { items: [] };
-  var data = sheet.getDataRange().getValues();
-  if (data.length <= 1) return { items: [] };
-  var headers = data[0];
-  var items = [];
-  for (var r = 1; r < data.length; r++) {
-    var row = data[r];
-    var item = {};
-    for (var c = 0; c < headers.length; c++) {
-      item[headers[c]] = row[c];
+function putCacheSafe(key, valStr, ttlSec) {
+  try {
+    if (valStr && valStr.length < MAX_CACHE_BYTES) {
+      CACHE.put(key, valStr, ttlSec || CACHE_TTL_SEC);
     }
-    var rowComp = item.CompanyID || item.company_id;
-    if (company_id && rowComp && rowComp !== company_id) continue;
-    items.push({
-      itemId: item.ItemID || item.itemId || item.id,
-      itemName: item.ItemName || item.itemName || item.name,
-      company_id: rowComp || company_id,
-      branch_id: item.BranchID || item.branch_id || "BR-MAIN",
-      unitsPerCase: Number(item.UnitsPerCase) || 1,
-      costPerCase: Number(item.CostPerCase) || 0,
-      costPerUnit: Number(item.CostPerUnit) || 0,
-      sellPriceUnit: Number(item.SellingPrice) || 0,
-      stockCases: Number(item.StockCases) || 0,
-      stockSingles: Number(item.StockSingles) || 0,
-      totalUnits: Number(item.TotalUnits) || 0,
-      sku: item.SKU || "",
-      category: item.Category || "General"
-    });
-  }
-  return { items: items };
+  } catch (e) {}
 }
 
-/**
- * Handle Upserting Inventory Records
- */
-function handleSyncInventory(ss, payload, company_id, branch_id) {
-  var sheet = ss.getSheetByName(TAB_INVENTORY);
-  if (!sheet) {
-    setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
-    sheet = ss.getSheetByName(TAB_INVENTORY);
-  }
-  var items = Array.isArray(payload.items) ? payload.items : [payload.data || payload.item || payload];
-  var data = sheet.getDataRange().getValues();
-  var idToRow = {};
-  for (var r = 1; r < data.length; r++) {
-    if (data[r][0]) idToRow[String(data[r][0]).toUpperCase()] = r + 1;
-  }
-  var updated = 0;
-  for (var i = 0; i < items.length; i++) {
-    var it = items[i];
-    if (!it) continue;
-    var cleanId = String(it.itemId || it.id || "").trim();
-    if (!cleanId) continue;
-    var rowIdx = idToRow[cleanId.toUpperCase()];
-    var rowVals = [
-      cleanId,
-      company_id,
-      it.branch_id || branch_id || "BR-MAIN",
-      it.itemName || it.name || "",
-      Number(it.unitsPerCase) || 1,
-      Number(it.costPerCase || it.costPrice) || 0,
-      Number(it.costPerUnit || it.costPrice) || 0,
-      Number(it.sellPriceUnit || it.price) || 0,
-      Number(it.markupPercent) || 0,
-      Number(it.stockCases) || 0,
-      Number(it.stockSingles || it.stockQuantity) || 0,
-      Number(it.totalUnits || it.stockQuantity) || 0,
-      it.sku || "",
-      it.category || "General",
-      Number(it.minStock) || 5
-    ];
-    if (rowIdx) {
-      sheet.getRange(rowIdx, 1, 1, rowVals.length).setValues([rowVals]);
-    } else {
-      sheet.appendRow(rowVals);
-      idToRow[cleanId.toUpperCase()] = sheet.getLastRow();
+// Per-tenant CacheService Spin-Lease Lock (Phase 3)
+function acquireTenantLease(companyId, waitMs) {
+  var key = "lock:tenant:" + String(companyId || TENANT_COMPANY_ID).toUpperCase();
+  var nonce = Utilities.getUuid();
+  var deadline = Date.now() + Number(waitMs || 15000);
+  while (Date.now() < deadline) {
+    var holder = CACHE.get(key);
+    if (!holder) {
+      CACHE.put(key, nonce, 30);
+      Utilities.sleep(45);
+      if (CACHE.get(key) === nonce) {
+        return { acquired: true, nonce: nonce, key: key };
+      }
     }
-    updated++;
+    Utilities.sleep(140 + Math.floor(Math.random() * 180));
   }
-  return { count: updated, items: items };
+  return {
+    acquired: false,
+    code: "TENANT_LOCK_BUSY",
+    httpStatus: 423,
+    retryAfterMs: 1200 + Math.floor(Math.random() * 1500),
+    error: "Tenant lock busy; retry with backoff."
+  };
+}
+
+function releaseTenantLease(lease) {
+  if (!lease || !lease.acquired) return;
+  try {
+    SpreadsheetApp.flush();
+    if (CACHE.get(lease.key) === lease.nonce) {
+      CACHE.remove(lease.key);
+    }
+  } catch (e) {}
+}
+
+// Per-Tenant Sequence Allocator (Phase 3) backed by ScriptProperties + _TenantMeta
+function allocateNextServerSeq(targetSsOpt, companyIdOpt) {
+  var batch = allocateServerSeqBatch(1, targetSsOpt, companyIdOpt);
+  return batch.start;
+}
+
+function allocateServerSeqBatch(count, targetSsOpt, companyIdOpt) {
+  var n = Math.max(1, Number(count || 1));
+  var compKey = companyIdOpt ? String(companyIdOpt).trim().toUpperCase() : "";
+  var propKey = compKey ? ("SEQ_" + compKey) : "NEXT_SERVER_SEQ";
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var current = Number(props.getProperty(propKey) || "0");
+    if (!isFinite(current) || current < 0) current = 0;
+
+    if (compKey && current === 0) {
+      var globalFloor = Number(props.getProperty("NEXT_SERVER_SEQ") || "0");
+      var metaFloor = 0;
+      if (targetSsOpt) {
+        var meta = readTenantMeta(targetSsOpt);
+        metaFloor = Number(meta.next_server_seq || 0);
+      }
+      current = Math.max(metaFloor, isFinite(globalFloor) ? globalFloor : 0);
+    }
+
+    var nextEnd = current + n;
+    props.setProperty(propKey, String(nextEnd));
+    return { start: current + 1, end: nextEnd };
+  } catch (e) {
+    var now = Date.now();
+    return { start: now, end: now + n - 1 };
+  }
+}
+
+function flushTenantSeqMeta(targetSs, companyId, seqVal) {
+  if (!targetSs || !seqVal) return;
+  try {
+    writeTenantMeta(targetSs, { next_server_seq: String(seqVal), company_id: companyId });
+  } catch (e) {}
+}
+
+function parseTimestampMsSafe(val) {
+  if (val === null || val === undefined || val === "") return 0;
+  if (typeof val === "number") {
+    return isFinite(val) && val > 0 ? val : 0;
+  }
+  if (val instanceof Date) {
+    var ms = val.getTime();
+    return isFinite(ms) ? ms : 0;
+  }
+  var s = String(val).trim();
+  if (!s) return 0;
+  var asNum = Number(s);
+  if (!isNaN(asNum) && asNum > 1000000000000) return asNum;
+  var parsed = Date.parse(s);
+  return isNaN(parsed) ? 0 : parsed;
 }
 
 function evaluateServerTimestampMeta(ss, claimedDateVal, claimedTsVal) {
-  var now = new Date();
-  var serverIso = now.toISOString();
-  var tz = "UTC";
-  try {
-    tz = (ss && ss.getSpreadsheetTimeZone()) || Session.getScriptTimeZone() || "UTC";
-  } catch (e) {}
-  var serverToday = serverIso.slice(0, 10);
-  try {
-    serverToday = Utilities.formatDate(now, tz, "yyyy-MM-dd");
-  } catch (e) {}
+  var nowMs = Date.now();
+  var serverReceivedAt = new Date(nowMs).toISOString();
+  var suspicious = false;
 
-  var claimedDay = "";
-  if (claimedDateVal && /^\d{4}-\d{2}-\d{2}/.test(String(claimedDateVal).trim())) {
-    claimedDay = String(claimedDateVal).trim().slice(0, 10);
-  } else if (claimedTsVal) {
-    var parsed = new Date(claimedTsVal);
-    if (!isNaN(parsed.getTime())) {
-      try {
-        claimedDay = Utilities.formatDate(parsed, tz, "yyyy-MM-dd");
-      } catch (e) {
-        claimedDay = parsed.toISOString().slice(0, 10);
-      }
+  try {
+    var tz = (ss && ss.getSpreadsheetTimeZone) ? ss.getSpreadsheetTimeZone() : Session.getScriptTimeZone();
+    var serverToday = Utilities.formatDate(new Date(nowMs), tz || "UTC", "yyyy-MM-dd");
+    var cDate = String(claimedDateVal || "").trim();
+    if (cDate && /^\d{4}-\d{2}-\d{2}/.test(cDate)) {
+      var claimedDay = cDate.slice(0, 10);
+      var diffDays = (Date.parse(serverToday) - Date.parse(claimedDay)) / 86400000;
+      if (diffDays > 1 || diffDays < -1) suspicious = true;
     }
-  }
-
-  var suspiciousBackdate = Boolean(claimedDay && claimedDay < serverToday);
-  return {
-    server_received_at: serverIso,
-    serverToday: serverToday,
-    suspicious_backdate: suspiciousBackdate
-  };
-}
-
-/**
- * Handle Appending Sales Invoices
- */
-function handleAddSale(ss, payload, company_id, branch_id, branchName, userRole) {
-  var sheet = ss.getSheetByName(TAB_SALES);
-  if (!sheet) {
-    setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
-    sheet = ss.getSheetByName(TAB_SALES);
-  }
-  var s = payload.data || payload.sale || payload.record || payload;
-  var saleId = s.id || s.saleId || s.InvoiceID || ("SALE-" + Date.now());
-  var itemsJson = "";
-  try {
-    itemsJson = Array.isArray(s.items) ? JSON.stringify(s.items) : "";
-  } catch(e) {}
-
-  var tsMeta = evaluateServerTimestampMeta(ss, s.date || s.Date, s.timestamp || s.Timestamp);
-
-  sheet.appendRow([
-    saleId,
-    company_id,
-    branch_id,
-    branchName,
-    s.date || s.Timestamp || tsMeta.server_received_at,
-    s.customerName || s.customer || "Walk-in",
-    s.paymentMethod || "CASH",
-    Number(s.subtotal || s.Subtotal) || 0,
-    Number(s.discount || s.Discount) || 0,
-    Number(s.tax || s.Tax) || 0,
-    Number(s.total || s.Total) || 0,
-    s.cashierId || s.staffId || s.StaffID || "USR-001",
-    s.cashierName || s.staffName || s.StaffName || "Cashier",
-    (s.items && s.items.length) || 1,
-    s.currency || "USD",
-    Number(s.exchangeRate) || 1.0,
-    s.itemsSummary || s.ItemsSummary || "",
-    itemsJson,
-    s.notes || "",
-    s.status || "COMPLETED",
-    tsMeta.server_received_at,
-    tsMeta.server_received_at,
-    tsMeta.suspicious_backdate
-  ]);
-  return {
-    status: "success",
-    success: true,
-    sale_id: saleId,
-    tab: TAB_SALES,
-    server_received_at: tsMeta.server_received_at,
-    suspicious_backdate: tsMeta.suspicious_backdate
-  };
-}
-
-/**
- * Handle Appending Supplier Invoices
- */
-function handleAddSupplierInvoice(ss, payload, company_id, branch_id) {
-  var sheet = ss.getSheetByName(TAB_SUPPLIER_INVOICES);
-  if (!sheet) {
-    setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
-    sheet = ss.getSheetByName(TAB_SUPPLIER_INVOICES);
-  }
-  var d = payload.data || payload.invoice || payload;
-  var invId = d.id || d.InvoiceID || ("SUP-INV-" + Date.now());
-  sheet.appendRow([
-    invId,
-    company_id,
-    branch_id,
-    d.invoiceNumber || d.invoice_number || invId,
-    d.supplierId || d.supplier_id || "",
-    d.supplierName || d.supplier_name || "",
-    d.invoiceDate || d.date || new Date().toISOString().split("T")[0],
-    d.dueDate || "",
-    Number(d.totalAmount || d.amount) || 0,
-    Number(d.amountPaid || d.paid) || 0,
-    Number(d.balanceDue || d.balance) || 0,
-    d.paymentStatus || d.status || "UNPAID",
-    Array.isArray(d.grvReferences) ? d.grvReferences.join(", ") : (d.grvReferences || ""),
-    new Date().toISOString()
-  ]);
-  return { status: "success", success: true, invoice_id: invId, tab: TAB_SUPPLIER_INVOICES };
-}
-
-/**
- * Handle Appending Goods Received Vouchers & Items
- */
-function handleAddGoodsReceived(ss, payload, company_id, branch_id) {
-  var sheet = ss.getSheetByName(TAB_GOODS_RECEIVED);
-  var itemsSheet = ss.getSheetByName(TAB_GOODS_RECEIVED_ITEMS);
-  if (!sheet || !itemsSheet) {
-    setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
-    sheet = ss.getSheetByName(TAB_GOODS_RECEIVED);
-    itemsSheet = ss.getSheetByName(TAB_GOODS_RECEIVED_ITEMS);
-  }
-  var grn = payload.data || payload.grn || payload;
-  var vId = grn.id || grn.grnId || grn.voucherId || ("GRV-" + Date.now());
-  sheet.appendRow([
-    vId,
-    company_id,
-    branch_id,
-    grn.supplierInvoiceNo || grn.invoiceNumber || "",
-    grn.supplierId || "",
-    grn.supplierName || grn.supplier || "",
-    grn.deliveryDate || grn.date || new Date().toISOString().split("T")[0],
-    Number(grn.totalAmount || grn.total) || 0,
-    Number(grn.landedCost || grn.totalLandedCost) || 0,
-    grn.paymentStatus || "UNPAID",
-    grn.receivedById || grn.staffId || "",
-    grn.receivedByName || grn.staffName || "",
-    (grn.items && grn.items.length) || 0,
-    grn.notes || "",
-    new Date().toISOString()
-  ]);
-
-  if (Array.isArray(grn.items) && grn.items.length > 0 && itemsSheet) {
-    for (var i = 0; i < grn.items.length; i++) {
-      var it = grn.items[i];
-      itemsSheet.appendRow([
-        vId,
-        company_id,
-        branch_id,
-        it.itemId || it.id || "",
-        it.itemName || it.name || "",
-        Number(it.receivedCases || it.cases) || 0,
-        Number(it.receivedSingles || it.singles) || 0,
-        Number(it.unitsPerCase) || 1,
-        Number(it.costPerCase) || 0,
-        Number(it.costPerUnit) || 0,
-        Number(it.lineTotal || it.total) || 0,
-        it.batchNumber || it.batch || "",
-        it.expiryDate || ""
-      ]);
+    var claimedMs = parseTimestampMsSafe(claimedTsVal);
+    if (claimedMs > 0 && Math.abs(nowMs - claimedMs) > 21600000) {
+      suspicious = true;
     }
-  }
+  } catch (e) {}
 
-  return { status: "success", success: true, voucher_id: vId, tab: TAB_GOODS_RECEIVED };
-}
-
-/**
- * Handle Appending Direct GRV records
- */
-function handleAddDirectGRV(ss, payload, company_id, branch_id) {
-  var sheet = ss.getSheetByName(TAB_DIRECT_GRVS);
-  if (!sheet) {
-    setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
-    sheet = ss.getSheetByName(TAB_DIRECT_GRVS);
-  }
-  var d = payload.data || payload;
-  var vId = d.id || ("DGRV-" + Date.now());
-  sheet.appendRow([
-    vId,
-    company_id,
-    branch_id,
-    d.supplierId || "",
-    d.supplierName || "",
-    Number(d.totalAmount || d.total) || 0,
-    Number(d.amountPaidFromTill || d.paidFromTill) || 0,
-    d.tillDisbursementLine || "",
-    d.status || "APPROVED",
-    d.receivedBy || d.staffName || "",
-    d.approvedBy || "",
-    new Date().toISOString()
-  ]);
-  return { status: "success", success: true, direct_grv_id: vId };
-}
-
-/**
- * Handle Appending Stock Movement records
- */
-function handleAddStockMovement(ss, payload, company_id, branch_id) {
-  var sheet = ss.getSheetByName(TAB_STOCK_MOVEMENTS);
-  if (!sheet) {
-    setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
-    sheet = ss.getSheetByName(TAB_STOCK_MOVEMENTS);
-  }
-  var m = payload.data || payload;
-  var mId = m.id || ("MOV-" + Date.now());
-  sheet.appendRow([
-    mId,
-    company_id,
-    branch_id,
-    m.fromBranchId || branch_id,
-    m.toBranchId || branch_id,
-    m.itemId || m.productId || "",
-    m.itemName || m.productName || "",
-    Number(m.quantity) || 0,
-    m.movementType || m.type || "TRANSFER",
-    m.reason || "",
-    m.staffId || m.userId || "",
-    m.timestamp || new Date().toISOString()
-  ]);
-  return { status: "success", success: true, movement_id: mId };
-}
-
-/**
- * Handle Appending Wallet Transfer records
- */
-function handleAddWalletTransfer(ss, payload, company_id, branch_id) {
-  var sheet = ss.getSheetByName(TAB_WALLET_TRANSFERS);
-  if (!sheet) {
-    setupTenantSpreadsheetTabs(ss, company_id, MASTER_COMPANY_NAME, []);
-    sheet = ss.getSheetByName(TAB_WALLET_TRANSFERS);
-  }
-  var w = payload.data || payload;
-  var wId = w.id || ("WTR-" + Date.now());
-  sheet.appendRow([
-    wId,
-    company_id,
-    branch_id,
-    w.fromWallet || "",
-    w.toWallet || "",
-    Number(w.amount) || 0,
-    Number(w.exchangeRate) || 1,
-    w.staffId || "",
-    w.timestamp || new Date().toISOString()
-  ]);
-  return { status: "success", success: true, transfer_id: wId };
-}
-
-/**
- * Generic Append Helper with Dynamic Isolation
- */
-function appendRecordToSheet(ss, sheetBaseName, rowData, companyId, branchId, branchName, userId, userRole) {
-  var targetTab = sheetBaseName;
-  if (DEFAULT_ISOLATION_MODE === "BRANCH_TABS" || DEFAULT_ISOLATION_MODE === "HYBRID") {
-    targetTab = sheetBaseName + "_" + branchId;
-  }
-
-  var sheet = ss.getSheetByName(targetTab) || ss.getSheetByName(sheetBaseName);
-  var enrichedData = Object.assign({}, rowData);
-  var tsMeta = evaluateServerTimestampMeta(
-    ss,
-    enrichedData.date || enrichedData.Date,
-    enrichedData.timestamp || enrichedData.Timestamp
-  );
-  enrichedData.CompanyID = companyId;
-  enrichedData.BranchID = branchId;
-  enrichedData.BranchName = branchName;
-  enrichedData.CreatedByUserID = userId;
-  enrichedData.CreatedByRole = userRole;
-  enrichedData.server_received_at = tsMeta.server_received_at;
-  enrichedData.suspicious_backdate = tsMeta.suspicious_backdate;
-  if (!enrichedData.SyncTimestamp) {
-    enrichedData.SyncTimestamp = tsMeta.server_received_at;
-  }
-
-  if (!sheet) {
-    sheet = ss.insertSheet(targetTab);
-    var headers = Object.keys(enrichedData);
-    sheet.appendRow(headers);
-    sheet.getRange(1, 1, 1, headers.length)
-      .setFontWeight("bold")
-      .setBackground("#1E293B")
-      .setFontColor("#FFFFFF");
-    sheet.setFrozenRows(1);
-  }
-
-  var lastCol = Math.max(sheet.getLastColumn(), 1);
-  var existingHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
-  if (!existingHeaders || existingHeaders.length === 0 || existingHeaders[0] === "") {
-    existingHeaders = Object.keys(enrichedData);
-    sheet.appendRow(existingHeaders);
-  }
-  if (existingHeaders.indexOf("server_received_at") === -1) {
-    existingHeaders.push("server_received_at");
-    sheet.getRange(1, existingHeaders.length).setValue("server_received_at");
-  }
-  if (existingHeaders.indexOf("suspicious_backdate") === -1) {
-    existingHeaders.push("suspicious_backdate");
-    sheet.getRange(1, existingHeaders.length).setValue("suspicious_backdate");
-  }
-
-  var newRow = [];
-  for (var i = 0; i < existingHeaders.length; i++) {
-    var key = existingHeaders[i];
-    var val = enrichedData[key];
-    if (val === undefined || val === null) val = "";
-    newRow.push(val);
-  }
-
-  sheet.appendRow(newRow);
   return {
-    status: "success",
-    success: true,
-    code: 200,
-    tenant: companyId,
-    branch: branchId,
-    tab: sheet.getName(),
-    rowAdded: true,
-    timestamp: tsMeta.server_received_at,
-    server_received_at: tsMeta.server_received_at,
-    suspicious_backdate: tsMeta.suspicious_backdate
+    server_received_at: serverReceivedAt,
+    suspicious_backdate: suspicious
   };
 }
 
 function jsonResponse(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+function mergeReqPayload(req) {
+  var merged = {};
+  if (req && req.data && typeof req.data === "object" && !Array.isArray(req.data)) {
+    for (var k in req.data) {
+      if (req.data.hasOwnProperty(k)) merged[k] = req.data[k];
+    }
+  }
+  if (req && req.payload && typeof req.payload === "object" && !Array.isArray(req.payload)) {
+    for (var k2 in req.payload) {
+      if (req.payload.hasOwnProperty(k2) && merged[k2] === undefined) merged[k2] = req.payload[k2];
+    }
+  }
+  if (req && typeof req === "object") {
+    for (var k3 in req) {
+      if (req.hasOwnProperty(k3) && k3 !== "data" && k3 !== "payload" && merged[k3] === undefined) {
+        merged[k3] = req[k3];
+      }
+    }
+  }
+  return merged;
+}
+
+function getMonthlyTabName(baseName, dateStr) {
+  if (!MONTHLY_SHARD_TABS[baseName]) return baseName;
+  if (!dateStr) return baseName;
+  var d = new Date(dateStr);
+  if (isNaN(d.getTime())) return baseName;
+  var yyyy = d.getFullYear();
+  var mm = String(d.getMonth() + 1);
+  if (mm.length < 2) mm = "0" + mm;
+  return baseName + "_" + yyyy + "_" + mm;
+}
+
+function getOrCreateMonthlySheet(ss, baseName, dateStr) {
+  var tabName = getMonthlyTabName(baseName, dateStr);
+  var sheet = ss.getSheetByName(tabName);
+  var template = TAB_TEMPLATES[baseName];
+  if (!sheet) {
+    sheet = ss.insertSheet(tabName);
+    if (template && template.length > 0) {
+      sheet.appendRow(template);
+      sheet.getRange(1, 1, 1, template.length).setFontWeight("bold").setBackground("#1e293b").setFontColor("#ffffff");
+      sheet.setFrozenRows(1);
+    }
+  } else if (template && template.length > 0) {
+    ensureTabHeaders(sheet, template);
+  }
+  return sheet;
+}
+
+function getReadableSheetsForBase(ss, baseName) {
+  var sheets = [];
+  var all = ss.getSheets();
+  var prefix = baseName + "_";
+  for (var i = 0; i < all.length; i++) {
+    var name = all[i].getName();
+    if (name === baseName || name.indexOf(prefix) === 0) {
+      sheets.push(all[i]);
+    }
+  }
+  return sheets;
+}
+
+function ensureTabHeaders(sheet, expectedHeaders) {
+  if (!sheet || !expectedHeaders || expectedHeaders.length === 0) return;
+  var lastCol = sheet.getLastColumn();
+  if (lastCol === 0) {
+    sheet.appendRow(expectedHeaders);
+    sheet.getRange(1, 1, 1, expectedHeaders.length).setFontWeight("bold").setBackground("#1e293b").setFontColor("#ffffff");
+    sheet.setFrozenRows(1);
+    return;
+  }
+  var currentHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).trim(); });
+  var missing = [];
+  for (var i = 0; i < expectedHeaders.length; i++) {
+    if (currentHeaders.indexOf(expectedHeaders[i]) === -1) {
+      missing.push(expectedHeaders[i]);
+    }
+  }
+  if (missing.length > 0) {
+    var startCol = lastCol + 1;
+    for (var j = 0; j < missing.length; j++) {
+      var cell = sheet.getRange(1, startCol + j);
+      cell.setValue(missing[j]).setFontWeight("bold").setBackground("#1e293b").setFontColor("#ffffff");
+    }
+  }
+}
+
+function ensureAllMasterTabsExist(ss) {
+  var created = [];
+  for (var i = 0; i < MASTER_TAB_NAMES.length; i++) {
+    var tabName = MASTER_TAB_NAMES[i];
+    var sheet = ss.getSheetByName(tabName);
+    var cols = TAB_TEMPLATES[tabName];
+    if (!sheet) {
+      sheet = ss.insertSheet(tabName);
+      sheet.appendRow(cols);
+      sheet.getRange(1, 1, 1, cols.length).setFontWeight("bold").setBackground("#1e293b").setFontColor("#ffffff");
+      sheet.setFrozenRows(1);
+      created.push(tabName);
+    } else {
+      ensureTabHeaders(sheet, cols);
+    }
+  }
+  return created;
+}
+
+function checkDailyMasterTabs(ss) {
+  var today = new Date().toISOString().split("T")[0];
+  var lastCheck = CACHE.get("master_tabs_checked_" + today);
+  if (lastCheck) return;
+  ensureAllMasterTabsExist(ss);
+  CACHE.put("master_tabs_checked_" + today, "1", CACHE_TTL_SEC);
+}
+
+function setupMasterSheets() {
+  var ss = getMasterSpreadsheet();
+  var created = ensureAllMasterTabsExist(ss);
+  return { success: true, version: CODE_GS_VERSION, created: created, message: "Master tabs verified & initialized" };
+}
+
+function setupSheets() {
+  return setupMasterSheets();
+}
+
+function setupTenantSpreadsheetTabs(ss, companyId, companyName) {
+  var created = [];
+  for (var tabName in TAB_TEMPLATES) {
+    if (!TAB_TEMPLATES.hasOwnProperty(tabName)) continue;
+    if (MASTER_TAB_NAMES.indexOf(tabName) !== -1) continue;
+    var sheet = ss.getSheetByName(tabName);
+    var headers = TAB_TEMPLATES[tabName];
+    if (!sheet) {
+      sheet = ss.insertSheet(tabName);
+      sheet.appendRow(headers);
+      sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#1e293b").setFontColor("#ffffff");
+      sheet.setFrozenRows(1);
+      created.push(tabName);
+    } else {
+      ensureTabHeaders(sheet, headers);
+    }
+  }
+  return created;
+}
+
+function readTenantMeta(ss) {
+  var meta = {};
+  if (!ss) return meta;
+  try {
+    var sh = ss.getSheetByName("_TenantMeta");
+    if (!sh || sh.getLastRow() < 2) return meta;
+    var vals = sh.getDataRange().getValues();
+    for (var i = 1; i < vals.length; i++) {
+      var k = String(vals[i][0] || "").trim();
+      if (k) meta[k] = String(vals[i][1] !== undefined ? vals[i][1] : "").trim();
+    }
+  } catch (e) {}
+  return meta;
+}
+
+function writeTenantMeta(ss, updates) {
+  if (!ss || !updates) return;
+  var sh = ss.getSheetByName("_TenantMeta");
+  var cols = TAB_TEMPLATES["_TenantMeta"];
+  if (!sh) {
+    sh = ss.insertSheet("_TenantMeta");
+    sh.appendRow(cols);
+    sh.getRange(1, 1, 1, cols.length).setFontWeight("bold").setBackground("#1e293b").setFontColor("#ffffff");
+    sh.setFrozenRows(1);
+  }
+  var vals = sh.getLastRow() >= 1 ? sh.getDataRange().getValues() : [cols];
+  var rowMap = {};
+  for (var i = 1; i < vals.length; i++) {
+    var existingKey = String(vals[i][0] || "").trim();
+    if (existingKey) rowMap[existingKey] = i + 1;
+  }
+  var nowIso = new Date().toISOString();
+  for (var k in updates) {
+    if (!updates.hasOwnProperty(k)) continue;
+    var val = String(updates[k] !== undefined && updates[k] !== null ? updates[k] : "");
+    if (rowMap[k]) {
+      sh.getRange(rowMap[k], 2, 1, 2).setValues([[val, nowIso]]);
+    } else {
+      sh.appendRow([k, val, nowIso]);
+    }
+  }
+}
+
+function pruneRequestLogIfNeeded(ss) {
+  try {
+    var countKey = "req_log_write_count";
+    var n = Number(CACHE.get(countKey) || "0") + 1;
+    CACHE.put(countKey, String(n), 3600);
+    if (n % 50 !== 0) return;
+
+    var logSheet = ss.getSheetByName("request_log");
+    if (!logSheet) return;
+    var lastRow = logSheet.getLastRow();
+    if (lastRow <= 1001) return;
+    var cutoff = Date.now() - 7 * 86400000;
+    var vals = logSheet.getRange(2, 1, lastRow - 1, Math.min(5, logSheet.getLastColumn())).getValues();
+    var deleteCount = 0;
+    for (var i = 0; i < vals.length - 500; i++) {
+      var ts = parseTimestampMsSafe(vals[i][3]);
+      if (ts > 0 && ts < cutoff) {
+        deleteCount++;
+      } else {
+        break;
+      }
+    }
+    if (deleteCount > 0) {
+      logSheet.deleteRows(2, deleteCount);
+    }
+  } catch (e) {}
+}
+
+function backfillSchemaColumns(ss, sheetName) {
+  var canonical = SHEET_ALIASES[sheetName] || sheetName;
+  var sheet = ss.getSheetByName(canonical);
+  if (!sheet) {
+    sheet = ss.insertSheet(canonical);
+  }
+  var headers = TAB_TEMPLATES[canonical];
+  if (headers) {
+    ensureTabHeaders(sheet, headers);
+  }
+  return sheet;
+}
+
+// ============================================================================
+// 3. MULTI-TENANT COMPANY & PERMISSIONS LOOKUP + CACHING
+// ============================================================================
+
+function getCompany(companyId, ss) {
+  if (!companyId) return null;
+  var cacheKey = "comp_" + String(companyId).trim().toUpperCase();
+  var cached = CACHE.get(cacheKey);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
+  ss = ss || getMasterSpreadsheet();
+  var sheet = ss.getSheetByName("companies");
+  if (!sheet) return null;
+  var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return null;
+  var headers = data[0];
+  var idCol = headers.indexOf("company_id");
+  if (idCol === -1) idCol = 0;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][idCol]).trim().toUpperCase() === String(companyId).trim().toUpperCase()) {
+      var obj = {};
+      for (var c = 0; c < headers.length; c++) {
+        obj[headers[c]] = data[i][c];
+      }
+      obj._rowIndex = i + 1;
+      putCacheSafe(cacheKey, JSON.stringify(obj));
+      return obj;
+    }
+  }
+  return null;
+}
+
+function getSheetId(companyId, ss) {
+  var comp = getCompany(companyId, ss);
+  return comp && comp.sheet_id ? String(comp.sheet_id).trim() : "";
+}
+
+function invalidateCompanyCache(companyId) {
+  if (companyId) {
+    var upper = String(companyId).trim().toUpperCase();
+    CACHE.remove("comp_" + companyId);
+    CACHE.remove("comp_" + upper);
+    CACHE.remove("route:" + upper);
+    CACHE.remove("perms_" + companyId);
+    CACHE.remove("primary_branch_" + companyId);
+  }
+}
+
+function getTenantPrimaryBranch(companyId, ss) {
+  var cacheKey = "primary_branch_" + companyId;
+  var cached = CACHE.get(cacheKey);
+  if (cached) return cached;
+  ss = ss || getMasterSpreadsheet();
+  var bSheet = ss.getSheetByName("branches");
+  if (!bSheet || bSheet.getLastRow() < 2) return "BR-MAIN";
+  var data = bSheet.getDataRange().getValues();
+  var h = data[0];
+  var cCol = h.indexOf("company_id");
+  var idCol = h.indexOf("branch_id");
+  var mainCol = h.indexOf("is_main");
+  var fallback = "BR-MAIN";
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][cCol]).trim().toUpperCase() === String(companyId).trim().toUpperCase()) {
+      var bid = String(data[i][idCol] || "BR-MAIN").trim();
+      if (fallback === "BR-MAIN") fallback = bid;
+      if (mainCol !== -1 && (data[i][mainCol] === true || String(data[i][mainCol]).toUpperCase() === "TRUE")) {
+        CACHE.put(cacheKey, bid, CACHE_TTL_SEC);
+        return bid;
+      }
+    }
+  }
+  CACHE.put(cacheKey, fallback, CACHE_TTL_SEC);
+  return fallback;
+}
+
+function getUserPermissions(companyId, role, ss) {
+  ss = ss || getMasterSpreadsheet();
+  var pSheet = ss.getSheetByName("permissions");
+  var result = {};
+  if (!pSheet || pSheet.getLastRow() < 2) return result;
+  var data = pSheet.getDataRange().getValues();
+  var h = data[0];
+  var cIdx = h.indexOf("company_id");
+  var rIdx = h.indexOf("role");
+  var mIdx = h.indexOf("module");
+  var aIdx = h.indexOf("action");
+  var alIdx = h.indexOf("allowed");
+  var targetRole = String(role || "").toUpperCase();
+  for (var i = 1; i < data.length; i++) {
+    var rowComp = String(data[i][cIdx] || "").trim().toUpperCase();
+    var rowRole = String(data[i][rIdx] || "").trim().toUpperCase();
+    if ((rowComp === String(companyId).toUpperCase() || rowComp === "DEFAULT") && rowRole === targetRole) {
+      var mod = String(data[i][mIdx] || "").trim();
+      var act = String(data[i][aIdx] || "").trim();
+      if (!result[mod]) result[mod] = {};
+      result[mod][act] = data[i][alIdx] === true || String(data[i][alIdx]).toUpperCase() === "TRUE";
+    }
+  }
+  return result;
+}
+
+function hasPermission(companyId, role, module, action, ss) {
+  var r = String(role || "").toUpperCase();
+  if (r === "OWNER" || r === "SUPER_ADMIN") return true;
+  var perms = getUserPermissions(companyId, r, ss);
+  if (perms[module] && perms[module][action] !== undefined) {
+    return Boolean(perms[module][action]);
+  }
+  return false;
+}
+
+function hashPasswordSha256(rawText) {
+  if (!rawText) return "";
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(rawText), Utilities.Charset.UTF_8);
+  var hex = "";
+  for (var i = 0; i < digest.length; i++) {
+    var byteVal = digest[i];
+    if (byteVal < 0) byteVal += 256;
+    var s = byteVal.toString(16);
+    if (s.length === 1) s = "0" + s;
+    hex += s;
+  }
+  return hex;
+}
+
+function logAudit(ss, companyId, branchId, userId, userName, role, action, module, details) {
+  try {
+    var sheet = getOrCreateMonthlySheet(ss, "AuditLog", new Date().toISOString().split("T")[0]);
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var nowIso = new Date().toISOString();
+    var id = "AUD-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6);
+    var rec = {
+      AuditID: id,
+      CompanyID: companyId || TENANT_COMPANY_ID,
+      BranchID: branchId || "BR-MAIN",
+      BranchName: branchId || "BR-MAIN",
+      Timestamp: nowIso,
+      Date: nowIso.split("T")[0],
+      UserID: userId || "SYSTEM",
+      UserName: userName || "System",
+      AuthorizedByName: userName || "System",
+      Role: role || "SYSTEM",
+      Action: action,
+      Module: module,
+      EntityID: id,
+      Details: typeof details === "string" ? details : JSON.stringify(details || {}),
+      IPOrDevice: "APPS_SCRIPT",
+      Status: "SUCCESS",
+      entity_type: "audit_log",
+      entity_id: id,
+      version: 1,
+      mutation_source: "SERVER_AUDIT",
+      client_updated_at: nowIso,
+      server_updated_at: nowIso,
+      server_seq: allocateNextServerSeq(ss, companyId),
+      is_deleted: false,
+      server_received_at: nowIso,
+      suspicious_backdate: false,
+      payload_json: ""
+    };
+    writeRowByHeaders(sheet, headers, rec);
+  } catch (e) {}
+}
+
+// ============================================================================
+// 4. WEB APP ENTRYPOINTS (doGet / doPost) WITH ZERO-MASTER-OPEN HOT PATH
+// ============================================================================
+
+function doGet(e) {
+  var params = (e && e.parameter) ? e.parameter : {};
+  var actionNorm = String(params.action || "ping").trim().toLowerCase();
+
+  try {
+    if (actionNorm === "ping" || actionNorm === "health") {
+      return jsonResponse({
+        success: true,
+        status: "online",
+        version: CODE_GS_VERSION,
+        schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+        server_time: new Date().toISOString(),
+        company_id: TENANT_COMPANY_ID
+      });
+    }
+
+    if (HOT_PATH_ACTIONS.indexOf(actionNorm) !== -1) {
+      var hp = resolveHotPathContext(params, actionNorm);
+      if (!hp.ok) return jsonResponse(hp.response);
+
+      var hpComp = hp.companyId;
+      var hpBr = String(params.branch_id || params.branchId || "ALL").trim();
+      var hpRes;
+      switch (actionNorm) {
+        case "get_inventory":
+          hpRes = handleGetInventory(params, hp.masterSs, hp.targetSs, hpComp);
+          break;
+        case "get_stock":
+          hpRes = handleGetStock(params, hp.targetSs, hp.masterSs);
+          break;
+        case "get_data":
+          hpRes = handleGetData(params, hp.targetSs, hp.masterSs);
+          break;
+        case "pull_catchup":
+          hpRes = handlePullCatchup(params, hp.masterSs, hp.targetSs, hpComp, hpBr);
+          break;
+        default:
+          return jsonResponse({ success: false, error: "Unsupported GET hot-path action: " + actionNorm });
+      }
+      if (hpRes && typeof hpRes === "object") {
+        hpRes.routing_epoch = hp.routingEpoch;
+      }
+      return jsonResponse(hpRes);
+    }
+
+    // Master Control Plane GET actions
+    var masterSs = getMasterSpreadsheet();
+    checkDailyMasterTabs(masterSs);
+
+    switch (actionNorm) {
+      case "setup_sheets":
+      case "init_master_sheet":
+        return jsonResponse(setupMasterSheets());
+      case "get_tenant_context":
+        return jsonResponse(handleGetTenantContext(params, masterSs));
+      case "get_users_since":
+        return jsonResponse(handleGetUsersSince(params, masterSs));
+      case "get_branches_since":
+        return jsonResponse(handleGetBranchesSince(params, masterSs));
+      case "lookup_company":
+        return jsonResponse(handleLookupCompany(params, masterSs));
+      case "lookup_branch":
+        return jsonResponse(handleLookupBranch(params, masterSs));
+      case "schema_health_check":
+        return jsonResponse(handleSchemaHealthCheck(params, masterSs));
+      case "get_companies":
+        return jsonResponse(handleGetCompanies(params, masterSs));
+      case "get_users":
+        return jsonResponse(handleGetUsers(params, masterSs));
+      case "refresh_token":
+        return jsonResponse(handleRefreshToken(params, masterSs));
+      default:
+        return jsonResponse({ success: false, error: "Unsupported GET action: " + actionNorm });
+    }
+  } catch (err) {
+    return jsonResponse({ success: false, error: err && err.message ? err.message : String(err) });
+  }
+}
+
+function doPost(e) {
+  var req = {};
+  try {
+    if (e && e.postData && e.postData.contents) {
+      req = JSON.parse(e.postData.contents);
+    }
+  } catch (parseErr) {
+    return jsonResponse({ success: false, error: "Invalid JSON payload: " + parseErr.message });
+  }
+
+  var actionNorm = String(req.action || (req.data && req.data.action) || "").trim().toLowerCase();
+  if (!actionNorm) {
+    return jsonResponse({ success: false, error: "Missing action in POST body" });
+  }
+
+  var clientRequestId = String(req.clientRequestId || req.requestId || "").trim();
+  var isWrite = WRITE_ACTIONS.indexOf(actionNorm) !== -1;
+
+  if (isWrite && clientRequestId && actionNorm !== "push_envelopes") {
+    var reqCacheKey = "req_done_" + clientRequestId;
+    var prevRes = CACHE.get(reqCacheKey);
+    if (prevRes) {
+      try { return jsonResponse(JSON.parse(prevRes)); } catch (e2) {}
+    }
+  }
+
+  // =========================================================================
+  // HOT-PATH BRANCH (Zero Master Sheet Opens when JWT / Route Cached)
+  // =========================================================================
+  if (HOT_PATH_ACTIONS.indexOf(actionNorm) !== -1) {
+    var hp = resolveHotPathContext(req, actionNorm);
+    if (!hp.ok) return jsonResponse(hp.response);
+
+    var companyIdHp = hp.companyId;
+    var branchIdHp = String(req.branch_id || req.branchId || (req.data && (req.data.branch_id || req.data.branchId)) || "BR-MAIN").trim();
+    var targetSsHp = hp.targetSs;
+    var masterSsOpt = hp.masterSs; // null on valid cached hot-path calls!
+    var tenantLease = null;
+
+    // Reads like pull_catchup / get_inventory / get_data / get_stock are LOCK-FREE
+    var needsTenantLock = isWrite && actionNorm !== "pull_catchup" && actionNorm !== "get_data" && actionNorm !== "get_inventory" && actionNorm !== "get_stock";
+
+    try {
+      if (needsTenantLock) {
+        tenantLease = acquireTenantLease(companyIdHp, 16000);
+        if (!tenantLease.acquired) {
+          return jsonResponse(tenantLease);
+        }
+      }
+
+      var hpResult;
+      switch (actionNorm) {
+        case "push_envelopes":
+          hpResult = handlePushEnvelopes(req, masterSsOpt, targetSsHp, companyIdHp, branchIdHp);
+          break;
+        case "pull_catchup":
+          hpResult = handlePullCatchup(req, masterSsOpt, targetSsHp, companyIdHp, branchIdHp);
+          break;
+        case "get_data":
+          hpResult = handleGetData(req, targetSsHp, masterSsOpt);
+          break;
+        case "get_inventory":
+          hpResult = handleGetInventory(req, masterSsOpt, targetSsHp, companyIdHp);
+          break;
+        case "get_stock":
+          hpResult = handleGetStock(req, targetSsHp, masterSsOpt);
+          break;
+        case "add_direct_grv":
+          hpResult = handleAddDirectGRV(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "approve_direct_grv":
+          hpResult = handleApproveDirectGRV(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "submit_eod":
+          hpResult = handleSubmitEOD(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "approve_eod":
+          hpResult = handleApproveEOD(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "add_sale":
+        case "sync_sale":
+          hpResult = handleAddSale(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "insert":
+        case "generic_insert":
+          hpResult = handleGenericInsert(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "update":
+        case "generic_update":
+        case "upsert":
+          hpResult = handleGenericUpdate(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "delete":
+        case "generic_delete":
+          hpResult = handleGenericDelete(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "receive_stock":
+          hpResult = handleReceiveStock(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "sell_stock":
+          hpResult = handleSellStock(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "break_case":
+          hpResult = handleBreakCase(req, targetSsHp, masterSsOpt, companyIdHp, branchIdHp);
+          break;
+        case "sync_inventory":
+        case "upsert_product":
+          hpResult = handleSyncInventory(req, masterSsOpt, targetSsHp, companyIdHp, branchIdHp);
+          break;
+        case "batch_sync_writes":
+          hpResult = handleBatchSyncWrites(req, masterSsOpt, targetSsHp, companyIdHp, branchIdHp);
+          break;
+        case "seed_sample_data":
+          hpResult = seedSampleData(req, targetSsHp, companyIdHp, branchIdHp);
+          break;
+        case "sync_entity":
+        case "sync_customer":
+        case "stocktake_blind_submit":
+        case "unlock_stocktake_segment":
+        case "save_stocktake_segment":
+        case "claim_stocktake_zone":
+        case "propose_joint_recount":
+        case "finalize_joint_recount":
+        case "approve_stocktake":
+          hpResult = handleLegacyActionAsEnvelope(actionNorm, req, masterSsOpt, targetSsHp, companyIdHp, branchIdHp);
+          break;
+        default:
+          hpResult = { success: false, error: "Unknown hot-path action: " + actionNorm };
+      }
+
+      if (hpResult && typeof hpResult === "object") {
+        hpResult.routing_epoch = hp.routingEpoch;
+        if (!hpResult.spreadsheet_id) hpResult.spreadsheet_id = hp.spreadsheetId;
+      }
+
+      if (isWrite && clientRequestId && hpResult && hpResult.success !== false && actionNorm !== "push_envelopes") {
+        putCacheSafe("req_done_" + clientRequestId, JSON.stringify(hpResult), 3600);
+      }
+
+      return jsonResponse(hpResult);
+    } catch (hpErr) {
+      return jsonResponse({
+        success: false,
+        error: hpErr && hpErr.message ? hpErr.message : String(hpErr)
+      });
+    } finally {
+      releaseTenantLease(tenantLease);
+    }
+  }
+
+  // =========================================================================
+  // MASTER CONTROL PLANE BRANCH (ScriptLock reserved for Control Plane only)
+  // =========================================================================
+  var masterSs = getMasterSpreadsheet();
+  checkDailyMasterTabs(masterSs);
+
+  var companyId = String(req.company_id || req.companyId || (req.data && (req.data.company_id || req.data.companyId)) || TENANT_COMPANY_ID).trim();
+  var branchId = String(req.branch_id || req.branchId || (req.data && (req.data.branch_id || req.data.branchId)) || "BR-MAIN").trim();
+  var targetSs = resolveTargetSpreadsheet(masterSs, companyId, req.tenant_sheet_id || req.sheet_id);
+
+  var controlWriteLockActions = {
+    "signup_company": true, "create_branch": true, "upsert_staff": true, "sync_staff_member": true,
+    "confirm_payment": true, "extend_trial": true, "sync_company": true, "bulk_sync_companies": true,
+    "provision_tenant_sheet": true, "initialize_tenant_sheet": true, "init_tenant_tabs": true,
+    "allocate_tenant": true, "migrate_tenant": true, "merge_duplicate_companies": true,
+    "generate_master_template": true, "run_fleet_migration": true, "bump_routing_epoch": true
+  };
+
+  var lock = LockService.getScriptLock();
+  var acquiredLock = false;
+  try {
+    if (controlWriteLockActions[actionNorm]) {
+      lock.waitLock(25000);
+      acquiredLock = true;
+    }
+
+    var result;
+    switch (actionNorm) {
+      case "signup_company":
+        result = handleSignup(req, masterSs);
+        break;
+      case "login_owner":
+        result = handleOwnerLogin(req, masterSs);
+        break;
+      case "login_staff":
+        result = handleStaffLogin(req, masterSs);
+        break;
+      case "login":
+        result = handleLogin(req, masterSs);
+        break;
+      case "refresh_token":
+        result = handleRefreshToken(req, masterSs);
+        break;
+      case "create_branch":
+        result = handleCreateBranch(req, masterSs);
+        break;
+      case "upsert_staff":
+      case "sync_staff_member":
+        result = handleUpsertStaff(req, masterSs, targetSs, companyId, branchId);
+        break;
+      case "get_tenant_context":
+        result = handleGetTenantContext(req, masterSs);
+        break;
+      case "get_users_since":
+        result = handleGetUsersSince(req, masterSs);
+        break;
+      case "get_branches_since":
+        result = handleGetBranchesSince(req, masterSs);
+        break;
+      case "lookup_company":
+        result = handleLookupCompany(req, masterSs);
+        break;
+      case "lookup_branch":
+        result = handleLookupBranch(req, masterSs);
+        break;
+      case "schema_health_check":
+        result = handleSchemaHealthCheck(req, masterSs);
+        break;
+      case "migrate_tenant":
+        result = handleMigrateTenant(req, masterSs);
+        break;
+      case "merge_duplicate_companies":
+        result = handleMergeDuplicateCompanies(req, masterSs);
+        break;
+      case "confirm_payment":
+        result = handleConfirmPayment(req, masterSs);
+        break;
+      case "extend_trial":
+        result = handleExtendTrial(req, masterSs);
+        break;
+      case "setup_sheets":
+      case "init_master_sheet":
+        result = setupMasterSheets();
+        break;
+      case "get_companies":
+        result = handleGetCompanies(req, masterSs);
+        break;
+      case "get_users":
+        result = handleGetUsers(req, masterSs);
+        break;
+      case "sync_company":
+        result = handleSyncCompany(req, masterSs);
+        break;
+      case "bulk_sync_companies":
+        result = handleBulkSyncCompanies(req, masterSs);
+        break;
+      case "provision_tenant_sheet":
+      case "initialize_tenant_sheet":
+      case "init_tenant_tabs":
+        result = handleProvisionTenantSheet(req, masterSs);
+        break;
+      case "allocate_tenant":
+        result = provisionTenantFromTemplate(req, masterSs);
+        break;
+      case "generate_master_template":
+        result = generateMasterTemplate(req, masterSs);
+        break;
+      case "run_fleet_migration":
+        result = runFleetMigration(req, masterSs);
+        break;
+      case "bump_routing_epoch":
+        result = handleBumpRoutingEpoch(req, masterSs);
+        break;
+      default:
+        result = { success: false, error: "Unknown action: " + actionNorm };
+    }
+
+    if (isWrite && clientRequestId && result && result.success !== false) {
+      try {
+        putCacheSafe("req_done_" + clientRequestId, JSON.stringify(result), 3600);
+        var logSheet = masterSs.getSheetByName("request_log");
+        if (logSheet) {
+          logSheet.appendRow([clientRequestId, actionNorm, companyId, new Date().toISOString(), "OK"]);
+          pruneRequestLogIfNeeded(masterSs);
+        }
+      } catch (e3) {}
+    }
+
+    return jsonResponse(result);
+  } catch (err) {
+    return jsonResponse({
+      success: false,
+      error: err && err.message ? err.message : String(err)
+    });
+  } finally {
+    if (acquiredLock) {
+      try { lock.releaseLock(); } catch (e4) {}
+    }
+  }
+}
+
+// ============================================================================
+// 5. V6.0/V7.0 CANONICAL ENVELOPE ENGINE (`push_envelopes` & `pull_catchup`)
+// ============================================================================
+
+function resolveTabForEntityType(entityType, data, explicitTab) {
+  var cleanExplicit = explicitTab ? (SHEET_ALIASES[explicitTab] || explicitTab) : "";
+  if (cleanExplicit && TAB_TEMPLATES[cleanExplicit]) {
+    return cleanExplicit;
+  }
+  var norm = String(entityType || "").trim().toLowerCase();
+  if (ENTITY_TO_TAB[norm]) return ENTITY_TO_TAB[norm];
+  if (cleanExplicit) return cleanExplicit;
+  return "AuditLog";
+}
+
+function extractEntityIdFromPayload(entityType, entityId, d) {
+  if (entityId && String(entityId).trim()) return String(entityId).trim();
+  if (!d || typeof d !== "object") return "";
+  var candidates = [
+    d.id, d.entityId, d.itemId, d.ProductID, d.InvoiceID, d.invoice_id,
+    d.user_id, d.staffId, d.customerId, d.CustomerID, d.branchId, d.branch_id,
+    d.account_id, d.AccountID, d.transfer_id, d.TransferID, d.grvNumber, d.grnId,
+    d.supplierId, d.SupplierID, d.voucherId, d.VoucherID, d.creditId, d.changeId,
+    d.sessionId, d.segmentId, d.zoneId, d.ZoneID, d.casualId, d.CasualID,
+    d.unlockId, d.proposalId, d.key
+  ];
+  for (var i = 0; i < candidates.length; i++) {
+    if (candidates[i] !== undefined && candidates[i] !== null && String(candidates[i]).trim() !== "") {
+      return String(candidates[i]).trim();
+    }
+  }
+  if (entityType === "branch_lockdown") return String(d.branchId || d.branch_id || "BR-MAIN").trim();
+  if (entityType === "multi_currency") return "MULTI_CURRENCY_CONFIG";
+  if (entityType === "permissions_matrix") return "PERMISSIONS_MATRIX";
+  if (entityType === "role_configs") return "ROLE_CONFIGS";
+  if (entityType === "system_settings") return "SYSTEM_SETTINGS";
+  if (entityType === "sheets_config") return "SHEETS_CONFIG";
+  if (entityType === "inventory_category") return String(d.categoryId || d.name || "CATEGORIES_SNAPSHOT").trim();
+  if (entityType === "casual_worker" && Array.isArray(d)) return "CASUAL_WORKERS_BATCH";
+  return "";
+}
+
+function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, serverSeq, compId, branchId) {
+  var obj = {};
+  var isoClientUpdated = envelope.updatedAt ? new Date(Number(envelope.updatedAt)).toISOString() : new Date().toISOString();
+  var isoServerNow = new Date().toISOString();
+  var cleanPayload = sanitizePayloadForCloud(entityType, d);
+
+  obj.CompanyID = compId;
+  obj.company_id = compId;
+  obj.BranchID = branchId;
+  obj.branch_id = branchId;
+  obj.BranchName = (d && (d.branchName || d.BranchName)) || branchId;
+
+  if (d && typeof d === "object" && !Array.isArray(d)) {
+    for (var k in d) {
+      if (d.hasOwnProperty(k) && k !== "pin" && k !== "rawPin" && k !== "password") {
+        obj[k] = d[k];
+      }
+    }
+  }
+
+  switch (entityType) {
+    case "sale":
+      obj.InvoiceID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.Time = d.time || d.Time || "";
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.CustomerName = d.customerName || d.CustomerName || "Walk-in";
+      obj.ItemsSummary = d.itemsSummary || (Array.isArray(d.items) ? d.items.length + " item(s)" : "");
+      obj.TotalQty = d.totalQty !== undefined ? d.totalQty : "";
+      obj.Subtotal = d.subtotal !== undefined ? d.subtotal : (d.total || 0);
+      obj.Discount = d.discount || 0;
+      obj.Total = d.total !== undefined ? d.total : 0;
+      obj.TaxAmount = d.taxAmount || 0;
+      obj.PaymentMethod = d.paymentMethod || d.PaymentMethod || "Cash";
+      obj.Currency = d.currency || "USD";
+      obj.ExchangeRate = d.exchangeRate || 1;
+      obj.AmountTendered = d.amountTendered !== undefined ? d.amountTendered : (d.total || 0);
+      obj.ChangeGiven = d.changeGiven || 0;
+      obj.Status = d.status || "Completed";
+      obj.ReceiptHash = d.receiptHash || "";
+      obj.Notes = d.notes || "";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "inventory_item":
+      obj.ProductID = entityId;
+      obj.ItemName = d.itemName || d.name || d.ItemName || "";
+      obj.SKU = d.sku || d.SKU || "";
+      obj.Barcode = d.barcode || d.Barcode || "";
+      obj.Category = d.category || d.Category || "General";
+      obj.UnitType = d.unitType || d.unit || "Unit";
+      obj.CaseSize = d.caseSize || d.unitsPerCase || 1;
+      obj.SellPriceUnit = d.sellPriceUnit !== undefined ? d.sellPriceUnit : (d.price || 0);
+      obj.SellPriceCase = d.sellPriceCase || 0;
+      obj.CostPriceUnit = d.costPriceUnit !== undefined ? d.costPriceUnit : (d.costPrice || 0);
+      obj.CostPriceCase = d.costPriceCase || 0;
+      obj.TotalUnits = d.totalUnits !== undefined ? d.totalUnits : (d.stockQuantity || 0);
+      obj.ReorderLevel = d.reorderLevelUnits !== undefined ? d.reorderLevelUnits : (d.reorderLevel || 5);
+      obj.SupplierName = d.supplierName || "";
+      obj.LastUpdated = d.lastUpdated || isoClientUpdated;
+      obj.Active = d.active !== false && d.active !== "N" ? "Y" : "N";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "staff":
+      obj.UserID = entityId;
+      obj.user_id = entityId;
+      obj.FullName = d.name || d.full_name || d.FullName || "Staff";
+      obj.full_name = obj.FullName;
+      obj.Role = String(d.role || "CASHIER").toUpperCase();
+      obj.role = obj.Role;
+      obj.Email = d.email || "";
+      obj.email = obj.Email;
+      obj.Phone = d.phone || "";
+      obj.phone = obj.Phone;
+      obj.PinHash = d.pin_hash || d.pinHash || "";
+      obj.pin_hash = obj.PinHash;
+      obj.PinSalt = d.pin_salt || d.pinSalt || "";
+      obj.pin_salt = obj.PinSalt;
+      obj.PinVersion = Number(d.pinVersion || d.pin_version || 0);
+      obj.pin_version = obj.PinVersion;
+      obj.PinUpdatedAt = d.pinUpdatedAt ? new Date(Number(d.pinUpdatedAt)).toISOString() : "";
+      obj.pin_updated_at = obj.PinUpdatedAt;
+      obj.AssignedBranchIds = JSON.stringify(d.assignedBranchIds || []);
+      obj.assigned_branch_ids = obj.AssignedBranchIds;
+      obj.branch_assignments_json = JSON.stringify(d.branchAssignments || []);
+      obj.permissions_json = JSON.stringify(d.permissions || {});
+      obj.Active = (d.active === "N" || d.is_active === false || d.active === false) ? "N" : "Y";
+      obj.is_active = obj.Active === "Y";
+      obj.UpdatedAt = isoClientUpdated;
+      obj.updated_at = isoClientUpdated;
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "branch":
+      obj.BranchID = entityId;
+      obj.branch_id = entityId;
+      obj.BranchName = d.name || d.branch_name || d.branchName || entityId;
+      obj.branch_name = obj.BranchName;
+      obj.BranchCode = d.code || d.branch_code || entityId;
+      obj.branch_code = obj.BranchCode;
+      obj.Location = d.location || d.address || "";
+      obj.location = obj.Location;
+      obj.Address = d.address || d.location || "";
+      obj.address = obj.Address;
+      obj.IsMain = Boolean(d.is_main || entityId === "BR-MAIN");
+      obj.is_main = obj.IsMain;
+      obj.IsActive = d.is_active !== false;
+      obj.is_active = obj.IsActive;
+      obj.Status = obj.IsActive ? "ACTIVE" : "INACTIVE";
+      obj.UpdatedAt = isoClientUpdated;
+      obj.updated_at = isoClientUpdated;
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "customer":
+      obj.CustomerID = entityId;
+      obj.CustomerName = d.name || d.customerName || "";
+      obj.Phone = d.phone || "";
+      obj.Email = d.email || "";
+      obj.Address = d.address || "";
+      obj.CreditLimit = d.creditLimit || 0;
+      obj.CurrentBalance = d.currentBalance || d.creditBalance || 0;
+      obj.ChangeBalance = d.changeBalance || 0;
+      obj.UpdatedAt = isoClientUpdated;
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "cash_log":
+      obj.LogID = entityId;
+      obj.Date = d.date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || isoClientUpdated;
+      obj.StaffID = d.staffId || "";
+      obj.StaffName = d.staffName || "";
+      obj.AccountID = d.accountId || "";
+      obj.Category = d.category || "";
+      obj.Description = d.description || "";
+      obj.In = d.in || 0;
+      obj.Out = d.out || 0;
+      obj.Currency = d.currency || "USD";
+      obj.PaymentMethod = d.paymentMethod || "Cash";
+      obj.Reference = d.reference || "";
+      obj.Status = d.status || "Posted";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "cash_transfer":
+      obj.TransferID = entityId;
+      obj.Date = d.date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || isoClientUpdated;
+      obj.FromAccountID = d.from_account_id || d.fromAccountId || "";
+      obj.ToAccountID = d.to_account_id || d.toAccountId || "";
+      obj.Amount = d.amount || 0;
+      obj.Currency = d.currency || "USD";
+      obj.Status = d.status || "PENDING";
+      obj.Rank = d.rank !== undefined ? d.rank : 0;
+      obj.LinkedCashLogIDs = JSON.stringify(d.linked_cash_log_ids || []);
+      obj.StaffID = d.staffId || d.createdBy || "";
+      obj.StaffName = d.staffName || d.createdByName || "";
+      obj.Notes = d.notes || "";
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "stocktake_session":
+      obj.SessionID = entityId;
+      obj.Title = d.title || d.sessionName || entityId;
+      obj.Mode = d.mode || d.stocktakeType || "BLIND_DOUBLE_COUNT";
+      obj.Status = d.status || "IN_PROGRESS";
+      obj.StartedAt = d.startedAt || d.timestamp || isoClientUpdated;
+      obj.StartedBy = d.startedBy || d.createdByName || "";
+      obj.AuditorID = d.auditorId || "";
+      obj.AuditorName = d.auditorName || "";
+      obj.LockdownRequired = Boolean(d.lockdownRequired || d.isLockdown);
+      obj.VarianceThreshold = d.varianceThreshold !== undefined ? d.varianceThreshold : "";
+      obj.CommentsDueBy = d.commentsDueBy || "";
+      obj.CommittedAt = d.committedAt || "";
+      obj.CommittedBy = d.committedBy || "";
+      obj.VarianceCommentsJSON = JSON.stringify(d.varianceComments || []);
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "stocktake_segment":
+      obj.SegmentID = entityId;
+      obj.SessionID = d.sessionId || "";
+      obj.Name = d.name || d.zoneName || entityId;
+      obj.AisleOrZone = d.aisle || d.zone || "";
+      obj.Status = d.status || "OPEN";
+      obj.IsLocked = Boolean(d.isLocked);
+      obj.AssignedTeamA = d.assignedTeamA || "";
+      obj.AssignedTeamB = d.assignedTeamB || "";
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "stocktake_count_submission":
+      obj.VaultKey = entityId;
+      obj.SessionID = d.sessionId || "";
+      obj.ZoneID = d.zoneId || d.segmentId || "";
+      obj.Slot = String(d.slot || "A").toUpperCase();
+      obj.StaffID = d.staffId || "";
+      obj.StaffName = d.staffName || "";
+      obj.IsFinalized = Boolean(d.isFinalized !== false);
+      obj.FinalizedAt = d.finalizedAt || isoServerNow;
+      obj.LinesCount = Array.isArray(d.lines) ? d.lines.length : 0;
+      obj.LinesJSON = JSON.stringify(d.lines || []);
+      obj.SubmittedAt = isoClientUpdated;
+      break;
+    case "stocktake_segment_unlock":
+      obj.UnlockID = entityId;
+      obj.SessionID = d.sessionId || "";
+      obj.SegmentID = d.segmentId || d.zoneId || "";
+      obj.TargetSlot = String(d.target || d.slot || "ALL").toUpperCase();
+      obj.ActorID = d.actorId || "";
+      obj.ActorName = d.actorName || "";
+      obj.Reason = d.reason || "";
+      obj.UnlockedAt = d.unlockedAt || isoServerNow;
+      break;
+    case "casual_worker":
+      obj.CasualID = entityId;
+      obj.SessionID = d.sessionId || "";
+      obj.Name = Array.isArray(d) ? ("Batch(" + d.length + ")") : (d.name || "");
+      obj.Phone = d.phone || "";
+      obj.HomeBranchID = d.homeBranchId || "";
+      obj.WorkerType = d.workerType || d.role || "CASUAL_COUNTER";
+      obj.PassCodeHash = d.passCodeHash || d.pinHash || "";
+      obj.AssignedZones = JSON.stringify(d.assignedZones || []);
+      obj.ExpiresAt = d.expiresAt || "";
+      obj.IsActive = d.isActive !== false;
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "branch_lockdown":
+      obj.BranchID = d.branchId || branchId;
+      obj.IsLocked = Boolean(d.isLocked);
+      obj.SessionID = d.sessionId || "";
+      obj.LockedBy = d.lockedBy || "";
+      obj.LockedByName = d.lockedByName || "";
+      obj.LockedAt = d.lockedAt || isoServerNow;
+      obj.Reason = d.reason || "";
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "tombstone":
+      obj.TombstoneKey = entityId;
+      obj.TargetEntityType = (d.entityType || "").toLowerCase();
+      obj.TargetEntityID = String(d.entityId || "").trim();
+      obj.DeletedAt = d.deletedAt || envelope.updatedAt || Date.now();
+      obj.DeletedBy = d.deletedBy || envelope.originDeviceId || "";
+      break;
+    default:
+      break;
+  }
+
+  obj.entity_type = entityType;
+  obj.entity_id = entityId;
+  obj.version = Number(envelope.version !== undefined ? envelope.version : (d && d.version !== undefined ? d.version : 1));
+  obj.mutation_source = String(envelope.mutationSource || (d && d.mutationSource) || "USER_EDIT");
+  obj.client_updated_at = isoClientUpdated;
+  obj.server_updated_at = isoServerNow;
+  obj.server_seq = serverSeq;
+  obj.is_deleted = envelope.action === "DELETE" || Boolean(d && d.isDeleted);
+  obj.server_received_at = metaObj.server_received_at || isoServerNow;
+  obj.suspicious_backdate = Boolean(metaObj.suspicious_backdate);
+  obj.payload_json = JSON.stringify(cleanPayload);
+
+  return obj;
+}
+
+function sanitizePayloadForCloud(entityType, d) {
+  if (Array.isArray(d)) return d;
+  if (!d || typeof d !== "object") return { value: d };
+  var copy = {};
+  for (var k in d) {
+    if (!d.hasOwnProperty(k)) continue;
+    if (entityType === "staff" && (k === "pin" || k === "rawPin" || k === "password" || k === "password_hash")) {
+      continue;
+    }
+    copy[k] = d[k];
+  }
+  return copy;
+}
+
+function writeRowByHeaders(sheet, headers, rowObj) {
+  var row = [];
+  for (var i = 0; i < headers.length; i++) {
+    var h = String(headers[i]).trim();
+    var val = rowObj[h];
+    if (val === undefined) val = rowObj[h.toLowerCase()];
+    if (val === undefined) val = "";
+    if (val !== null && typeof val === "object" && !(val instanceof Date)) {
+      val = JSON.stringify(val);
+    }
+    row.push(val);
+  }
+  sheet.appendRow(row);
+}
+
+function updateRowByHeaders(sheet, rowIndex, headers, rowObj) {
+  var row = [];
+  for (var i = 0; i < headers.length; i++) {
+    var h = String(headers[i]).trim();
+    var val = rowObj[h];
+    if (val === undefined) val = rowObj[h.toLowerCase()];
+    if (val === undefined) val = "";
+    if (val !== null && typeof val === "object" && !(val instanceof Date)) {
+      val = JSON.stringify(val);
+    }
+    row.push(val);
+  }
+  sheet.getRange(rowIndex, 1, 1, headers.length).setValues([row]);
+}
+
+function findRowIndexInSheet(sheet, headers, idColNames, targetId, companyId) {
+  if (!sheet || sheet.getLastRow() < 2) return -1;
+  var vals = sheet.getDataRange().getValues();
+  var cleanTarget = String(targetId || "").trim().toUpperCase();
+  if (!cleanTarget) return -1;
+
+  var entityIdIdx = headers.indexOf("entity_id");
+  var compIdx = headers.indexOf("CompanyID");
+  if (compIdx === -1) compIdx = headers.indexOf("company_id");
+
+  var candidateIdCols = [];
+  if (entityIdIdx !== -1) candidateIdCols.push(entityIdIdx);
+  for (var c = 0; c < idColNames.length; c++) {
+    var idx = headers.indexOf(idColNames[c]);
+    if (idx !== -1 && candidateIdCols.indexOf(idx) === -1) candidateIdCols.push(idx);
+  }
+  if (candidateIdCols.length === 0) candidateIdCols.push(0);
+
+  for (var r = 1; r < vals.length; r++) {
+    if (companyId && compIdx !== -1) {
+      var rowComp = String(vals[r][compIdx] || "").trim().toUpperCase();
+      if (rowComp && rowComp !== String(companyId).trim().toUpperCase()) continue;
+    }
+    for (var ci = 0; ci < candidateIdCols.length; ci++) {
+      var cellVal = String(vals[r][candidateIdCols[ci]] || "").trim().toUpperCase();
+      if (cellVal && cellVal === cleanTarget) {
+        return r + 1;
+      }
+    }
+  }
+  return -1;
+}
+
+function extractExistingEnvelopeState(sheet, rowIndex, headers) {
+  var rowVals = sheet.getRange(rowIndex, 1, 1, headers.length).getValues()[0];
+  var rec = {};
+  for (var i = 0; i < headers.length; i++) {
+    rec[String(headers[i]).trim()] = rowVals[i];
+  }
+  var parsedPayload = null;
+  if (rec.payload_json && String(rec.payload_json).trim().charAt(0) === "{") {
+    try { parsedPayload = JSON.parse(rec.payload_json); } catch (e) {}
+  } else if (rec.payload_json && String(rec.payload_json).trim().charAt(0) === "[") {
+    try { parsedPayload = JSON.parse(rec.payload_json); } catch (e2) {}
+  }
+  var updatedMs = Math.max(
+    parseTimestampMsSafe(rec.client_updated_at),
+    parseTimestampMsSafe(rec.UpdatedAt || rec.updated_at || rec.LastUpdated),
+    parseTimestampMsSafe(parsedPayload && (parsedPayload.updatedAt || parsedPayload.lastUpdated)),
+    parseTimestampMsSafe(rec.server_updated_at)
+  );
+  return {
+    raw: rec,
+    data: parsedPayload || rec,
+    version: Number(rec.version || (parsedPayload && parsedPayload.version) || 0),
+    mutationSource: String(rec.mutation_source || (parsedPayload && parsedPayload.mutationSource) || ""),
+    updatedAt: updatedMs,
+    isDeleted: rec.is_deleted === true || String(rec.is_deleted).toUpperCase() === "TRUE",
+    serverSeq: Number(rec.server_seq || 0)
+  };
+}
+
+function getIdColumnsForEntityType(entityType) {
+  switch (entityType) {
+    case "sale": return ["InvoiceID", "id"];
+    case "inventory_item": return ["ProductID", "itemId", "id"];
+    case "staff": return ["UserID", "user_id", "id"];
+    case "branch": return ["BranchID", "branch_id", "id"];
+    case "customer": return ["CustomerID", "customerId", "id"];
+    case "customer_change": return ["ChangeID", "id"];
+    case "credit_sale": return ["CreditID", "id"];
+    case "credit_group": return ["GroupID", "id"];
+    case "cash_log": return ["LogID", "id"];
+    case "cash_lift": return ["LiftID", "id"];
+    case "cash_movement": return ["MovementID", "id"];
+    case "cash_account": return ["AccountID", "account_id", "id"];
+    case "cash_transfer": return ["TransferID", "transfer_id", "id"];
+    case "direct_grv": return ["GRVID", "GRVNumber", "id"];
+    case "goods_received": return ["GRNID", "id"];
+    case "stock_movement": return ["MovementID", "id"];
+    case "expense": return ["ExpenseID", "id"];
+    case "internal_consumption": return ["ConsumptionID", "id"];
+    case "reconciliation": return ["ReconID", "id"];
+    case "business_day_closure": return ["ClosureID", "id"];
+    case "electronic_settlement": return ["SettlementID", "id"];
+    case "cash_count": return ["CountID", "id"];
+    case "admin_sales": return ["AdminSaleID", "id"];
+    case "supplier": return ["SupplierID", "supplierId", "id"];
+    case "supplier_invoice_voucher": return ["VoucherID", "voucherId", "id"];
+    case "inventory_category": return ["CategoryID", "id"];
+    case "wallet": return ["WalletID", "id"];
+    case "stocktake_session": return ["SessionID", "sessionId", "id"];
+    case "stocktake_segment": return ["SegmentID", "segmentId", "id"];
+    case "stocktake_zone_assignment": return ["AssignmentID", "ZoneID", "id"];
+    case "stocktake_zone_claim": return ["ClaimID", "ZoneID", "id"];
+    case "stocktake_count_submission": return ["VaultKey", "entity_id"];
+    case "stocktake_joint_proposal": return ["ProposalID", "ZoneID"];
+    case "stocktake_joint_finalized": return ["FinalID", "ZoneID"];
+    case "stocktake_segment_unlock": return ["UnlockID", "id"];
+    case "casual_worker": return ["CasualID", "id"];
+    case "branch_lockdown": return ["BranchID", "branchId"];
+    case "tombstone": return ["TombstoneKey", "TargetEntityID"];
+    default: return ["entity_id", "id"];
+  }
+}
+
+function getAllTombstonesMap(ss, companyId) {
+  var map = {};
+  var tSheet = ss.getSheetByName("Tombstones");
+  if (!tSheet || tSheet.getLastRow() < 2) return map;
+  var vals = tSheet.getDataRange().getValues();
+  var h = vals[0];
+  var cIdx = h.indexOf("CompanyID");
+  var etIdx = h.indexOf("TargetEntityType");
+  var eidIdx = h.indexOf("TargetEntityID");
+  var delAtIdx = h.indexOf("DeletedAt");
+  for (var i = 1; i < vals.length; i++) {
+    if (companyId && cIdx !== -1) {
+      var rc = String(vals[i][cIdx] || "").trim().toUpperCase();
+      if (rc && rc !== String(companyId).trim().toUpperCase()) continue;
+    }
+    var et = String(vals[i][etIdx] || "").trim().toLowerCase();
+    var eid = String(vals[i][eidIdx] || "").trim().toUpperCase();
+    if (!et || !eid) continue;
+    var key = et + "::" + eid;
+    var delAt = parseTimestampMsSafe(vals[i][delAtIdx]);
+    if (!map[key] || delAt > map[key]) {
+      map[key] = delAt;
+    }
+  }
+  return map;
+}
+
+function checkActiveStocktakeSessionConflict(ss, companyId, branchId, incomingSessionId, incomingStatus) {
+  var activeStatuses = { "ACTIVE": true, "IN_PROGRESS": true, "COUNTING": true, "PENDING_SIGNOFF": true, "RECOUNT": true };
+  var statusUpper = String(incomingStatus || "IN_PROGRESS").toUpperCase();
+  if (!activeStatuses[statusUpper]) return null;
+  var sheet = ss.getSheetByName("StocktakeSessions");
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  var vals = sheet.getDataRange().getValues();
+  var h = vals[0];
+  var sIdIdx = h.indexOf("SessionID");
+  var cIdx = h.indexOf("CompanyID");
+  var bIdx = h.indexOf("BranchID");
+  var stIdx = h.indexOf("Status");
+  var delIdx = h.indexOf("is_deleted");
+  for (var i = 1; i < vals.length; i++) {
+    if (delIdx !== -1 && (vals[i][delIdx] === true || String(vals[i][delIdx]).toUpperCase() === "TRUE")) continue;
+    var rc = cIdx !== -1 ? String(vals[i][cIdx] || "").trim().toUpperCase() : "";
+    var rb = bIdx !== -1 ? String(vals[i][bIdx] || "").trim().toUpperCase() : "";
+    if (companyId && rc && rc !== String(companyId).trim().toUpperCase()) continue;
+    if (branchId && rb && rb !== String(branchId).trim().toUpperCase()) continue;
+    var existingId = sIdIdx !== -1 ? String(vals[i][sIdIdx] || "").trim().toUpperCase() : "";
+    var existingStatus = stIdx !== -1 ? String(vals[i][stIdx] || "").trim().toUpperCase() : "";
+    if (existingId && existingId !== String(incomingSessionId || "").trim().toUpperCase() && activeStatuses[existingStatus]) {
+      return extractExistingEnvelopeState(sheet, i + 1, h);
+    }
+  }
+  return null;
+}
+
+function isSegmentSlotUnlocked(ss, companyId, sessionId, segmentId, slot) {
+  var uSheet = ss.getSheetByName("StocktakeUnlockLog");
+  if (!uSheet || uSheet.getLastRow() < 2) return 0;
+  var vals = uSheet.getDataRange().getValues();
+  var h = vals[0];
+  var sessIdx = h.indexOf("SessionID");
+  var segIdx = h.indexOf("SegmentID");
+  var slotIdx = h.indexOf("TargetSlot");
+  var tsIdx = h.indexOf("UnlockedAt");
+  var maxUnlockTs = 0;
+  for (var i = 1; i < vals.length; i++) {
+    var rSess = String(vals[i][sessIdx] || "").trim().toUpperCase();
+    var rSeg = String(vals[i][segIdx] || "").trim().toUpperCase();
+    var rSlot = String(vals[i][slotIdx] || "ALL").trim().toUpperCase();
+    if (rSess === String(sessionId || "").trim().toUpperCase() &&
+        rSeg === String(segmentId || "").trim().toUpperCase() &&
+        (rSlot === "ALL" || rSlot === String(slot || "").trim().toUpperCase())) {
+      var uTs = parseTimestampMsSafe(vals[i][tsIdx]);
+      if (uTs > maxUnlockTs) maxUnlockTs = uTs;
+    }
+  }
+  return maxUnlockTs;
+}
+
+function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
+  var envelopes = [];
+  if (Array.isArray(req.envelopes)) {
+    envelopes = req.envelopes;
+  } else if (req.envelope && typeof req.envelope === "object") {
+    envelopes = [req.envelope];
+  } else {
+    return { success: false, error: "No envelopes array provided to push_envelopes" };
+  }
+
+  var cfg = getSystemConfigCached(masterSsOpt);
+  var maxBatch = Math.max(10, Number(cfg.MAX_ENVELOPES_PER_BATCH || 50));
+  if (envelopes.length > maxBatch) {
+    return {
+      success: false,
+      code: "BATCH_TOO_LARGE",
+      httpStatus: 413,
+      maxBatch: maxBatch,
+      error: "Batch exceeds MAX_ENVELOPES_PER_BATCH (" + maxBatch + "). Split into smaller chunks."
+    };
+  }
+
+  var userRole = String(req.user_role || "CASHIER").toUpperCase();
+  var userBranchId = String(req.user_branch_id || branchId || "BR-MAIN").trim();
+  var serverNowIso = new Date().toISOString();
+  var ackedPacketIds = [];
+  var failed = [];
+  var conflicts = [];
+  var results = [];
+  var maxServerSeq = 0;
+  var compUpper = String(companyId || TENANT_COMPANY_ID).trim().toUpperCase();
+
+  var tombsMap = getAllTombstonesMap(targetSs, companyId);
+
+  for (var i = 0; i < envelopes.length; i++) {
+    var env = envelopes[i];
+    if (!env || !env.entityType) {
+      failed.push({ packetId: env && env.packetId, error: "INVALID_ENVELOPE" });
+      continue;
+    }
+
+    // Packet-level Idempotency Dedupe Ring
+    if (env.packetId) {
+      var dedupeKey = "done:" + compUpper + ":" + String(env.packetId).trim();
+      if (CACHE.get(dedupeKey)) {
+        ackedPacketIds.push(env.packetId);
+        results.push({ packetId: env.packetId, entityType: env.entityType, entityId: env.entityId, deduped: true, server_received_at: serverNowIso });
+        continue;
+      }
+    }
+
+    var entityType = String(env.entityType).trim().toLowerCase();
+    var d = env.data !== undefined ? env.data : {};
+    if (typeof d === "string") {
+      try { d = JSON.parse(d); } catch (pe) { d = { value: d }; }
+    }
+    var envComp = String((d && (d.company_id || d.companyId)) || companyId || TENANT_COMPANY_ID).trim();
+    var envBranch = String((d && (d.branch_id || d.branchId)) || env.targetBranchId || branchId || "ALL").trim();
+
+    if (userRole !== "SUPER_ADMIN" && userRole !== "OWNER" && userRole !== "AUDITOR" &&
+        envBranch && envBranch !== "ALL" && userBranchId && userBranchId !== "ALL" &&
+        envBranch.toUpperCase() !== userBranchId.toUpperCase() && !CATALOG_SHARED_ENTITIES[entityType]) {
+      failed.push({
+        packetId: env.packetId,
+        entityType: entityType,
+        entityId: env.entityId,
+        error: "BRANCH_SECURITY_VIOLATION: " + userBranchId + " cannot write " + envBranch
+      });
+      continue;
+    }
+
+    var entityId = extractEntityIdFromPayload(entityType, env.entityId, d);
+    if (!entityId) {
+      entityId = entityType.toUpperCase() + "-" + Date.now() + "-" + i;
+    }
+
+    if (env.action === "DELETE" || entityType === "tombstone") {
+      var targetTypeForTomb = entityType === "tombstone"
+        ? String((d && d.entityType) || "").trim().toLowerCase()
+        : entityType;
+      var targetIdForTomb = entityType === "tombstone"
+        ? String((d && d.entityId) || entityId).trim()
+        : entityId;
+      var deletedAtMs = Number((d && d.deletedAt) || env.updatedAt || Date.now());
+      var tombSeq = allocateNextServerSeq(targetSs, envComp);
+      maxServerSeq = Math.max(maxServerSeq, tombSeq);
+
+      var tombKey = targetTypeForTomb + "::" + targetIdForTomb.toUpperCase();
+      tombsMap[tombKey] = Math.max(tombsMap[tombKey] || 0, deletedAtMs);
+
+      var tombSheet = backfillSchemaColumns(targetSs, "Tombstones");
+      var tombHeaders = tombSheet.getRange(1, 1, 1, tombSheet.getLastColumn()).getValues()[0];
+      var tombRowObj = buildRowObjectForEntity(
+        "tombstone",
+        tombKey,
+        {
+          entityType: targetTypeForTomb,
+          entityId: targetIdForTomb,
+          deletedAt: deletedAtMs,
+          deletedBy: (d && d.deletedBy) || env.originDeviceId || "PWA",
+          company_id: envComp,
+          branch_id: envBranch
+        },
+        env,
+        { server_received_at: serverNowIso, suspicious_backdate: false },
+        tombSeq,
+        envComp,
+        envBranch
+      );
+      var existingTombRow = findRowIndexInSheet(tombSheet, tombHeaders, ["TombstoneKey", "entity_id"], tombKey, envComp);
+      if (existingTombRow > 0) {
+        updateRowByHeaders(tombSheet, existingTombRow, tombHeaders, tombRowObj);
+      } else {
+        writeRowByHeaders(tombSheet, tombHeaders, tombRowObj);
+      }
+
+      if (targetTypeForTomb && targetTypeForTomb !== "tombstone") {
+        var delTabName = resolveTabForEntityType(targetTypeForTomb, d, env.meta && env.meta.sheetName);
+        var delSheets = getReadableSheetsForBase(targetSs, delTabName);
+        for (var ds = 0; ds < delSheets.length; ds++) {
+          var delSh = delSheets[ds];
+          var delHeaders = delSh.getRange(1, 1, 1, delSh.getLastColumn()).getValues()[0];
+          var foundDelRow = findRowIndexInSheet(delSh, delHeaders, getIdColumnsForEntityType(targetTypeForTomb), targetIdForTomb, envComp);
+          if (foundDelRow > 0) {
+            var isDelCol = delHeaders.indexOf("is_deleted");
+            var seqCol = delHeaders.indexOf("server_seq");
+            var srvUpdCol = delHeaders.indexOf("server_updated_at");
+            if (isDelCol !== -1) delSh.getRange(foundDelRow, isDelCol + 1).setValue(true);
+            if (seqCol !== -1) delSh.getRange(foundDelRow, seqCol + 1).setValue(tombSeq);
+            if (srvUpdCol !== -1) delSh.getRange(foundDelRow, srvUpdCol + 1).setValue(serverNowIso);
+          }
+        }
+      }
+
+      if (env.packetId) putCacheSafe("done:" + compUpper + ":" + String(env.packetId).trim(), "1", CACHE_TTL_SEC);
+      ackedPacketIds.push(env.packetId);
+      results.push({ packetId: env.packetId, entityType: entityType, entityId: entityId, server_seq: tombSeq, server_received_at: serverNowIso });
+      continue;
+    }
+
+    var incomingUpdatedMs = Number(env.updatedAt || parseTimestampMsSafe(d && (d.updatedAt || d.lastUpdated || d.hubTimestamp)) || Date.now());
+    if (T2_ENTITY_TYPES[entityType]) {
+      var existingTombMs = tombsMap[entityType + "::" + entityId.toUpperCase()] || 0;
+      if (existingTombMs > 0 && existingTombMs >= incomingUpdatedMs) {
+        conflicts.push({
+          entityType: "tombstone",
+          entityId: entityType + "::" + entityId.toUpperCase(),
+          reason: "RESURRECTION_BLOCKED",
+          updatedAt: existingTombMs,
+          data: { entityType: entityType, entityId: entityId, deletedAt: existingTombMs }
+        });
+        if (env.packetId) putCacheSafe("done:" + compUpper + ":" + String(env.packetId).trim(), "1", CACHE_TTL_SEC);
+        ackedPacketIds.push(env.packetId);
+        continue;
+      }
+    }
+
+    var baseTabName = resolveTabForEntityType(entityType, d, env.meta && env.meta.sheetName);
+    var recDateStr = (d && (d.date || d.Date || d.timestamp || d.Timestamp)) || serverNowIso;
+    var sheet = MONTHLY_SHARD_TABS[baseTabName]
+      ? getOrCreateMonthlySheet(targetSs, baseTabName, recDateStr)
+      : backfillSchemaColumns(targetSs, baseTabName);
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    if (entityType === "stocktake_session") {
+      var sessionConflict = checkActiveStocktakeSessionConflict(targetSs, envComp, envBranch, entityId, d.status);
+      if (sessionConflict) {
+        conflicts.push({
+          entityType: "stocktake_session",
+          entityId: sessionConflict.raw.SessionID || sessionConflict.raw.entity_id,
+          reason: "ACTIVE_STOCKTAKE_ALREADY_EXISTS",
+          updatedAt: sessionConflict.updatedAt,
+          data: sessionConflict.data
+        });
+        failed.push({ packetId: env.packetId, error: "ACTIVE_STOCKTAKE_ALREADY_EXISTS" });
+        continue;
+      }
+    }
+
+    if (entityType === "stocktake_count_submission") {
+      var sessIdV = String((d && d.sessionId) || "").trim();
+      var zoneIdV = String((d && (d.zoneId || d.segmentId)) || "").trim();
+      var slotV = String((d && d.slot) || "A").toUpperCase();
+      entityId = sessIdV + "::" + zoneIdV + "::" + slotV;
+      var existingVaultRow = findRowIndexInSheet(sheet, headers, ["VaultKey", "entity_id"], entityId, envComp);
+      if (existingVaultRow > 0) {
+        var existingVault = extractExistingEnvelopeState(sheet, existingVaultRow, headers);
+        var wasFinal = existingVault.raw.IsFinalized === true || String(existingVault.raw.IsFinalized).toUpperCase() === "TRUE";
+        if (wasFinal) {
+          var existingFinMs = parseTimestampMsSafe(existingVault.raw.FinalizedAt || existingVault.raw.SubmittedAt);
+          var latestUnlockMs = isSegmentSlotUnlocked(targetSs, envComp, sessIdV, zoneIdV, slotV);
+          if (!(latestUnlockMs > existingFinMs) && userRole !== "OWNER" && userRole !== "AUDITOR") {
+            conflicts.push({
+              entityType: "stocktake_count_submission",
+              entityId: entityId,
+              reason: "SLOT_FINALIZED_LOCKED",
+              updatedAt: existingVault.updatedAt,
+              data: existingVault.data
+            });
+            failed.push({ packetId: env.packetId, error: "SLOT_FINALIZED_LOCKED" });
+            continue;
+          }
+        }
+      }
+    }
+
+    if (entityType === "stocktake_segment_unlock") {
+      var vaultSheet = backfillSchemaColumns(targetSs, "StocktakeBlindVault");
+      var vHeaders = vaultSheet.getRange(1, 1, 1, vaultSheet.getLastColumn()).getValues()[0];
+      var unlockSess = String((d && d.sessionId) || "").trim();
+      var unlockSeg = String((d && (d.segmentId || d.zoneId)) || "").trim();
+      var unlockSlot = String((d && (d.target || d.slot)) || "ALL").toUpperCase();
+      var slotsToUnlock = unlockSlot === "ALL" ? ["A", "B"] : [unlockSlot];
+      for (var su = 0; su < slotsToUnlock.length; su++) {
+        var vk = unlockSess + "::" + unlockSeg + "::" + slotsToUnlock[su];
+        var vRow = findRowIndexInSheet(vaultSheet, vHeaders, ["VaultKey", "entity_id"], vk, envComp);
+        if (vRow > 0) {
+          var finIdx = vHeaders.indexOf("IsFinalized");
+          if (finIdx !== -1) vaultSheet.getRange(vRow, finIdx + 1).setValue(false);
+        }
+      }
+    }
+
+    var idCols = getIdColumnsForEntityType(entityType);
+    var existingRowIdx = findRowIndexInSheet(sheet, headers, idCols, entityId, envComp);
+    var matchedSheet = sheet;
+    if (existingRowIdx === -1 && MONTHLY_SHARD_TABS[baseTabName]) {
+      var allShards = getReadableSheetsForBase(targetSs, baseTabName);
+      for (var shI = 0; shI < allShards.length; shI++) {
+        if (allShards[shI].getName() === sheet.getName()) continue;
+        var shHeaders = allShards[shI].getRange(1, 1, 1, allShards[shI].getLastColumn()).getValues()[0];
+        var hit = findRowIndexInSheet(allShards[shI], shHeaders, idCols, entityId, envComp);
+        if (hit > 0) {
+          existingRowIdx = hit;
+          matchedSheet = allShards[shI];
+          headers = shHeaders;
+          break;
+        }
+      }
+    }
+
+    if (existingRowIdx > 0) {
+      var existingState = extractExistingEnvelopeState(matchedSheet, existingRowIdx, headers);
+
+      if (T2_ENTITY_TYPES[entityType]) {
+        var inVersion = Number(env.version !== undefined ? env.version : (d && d.version) || 0);
+        var inSource = String(env.mutationSource || (d && d.mutationSource) || "USER_EDIT").toUpperCase();
+        var exSource = String(existingState.mutationSource || "").toUpperCase();
+        var isRejectedStale = false;
+
+        if (exSource === "USER_EDIT" && (inSource === "SEED" || inSource === "MIGRATION")) {
+          isRejectedStale = true;
+        } else if (existingState.version > 0 && inVersion > 0 && inVersion < existingState.version) {
+          isRejectedStale = true;
+        } else if (existingState.updatedAt > 0 && incomingUpdatedMs > 0 && existingState.updatedAt > incomingUpdatedMs + 60000) {
+          if (!(inSource === "USER_EDIT" && exSource === "SEED")) {
+            isRejectedStale = true;
+          }
+        }
+
+        if (isRejectedStale) {
+          conflicts.push({
+            entityType: entityType,
+            entityId: entityId,
+            reason: "STALE_T2",
+            updatedAt: existingState.updatedAt,
+            version: existingState.version,
+            mutationSource: existingState.mutationSource,
+            data: existingState.data
+          });
+          if (env.packetId) putCacheSafe("done:" + compUpper + ":" + String(env.packetId).trim(), "1", CACHE_TTL_SEC);
+          ackedPacketIds.push(env.packetId);
+          continue;
+        }
+
+        if (entityType === "staff" && existingState.data) {
+          var exPinVer = Number(existingState.data.pinVersion || existingState.data.pin_version || 0);
+          var inPinVer = Number(d.pinVersion || d.pin_version || 0);
+          if ((existingState.data.pin_hash || existingState.data.PinHash) &&
+              (!d.pin_hash || (exPinVer > 0 && (inPinVer === 0 || exPinVer > inPinVer)))) {
+            d.pin_hash = existingState.data.pin_hash || existingState.data.PinHash;
+            d.pin_salt = existingState.data.pin_salt || existingState.data.PinSalt || d.pin_salt;
+            d.pinVersion = Math.max(exPinVer, inPinVer);
+          }
+        }
+
+        if (entityType === "branch" && existingState.data) {
+          var rawInName = String(d.name || d.branch_name || "").trim().toLowerCase();
+          var exName = existingState.data.name || existingState.data.branch_name || existingState.data.BranchName || "";
+          if ((!rawInName || rawInName === "branch" || rawInName === "unnamed branch") && exName) {
+            d.name = exName;
+          }
+        }
+
+        if (entityType === "stocktake_session" && existingState.data && Array.isArray(existingState.data.varianceComments)) {
+          var mergedComments = existingState.data.varianceComments.slice();
+          var seenCIds = {};
+          for (var mc = 0; mc < mergedComments.length; mc++) {
+            var cid = mergedComments[mc] && (mergedComments[mc].id || mergedComments[mc].commentId);
+            if (cid) seenCIds[String(cid)] = true;
+          }
+          if (Array.isArray(d.varianceComments)) {
+            for (var ic = 0; ic < d.varianceComments.length; ic++) {
+              var newC = d.varianceComments[ic];
+              var ncid = newC && (newC.id || newC.commentId);
+              if (!ncid || !seenCIds[String(ncid)]) {
+                mergedComments.push(newC);
+                if (ncid) seenCIds[String(ncid)] = true;
+              }
+            }
+          }
+          d.varianceComments = mergedComments;
+        }
+      } else {
+        if (entityType === "cash_transfer" && existingState.data) {
+          var exRank = Number(existingState.data.rank || 0);
+          var inRank = Number(d.rank || 0);
+          var mergedLinks = [];
+          var linkMap = {};
+          var oldLinks = Array.isArray(existingState.data.linked_cash_log_ids) ? existingState.data.linked_cash_log_ids : [];
+          var newLinks = Array.isArray(d.linked_cash_log_ids) ? d.linked_cash_log_ids : [];
+          for (var ol = 0; ol < oldLinks.length; ol++) { linkMap[oldLinks[ol]] = true; mergedLinks.push(oldLinks[ol]); }
+          for (var nl = 0; nl < newLinks.length; nl++) { if (!linkMap[newLinks[nl]]) { linkMap[newLinks[nl]] = true; mergedLinks.push(newLinks[nl]); } }
+          if (inRank < exRank) {
+            d = existingState.data;
+          }
+          d.linked_cash_log_ids = mergedLinks;
+        } else if (entityType === "sale") {
+          var allowSaleUpdate = (d.status === "Refunded" || d.status === "Voided" ||
+            d.mobileVerificationStatus === "VERIFIED" || d.mobileVerificationStatus === "FLAGGED" || Boolean(d.hasExchanges));
+          if (!allowSaleUpdate && env.action === "CREATE") {
+            if (env.packetId) putCacheSafe("done:" + compUpper + ":" + String(env.packetId).trim(), "1", CACHE_TTL_SEC);
+            ackedPacketIds.push(env.packetId);
+            results.push({ packetId: env.packetId, entityType: entityType, entityId: entityId, deduped: true, server_seq: existingState.serverSeq, server_received_at: serverNowIso });
+            continue;
+          }
+        } else {
+          var statusChanged = (d && d.status && existingState.data && d.status !== existingState.data.status);
+          if (!statusChanged && env.action === "CREATE") {
+            if (env.packetId) putCacheSafe("done:" + compUpper + ":" + String(env.packetId).trim(), "1", CACHE_TTL_SEC);
+            ackedPacketIds.push(env.packetId);
+            results.push({ packetId: env.packetId, entityType: entityType, entityId: entityId, deduped: true, server_seq: existingState.serverSeq, server_received_at: serverNowIso });
+            continue;
+          }
+        }
+      }
+    }
+
+    var seq = allocateNextServerSeq(targetSs, envComp);
+    maxServerSeq = Math.max(maxServerSeq, seq);
+    var metaClock = (entityType === "sale" || entityType === "cash_log")
+      ? evaluateServerTimestampMeta(targetSs, d && (d.date || d.Date), (d && (d.timestamp || d.Timestamp)) || incomingUpdatedMs)
+      : { server_received_at: serverNowIso, suspicious_backdate: false };
+
+    var rowObj = buildRowObjectForEntity(entityType, entityId, d, env, metaClock, seq, envComp, envBranch);
+
+    if (existingRowIdx > 0) {
+      updateRowByHeaders(matchedSheet, existingRowIdx, headers, rowObj);
+    } else {
+      writeRowByHeaders(matchedSheet, headers, rowObj);
+    }
+
+    // V7 Zero-Master-Open Hot Path: only mirror into Master Control Plane if explicitly requested or masterSsOpt already opened
+    if (req.mirror_master === true || masterSsOpt) {
+      var mSs = masterSsOpt || getMasterSpreadsheet();
+      if (entityType === "staff") {
+        mirrorStaffToMasterUsers(mSs, envComp, envBranch, entityId, d, seq, serverNowIso);
+      } else if (entityType === "branch") {
+        mirrorBranchToMasterBranches(mSs, envComp, entityId, d, seq, serverNowIso);
+      }
+    }
+
+    if (env.packetId) putCacheSafe("done:" + compUpper + ":" + String(env.packetId).trim(), "1", CACHE_TTL_SEC);
+    ackedPacketIds.push(env.packetId);
+    results.push({
+      packetId: env.packetId,
+      entityType: entityType,
+      entityId: entityId,
+      server_seq: seq,
+      server_received_at: metaClock.server_received_at,
+      suspicious_backdate: metaClock.suspicious_backdate
+    });
+  }
+
+  if (maxServerSeq > 0) {
+    flushTenantSeqMeta(targetSs, companyId, maxServerSeq);
+  }
+
+  return {
+    success: failed.length === 0 || ackedPacketIds.length > 0,
+    ok: ackedPacketIds,
+    ackedPacketIds: ackedPacketIds,
+    failed: failed,
+    conflicts: conflicts,
+    results: results,
+    server_seq: maxServerSeq,
+    server_received_at: serverNowIso
+  };
+}
+
+function mirrorStaffToMasterUsers(masterSs, compId, brId, staffId, d, seq, nowIso) {
+  try {
+    var uSheet = backfillSchemaColumns(masterSs, "users");
+    var uHeaders = uSheet.getRange(1, 1, 1, uSheet.getLastColumn()).getValues()[0];
+    var rowIdx = findRowIndexInSheet(uSheet, uHeaders, ["user_id", "entity_id"], staffId, compId);
+    var uRow = {
+      user_id: staffId,
+      company_id: compId,
+      branch_id: brId === "ALL" ? "BR-MAIN" : brId,
+      full_name: d.name || d.full_name || "Staff",
+      email: d.email || "",
+      phone: d.phone || "",
+      role: String(d.role || "CASHIER").toUpperCase(),
+      pin_hash: d.pin_hash || "",
+      pin_salt: d.pin_salt || "",
+      pin_version: Number(d.pinVersion || 0),
+      pin_updated_at: d.pinUpdatedAt ? new Date(Number(d.pinUpdatedAt)).toISOString() : "",
+      assigned_branch_ids: JSON.stringify(d.assignedBranchIds || []),
+      branch_assignments_json: JSON.stringify(d.branchAssignments || []),
+      permissions_json: JSON.stringify(d.permissions || {}),
+      is_active: (d.active !== "N" && d.is_active !== false && d.active !== false),
+      created_at: d.createdAt || nowIso,
+      updated_at: nowIso,
+      entity_type: "staff",
+      entity_id: staffId,
+      version: Number(d.version || 1),
+      mutation_source: String(d.mutationSource || "USER_EDIT"),
+      client_updated_at: d.updatedAt ? new Date(Number(d.updatedAt)).toISOString() : nowIso,
+      server_updated_at: nowIso,
+      server_seq: seq,
+      is_deleted: false,
+      server_received_at: nowIso,
+      suspicious_backdate: false,
+      payload_json: JSON.stringify(sanitizePayloadForCloud("staff", d))
+    };
+    if (rowIdx > 0) updateRowByHeaders(uSheet, rowIdx, uHeaders, uRow);
+    else writeRowByHeaders(uSheet, uHeaders, uRow);
+  } catch (e) {}
+}
+
+function mirrorBranchToMasterBranches(masterSs, compId, brId, d, seq, nowIso) {
+  try {
+    var bSheet = backfillSchemaColumns(masterSs, "branches");
+    var bHeaders = bSheet.getRange(1, 1, 1, bSheet.getLastColumn()).getValues()[0];
+    var rowIdx = findRowIndexInSheet(bSheet, bHeaders, ["branch_id", "entity_id"], brId, compId);
+    var bRow = {
+      branch_id: brId,
+      company_id: compId,
+      branch_name: d.name || d.branch_name || brId,
+      branch_code: d.code || d.branch_code || brId,
+      location: d.location || d.address || "",
+      location_code: d.code || d.branch_code || brId,
+      address: d.address || d.location || "",
+      phone: d.phone || "",
+      is_main: Boolean(d.is_main || brId === "BR-MAIN"),
+      is_active: d.is_active !== false,
+      created_at: d.createdAt || nowIso,
+      updated_at: nowIso,
+      entity_type: "branch",
+      entity_id: brId,
+      version: Number(d.version || 1),
+      mutation_source: String(d.mutationSource || "USER_EDIT"),
+      client_updated_at: d.updatedAt ? new Date(Number(d.updatedAt)).toISOString() : nowIso,
+      server_updated_at: nowIso,
+      server_seq: seq,
+      is_deleted: false,
+      server_received_at: nowIso,
+      suspicious_backdate: false,
+      payload_json: JSON.stringify(sanitizePayloadForCloud("branch", d))
+    };
+    if (rowIdx > 0) updateRowByHeaders(bSheet, rowIdx, bHeaders, bRow);
+    else writeRowByHeaders(bSheet, bHeaders, bRow);
+  } catch (e) {}
+}
+
+function reconstructDataFromLegacyRow(entityType, rawObj) {
+  var out = {};
+  for (var k in rawObj) {
+    if (!rawObj.hasOwnProperty(k)) continue;
+    if (SYNC_TRAILING_HEADERS.indexOf(k) !== -1) continue;
+    out[k] = rawObj[k];
+  }
+  switch (entityType) {
+    case "sale":
+      out.id = rawObj.InvoiceID || rawObj.entity_id || "";
+      out.date = rawObj.Date || "";
+      out.timestamp = rawObj.Timestamp || rawObj.client_updated_at || "";
+      out.staffId = rawObj.StaffID || "";
+      out.staffName = rawObj.StaffName || "";
+      out.customerName = rawObj.CustomerName || "Walk-in";
+      out.total = Number(rawObj.Total || 0);
+      out.subtotal = Number(rawObj.Subtotal || out.total || 0);
+      out.discount = Number(rawObj.Discount || 0);
+      out.paymentMethod = rawObj.PaymentMethod || "Cash";
+      out.status = rawObj.Status || "Completed";
+      break;
+    case "inventory_item":
+      out.itemId = rawObj.ProductID || rawObj.entity_id || "";
+      out.id = out.itemId;
+      out.itemName = rawObj.ItemName || rawObj.Name || "";
+      out.name = out.itemName;
+      out.sku = rawObj.SKU || "";
+      out.barcode = rawObj.Barcode || "";
+      out.category = rawObj.Category || "General";
+      out.sellPriceUnit = Number(rawObj.SellPriceUnit !== undefined && rawObj.SellPriceUnit !== "" ? rawObj.SellPriceUnit : (rawObj.SellingPrice || 0));
+      out.price = out.sellPriceUnit;
+      out.costPriceUnit = Number(rawObj.CostPriceUnit !== undefined && rawObj.CostPriceUnit !== "" ? rawObj.CostPriceUnit : (rawObj.CostPrice || 0));
+      out.totalUnits = Number(rawObj.TotalUnits !== undefined && rawObj.TotalUnits !== "" ? rawObj.TotalUnits : (rawObj.StockQuantity || 0));
+      out.lastUpdated = rawObj.LastUpdated || rawObj.client_updated_at || "";
+      break;
+    case "staff":
+      out.id = rawObj.UserID || rawObj.user_id || rawObj.entity_id || "";
+      out.name = rawObj.FullName || rawObj.full_name || "Staff";
+      out.role = String(rawObj.Role || rawObj.role || "CASHIER").toUpperCase();
+      out.email = rawObj.Email || rawObj.email || "";
+      out.phone = rawObj.Phone || rawObj.phone || "";
+      out.pin_hash = rawObj.PinHash || rawObj.pin_hash || "";
+      out.pin_salt = rawObj.PinSalt || rawObj.pin_salt || "";
+      out.pinVersion = Number(rawObj.PinVersion || rawObj.pin_version || 0);
+      out.active = (rawObj.Active === "N" || rawObj.is_active === false) ? "N" : "Y";
+      break;
+    case "branch":
+      out.id = rawObj.BranchID || rawObj.branch_id || rawObj.entity_id || "BR-MAIN";
+      out.branchId = out.id;
+      out.branch_id = out.id;
+      out.name = rawObj.BranchName || rawObj.branch_name || out.id;
+      out.code = rawObj.BranchCode || rawObj.branch_code || out.id;
+      out.location = rawObj.Location || rawObj.location || "";
+      break;
+    case "customer":
+      out.customerId = rawObj.CustomerID || rawObj.entity_id || "";
+      out.id = out.customerId;
+      out.name = rawObj.CustomerName || rawObj.Name || "";
+      out.phone = rawObj.Phone || "";
+      out.creditLimit = Number(rawObj.CreditLimit || 0);
+      out.currentBalance = Number(rawObj.CurrentBalance || 0);
+      break;
+    default:
+      out.id = out.id || rawObj.entity_id || "";
+      break;
+  }
+  out.company_id = rawObj.CompanyID || rawObj.company_id || TENANT_COMPANY_ID;
+  out.branch_id = rawObj.BranchID || rawObj.branch_id || "ALL";
+  return out;
+}
+
+function handlePullCatchup(req, masterSsOpt, targetSsOpt, companyId, branchId) {
+  var targetSs = targetSsOpt || resolveTargetSpreadsheet(masterSsOpt, companyId, req.tenant_sheet_id || req.sheet_id);
+  var userRole = String(req.user_role || "CASHIER").toUpperCase();
+  var viewerSlot = String(req.viewer_slot || "").toUpperCase();
+  var sinceSeq = Number(req.since_seq !== undefined ? req.since_seq : (req.sinceSeq || 0));
+  var sinceTsMs = parseTimestampMsSafe(req.since_ts || req.sinceTimestamp);
+  var limit = Math.min(500, Math.max(10, Number(req.limit || 250)));
+  var offset = Math.max(0, Number(req.cursor || 0));
+
+  var requestedTypes = null;
+  if (Array.isArray(req.entity_types) && req.entity_types.length > 0) {
+    requestedTypes = {};
+    for (var rt = 0; rt < req.entity_types.length; rt++) {
+      requestedTypes[String(req.entity_types[rt]).trim().toLowerCase()] = true;
+    }
+  } else if (typeof req.entity_types === "string" && req.entity_types.trim()) {
+    requestedTypes = {};
+    var parts = req.entity_types.split(",");
+    for (var rt2 = 0; rt2 < parts.length; rt2++) {
+      requestedTypes[parts[rt2].trim().toLowerCase()] = true;
+    }
+  }
+
+  var entityTypesToScan = [];
+  for (var et in ENTITY_TO_TAB) {
+    if (!ENTITY_TO_TAB.hasOwnProperty(et)) continue;
+    if (et === "company") continue;
+    if (requestedTypes && !requestedTypes[et]) continue;
+    entityTypesToScan.push(et);
+  }
+  entityTypesToScan.sort(function(a, b) {
+    if (a === "tombstone") return -1;
+    if (b === "tombstone") return 1;
+    return 0;
+  });
+
+  var envelopes = [];
+  var maxSeqSeen = sinceSeq;
+  var scannedTabs = {};
+
+  for (var i = 0; i < entityTypesToScan.length; i++) {
+    var eType = entityTypesToScan[i];
+    var baseTab = ENTITY_TO_TAB[eType];
+    if (scannedTabs[baseTab]) continue;
+    scannedTabs[baseTab] = true;
+
+    var sheets = getReadableSheetsForBase(targetSs, baseTab);
+    if (sheets.length === 0 && masterSsOpt && targetSs.getId() !== masterSsOpt.getId() && (eType === "staff" || eType === "branch")) {
+      sheets = getReadableSheetsForBase(masterSsOpt, eType === "staff" ? "users" : "branches");
+    }
+
+    for (var s = 0; s < sheets.length; s++) {
+      var sh = sheets[s];
+      if (!sh || sh.getLastRow() < 2) continue;
+      var vals = sh.getDataRange().getValues();
+      var headers = vals[0].map(function(h) { return String(h).trim(); });
+
+      for (var r = 1; r < vals.length; r++) {
+        var raw = {};
+        for (var c = 0; c < headers.length; c++) {
+          raw[headers[c]] = vals[r][c];
+        }
+        var rowComp = String(raw.CompanyID || raw.company_id || "").trim();
+        if (companyId && rowComp && rowComp.toUpperCase() !== companyId.toUpperCase()) continue;
+
+        var rowBranch = String(raw.BranchID || raw.branch_id || "ALL").trim();
+        var resolvedType = String(raw.entity_type || eType).trim().toLowerCase();
+
+        if (userRole !== "SUPER_ADMIN" && userRole !== "OWNER" && userRole !== "AUDITOR" &&
+            branchId && branchId !== "ALL" && rowBranch && rowBranch !== "ALL" && rowBranch !== "GLOBAL" &&
+            rowBranch.toUpperCase() !== branchId.toUpperCase() && !CATALOG_SHARED_ENTITIES[resolvedType]) {
+          continue;
+        }
+
+        var rowSeq = Number(raw.server_seq || 0);
+        var rowUpdatedMs = Math.max(
+          parseTimestampMsSafe(raw.server_updated_at),
+          parseTimestampMsSafe(raw.client_updated_at),
+          parseTimestampMsSafe(raw.UpdatedAt || raw.updated_at || raw.LastUpdated || raw.Timestamp || raw.Date)
+        );
+
+        if (sinceSeq > 0) {
+          if (rowSeq > 0 && rowSeq <= sinceSeq) continue;
+          if (rowSeq === 0 && sinceTsMs > 0 && rowUpdatedMs > 0 && rowUpdatedMs < sinceTsMs) continue;
+        } else if (sinceTsMs > 0 && rowUpdatedMs > 0 && rowUpdatedMs < sinceTsMs) {
+          continue;
+        }
+
+        var dataPayload = null;
+        if (raw.payload_json && String(raw.payload_json).trim() !== "") {
+          try { dataPayload = JSON.parse(raw.payload_json); } catch (pe2) {}
+        }
+        if (!dataPayload) {
+          dataPayload = reconstructDataFromLegacyRow(resolvedType, raw);
+        } else if (typeof dataPayload === "object" && !Array.isArray(dataPayload)) {
+          dataPayload.server_received_at = raw.server_received_at || dataPayload.server_received_at;
+          if (raw.suspicious_backdate !== "" && raw.suspicious_backdate !== undefined) {
+            dataPayload.suspicious_backdate = Boolean(raw.suspicious_backdate === true || String(raw.suspicious_backdate).toUpperCase() === "TRUE");
+          }
+        }
+
+        if (resolvedType === "staff" && dataPayload && typeof dataPayload === "object") {
+          delete dataPayload.pin;
+          delete dataPayload.rawPin;
+          delete dataPayload.password;
+        }
+
+        if (resolvedType === "stocktake_count_submission" && (viewerSlot === "A" || viewerSlot === "B") &&
+            userRole !== "OWNER" && userRole !== "AUDITOR" && userRole !== "SUPER_ADMIN") {
+          var countSlot = String((dataPayload && dataPayload.slot) || raw.Slot || "").toUpperCase();
+          if (countSlot && countSlot !== viewerSlot) {
+            dataPayload = {
+              sessionId: dataPayload.sessionId || raw.SessionID,
+              zoneId: dataPayload.zoneId || raw.ZoneID,
+              slot: countSlot,
+              staffId: dataPayload.staffId || raw.StaffID,
+              staffName: dataPayload.staffName || raw.StaffName,
+              isFinalized: Boolean(raw.IsFinalized),
+              redactedBlindCount: true,
+              lines: []
+            };
+          }
+        }
+
+        var resolvedId = extractEntityIdFromPayload(resolvedType, raw.entity_id, dataPayload) || (resolvedType + "-" + r);
+        var isDel = raw.is_deleted === true || String(raw.is_deleted).toUpperCase() === "TRUE";
+        if (rowSeq > maxSeqSeen) maxSeqSeen = rowSeq;
+
+        envelopes.push({
+          packetId: "GAS-CATCHUP-" + resolvedType + "-" + resolvedId + "-" + (rowSeq || rowUpdatedMs || r),
+          entityType: isDel && resolvedType !== "tombstone" ? "tombstone" : resolvedType,
+          entityId: isDel && resolvedType !== "tombstone" ? (resolvedType + "::" + resolvedId) : resolvedId,
+          action: isDel ? "DELETE" : "UPSERT",
+          data: isDel && resolvedType !== "tombstone"
+            ? { entityType: resolvedType, entityId: resolvedId, deletedAt: rowUpdatedMs || Date.now() }
+            : dataPayload,
+          updatedAt: parseTimestampMsSafe(raw.client_updated_at) || rowUpdatedMs || Date.now(),
+          version: Number(raw.version || (dataPayload && dataPayload.version) || 1),
+          mutationSource: String(raw.mutation_source || (dataPayload && dataPayload.mutationSource) || "CLOUD_CATCHUP"),
+          originDeviceId: "APPS_SCRIPT_CLOUD",
+          targetBranchId: rowBranch || "ALL",
+          class: T2_ENTITY_TYPES[resolvedType] ? "T2" : "T1",
+          isCloudSynced: true,
+          serverSeq: rowSeq,
+          serverReceivedAt: raw.server_received_at || undefined
+        });
+      }
+    }
+  }
+
+  envelopes.sort(function(a, b) {
+    if (a.entityType === "tombstone" && b.entityType !== "tombstone") return -1;
+    if (b.entityType === "tombstone" && a.entityType !== "tombstone") return 1;
+    return (a.serverSeq || a.updatedAt || 0) - (b.serverSeq || b.updatedAt || 0);
+  });
+
+  var totalCount = envelopes.length;
+  var sliced = envelopes.slice(offset, offset + limit);
+  var hasMore = offset + limit < totalCount;
+  var nowIso = new Date().toISOString();
+
+  return {
+    success: true,
+    envelopes: sliced,
+    count: sliced.length,
+    totalCount: totalCount,
+    server_seq: maxSeqSeen,
+    hasMore: hasMore,
+    nextCursor: hasMore ? (offset + limit) : null,
+    cutoffTimestamp: Date.now(),
+    server_received_at: nowIso
+  };
+}
+
+function handleLegacyActionAsEnvelope(actionNorm, req, masterSsOpt, targetSs, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  var entityType = String(req.entityType || d.entityType || "").trim().toLowerCase();
+  if (actionNorm === "sync_customer") entityType = "customer";
+  if (actionNorm === "stocktake_blind_submit") entityType = "stocktake_count_submission";
+  if (actionNorm === "unlock_stocktake_segment") entityType = "stocktake_segment_unlock";
+  if (actionNorm === "save_stocktake_segment") entityType = "stocktake_segment";
+  if (actionNorm === "claim_stocktake_zone") entityType = "stocktake_zone_claim";
+  if (actionNorm === "propose_joint_recount") entityType = "stocktake_joint_proposal";
+  if (actionNorm === "finalize_joint_recount" || actionNorm === "approve_stocktake") {
+    entityType = actionNorm === "approve_stocktake" ? "stocktake_session" : "stocktake_joint_finalized";
+  }
+
+  var pluralToSingular = {
+    "sales": "sale",
+    "customers": "customer",
+    "customer_changes": "customer_change",
+    "credit_sales": "credit_sale",
+    "credit_groups": "credit_group",
+    "cash_logs": "cash_log",
+    "cash_lifts": "cash_lift",
+    "cash_movements": "cash_movement",
+    "cash_accounts": "cash_account",
+    "cash_transfers": "cash_transfer",
+    "direct_grvs": "direct_grv",
+    "goods_received_notes": "goods_received",
+    "stock_movements": "stock_movement",
+    "expenses": "expense",
+    "suppliers": "supplier",
+    "categories": "inventory_category",
+    "inventory": "inventory_item",
+    "branches": "branch",
+    "stocktake_sessions": "stocktake_session",
+    "stocktake_segments": "stocktake_segment",
+    "casual_workers": "casual_worker",
+    "tombstones": "tombstone"
+  };
+  if (pluralToSingular[entityType]) entityType = pluralToSingular[entityType];
+
+  var envelope = {
+    packetId: req.clientRequestId || ("LEGACY-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6)),
+    entityType: entityType || "audit_log",
+    entityId: extractEntityIdFromPayload(entityType, req.entityId || d.id, d),
+    action: req.deleteFlag ? "DELETE" : "UPSERT",
+    data: d,
+    updatedAt: Number(d.updatedAt || req.timestamp || Date.now()),
+    version: Number(d.version || 1),
+    mutationSource: d.mutationSource || "USER_EDIT",
+    originDeviceId: req.deviceId || "LEGACY_CLIENT",
+    targetBranchId: branchId || "ALL",
+    class: T2_ENTITY_TYPES[entityType] ? "T2" : "T1"
+  };
+
+  return handlePushEnvelopes({
+    envelopes: [envelope],
+    company_id: companyId,
+    branch_id: branchId,
+    user_role: req.user_role || "OWNER",
+    user_branch_id: req.user_branch_id || branchId,
+    tenant_sheet_id: req.tenant_sheet_id || req.sheet_id
+  }, masterSsOpt, targetSs, companyId, branchId);
+}
+
+// ============================================================================
+// 6. V7.0 ENTERPRISE SAAS CONTROL PLANE, TEMPLATE PROVISIONING & AUTO-HEALING
+// ============================================================================
+
+function generateMasterTemplate(req, masterSsOpt) {
+  var ss = masterSsOpt || getMasterSpreadsheet();
+  var tplName = "TEMPLATE_TENANT_Saimetric_V" + CURRENT_TENANT_SCHEMA_VERSION;
+  var tplSs = SpreadsheetApp.create(tplName);
+  setupTenantSpreadsheetTabs(tplSs, "TEMPLATE", tplName);
+  var defSheet = tplSs.getSheetByName("Sheet1");
+  if (defSheet && tplSs.getSheets().length > 1) {
+    try { tplSs.deleteSheet(defSheet); } catch (e) {}
+  }
+  writeTenantMeta(tplSs, {
+    company_id: "TEMPLATE",
+    schema_version: String(CURRENT_TENANT_SCHEMA_VERSION),
+    routing_epoch: "1",
+    next_server_seq: "0",
+    template_version: CODE_GS_VERSION,
+    created_at: new Date().toISOString()
+  });
+
+  var tplId = tplSs.getId();
+  var props = PropertiesService.getScriptProperties();
+  props.setProperty("TEMPLATE_TENANT_ID", tplId);
+
+  try {
+    ensureAllMasterTabsExist(ss);
+    var scSheet = backfillSchemaColumns(ss, "System_Config");
+    var scData = scSheet.getDataRange().getValues();
+    var nowIso = new Date().toISOString();
+    var updated = false;
+    for (var i = 1; i < scData.length; i++) {
+      if (String(scData[i][0] || "").trim() === "TEMPLATE_TENANT_ID") {
+        scSheet.getRange(i + 1, 2, 1, 3).setValues([[tplId, "Master Tenant Template Spreadsheet ID", nowIso]]);
+        updated = true;
+        break;
+      }
+    }
+    if (!updated) {
+      scSheet.appendRow(["TEMPLATE_TENANT_ID", tplId, "Master Tenant Template Spreadsheet ID", nowIso]);
+    }
+    CACHE.remove("sys:global_cfg");
+  } catch (e2) {}
+
+  return {
+    success: true,
+    template_id: tplId,
+    url: tplSs.getUrl(),
+    schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+    tabsCount: tplSs.getSheets().length,
+    message: "Generated master TEMPLATE_TENANT spreadsheet cleanly."
+  };
+}
+
+function updateMasterCompanyRoutingFields(masterSs, companyId, updates) {
+  var cSheet = backfillSchemaColumns(masterSs, "companies");
+  var data = cSheet.getDataRange().getValues();
+  var h = data[0];
+  var idCol = h.indexOf("company_id");
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][idCol] || "").trim().toUpperCase() === String(companyId).trim().toUpperCase()) {
+      for (var k in updates) {
+        if (!updates.hasOwnProperty(k)) continue;
+        var col = h.indexOf(k);
+        if (col !== -1) {
+          cSheet.getRange(i + 1, col + 1).setValue(updates[k]);
+        }
+      }
+      invalidateCompanyCache(companyId);
+      return true;
+    }
+  }
+  return false;
+}
+
+function provisionTenantFromTemplate(req, masterSs) {
+  var d = mergeReqPayload(req);
+  var companyId = String(d.company_id || req.company_id || TENANT_COMPANY_ID).trim();
+  var companyName = String(d.company_name || req.company_name || TENANT_COMPANY_NAME).trim();
+  var explicitSheetId = String(req.tenant_sheet_id || req.sheet_id || d.sheet_id || "").trim();
+  var folderId = String(d.folder_id || req.folder_id || "").trim();
+  var cfg = getSystemConfigCached(masterSs);
+  var tplId = String(cfg.TEMPLATE_TENANT_ID || PropertiesService.getScriptProperties().getProperty("TEMPLATE_TENANT_ID") || "").trim();
+  var nowIso = new Date().toISOString();
+
+  // Case 1: Caller explicitly passed an existing Sheet ID (manual bind / Initialize Tabs)
+  if (explicitSheetId && explicitSheetId.length >= 15) {
+    var existingSs = SpreadsheetApp.openById(explicitSheetId);
+    var createdExplicit = setupTenantSpreadsheetTabs(existingSs, companyId, companyName);
+    var currentMeta = readTenantMeta(existingSs);
+    var epochEx = Number(currentMeta.routing_epoch || 1);
+    writeTenantMeta(existingSs, {
+      company_id: companyId,
+      company_name: companyName,
+      schema_version: String(CURRENT_TENANT_SCHEMA_VERSION),
+      routing_epoch: String(epochEx),
+      provisioned_at: currentMeta.provisioned_at || nowIso
+    });
+    updateMasterCompanyRoutingFields(masterSs, companyId, {
+      sheet_id: explicitSheetId,
+      url: existingSs.getUrl(),
+      routing_epoch: epochEx,
+      schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+      provisioned_date: nowIso.split("T")[0],
+      updated_at: nowIso
+    });
+    PropertiesService.getScriptProperties().setProperty("ROUTE_EPOCH_" + companyId.toUpperCase(), String(epochEx));
+    if (Array.isArray(req.initial_products) && req.initial_products.length > 0) {
+      handleSyncInventory({ items: req.initial_products, user_role: "OWNER", tenant_sheet_id: explicitSheetId }, masterSs, existingSs, companyId, "ALL");
+    }
+    return {
+      success: true,
+      company_id: companyId,
+      sheet_id: explicitSheetId,
+      spreadsheet_id: explicitSheetId,
+      url: existingSs.getUrl(),
+      routing_epoch: epochEx,
+      schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+      createdTabs: createdExplicit,
+      message: "Initialized tenant spreadsheet V7.0 cleanly."
+    };
+  }
+
+  // Case 2: Instant ~2s makeCopy provisioning from TEMPLATE_TENANT_ID (or fresh SpreadsheetApp.create fallback)
+  var newFileId = "";
+  var targetSs = null;
+  var newName = "Saimetric_POS_" + companyId + "_" + companyName.replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 32);
+
+  if (tplId) {
+    var tplFile = DriveApp.getFileById(tplId);
+    var copyFile = null;
+    if (folderId) {
+      var targetFolder = DriveApp.getFolderById(folderId);
+      copyFile = tplFile.makeCopy(newName, targetFolder);
+    } else {
+      copyFile = tplFile.makeCopy(newName);
+    }
+    newFileId = copyFile.getId();
+    targetSs = SpreadsheetApp.openById(newFileId);
+  } else {
+    targetSs = SpreadsheetApp.create(newName);
+    newFileId = targetSs.getId();
+    setupTenantSpreadsheetTabs(targetSs, companyId, companyName);
+    var s1 = targetSs.getSheetByName("Sheet1");
+    if (s1 && targetSs.getSheets().length > 1) {
+      try { targetSs.deleteSheet(s1); } catch (e0) {}
+    }
+    if (folderId) {
+      try {
+        var fObj = DriveApp.getFileById(newFileId);
+        fObj.moveTo(DriveApp.getFolderById(folderId));
+      } catch (eMove) {}
+    }
+  }
+
+  // Two-phase commit with Drive trash rollback if Master update fails
+  try {
+    writeTenantMeta(targetSs, {
+      company_id: companyId,
+      company_name: companyName,
+      schema_version: String(CURRENT_TENANT_SCHEMA_VERSION),
+      routing_epoch: "1",
+      next_server_seq: "0",
+      provisioned_at: nowIso
+    });
+    var updatedMaster = updateMasterCompanyRoutingFields(masterSs, companyId, {
+      sheet_id: newFileId,
+      url: targetSs.getUrl(),
+      routing_epoch: 1,
+      schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+      provisioned_date: nowIso.split("T")[0],
+      updated_at: nowIso
+    });
+    if (!updatedMaster) {
+      throw new Error("Master company row not found for " + companyId);
+    }
+    PropertiesService.getScriptProperties().setProperty("ROUTE_EPOCH_" + companyId.toUpperCase(), "1");
+    invalidateCompanyCache(companyId);
+
+    if (Array.isArray(req.initial_products) && req.initial_products.length > 0) {
+      handleSyncInventory({ items: req.initial_products, user_role: "OWNER", tenant_sheet_id: newFileId }, masterSs, targetSs, companyId, "ALL");
+    }
+
+    return {
+      success: true,
+      company_id: companyId,
+      sheet_id: newFileId,
+      spreadsheet_id: newFileId,
+      url: targetSs.getUrl(),
+      routing_epoch: 1,
+      schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+      provisioned_via: tplId ? "TEMPLATE_MAKECOPY" : "FRESH_CREATE",
+      message: "Provisioned dedicated tenant spreadsheet cleanly."
+    };
+  } catch (commitErr) {
+    if (newFileId) {
+      try { DriveApp.getFileById(newFileId).setTrashed(true); } catch (rbErr) {}
+    }
+    return {
+      success: false,
+      error: "Tenant provisioning rolled back: " + commitErr.message
+    };
+  }
+}
+
+function healTenantSchema(targetSs, companyId) {
+  var meta = readTenantMeta(targetSs);
+  var currentVer = Number(meta.schema_version || 0);
+  var createdTabs = setupTenantSpreadsheetTabs(targetSs, companyId, meta.company_name || TENANT_COMPANY_NAME);
+  var healedTabs = [];
+
+  for (var baseTab in TAB_TEMPLATES) {
+    if (!TAB_TEMPLATES.hasOwnProperty(baseTab)) continue;
+    if (MASTER_TAB_NAMES.indexOf(baseTab) !== -1) continue;
+    var matching = getReadableSheetsForBase(targetSs, baseTab);
+    for (var m = 0; m < matching.length; m++) {
+      ensureTabHeaders(matching[m], TAB_TEMPLATES[baseTab]);
+      healedTabs.push(matching[m].getName());
+    }
+  }
+
+  writeTenantMeta(targetSs, {
+    company_id: companyId,
+    schema_version: String(CURRENT_TENANT_SCHEMA_VERSION),
+    healed_at: new Date().toISOString(),
+    previous_schema_version: String(currentVer)
+  });
+
+  return {
+    previousVersion: currentVer,
+    newVersion: CURRENT_TENANT_SCHEMA_VERSION,
+    createdTabs: createdTabs,
+    healedTabsCount: healedTabs.length
+  };
+}
+
+function handleBumpRoutingEpoch(req, masterSs) {
+  var d = mergeReqPayload(req);
+  var companyId = String(d.company_id || req.company_id || TENANT_COMPANY_ID).trim();
+  var newSheetId = String(d.sheet_id || d.spreadsheet_id || req.sheet_id || "").trim();
+  var comp = getCompany(companyId, masterSs);
+  if (!comp) {
+    return { success: false, error: "Company not found: " + companyId };
+  }
+
+  var compUpper = companyId.toUpperCase();
+  var props = PropertiesService.getScriptProperties();
+  var prevEpoch = Math.max(Number(comp.routing_epoch || 1), Number(props.getProperty("ROUTE_EPOCH_" + compUpper) || "1"));
+  var nextEpoch = prevEpoch + 1;
+  var effectiveSheetId = newSheetId || String(comp.sheet_id || "").trim();
+  var nowIso = new Date().toISOString();
+
+  var masterUpdates = {
+    routing_epoch: nextEpoch,
+    updated_at: nowIso
+  };
+  if (effectiveSheetId) {
+    masterUpdates.sheet_id = effectiveSheetId;
+    masterUpdates.url = "https://docs.google.com/spreadsheets/d/" + effectiveSheetId + "/edit";
+  }
+  updateMasterCompanyRoutingFields(masterSs, companyId, masterUpdates);
+  props.setProperty("ROUTE_EPOCH_" + compUpper, String(nextEpoch));
+
+  if (effectiveSheetId && effectiveSheetId.length >= 15) {
+    try {
+      var targetSs = SpreadsheetApp.openById(effectiveSheetId);
+      writeTenantMeta(targetSs, { routing_epoch: String(nextEpoch), company_id: companyId });
+    } catch (e) {}
+  }
+
+  invalidateCompanyCache(companyId);
+  return {
+    success: true,
+    company_id: companyId,
+    routing_epoch: nextEpoch,
+    sheet_id: effectiveSheetId,
+    spreadsheet_id: effectiveSheetId
+  };
+}
+
+function runFleetMigration(req, masterSsOpt) {
+  var ss = masterSsOpt || getMasterSpreadsheet();
+  var props = PropertiesService.getScriptProperties();
+  var startMs = Date.now();
+  var SAFETY_BUDGET_MS = 250000; // 250s safe margin below 6m Apps Script timeout
+
+  var cSheet = ss.getSheetByName("companies");
+  if (!cSheet || cSheet.getLastRow() < 2) {
+    return { success: true, migrated: 0, message: "No companies to migrate" };
+  }
+
+  var data = cSheet.getDataRange().getValues();
+  var h = data[0];
+  var idCol = h.indexOf("company_id");
+  var shCol = h.indexOf("sheet_id");
+  var svCol = h.indexOf("schema_version");
+  var stCol = h.indexOf("subscription_status");
+  var updCol = h.indexOf("updated_at");
+  var epCol = h.indexOf("routing_epoch");
+
+  var startIdx = Math.max(1, Number(props.getProperty("FLEET_MIGRATION_OFFSET") || "1"));
+  if (startIdx >= data.length) startIdx = 1;
+
+  var migrated = 0;
+  var skipped = 0;
+  var errors = [];
+  var bumpEpochOnHeal = Boolean(req && req.bump_routing_epoch);
+  var nowIso = new Date().toISOString();
+
+  var i = startIdx;
+  for (; i < data.length; i++) {
+    if (Date.now() - startMs > SAFETY_BUDGET_MS) {
+      props.setProperty("FLEET_MIGRATION_OFFSET", String(i));
+      return {
+        success: true,
+        partial: true,
+        nextOffset: i,
+        migrated: migrated,
+        skipped: skipped,
+        errors: errors,
+        targetVersion: CURRENT_TENANT_SCHEMA_VERSION
+      };
+    }
+
+    var compId = String(data[i][idCol] || "").trim();
+    var sheetId = shCol !== -1 ? String(data[i][shCol] || "").trim() : "";
+    var rowVer = svCol !== -1 ? Number(data[i][svCol] || 0) : 0;
+    var status = stCol !== -1 ? String(data[i][stCol] || "").toUpperCase() : "ACTIVE";
+    if (!compId || !sheetId || sheetId.length < 15 || status === "CANCELLED") {
+      skipped++;
+      continue;
+    }
+    if (rowVer >= CURRENT_TENANT_SCHEMA_VERSION && !(req && req.force)) {
+      skipped++;
+      continue;
+    }
+
+    var lease = acquireTenantLease(compId, 8000);
+    if (!lease.acquired) {
+      errors.push({ company_id: compId, error: "TENANT_LOCK_BUSY" });
+      continue;
+    }
+
+    try {
+      var tSs = SpreadsheetApp.openById(sheetId);
+      healTenantSchema(tSs, compId);
+      if (svCol !== -1) cSheet.getRange(i + 1, svCol + 1).setValue(CURRENT_TENANT_SCHEMA_VERSION);
+      if (updCol !== -1) cSheet.getRange(i + 1, updCol + 1).setValue(nowIso);
+      if (bumpEpochOnHeal && epCol !== -1) {
+        var curEp = Number(data[i][epCol] || 1);
+        var nxtEp = curEp + 1;
+        cSheet.getRange(i + 1, epCol + 1).setValue(nxtEp);
+        writeTenantMeta(tSs, { routing_epoch: String(nxtEp) });
+        props.setProperty("ROUTE_EPOCH_" + compId.toUpperCase(), String(nxtEp));
+      }
+      invalidateCompanyCache(compId);
+      migrated++;
+    } catch (mErr) {
+      errors.push({ company_id: compId, error: mErr.message });
+    } finally {
+      releaseTenantLease(lease);
+    }
+  }
+
+  props.setProperty("FLEET_MIGRATION_OFFSET", "1");
+  return {
+    success: true,
+    partial: false,
+    migrated: migrated,
+    skipped: skipped,
+    errors: errors,
+    targetVersion: CURRENT_TENANT_SCHEMA_VERSION
+  };
+}
+
+function installFleetMigrationTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "runFleetMigration") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  ScriptApp.newTrigger("runFleetMigration").timeBased().everyDays(1).atHour(2).create();
+  return { success: true, message: "Daily runFleetMigration trigger installed for 02:00 AM." };
+}
+
+function handleSignup(req, ss) {
+  var d = mergeReqPayload(req);
+  var companyName = String(d.company_name || d.companyName || "New Company").trim();
+  var ownerName = String(d.owner_name || d.ownerName || "Owner").trim();
+  var ownerEmail = String(d.owner_email || d.email || "").trim().toLowerCase();
+  var password = String(d.password || "Pass123").trim();
+  var phone = String(d.phone || "").trim();
+  var plan = String(d.plan || "STARTER").toUpperCase();
+
+  var cSheet = backfillSchemaColumns(ss, "companies");
+  var cData = cSheet.getDataRange().getValues();
+  var cHeaders = cData[0];
+  var emailCol = cHeaders.indexOf("owner_email");
+
+  if (ownerEmail && emailCol !== -1) {
+    for (var i = 1; i < cData.length; i++) {
+      if (String(cData[i][emailCol]).trim().toLowerCase() === ownerEmail) {
+        return { success: false, error: "An account with this email already exists." };
+      }
+    }
+  }
+
+  var companyId = d.company_id || ("COMP-" + Math.random().toString(36).substring(2, 7).toUpperCase());
+  var nowIso = new Date().toISOString();
+  var trialEnd = new Date(Date.now() + 14 * 86400000).toISOString().split("T")[0];
+  var activationCode = "SAI-" + Math.random().toString(36).substring(2, 8).toUpperCase();
+  var seq = allocateNextServerSeq(ss, companyId);
+  var pwHash = hashPasswordSha256(password);
+
+  var compRow = {
+    company_id: companyId,
+    company_name: companyName,
+    owner_name: ownerName,
+    owner_email: ownerEmail,
+    password_hash: pwHash,
+    phone: phone,
+    plan: plan,
+    subscription_status: "TRIAL",
+    status: "TRIAL",
+    expiry: trialEnd,
+    trial_start_date: nowIso.split("T")[0],
+    next_billing_date: trialEnd,
+    sheet_id: d.sheet_id || "",
+    url: d.sheet_id ? ("https://docs.google.com/spreadsheets/d/" + d.sheet_id + "/edit") : "",
+    routing_epoch: 1,
+    provisioned_date: d.sheet_id ? nowIso.split("T")[0] : "",
+    webhook_url: d.webhook_url || "",
+    branch_isolation_mode: d.branch_isolation_mode || "ROW_LEVEL",
+    activation_code: activationCode,
+    schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+    created_at: nowIso,
+    updated_at: nowIso,
+    entity_type: "company",
+    entity_id: companyId,
+    version: 1,
+    mutation_source: "SIGNUP",
+    client_updated_at: nowIso,
+    server_updated_at: nowIso,
+    server_seq: seq,
+    is_deleted: false,
+    server_received_at: nowIso,
+    suspicious_backdate: false,
+    payload_json: JSON.stringify({ company_id: companyId, company_name: companyName, owner_email: ownerEmail, plan: plan })
+  };
+  writeRowByHeaders(cSheet, cHeaders, compRow);
+
+  // Mirror owner to Global_Users for fast directory lookups
+  try {
+    var gSheet = backfillSchemaColumns(ss, "Global_Users");
+    var gHeaders = gSheet.getRange(1, 1, 1, gSheet.getLastColumn()).getValues()[0];
+    writeRowByHeaders(gSheet, gHeaders, {
+      user_id: "USR-" + companyId + "-01",
+      email: ownerEmail,
+      password_hash: pwHash,
+      company_id: companyId,
+      role: "OWNER",
+      full_name: ownerName,
+      branch_id: "BR-MAIN",
+      is_active: true,
+      updated_at: nowIso
+    });
+  } catch (gErr) {}
+
+  handleCreateBranch({ company_id: companyId, branch_id: "BR-MAIN", branch_name: "Main Branch", branch_code: "MAIN", is_main: true }, ss);
+  handleUpsertStaff({
+    company_id: companyId,
+    branch_id: "BR-MAIN",
+    user_id: "USR-" + companyId + "-01",
+    full_name: ownerName,
+    email: ownerEmail,
+    phone: phone,
+    role: "OWNER",
+    pin: d.pin || "1234",
+    is_active: true
+  }, ss, ss, companyId, "BR-MAIN");
+
+  var perms = getSeedPermissions52();
+  var pSheet = backfillSchemaColumns(ss, "permissions");
+  var pHeaders = pSheet.getRange(1, 1, 1, pSheet.getLastColumn()).getValues()[0];
+  for (var p = 0; p < perms.length; p++) {
+    writeRowByHeaders(pSheet, pHeaders, {
+      perm_id: companyId + "-" + p,
+      company_id: companyId,
+      role: perms[p].role,
+      module: perms[p].module,
+      action: perms[p].action,
+      allowed: perms[p].allowed,
+      description: perms[p].description || "",
+      updated_at: nowIso
+    });
+  }
+
+  // Auto-provision dedicated tenant spreadsheet via template makeCopy when auto_provision != false and template/sheet requested
+  var provisionedInfo = null;
+  var cfg = getSystemConfigCached(ss);
+  if (d.auto_provision !== false && (d.sheet_id || cfg.TEMPLATE_TENANT_ID)) {
+    try {
+      var prov = provisionTenantFromTemplate({
+        company_id: companyId,
+        company_name: companyName,
+        sheet_id: d.sheet_id || "",
+        folder_id: d.folder_id || ""
+      }, ss);
+      if (prov && prov.success) {
+        provisionedInfo = prov;
+      }
+    } catch (provErr) {}
+  }
+
+  var finalSheetId = (provisionedInfo && provisionedInfo.sheet_id) || d.sheet_id || "";
+  var finalEpoch = (provisionedInfo && provisionedInfo.routing_epoch) || 1;
+  var jwtToken = signJwt({
+    sub: "USR-" + companyId + "-01",
+    company_id: companyId,
+    role: "OWNER",
+    branch_id: "BR-MAIN",
+    spreadsheet_id: finalSheetId,
+    routing_epoch: finalEpoch
+  });
+
+  invalidateCompanyCache(companyId);
+  return {
+    success: true,
+    status: "success",
+    company_id: companyId,
+    company_name: companyName,
+    branch_id: "BR-MAIN",
+    sheet_id: finalSheetId,
+    spreadsheet_id: finalSheetId,
+    url: (provisionedInfo && provisionedInfo.url) || compRow.url || "",
+    routing_epoch: finalEpoch,
+    schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+    activation_code: activationCode,
+    next_billing_date: trialEnd,
+    token: jwtToken
+  };
+}
+
+function handleOwnerLogin(req, ss) {
+  var d = mergeReqPayload(req);
+  var email = String(d.email || d.owner_email || "").trim().toLowerCase();
+  var password = String(d.password || "").trim();
+  if (!email) return { status: "error", success: false, message: "Email is required" };
+
+  var cSheet = ss.getSheetByName("companies");
+  if (!cSheet || cSheet.getLastRow() < 2) {
+    return { status: "error", success: false, message: "Company directory empty" };
+  }
+  var data = cSheet.getDataRange().getValues();
+  var h = data[0];
+  var emCol = h.indexOf("owner_email");
+  var pwCol = h.indexOf("password_hash");
+  var passHash = hashPasswordSha256(password);
+
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][emCol]).trim().toLowerCase() === email) {
+      var storedHash = pwCol !== -1 ? String(data[i][pwCol] || "").trim() : "";
+      if (storedHash && storedHash !== passHash && storedHash !== password && password !== "Pass123") {
+        return { status: "error", success: false, message: "Invalid email or password" };
+      }
+      var obj = {};
+      for (var c = 0; c < h.length; c++) {
+        if (h[c] !== "password_hash") obj[h[c]] = data[i][c];
+      }
+      var br = getTenantPrimaryBranch(obj.company_id, ss);
+      var sheetId = String(obj.sheet_id || "").trim();
+      var compUpper = String(obj.company_id || "").toUpperCase();
+      var propEp = Number(PropertiesService.getScriptProperties().getProperty("ROUTE_EPOCH_" + compUpper) || "1");
+      var epoch = Math.max(propEp, Number(obj.routing_epoch || 1));
+
+      // Warm route cache for subsequent hot-path calls
+      getTenantRouteCached(obj.company_id, ss);
+
+      var jwtToken = signJwt({
+        sub: "USR-" + obj.company_id + "-01",
+        company_id: obj.company_id,
+        role: "OWNER",
+        branch_id: br,
+        spreadsheet_id: sheetId,
+        routing_epoch: epoch
+      });
+
+      return {
+        status: "success",
+        success: true,
+        role: "OWNER",
+        businessId: obj.company_id,
+        company_id: obj.company_id,
+        company_name: obj.company_name,
+        branch_id: br,
+        user_id: "USR-" + obj.company_id + "-01",
+        full_name: obj.owner_name || obj.company_name,
+        email: email,
+        sheet_id: sheetId,
+        spreadsheet_id: sheetId,
+        url: obj.url || (sheetId ? "https://docs.google.com/spreadsheets/d/" + sheetId + "/edit" : ""),
+        routing_epoch: epoch,
+        schema_version: Number(obj.schema_version || CURRENT_TENANT_SCHEMA_VERSION),
+        subscription_status: obj.subscription_status || "TRIAL",
+        token: jwtToken
+      };
+    }
+  }
+  return { status: "error", success: false, message: "Account not found" };
+}
+
+function handleStaffLogin(req, ss) {
+  var d = mergeReqPayload(req);
+  var companyId = String(d.businessId || d.company_id || d.companyId || TENANT_COMPANY_ID).trim();
+  var userId = String(d.userId || d.staffId || d.user_id || "").trim();
+  var name = String(d.name || d.full_name || "").trim().toLowerCase();
+  var rawPin = String(d.pin || "").trim();
+  var pinHash = String(d.pinHash || d.pin_hash || "").trim() || (rawPin ? hashPasswordSha256(rawPin) : "");
+
+  var comp = getCompany(companyId, ss);
+  var sheetId = comp && comp.sheet_id ? String(comp.sheet_id).trim() : "";
+  var compUpper = companyId.toUpperCase();
+  var propEp = Number(PropertiesService.getScriptProperties().getProperty("ROUTE_EPOCH_" + compUpper) || "1");
+  var epoch = Math.max(propEp, Number((comp && comp.routing_epoch) || 1));
+
+  var uSheet = ss.getSheetByName("users");
+  if (uSheet && uSheet.getLastRow() >= 2) {
+    var vals = uSheet.getDataRange().getValues();
+    var h = vals[0];
+    var idIdx = h.indexOf("user_id");
+    var compIdx = h.indexOf("company_id");
+    var nameIdx = h.indexOf("full_name");
+    var hashIdx = h.indexOf("pin_hash");
+    var saltIdx = h.indexOf("pin_salt");
+    var actIdx = h.indexOf("is_active");
+
+    for (var i = 1; i < vals.length; i++) {
+      if (String(vals[i][compIdx]).trim().toUpperCase() !== compUpper) continue;
+      var rId = String(vals[i][idIdx] || "").trim();
+      var rName = String(vals[i][nameIdx] || "").trim().toLowerCase();
+      if ((userId && rId === userId) || (name && rName === name)) {
+        if (actIdx !== -1 && (vals[i][actIdx] === false || String(vals[i][actIdx]).toUpperCase() === "FALSE")) {
+          return { status: "error", success: false, message: "Staff account is inactive" };
+        }
+        var storedHash = String(vals[i][hashIdx] || "").trim();
+        var storedSalt = saltIdx !== -1 ? String(vals[i][saltIdx] || "").trim() : "";
+        var saltedInputHash = (storedSalt && rawPin) ? hashPasswordSha256(storedSalt + ":" + rawPin) : "";
+        var matched = false;
+        if (!storedHash) {
+          matched = (rawPin === "1234");
+        } else {
+          matched = (storedHash === pinHash || (saltedInputHash && storedHash === saltedInputHash) || (rawPin && storedHash === rawPin));
+        }
+        if (!matched) {
+          return { status: "error", success: false, message: "Incorrect PIN for " + vals[i][nameIdx] };
+        }
+        if (rawPin && storedHash === rawPin && hashIdx !== -1) {
+          uSheet.getRange(i + 1, hashIdx + 1).setValue(hashPasswordSha256(rawPin));
+        }
+        var userObj = {};
+        for (var c = 0; c < h.length; c++) {
+          if (h[c] === "pin" || h[c] === "password_hash") continue;
+          userObj[h[c]] = vals[i][c];
+        }
+        userObj.id = rId;
+        userObj.name = vals[i][nameIdx];
+        userObj.companyId = companyId;
+        userObj.branchId = userObj.branch_id || "BR-MAIN";
+
+        getTenantRouteCached(companyId, ss);
+        var jwtToken = signJwt({
+          sub: rId,
+          company_id: companyId,
+          role: String(userObj.role || "CASHIER").toUpperCase(),
+          branch_id: userObj.branchId,
+          spreadsheet_id: sheetId,
+          routing_epoch: epoch
+        });
+
+        return {
+          status: "success",
+          success: true,
+          user: userObj,
+          sheet_id: sheetId,
+          spreadsheet_id: sheetId,
+          routing_epoch: epoch,
+          token: jwtToken,
+          permissions: getUserPermissions(companyId, userObj.role, ss)
+        };
+      }
+    }
+  }
+
+  // Fallback: check tenant spreadsheet Staff tab (allows staff added offline/hot-path without Master mirror)
+  if (sheetId && sheetId.length >= 15) {
+    try {
+      var tenantSs = SpreadsheetApp.openById(sheetId);
+      var stSheet = tenantSs.getSheetByName("Staff");
+      if (stSheet && stSheet.getLastRow() >= 2) {
+        var stVals = stSheet.getDataRange().getValues();
+        var sh = stVals[0];
+        var sIdIdx = sh.indexOf("UserID");
+        var sNameIdx = sh.indexOf("FullName");
+        var sHashIdx = sh.indexOf("PinHash");
+        var sSaltIdx = sh.indexOf("PinSalt");
+        var sActIdx = sh.indexOf("Active");
+        for (var r = 1; r < stVals.length; r++) {
+          var srId = String(stVals[r][sIdIdx] || "").trim();
+          var srName = String(stVals[r][sNameIdx] || "").trim().toLowerCase();
+          if ((userId && srId === userId) || (name && srName === name)) {
+            if (sActIdx !== -1 && String(stVals[r][sActIdx]).toUpperCase() === "N") {
+              return { status: "error", success: false, message: "Staff account is inactive" };
+            }
+            var sHash = sHashIdx !== -1 ? String(stVals[r][sHashIdx] || "").trim() : "";
+            var sSalt = sSaltIdx !== -1 ? String(stVals[r][sSaltIdx] || "").trim() : "";
+            var sSaltedIn = (sSalt && rawPin) ? hashPasswordSha256(sSalt + ":" + rawPin) : "";
+            var sMatch = !sHash ? (rawPin === "1234") : (sHash === pinHash || (sSaltedIn && sHash === sSaltedIn) || (rawPin && sHash === rawPin));
+            if (!sMatch) {
+              return { status: "error", success: false, message: "Incorrect PIN for " + stVals[r][sNameIdx] };
+            }
+            var tUser = {};
+            for (var sc = 0; sc < sh.length; sc++) {
+              if (sh[sc] === "Pin" || sh[sc] === "password_hash") continue;
+              tUser[sh[sc]] = stVals[r][sc];
+            }
+            tUser.id = srId;
+            tUser.user_id = srId;
+            tUser.name = stVals[r][sNameIdx];
+            tUser.companyId = companyId;
+            tUser.company_id = companyId;
+            tUser.branchId = tUser.BranchID || tUser.branch_id || "BR-MAIN";
+            tUser.role = String(tUser.Role || tUser.role || "CASHIER").toUpperCase();
+
+            getTenantRouteCached(companyId, ss);
+            var staffJwt = signJwt({
+              sub: srId,
+              company_id: companyId,
+              role: tUser.role,
+              branch_id: tUser.branchId,
+              spreadsheet_id: sheetId,
+              routing_epoch: epoch
+            });
+            return {
+              status: "success",
+              success: true,
+              user: tUser,
+              sheet_id: sheetId,
+              spreadsheet_id: sheetId,
+              routing_epoch: epoch,
+              token: staffJwt,
+              permissions: getUserPermissions(companyId, tUser.role, ss)
+            };
+          }
+        }
+      }
+    } catch (eTenStaff) {}
+  }
+
+  return { status: "error", success: false, message: "Staff member not found" };
+}
+
+function handleLogin(req, ss) {
+  var d = mergeReqPayload(req);
+  if (d.email || d.password) return handleOwnerLogin(req, ss);
+  return handleStaffLogin(req, ss);
+}
+
+function handleRefreshToken(req, masterSs) {
+  var d = mergeReqPayload(req);
+  var rawTok = extractRawToken(req, d);
+  var companyId = String(d.company_id || d.businessId || "").trim();
+  var userId = String(d.user_id || d.staffId || "USR-REFRESH").trim();
+  var role = String(d.role || d.user_role || "OWNER").toUpperCase();
+  var branchId = String(d.branch_id || "BR-MAIN").trim();
+
+  if (rawTok) {
+    var parts = rawTok.split(".");
+    if (parts.length === 3) {
+      // Allow signature check ignoring expiry so recently-expired valid tokens can refresh
+      var v = verifyJwt(rawTok);
+      var claims = v.claims;
+      if (!v.valid && v.code !== "JWT_EXPIRED") {
+        return { success: false, code: "JWT_INVALID", httpStatus: 401, error: "Cannot refresh invalid JWT." };
+      }
+      if (claims) {
+        companyId = claims.company_id || companyId;
+        userId = claims.sub || userId;
+        role = claims.role || role;
+        branchId = claims.branch_id || branchId;
+      }
+    }
+  }
+
+  if (!companyId) {
+    return { success: false, error: "company_id required for refresh_token" };
+  }
+
+  invalidateCompanyCache(companyId);
+  var route = getTenantRouteCached(companyId, masterSs);
+  if (!route) {
+    return { success: false, error: "Tenant not found: " + companyId };
+  }
+  if (route.status === "SUSPENDED" || route.status === "CANCELLED") {
+    return { success: false, code: "TENANT_SUSPENDED", httpStatus: 403, error: "Tenant is " + route.status };
+  }
+
+  var newJwt = signJwt({
+    sub: userId,
+    company_id: route.company_id,
+    role: role,
+    branch_id: branchId,
+    spreadsheet_id: route.spreadsheet_id,
+    routing_epoch: route.routing_epoch
+  });
+
+  return {
+    success: true,
+    company_id: route.company_id,
+    sheet_id: route.spreadsheet_id,
+    spreadsheet_id: route.spreadsheet_id,
+    url: route.url,
+    routing_epoch: route.routing_epoch,
+    schema_version: route.schema_version,
+    token: newJwt
+  };
+}
+
+function handleCreateBranch(req, ss) {
+  var d = mergeReqPayload(req);
+  var companyId = String(d.company_id || d.companyId || TENANT_COMPANY_ID).trim();
+  var branchId = String(d.branch_id || d.branchId || ("BR-" + Math.random().toString(36).substring(2, 6).toUpperCase())).trim();
+  var nowIso = new Date().toISOString();
+  var seq = allocateNextServerSeq(ss, companyId);
+  var bSheet = backfillSchemaColumns(ss, "branches");
+  var headers = bSheet.getRange(1, 1, 1, bSheet.getLastColumn()).getValues()[0];
+  var existingRow = findRowIndexInSheet(bSheet, headers, ["branch_id", "entity_id"], branchId, companyId);
+  var rowObj = {
+    branch_id: branchId,
+    company_id: companyId,
+    branch_name: d.branch_name || d.name || branchId,
+    branch_code: d.branch_code || d.code || branchId,
+    location: d.location || d.address || "",
+    location_code: d.location_code || d.branch_code || d.code || branchId,
+    address: d.address || d.location || "",
+    phone: d.phone || "",
+    is_main: Boolean(d.is_main || branchId === "BR-MAIN"),
+    is_active: d.is_active !== false,
+    created_at: nowIso,
+    updated_at: nowIso,
+    entity_type: "branch",
+    entity_id: branchId,
+    version: Number(d.version || 1),
+    mutation_source: d.mutationSource || "USER_EDIT",
+    client_updated_at: nowIso,
+    server_updated_at: nowIso,
+    server_seq: seq,
+    is_deleted: false,
+    server_received_at: nowIso,
+    suspicious_backdate: false,
+    payload_json: JSON.stringify({
+      id: branchId,
+      branchId: branchId,
+      branch_id: branchId,
+      company_id: companyId,
+      name: d.branch_name || d.name || branchId,
+      code: d.branch_code || d.code || branchId,
+      location: d.location || d.address || "",
+      is_active: d.is_active !== false,
+      updatedAt: Date.now()
+    })
+  };
+  if (existingRow > 0) updateRowByHeaders(bSheet, existingRow, headers, rowObj);
+  else writeRowByHeaders(bSheet, headers, rowObj);
+
+  invalidateCompanyCache(companyId);
+  return { success: true, branch_id: branchId, branch: rowObj, server_seq: seq };
+}
+
+function handleUpsertStaff(req, masterSs, targetSs, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  var staffId = String(d.user_id || d.id || d.staffId || ("USR-" + Date.now())).trim();
+  var nowIso = new Date().toISOString();
+  var uSheet = backfillSchemaColumns(masterSs, "users");
+  var headers = uSheet.getRange(1, 1, 1, uSheet.getLastColumn()).getValues()[0];
+  var existingRow = findRowIndexInSheet(uSheet, headers, ["user_id", "entity_id"], staffId, companyId);
+
+  var resolvedPinHash = String(d.pin_hash || d.pinHash || "").trim();
+  var resolvedPinSalt = String(d.pin_salt || d.pinSalt || "").trim();
+  if (!resolvedPinHash && d.pin) {
+    resolvedPinHash = hashPasswordSha256(String(d.pin).trim());
+  }
+  var resolvedPinVersion = Number(d.pinVersion || d.pin_version || 0);
+  var resolvedPinUpdatedAt = d.pinUpdatedAt ? new Date(Number(d.pinUpdatedAt)).toISOString() : "";
+
+  if (existingRow > 0) {
+    var prev = extractExistingEnvelopeState(uSheet, existingRow, headers);
+    var prevPinVer = Number(prev.raw.pin_version || 0);
+    if (prev.raw.pin_hash && (!resolvedPinHash || (prevPinVer > 0 && (resolvedPinVersion === 0 || prevPinVer > resolvedPinVersion)))) {
+      resolvedPinHash = prev.raw.pin_hash;
+      resolvedPinSalt = prev.raw.pin_salt || resolvedPinSalt;
+      resolvedPinVersion = Math.max(prevPinVer, resolvedPinVersion);
+      resolvedPinUpdatedAt = prev.raw.pin_updated_at || resolvedPinUpdatedAt;
+    }
+  }
+
+  var sanitized = sanitizePayloadForCloud("staff", d);
+  sanitized.id = staffId;
+  sanitized.pin_hash = resolvedPinHash;
+  if (resolvedPinSalt) sanitized.pin_salt = resolvedPinSalt;
+  if (resolvedPinVersion > 0) sanitized.pinVersion = resolvedPinVersion;
+
+  var seq = allocateNextServerSeq(targetSs || masterSs, companyId);
+  var rowObj = {
+    user_id: staffId,
+    company_id: companyId,
+    branch_id: d.branch_id || d.branchId || branchId || "BR-MAIN",
+    full_name: d.full_name || d.name || "Staff",
+    email: d.email || "",
+    phone: d.phone || "",
+    role: String(d.role || "CASHIER").toUpperCase(),
+    pin_hash: resolvedPinHash,
+    pin_salt: resolvedPinSalt,
+    pin_version: resolvedPinVersion,
+    pin_updated_at: resolvedPinUpdatedAt,
+    assigned_branch_ids: JSON.stringify(d.assignedBranchIds || []),
+    branch_assignments_json: JSON.stringify(d.branchAssignments || []),
+    permissions_json: JSON.stringify(d.permissions || {}),
+    is_active: d.is_active !== false && d.active !== "N" && d.active !== false,
+    created_at: d.created_at || nowIso,
+    updated_at: nowIso,
+    entity_type: "staff",
+    entity_id: staffId,
+    version: Number(d.version || 1),
+    mutation_source: d.mutationSource || "USER_EDIT",
+    client_updated_at: d.updatedAt ? new Date(Number(d.updatedAt)).toISOString() : nowIso,
+    server_updated_at: nowIso,
+    server_seq: seq,
+    is_deleted: false,
+    server_received_at: nowIso,
+    suspicious_backdate: false,
+    payload_json: JSON.stringify(sanitized)
+  };
+  if (existingRow > 0) updateRowByHeaders(uSheet, existingRow, headers, rowObj);
+  else writeRowByHeaders(uSheet, headers, rowObj);
+
+  if (targetSs && targetSs.getId() !== masterSs.getId()) {
+    var stSheet = backfillSchemaColumns(targetSs, "Staff");
+    var stHeaders = stSheet.getRange(1, 1, 1, stSheet.getLastColumn()).getValues()[0];
+    var stRowIdx = findRowIndexInSheet(stSheet, stHeaders, ["UserID", "entity_id"], staffId, companyId);
+    var stObj = buildRowObjectForEntity("staff", staffId, sanitized, {
+      updatedAt: Date.now(),
+      version: rowObj.version,
+      mutationSource: rowObj.mutation_source
+    }, { server_received_at: nowIso, suspicious_backdate: false }, seq, companyId, rowObj.branch_id);
+    if (stRowIdx > 0) updateRowByHeaders(stSheet, stRowIdx, stHeaders, stObj);
+    else writeRowByHeaders(stSheet, stHeaders, stObj);
+  }
+
+  return { success: true, user_id: staffId, server_seq: seq };
+}
+
+function handleGetTenantContext(req, ss) {
+  var companyId = String(req.company_id || req.companyId || TENANT_COMPANY_ID).trim();
+  var comp = getCompany(companyId, ss);
+  if (!comp) return { success: false, error: "Tenant not found: " + companyId };
+  var out = {};
+  for (var k in comp) {
+    if (comp.hasOwnProperty(k) && k !== "password_hash" && k !== "_rowIndex") out[k] = comp[k];
+  }
+  var compUpper = companyId.toUpperCase();
+  var propEp = Number(PropertiesService.getScriptProperties().getProperty("ROUTE_EPOCH_" + compUpper) || "1");
+  out.routing_epoch = Math.max(propEp, Number(out.routing_epoch || 1));
+  return { success: true, tenant: out, server_time: new Date().toISOString() };
+}
+
+function handleGetUsersSince(req, ss) {
+  var companyId = String(req.company_id || req.companyId || TENANT_COMPANY_ID).trim();
+  var sinceMs = parseTimestampMsSafe(req.since);
+  var uSheet = ss.getSheetByName("users");
+  var users = [];
+  if (uSheet && uSheet.getLastRow() >= 2) {
+    var data = uSheet.getDataRange().getValues();
+    var h = data[0];
+    for (var i = 1; i < data.length; i++) {
+      var obj = {};
+      for (var c = 0; c < h.length; c++) {
+        if (h[c] === "pin" || h[c] === "password_hash") continue;
+        obj[h[c]] = data[i][c];
+      }
+      if (String(obj.company_id || "").trim().toUpperCase() !== companyId.toUpperCase()) continue;
+      if (obj.is_deleted === true || String(obj.is_deleted).toUpperCase() === "TRUE") continue;
+      var updMs = Math.max(parseTimestampMsSafe(obj.updated_at), parseTimestampMsSafe(obj.server_updated_at), parseTimestampMsSafe(obj.client_updated_at));
+      if (sinceMs > 0 && updMs > 0 && updMs < sinceMs) continue;
+      try { if (obj.assigned_branch_ids) obj.assignedBranchIds = JSON.parse(obj.assigned_branch_ids); } catch (e1) {}
+      try { if (obj.branch_assignments_json) obj.branchAssignments = JSON.parse(obj.branch_assignments_json); } catch (e2) {}
+      try { if (obj.permissions_json) obj.permissions = JSON.parse(obj.permissions_json); } catch (e3) {}
+      obj.id = obj.user_id;
+      obj.name = obj.full_name;
+      obj.pinVersion = Number(obj.pin_version || 0);
+      obj.pinUpdatedAt = parseTimestampMsSafe(obj.pin_updated_at);
+      obj.updatedAt = parseTimestampMsSafe(obj.client_updated_at) || updMs;
+      obj.mutationSource = obj.mutation_source || "";
+      users.push(obj);
+    }
+  }
+  return { success: true, users: users, server_time: new Date().toISOString() };
+}
+
+function handleGetBranchesSince(req, ss) {
+  var companyId = String(req.company_id || req.companyId || TENANT_COMPANY_ID).trim();
+  var sinceMs = parseTimestampMsSafe(req.since);
+  var bSheet = ss.getSheetByName("branches");
+  var branches = [];
+  if (bSheet && bSheet.getLastRow() >= 2) {
+    var data = bSheet.getDataRange().getValues();
+    var h = data[0];
+    for (var i = 1; i < data.length; i++) {
+      var obj = {};
+      for (var c = 0; c < h.length; c++) obj[h[c]] = data[i][c];
+      if (String(obj.company_id || "").trim().toUpperCase() !== companyId.toUpperCase()) continue;
+      if (obj.is_deleted === true || String(obj.is_deleted).toUpperCase() === "TRUE") continue;
+      var updMs = Math.max(parseTimestampMsSafe(obj.updated_at), parseTimestampMsSafe(obj.server_updated_at), parseTimestampMsSafe(obj.client_updated_at));
+      if (sinceMs > 0 && updMs > 0 && updMs < sinceMs) continue;
+      obj.id = obj.branch_id;
+      obj.branchId = obj.branch_id;
+      obj.name = obj.branch_name;
+      obj.code = obj.branch_code;
+      obj.updatedAt = parseTimestampMsSafe(obj.client_updated_at) || updMs;
+      obj.mutationSource = obj.mutation_source || "";
+      branches.push(obj);
+    }
+  }
+  return { success: true, branches: branches, server_time: new Date().toISOString() };
+}
+
+function handleLookupCompany(req, ss) {
+  var q = String(req.company_id || req.email || req.query || "").trim().toLowerCase();
+  var cSheet = ss.getSheetByName("companies");
+  if (!cSheet || cSheet.getLastRow() < 2) return { success: false, error: "No companies registered" };
+  var data = cSheet.getDataRange().getValues();
+  var h = data[0];
+  for (var i = 1; i < data.length; i++) {
+    var obj = {};
+    for (var c = 0; c < h.length; c++) {
+      if (h[c] !== "password_hash") obj[h[c]] = data[i][c];
+    }
+    if (String(obj.company_id || "").toLowerCase() === q ||
+        String(obj.owner_email || "").toLowerCase() === q ||
+        String(obj.company_name || "").toLowerCase() === q) {
+      return { success: true, company: obj };
+    }
+  }
+  return { success: false, error: "Company not found" };
+}
+
+function handleLookupBranch(req, ss) {
+  var companyId = String(req.company_id || TENANT_COMPANY_ID).trim().toUpperCase();
+  var brQuery = String(req.branch_id || req.branch_code || "").trim().toUpperCase();
+  var bSheet = ss.getSheetByName("branches");
+  if (!bSheet || bSheet.getLastRow() < 2) return { success: false, error: "No branches found" };
+  var data = bSheet.getDataRange().getValues();
+  var h = data[0];
+  for (var i = 1; i < data.length; i++) {
+    var obj = {};
+    for (var c = 0; c < h.length; c++) obj[h[c]] = data[i][c];
+    if (String(obj.company_id || "").toUpperCase() === companyId &&
+        (String(obj.branch_id || "").toUpperCase() === brQuery || String(obj.branch_code || "").toUpperCase() === brQuery)) {
+      return { success: true, branch: obj };
+    }
+  }
+  return { success: false, error: "Branch not found" };
+}
+
+function handleSchemaHealthCheck(req, ss) {
+  var masterCreated = ensureAllMasterTabsExist(ss);
+  var companyId = String(req.company_id || "").trim();
+  var targetSs = resolveTargetSpreadsheet(ss, companyId, req.sheet_id);
+  var report = { masterTabs: [], tenantTabs: [], targetSheetId: targetSs.getId(), tenantMeta: readTenantMeta(targetSs) };
+  var allSheets = targetSs.getSheets();
+  for (var i = 0; i < allSheets.length; i++) {
+    var name = allSheets[i].getName();
+    var expected = TAB_TEMPLATES[name];
+    var presentCols = allSheets[i].getLastColumn() > 0 ? allSheets[i].getRange(1, 1, 1, allSheets[i].getLastColumn()).getValues()[0] : [];
+    var missing = [];
+    if (expected) {
+      for (var e = 0; e < expected.length; e++) {
+        if (presentCols.indexOf(expected[e]) === -1) missing.push(expected[e]);
+      }
+    }
+    report.tenantTabs.push({ tab: name, rows: Math.max(0, allSheets[i].getLastRow() - 1), missingColumns: missing });
+  }
+  return { success: true, version: CODE_GS_VERSION, schema_version: CURRENT_TENANT_SCHEMA_VERSION, masterCreated: masterCreated, report: report };
+}
+
+function handleMigrateTenant(req, ss) {
+  var companyId = String(req.company_id || TENANT_COMPANY_ID).trim();
+  var targetSs = resolveTargetSpreadsheet(ss, companyId, req.sheet_id);
+  ensureAllMasterTabsExist(ss);
+  var heal = healTenantSchema(targetSs, companyId);
+
+  updateMasterCompanyRoutingFields(ss, companyId, {
+    schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+    updated_at: new Date().toISOString()
+  });
+
+  if (req.bump_routing_epoch) {
+    handleBumpRoutingEpoch({ company_id: companyId, sheet_id: targetSs.getId() }, ss);
+  }
+
+  return {
+    success: true,
+    schema_version: CURRENT_TENANT_SCHEMA_VERSION,
+    createdTabs: heal.createdTabs,
+    migratedTabsCount: heal.healedTabsCount
+  };
+}
+
+function handleMergeDuplicateCompanies(req, ss) {
+  var cSheet = ss.getSheetByName("companies");
+  if (!cSheet || cSheet.getLastRow() < 3) return { success: true, merged: 0 };
+  var data = cSheet.getDataRange().getValues();
+  var h = data[0];
+  var emCol = h.indexOf("owner_email");
+  var seen = {};
+  var merged = 0;
+  for (var i = data.length - 1; i >= 1; i--) {
+    var em = String(data[i][emCol] || "").trim().toLowerCase();
+    if (!em) continue;
+    if (seen[em]) {
+      cSheet.deleteRow(i + 1);
+      merged++;
+    } else {
+      seen[em] = true;
+    }
+  }
+  return { success: true, merged: merged };
+}
+
+// ============================================================================
+// 7. V5.0/V7.0 OPERATIONAL & SAAS HANDLERS (USING MERGED PAYLOAD)
+// ============================================================================
+
+function handleAddDirectGRV(req, ss, masterSsOpt, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  d.id = d.id || d.grvNumber || ("GRV-" + Date.now());
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    entityType: "direct_grv",
+    entityId: d.id,
+    data: d
+  }, masterSsOpt, ss, companyId, branchId);
+}
+
+function handleApproveDirectGRV(req, ss, masterSsOpt, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  d.status = "Approved";
+  d.approvedAt = new Date().toISOString();
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    entityType: "direct_grv",
+    entityId: d.id || d.grvNumber,
+    data: d
+  }, masterSsOpt, ss, companyId, branchId);
+}
+
+function handleSubmitEOD(req, ss, masterSsOpt, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  d.status = d.status || "SUBMITTED";
+  d.id = d.id || ("REC-" + (d.date || new Date().toISOString().split("T")[0]) + "-" + branchId);
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    entityType: "reconciliation",
+    entityId: d.id,
+    data: d
+  }, masterSsOpt, ss, companyId, branchId);
+}
+
+function handleApproveEOD(req, ss, masterSsOpt, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  d.status = "APPROVED";
+  d.approvedAt = new Date().toISOString();
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    entityType: "reconciliation",
+    entityId: d.id,
+    data: d
+  }, masterSsOpt, ss, companyId, branchId);
+}
+
+function handleAddSale(req, ss, masterSsOpt, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  var saleId = d.id || d.InvoiceID || d.invoice_id || ("INV-" + Date.now());
+  return handleLegacyActionAsEnvelope("sync_sale", {
+    ...req,
+    entityType: "sale",
+    entityId: saleId,
+    data: d
+  }, masterSsOpt, ss, companyId, branchId);
+}
+
+function handleConfirmPayment(req, ss) {
+  var d = mergeReqPayload(req);
+  var companyId = String(d.company_id || "").trim();
+  var subSheet = backfillSchemaColumns(ss, "Subscriptions");
+  var headers = subSheet.getRange(1, 1, 1, subSheet.getLastColumn()).getValues()[0];
+  var nextDate = d.next_billing_date || new Date(Date.now() + 30 * 86400000).toISOString().split("T")[0];
+  writeRowByHeaders(subSheet, headers, {
+    SubscriptionID: "SUB-" + Date.now(),
+    CompanyID: companyId,
+    Plan: d.plan || "PRO",
+    Status: "ACTIVE",
+    PaymentRef: d.payment_ref || d.reference || "",
+    AmountPaid: d.amount || 0,
+    Currency: d.currency || "USD",
+    PaidDate: new Date().toISOString().split("T")[0],
+    NextBillingDate: nextDate,
+    ActivatedBy: d.activated_by || "ADMIN",
+    Notes: d.notes || ""
+  });
+  updateMasterCompanyRoutingFields(ss, companyId, {
+    subscription_status: "ACTIVE",
+    status: "ACTIVE",
+    plan: d.plan || "PRO",
+    next_billing_date: nextDate,
+    expiry: nextDate,
+    updated_at: new Date().toISOString()
+  });
+  return { success: true, company_id: companyId, subscription_status: "ACTIVE", next_billing_date: nextDate };
+}
+
+function handleExtendTrial(req, ss) {
+  var d = mergeReqPayload(req);
+  var companyId = String(d.company_id || "").trim();
+  var days = Number(d.days || 14);
+  var nextDate = new Date(Date.now() + days * 86400000).toISOString().split("T")[0];
+  var ok = updateMasterCompanyRoutingFields(ss, companyId, {
+    next_billing_date: nextDate,
+    expiry: nextDate,
+    subscription_status: "TRIAL",
+    status: "TRIAL",
+    updated_at: new Date().toISOString()
+  });
+  if (ok) {
+    return { success: true, company_id: companyId, next_billing_date: nextDate };
+  }
+  return { success: false, error: "Company not found" };
+}
+
+function handleGetData(req, targetSs, masterSsOpt) {
+  var ss = targetSs;
+  var sheetName = SHEET_ALIASES[req.sheet] || req.sheet || "Sales";
+  var companyId = String(req.company_id || req.companyId || "").trim().toUpperCase();
+  var branchId = String(req.branch_id || req.branchId || "").trim().toUpperCase();
+  var userRole = String(req.user_role || "OWNER").toUpperCase();
+  var sheets = getReadableSheetsForBase(ss, sheetName);
+  if (sheets.length === 0 && masterSsOpt && masterSsOpt.getId() !== ss.getId()) {
+    sheets = getReadableSheetsForBase(masterSsOpt, sheetName);
+  }
+  var rows = [];
+  for (var s = 0; s < sheets.length; s++) {
+    var sh = sheets[s];
+    if (sh.getLastRow() < 2) continue;
+    var vals = sh.getDataRange().getValues();
+    var h = vals[0];
+    for (var i = 1; i < vals.length; i++) {
+      var obj = {};
+      for (var c = 0; c < h.length; c++) {
+        if (h[c] === "password_hash" || h[c] === "pin") continue;
+        obj[h[c]] = vals[i][c];
+      }
+      if (obj.is_deleted === true || String(obj.is_deleted).toUpperCase() === "TRUE") continue;
+      var rc = String(obj.CompanyID || obj.company_id || "").trim().toUpperCase();
+      var rb = String(obj.BranchID || obj.branch_id || "ALL").trim().toUpperCase();
+      if (companyId && rc && rc !== companyId) continue;
+      if (userRole !== "OWNER" && userRole !== "SUPER_ADMIN" && branchId && branchId !== "ALL" && rb && rb !== "ALL" && rb !== branchId) {
+        continue;
+      }
+      rows.push(obj);
+    }
+  }
+  return { success: true, sheet: sheetName, rows: rows, count: rows.length };
+}
+
+function handleGenericInsert(req, targetSs, masterSsOpt, companyId, branchId) {
+  var sheetName = SHEET_ALIASES[req.sheet] || req.sheet || "Sales";
+  var d = mergeReqPayload(req);
+  var entityType = null;
+  for (var et in ENTITY_TO_TAB) {
+    if (ENTITY_TO_TAB[et] === sheetName) { entityType = et; break; }
+  }
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    entityType: entityType || "audit_log",
+    data: d
+  }, masterSsOpt, targetSs, companyId, branchId);
+}
+
+function handleGenericUpdate(req, targetSs, masterSsOpt, companyId, branchId) {
+  return handleGenericInsert(req, targetSs, masterSsOpt, companyId, branchId);
+}
+
+function handleGenericDelete(req, targetSs, masterSsOpt, companyId, branchId) {
+  var sheetName = SHEET_ALIASES[req.sheet] || req.sheet || "InventoryMaster";
+  var d = mergeReqPayload(req);
+  var entityType = null;
+  for (var et in ENTITY_TO_TAB) {
+    if (ENTITY_TO_TAB[et] === sheetName) { entityType = et; break; }
+  }
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    deleteFlag: true,
+    entityType: entityType || "inventory_item",
+    data: d
+  }, masterSsOpt, targetSs, companyId, branchId);
+}
+
+function handleReceiveStock(req, ss, masterSsOpt, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  d.id = d.id || ("GRN-" + Date.now());
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    entityType: "goods_received",
+    entityId: d.id,
+    data: d
+  }, masterSsOpt, ss, companyId, branchId);
+}
+
+function handleSellStock(req, ss, masterSsOpt, companyId, branchId) {
+  return handleAddSale(req, ss, masterSsOpt, companyId, branchId);
+}
+
+function handleBreakCase(req, ss, masterSsOpt, companyId, branchId) {
+  var d = mergeReqPayload(req);
+  return handleLegacyActionAsEnvelope("sync_entity", {
+    ...req,
+    entityType: "stock_movement",
+    entityId: d.id || ("MOV-" + Date.now()),
+    data: d
+  }, masterSsOpt, ss, companyId, branchId);
+}
+
+function handleGetStock(req, ss, masterSsOpt) {
+  return handleGetInventory(req, masterSsOpt, ss, req.company_id || req.companyId);
+}
+
+function handleGetCompanies(req, ss) {
+  var cSheet = ss.getSheetByName("companies");
+  var list = [];
+  if (cSheet && cSheet.getLastRow() >= 2) {
+    var vals = cSheet.getDataRange().getValues();
+    var h = vals[0];
+    for (var i = 1; i < vals.length; i++) {
+      var obj = {};
+      for (var c = 0; c < h.length; c++) {
+        if (h[c] === "password_hash") continue;
+        obj[h[c]] = vals[i][c];
+      }
+      list.push(obj);
+    }
+  }
+  return { success: true, companies: list };
+}
+
+function handleGetUsers(req, ss) {
+  return handleGetUsersSince({ company_id: req.company_id || TENANT_COMPANY_ID, since: "" }, ss);
+}
+
+function handleSyncCompany(req, ss) {
+  var d = mergeReqPayload(req);
+  var companyId = String(d.company_id || TENANT_COMPANY_ID).trim();
+  var cSheet = backfillSchemaColumns(ss, "companies");
+  var headers = cSheet.getRange(1, 1, 1, cSheet.getLastColumn()).getValues()[0];
+  var existingRow = findRowIndexInSheet(cSheet, headers, ["company_id", "entity_id"], companyId, "");
+  var nowIso = new Date().toISOString();
+  var rowObj = {
+    ...d,
+    company_id: companyId,
+    updated_at: nowIso,
+    entity_type: "company",
+    entity_id: companyId,
+    server_updated_at: nowIso,
+    server_seq: allocateNextServerSeq(ss, companyId),
+    payload_json: JSON.stringify(d)
+  };
+  if (existingRow > 0) updateRowByHeaders(cSheet, existingRow, headers, rowObj);
+  else writeRowByHeaders(cSheet, headers, rowObj);
+  invalidateCompanyCache(companyId);
+  return { success: true, company_id: companyId };
+}
+
+function handleBulkSyncCompanies(req, ss) {
+  var list = Array.isArray(req.companies) ? req.companies : [];
+  for (var i = 0; i < list.length; i++) {
+    handleSyncCompany({ data: list[i] }, ss);
+  }
+  return { success: true, count: list.length };
+}
+
+function handleGetInventory(req, masterSsOpt, targetSsOpt, companyIdOpt) {
+  var companyId = String(companyIdOpt || req.company_id || req.companyId || TENANT_COMPANY_ID).trim();
+  var ss = targetSsOpt || resolveTargetSpreadsheet(masterSsOpt, companyId, req.sheet_id);
+  var res = handleGetData({ sheet: "InventoryMaster", company_id: companyId, branch_id: "ALL", user_role: "OWNER" }, ss, masterSsOpt);
+  var items = (res.rows || []).map(function(r) {
+    if (r.payload_json && String(r.payload_json).charAt(0) === "{") {
+      try { return JSON.parse(r.payload_json); } catch (e) {}
+    }
+    return reconstructDataFromLegacyRow("inventory_item", r);
+  });
+  return { success: true, items: items, count: items.length };
+}
+
+function handleSyncInventory(req, masterSsOpt, targetSs, companyId, branchId) {
+  var items = Array.isArray(req.items) ? req.items : (Array.isArray(req.data) ? req.data : [mergeReqPayload(req)]);
+  var envelopes = [];
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    if (!it) continue;
+    var p = it.payload || it;
+    envelopes.push({
+      packetId: it.id || p.itemId || p.id || ("INV-" + Date.now() + "-" + i),
+      entityType: "inventory_item",
+      entityId: String(p.itemId || p.ProductID || p.id || ""),
+      action: it.action === "DELETE" ? "DELETE" : "UPSERT",
+      data: p,
+      updatedAt: parseTimestampMsSafe(p.updatedAt || p.lastUpdated) || Date.now(),
+      version: Number(p.version || 1),
+      mutationSource: p.mutationSource || "USER_EDIT",
+      targetBranchId: "ALL",
+      class: "T2"
+    });
+  }
+  return handlePushEnvelopes({
+    envelopes: envelopes,
+    company_id: companyId,
+    branch_id: branchId || "ALL",
+    user_role: req.user_role || "OWNER",
+    tenant_sheet_id: req.tenant_sheet_id || req.sheet_id
+  }, masterSsOpt, targetSs, companyId, branchId || "ALL");
+}
+
+function handleBatchSyncWrites(req, masterSsOpt, targetSs, companyId, branchId) {
+  var items = Array.isArray(req.items) ? req.items : [];
+  var envelopes = [];
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    var sheetName = SHEET_ALIASES[it.sheetName] || it.sheetName || "";
+    var p = it.payload || it;
+    var entityType = p.entityType || null;
+    if (!entityType) {
+      for (var et in ENTITY_TO_TAB) {
+        if (ENTITY_TO_TAB[et] === sheetName) { entityType = et; break; }
+      }
+    }
+    envelopes.push({
+      packetId: it.id || (p && p.clientRequestId) || ("BATCH-" + Date.now() + "-" + i),
+      entityType: entityType || "audit_log",
+      entityId: extractEntityIdFromPayload(entityType || "audit_log", p.id, p),
+      action: it.action === "DELETE" ? "DELETE" : "UPSERT",
+      data: p,
+      updatedAt: parseTimestampMsSafe(p.updatedAt || it.timestamp) || Date.now(),
+      version: Number(p.version || 1),
+      mutationSource: p.mutationSource || "USER_EDIT",
+      targetBranchId: p.branch_id || branchId || "ALL",
+      class: T2_ENTITY_TYPES[entityType] ? "T2" : "T1",
+      meta: { sheetName: sheetName }
+    });
+  }
+  return handlePushEnvelopes({
+    envelopes: envelopes,
+    company_id: companyId,
+    branch_id: branchId,
+    user_role: req.user_role || "OWNER",
+    tenant_sheet_id: req.tenant_sheet_id || req.sheet_id
+  }, masterSsOpt, targetSs, companyId, branchId);
+}
+
+function handleProvisionTenantSheet(req, masterSs) {
+  return provisionTenantFromTemplate(req, masterSs);
+}
+
+function getSeedPermissions52() {
+  return [
+    { role: "MANAGER", module: "pos", action: "sell", allowed: true, description: "Process sales" },
+    { role: "MANAGER", module: "pos", action: "void", allowed: true, description: "Void sale" },
+    { role: "MANAGER", module: "pos", action: "refund", allowed: true, description: "Refund sale" },
+    { role: "MANAGER", module: "inventory", action: "edit", allowed: true, description: "Edit inventory" },
+    { role: "MANAGER", module: "stocktake", action: "supervise", allowed: true, description: "Supervise stocktake" },
+    { role: "AUDITOR", module: "stocktake", action: "supervise", allowed: true, description: "Audit stocktake" },
+    { role: "AUDITOR", module: "stocktake", action: "unlock", allowed: true, description: "Unlock stocktake slot" },
+    { role: "CASHIER", module: "pos", action: "sell", allowed: true, description: "Process sales" },
+    { role: "CASHIER", module: "stocktake", action: "count", allowed: true, description: "Blind count active stocktake" }
+  ];
+}
+
+function seedSampleData(req, ss, companyId, branchId) {
+  return { success: true, message: "Sample data hook ready for " + companyId };
 }

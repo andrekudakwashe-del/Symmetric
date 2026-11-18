@@ -81,8 +81,13 @@ let supabaseKey = supabaseKeyArgIdx !== -1 && process.argv[supabaseKeyArgIdx + 1
   ? process.argv[supabaseKeyArgIdx + 1]
   : (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || '');
 
-// High-Water Mark for Edge-to-Cloud Hub-to-Cloud Sync
+// High-Water Marks & V7.0 Enterprise Cloud Routing State for Edge-to-Cloud Sync
 let lastCloudSyncTimestamp = 0;
+let lastAppsScriptServerSeq = 0;
+let cloudRoutingEpoch = 1;
+let cloudBackoffUntil = 0;
+let cloudSpreadsheetId = '';
+let cloudJwtToken = '';
 
 // Universal Encrypted Cloud Configuration (Database-Agnostic)
 const CLOUD_CONFIG_FILE = path.join(process.cwd(), 'hub-cloud-config.enc');
@@ -149,6 +154,12 @@ function loadEncryptedCloudConfig() {
     const parsed = JSON.parse(decrypted);
     if (parsed && typeof parsed === 'object') {
       cloudConfig = parsed;
+      const creds = parsed.credentials && typeof parsed.credentials === 'object' ? parsed.credentials : {};
+      if (creds.token || creds.jwt) cloudJwtToken = String(creds.token || creds.jwt).trim();
+      if (creds.spreadsheetId || creds.sheetId) cloudSpreadsheetId = String(creds.spreadsheetId || creds.sheetId).trim();
+      if (Number(creds.routingEpoch || creds.routing_epoch) > 0) {
+        cloudRoutingEpoch = Math.max(cloudRoutingEpoch, Number(creds.routingEpoch || creds.routing_epoch));
+      }
       console.log('[Termux Hub] 🔓 Loaded and decrypted Cloud Config from hub-cloud-config.enc. DB Type:', cloudConfig.databaseType || 'unknown');
       return cloudConfig;
     }
@@ -156,6 +167,88 @@ function loadEncryptedCloudConfig() {
     console.warn('[Termux Hub] Notice loading encrypted cloud config:', err.message);
   }
   return null;
+}
+
+function getHubCloudAuthFields() {
+  const creds = (cloudConfig && cloudConfig.credentials && typeof cloudConfig.credentials === 'object') ? cloudConfig.credentials : {};
+  const jwt = String(cloudJwtToken || creds.token || creds.jwt || '').trim();
+  const sheetId = String(cloudSpreadsheetId || creds.spreadsheetId || creds.sheetId || '').trim();
+  const epoch = Number(cloudRoutingEpoch || creds.routingEpoch || creds.routing_epoch || 1) || 1;
+  return {
+    ...(jwt ? { jwt, token: jwt } : {}),
+    ...(sheetId ? { spreadsheet_id: sheetId, sheet_id: sheetId, tenant_sheet_id: sheetId } : {}),
+    routing_epoch: epoch,
+  };
+}
+
+function applyHubCloudBackoff(waitMs, reason) {
+  const bounded = Math.min(300000, Math.max(1000, Number(waitMs) || 3000));
+  cloudBackoffUntil = Math.max(cloudBackoffUntil, Date.now() + bounded);
+  console.warn(`[Edge-to-Cloud] ⏳ Cloud backoff active for ${Math.round(bounded / 1000)}s (${reason})`);
+}
+
+function handleHubAppsScriptErrorResponse(json) {
+  if (!json || typeof json !== 'object') return 'UNKNOWN';
+  const code = String(json.code || '').toUpperCase().trim();
+
+  if (code === 'ROUTING_EPOCH_STALE') {
+    const nextEp = Number(json.current_routing_epoch || json.routing_epoch || 0);
+    if (nextEp > 0) cloudRoutingEpoch = nextEp;
+    const nextSid = String(json.spreadsheet_id || json.sheet_id || '').trim();
+    if (nextSid && nextSid.length >= 10) cloudSpreadsheetId = nextSid;
+    if (cloudConfig && typeof cloudConfig === 'object') {
+      cloudConfig.credentials = {
+        ...(cloudConfig.credentials || {}),
+        ...(cloudSpreadsheetId ? { spreadsheetId: cloudSpreadsheetId } : {}),
+        routingEpoch: cloudRoutingEpoch,
+      };
+      encryptAndSaveCloudConfig(cloudConfig);
+    }
+    lastAppsScriptServerSeq = 0;
+    lastCloudSyncTimestamp = 0;
+    scheduleSave();
+    const epochMsg = JSON.stringify({
+      type: 'HUB_ROUTING_EPOCH_UPDATED',
+      action: 'HUB_ROUTING_EPOCH_UPDATED',
+      company_id: hubTenantId,
+      routing_epoch: cloudRoutingEpoch,
+      spreadsheet_id: cloudSpreadsheetId,
+      timestamp: Date.now(),
+    });
+    wss.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) {
+        try { c.send(epochMsg); } catch (e) {}
+      }
+    });
+    console.warn(`[Edge-to-Cloud] 🔄 ROUTING_EPOCH_STALE handled -> updated epoch=${cloudRoutingEpoch}, reset catch-up cursors.`);
+    return 'EPOCH_STALE';
+  }
+
+  if (code === 'JWT_EXPIRED' || code === 'JWT_INVALID' || code === 'JWT_MISSING') {
+    applyHubCloudBackoff(60000, code);
+    const refreshMsg = JSON.stringify({
+      type: 'CLOUD_AUTH_REFRESH_REQUIRED',
+      action: 'CLOUD_AUTH_REFRESH_REQUIRED',
+      company_id: hubTenantId,
+      code,
+      timestamp: Date.now(),
+    });
+    wss.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) {
+        try { c.send(refreshMsg); } catch (e) {}
+      }
+    });
+    return 'AUTH_REQUIRED';
+  }
+
+  if (code === 'RATE_LIMITED' || code === 'TENANT_LOCK_BUSY' || code === 'KILL_SWITCH_ACTIVE' || code === 'TENANT_SUSPENDED') {
+    const baseMs = Number(json.retryAfterMs) || (code === 'KILL_SWITCH_ACTIVE' || code === 'TENANT_SUSPENDED' ? 300000 : code === 'RATE_LIMITED' ? 15000 : 2500);
+    const jitter = (code === 'KILL_SWITCH_ACTIVE' || code === 'TENANT_SUSPENDED') ? baseMs : baseMs + Math.floor(Math.random() * 1500);
+    applyHubCloudBackoff(jitter, code);
+    return 'BACKOFF';
+  }
+
+  return code || 'ERROR';
 }
 
 function resolveCloudAdapterConfig() {
@@ -397,6 +490,190 @@ function annotateCloudBackdateFlag(entityType, record, serverHeaderDate) {
   }
 }
 
+const T2_CANONICAL_TYPES = new Set([
+  'inventory_item',
+  'staff',
+  'customer',
+  'supplier',
+  'branch',
+  'cash_account',
+  'casual_worker',
+  'branch_lockdown',
+  'credit_group',
+  'inventory_category',
+  'stocktake_session',
+  'stocktake_segment',
+  'stocktake_zone_assignment',
+  'stocktake_zone_claim',
+  'stocktake_count_submission',
+  'stocktake_joint_proposal',
+  'stocktake_joint_finalized',
+  'stocktake_segment_unlock',
+  'permissions_matrix',
+  'role_configs',
+  'multi_currency',
+  'system_settings',
+  'sheets_config',
+]);
+
+function mapHubEntityToCanonicalType(entityType) {
+  const t = String(entityType || '').trim().toUpperCase();
+  if (t === 'SALE' || t === 'SALE_UPDATE' || t === 'SALES') return 'sale';
+  if (t === 'INVENTORY' || t === 'INVENTORY_ITEM' || t === 'INVENTORY_UPDATE') return 'inventory_item';
+  if (t === 'STAFF' || t === 'SALESPERSON' || t === 'STAFF_MEMBER') return 'staff';
+  if (t === 'CUSTOMER' || t === 'CUSTOMERS') return 'customer';
+  if (t === 'CUSTOMER_CHANGE' || t === 'CUSTOMER_CHANGES') return 'customer_change';
+  if (t === 'CREDIT_SALE' || t === 'CREDIT_SALES') return 'credit_sale';
+  if (t === 'CREDIT_GROUP' || t === 'CREDIT_GROUPS') return 'credit_group';
+  if (t === 'CASH_LOG' || t === 'CASH_LOGS') return 'cash_log';
+  if (t === 'CASH_LIFT' || t === 'CASH_LIFTS') return 'cash_lift';
+  if (t === 'CASH_MOVEMENT' || t === 'CASH_MOVEMENTS') return 'cash_movement';
+  if (t === 'CASH_ACCOUNT' || t === 'CASH_ACCOUNTS') return 'cash_account';
+  if (t === 'CASH_TRANSFER' || t === 'CASH_TRANSFERS') return 'cash_transfer';
+  if (t === 'GRV' || t === 'DIRECT_GRV' || t === 'DIRECT_GRVS') return 'direct_grv';
+  if (t === 'EXPENSE' || t === 'EXPENSES') return 'expense';
+  if (t === 'INTERNAL_CONSUMPTION' || t === 'SHOP_USE' || t === 'INTERNAL_CONSUMPTIONS') return 'internal_consumption';
+  if (t === 'STOCK_MOVEMENT' || t === 'STOCK_MOVEMENTS') return 'stock_movement';
+  if (t === 'RECONCILIATION' || t === 'RECONCILIATIONS') return 'reconciliation';
+  if (t === 'SUPPLIER' || t === 'SUPPLIERS') return 'supplier';
+  if (t === 'ADMIN_SALE' || t === 'ADMIN_SALES') return 'admin_sale';
+  if (t === 'CASH_COUNT' || t === 'CASH_COUNTS') return 'cash_count';
+  if (t === 'VOUCHER' || t === 'VOUCHERS' || t === 'SUPPLIER_INVOICE' || t === 'SUPPLIER_INVOICE_VOUCHER') return 'supplier_invoice_voucher';
+  if (t === 'BUSINESS_DAY_CLOSURE' || t === 'BUSINESS_DAY_CLOSURES') return 'business_day_closure';
+  if (t === 'ELECTRONIC_SETTLEMENT' || t === 'ELECTRONIC_SETTLEMENTS') return 'electronic_settlement';
+  if (t === 'CATEGORY' || t === 'CATEGORIES' || t === 'INVENTORY_CATEGORY') return 'inventory_category';
+  if (t === 'BRANCH' || t === 'BRANCHES') return 'branch';
+  if (t === 'CASUAL_WORKER' || t === 'CASUAL_WORKERS') return 'casual_worker';
+  if (t === 'BRANCH_LOCKDOWN' || t === 'BRANCH_LOCKDOWNS') return 'branch_lockdown';
+  if (t === 'STOCKTAKE_SESSION' || t === 'STOCKTAKE_SESSIONS') return 'stocktake_session';
+  if (t === 'STOCKTAKE_SEGMENT' || t === 'STOCKTAKE_SEGMENTS') return 'stocktake_segment';
+  if (t === 'STOCKTAKE_ZONE_ASSIGNMENT' || t === 'STOCKTAKE_ZONE_ASSIGNMENTS') return 'stocktake_zone_assignment';
+  if (t === 'STOCKTAKE_BLIND_COUNT' || t === 'STOCKTAKE_COUNT_SUBMISSION') return 'stocktake_count_submission';
+  if (t === 'TOMBSTONE' || t === 'TOMBSTONES') return 'tombstone';
+  if (t === 'PERMISSIONS_MATRIX') return 'permissions_matrix';
+  if (t === 'ROLE_CONFIGS') return 'role_configs';
+  if (t === 'MULTI_CURRENCY') return 'multi_currency';
+  return String(entityType || 'audit_log').trim().toLowerCase();
+}
+
+function getHubCanonicalEntityId(record, canonicalType) {
+  if (!record || typeof record !== 'object') return '';
+  if (canonicalType === 'sale' || canonicalType === 'admin_sale') {
+    return String(record.id || record.invoice_id || record.InvoiceID || record.sale_id || '').trim();
+  }
+  if (canonicalType === 'inventory_item') return String(record.itemId || record.id || record.ItemID || '').trim();
+  if (canonicalType === 'staff' || canonicalType === 'casual_worker') return String(record.id || record.staffId || record.pin_hash || '').trim();
+  if (canonicalType === 'customer') return String(record.customerId || record.id || '').trim();
+  if (canonicalType === 'branch' || canonicalType === 'branch_lockdown') return String(record.branchId || record.branch_id || record.id || hubBranchId || 'BR-MAIN').trim();
+  if (canonicalType === 'cash_account') return String(record.account_id || record.id || '').trim();
+  if (canonicalType === 'cash_transfer') return String(record.transfer_id || record.id || '').trim();
+  if (canonicalType === 'supplier') return String(record.supplierId || record.SupplierID || record.id || '').trim();
+  if (canonicalType === 'inventory_category') return String(record.categoryId || record.id || record.categoryName || '').trim();
+  if (canonicalType === 'credit_group') return String(record.groupId || record.id || '').trim();
+  if (canonicalType === 'direct_grv') return String(record.id || record.grvNumber || record.grn_id || '').trim();
+  if (canonicalType === 'supplier_invoice_voucher') return String(record.id || record.voucherNumber || record.voucherId || '').trim();
+  if (canonicalType === 'stocktake_session') return String(record.sessionId || record.id || '').trim();
+  if (canonicalType === 'stocktake_segment') return String(record.segmentId || record.id || '').trim();
+  if (canonicalType === 'stocktake_zone_assignment') return String(record.id || `${record.sessionId || ''}::${record.zoneId || ''}`).trim();
+  if (canonicalType === 'permissions_matrix') return 'PERMISSIONS_MATRIX';
+  if (canonicalType === 'role_configs') return 'ROLE_CONFIGS';
+  if (canonicalType === 'multi_currency') return 'MULTI_CURRENCY_CONFIG';
+  if (canonicalType === 'tombstone') return String(record.id || `${record.entityType || 'entity'}::${record.entityId || ''}`).trim();
+  return String(record.id || record.logId || record.cashLogId || record.changeId || record.creditId || record.movementId || record.countId || record.closureId || record.settlementId || '').trim();
+}
+
+function buildHubSyncEnvelope(entityType, record) {
+  const canonicalType = mapHubEntityToCanonicalType(entityType);
+  const recId = getHubCanonicalEntityId(record, canonicalType) || `REC-${Date.now()}`;
+  const cleanData = record && typeof record === 'object' ? { ...record } : { id: recId };
+  if ('pin' in cleanData) delete cleanData.pin;
+  if ('rawPin' in cleanData) delete cleanData.rawPin;
+  if ('password' in cleanData) delete cleanData.password;
+  cleanData.company_id = cleanData.company_id || cleanData.companyId || hubTenantId;
+  cleanData.branch_id = cleanData.branch_id || cleanData.branchId || hubBranchId;
+
+  const updatedAtMs =
+    parseHubTimestampMs(cleanData.updatedAt || cleanData.lastUpdated || cleanData.hubTimestamp || cleanData.timestamp) || Date.now();
+  const targetBranch =
+    cleanData.targetBranchId ||
+    cleanData.target_branch_id ||
+    (canonicalType === 'inventory_item' ||
+    canonicalType === 'staff' ||
+    canonicalType === 'branch' ||
+    canonicalType === 'supplier' ||
+    canonicalType === 'inventory_category' ||
+    canonicalType === 'permissions_matrix' ||
+    canonicalType === 'role_configs' ||
+    canonicalType === 'multi_currency'
+      ? 'ALL'
+      : cleanData.branch_id || hubBranchId || 'ALL');
+
+  return {
+    packetId: String(cleanData.packetId || cleanData.clientRequestId || `HUB-ENV-${canonicalType}-${recId}-${Date.now()}`),
+    entityType: canonicalType,
+    entityId: recId,
+    action: 'UPSERT',
+    data: cleanData,
+    updatedAt: updatedAtMs,
+    version: Number(cleanData.version || 1),
+    mutationSource: cleanData.mutationSource || 'LOCAL_HUB',
+    originDeviceId: cleanData.originDeviceId || cleanData.origin_device_id || `HUB-${hubBranchId}`,
+    targetBranchId: targetBranch,
+    class: T2_CANONICAL_TYPES.has(canonicalType) ? 'T2' : 'T1',
+  };
+}
+
+async function postAppsScriptJson(targetUrl, bodyObj) {
+  const postStr = JSON.stringify(bodyObj);
+  if (typeof fetch === 'function') {
+    const res = await fetch(targetUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: postStr,
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch (_) {}
+    return {
+      ok: res.ok,
+      status: res.status,
+      dateHeader: res.headers && res.headers.get ? res.headers.get('date') : null,
+      json,
+    };
+  }
+  return await new Promise((resolve, reject) => {
+    const isHttps = targetUrl.startsWith('https:');
+    const client = isHttps ? require('https') : require('http');
+    const url = new URL(targetUrl);
+    const req = client.request({
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + (url.search || ''),
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8',
+        'Content-Length': Buffer.byteLength(postStr),
+      },
+    }, (res) => {
+      let chunks = '';
+      res.on('data', (d) => { chunks += d; });
+      res.on('end', () => {
+        let json = null;
+        try { json = JSON.parse(chunks); } catch (_) {}
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          dateHeader: res.headers ? res.headers.date : null,
+          json,
+        });
+      });
+    });
+    req.on('error', reject);
+    req.write(postStr);
+    req.end();
+  });
+}
+
 function pushToCloud(entityType, record) {
   if (!record) return;
   if (record.isCloudSynced === true) {
@@ -407,7 +684,8 @@ function pushToCloud(entityType, record) {
     const adapterCfg = resolveCloudAdapterConfig();
     if (adapterCfg.databaseType === 'none') return;
 
-    const isT1 = entityType === 'SALE' || entityType === 'GRV' || entityType === 'CASH_LOG' || entityType === 'EXPENSE';
+    const canonicalType = mapHubEntityToCanonicalType(entityType);
+    const isT1 = !T2_CANONICAL_TYPES.has(canonicalType) && canonicalType !== 'tombstone';
     const markCloudSyncedAndAck = () => {
       record.isCloudSynced = true;
       scheduleSave();
@@ -416,7 +694,7 @@ function pushToCloud(entityType, record) {
           type: 'T1_CLOUD_SYNC_ACK',
           action: 'T1_CLOUD_SYNC_ACK',
           entityType,
-          id: record.id || record.invoice_id || record.grvNumber,
+          id: getHubCanonicalEntityId(record, canonicalType),
           isCloudSynced: true,
           server_received_at: record.server_received_at,
           suspicious_backdate: record.suspicious_backdate,
@@ -529,7 +807,10 @@ function pushToCloud(entityType, record) {
       return;
     }
 
-    // Default / App Scripts Adapter
+    // Default / App Scripts Adapter (Canonical V7.0 push_envelopes)
+    if (cloudBackoffUntil > Date.now()) {
+      return;
+    }
     const targetUrl = String(
       adapterCfg.credentials.url ||
       adapterCfg.credentials.webhookUrl ||
@@ -539,64 +820,44 @@ function pushToCloud(entityType, record) {
     ).trim();
     if (!targetUrl) return;
 
-    const postData = JSON.stringify({
-      action: entityType === 'STAFF' ? 'sync_staff_member' : (entityType === 'CUSTOMER' ? 'sync_customer' : (entityType === 'SALE' ? 'sync_sale' : 'sync_entity')),
+    const envelope = buildHubSyncEnvelope(entityType, record);
+    postAppsScriptJson(targetUrl, {
+      action: 'push_envelopes',
       company_id: hubTenantId,
       branch_id: hubBranchId,
-      entityType,
-      record,
-      payload: record,
+      user_id: `HUB-${hubBranchId}`,
+      user_role: 'OWNER',
+      user_branch_id: hubBranchId,
+      ...getHubCloudAuthFields(),
+      envelopes: [envelope],
       timestamp: Date.now(),
+    }).then((res) => {
+      if (!res.ok) {
+        console.log(`[Edge Gateway] Apps Script HTTP ${res.status} for ${canonicalType}`);
+        return;
+      }
+      const json = res.json;
+      if (json && (json.success === false || json.status === 'error' || (typeof json.httpStatus === 'number' && json.httpStatus >= 400))) {
+        handleHubAppsScriptErrorResponse(json);
+        return;
+      }
+      if (json && typeof json.current_routing_epoch === 'number' && json.current_routing_epoch > cloudRoutingEpoch) {
+        cloudRoutingEpoch = json.current_routing_epoch;
+      }
+      if (json && json.server_received_at) record.server_received_at = json.server_received_at;
+      if (json && Array.isArray(json.flaggedBackdateIds) && json.flaggedBackdateIds.includes(envelope.entityId)) {
+        record.suspicious_backdate = true;
+      } else if (json && json.suspicious_backdate !== undefined) {
+        record.suspicious_backdate = Boolean(json.suspicious_backdate);
+      }
+      if (canonicalType === 'sale' || canonicalType === 'cash_log') {
+        annotateCloudBackdateFlag(entityType, record, res.dateHeader || null);
+      }
+      console.log(`[Edge Gateway] ☁️ Pushed canonical envelope ${canonicalType}:${envelope.entityId} to Apps Script`);
+      markCloudSyncedAndAck();
+    }).catch((err) => {
+      console.log(`[Edge Gateway] Cloud bridge notice for ${canonicalType}: ${err.message}`);
     });
-
-    if (typeof fetch === 'function') {
-      fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: postData,
-      }).then(async (res) => {
-        if (!res.ok) {
-          console.log(`[Edge Gateway] Cloud bridge HTTP ${res.status} for ${entityType}`);
-        } else {
-          try {
-            const json = await res.json();
-            if (json && json.server_received_at) record.server_received_at = json.server_received_at;
-            if (json && json.suspicious_backdate !== undefined) record.suspicious_backdate = Boolean(json.suspicious_backdate);
-          } catch (_) {}
-          if (entityType === 'SALE' || entityType === 'SALE_UPDATE' || entityType === 'CASH_LOG') {
-            annotateCloudBackdateFlag(entityType, record, res.headers && res.headers.get ? res.headers.get('date') : null);
-          }
-          console.log(`[Edge Gateway] ☁️ Pushed ${entityType} (${record.id || record.customerId || record.name}) to Cloud Bridge`);
-          markCloudSyncedAndAck();
-        }
-      }).catch((err) => {
-        console.log(`[Edge Gateway] Cloud bridge notice for ${entityType}: ${err.message}`);
-      });
-    } else {
-      const isHttps = targetUrl.startsWith('https:');
-      const client = isHttps ? require('https') : require('http');
-      const url = new URL(targetUrl);
-      const req = client.request({
-        hostname: url.hostname,
-        port: url.port || (isHttps ? 443 : 80),
-        path: url.pathname + (url.search || ''),
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(postData),
-        },
-      }, (res) => {
-        console.log(`[Edge Gateway] ☁️ Pushed ${entityType} to Cloud Bridge (${res.statusCode})`);
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          markCloudSyncedAndAck();
-        }
-      });
-      req.on('error', (e) => {
-        console.log(`[Edge Gateway] Cloud bridge network notice for ${entityType}: ${e.message}`);
-      });
-      req.write(postData);
-      req.end();
-    }
   } catch (err) {
     console.log(`[Edge Gateway] Cloud push notice: ${err.message}`);
   }
@@ -664,6 +925,7 @@ let creditGroupsStore = [];
 let stockMovementsStore = [];
 let expensesStore = [];
 let cashTransfersStore = [];
+let internalConsumptionsStore = [];
 
 // T1 Batch A Stores (Append-Only)
 let suppliersStore = [];
@@ -686,6 +948,9 @@ let salespeopleStore = [];
 let customersStore = [];
 let branchesStore = [];
 let cashAccountsStore = [];
+let permissionsMatrixStore = { rules: [], updatedAt: 0 };
+let roleConfigsStore = { definitions: null, updatedAt: 0 };
+let multiCurrencyStore = { config: null, updatedAt: 0 };
 
 // Tombstones Store (Soft Deletes across multi-device Wi-Fi)
 let tombstonesStore = [];
@@ -955,6 +1220,7 @@ function pruneOldRecords() {
   stockMovementsStore = stockMovementsStore.filter(shouldRetain);
   expensesStore = expensesStore.filter(shouldRetain);
   cashTransfersStore = cashTransfersStore.filter(shouldRetain);
+  internalConsumptionsStore = internalConsumptionsStore.filter(shouldRetain);
   suppliersStore = suppliersStore.filter(shouldRetain);
   adminSalesStore = adminSalesStore.filter(shouldRetain);
   cashCountsStore = cashCountsStore.filter(shouldRetain);
@@ -973,18 +1239,22 @@ function loadData() {
       if (parsed.hubBranchName) hubBranchName = parsed.hubBranchName;
       if (parsed.hubTenantId) hubTenantId = parsed.hubTenantId;
       if (parsed.lastCloudSyncTimestamp) lastCloudSyncTimestamp = Number(parsed.lastCloudSyncTimestamp) || 0;
+      if (parsed.lastAppsScriptServerSeq) lastAppsScriptServerSeq = Number(parsed.lastAppsScriptServerSeq) || 0;
+      if (parsed.cloudRoutingEpoch) cloudRoutingEpoch = Math.max(1, Number(parsed.cloudRoutingEpoch) || 1);
+      if (parsed.cloudSpreadsheetId) cloudSpreadsheetId = String(parsed.cloudSpreadsheetId || '').trim();
       if (Array.isArray(parsed.sales)) salesStore = parsed.sales;
       if (Array.isArray(parsed.inventory)) inventoryStore = parsed.inventory;
       if (Array.isArray(parsed.directGrvs)) directGrvsStore = parsed.directGrvs;
       if (Array.isArray(parsed.cashMovements)) cashMovementsStore = parsed.cashMovements;
       if (Array.isArray(parsed.cashLifts)) cashLiftsStore = parsed.cashLifts;
-      if (Array.isArray(parsed.cashLogs)) cashLogsStore = parsed.cashLogs;
+      if (Array.isArray(parsed.cashLogs)) cashLogsStore = deduplicateHubCashLogs(parsed.cashLogs);
       if (Array.isArray(parsed.customerChanges)) customerChangesStore = parsed.customerChanges;
       if (Array.isArray(parsed.creditSales)) creditSalesStore = parsed.creditSales;
       if (Array.isArray(parsed.creditGroups)) creditGroupsStore = parsed.creditGroups;
       if (Array.isArray(parsed.stockMovements)) stockMovementsStore = deduplicateHubStockMovements(parsed.stockMovements);
       if (Array.isArray(parsed.expenses)) expensesStore = parsed.expenses;
       if (Array.isArray(parsed.cashTransfers)) cashTransfersStore = parsed.cashTransfers;
+      if (Array.isArray(parsed.internalConsumptions)) internalConsumptionsStore = parsed.internalConsumptions;
       if (Array.isArray(parsed.suppliers)) suppliersStore = parsed.suppliers;
       if (Array.isArray(parsed.adminSales)) adminSalesStore = parsed.adminSales;
       if (Array.isArray(parsed.cashCounts)) cashCountsStore = parsed.cashCounts;
@@ -1017,6 +1287,26 @@ function loadData() {
       if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
       if (Array.isArray(parsed.tombstones)) tombstonesStore = parsed.tombstones;
       if (Array.isArray(parsed.securityAlerts)) securityAlertsStore = parsed.securityAlerts;
+      if (parsed.permissionsMatrix && Array.isArray(parsed.permissionsMatrix.rules)) {
+        permissionsMatrixStore = {
+          rules: parsed.permissionsMatrix.rules,
+          updatedAt: Number(parsed.permissionsMatrix.updatedAt) || 0,
+          ...(parsed.permissionsMatrix.isCloudSynced === true ? { isCloudSynced: true } : {}),
+        };
+      }
+      if (parsed.roleConfigs && parsed.roleConfigs.definitions && typeof parsed.roleConfigs.definitions === 'object') {
+        roleConfigsStore = {
+          definitions: parsed.roleConfigs.definitions,
+          updatedAt: Number(parsed.roleConfigs.updatedAt) || 0,
+          ...(parsed.roleConfigs.isCloudSynced === true ? { isCloudSynced: true } : {}),
+        };
+      }
+      if (parsed.multiCurrency && parsed.multiCurrency.config && typeof parsed.multiCurrency.config === 'object') {
+        multiCurrencyStore = {
+          config: parsed.multiCurrency.config,
+          updatedAt: Number(parsed.multiCurrency.updatedAt) || 0,
+        };
+      }
 
       // Purge any records already superseded by tombstones on startup
       if (tombstonesStore.length > 0) {
@@ -1054,6 +1344,9 @@ function saveData() {
       hubBranchName,
       hubTenantId,
       lastCloudSyncTimestamp,
+      lastAppsScriptServerSeq,
+      cloudRoutingEpoch,
+      cloudSpreadsheetId,
       sales: salesStore,
       inventory: inventoryStore,
       directGrvs: directGrvsStore,
@@ -1066,6 +1359,7 @@ function saveData() {
       stockMovements: stockMovementsStore,
       expenses: expensesStore,
       cashTransfers: cashTransfersStore,
+      internalConsumptions: internalConsumptionsStore,
       suppliers: suppliersStore,
       adminSales: adminSalesStore,
       cashCounts: cashCountsStore,
@@ -1084,6 +1378,9 @@ function saveData() {
       stocktakeSegments: stocktakeSegmentsStore,
       tombstones: tombstonesStore,
       securityAlerts: securityAlertsStore,
+      permissionsMatrix: permissionsMatrixStore,
+      roleConfigs: roleConfigsStore,
+      multiCurrency: multiCurrencyStore,
       savedAt: new Date().toISOString(),
     };
 
@@ -2102,7 +2399,18 @@ wss.on('connection', (ws, req) => {
       if (pType === 'SYNC_CLOUD_CONFIG') {
         if (packet.config && typeof packet.config === 'object') {
           cloudConfig = packet.config;
+          const creds = cloudConfig.credentials && typeof cloudConfig.credentials === 'object' ? cloudConfig.credentials : {};
+          const incomingTok = String(creds.token || creds.jwt || packet.token || packet.jwt || '').trim();
+          const incomingSid = String(creds.spreadsheetId || creds.sheetId || packet.spreadsheet_id || '').trim();
+          const incomingEpoch = Number(creds.routingEpoch || creds.routing_epoch || packet.routing_epoch || 0);
+          if (incomingTok) {
+            cloudJwtToken = incomingTok;
+            cloudBackoffUntil = 0; // Fresh token clears auth backoff immediately
+          }
+          if (incomingSid) cloudSpreadsheetId = incomingSid;
+          if (incomingEpoch > 0) cloudRoutingEpoch = Math.max(cloudRoutingEpoch, incomingEpoch);
           encryptAndSaveCloudConfig(cloudConfig);
+          scheduleSave();
           console.log('[Termux Hub] 🔒 Received and encrypted Cloud Config. DB Type:', packet.config.databaseType);
           try {
             ws.send(JSON.stringify({
@@ -2110,6 +2418,7 @@ wss.on('connection', (ws, req) => {
               action: 'SYNC_CLOUD_CONFIG_ACK',
               success: true,
               databaseType: packet.config.databaseType || 'unknown',
+              routing_epoch: cloudRoutingEpoch,
               timestamp: Date.now(),
             }));
           } catch (e) {}
@@ -2278,7 +2587,8 @@ wss.on('connection', (ws, req) => {
           branch_name: hubBranchName,
           tenant_id: hubTenantId,
           hub_id: `HUB-${hubBranchId}`,
-          version: '3.4.0',
+          version: '3.7.0',
+          routing_epoch: cloudRoutingEpoch,
           totalRecords: salesStore.length + directGrvsStore.length,
           casualWorkersCount: casualWorkersStore.length,
           timestamp: Date.now(),
@@ -2309,6 +2619,7 @@ wss.on('connection', (ws, req) => {
         stockMovementsStore = [];
         expensesStore = [];
         cashTransfersStore = [];
+        internalConsumptionsStore = [];
         casualWorkersStore = [];
         zoneAssignmentsStore = [];
         branchLockdownsStore = {};
@@ -2318,6 +2629,10 @@ wss.on('connection', (ws, req) => {
         cashAccountsStore = [];
         businessDayClosuresStore = [];
         electronicSettlementsStore = [];
+        permissionsMatrixStore = { rules: [], updatedAt: 0 };
+        roleConfigsStore = { definitions: null, updatedAt: 0 };
+        multiCurrencyStore = { config: null, updatedAt: 0 };
+        lastAppsScriptServerSeq = 0;
 
         hubBranchId = packet.new_branch_id || 'UNASSIGNED';
         hubBranchName = packet.new_branch_name || 'Unassigned Hub';
@@ -2370,7 +2685,8 @@ wss.on('connection', (ws, req) => {
             branch_name: hubBranchName,
             tenant_id: hubTenantId,
             hub_id: `HUB-${hubBranchId}`,
-            version: '3.4.0',
+            version: '3.7.0',
+            routing_epoch: cloudRoutingEpoch,
             totalRecords: salesStore.length + directGrvsStore.length,
             casualWorkersCount: casualWorkersStore.length,
             timestamp: Date.now(),
@@ -2643,6 +2959,44 @@ wss.on('connection', (ws, req) => {
           }
           const sIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
           const existing = sIdx >= 0 ? stocktakeSessionsStore[sIdx] : null;
+          const ACTIVE_FLOOR_STATUSES = new Set([
+            'DRAFT',
+            'SCHEDULED',
+            'IN_PROGRESS',
+            'COUNTING',
+            'RECOUNTING',
+            'AUDIT_REVIEW',
+            'CONSOLIDATED',
+            'READY_FOR_COMMITTAL',
+          ]);
+          const targetBranchNorm = String(packet.branchId || sess.branchId || existing?.branchId || hubBranchId || '')
+            .trim()
+            .toUpperCase();
+          const incomingStatusNorm = String(packet.status || sess.status || 'COUNTING').toUpperCase();
+          if (!existing && ACTIVE_FLOOR_STATUSES.has(incomingStatusNorm)) {
+            const conflictingActive = stocktakeSessionsStore.find((s) => {
+              if (!s || s.sessionId === sessionId) return false;
+              const sBranch = String(s.branchId || hubBranchId || '').trim().toUpperCase();
+              const sStatus = String(s.status || '').toUpperCase();
+              return (!targetBranchNorm || !sBranch || sBranch === targetBranchNorm) && ACTIVE_FLOOR_STATUSES.has(sStatus);
+            });
+            if (conflictingActive) {
+              console.log(
+                `[Termux Hub] ⚠️ Rejected duplicate active stocktake [${sessionId}] on branch ${targetBranchNorm}: [${conflictingActive.sessionId}] is already ${conflictingActive.status}.`
+              );
+              try {
+                ws.send(JSON.stringify({
+                  type: 'STOCKTAKE_SESSION_CONFLICT',
+                  sessionId,
+                  existingSessionId: conflictingActive.sessionId,
+                  existingSessionName: conflictingActive.title || conflictingActive.sessionName || conflictingActive.sessionId,
+                  message: `Only 1 active floor stocktake session is allowed per branch. Close or commit "${conflictingActive.title || conflictingActive.sessionName}" first.`,
+                  timestamp: hubNow,
+                }));
+              } catch (e) {}
+              return;
+            }
+          }
 
           if (existing) {
             const existingTime = getTimestamp(existing);
@@ -2684,9 +3038,26 @@ wss.on('connection', (ws, req) => {
               const exCT = ex.commentedAt ? new Date(ex.commentedAt).getTime() : 0;
               const incCT = inc.commentedAt ? new Date(inc.commentedAt).getTime() : 0;
               const keepEx = exCT > incCT && Boolean(ex.managerComment || ex.reasonCode);
+              const commentMap = new Map();
+              (Array.isArray(ex.varianceComments) ? ex.varianceComments : []).forEach((c) => {
+                if (c && c.id) commentMap.set(c.id, c);
+              });
+              (Array.isArray(inc.varianceComments) ? inc.varianceComments : []).forEach((c) => {
+                if (c && c.id) commentMap.set(c.id, c);
+              });
+              const mergedComments = Array.from(commentMap.values()).sort(
+                (a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+              );
               return {
                 ...ex,
                 ...inc,
+                originalCountedCases: ex.originalCountedCases ?? inc.originalCountedCases,
+                originalCountedSingles: ex.originalCountedSingles ?? inc.originalCountedSingles,
+                originalCountedTotalUnits: ex.originalCountedTotalUnits ?? inc.originalCountedTotalUnits,
+                originalVarianceUnits: ex.originalVarianceUnits ?? inc.originalVarianceUnits,
+                originalVarianceCostValue: ex.originalVarianceCostValue ?? inc.originalVarianceCostValue,
+                originalVarianceRetailValue: ex.originalVarianceRetailValue ?? inc.originalVarianceRetailValue,
+                varianceComments: mergedComments.length > 0 ? mergedComments : (inc.varianceComments ?? ex.varianceComments),
                 reasonCode: keepEx ? ex.reasonCode : (inc.reasonCode ?? ex.reasonCode),
                 managerComment: keepEx ? ex.managerComment : (inc.managerComment ?? ex.managerComment),
                 actionTaken: keepEx ? ex.actionTaken : (inc.actionTaken ?? ex.actionTaken),
@@ -2697,6 +3068,40 @@ wss.on('connection', (ws, req) => {
               };
             });
           }
+
+          const incomingSegmentsRaw = Array.isArray(packet.segments)
+            ? packet.segments
+            : (Array.isArray(sess.segments) ? sess.segments : (existing?.segments || []));
+          const exSegMap = new Map();
+          (existing?.segments || []).forEach((es) => {
+            const k = es.segmentId || es.id;
+            if (k) exSegMap.set(k, es);
+          });
+          const mergedSegments = incomingSegmentsRaw.map((sg) => {
+            const k = sg.segmentId || sg.id;
+            const exSeg = k ? exSegMap.get(k) : null;
+            if (!exSeg) return sg;
+            const uHistMap = new Map();
+            (Array.isArray(exSeg.unlockHistory) ? exSeg.unlockHistory : []).forEach((u) => {
+              uHistMap.set(`${u.unlockedAt || ''}:${u.target || ''}:${u.actorId || ''}`, u);
+            });
+            (Array.isArray(sg.unlockHistory) ? sg.unlockHistory : []).forEach((u) => {
+              uHistMap.set(`${u.unlockedAt || ''}:${u.target || ''}:${u.actorId || ''}`, u);
+            });
+            const mergedUnlockHistory = Array.from(uHistMap.values());
+            return {
+              ...exSeg,
+              ...sg,
+              count1Finalized: sg.count1Finalized !== undefined ? sg.count1Finalized : exSeg.count1Finalized,
+              count2Finalized: sg.count2Finalized !== undefined ? sg.count2Finalized : exSeg.count2Finalized,
+              comparisonFinalized: sg.comparisonFinalized !== undefined ? sg.comparisonFinalized : exSeg.comparisonFinalized,
+              count1FinalizedAt: sg.count1FinalizedAt || exSeg.count1FinalizedAt,
+              count2FinalizedAt: sg.count2FinalizedAt || exSeg.count2FinalizedAt,
+              comparisonFinalizedAt: sg.comparisonFinalizedAt || exSeg.comparisonFinalizedAt,
+              comparisonFinalizedBy: sg.comparisonFinalizedBy || exSeg.comparisonFinalizedBy,
+              unlockHistory: mergedUnlockHistory.length > 0 ? mergedUnlockHistory : undefined,
+            };
+          });
 
           const incomingPasses = Array.isArray(packet.guestPasses)
             ? packet.guestPasses
@@ -2715,7 +3120,7 @@ wss.on('connection', (ws, req) => {
             sessionName: packet.sessionName || packet.title || sess.title || existing?.sessionName || `Session ${sessionId}`,
             date: packet.date || sess.date || existing?.date || hubIso.split('T')[0],
             status: packet.status || sess.status || existing?.status || 'COUNTING',
-            segments: Array.isArray(packet.segments) ? packet.segments : (Array.isArray(sess.segments) ? sess.segments : (existing?.segments || [])),
+            segments: mergedSegments,
             consolidatedItems: mergedConsolidated,
             guestPasses: incomingPasses !== undefined ? incomingPasses : existing?.guestPasses,
             startedBy: packet.startedBy || sess.startedBy || existing?.startedBy || 'Manager',
@@ -2731,6 +3136,9 @@ wss.on('connection', (ws, req) => {
             stocktakeAuditorId: packet.stocktakeAuditorId !== undefined ? packet.stocktakeAuditorId : (sess.stocktakeAuditorId !== undefined ? sess.stocktakeAuditorId : existing?.stocktakeAuditorId),
             stocktakeAuditorName: packet.stocktakeAuditorName !== undefined ? packet.stocktakeAuditorName : (sess.stocktakeAuditorName !== undefined ? sess.stocktakeAuditorName : existing?.stocktakeAuditorName),
             stocktakeAuditorPhone: packet.stocktakeAuditorPhone !== undefined ? packet.stocktakeAuditorPhone : (sess.stocktakeAuditorPhone !== undefined ? sess.stocktakeAuditorPhone : existing?.stocktakeAuditorPhone),
+            auditorType: packet.auditorType || sess.auditorType || existing?.auditorType,
+            auditorGuestPassId: packet.auditorGuestPassId || sess.auditorGuestPassId || existing?.auditorGuestPassId,
+            auditorCasualId: packet.auditorCasualId || sess.auditorCasualId || existing?.auditorCasualId,
             predefinedDailyItemIds: packet.predefinedDailyItemIds || sess.predefinedDailyItemIds || existing?.predefinedDailyItemIds,
             certifiedById: packet.certifiedById || sess.certifiedById || existing?.certifiedById,
             certifiedByName: packet.certifiedByName || sess.certifiedByName || existing?.certifiedByName,
@@ -2744,6 +3152,14 @@ wss.on('connection', (ws, req) => {
               packet.varianceMaterialityThreshold !== undefined
                 ? packet.varianceMaterialityThreshold
                 : (sess.varianceMaterialityThreshold !== undefined ? sess.varianceMaterialityThreshold : existing?.varianceMaterialityThreshold),
+            varianceMinUnitThreshold:
+              packet.varianceMinUnitThreshold !== undefined
+                ? packet.varianceMinUnitThreshold
+                : (sess.varianceMinUnitThreshold !== undefined ? sess.varianceMinUnitThreshold : existing?.varianceMinUnitThreshold),
+            varianceReviewWindowHours:
+              packet.varianceReviewWindowHours !== undefined
+                ? packet.varianceReviewWindowHours
+                : (sess.varianceReviewWindowHours !== undefined ? sess.varianceReviewWindowHours : existing?.varianceReviewWindowHours),
             varianceReviewedById: packet.varianceReviewedById || sess.varianceReviewedById || existing?.varianceReviewedById,
             varianceReviewedByName: packet.varianceReviewedByName || sess.varianceReviewedByName || existing?.varianceReviewedByName,
             varianceReviewedAt: packet.varianceReviewedAt || sess.varianceReviewedAt || existing?.varianceReviewedAt,
@@ -2921,6 +3337,53 @@ wss.on('connection', (ws, req) => {
         const { sessionId, zoneId, slot, deviceId, staffId, staffName } = packet;
         if (sessionId && zoneId && (slot === 'A' || slot === 'B')) {
           let zoneRec = zoneAssignmentsStore.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+          const sessIdxPre = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+          const sessPre = sessIdxPre >= 0 ? stocktakeSessionsStore[sessIdxPre] : null;
+          const segPre = sessPre && Array.isArray(sessPre.segments)
+            ? sessPre.segments.find((s) => (s.segmentId || s.id) === zoneId)
+            : null;
+
+          // Finalized lock validation
+          if (
+            zoneRec?.comparisonFinalized ||
+            segPre?.comparisonFinalized ||
+            (slot === 'A' && (zoneRec?.teamA?.finalized || segPre?.count1Finalized)) ||
+            (slot === 'B' && (zoneRec?.teamB?.finalized || segPre?.count2Finalized))
+          ) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'STOCKTAKE_SLOT_LOCKED',
+                sessionId,
+                zoneId,
+                slot,
+                message: `Team ${slot} / segment comparison is finalized & locked. Auditor unlock required.`,
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+
+          // Cross-slot blind isolation validation (counterAId !== counterBId)
+          const cleanStaff = String(staffId || '').trim().toUpperCase();
+          const oppositeOwner = String(
+            slot === 'A'
+              ? (zoneRec?.teamB?.staffId || segPre?.counterBId || '')
+              : (zoneRec?.teamA?.staffId || segPre?.counterAId || '')
+          ).trim().toUpperCase();
+          if (cleanStaff && oppositeOwner && oppositeOwner === cleanStaff) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'STOCKTAKE_CLAIM_REJECTED',
+                sessionId,
+                zoneId,
+                slot,
+                message: `Blind isolation: You already hold Team ${slot === 'A' ? 'B' : 'A'} on this segment and cannot claim Team ${slot}.`,
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+
           if (!zoneRec) {
             zoneRec = {
               zoneId,
@@ -2933,10 +3396,10 @@ wss.on('connection', (ws, req) => {
           }
 
           if (slot === 'A') {
-            zoneRec.teamA = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: false };
+            zoneRec.teamA = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: false, finalized: false };
             zoneRec.status = zoneRec.teamB?.submitted ? 'AWAITING_DOUBLE_COUNT' : 'IN_PROGRESS';
           } else {
-            zoneRec.teamB = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: false };
+            zoneRec.teamB = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: false, finalized: false };
           }
 
           // Authoritatively update session and segment stores on Hub
@@ -3009,16 +3472,66 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
+        const existingZoneCheck = zoneAssignmentsStore.find((z) => z.sessionId === sessionId && z.zoneId === zoneId);
+        const sessIdxPre = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+        const sessPre = sessIdxPre >= 0 ? stocktakeSessionsStore[sessIdxPre] : null;
+        const segPre = sessPre && Array.isArray(sessPre.segments)
+          ? sessPre.segments.find((s) => (s.segmentId || s.id) === zoneId)
+          : null;
+        const existingBlindEntry = hubBlindStore[sessionId]?.[zoneId];
+
+        if (slot === 'A' || slot === 'B') {
+          if (
+            existingZoneCheck?.comparisonFinalized ||
+            segPre?.comparisonFinalized ||
+            (slot === 'A' && (existingZoneCheck?.teamA?.finalized || segPre?.count1Finalized)) ||
+            (slot === 'B' && (existingZoneCheck?.teamB?.finalized || segPre?.count2Finalized))
+          ) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'STOCKTAKE_SLOT_LOCKED',
+                sessionId,
+                zoneId,
+                slot,
+                message: `Team ${slot} count is finalized & locked. Auditor unlock required before re-submitting.`,
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+
+          const cleanStaff = String(staffId || '').trim().toUpperCase();
+          const oppositeOwner = String(
+            slot === 'A'
+              ? (existingBlindEntry?.B?.staffId || existingZoneCheck?.teamB?.staffId || segPre?.counterBId || '')
+              : (existingBlindEntry?.A?.staffId || existingZoneCheck?.teamA?.staffId || segPre?.counterAId || '')
+          ).trim().toUpperCase();
+          if (cleanStaff && oppositeOwner && oppositeOwner === cleanStaff) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'STOCKTAKE_CLAIM_REJECTED',
+                sessionId,
+                zoneId,
+                slot,
+                message: `Blind isolation: You already counted Team ${slot === 'A' ? 'B' : 'A'} on this segment.`,
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+        }
+
         if (!hubBlindStore[sessionId]) hubBlindStore[sessionId] = {};
         if (!hubBlindStore[sessionId][zoneId]) {
           hubBlindStore[sessionId][zoneId] = { A: null, B: null, recount: null };
         }
 
+        const finalizedAtIso = new Date().toISOString();
         hubBlindStore[sessionId][zoneId][slot] = {
           deviceId,
           staffId,
           staffName,
-          submittedAt: new Date().toISOString(),
+          submittedAt: finalizedAtIso,
           lines: Array.isArray(lines) ? lines : [],
         };
 
@@ -3040,18 +3553,26 @@ wss.on('connection', (ws, req) => {
 
         if (slot === 'A') {
           if (!zoneRec.teamA) {
-            zoneRec.teamA = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: true };
+            zoneRec.teamA = { deviceId, staffId, staffName, claimedAt: finalizedAtIso, submitted: true };
           }
+          zoneRec.teamA.staffId = staffId;
+          zoneRec.teamA.staffName = staffName;
           zoneRec.teamA.submitted = true;
-          zoneRec.teamA.submittedAt = new Date().toISOString();
+          zoneRec.teamA.submittedAt = finalizedAtIso;
+          zoneRec.teamA.finalized = true;
+          zoneRec.teamA.finalizedAt = finalizedAtIso;
           zoneRec.teamA.lineCount = Array.isArray(lines) ? lines.length : 0;
           if (!zoneRec.teamB?.submitted) zoneRec.status = 'AWAITING_DOUBLE_COUNT';
         } else if (slot === 'B') {
           if (!zoneRec.teamB) {
-            zoneRec.teamB = { deviceId, staffId, staffName, claimedAt: new Date().toISOString(), submitted: true };
+            zoneRec.teamB = { deviceId, staffId, staffName, claimedAt: finalizedAtIso, submitted: true };
           }
+          zoneRec.teamB.staffId = staffId;
+          zoneRec.teamB.staffName = staffName;
           zoneRec.teamB.submitted = true;
-          zoneRec.teamB.submittedAt = new Date().toISOString();
+          zoneRec.teamB.submittedAt = finalizedAtIso;
+          zoneRec.teamB.finalized = true;
+          zoneRec.teamB.finalizedAt = finalizedAtIso;
           zoneRec.teamB.lineCount = Array.isArray(lines) ? lines.length : 0;
           if (!zoneRec.teamA?.submitted) zoneRec.status = 'IN_PROGRESS';
         }
@@ -3066,12 +3587,16 @@ wss.on('connection', (ws, req) => {
               if (slot === 'A') {
                 seg.hasCountA = true;
                 seg.count1Submitted = true;
+                seg.count1Finalized = true;
+                seg.count1FinalizedAt = finalizedAtIso;
                 seg.counterAId = staffId;
                 seg.counterAName = staffName;
                 if (!seg.count2Submitted) seg.status = 'AWAITING_DOUBLE_COUNT';
               } else if (slot === 'B') {
                 seg.hasCountB = true;
                 seg.count2Submitted = true;
+                seg.count2Finalized = true;
+                seg.count2FinalizedAt = finalizedAtIso;
                 seg.counterBId = staffId;
                 seg.counterBName = staffName;
               }
@@ -3088,7 +3613,7 @@ wss.on('connection', (ws, req) => {
             zoneId,
             slot,
             status: 'VAULTED',
-            message: `Count for Zone ${zoneId} secured in Hub Vault. Awaiting Team ${slot === 'A' ? 'B' : 'A'} submission.`,
+            message: `Count for Zone ${zoneId} finalized & secured in Hub Vault. Awaiting Team ${slot === 'A' ? 'B' : 'A'} submission.`,
             timestamp: Date.now(),
           };
           ws.send(JSON.stringify(ackPacket));
@@ -3101,10 +3626,15 @@ wss.on('connection', (ws, req) => {
           slot,
           staffId,
           staffName,
-          teamAStaffName: hubBlindStore[sessionId][zoneId].A?.staffName,
-          teamBStaffName: hubBlindStore[sessionId][zoneId].B?.staffName,
+          teamAStaffId: hubBlindStore[sessionId][zoneId].A?.staffId || zoneRec.teamA?.staffId,
+          teamBStaffId: hubBlindStore[sessionId][zoneId].B?.staffId || zoneRec.teamB?.staffId,
+          teamAStaffName: hubBlindStore[sessionId][zoneId].A?.staffName || zoneRec.teamA?.staffName,
+          teamBStaffName: hubBlindStore[sessionId][zoneId].B?.staffName || zoneRec.teamB?.staffName,
           hasCountA: Boolean(hubBlindStore[sessionId][zoneId].A),
           hasCountB: Boolean(hubBlindStore[sessionId][zoneId].B),
+          teamAFinalized: Boolean(hubBlindStore[sessionId][zoneId].A),
+          teamBFinalized: Boolean(hubBlindStore[sessionId][zoneId].B),
+          comparisonFinalized: Boolean(zoneRec.comparisonFinalized),
           status:
             hubBlindStore[sessionId][zoneId].A && hubBlindStore[sessionId][zoneId].B
               ? 'COMPARING'
@@ -3191,10 +3721,14 @@ wss.on('connection', (ws, req) => {
           });
 
           if (discrepancies.length === 0) {
+            const matchIso = new Date().toISOString();
             console.log(`[Termux Hub] ✅ Zone ${zoneId} DOUBLE-COUNT MATCHED 100% (${verifiedCounts.length} lines verified).`);
             if (zoneRec) {
               zoneRec.status = 'VERIFIED';
               zoneRec.verifiedCounts = verifiedCounts;
+              zoneRec.comparisonFinalized = true;
+              zoneRec.comparisonFinalizedAt = matchIso;
+              zoneRec.comparisonFinalizedBy = `${subA.staffName || 'Team A'} & ${subB.staffName || 'Team B'}`;
             }
             if (sessIdx >= 0) {
               const sess = stocktakeSessionsStore[sessIdx];
@@ -3209,6 +3743,11 @@ wss.on('connection', (ws, req) => {
                   seg.hasCountB = true;
                   seg.count1Submitted = true;
                   seg.count2Submitted = true;
+                  seg.count1Finalized = true;
+                  seg.count2Finalized = true;
+                  seg.comparisonFinalized = true;
+                  seg.comparisonFinalizedAt = matchIso;
+                  seg.comparisonFinalizedBy = `${subA.staffName || 'Team A'} & ${subB.staffName || 'Team B'}`;
                 }
               }
             }
@@ -3219,6 +3758,7 @@ wss.on('connection', (ws, req) => {
               sessionId,
               zoneId,
               status: 'VERIFIED',
+              comparisonFinalized: true,
               verifiedCounts,
               verifiedCount: verifiedCounts.length,
               zone: zoneRec,
@@ -3366,6 +3906,18 @@ wss.on('connection', (ws, req) => {
       if (pType === 'STOCKTAKE_JOINT_FINALIZED') {
         const incomingTime = getTimestamp(packet);
         const existingZone = zoneAssignmentsStore.find((z) => z.zoneId === packet.zoneId && (!packet.sessionId || z.sessionId === packet.sessionId));
+        if (existingZone?.comparisonFinalized) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'STOCKTAKE_SLOT_LOCKED',
+              sessionId: packet.sessionId,
+              zoneId: packet.zoneId,
+              message: 'Segment joint recount comparison is already finalized & locked. Auditor unlock required.',
+              timestamp: Date.now(),
+            }));
+          } catch (e) {}
+          return;
+        }
         const existingTime = existingZone?.jointRecount?.resolvedAt ? getTimestamp({ updatedAt: existingZone.jointRecount.resolvedAt }) : (existingZone ? getTimestamp(existingZone) : 0);
         if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
           console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_JOINT_FINALIZED for Zone ${packet.zoneId}`);
@@ -3376,6 +3928,7 @@ wss.on('connection', (ws, req) => {
         const zoneId = packet.zoneId;
         const resolvedLines = packet.resolvedLines || packet.lines || [];
         const staffName = packet.resolvedByName || packet.staffName || 'Dual Counters';
+        const resolvedIso = new Date().toISOString();
 
         console.log(`[Termux Hub] 🏆 Zone ${zoneId} JOINT RECOUNT FINALIZED & VERIFIED by ${staffName} (${resolvedLines.length} lines).`);
 
@@ -3383,6 +3936,9 @@ wss.on('connection', (ws, req) => {
         if (zoneRec) {
           zoneRec.status = 'VERIFIED';
           zoneRec.verifiedCounts = resolvedLines;
+          zoneRec.comparisonFinalized = true;
+          zoneRec.comparisonFinalizedAt = resolvedIso;
+          zoneRec.comparisonFinalizedBy = staffName;
           if (!zoneRec.jointRecount) zoneRec.jointRecount = {};
           zoneRec.jointRecount.signedByA = true;
           zoneRec.jointRecount.signedByB = true;
@@ -3401,6 +3957,9 @@ wss.on('connection', (ws, req) => {
               seg.verifiedCounts = resolvedLines;
               seg.discrepancies = [];
               seg.discrepancyCount = 0;
+              seg.comparisonFinalized = true;
+              seg.comparisonFinalizedAt = resolvedIso;
+              seg.comparisonFinalizedBy = staffName;
             }
           }
         }
@@ -3411,6 +3970,9 @@ wss.on('connection', (ws, req) => {
           stocktakeSegmentsStore[segIdx].verifiedCounts = resolvedLines;
           stocktakeSegmentsStore[segIdx].discrepancies = [];
           stocktakeSegmentsStore[segIdx].discrepancyCount = 0;
+          stocktakeSegmentsStore[segIdx].comparisonFinalized = true;
+          stocktakeSegmentsStore[segIdx].comparisonFinalizedAt = resolvedIso;
+          stocktakeSegmentsStore[segIdx].comparisonFinalizedBy = staffName;
         }
 
         scheduleSave();
@@ -3421,6 +3983,7 @@ wss.on('connection', (ws, req) => {
           sessionId,
           zoneId,
           status: 'VERIFIED',
+          comparisonFinalized: true,
           verifiedCounts: resolvedLines,
           resolvedByName: staffName,
           source: 'JOINT_RECOUNT',
@@ -3432,6 +3995,7 @@ wss.on('connection', (ws, req) => {
           sessionId,
           zoneId,
           status: 'VERIFIED',
+          comparisonFinalized: true,
           verifiedCounts: resolvedLines,
           timestamp: Date.now(),
         };
@@ -3444,6 +4008,98 @@ wss.on('connection', (ws, req) => {
             } catch (e) {}
           }
         });
+        return;
+      }
+
+      // 0.51 STOCKTAKE SEGMENT UNLOCK (AUDITOR / LEADER CORRECTION RE-OPEN)
+      if (pType === 'STOCKTAKE_SEGMENT_UNLOCK') {
+        const { sessionId, zoneId, segmentId, target = 'ALL', actorId = 'AUDITOR', actorName = 'Auditor', reason = 'Auditor correction unlock' } = packet;
+        const zId = segmentId || zoneId;
+        if (sessionId && zId) {
+          const nowIso = new Date().toISOString();
+          if (hubBlindStore[sessionId] && hubBlindStore[sessionId][zId]) {
+            if (target === 'A' || target === 'ALL') hubBlindStore[sessionId][zId].A = null;
+            if (target === 'B' || target === 'ALL') hubBlindStore[sessionId][zId].B = null;
+            saveBlindVault();
+          }
+
+          const zoneRec = zoneAssignmentsStore.find((z) => z.sessionId === sessionId && z.zoneId === zId);
+          if (zoneRec) {
+            if ((target === 'A' || target === 'ALL') && zoneRec.teamA) {
+              zoneRec.teamA.submitted = false;
+              zoneRec.teamA.finalized = false;
+            }
+            if ((target === 'B' || target === 'ALL') && zoneRec.teamB) {
+              zoneRec.teamB.submitted = false;
+              zoneRec.teamB.finalized = false;
+            }
+            zoneRec.comparisonFinalized = false;
+            zoneRec.unlockedReason = reason;
+            zoneRec.unlockedByName = actorName;
+            zoneRec.unlockedAt = nowIso;
+            zoneRec.status = target === 'COMPARISON' && zoneRec.discrepancies?.length ? 'VARIANCE_FLAGGED' : 'IN_PROGRESS';
+          }
+
+          const sessIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+          if (sessIdx >= 0) {
+            const sess = stocktakeSessionsStore[sessIdx];
+            if (Array.isArray(sess.segments)) {
+              const seg = sess.segments.find((s) => (s.segmentId || s.id) === zId);
+              if (seg) {
+                if (target === 'A' || target === 'ALL') {
+                  seg.count1Finalized = false;
+                  seg.count1FinalizedAt = undefined;
+                  seg.hasCountA = false;
+                  seg.count1Submitted = false;
+                }
+                if (target === 'B' || target === 'ALL') {
+                  seg.count2Finalized = false;
+                  seg.count2FinalizedAt = undefined;
+                  seg.hasCountB = false;
+                  seg.count2Submitted = false;
+                }
+                if (target === 'COMPARISON' || target === 'ALL' || target === 'A' || target === 'B') {
+                  seg.comparisonFinalized = false;
+                  seg.comparisonFinalizedAt = undefined;
+                  seg.comparisonFinalizedBy = undefined;
+                }
+                seg.status = target === 'COMPARISON' && (seg.discrepancies?.length || seg.recount?.length)
+                  ? 'DISCREPANCY_RECOUNT'
+                  : 'COUNTING';
+                seg.unlockHistory = [
+                  ...(Array.isArray(seg.unlockHistory) ? seg.unlockHistory : []),
+                  { target, actorId, actorName, reason, unlockedAt: nowIso },
+                ];
+              }
+            }
+            if (sess.status === 'CONSOLIDATED' || sess.status === 'READY_FOR_COMMITTAL') {
+              sess.status = 'COUNTING';
+            }
+          }
+
+          scheduleSave();
+          console.log(`[Termux Hub] 🔓 Segment ${zId} (${target}) unlocked by ${actorName}: ${reason}`);
+
+          const unlockBroadcast = {
+            type: 'STOCKTAKE_SEGMENT_UNLOCKED',
+            sessionId,
+            zoneId: zId,
+            segmentId: zId,
+            target,
+            actorId,
+            actorName,
+            reason,
+            unlockedAt: nowIso,
+            timestamp: Date.now(),
+          };
+          wss.clients.forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              try {
+                client.send(JSON.stringify(unlockBroadcast));
+              } catch (e) {}
+            }
+          });
+        }
         return;
       }
 
@@ -3506,12 +4162,45 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
-          // Otherwise update existing record (e.g. cashier issuing refund/void or exchange)
-          salesStore[existingIdx] = {
+          const isExistingMobFinal = prevSale.mobileVerificationStatus === 'VERIFIED' || prevSale.mobileVerificationStatus === 'FLAGGED';
+          const isIncomingMobPending = !cleanSaleObj?.mobileVerificationStatus || cleanSaleObj.mobileVerificationStatus === 'PENDING';
+          if (isExistingMobFinal && isIncomingMobPending && isIncomingCompleted) {
+            console.log(`[Termux Hub] 🛡️ Preserved authoritative mobile verification (${prevSale.mobileVerificationStatus}) for Sale #${saleId}.`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'SALE_UPDATE',
+                action: 'SALE_UPDATE',
+                invoice_id: saleId,
+                sale: prevSale,
+                payload: prevSale,
+                status: prevSale.status,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+
+          // Otherwise update existing record (e.g. cashier issuing refund/void, exchange, or mobile money verification)
+          const mergedSale = {
             ...salesStore[existingIdx],
             ...(cleanSaleObj || packet),
             ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
           };
+          if (isExistingMobFinal && isIncomingMobPending) {
+            mergedSale.mobileVerificationStatus = prevSale.mobileVerificationStatus;
+            mergedSale.mobileVerifiedAmountInCurrency = prevSale.mobileVerifiedAmountInCurrency;
+            mergedSale.mobileExpectedAmountInCurrency = prevSale.mobileExpectedAmountInCurrency;
+            mergedSale.mobileVerifiedRef = prevSale.mobileVerifiedRef;
+            mergedSale.mobileVerifiedBy = prevSale.mobileVerifiedBy;
+            mergedSale.mobileVerifiedByName = prevSale.mobileVerifiedByName;
+            mergedSale.mobileVerifiedAt = prevSale.mobileVerifiedAt;
+            mergedSale.mobileDisputeReason = prevSale.mobileDisputeReason;
+            mergedSale.mobileDisputeResolution = prevSale.mobileDisputeResolution;
+            mergedSale.mobileShortfallUsd = prevSale.mobileShortfallUsd;
+          }
+          salesStore[existingIdx] = mergedSale;
         } else {
           // APPEND-ONLY: Offline invoices arriving with old timestamps (e.g. offline for 5 hours)
           // MUST BE ACCEPTED as long as the invoice_id is unique! NO TIMESTAMP REJECTION!
@@ -4175,6 +4864,42 @@ wss.on('connection', (ws, req) => {
         if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'EXPENSE', payload.id);
       }
 
+      if (
+        (pType === 'INTERNAL_CONSUMPTION' || pType === 'SHOP_USE' || sheetName === 'InternalConsumption') &&
+        (packet.internalConsumption || payload) &&
+        (packet.internalConsumption?.id || payload?.id)
+      ) {
+        const icObj = packet.internalConsumption || payload;
+        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, icObj);
+        const exIdx = internalConsumptionsStore.findIndex((c) => c.id === icObj.id);
+        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && internalConsumptionsStore[exIdx].isCloudSynced === true);
+        if (exIdx >= 0) {
+          const prevIc = internalConsumptionsStore[exIdx];
+          const prevFinal = prevIc.status === 'APPROVED' || prevIc.status === 'REJECTED';
+          const incPending = !icObj.status || icObj.status === 'PENDING' || icObj.status === 'PENDING_APPROVAL';
+          if (prevFinal && incPending) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'INTERNAL_CONSUMPTION',
+                action: 'INTERNAL_CONSUMPTION_RECORD',
+                internalConsumption: prevIc,
+                payload: prevIc,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+          internalConsumptionsStore[exIdx] = { ...prevIc, ...icObj, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+        } else {
+          internalConsumptionsStore.unshift({ ...icObj, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) });
+          console.log(`[Termux Hub] 📥 Accepted Shop Use / Internal Consumption [${icObj.id}]`);
+        }
+        scheduleSave();
+        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'INTERNAL_CONSUMPTION', icObj.id);
+      }
+
       const trObj = packet.cashTransfer || payload;
       const isCashTransferPkt =
         pType === 'CASH_TRANSFER' ||
@@ -4569,6 +5294,224 @@ wss.on('connection', (ws, req) => {
             pushToCloud('STAFF', staffObj);
           }
         }
+      }
+
+      // =====================================================================
+      // 9.1b CONFIGURATION DATA: 52 GRANULAR PERMISSIONS MATRIX (STRICT LWW)
+      // =====================================================================
+      if (pType === 'PERMISSIONS_MATRIX' || pType === 'PERMISSIONS_MATRIX_SYNC') {
+        const incomingRules = packet.rules || packet.permissionsMatrix?.rules || (Array.isArray(payload) ? payload : payload?.rules);
+        if (Array.isArray(incomingRules) && incomingRules.length > 0) {
+          const hubNow = Date.now();
+          const incomingTime = Number(packet.updatedAt ?? packet.permissionsMatrix?.updatedAt ?? packet.timestamp) || hubNow;
+          const existingTime = Number(permissionsMatrixStore.updatedAt) || 0;
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'PERMISSIONS_MATRIX_SYNC',
+                action: 'PERMISSIONS_MATRIX_SYNC',
+                rules: permissionsMatrixStore.rules,
+                permissionsMatrix: permissionsMatrixStore,
+                updatedAt: existingTime,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+          } else {
+            const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
+            permissionsMatrixStore = { rules: incomingRules, updatedAt: hubNow, ...(incomingCloudSynced ? { isCloudSynced: true } : {}) };
+            scheduleSave();
+            console.log(`[Termux Hub] 🔐 Synced Permissions Matrix (${incomingRules.length} rules)`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'SYNC_ACK',
+                action: 'SYNC_ACK',
+                entityType: 'PERMISSIONS_MATRIX',
+                updatedAt: hubNow,
+              }));
+            } catch (e) {}
+            const permsBroadcastStr = JSON.stringify({
+              type: 'PERMISSIONS_MATRIX_SYNC',
+              action: 'PERMISSIONS_MATRIX_SYNC',
+              rules: permissionsMatrixStore.rules,
+              permissionsMatrix: permissionsMatrixStore,
+              payload: permissionsMatrixStore,
+              updatedAt: hubNow,
+              origin_device_id: packet.origin_device_id || packet.originDeviceId || 'LOCAL_HUB',
+              origin_device_name: packet.origin_device_name || packet.originDeviceName || 'Termux Local Hub',
+              timestamp: hubNow,
+            });
+            wss.clients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                try { client.send(permsBroadcastStr); } catch (e) {}
+              }
+            });
+            if (!incomingCloudSynced) {
+              pushToCloud('PERMISSIONS_MATRIX', permissionsMatrixStore);
+            }
+          }
+        }
+        return;
+      }
+
+      // =====================================================================
+      // 9.1c CONFIGURATION DATA: ROLE CONFIGURATIONS & MODULE ACCESS (LWW)
+      // =====================================================================
+      if (pType === 'ROLE_CONFIGS' || pType === 'ROLE_CONFIGS_SYNC') {
+        const incomingDefs = packet.definitions || packet.roleConfigs?.definitions || payload?.definitions || (payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null);
+        if (incomingDefs && typeof incomingDefs === 'object') {
+          const hubNow = Date.now();
+          const incomingTime = Number(packet.updatedAt ?? packet.roleConfigs?.updatedAt ?? packet.timestamp) || hubNow;
+          const existingTime = Number(roleConfigsStore.updatedAt) || 0;
+          if (existingTime > 0 && incomingTime > 0 && existingTime > (incomingTime + 60000)) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'ROLE_CONFIGS_SYNC',
+                action: 'ROLE_CONFIGS_SYNC',
+                definitions: roleConfigsStore.definitions,
+                roleConfigs: roleConfigsStore,
+                updatedAt: existingTime,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+          } else {
+            const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
+            roleConfigsStore = { definitions: incomingDefs, updatedAt: hubNow, ...(incomingCloudSynced ? { isCloudSynced: true } : {}) };
+            scheduleSave();
+            console.log(`[Termux Hub] 🛡️ Synced Role Configurations`);
+            try {
+              ws.send(JSON.stringify({
+                type: 'SYNC_ACK',
+                action: 'SYNC_ACK',
+                entityType: 'ROLE_CONFIGS',
+                updatedAt: hubNow,
+              }));
+            } catch (e) {}
+            const rolesBroadcastStr = JSON.stringify({
+              type: 'ROLE_CONFIGS_SYNC',
+              action: 'ROLE_CONFIGS_SYNC',
+              definitions: roleConfigsStore.definitions,
+              roleConfigs: roleConfigsStore,
+              payload: roleConfigsStore,
+              updatedAt: hubNow,
+              origin_device_id: packet.origin_device_id || packet.originDeviceId || 'LOCAL_HUB',
+              origin_device_name: packet.origin_device_name || packet.originDeviceName || 'Termux Local Hub',
+              timestamp: hubNow,
+            });
+            wss.clients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                try { client.send(rolesBroadcastStr); } catch (e) {}
+              }
+            });
+            if (!incomingCloudSynced) {
+              pushToCloud('ROLE_CONFIGS', roleConfigsStore);
+            }
+          }
+        }
+        return;
+      }
+
+      // =====================================================================
+      // 9.1d CONFIGURATION DATA: MULTI-CURRENCY & EXCHANGE RATES (STRICT T2 LWW)
+      // =====================================================================
+      if (
+        pType === 'MULTI_CURRENCY' ||
+        pType === 'MULTI_CURRENCY_SYNC' ||
+        pType === 'EXCHANGE_RATES' ||
+        pType === 'EXCHANGE_RATES_SYNC'
+      ) {
+        const incomingMc =
+          packet.multiCurrencyConfig ||
+          packet.exchangeRates ||
+          payload?.multiCurrencyConfig ||
+          payload?.exchangeRates ||
+          (payload && typeof payload === 'object' && payload.rates ? payload : null);
+        if (incomingMc && typeof incomingMc === 'object' && incomingMc.rates) {
+          const hubNow = Date.now();
+          const hubIso = new Date(hubNow).toISOString();
+          const rawIncomingTs = packet.updatedAt ?? incomingMc.updatedAt ?? incomingMc.lastUpdated ?? packet.timestamp;
+          const incomingTime = incomingMc.isSystemDefault === true ? 0 : getTimestamp({ updatedAt: rawIncomingTs });
+          const existingTime = Number(multiCurrencyStore.updatedAt) || 0;
+
+          if (existingTime > 0 && (incomingTime === 0 || existingTime > incomingTime + 60000)) {
+            console.log(
+              `[Termux Hub] 🛡️ LWW Reject: Stale Multi-Currency update (Hub: ${new Date(existingTime).toISOString()} > Incoming: ${incomingTime > 0 ? new Date(incomingTime).toISOString() : 'SystemDefault'}). Sending authoritative rates back.`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'MULTI_CURRENCY_SYNC',
+                action: 'MULTI_CURRENCY_SYNC',
+                entityType: 'multi_currency',
+                recordId: 'MULTI_CURRENCY_CONFIG',
+                multiCurrencyConfig: multiCurrencyStore.config,
+                exchangeRates: multiCurrencyStore.config,
+                payload: multiCurrencyStore.config,
+                updatedAt: existingTime,
+                hubTimestamp: existingTime,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+          } else if (incomingTime > 0 || existingTime === 0) {
+            const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, incomingMc);
+            const resolvedCloudSynced = incomingCloudSynced || Boolean(multiCurrencyStore.config && multiCurrencyStore.config.isCloudSynced === true);
+            const storedMc = {
+              ...incomingMc,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+              isSystemDefault: false,
+              ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+            };
+            multiCurrencyStore = { config: storedMc, updatedAt: hubNow };
+            scheduleSave();
+            console.log(
+              `[Termux Hub] 💱 Synced Multi-Currency Config (Base: ${storedMc.baseCurrency || 'USD'}) stamped at ${hubIso}`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'SYNC_ACK',
+                action: 'SYNC_ACK',
+                entityType: 'MULTI_CURRENCY',
+                recordId: 'MULTI_CURRENCY_CONFIG',
+                updatedAt: hubNow,
+                hubTimestamp: hubNow,
+                lastUpdated: hubIso,
+              }));
+            } catch (e) {}
+            const mcBroadcastStr = JSON.stringify({
+              type: 'MULTI_CURRENCY_SYNC',
+              action: 'MULTI_CURRENCY_SYNC',
+              entityType: 'multi_currency',
+              recordId: 'MULTI_CURRENCY_CONFIG',
+              multiCurrencyConfig: storedMc,
+              exchangeRates: storedMc,
+              payload: storedMc,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+              origin_device_id: packet.origin_device_id || packet.originDeviceId || 'LOCAL_HUB',
+              origin_device_name: packet.origin_device_name || packet.originDeviceName || 'Termux Local Hub',
+              timestamp: hubNow,
+            });
+            wss.clients.forEach((client) => {
+              if (client !== ws && client.readyState === WebSocket.OPEN) {
+                try { client.send(mcBroadcastStr); } catch (e) {}
+              }
+            });
+            if (incomingCloudSynced) {
+              console.log(`[Termux Hub] ⏭️ Dual-Writer Skip: MULTI_CURRENCY already cloud-synced by PWA. Broadcasting T1_CLOUD_SYNC_ACK.`);
+              broadcastCloudSyncAck(ws, 'MULTI_CURRENCY', 'MULTI_CURRENCY_CONFIG');
+            } else {
+              pushToCloud('MULTI_CURRENCY', storedMc);
+            }
+          }
+        }
+        return;
       }
 
       // =====================================================================
@@ -5211,6 +6154,7 @@ wss.on('connection', (ws, req) => {
           stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && (getTimestamp(sm) >= sinceTime || packet.isForced || isExplicitZero))
         );
         const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && (getTimestamp(ex) >= sinceTime || packet.isForced || isExplicitZero));
+        const missedInternalConsumptions = internalConsumptionsStore.filter((ic) => isMatch(ic, reqComp, reqBranch) && (getTimestamp(ic) >= sinceTime || packet.isForced || isExplicitZero));
         const isGlobalCashTransferRec = (tr) => {
           const t = String(tr?.type || '').toUpperCase().trim();
           const b = String(tr?.branch_id || '').toUpperCase().trim();
@@ -5289,6 +6233,7 @@ wss.on('connection', (ws, req) => {
             creditSales: missedCreditSales,
             stockMovements: missedStockMovements,
             expenses: missedExpenses,
+            internalConsumptions: missedInternalConsumptions,
             cashTransfers: missedCashTransfers,
             suppliers: missedSuppliers,
             adminSales: missedAdminSales,
@@ -5308,6 +6253,15 @@ wss.on('connection', (ws, req) => {
             stocktakeSessions: missedStocktakeSessions,
             stocktakeSegments: stocktakeSegmentsStore,
             tombstones: missedTombstones,
+            ...(Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && ((permissionsMatrixStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
+              ? { permissionsMatrix: permissionsMatrixStore }
+              : {}),
+            ...(roleConfigsStore.definitions && ((roleConfigsStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
+              ? { roleConfigs: roleConfigsStore }
+              : {}),
+            ...(multiCurrencyStore.config && ((multiCurrencyStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
+              ? { multiCurrencyConfig: multiCurrencyStore.config }
+              : {}),
             securityAlerts: securityAlertsStore.slice(0, 50),
           },
         };
@@ -5438,48 +6392,420 @@ async function syncEdgeToCloudSupabase() {
   }
 
   if (adapterCfg.databaseType === 'appscripts') {
+    if (cloudBackoffUntil > Date.now()) {
+      return;
+    }
     const targetUrl = String(
       adapterCfg.credentials.url ||
       adapterCfg.credentials.webhookUrl ||
       adapterCfg.credentials.masterWebhookUrl ||
+      cloudSyncUrl ||
       ''
     ).trim();
-    if (!targetUrl || typeof fetch !== 'function') return;
-    for (const t of tablesToSync) {
-      const unsynced = t.store.filter((r) => r && r.isCloudSynced !== true).slice(0, 25);
-      for (const rec of unsynced) {
-        try {
-          const res = await fetch(targetUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: 'sync_entity',
-              company_id: hubTenantId,
-              branch_id: hubBranchId,
-              entityType: t.entityType,
-              record: rec,
-              payload: rec,
-              timestamp: Date.now(),
-            }),
-          });
-          if (res.ok || res.status === 200 || res.status === 201) {
-            try {
-              const json = await res.json();
-              if (json && json.server_received_at) rec.server_received_at = json.server_received_at;
-              if (json && json.suspicious_backdate !== undefined) rec.suspicious_backdate = Boolean(json.suspicious_backdate);
-            } catch (_) {}
-            if (t.entityType === 'sales' || t.entityType === 'cash_logs') {
-              annotateCloudBackdateFlag(t.entityType === 'sales' ? 'SALE' : 'CASH_LOG', rec, res.headers && res.headers.get ? res.headers.get('date') : null);
-            }
-            rec.isCloudSynced = true;
-          }
-        } catch (err) {
-          console.warn(`[Edge-to-Cloud] Apps Script push notice for '${t.name}':`, err.message);
+    if (!targetUrl) return;
+
+    const getTrRankHub = (st) => {
+      const u = String(st || '').toUpperCase().trim();
+      if (u === 'DRAFT') return 0;
+      if (u === 'PENDING_APPROVAL' || u === 'PENDING_ACCEPTANCE') return 1;
+      if (u === 'IN_TRANSIT') return 2;
+      if (u === 'APPROVED') return 3;
+      if (u === 'RECEIVED' || u === 'COMPLETED' || u === 'RETURNED' || u === 'CANCELLED' || u === 'REJECTED') return 4;
+      return 0;
+    };
+
+    const mergeStocktakeSessionHub = (existing, incoming) => {
+      const exItems = Array.isArray(existing?.consolidatedItems) ? existing.consolidatedItems : [];
+      const incItems = Array.isArray(incoming?.consolidatedItems) ? incoming.consolidatedItems : [];
+      if (incItems.length === 0) return { ...existing, ...incoming, isCloudSynced: true };
+      const exMap = new Map();
+      exItems.forEach((ci) => { if (ci && ci.itemId) exMap.set(String(ci.itemId).toUpperCase(), ci); });
+      const mergedItems = incItems.map((inc) => {
+        const ex = exMap.get(String(inc.itemId || '').toUpperCase());
+        if (!ex) return inc;
+        const cMap = new Map();
+        (Array.isArray(ex.varianceComments) ? ex.varianceComments : []).forEach((c) => { if (c && c.id) cMap.set(c.id, c); });
+        (Array.isArray(inc.varianceComments) ? inc.varianceComments : []).forEach((c) => { if (c && c.id) cMap.set(c.id, c); });
+        const mergedComments = Array.from(cMap.values()).sort(
+          (a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+        );
+        return {
+          ...ex,
+          ...inc,
+          ...(mergedComments.length > 0 ? { varianceComments: mergedComments } : {}),
+        };
+      });
+      return { ...existing, ...incoming, consolidatedItems: mergedItems, isCloudSynced: true };
+    };
+
+    const ingestCloudEnvelopeIntoHub = (env) => {
+      if (!env || !env.entityType || !env.data || typeof env.data !== 'object') return false;
+      const eType = String(env.entityType).trim().toLowerCase();
+      const rec = { ...env.data, isCloudSynced: true };
+      const cId = String(env.entityId || getHubCanonicalEntityId(rec, eType) || '').trim();
+      const cloudTs = parseHubTimestampMs(env.updatedAt || rec.updatedAt || rec.lastUpdated || rec.hubTimestamp) || Date.now();
+
+      if (eType === 'tombstone') {
+        const tTargetType = normalizeHubEntityType(rec.entityType || '');
+        const tTargetId = String(rec.entityId || cId).trim();
+        const delAt = parseHubTimestampMs(rec.deletedAt || cloudTs) || Date.now();
+        if (tTargetId) {
+          recordAndPurgeHubTombstone(tTargetType, tTargetId, delAt, { ...rec, isCloudSynced: true });
+          return true;
         }
+        return false;
+      }
+
+      if (T2_CANONICAL_TYPES.has(eType) && cId && isTombstoned(cId, eType, cloudTs)) {
+        return false;
+      }
+
+      if (eType === 'permissions_matrix') {
+        const exTs = Number(permissionsMatrixStore.updatedAt) || 0;
+        if (exTs > 0 && exTs > cloudTs + 60000) return false;
+        const rules = Array.isArray(rec.rules) ? rec.rules : permissionsMatrixStore.rules;
+        permissionsMatrixStore = { rules, updatedAt: cloudTs, isCloudSynced: true };
+        return true;
+      }
+      if (eType === 'role_configs') {
+        const exTs = Number(roleConfigsStore.updatedAt) || 0;
+        if (exTs > 0 && exTs > cloudTs + 60000) return false;
+        const defs = rec.definitions || rec;
+        roleConfigsStore = { definitions: defs, updatedAt: cloudTs, isCloudSynced: true };
+        return true;
+      }
+      if (eType === 'multi_currency') {
+        const exTs = Number(multiCurrencyStore.updatedAt) || 0;
+        if (exTs > 0 && (cloudTs === 0 || exTs > cloudTs + 60000)) return false;
+        multiCurrencyStore = { config: rec, updatedAt: cloudTs };
+        return true;
+      }
+      if (eType === 'branch_lockdown') {
+        const brKey = String(rec.branchId || rec.branch_id || cId || hubBranchId).trim().toUpperCase();
+        const ex = branchLockdownsStore[brKey];
+        const exTs = ex ? getRecordTimestamp(ex) : 0;
+        if (ex && exTs > 0 && exTs > cloudTs + 60000) return false;
+        branchLockdownsStore[brKey] = rec;
+        return true;
+      }
+
+      if (eType === 'cash_log') {
+        upsertHubCashLog(rec, true);
+        return true;
+      }
+
+      const storeByType = {
+        sale: { arr: salesStore, keyFn: (r) => r.id || r.invoice_id || r.InvoiceID },
+        customer_change: { arr: customerChangesStore, keyFn: (r) => r.id || r.changeId },
+        credit_sale: { arr: creditSalesStore, keyFn: (r) => r.id || r.creditId },
+        cash_lift: { arr: cashLiftsStore, keyFn: (r) => r.id },
+        cash_movement: { arr: cashMovementsStore, keyFn: (r) => r.id },
+        cash_transfer: { arr: cashTransfersStore, keyFn: (r) => r.transfer_id || r.id },
+        direct_grv: { arr: directGrvsStore, keyFn: (r) => r.id || r.grvNumber || r.grvId },
+        expense: { arr: expensesStore, keyFn: (r) => r.id },
+        internal_consumption: { arr: internalConsumptionsStore, keyFn: (r) => r.id },
+        stock_movement: { arr: stockMovementsStore, keyFn: (r) => r.id || r.movementId || r.txnId },
+        admin_sale: { arr: adminSalesStore, keyFn: (r) => r.id || r.invoice_id },
+        cash_count: { arr: cashCountsStore, keyFn: (r) => r.id || r.countId },
+        supplier_invoice_voucher: { arr: vouchersStore, keyFn: (r) => r.id || r.voucherNumber || r.voucherId },
+        business_day_closure: { arr: businessDayClosuresStore, keyFn: (r) => r.id || r.closureId },
+        electronic_settlement: { arr: electronicSettlementsStore, keyFn: (r) => r.id || r.settlementId },
+        inventory_item: { arr: inventoryStore, keyFn: (r) => r.itemId || r.id || r.ItemID },
+        customer: { arr: customersStore, keyFn: (r) => r.customerId || r.id },
+        credit_group: { arr: creditGroupsStore, keyFn: (r) => r.groupId || r.id },
+        supplier: { arr: suppliersStore, keyFn: (r) => r.supplierId || r.SupplierID || r.id },
+        inventory_category: { arr: categoriesStore, keyFn: (r) => r.categoryId || r.id || r.categoryName },
+        staff: { arr: salespeopleStore, keyFn: (r) => r.id || r.staffId },
+        branch: { arr: branchesStore, keyFn: (r) => canonicalizeHubBranchId(r.branchId || r.branch_id || r.id) },
+        cash_account: { arr: cashAccountsStore, keyFn: (r) => r.account_id || r.id },
+        casual_worker: { arr: casualWorkersStore, keyFn: (r) => r.id || r.pin_hash },
+        stocktake_session: { arr: stocktakeSessionsStore, keyFn: (r) => r.sessionId || r.id },
+        stocktake_segment: { arr: stocktakeSegmentsStore, keyFn: (r) => r.segmentId || r.id },
+        stocktake_zone_assignment: { arr: zoneAssignmentsStore, keyFn: (r) => r.id || `${r.sessionId || ''}::${r.zoneId || ''}` },
+      };
+
+      const targetSpec = storeByType[eType];
+      if (!targetSpec) return false;
+
+      if (eType === 'branch' && !isValidBranchRecord(rec)) return false;
+      if (eType === 'staff') {
+        if ('pin' in rec) delete rec.pin;
+        if ('rawPin' in rec) delete rec.rawPin;
+        if ('password' in rec) delete rec.password;
+        if (!isValidStaffRecord(rec)) return false;
+      }
+      if (eType === 'customer' && !isValidCustomerRecord(rec)) return false;
+
+      const idx = targetSpec.arr.findIndex((item) => String(targetSpec.keyFn(item) || '').trim().toUpperCase() === cId.toUpperCase());
+
+      if (!T2_CANONICAL_TYPES.has(eType)) {
+        if (idx === -1) {
+          targetSpec.arr.unshift(rec);
+          return true;
+        }
+        const ex = targetSpec.arr[idx];
+        if (eType === 'sale') {
+          const exVoid = ex.status === 'Voided' || ex.status === 'Refunded';
+          const incCompleted = rec.status !== 'Voided' && rec.status !== 'Refunded';
+          if (exVoid && incCompleted) return false;
+          if (rec.status !== ex.status || rec.mobileVerificationStatus !== ex.mobileVerificationStatus) {
+            targetSpec.arr[idx] = { ...ex, ...rec, isCloudSynced: true };
+            return true;
+          }
+        } else if (eType === 'cash_transfer') {
+          const exRank = getTrRankHub(ex.status);
+          const incRank = getTrRankHub(rec.status);
+          if (incRank > exRank || (incRank === exRank && cloudTs > getRecordTimestamp(ex))) {
+            const linked = Array.from(new Set([...(ex.linked_cash_log_ids || []), ...(rec.linked_cash_log_ids || [])]));
+            targetSpec.arr[idx] = { ...ex, ...rec, ...(linked.length > 0 ? { linked_cash_log_ids: linked } : {}), isCloudSynced: true };
+            return true;
+          }
+        } else if (eType === 'credit_sale' || eType === 'expense' || eType === 'internal_consumption' || eType === 'direct_grv') {
+          if (cloudTs > getRecordTimestamp(ex) && rec.status !== ex.status) {
+            targetSpec.arr[idx] = { ...ex, ...rec, isCloudSynced: true };
+            return true;
+          }
+        }
+        return false;
+      }
+
+      if (idx === -1) {
+        if (eType === 'branch') {
+          const normId = canonicalizeHubBranchId(cId);
+          rec.id = normId;
+          rec.branchId = normId;
+        }
+        targetSpec.arr.push(rec);
+        return true;
+      }
+
+      const ex = targetSpec.arr[idx];
+      const exTs = getRecordTimestamp(ex);
+      if (exTs > 0 && (cloudTs === 0 || exTs > cloudTs + 60000)) {
+        return false;
+      }
+
+      if (eType === 'staff') {
+        const exPinVer = Number(ex.pinVersion || 0);
+        const incPinVer = Number(rec.pinVersion || 0);
+        const exPinTs = parseHubTimestampMs(ex.pinUpdatedAt) || exTs;
+        const incPinTs = parseHubTimestampMs(rec.pinUpdatedAt) || cloudTs;
+        if (ex.pin_hash && (!rec.pin_hash || (exPinVer > incPinVer && incPinVer === 0) || exPinVer > incPinVer || exPinTs > incPinTs + 5000)) {
+          rec.pin_hash = ex.pin_hash;
+          if (ex.pin_salt) rec.pin_salt = ex.pin_salt;
+          rec.pinVersion = exPinVer;
+          if (ex.pinUpdatedAt) rec.pinUpdatedAt = ex.pinUpdatedAt;
+        }
+        targetSpec.arr[idx] = { ...ex, ...rec, isCloudSynced: true };
+        return true;
+      }
+
+      if (eType === 'branch') {
+        const normId = canonicalizeHubBranchId(ex.branchId || cId);
+        const nextName = isHubPlaceholderBranchName(rec.name) && !isHubPlaceholderBranchName(ex.name) ? ex.name : rec.name;
+        const nextCode = isHubPlaceholderBranchCode(rec.code, normId) && !isHubPlaceholderBranchCode(ex.code, normId) ? ex.code : rec.code;
+        targetSpec.arr[idx] = { ...ex, ...rec, id: normId, branchId: normId, name: nextName, code: nextCode, isCloudSynced: true };
+        return true;
+      }
+
+      if (eType === 'stocktake_session') {
+        targetSpec.arr[idx] = mergeStocktakeSessionHub(ex, rec);
+        return true;
+      }
+
+      targetSpec.arr[idx] = { ...ex, ...rec, isCloudSynced: true };
+      return true;
+    };
+
+    const newlyPulledEnvelopes = [];
+
+    // STEP A: Collect & push all unsynced records across all Hub stores via push_envelopes
+    const pushSources = [
+      { hubType: 'SALE', store: salesStore },
+      { hubType: 'CUSTOMER_CHANGE', store: customerChangesStore },
+      { hubType: 'CREDIT_SALE', store: creditSalesStore },
+      { hubType: 'CREDIT_GROUP', store: creditGroupsStore },
+      { hubType: 'CASH_LOG', store: cashLogsStore },
+      { hubType: 'CASH_LIFT', store: cashLiftsStore },
+      { hubType: 'CASH_MOVEMENT', store: cashMovementsStore },
+      { hubType: 'CASH_ACCOUNT', store: cashAccountsStore },
+      { hubType: 'CASH_TRANSFER', store: cashTransfersStore },
+      { hubType: 'GRV', store: directGrvsStore },
+      { hubType: 'EXPENSE', store: expensesStore },
+      { hubType: 'INTERNAL_CONSUMPTION', store: internalConsumptionsStore },
+      { hubType: 'STOCK_MOVEMENT', store: stockMovementsStore },
+      { hubType: 'ADMIN_SALE', store: adminSalesStore },
+      { hubType: 'CASH_COUNT', store: cashCountsStore },
+      { hubType: 'VOUCHER', store: vouchersStore },
+      { hubType: 'BUSINESS_DAY_CLOSURE', store: businessDayClosuresStore },
+      { hubType: 'ELECTRONIC_SETTLEMENT', store: electronicSettlementsStore },
+      { hubType: 'SUPPLIER', store: suppliersStore },
+      { hubType: 'CATEGORY', store: categoriesStore },
+      { hubType: 'CASUAL_WORKER', store: casualWorkersStore },
+      { hubType: 'STOCKTAKE_SESSION', store: stocktakeSessionsStore },
+      { hubType: 'STOCKTAKE_SEGMENT', store: stocktakeSegmentsStore },
+      { hubType: 'STOCKTAKE_ZONE_ASSIGNMENT', store: zoneAssignmentsStore },
+      { hubType: 'TOMBSTONE', store: tombstonesStore },
+      { hubType: 'INVENTORY', store: inventoryStore },
+      { hubType: 'CUSTOMER', store: customersStore },
+      { hubType: 'STAFF', store: salespeopleStore },
+      { hubType: 'BRANCH', store: branchesStore },
+      { hubType: 'BRANCH_LOCKDOWN', store: Object.values(branchLockdownsStore || {}) },
+    ];
+
+    const pendingPushPairs = [];
+    for (const src of pushSources) {
+      for (const rec of src.store) {
+        if (!rec || typeof rec !== 'object' || rec.isCloudSynced === true) continue;
+        const env = buildHubSyncEnvelope(src.hubType, rec);
+        if (!env.entityId) continue;
+        pendingPushPairs.push({ rec, env, hubType: src.hubType });
       }
     }
+    if (Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && permissionsMatrixStore.isCloudSynced !== true) {
+      pendingPushPairs.push({ rec: permissionsMatrixStore, env: buildHubSyncEnvelope('PERMISSIONS_MATRIX', permissionsMatrixStore), hubType: 'PERMISSIONS_MATRIX' });
+    }
+    if (roleConfigsStore.definitions && roleConfigsStore.isCloudSynced !== true) {
+      pendingPushPairs.push({ rec: roleConfigsStore, env: buildHubSyncEnvelope('ROLE_CONFIGS', roleConfigsStore), hubType: 'ROLE_CONFIGS' });
+    }
+    if (multiCurrencyStore.config && multiCurrencyStore.config.isCloudSynced !== true) {
+      pendingPushPairs.push({ rec: multiCurrencyStore.config, env: buildHubSyncEnvelope('MULTI_CURRENCY', multiCurrencyStore.config), hubType: 'MULTI_CURRENCY' });
+    }
+
+    const PUSH_BATCH = 20;
+    for (let i = 0; i < pendingPushPairs.length; i += PUSH_BATCH) {
+      if (cloudBackoffUntil > Date.now()) break;
+      const chunk = pendingPushPairs.slice(i, i + PUSH_BATCH);
+      try {
+        const pushRes = await postAppsScriptJson(targetUrl, {
+          action: 'push_envelopes',
+          company_id: hubTenantId,
+          branch_id: hubBranchId,
+          user_id: `HUB-${hubBranchId}`,
+          user_role: 'OWNER',
+          user_branch_id: hubBranchId,
+          ...getHubCloudAuthFields(),
+          envelopes: chunk.map((c) => c.env),
+          timestamp: Date.now(),
+        });
+        if (pushRes.ok && pushRes.json && (pushRes.json.success === false || pushRes.json.status === 'error' || (typeof pushRes.json.httpStatus === 'number' && pushRes.json.httpStatus >= 400))) {
+          handleHubAppsScriptErrorResponse(pushRes.json);
+          break;
+        }
+        if (pushRes.ok && pushRes.json && pushRes.json.success !== false) {
+          if (typeof pushRes.json.current_routing_epoch === 'number' && pushRes.json.current_routing_epoch > cloudRoutingEpoch) {
+            cloudRoutingEpoch = pushRes.json.current_routing_epoch;
+          }
+          const ackedSet = new Set(Array.isArray(pushRes.json.ackedPacketIds) ? pushRes.json.ackedPacketIds.map(String) : []);
+          const flaggedSet = new Set(Array.isArray(pushRes.json.flaggedBackdateIds) ? pushRes.json.flaggedBackdateIds.map(String) : []);
+          const srvIso = pushRes.json.server_received_at || new Date().toISOString();
+
+          for (const pair of chunk) {
+            if (ackedSet.size === 0 || ackedSet.has(pair.env.packetId)) {
+              pair.rec.isCloudSynced = true;
+              if (!pair.rec.server_received_at) pair.rec.server_received_at = srvIso;
+              if (flaggedSet.has(pair.env.entityId)) pair.rec.suspicious_backdate = true;
+              if (pair.env.class === 'T1') {
+                broadcastCloudSyncAck(null, pair.hubType, pair.env.entityId);
+              }
+            }
+          }
+
+          if (Array.isArray(pushRes.json.conflicts)) {
+            for (const c of pushRes.json.conflicts) {
+              if (c && c.winner && ingestCloudEnvelopeIntoHub(c.winner)) {
+                newlyPulledEnvelopes.push(c.winner);
+              }
+            }
+          }
+        }
+      } catch (pushErr) {
+        console.warn('[Edge-to-Cloud] Apps Script push_envelopes notice:', pushErr.message);
+        break;
+      }
+    }
+
+    // STEP B: Cursor-based pull_catchup across all synced entities & sharded monthly tabs
+    try {
+      let cursor = 0;
+      let page = 0;
+      let maxSeq = lastAppsScriptServerSeq;
+      const MAX_PAGES = 4;
+
+      while (cursor !== null && page < MAX_PAGES) {
+        if (cloudBackoffUntil > Date.now()) break;
+        const pullRes = await postAppsScriptJson(targetUrl, {
+          action: 'pull_catchup',
+          company_id: hubTenantId,
+          branch_id: hubBranchId || 'ALL',
+          user_role: 'OWNER',
+          ...getHubCloudAuthFields(),
+          since_seq: lastAppsScriptServerSeq,
+          since_ts: lastCloudSyncTimestamp,
+          limit: 250,
+          cursor,
+        });
+        if (!pullRes.ok || !pullRes.json) break;
+        if (pullRes.json.success === false || pullRes.json.status === 'error' || (typeof pullRes.json.httpStatus === 'number' && pullRes.json.httpStatus >= 400)) {
+          handleHubAppsScriptErrorResponse(pullRes.json);
+          break;
+        }
+        if (typeof pullRes.json.current_routing_epoch === 'number' && pullRes.json.current_routing_epoch > cloudRoutingEpoch) {
+          cloudRoutingEpoch = pullRes.json.current_routing_epoch;
+        }
+
+        const list = Array.isArray(pullRes.json.envelopes) ? pullRes.json.envelopes : [];
+        list.sort((a, b) => {
+          if (a?.entityType === 'tombstone' && b?.entityType !== 'tombstone') return -1;
+          if (b?.entityType === 'tombstone' && a?.entityType !== 'tombstone') return 1;
+          return (Number(a?.serverSeq || 0) - Number(b?.serverSeq || 0));
+        });
+
+        for (const rawEnv of list) {
+          if (ingestCloudEnvelopeIntoHub(rawEnv)) {
+            newlyPulledEnvelopes.push(rawEnv);
+          }
+          if (typeof rawEnv?.serverSeq === 'number' && rawEnv.serverSeq > maxSeq) {
+            maxSeq = rawEnv.serverSeq;
+          }
+        }
+
+        if (typeof pullRes.json.server_seq === 'number' && pullRes.json.server_seq > maxSeq) {
+          maxSeq = pullRes.json.server_seq;
+        }
+        cursor = pullRes.json.hasMore && pullRes.json.nextCursor !== undefined && pullRes.json.nextCursor !== null
+          ? Number(pullRes.json.nextCursor)
+          : null;
+        page++;
+      }
+
+      if (maxSeq > lastAppsScriptServerSeq) {
+        lastAppsScriptServerSeq = maxSeq;
+      }
+    } catch (pullErr) {
+      console.warn('[Edge-to-Cloud] Apps Script pull_catchup notice:', pullErr.message);
+    }
+
     lastCloudSyncTimestamp = Date.now();
     scheduleSave();
+
+    // STEP C: Downstream broadcast canonical envelopes to connected PWAs
+    if (newlyPulledEnvelopes.length > 0) {
+      console.log(`[Edge-to-Cloud] 📡 Broadcasting ${newlyPulledEnvelopes.length} Apps Script envelope(s) to connected terminals...`);
+      const broadcastStr = JSON.stringify({
+        type: 'HUB_CLOUD_BROADCAST',
+        action: 'HUB_CLOUD_BROADCAST',
+        envelopes: newlyPulledEnvelopes,
+        hubTimestamp: Date.now(),
+        branchId: hubBranchId,
+        count: newlyPulledEnvelopes.length,
+      });
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try { client.send(broadcastStr); } catch (e) {}
+        }
+      });
+    }
     return;
   }
 
