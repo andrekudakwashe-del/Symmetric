@@ -12646,7 +12646,25 @@ export const resetFailedSyncQueueItems = () => {
 
 export const purgeSyncedRecords = clearSyncedQueueItems;
 
-export const DEFAULT_MASTER_WEBHOOK_URL = 'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec';
+export const DEPRECATED_LEGACY_WEBHOOK_URLS = new Set<string>([
+  'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec',
+]);
+
+export const DEFAULT_MASTER_WEBHOOK_URL =
+  'https://script.google.com/macros/s/AKfycbz6_mPX1_8RRu74w1ww39-ZCltPGfIODPxx7G_MpVgosyF_476mQHiEtLq26YNU8_fY0g/exec';
+
+export const isDeprecatedLegacyWebhookUrl = (url?: string | null): boolean => {
+  const trimmed = String(url || '').trim();
+  return Boolean(trimmed && DEPRECATED_LEGACY_WEBHOOK_URLS.has(trimmed));
+};
+
+export const sanitizeMasterWebhookUrl = (url?: string | null): string => {
+  const trimmed = String(url || '').trim();
+  if (!trimmed || DEPRECATED_LEGACY_WEBHOOK_URLS.has(trimmed)) {
+    return DEFAULT_MASTER_WEBHOOK_URL;
+  }
+  return trimmed;
+};
 
 export const getRawStoredSheetsConfig = (): Partial<GoogleSheetsConfig> | null => {
   try {
@@ -12901,22 +12919,33 @@ export const getSheetsConfig = (): GoogleSheetsConfig => {
 
   // Per-tenant override if exists in tenantConfigs
   const tenantOverride = base.tenantConfigs?.[currentCompId];
+  const cleanBaseMasterWebhook = sanitizeMasterWebhookUrl(base.masterWebhookUrl);
+  const cleanBaseWebhook = base.webhookUrl && !isDeprecatedLegacyWebhookUrl(base.webhookUrl)
+    ? base.webhookUrl.trim()
+    : '';
+  const cleanTenantOverrideWebhook = tenantOverride?.webhookUrl && !isDeprecatedLegacyWebhookUrl(tenantOverride.webhookUrl)
+    ? tenantOverride.webhookUrl.trim()
+    : '';
+  const cleanCompanyWebhook = currentCompany?.webhook_url && !isDeprecatedLegacyWebhookUrl(currentCompany.webhook_url)
+    ? currentCompany.webhook_url.trim()
+    : '';
+
   const dedicatedSheetId =
     tenantOverride?.spreadsheetId ||
     currentCompany?.sheet_id ||
     (currentCompId === 'COMP-001' ? '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE' : '');
   const dedicatedWebhookUrl =
-    tenantOverride?.webhookUrl ||
-    currentCompany?.webhook_url ||
-    base.webhookUrl ||
-    base.masterWebhookUrl ||
+    cleanTenantOverrideWebhook ||
+    cleanCompanyWebhook ||
+    cleanBaseWebhook ||
+    cleanBaseMasterWebhook ||
     DEFAULT_MASTER_WEBHOOK_URL;
   const branchIsolation =
     tenantOverride?.branchIsolationMode || currentCompany?.branch_isolation_mode || base.branchIsolationMode || 'ROW_LEVEL';
 
   return {
     ...base,
-    masterWebhookUrl: base.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL,
+    masterWebhookUrl: cleanBaseMasterWebhook,
     masterSpreadsheetId: base.masterSpreadsheetId || '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
     spreadsheetId: dedicatedSheetId,
     webhookUrl: dedicatedWebhookUrl,
@@ -23102,6 +23131,9 @@ function sanitizeCompanyRecord_(company: Company): Company {
   const safeFolderId = isMasterSpreadsheetId(company.sheet_folder_id, masterId)
     ? ''
     : (company.sheet_folder_id || '');
+  const safeWebhookUrl = isDeprecatedLegacyWebhookUrl(company.webhook_url)
+    ? DEFAULT_MASTER_WEBHOOK_URL
+    : company.webhook_url;
   let safeBackendConfig = company.backend_config;
   if (safeBackendConfig && safeBackendConfig.sheets) {
     const safeCfgSheetId = sanitizeTenantSheetId(
@@ -23112,9 +23144,17 @@ function sanitizeCompanyRecord_(company: Company): Company {
     const safeCfgFolderId = isMasterSpreadsheetId(safeBackendConfig.sheets.sheetFolderId, masterId)
       ? ''
       : (safeBackendConfig.sheets.sheetFolderId || '');
+    const safeCfgWebhook = isDeprecatedLegacyWebhookUrl(safeBackendConfig.sheets.webhookUrl)
+      ? DEFAULT_MASTER_WEBHOOK_URL
+      : safeBackendConfig.sheets.webhookUrl;
+    const safeCfgMasterWebhook = isDeprecatedLegacyWebhookUrl(safeBackendConfig.sheets.masterWebhookUrl)
+      ? DEFAULT_MASTER_WEBHOOK_URL
+      : safeBackendConfig.sheets.masterWebhookUrl;
     if (
       safeCfgSheetId !== safeBackendConfig.sheets.spreadsheetId ||
-      safeCfgFolderId !== safeBackendConfig.sheets.sheetFolderId
+      safeCfgFolderId !== safeBackendConfig.sheets.sheetFolderId ||
+      safeCfgWebhook !== safeBackendConfig.sheets.webhookUrl ||
+      safeCfgMasterWebhook !== safeBackendConfig.sheets.masterWebhookUrl
     ) {
       safeBackendConfig = {
         ...safeBackendConfig,
@@ -23122,6 +23162,8 @@ function sanitizeCompanyRecord_(company: Company): Company {
           ...safeBackendConfig.sheets,
           spreadsheetId: safeCfgSheetId,
           sheetFolderId: safeCfgFolderId,
+          ...(safeCfgWebhook !== undefined ? { webhookUrl: safeCfgWebhook } : {}),
+          ...(safeCfgMasterWebhook !== undefined ? { masterWebhookUrl: safeCfgMasterWebhook } : {}),
         },
       };
     }
@@ -23129,6 +23171,7 @@ function sanitizeCompanyRecord_(company: Company): Company {
   if (
     safeSheetId === company.sheet_id &&
     safeFolderId === (company.sheet_folder_id || '') &&
+    safeWebhookUrl === company.webhook_url &&
     safeBackendConfig === company.backend_config
   ) {
     return company;
@@ -23137,6 +23180,7 @@ function sanitizeCompanyRecord_(company: Company): Company {
     ...company,
     sheet_id: safeSheetId,
     sheet_folder_id: safeFolderId,
+    ...(safeWebhookUrl !== undefined ? { webhook_url: safeWebhookUrl } : {}),
     ...(safeBackendConfig ? { backend_config: safeBackendConfig } : {}),
   };
 }

@@ -10,6 +10,8 @@ import {
   saveSalesperson,
   getOwnerDefaultPermissions,
   parseTimestampMs,
+  sanitizeMasterWebhookUrl,
+  isDeprecatedLegacyWebhookUrl,
 } from '../db/roomDatabase';
 import {
   fetchCompaniesFromMasterSheet,
@@ -187,13 +189,17 @@ export async function fetchGlobalSystemConfig(): Promise<GlobalSystemConfig | nu
         const remoteConfig: GlobalSystemConfig = data.config;
         const local = getSheetsConfig();
 
-        // If server has a configured master webhook, adopt it locally
+        // If server has a configured master webhook, adopt it locally (auto-upgrading deprecated legacy V1 URLs)
         if (remoteConfig.masterWebhookUrl) {
+          const cleanMaster = sanitizeMasterWebhookUrl(remoteConfig.masterWebhookUrl);
+          const localWebhookClean =
+            local.webhookUrl && !isDeprecatedLegacyWebhookUrl(local.webhookUrl)
+              ? local.webhookUrl
+              : cleanMaster;
           const updated = {
             ...local,
-            masterWebhookUrl: remoteConfig.masterWebhookUrl,
-            // If local webhookUrl was empty or default, adopt the master webhook
-            webhookUrl: local.webhookUrl ? local.webhookUrl : remoteConfig.masterWebhookUrl,
+            masterWebhookUrl: cleanMaster,
+            webhookUrl: localWebhookClean,
             masterSpreadsheetId: remoteConfig.masterSpreadsheetId || local.masterSpreadsheetId,
           };
           saveSheetsConfig(updated);
@@ -272,7 +278,7 @@ export async function pushAllLocalTenantsToCloud(
   const localCompanies = getCompanies();
   const branches = getAllBranches();
   const config = getSheetsConfig();
-  const effectiveUrl = (targetWebhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
+  const effectiveUrl = sanitizeMasterWebhookUrl(targetWebhookUrl || config.masterWebhookUrl || config.webhookUrl || '');
 
   // If a valid webhook is provided, persist it to server config BEFORE bulk syncing
   if (effectiveUrl && effectiveUrl.startsWith('http')) {

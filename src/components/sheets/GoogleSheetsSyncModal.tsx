@@ -29,6 +29,8 @@ import {
   isMasterCompanyId,
   isMasterSpreadsheetId,
   DEFAULT_MASTER_SPREADSHEET_ID,
+  DEFAULT_MASTER_WEBHOOK_URL,
+  sanitizeMasterWebhookUrl,
 } from '../../db/roomDatabase';
 import {
   processSyncQueue,
@@ -94,7 +96,7 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
   const sheetsConfig = getSheetsConfig();
 
   const [webhookUrl, setWebhookUrl] = useState(
-    () => sheetsConfig.webhookUrl || currentComp.webhook_url || sheetsConfig.masterWebhookUrl || 'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec'
+    () => sanitizeMasterWebhookUrl(sheetsConfig.webhookUrl || currentComp.webhook_url || sheetsConfig.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL)
   );
   const [tenantSpreadsheetId, setTenantSpreadsheetId] = useState(
     () => currentComp.sheet_id || sheetsConfig.spreadsheetId || ''
@@ -106,11 +108,12 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       const cfg = getSheetsConfig();
-      const resolvedWebhook =
+      const resolvedWebhook = sanitizeMasterWebhookUrl(
         currentComp.webhook_url ||
         cfg.webhookUrl ||
         cfg.masterWebhookUrl ||
-        'https://script.google.com/macros/s/AKfycbyH7SbJv6_tcXW5ypsUZsSiiu6LLP5tB73cRLgDYZvpaZBTpw7lIE-D7vBmpgXD6l6p/exec';
+        DEFAULT_MASTER_WEBHOOK_URL
+      );
       setWebhookUrl(resolvedWebhook);
       setTenantSpreadsheetId(currentComp.sheet_id || cfg.spreadsheetId || '');
       setBranchIsolationMode(currentComp.branch_isolation_mode || cfg.branchIsolationMode || 'ROW_LEVEL');

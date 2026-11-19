@@ -32,6 +32,7 @@ import {
   isMasterCompanyId,
   isMasterSpreadsheetId,
   sanitizeTenantSheetId,
+  sanitizeMasterWebhookUrl,
   getInventoryItems,
   updateTenantSheetBinding,
   pullTenantInventory,
@@ -1795,7 +1796,9 @@ export const registerCompanyInCloud = async (
   webhookUrl?: string
 ): Promise<CloudRegistrationResult> => {
   const config = getSheetsConfig();
-  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || DEFAULT_MASTER_WEBHOOK_URL || '').trim();
+  const targetUrl = sanitizeMasterWebhookUrl(
+    webhookUrl || config.masterWebhookUrl || config.webhookUrl || DEFAULT_MASTER_WEBHOOK_URL || ''
+  );
   const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
   const clientRequestId = `REQ-SIGNUP-${payload.company_id}-${Date.now()}`;
 
@@ -1990,14 +1993,14 @@ export const autoProvisionDedicatedTenantSheet = async (
 }> => {
   const config = getSheetsConfig();
   const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
-  const targetWebhook = (
+  const targetWebhook = sanitizeMasterWebhookUrl(
     webhookUrl ||
     config.masterWebhookUrl ||
     company.webhook_url ||
     config.webhookUrl ||
     DEFAULT_MASTER_WEBHOOK_URL ||
     ''
-  ).trim();
+  );
 
   if (isMasterCompanyId(company.company_id)) {
     return {
