@@ -220,13 +220,26 @@ export type StocktakeStatus =
   | 'SCHEDULED'
   | 'IN_PROGRESS'
   | 'COUNTING'
+  | 'PAUSED'
   | 'RECOUNTING'
   | 'AUDIT_REVIEW'
   | 'CONSOLIDATED'
   | 'READY_FOR_COMMITTAL'
   | 'APPROVED_POSTED'
+  | 'ARCHIVED'
   | 'CANCELLED'
   | string;
+
+export interface StocktakePauseEntry {
+  pausedAt: string;
+  pausedBy: string;
+  pausedByName: string;
+  reason: string;
+  unlockPosDuringPause?: boolean;
+  resumedAt?: string;
+  resumedBy?: string;
+  resumedByName?: string;
+}
 
 export type StocktakeVarianceReasonCode =
   | 'THEFT_SHRINKAGE'
@@ -388,6 +401,22 @@ export interface StocktakeSession {
   varianceReviewedById?: string;
   varianceReviewedByName?: string;
   varianceReviewedAt?: string;
+  // Draft / Activation / Pause / Archive Lifecycle Audit Fields
+  lockdownRequested?: boolean;
+  everActivated?: boolean;
+  activatedAt?: string;
+  activatedBy?: string;
+  activatedByName?: string;
+  pausedAt?: string;
+  pausedBy?: string;
+  pausedByName?: string;
+  pauseReason?: string;
+  pausedFromStatus?: StocktakeStatus;
+  pauseHistory?: StocktakePauseEntry[];
+  archivedAt?: string;
+  archivedBy?: string;
+  archivedByName?: string;
+  archiveReason?: string;
   // SyncCore L3/L6 versioning metadata
   version?: number;
   mutationSource?: 'SEED' | 'USER_EDIT' | 'MIGRATION';

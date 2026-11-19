@@ -9,7 +9,16 @@ import { sheetsAppScriptAdapter } from './adapters/SheetsAppScriptAdapter';
 import { firebaseBackendAdapter } from './adapters/FirebaseAdapter';
 import { supabaseBackendAdapter } from './adapters/SupabaseAdapter';
 import { Company } from '../../data/saasData';
-import { getCompanies, saveCompany, getSheetsConfig, DEFAULT_MASTER_WEBHOOK_URL } from '../../db/roomDatabase';
+import {
+  getCompanies,
+  saveCompany,
+  getSheetsConfig,
+  DEFAULT_MASTER_WEBHOOK_URL,
+  DEFAULT_MASTER_SPREADSHEET_ID,
+  isMasterCompanyId,
+  isMasterSpreadsheetId,
+  sanitizeTenantSheetId,
+} from '../../db/roomDatabase';
 
 const ADAPTER_MAP: Record<BackendType, IBackendAdapter> = {
   room: roomBackendAdapter,
@@ -55,6 +64,14 @@ export const getTenantBackendConfig = (company: Company): TenantBackendConfig =>
     (company.sheet_id || company.webhook_url ? 'sheets_appscript' : 'room');
 
   const sheetsCfg = getSheetsConfig();
+  const masterSheetId = sheetsCfg.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+  const isMaster = isMasterCompanyId(company.company_id);
+  const resolvedSpreadsheetId =
+    sanitizeTenantSheetId(company.company_id, existing?.sheets?.spreadsheetId, masterSheetId) ||
+    sanitizeTenantSheetId(company.company_id, company.sheet_id, masterSheetId) ||
+    (isMaster ? masterSheetId : '');
+  const rawFolderId = existing?.sheets?.sheetFolderId || company.sheet_folder_id || '';
+  const resolvedFolderId = isMasterSpreadsheetId(rawFolderId, masterSheetId) ? '' : rawFolderId;
 
   return {
     backendType,
@@ -66,8 +83,8 @@ export const getTenantBackendConfig = (company: Company): TenantBackendConfig =>
     sheets: {
       webhookUrl: existing?.sheets?.webhookUrl || company.webhook_url || sheetsCfg.webhookUrl || DEFAULT_MASTER_WEBHOOK_URL,
       masterWebhookUrl: existing?.sheets?.masterWebhookUrl || sheetsCfg.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL,
-      spreadsheetId: existing?.sheets?.spreadsheetId || company.sheet_id || sheetsCfg.masterSpreadsheetId || '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
-      sheetFolderId: existing?.sheets?.sheetFolderId || company.sheet_folder_id || '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
+      spreadsheetId: resolvedSpreadsheetId,
+      sheetFolderId: resolvedFolderId,
       isolationMode: existing?.sheets?.isolationMode || company.branch_isolation_mode || 'ROW_LEVEL',
     },
     firebase: {
@@ -118,14 +135,31 @@ export const saveTenantBackendConfig = (
     retention: { ...currentCfg.retention, ...(configUpdates.retention || {}) },
   };
 
+  const sheetsCfg = getSheetsConfig();
+  const masterSheetId = sheetsCfg.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+  const safeSpreadsheetId = sanitizeTenantSheetId(
+    companyId,
+    mergedCfg.sheets.spreadsheetId,
+    masterSheetId
+  );
+  const safeFolderId = isMasterSpreadsheetId(mergedCfg.sheets.sheetFolderId, masterSheetId)
+    ? ''
+    : (mergedCfg.sheets.sheetFolderId || '');
+
+  mergedCfg.sheets = {
+    ...mergedCfg.sheets,
+    spreadsheetId: safeSpreadsheetId,
+    sheetFolderId: safeFolderId,
+  };
+
   const updatedCompany: Company = {
     ...company,
     backend_type: mergedCfg.backendType,
     backend_config: mergedCfg,
-    // Keep top-level sheet and webhook in sync for existing components
+    // Keep top-level sheet and webhook in sync for existing components (never assign Master Sheet to regular tenants)
     webhook_url: mergedCfg.sheets.webhookUrl,
-    sheet_id: mergedCfg.sheets.spreadsheetId,
-    sheet_folder_id: mergedCfg.sheets.sheetFolderId || company.sheet_folder_id,
+    sheet_id: safeSpreadsheetId,
+    sheet_folder_id: safeFolderId,
     branch_isolation_mode: mergedCfg.sheets.isolationMode || company.branch_isolation_mode,
   };
 

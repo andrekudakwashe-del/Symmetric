@@ -26,6 +26,9 @@ import {
   getAllGoodsReceived,
   getDirectGrvs,
   getAllCashLifts,
+  isMasterCompanyId,
+  isMasterSpreadsheetId,
+  DEFAULT_MASTER_SPREADSHEET_ID,
 } from '../../db/roomDatabase';
 import {
   processSyncQueue,
@@ -41,6 +44,7 @@ import {
   initializeTenantBusinessTabs,
   fetchProductsFromSheet,
   syncCompanyToCloud,
+  autoProvisionDedicatedTenantSheet,
 } from '../../services/googleSheetsSync';
 import {
   FileSpreadsheet,
@@ -206,15 +210,24 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
     const targetComp = allCompanies.find((c) => c.company_id === targetCompId) || currentComp;
     const targetInput = overrideId || inputSheetUrlOrId;
     const cleanId = extractGoogleSheetId(targetInput);
+    const masterId = getSheetsConfig().masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
 
     if (!cleanId) {
       setLinkModalError('Please enter a valid Google Sheet URL or 44-character Spreadsheet ID.');
       return;
     }
 
+    if (!isMasterCompanyId(targetCompId) && isMasterSpreadsheetId(cleanId, masterId)) {
+      setLinkModalError(
+        'Blocked: Cannot assign the Master SaaS Control Sheet to a regular tenant. Use Auto-Provision Dedicated Sheet or paste a unique tenant spreadsheet URL.'
+      );
+      return;
+    }
+
     saveCompany({
       ...targetComp,
       sheet_id: cleanId,
+      sheet_folder_id: '',
     });
 
     if (targetCompId === currentComp.company_id) {
@@ -231,9 +244,46 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
     confetti({ particleCount: 40, spread: 60, origin: { y: 0.65 } });
   };
 
+  const handleAutoProvisionTenantSheet = async (targetCompId: string) => {
+    const targetComp = allCompanies.find((c) => c.company_id === targetCompId) || currentComp;
+    if (isMasterCompanyId(targetComp.company_id)) {
+      setSyncStatusMsg('HQ Master uses the Master Spreadsheet by design.');
+      return;
+    }
+    setIsSyncing(true);
+    setLinkModalError(null);
+    setSyncStatusMsg(`Auto-provisioning dedicated Google Sheet for ${targetComp.company_name}...`);
+    try {
+      const res = await autoProvisionDedicatedTenantSheet(targetComp, webhookUrl.trim() || undefined);
+      if (res.success && res.sheet_id) {
+        if (targetComp.company_id === currentComp.company_id) {
+          setTenantSpreadsheetId(res.sheet_id);
+        }
+        setSyncStatusMsg(`✓ ${res.message}`);
+        setShowSheetLinkModal(false);
+        confetti({ particleCount: 50, spread: 70, origin: { y: 0.65 } });
+      } else {
+        const msg = res.message || res.error || 'Auto-provisioning failed. Please try again.';
+        setLinkModalError(msg);
+        setSyncStatusMsg(`⚠️ ${msg}`);
+      }
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      setLinkModalError(msg);
+      setSyncStatusMsg(`⚠️ Auto-provisioning error: ${msg}`);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
   const handleSaveTenantConfig = (e: React.FormEvent) => {
     e.preventDefault();
     const cleanSheetId = extractGoogleSheetId(tenantSpreadsheetId);
+    const masterId = getSheetsConfig().masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+    if (!isMasterCompanyId(currentComp.company_id) && isMasterSpreadsheetId(cleanSheetId, masterId)) {
+      setSyncStatusMsg('⚠️ Blocked: Cannot bind the Master Control Spreadsheet to a regular tenant. Use Auto-Provision Dedicated Sheet instead.');
+      return;
+    }
     updateSheetsConfig({
       spreadsheetId: cleanSheetId,
       webhookUrl: webhookUrl.trim(),
@@ -245,6 +295,7 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
     const updatedComp = {
       ...currentComp,
       sheet_id: cleanSheetId,
+      sheet_folder_id: '',
       webhook_url: webhookUrl.trim(),
       branch_isolation_mode: branchIsolationMode,
     };
@@ -1174,12 +1225,13 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                       {allCompanies.map((c) => {
                         const compBranches = allBranches.filter((b) => b.company_id === c.company_id);
                         const isCurrent = c.company_id === currentComp.company_id;
-                        const isMaster = c.company_id === 'COMP-001' || c.company_id === 'COMP-MASTER';
-                        const hasRealSheet = isRealGoogleSheetId(c.sheet_id) || (isMaster && isRealGoogleSheetId('1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE'));
-                        const sheetId = isRealGoogleSheetId(c.sheet_id)
-                          ? c.sheet_id!
-                          : isMaster
-                          ? '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE'
+                        const isMaster = isMasterCompanyId(c.company_id);
+                        const masterId = getSheetsConfig().masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+                        const hasRealSheet = isMaster
+                          ? isRealGoogleSheetId(c.sheet_id) || isRealGoogleSheetId(masterId)
+                          : isRealGoogleSheetId(c.sheet_id) && !isMasterSpreadsheetId(c.sheet_id, masterId);
+                        const sheetId = hasRealSheet
+                          ? (isRealGoogleSheetId(c.sheet_id) ? c.sheet_id! : masterId)
                           : '';
 
                         return (
@@ -1208,16 +1260,24 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                                   </button>
                                 </div>
                               ) : (
-                                <div className="flex items-center space-x-2">
+                                <div className="flex items-center space-x-1.5 flex-wrap gap-y-1">
                                   <span className="px-2 py-0.5 rounded text-[10px] bg-amber-950/80 text-amber-300 border border-amber-800 font-semibold">
-                                    ⚠️ Needs Sheet
+                                    ⚠️ Needs Dedicated Sheet
                                   </span>
+                                  <button
+                                    type="button"
+                                    disabled={isSyncing}
+                                    onClick={() => handleAutoProvisionTenantSheet(c.company_id)}
+                                    className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white text-[10px] font-bold transition"
+                                  >
+                                    Auto-Provision
+                                  </button>
                                   <button
                                     type="button"
                                     onClick={() => handleOpenSheetLinkModal(c.company_id)}
                                     className="px-2 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold transition"
                                   >
-                                    Link Sheet
+                                    Link
                                   </button>
                                 </div>
                               )}
@@ -1600,13 +1660,17 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                 <span>Save Dedicated Sheet Link</span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => handleSaveLinkedSheet('1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE')}
-                className="w-full py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs border border-slate-700 transition"
-              >
-                Use Master Sheet for Now (Row-Level Isolated)
-              </button>
+              {!isMasterCompanyId(linkModalCompanyId || currentComp.company_id) && (
+                <button
+                  type="button"
+                  disabled={isSyncing}
+                  onClick={() => handleAutoProvisionTenantSheet(linkModalCompanyId || currentComp.company_id)}
+                  className="w-full py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-cyan-600 hover:from-indigo-500 hover:to-cyan-500 disabled:opacity-60 text-white font-bold text-xs shadow transition flex items-center justify-center space-x-1.5"
+                >
+                  <Zap className="w-4 h-4" />
+                  <span>{isSyncing ? 'Auto-Provisioning Dedicated Sheet...' : 'Auto-Provision New Dedicated Sheet (Recommended)'}</span>
+                </button>
+              )}
             </div>
           </div>
         </div>

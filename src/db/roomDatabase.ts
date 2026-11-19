@@ -13005,27 +13005,57 @@ export const updateSheetsConfig = (updates: Partial<GoogleSheetsConfig>) => {
 
 export const saveSheetsConfig = updateSheetsConfig;
 
+export const DEFAULT_MASTER_SPREADSHEET_ID = '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE';
+
+export const isMasterCompanyId = (companyId?: string): boolean => {
+  const c = String(companyId || '').trim().toUpperCase();
+  return c === 'COMP-001' || c === 'COMP-MASTER';
+};
+
+export const isMasterSpreadsheetId = (sheetId?: string, masterSpreadsheetId?: string): boolean => {
+  const s = String(sheetId || '').trim();
+  if (!s) return false;
+  if (s === DEFAULT_MASTER_SPREADSHEET_ID) return true;
+  const m = String(masterSpreadsheetId || '').trim();
+  return Boolean(m && s === m);
+};
+
+export const sanitizeTenantSheetId = (
+  companyId?: string,
+  sheetId?: string,
+  masterSpreadsheetId?: string
+): string => {
+  const clean = String(sheetId || '').trim();
+  if (!clean) return '';
+  if (!isMasterCompanyId(companyId) && isMasterSpreadsheetId(clean, masterSpreadsheetId)) {
+    return '';
+  }
+  return clean;
+};
+
 export const updateTenantSheetBinding = (
   companyId: string,
   sheetId: string,
   webhookUrl?: string,
   isolationMode?: 'ROW_LEVEL' | 'BRANCH_TABS' | 'HYBRID'
 ) => {
+  const currentConfig = getStored<GoogleSheetsConfig>(STORAGE_KEYS.SHEETS_CONFIG, getSheetsConfig());
+  const safeSheetId = sanitizeTenantSheetId(companyId, sheetId, currentConfig.masterSpreadsheetId);
+
   const companies = getCompanies();
   const comp = companies.find((c) => c.company_id === companyId);
   if (comp) {
-    comp.sheet_id = sheetId;
+    comp.sheet_id = safeSheetId;
     if (webhookUrl !== undefined) comp.webhook_url = webhookUrl;
     if (isolationMode) comp.branch_isolation_mode = isolationMode;
     saveCompany(comp);
   }
 
-  const currentConfig = getStored<GoogleSheetsConfig>(STORAGE_KEYS.SHEETS_CONFIG, getSheetsConfig());
   const tenantConfigs = { ...(currentConfig.tenantConfigs || {}) };
   tenantConfigs[companyId] = {
     companyId,
     companyName: comp?.company_name || companyId,
-    spreadsheetId: sheetId,
+    spreadsheetId: safeSheetId,
     webhookUrl: webhookUrl !== undefined ? webhookUrl : comp?.webhook_url,
     branchIsolationMode: isolationMode || comp?.branch_isolation_mode || 'ROW_LEVEL',
   };
@@ -19407,18 +19437,28 @@ export const resolveConflictingLocalStocktakeSession = (
       hadOfflineCounts = Boolean(segHasCounts || draftHasCounts || (losing.totalCountedUnits || 0) > 0);
       const winLabel = winningSessionId || 'active branch session';
       const conflictNote = hadOfflineCounts
-        ? `[Superseded Offline Conflict — Counts Preserved Read-Only] Branch already had active stocktake ${winLabel}. Review or re-enter your offline counts into ${winLabel}.`
-        : `[Superseded Duplicate] Replaced by authoritative active stocktake ${winLabel}.`;
+        ? `[Offline Activation Conflict — Paused With Counts Preserved] Branch already had live stocktake ${winLabel}. Counts are preserved safely; resume after ${winLabel} closes or review.`
+        : `[Offline Activation Conflict — Returned to Draft] Branch already had live stocktake ${winLabel}. You can activate this draft once ${winLabel} finishes.`;
 
-      if (losing.status !== 'CANCELLED' && losing.status !== 'APPROVED_POSTED') {
+      if (losing.status !== 'CANCELLED' && losing.status !== 'ARCHIVED' && losing.status !== 'APPROVED_POSTED') {
         const nextNotes = losing.notes && losing.notes.includes(conflictNote)
           ? losing.notes
           : [losing.notes, conflictNote].filter(Boolean).join('\n');
+        const demotedStatus: StocktakeStatus = hadOfflineCounts ? 'PAUSED' : 'DRAFT';
         saveStocktakeSession(
           {
             ...losing,
-            status: 'CANCELLED',
+            status: demotedStatus,
             isLockdownActive: false,
+            ...(hadOfflineCounts
+              ? {
+                  pausedAt: new Date().toISOString(),
+                  pausedBy: 'SYSTEM',
+                  pausedByName: 'Sync Conflict Guard',
+                  pauseReason: `Auto-paused: branch already has live stocktake ${winLabel}`,
+                  pausedFromStatus: losing.status,
+                }
+              : {}),
             notes: nextNotes,
           },
           { fromSync: true }
@@ -19527,8 +19567,25 @@ export const ingestStocktakeSessionFromMesh = (data: {
   updatedAt?: number;
   lastUpdated?: string;
   timestamp?: string;
+  lockdownRequested?: boolean;
+  everActivated?: boolean;
+  activatedAt?: string;
+  activatedBy?: string;
+  activatedByName?: string;
+  pausedAt?: string;
+  pausedBy?: string;
+  pausedByName?: string;
+  pauseReason?: string;
+  pausedFromStatus?: StocktakeStatus;
+  pauseHistory?: any[];
+  archivedAt?: string;
+  archivedBy?: string;
+  archivedByName?: string;
+  archiveReason?: string;
 }): StocktakeSession => {
-  const existing = getStocktakeSessionById(data.sessionId);
+  const existing = getRawStoredStocktakeSessions().find(
+    (s) => String(s.sessionId || '').trim().toUpperCase() === String(data.sessionId || '').trim().toUpperCase()
+  );
   if (existing) {
     const existingTime = parseTimestampMs((existing as any).updatedAt || (existing as any).lastUpdated || existing.timestamp);
     const incomingTime = parseTimestampMs((data as any).updatedAt || (data as any).lastUpdated || data.startedAt || (data as any).timestamp);
@@ -19799,6 +19856,27 @@ export const ingestStocktakeSessionFromMesh = (data: {
     varianceReviewedById: data.varianceReviewedById || existing?.varianceReviewedById,
     varianceReviewedByName: data.varianceReviewedByName || existing?.varianceReviewedByName,
     varianceReviewedAt: data.varianceReviewedAt || existing?.varianceReviewedAt,
+    lockdownRequested:
+      data.lockdownRequested !== undefined
+        ? Boolean(data.lockdownRequested)
+        : (existing?.lockdownRequested !== undefined ? Boolean(existing.lockdownRequested) : Boolean(data.isLockdownActive ?? existing?.isLockdownActive)),
+    everActivated:
+      data.everActivated !== undefined
+        ? Boolean(data.everActivated)
+        : Boolean(existing?.everActivated || (data.status && !['DRAFT', 'SCHEDULED'].includes(String(data.status).toUpperCase()))),
+    activatedAt: data.activatedAt || existing?.activatedAt,
+    activatedBy: data.activatedBy || existing?.activatedBy,
+    activatedByName: data.activatedByName || existing?.activatedByName,
+    pausedAt: data.pausedAt !== undefined ? data.pausedAt : existing?.pausedAt,
+    pausedBy: data.pausedBy !== undefined ? data.pausedBy : existing?.pausedBy,
+    pausedByName: data.pausedByName !== undefined ? data.pausedByName : existing?.pausedByName,
+    pauseReason: data.pauseReason !== undefined ? data.pauseReason : existing?.pauseReason,
+    pausedFromStatus: data.pausedFromStatus !== undefined ? data.pausedFromStatus : existing?.pausedFromStatus,
+    pauseHistory: Array.isArray(data.pauseHistory) ? data.pauseHistory : existing?.pauseHistory,
+    archivedAt: data.archivedAt !== undefined ? data.archivedAt : existing?.archivedAt,
+    archivedBy: data.archivedBy !== undefined ? data.archivedBy : existing?.archivedBy,
+    archivedByName: data.archivedByName !== undefined ? data.archivedByName : existing?.archivedByName,
+    archiveReason: data.archiveReason !== undefined ? data.archiveReason : existing?.archiveReason,
     version: Math.max(Number(data.version || 0), Number(existing?.version || 0), 1),
     mutationSource: data.mutationSource || existing?.mutationSource || 'USER_EDIT',
     updatedAt: syncedTime,
@@ -19807,8 +19885,8 @@ export const ingestStocktakeSessionFromMesh = (data: {
 
   saveStocktakeSession(session, { fromSync: true });
 
-  // If session completed via mesh, ensure its casuals/passes stay deactivated locally too
-  if (session.status === 'APPROVED_POSTED') {
+  // If session completed/archived/cancelled via mesh, ensure its casuals stay deactivated locally too
+  if (session.status === 'APPROVED_POSTED' || session.status === 'ARCHIVED' || session.status === 'CANCELLED') {
     const allCasuals = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
     let changedCasuals = false;
     const updatedCasuals = allCasuals.map((c) => {
@@ -20568,30 +20646,8 @@ export const createStocktakeSession = (params: {
   const currentBranch = getCurrentBranchId();
   const targetBranch = params.branchId || currentBranch;
 
-  // Enforce Single Active Floor Stocktake Rule per Branch
-  const activeStatuses = new Set([
-    'DRAFT',
-    'SCHEDULED',
-    'IN_PROGRESS',
-    'COUNTING',
-    'RECOUNTING',
-    'AUDIT_REVIEW',
-    'CONSOLIDATED',
-    'READY_FOR_COMMITTAL',
-  ]);
-  const branches = getBranches();
-  const existingActive = getRawStoredStocktakeSessions().find((s) => {
-    const sBranch = (s as any).branch_id || s.branchId;
-    const sComp = (s as any).company_id || s.companyId;
-    const inScope = isRecordInBranchScope(sBranch, targetBranch, branches, currentCompany, sComp);
-    return inScope && activeStatuses.has(String(s.status || '').toUpperCase().trim());
-  });
-  if (existingActive) {
-    throw new Error(
-      `Only 1 active stocktake session is permitted per branch. Active session "${existingActive.title}" (${existingActive.sessionId}) is currently ${existingActive.status}. Commit or cancel it before starting a new stocktake.`
-    );
-  }
-
+  // Draft sessions can be created freely (unlimited per branch) and sync across all devices.
+  // The "Max 1 Live Execution Session per Branch" rule and POS lockdown are enforced on Activation.
   const sessionId = getNextStocktakeSessionId();
   const timestamp = new Date().toISOString();
   const date = params.date || timestamp.split('T')[0];
@@ -20650,6 +20706,8 @@ export const createStocktakeSession = (params: {
     }));
   }
 
+  const lockdownRequested = Boolean(params.isLockdownActive);
+
   const session: StocktakeSession = {
     sessionId,
     title: params.title || `${countType.replace('_', ' ')} Audit - ${date}`,
@@ -20658,7 +20716,10 @@ export const createStocktakeSession = (params: {
     status: 'DRAFT',
     branchId: targetBranch,
     branchName: params.branchName || 'Main Central Distribution & Warehouse',
-    isLockdownActive: Boolean(params.isLockdownActive),
+    // POS lockdown only engages when the draft is Activated for live counting
+    isLockdownActive: false,
+    lockdownRequested,
+    everActivated: false,
     stocktakeAuditorId: params.stocktakeAuditorId,
     stocktakeAuditorName: params.stocktakeAuditorName,
     stocktakeAuditorPhone: params.stocktakeAuditorPhone,
@@ -20685,20 +20746,372 @@ export const createStocktakeSession = (params: {
     companyId: currentCompany,
   } as any;
 
-  // If session activates lockdown, lock down the branch
-  if (session.isLockdownActive) {
+  return saveStocktakeSession(session);
+};
+
+const LIVE_EXECUTION_STATUSES_DB = new Set([
+  'ACTIVE',
+  'IN_PROGRESS',
+  'COUNTING',
+  'PAUSED',
+  'RECOUNT',
+  'RECOUNTING',
+  'AUDIT_REVIEW',
+  'CONSOLIDATED',
+  'PENDING_SIGNOFF',
+  'READY_FOR_COMMITTAL',
+]);
+
+export const activateStocktakeSession = (
+  sessionId: string,
+  actorId: string,
+  actorName: string
+): { success: boolean; message: string; session?: StocktakeSession; lockdownChanged?: boolean } => {
+  const allSessions = getRawStoredStocktakeSessions();
+  const target = allSessions.find(
+    (s) => String(s.sessionId || '').trim().toUpperCase() === String(sessionId || '').trim().toUpperCase()
+  );
+  if (!target) {
+    return { success: false, message: 'Stocktake session not found.' };
+  }
+  const stUpper = String(target.status || '').toUpperCase().trim();
+  if (stUpper !== 'DRAFT' && stUpper !== 'SCHEDULED') {
+    return {
+      success: false,
+      message: `Session "${target.title}" is currently ${target.status} and cannot be activated from this state.`,
+    };
+  }
+
+  // Enforce Single Live Execution Session per Branch at Activation time
+  const currentCompany = getCurrentCompanyId();
+  const targetBranch = target.branchId || (target as any).branch_id || getCurrentBranchId();
+  const branches = getBranches();
+  const conflictingLive = allSessions.find((s) => {
+    if (!s || String(s.sessionId || '').trim().toUpperCase() === String(target.sessionId || '').trim().toUpperCase()) {
+      return false;
+    }
+    const sBranch = (s as any).branch_id || s.branchId;
+    const sComp = (s as any).company_id || s.companyId;
+    const inScope = isRecordInBranchScope(sBranch, targetBranch, branches, currentCompany, sComp);
+    return inScope && LIVE_EXECUTION_STATUSES_DB.has(String(s.status || '').toUpperCase().trim());
+  });
+
+  if (conflictingLive) {
+    return {
+      success: false,
+      message: `Only 1 live stocktake session can run per branch. "${conflictingLive.title}" (${conflictingLive.sessionId}) is currently ${conflictingLive.status}. Commit or archive it before activating another draft.`,
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  const shouldLock = Boolean(target.lockdownRequested || target.isLockdownActive);
+
+  if (shouldLock) {
     setBranchLockdown(
       targetBranch,
       true,
-      sessionId,
-      params.stocktakeAuditorId || params.staffId,
-      params.stocktakeAuditorName || params.staffName,
-      `Full Stocktake Lockdown (${session.title})`
+      target.sessionId,
+      target.stocktakeAuditorId || actorId,
+      target.stocktakeAuditorName || actorName,
+      `Stocktake Activated (${target.title})`
     );
   }
 
-  saveStocktakeSession(session);
-  return session;
+  const updated = saveStocktakeSession({
+    ...target,
+    status: 'COUNTING',
+    everActivated: true,
+    activatedAt: target.activatedAt || nowIso,
+    activatedBy: target.activatedBy || actorId,
+    activatedByName: target.activatedByName || actorName,
+    isLockdownActive: shouldLock,
+    pausedAt: undefined,
+    pausedBy: undefined,
+    pausedByName: undefined,
+    pauseReason: undefined,
+    pausedFromStatus: undefined,
+  });
+
+  return {
+    success: true,
+    message: `Stocktake "${updated.title}" activated! Counters can now begin counting.`,
+    session: updated,
+    lockdownChanged: shouldLock,
+  };
+};
+
+export const pauseStocktakeSession = (
+  sessionId: string,
+  actorId: string,
+  actorName: string,
+  reason: string,
+  options?: { unlockPosDuringPause?: boolean }
+): { success: boolean; message: string; session?: StocktakeSession; lockdownChanged?: boolean } => {
+  const allSessions = getRawStoredStocktakeSessions();
+  const target = allSessions.find(
+    (s) => String(s.sessionId || '').trim().toUpperCase() === String(sessionId || '').trim().toUpperCase()
+  );
+  if (!target) {
+    return { success: false, message: 'Stocktake session not found.' };
+  }
+  const stUpper = String(target.status || '').toUpperCase().trim();
+  if (!LIVE_EXECUTION_STATUSES_DB.has(stUpper) || stUpper === 'PAUSED') {
+    return {
+      success: false,
+      message: `Only a live running stocktake can be paused (current status: ${target.status}).`,
+    };
+  }
+
+  const cleanReason = (reason || '').trim() || 'Paused by Auditor / Leader';
+  const nowIso = new Date().toISOString();
+  const unlockPos = Boolean(options?.unlockPosDuringPause);
+  const targetBranch = target.branchId || (target as any).branch_id || getCurrentBranchId();
+
+  let lockdownChanged = false;
+  let nextLockdownActive = Boolean(target.isLockdownActive);
+  if (unlockPos && nextLockdownActive) {
+    const currentLock = getBranchLockdowns()[targetBranch];
+    if (
+      !currentLock ||
+      !currentLock.sessionId ||
+      String(currentLock.sessionId).trim().toUpperCase() === String(target.sessionId).trim().toUpperCase()
+    ) {
+      setBranchLockdown(
+        targetBranch,
+        false,
+        target.sessionId,
+        actorId,
+        actorName,
+        `Stocktake paused — temporary trading enabled (${cleanReason})`
+      );
+      nextLockdownActive = false;
+      lockdownChanged = true;
+    }
+  }
+
+  const nextHistory = [
+    ...(Array.isArray(target.pauseHistory) ? target.pauseHistory : []),
+    {
+      pausedAt: nowIso,
+      pausedBy: actorId,
+      pausedByName: actorName,
+      reason: cleanReason,
+      unlockPosDuringPause: unlockPos,
+    },
+  ];
+
+  const updated = saveStocktakeSession({
+    ...target,
+    status: 'PAUSED',
+    pausedAt: nowIso,
+    pausedBy: actorId,
+    pausedByName: actorName,
+    pauseReason: cleanReason,
+    pausedFromStatus: target.status,
+    pauseHistory: nextHistory,
+    isLockdownActive: nextLockdownActive,
+  });
+
+  return {
+    success: true,
+    message: `Stocktake "${updated.title}" paused. All existing counts are preserved; counters are locked until resumed.`,
+    session: updated,
+    lockdownChanged,
+  };
+};
+
+export const resumeStocktakeSession = (
+  sessionId: string,
+  actorId: string,
+  actorName: string
+): { success: boolean; message: string; session?: StocktakeSession; lockdownChanged?: boolean } => {
+  const allSessions = getRawStoredStocktakeSessions();
+  const target = allSessions.find(
+    (s) => String(s.sessionId || '').trim().toUpperCase() === String(sessionId || '').trim().toUpperCase()
+  );
+  if (!target) {
+    return { success: false, message: 'Stocktake session not found.' };
+  }
+  if (String(target.status || '').toUpperCase().trim() !== 'PAUSED') {
+    return { success: false, message: `Session "${target.title}" is not paused.` };
+  }
+
+  const nowIso = new Date().toISOString();
+  const targetBranch = target.branchId || (target as any).branch_id || getCurrentBranchId();
+  const restoreStatus: StocktakeStatus =
+    target.pausedFromStatus && String(target.pausedFromStatus).toUpperCase() !== 'PAUSED'
+      ? target.pausedFromStatus
+      : 'COUNTING';
+
+  const shouldRelock = Boolean(target.lockdownRequested) && !target.isLockdownActive;
+  let lockdownChanged = false;
+  if (shouldRelock) {
+    setBranchLockdown(
+      targetBranch,
+      true,
+      target.sessionId,
+      actorId,
+      actorName,
+      `Stocktake resumed — branch lockdown re-engaged (${target.title})`
+    );
+    lockdownChanged = true;
+  }
+
+  const nextHistory = (Array.isArray(target.pauseHistory) ? target.pauseHistory : []).map((entry, idx, arr) => {
+    if (idx === arr.length - 1 && !entry.resumedAt) {
+      return {
+        ...entry,
+        resumedAt: nowIso,
+        resumedBy: actorId,
+        resumedByName: actorName,
+      };
+    }
+    return entry;
+  });
+
+  const updated = saveStocktakeSession({
+    ...target,
+    status: restoreStatus,
+    isLockdownActive: shouldRelock ? true : Boolean(target.isLockdownActive),
+    pausedAt: undefined,
+    pausedBy: undefined,
+    pausedByName: undefined,
+    pauseReason: undefined,
+    pausedFromStatus: undefined,
+    pauseHistory: nextHistory,
+  });
+
+  return {
+    success: true,
+    message: `Stocktake "${updated.title}" resumed (${restoreStatus.replace(/_/g, ' ')}).`,
+    session: updated,
+    lockdownChanged,
+  };
+};
+
+export const archiveStocktakeSession = (
+  sessionId: string,
+  actorId: string,
+  actorName: string,
+  reason?: string
+): { success: boolean; message: string; session?: StocktakeSession; lockdownReleased?: boolean } => {
+  const allSessions = getRawStoredStocktakeSessions();
+  const target = allSessions.find(
+    (s) => String(s.sessionId || '').trim().toUpperCase() === String(sessionId || '').trim().toUpperCase()
+  );
+  if (!target) {
+    return { success: false, message: 'Stocktake session not found.' };
+  }
+  const stUpper = String(target.status || '').toUpperCase().trim();
+  if (stUpper === 'APPROVED_POSTED') {
+    return { success: false, message: 'Committed stocktake sessions are already permanently archived.' };
+  }
+
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const cleanReason = (reason || '').trim() || (target.everActivated ? 'Cancelled & archived by Auditor / Leader' : 'Draft archived');
+  const targetBranch = target.branchId || (target as any).branch_id || getCurrentBranchId();
+
+  // Release branch lockdown ONLY if this session owned the active lock
+  let lockdownReleased = false;
+  try {
+    const currentLock = getBranchLockdowns()[targetBranch];
+    if (
+      currentLock &&
+      currentLock.isLocked &&
+      String(currentLock.sessionId || '').trim().toUpperCase() === String(target.sessionId || '').trim().toUpperCase()
+    ) {
+      setBranchLockdown(
+        targetBranch,
+        false,
+        target.sessionId,
+        actorId,
+        actorName,
+        `Stocktake ${target.sessionId} archived — lockdown released`
+      );
+      lockdownReleased = true;
+    }
+  } catch {}
+
+  // Deactivate temporary casual accounts linked to this session
+  try {
+    const allCasuals = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+    let changedCasuals = false;
+    const updatedCasuals = allCasuals.map((c) => {
+      if (c.sessionId === target.sessionId && c.active) {
+        changedCasuals = true;
+        return { ...c, active: false, updatedAt: nowMs, lastUpdated: nowIso };
+      }
+      return c;
+    });
+    if (changedCasuals) {
+      setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updatedCasuals);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
+      }
+    }
+  } catch {}
+
+  const updated = saveStocktakeSession({
+    ...target,
+    status: 'ARCHIVED',
+    isLockdownActive: false,
+    archivedAt: nowIso,
+    archivedBy: actorId,
+    archivedByName: actorName,
+    archiveReason: cleanReason,
+    notes: target.notes ? `${target.notes}\n[Archived: ${cleanReason}]` : `[Archived: ${cleanReason}]`,
+  });
+
+  return {
+    success: true,
+    message: `Stocktake "${updated.title}" archived (read-only). Active floor slot released.`,
+    session: updated,
+    lockdownReleased,
+  };
+};
+
+export const restoreArchivedDraftSession = (
+  sessionId: string,
+  actorId: string,
+  actorName: string
+): { success: boolean; message: string; session?: StocktakeSession } => {
+  const allSessions = getRawStoredStocktakeSessions();
+  const target = allSessions.find(
+    (s) => String(s.sessionId || '').trim().toUpperCase() === String(sessionId || '').trim().toUpperCase()
+  );
+  if (!target) {
+    return { success: false, message: 'Stocktake session not found.' };
+  }
+  const stUpper = String(target.status || '').toUpperCase().trim();
+  if (stUpper !== 'ARCHIVED' && stUpper !== 'CANCELLED') {
+    return { success: false, message: 'Only archived or cancelled sessions can be restored to draft.' };
+  }
+  if (target.everActivated) {
+    return {
+      success: false,
+      message: 'Sessions that were already activated cannot be restored to draft for audit integrity. Create a new draft instead.',
+    };
+  }
+
+  const nowIso = new Date().toISOString();
+  const updated = saveStocktakeSession({
+    ...target,
+    status: 'DRAFT',
+    isLockdownActive: false,
+    archivedAt: undefined,
+    archivedBy: undefined,
+    archivedByName: undefined,
+    archiveReason: undefined,
+    notes: `${target.notes ? target.notes + '\n' : ''}[Restored to Draft by ${actorName} (${actorId}) at ${nowIso}]`,
+  });
+
+  return {
+    success: true,
+    message: `Draft "${updated.title}" restored and ready to activate.`,
+    session: updated,
+  };
 };
 
 export const addStocktakeSegment = (
@@ -22682,33 +23095,81 @@ export const logEmergencyLockdownSale = (params: {
 // SAAS MULTI-TENANT & BRANCH ISOLATION DAO
 // ============================================================================
 
+function sanitizeCompanyRecord_(company: Company): Company {
+  const cfg = getStored<Partial<GoogleSheetsConfig>>(STORAGE_KEYS.SHEETS_CONFIG, {});
+  const masterId = cfg.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+  const safeSheetId = sanitizeTenantSheetId(company.company_id, company.sheet_id, masterId);
+  const safeFolderId = isMasterSpreadsheetId(company.sheet_folder_id, masterId)
+    ? ''
+    : (company.sheet_folder_id || '');
+  let safeBackendConfig = company.backend_config;
+  if (safeBackendConfig && safeBackendConfig.sheets) {
+    const safeCfgSheetId = sanitizeTenantSheetId(
+      company.company_id,
+      safeBackendConfig.sheets.spreadsheetId,
+      masterId
+    );
+    const safeCfgFolderId = isMasterSpreadsheetId(safeBackendConfig.sheets.sheetFolderId, masterId)
+      ? ''
+      : (safeBackendConfig.sheets.sheetFolderId || '');
+    if (
+      safeCfgSheetId !== safeBackendConfig.sheets.spreadsheetId ||
+      safeCfgFolderId !== safeBackendConfig.sheets.sheetFolderId
+    ) {
+      safeBackendConfig = {
+        ...safeBackendConfig,
+        sheets: {
+          ...safeBackendConfig.sheets,
+          spreadsheetId: safeCfgSheetId,
+          sheetFolderId: safeCfgFolderId,
+        },
+      };
+    }
+  }
+  if (
+    safeSheetId === company.sheet_id &&
+    safeFolderId === (company.sheet_folder_id || '') &&
+    safeBackendConfig === company.backend_config
+  ) {
+    return company;
+  }
+  return {
+    ...company,
+    sheet_id: safeSheetId,
+    sheet_folder_id: safeFolderId,
+    ...(safeBackendConfig ? { backend_config: safeBackendConfig } : {}),
+  };
+}
+
 export function getCompanies(): Company[] {
-  return getStored<Company[]>(STORAGE_KEYS.COMPANIES, SEED_COMPANIES);
+  const stored = getStored<Company[]>(STORAGE_KEYS.COMPANIES, SEED_COMPANIES);
+  return stored.map((c) => sanitizeCompanyRecord_(c));
 }
 
 export function saveCompany(company: Company): void {
+  const cleanCompany = sanitizeCompanyRecord_({ ...company });
   const list = getCompanies();
-  const index = list.findIndex((c) => c.company_id === company.company_id);
+  const index = list.findIndex((c) => c.company_id === cleanCompany.company_id);
 
   // Ensure package_id aligns with plan if not explicitly a custom package
-  if (company.plan) {
-    if (!company.package_id || company.package_id === 'pkg_starter' || company.package_id === 'pkg_professional' || company.package_id === 'pkg_enterprise') {
-      if (company.plan === 'ENTERPRISE') company.package_id = 'pkg_enterprise';
-      else if (company.plan === 'PROFESSIONAL') company.package_id = 'pkg_professional';
-      else if (company.plan === 'STARTER') company.package_id = 'pkg_starter';
+  if (cleanCompany.plan) {
+    if (!cleanCompany.package_id || cleanCompany.package_id === 'pkg_starter' || cleanCompany.package_id === 'pkg_professional' || cleanCompany.package_id === 'pkg_enterprise') {
+      if (cleanCompany.plan === 'ENTERPRISE') cleanCompany.package_id = 'pkg_enterprise';
+      else if (cleanCompany.plan === 'PROFESSIONAL') cleanCompany.package_id = 'pkg_professional';
+      else if (cleanCompany.plan === 'STARTER') cleanCompany.package_id = 'pkg_starter';
     }
   }
 
   if (index >= 0) {
-    list[index] = company;
+    list[index] = cleanCompany;
   } else {
-    list.push(company);
+    list.push(cleanCompany);
   }
   setStored(STORAGE_KEYS.COMPANIES, list);
   notifyListeners();
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('saas_company_updated', { detail: company }));
-    window.dispatchEvent(new CustomEvent('saas_packages_updated', { detail: company }));
+    window.dispatchEvent(new CustomEvent('saas_company_updated', { detail: cleanCompany }));
+    window.dispatchEvent(new CustomEvent('saas_packages_updated', { detail: cleanCompany }));
   }
 }
 
@@ -22945,6 +23406,13 @@ export interface RegisterTenantParams {
   branchCode?: string;
   branchLocation?: string;
   ownerPin: string;
+  companyId?: string;
+  branchId?: string;
+  ownerId?: string;
+  sheetId?: string;
+  offlineActivationCode?: string;
+  nextBillingDate?: string;
+  plan?: 'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE';
 }
 
 export const registerTenantCompany = (
@@ -22952,13 +23420,18 @@ export const registerTenantCompany = (
 ): { company: Company; branch: Branch; owner: Salesperson } => {
   const now = new Date();
   const todayStr = now.toISOString().split('T')[0];
-  const billingDate = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const billingDate =
+    params.nextBillingDate ||
+    new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
   
   const randSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const companyId = `COMP-${Date.now().toString(36).toUpperCase()}`;
-  const branchId = `BR-${randSuffix}-01`;
-  const ownerId = `USR-${randSuffix}-01`;
-  const offlineCode = `SAI-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+  const companyId = params.companyId?.trim() || `COMP-${Date.now().toString(36).toUpperCase()}`;
+  const branchId = params.branchId?.trim() || `BR-${randSuffix}-01`;
+  const ownerId = params.ownerId?.trim() || `USR-${randSuffix}-01`;
+  const offlineCode =
+    params.offlineActivationCode?.trim() ||
+    `SAI-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+  const safeSheetId = sanitizeTenantSheetId(companyId, params.sheetId || '');
 
   const company: Company = {
     company_id: companyId,
@@ -22968,9 +23441,10 @@ export const registerTenantCompany = (
     phone: params.ownerPhone?.trim() || '',
     business_category: params.businessCategory || 'Grocery & FMCG',
     sheet_folder_id: '',
+    sheet_id: safeSheetId,
     trial_start_date: todayStr,
     subscription_status: 'TRIAL',
-    plan: 'PROFESSIONAL',
+    plan: params.plan || 'PROFESSIONAL',
     next_billing_date: billingDate,
     offline_activation_code: offlineCode,
     trial_days_remaining: 14,

@@ -1015,6 +1015,21 @@ export class LocalHubAdapter implements SyncAdapter {
           companyId: d.companyId || d.company_id || ctx.companyId,
           company_id: d.company_id || d.companyId || ctx.companyId,
           isLockdownActive: d.isLockdownActive,
+          lockdownRequested: d.lockdownRequested,
+          everActivated: d.everActivated,
+          activatedAt: d.activatedAt,
+          activatedBy: d.activatedBy,
+          activatedByName: d.activatedByName,
+          pausedAt: d.pausedAt,
+          pausedBy: d.pausedBy,
+          pausedByName: d.pausedByName,
+          pauseReason: d.pauseReason,
+          pausedFromStatus: d.pausedFromStatus,
+          pauseHistory: d.pauseHistory,
+          archivedAt: d.archivedAt,
+          archivedBy: d.archivedBy,
+          archivedByName: d.archivedByName,
+          archiveReason: d.archiveReason,
           stocktakeAuditorId: d.stocktakeAuditorId,
           stocktakeAuditorName: d.stocktakeAuditorName,
           stocktakeAuditorPhone: d.stocktakeAuditorPhone,
@@ -1487,11 +1502,13 @@ export class LocalHubAdapter implements SyncAdapter {
       unwrapped.targetBranchId || unwrapped.target_branch_id || unwrapped.branchId || unwrapped.branch_id || ''
     );
     const fallbackUniqueId = `${entityType}-${entityId || 'row'}-${updatedAt}-${Math.random().toString(36).substring(2, 7)}`;
-    const isInv = entityType === 'inventory_item';
+    // T2 mutable records (like stocktake_session, inventory_item, staff, etc.) must NEVER reuse
+    // their static entity ID as a packetId, otherwise SyncCore's seenPacketIds drops subsequent edits.
+    const isMutableT2 = spec.class === 'T2' || entityType === 'inventory_item';
     const packetId = String(
       unwrapped.packetId ||
         unwrapped.packet_id ||
-        (!isInv && unwrapped.id ? unwrapped.id : '') ||
+        (!isMutableT2 && unwrapped.id ? unwrapped.id : '') ||
         fallbackUniqueId
     );
 

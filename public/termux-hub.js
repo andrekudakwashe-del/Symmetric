@@ -608,18 +608,41 @@ function buildHubSyncEnvelope(entityType, record) {
       ? 'ALL'
       : cleanData.branch_id || hubBranchId || 'ALL');
 
+  // For stocktake_session, keep serialized payload safely under Google Sheets 50,000-char cell limit
+  if (canonicalType === 'stocktake_session' && Array.isArray(cleanData.segments)) {
+    try {
+      const approxLen = JSON.stringify(cleanData).length;
+      if (approxLen > 42000) {
+        cleanData.segments = cleanData.segments.map((seg) => {
+          if (!seg || typeof seg !== 'object') return seg;
+          const compact = { ...seg };
+          if (Array.isArray(compact.count1) && compact.count1.length > 0) compact.count1 = [];
+          if (Array.isArray(compact.count2) && compact.count2.length > 0) compact.count2 = [];
+          return compact;
+        });
+      }
+    } catch (_) {}
+  }
+
+  const isT2Mutable = T2_CANONICAL_TYPES.has(canonicalType);
+  const versionNum = Number(cleanData.version || 1);
+  // T2 mutable records must emit a fresh packetId per revision so Cloud's packet dedupe ring never drops updates
+  const resolvedPacketId = isT2Mutable
+    ? `HUB-ENV-${canonicalType}-${recId}-v${versionNum}-${updatedAtMs}-${Math.random().toString(36).slice(2, 6)}`
+    : String(cleanData.packetId || cleanData.clientRequestId || `HUB-ENV-${canonicalType}-${recId}-${Date.now()}`);
+
   return {
-    packetId: String(cleanData.packetId || cleanData.clientRequestId || `HUB-ENV-${canonicalType}-${recId}-${Date.now()}`),
+    packetId: resolvedPacketId,
     entityType: canonicalType,
     entityId: recId,
     action: 'UPSERT',
     data: cleanData,
     updatedAt: updatedAtMs,
-    version: Number(cleanData.version || 1),
+    version: versionNum,
     mutationSource: cleanData.mutationSource || 'LOCAL_HUB',
     originDeviceId: cleanData.originDeviceId || cleanData.origin_device_id || `HUB-${hubBranchId}`,
     targetBranchId: targetBranch,
-    class: T2_CANONICAL_TYPES.has(canonicalType) ? 'T2' : 'T1',
+    class: isT2Mutable ? 'T2' : 'T1',
   };
 }
 
@@ -2955,12 +2978,13 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 0.4 STOCKTAKE BRANCH LOCKDOWN BROADCAST (SESSION-BOUND + LWW)
       // =====================================================================
+      // DRAFT & SCHEDULED sessions sync freely without consuming the branch's 1-active-session floor slot.
+      // PAUSED sessions retain the branch's active floor slot until resumed or archived.
       const ACTIVE_FLOOR_STATUSES_SET = new Set([
         'ACTIVE',
-        'DRAFT',
-        'SCHEDULED',
         'IN_PROGRESS',
         'COUNTING',
+        'PAUSED',
         'RECOUNT',
         'RECOUNTING',
         'AUDIT_REVIEW',
@@ -3076,8 +3100,10 @@ wss.on('connection', (ws, req) => {
           const targetBranchNorm = String(packet.branchId || sess.branchId || existing?.branchId || hubBranchId || '')
             .trim()
             .toUpperCase();
-          const incomingStatusNorm = String(packet.status || sess.status || 'COUNTING').toUpperCase();
-          if (!existing && ACTIVE_FLOOR_STATUSES_SET.has(incomingStatusNorm)) {
+          const incomingStatusNorm = String(packet.status || sess.status || existing?.status || 'DRAFT').toUpperCase();
+          // Enforce max 1 live execution session per branch ONLY when activating or updating a live session.
+          // Unlimited DRAFT, SCHEDULED, ARCHIVED, and CANCELLED sessions sync freely across all devices.
+          if (ACTIVE_FLOOR_STATUSES_SET.has(incomingStatusNorm)) {
             const conflictingActive = stocktakeSessionsStore.find((s) => {
               if (!s || s.sessionId === sessionId) return false;
               if (isTombstoned(s.sessionId, 'stocktake_session', getTimestamp(s))) return false;
@@ -3095,7 +3121,7 @@ wss.on('connection', (ws, req) => {
                 ) ||
                 null;
               console.log(
-                `[Termux Hub] ⚠️ Rejected duplicate active stocktake [${sessionId}] on branch ${targetBranchNorm}: [${conflictingActive.sessionId}] is already ${conflictingActive.status}.`
+                `[Termux Hub] ⚠️ Rejected duplicate active stocktake [${sessionId}] (${incomingStatusNorm}) on branch ${targetBranchNorm}: [${conflictingActive.sessionId}] is already ${conflictingActive.status}.`
               );
               try {
                 ws.send(JSON.stringify({
@@ -3105,7 +3131,7 @@ wss.on('connection', (ws, req) => {
                   existingSessionName: conflictingActive.title || conflictingActive.sessionName || conflictingActive.sessionId,
                   existingSession: conflictingActive,
                   existingLockdown,
-                  message: `Only 1 active floor stocktake session is allowed per branch. Close or commit "${conflictingActive.title || conflictingActive.sessionName}" first.`,
+                  message: `Only 1 active floor stocktake session is allowed per branch. Close, commit, or archive "${conflictingActive.title || conflictingActive.sessionName}" first.`,
                   timestamp: hubNow,
                 }));
               } catch (e) {}
@@ -3227,6 +3253,32 @@ wss.on('connection', (ws, req) => {
               ? Boolean(packet.isLockdownActive)
               : (sess.isLockdownActive !== undefined ? Boolean(sess.isLockdownActive) : Boolean(existing?.isLockdownActive));
 
+          const mergedPauseHistory = (() => {
+            const exHist = Array.isArray(existing?.pauseHistory) ? existing.pauseHistory : [];
+            const incHist = Array.isArray(packet.pauseHistory)
+              ? packet.pauseHistory
+              : (Array.isArray(sess.pauseHistory) ? sess.pauseHistory : []);
+            const map = new Map();
+            [...exHist, ...incHist].forEach((entry) => {
+              if (!entry || !entry.pausedAt) return;
+              const prev = map.get(entry.pausedAt);
+              map.set(entry.pausedAt, prev ? { ...prev, ...entry } : entry);
+            });
+            const merged = Array.from(map.values()).sort(
+              (a, b) => new Date(a.pausedAt).getTime() - new Date(b.pausedAt).getTime()
+            );
+            return merged.length > 0 ? merged : undefined;
+          })();
+
+          const resolvedLockdownRequested =
+            packet.lockdownRequested !== undefined
+              ? Boolean(packet.lockdownRequested)
+              : (sess.lockdownRequested !== undefined ? Boolean(sess.lockdownRequested) : existing?.lockdownRequested);
+
+          const resolvedEverActivated =
+            Boolean(packet.everActivated || sess.everActivated || existing?.everActivated ||
+              ACTIVE_FLOOR_STATUSES_SET.has(incomingStatusNorm) || incomingStatusNorm === 'APPROVED_POSTED');
+
           const sessionObj = {
             ...(existing || {}),
             ...sess,
@@ -3234,7 +3286,7 @@ wss.on('connection', (ws, req) => {
             title: packet.sessionName || packet.title || sess.title || existing?.title || `Session ${sessionId}`,
             sessionName: packet.sessionName || packet.title || sess.title || existing?.sessionName || `Session ${sessionId}`,
             date: packet.date || sess.date || existing?.date || hubIso.split('T')[0],
-            status: packet.status || sess.status || existing?.status || 'COUNTING',
+            status: packet.status || sess.status || existing?.status || 'DRAFT',
             segments: mergedSegments,
             consolidatedItems: mergedConsolidated,
             guestPasses: incomingPasses !== undefined ? incomingPasses : existing?.guestPasses,
@@ -3248,6 +3300,21 @@ wss.on('connection', (ws, req) => {
             companyId: packet.companyId || sess.companyId || existing?.companyId || hubTenantId,
             company_id: packet.company_id || sess.company_id || existing?.company_id || hubTenantId,
             isLockdownActive: resolvedLockdown,
+            lockdownRequested: resolvedLockdownRequested,
+            everActivated: resolvedEverActivated,
+            activatedAt: packet.activatedAt || sess.activatedAt || existing?.activatedAt,
+            activatedBy: packet.activatedBy || sess.activatedBy || existing?.activatedBy,
+            activatedByName: packet.activatedByName || sess.activatedByName || existing?.activatedByName,
+            pausedAt: packet.pausedAt !== undefined ? packet.pausedAt : (sess.pausedAt !== undefined ? sess.pausedAt : existing?.pausedAt),
+            pausedBy: packet.pausedBy !== undefined ? packet.pausedBy : (sess.pausedBy !== undefined ? sess.pausedBy : existing?.pausedBy),
+            pausedByName: packet.pausedByName !== undefined ? packet.pausedByName : (sess.pausedByName !== undefined ? sess.pausedByName : existing?.pausedByName),
+            pauseReason: packet.pauseReason !== undefined ? packet.pauseReason : (sess.pauseReason !== undefined ? sess.pauseReason : existing?.pauseReason),
+            pausedFromStatus: packet.pausedFromStatus !== undefined ? packet.pausedFromStatus : (sess.pausedFromStatus !== undefined ? sess.pausedFromStatus : existing?.pausedFromStatus),
+            pauseHistory: mergedPauseHistory,
+            archivedAt: packet.archivedAt !== undefined ? packet.archivedAt : (sess.archivedAt !== undefined ? sess.archivedAt : existing?.archivedAt),
+            archivedBy: packet.archivedBy !== undefined ? packet.archivedBy : (sess.archivedBy !== undefined ? sess.archivedBy : existing?.archivedBy),
+            archivedByName: packet.archivedByName !== undefined ? packet.archivedByName : (sess.archivedByName !== undefined ? sess.archivedByName : existing?.archivedByName),
+            archiveReason: packet.archiveReason !== undefined ? packet.archiveReason : (sess.archiveReason !== undefined ? sess.archiveReason : existing?.archiveReason),
             stocktakeAuditorId: packet.stocktakeAuditorId !== undefined ? packet.stocktakeAuditorId : (sess.stocktakeAuditorId !== undefined ? sess.stocktakeAuditorId : existing?.stocktakeAuditorId),
             stocktakeAuditorName: packet.stocktakeAuditorName !== undefined ? packet.stocktakeAuditorName : (sess.stocktakeAuditorName !== undefined ? sess.stocktakeAuditorName : existing?.stocktakeAuditorName),
             stocktakeAuditorPhone: packet.stocktakeAuditorPhone !== undefined ? packet.stocktakeAuditorPhone : (sess.stocktakeAuditorPhone !== undefined ? sess.stocktakeAuditorPhone : existing?.stocktakeAuditorPhone),
@@ -3289,6 +3356,8 @@ wss.on('connection', (ws, req) => {
             updatedAt: hubNow,
             hubTimestamp: hubNow,
             lastUpdated: hubIso,
+            // CRITICAL: Always mark client-originated stocktake updates dirty so Cloud push_envelopes syncs every revision
+            isCloudSynced: false,
           };
 
           if (sIdx >= 0) {
@@ -3297,12 +3366,17 @@ wss.on('connection', (ws, req) => {
             stocktakeSessionsStore.unshift(sessionObj);
           }
 
-          if (sessionObj.status === 'APPROVED_POSTED') {
+          if (
+            sessionObj.status === 'APPROVED_POSTED' ||
+            sessionObj.status === 'ARCHIVED' ||
+            sessionObj.status === 'CANCELLED'
+          ) {
             casualWorkersStore.forEach((cw) => {
               if (cw && cw.sessionId === sessionId && cw.active) {
                 cw.active = false;
                 cw.updatedAt = hubNow;
                 cw.lastUpdated = hubIso;
+                cw.isCloudSynced = false;
               }
             });
           }
@@ -6557,7 +6631,22 @@ async function syncEdgeToCloudSupabase() {
     const mergeStocktakeSessionHub = (existing, incoming) => {
       const exItems = Array.isArray(existing?.consolidatedItems) ? existing.consolidatedItems : [];
       const incItems = Array.isArray(incoming?.consolidatedItems) ? incoming.consolidatedItems : [];
-      if (incItems.length === 0) return { ...existing, ...incoming, isCloudSynced: true };
+      const pauseMap = new Map();
+      [...(Array.isArray(existing?.pauseHistory) ? existing.pauseHistory : []), ...(Array.isArray(incoming?.pauseHistory) ? incoming.pauseHistory : [])].forEach((p) => {
+        if (!p || !p.pausedAt) return;
+        const prev = pauseMap.get(p.pausedAt);
+        pauseMap.set(p.pausedAt, prev ? { ...prev, ...p } : p);
+      });
+      const mergedPauseHistory = Array.from(pauseMap.values()).sort(
+        (a, b) => new Date(a.pausedAt).getTime() - new Date(b.pausedAt).getTime()
+      );
+      const baseMerged = {
+        ...existing,
+        ...incoming,
+        ...(mergedPauseHistory.length > 0 ? { pauseHistory: mergedPauseHistory } : {}),
+        isCloudSynced: true,
+      };
+      if (incItems.length === 0) return baseMerged;
       const exMap = new Map();
       exItems.forEach((ci) => { if (ci && ci.itemId) exMap.set(String(ci.itemId).toUpperCase(), ci); });
       const mergedItems = incItems.map((inc) => {
@@ -6575,7 +6664,7 @@ async function syncEdgeToCloudSupabase() {
           ...(mergedComments.length > 0 ? { varianceComments: mergedComments } : {}),
         };
       });
-      return { ...existing, ...incoming, consolidatedItems: mergedItems, isCloudSynced: true };
+      return { ...baseMerged, consolidatedItems: mergedItems };
     };
 
     const ingestCloudEnvelopeIntoHub = (env) => {
@@ -6625,7 +6714,7 @@ async function syncEdgeToCloudSupabase() {
         const ex = branchLockdownsStore[brKey] || branchLockdownsStore[rec.branchId || rec.branch_id || hubBranchId];
         const exTs = ex ? getRecordTimestamp(ex) : 0;
         const ACTIVE_LOCK_STATUSES = new Set([
-          'ACTIVE', 'DRAFT', 'SCHEDULED', 'IN_PROGRESS', 'COUNTING',
+          'ACTIVE', 'IN_PROGRESS', 'COUNTING', 'PAUSED',
           'RECOUNT', 'RECOUNTING', 'AUDIT_REVIEW', 'CONSOLIDATED',
           'PENDING_SIGNOFF', 'READY_FOR_COMMITTAL',
         ]);
@@ -6892,11 +6981,28 @@ async function syncEdgeToCloudSupabase() {
                 const rejSessId = pair.rec.sessionId || pair.env.entityId;
                 const nowMs = Date.now();
                 const nowIso = new Date(nowMs).toISOString();
-                pair.rec.status = 'CANCELLED';
-                pair.rec.isCloudSynced = true;
+                const hasCounts = Array.isArray(pair.rec.segments) && pair.rec.segments.some(
+                  (seg) => (Array.isArray(seg.count1) && seg.count1.length > 0) || (Array.isArray(seg.count2) && seg.count2.length > 0)
+                );
+                const conflictReason = `Demoted by Cloud conflict: active stocktake already exists on this branch.`;
+                if (hasCounts) {
+                  pair.rec.pausedFromStatus = pair.rec.status;
+                  pair.rec.status = 'PAUSED';
+                  pair.rec.pausedAt = nowIso;
+                  pair.rec.pausedBy = 'CLOUD_CONFLICT_GUARD';
+                  pair.rec.pausedByName = 'Cloud Conflict Guard';
+                  pair.rec.pauseReason = conflictReason;
+                  pair.rec.isLockdownActive = false;
+                  pair.rec.isCloudSynced = true;
+                } else {
+                  pair.rec.status = 'DRAFT';
+                  pair.rec.isLockdownActive = false;
+                  // Mark dirty so the demoted DRAFT syncs safely to Cloud without conflicting
+                  pair.rec.isCloudSynced = false;
+                }
                 pair.rec.updatedAt = nowMs;
                 pair.rec.lastUpdated = nowIso;
-                pair.rec.notes = `${pair.rec.notes ? pair.rec.notes + ' | ' : ''}Auto-archived by Cloud: active stocktake already exists on this branch.`;
+                pair.rec.notes = `${pair.rec.notes ? pair.rec.notes + ' | ' : ''}${conflictReason}`;
 
                 // Release local Hub lockdown if it was bound to the rejected session
                 if (branchLockdownsStore && typeof branchLockdownsStore === 'object') {

@@ -48,6 +48,9 @@ import {
 import {
   resolveStocktakePersona,
   canClaimSegmentSlot,
+  isCountingPhaseStatus,
+  isDraftStocktakeStatus,
+  isPausedStocktakeStatus,
 } from '../../services/stocktakeAccessService';
 
 const PAGE_SIZE = 50;
@@ -419,6 +422,8 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     segment.comparisonFinalized ||
       (counterSlot === 'A' ? segment.count1Finalized : segment.count2Finalized)
   );
+  const isSessionCountable = isCountingPhaseStatus(session.status);
+  const isReadOnlyLocked = isSlotFinalized || !isSessionCountable;
 
   const [searchQuery, setSearchQuery] = useState('');
   const deferredSearchQuery = useDeferredValue(searchQuery);
@@ -474,7 +479,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     name: counterStaffName,
     phone: counterPhone,
   });
-  const isSlotFinalizedRef = useRef(isSlotFinalized);
+  const isSlotFinalizedRef = useRef(isReadOnlyLocked);
   const submittedCleanlyRef = useRef(false);
   const dirtyDraftRef = useRef(false);
 
@@ -485,7 +490,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     name: counterStaffName,
     phone: counterPhone,
   };
-  isSlotFinalizedRef.current = isSlotFinalized;
+  isSlotFinalizedRef.current = isReadOnlyLocked;
 
   const persona = resolveStocktakePersona(currentUser, session);
   const isBlindCounter =
@@ -964,7 +969,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
 
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (isSlotFinalized) return;
+    if (isReadOnlyLocked) return;
     submittedCleanlyRef.current = true;
     onSaveCount(counterSlot, lines, counterStaffId, counterStaffName);
     clearDraftLocally(counterSlot);
@@ -1093,7 +1098,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
             )}
 
             {/* Explicit Pause Button in Top Sticky Bar */}
-            {!isSlotFinalized && (
+            {!isReadOnlyLocked && (
               <button
                 type="button"
                 onClick={handlePauseAndExit}
@@ -1108,7 +1113,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
             {/* Finalize Count Submit Button */}
             <button
               type="button"
-              disabled={isSlotFinalized}
+              disabled={isReadOnlyLocked}
               onClick={() => {
                 setFinalizeSearchQuery('');
                 setConfirmFinalizeOpen(true);
@@ -1119,9 +1124,17 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
                   : 'bg-purple-600 hover:bg-purple-500 text-white shadow-purple-900/30'
               }`}
             >
-              {isSlotFinalized ? <Lock className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
+              {isReadOnlyLocked ? <Lock className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
               <span>
-                {isSlotFinalized ? `Count ${counterSlot} Finalized` : `Finalize Count ${counterSlot}`}
+                {!isSessionCountable
+                  ? isPausedStocktakeStatus(session.status)
+                    ? 'Session Paused'
+                    : isDraftStocktakeStatus(session.status)
+                    ? 'Draft (Not Activated)'
+                    : 'Session Closed'
+                  : isSlotFinalized
+                  ? `Count ${counterSlot} Finalized`
+                  : `Finalize Count ${counterSlot}`}
               </span>
             </button>
 
@@ -1343,7 +1356,20 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
         </div>
       )}
 
-      {isSlotFinalized && (
+      {!isSessionCountable && (
+        <div className="bg-rose-950/90 text-rose-100 border-b border-rose-700/80 px-4 py-2.5 text-xs font-semibold flex flex-wrap items-center justify-center gap-2">
+          <Lock className="w-4 h-4 text-rose-400 shrink-0" />
+          <span>
+            {isDraftStocktakeStatus(session.status)
+              ? 'Counting Locked: This stocktake is still in DRAFT. Wait for the Auditor or Manager to activate it.'
+              : isPausedStocktakeStatus(session.status)
+              ? `Counting Paused by ${session.pausedByName || 'Auditor'}${session.pauseReason ? ` — "${session.pauseReason}"` : ''}. Quantity edits are locked until resumed.`
+              : 'Counting Locked: This stocktake session is closed/archived and read-only.'}
+          </span>
+        </div>
+      )}
+
+      {isSlotFinalized && isSessionCountable && (
         <div className="bg-amber-950/90 text-amber-100 border-b border-amber-700/80 px-4 py-2.5 text-xs font-semibold flex flex-wrap items-center justify-center gap-3">
           <div className="flex items-center gap-2">
             <Lock className="w-4 h-4 text-amber-400 shrink-0" />
@@ -1373,7 +1399,7 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
               <DoubleCountLineCard
                 key={line.itemId}
                 line={line}
-                isSlotFinalized={isSlotFinalized}
+                isSlotFinalized={isReadOnlyLocked}
                 isSpotCheck={isSpotCheck}
                 isDailyBlind={isDailyBlind}
                 isBlindCounter={isBlindCounter}

@@ -22,13 +22,13 @@ import {
 } from 'lucide-react';
 import {
   registerTenantCompany,
-  saveCompany,
   updateTenantSheetBinding,
+  sanitizeTenantSheetId,
+  getSheetsConfig,
 } from '../../db/roomDatabase';
 import { registerCompanyInCloud, CloudRegistrationPayload } from '../../services/googleSheetsSync';
 import {
   fetchGlobalSystemConfig,
-  savePendingCloudRegistration,
   clearPendingCloudRegistration,
 } from '../../services/systemConfig';
 import { setTenantAuthToken, setRoutingEpoch } from '../../services/sync/highWaterMarks';
@@ -109,39 +109,40 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
     setExistingAccountModal(null);
 
     try {
-      // Ensure Master Webhook URL is loaded from server before dispatching signup
+      // 1. Ensure Master Webhook URL is loaded from server before dispatching signup
       await fetchGlobalSystemConfig().catch(() => {});
 
-      const { company, branch, owner } = registerTenantCompany({
-        companyName,
-        businessCategory,
-        ownerName,
-        ownerEmail,
-        ownerPhone,
-        branchName,
-        branchCode,
-        branchLocation,
-        ownerPin,
-      });
+      // 2. Generate deterministic tenant IDs WITHOUT writing to local DB yet (strict online cloud-first registration)
+      const randSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+      const generatedCompanyId = `COMP-${Date.now().toString(36).toUpperCase()}`;
+      const generatedBranchId = `BR-${randSuffix}-01`;
+      const generatedOwnerId = `USR-${randSuffix}-01`;
+      const cleanBranchCode =
+        branchCode.trim().toUpperCase() || `${companyName.trim().slice(0, 3).toUpperCase()}-01`;
+      const cleanBranchName = branchName.trim() || 'Main Branch';
+      const cleanBranchLocation = branchLocation.trim() || 'Central Store';
+      const cleanEmail = ownerEmail.trim().toLowerCase();
 
       const registrationPayload: CloudRegistrationPayload = {
-        company_id: company.company_id,
-        company_name: company.company_name,
+        company_id: generatedCompanyId,
+        company_name: companyName.trim(),
         owner_name: ownerName.trim(),
-        owner_email: ownerEmail.trim().toLowerCase(),
+        owner_email: cleanEmail,
         phone: ownerPhone.trim(),
         business_category: businessCategory,
-        branch_id: branch.branchId,
-        branch_name: branch.name,
-        branch_code: branch.code,
-        branch_location: branch.location || branchLocation.trim(),
-        user_id: owner.id,
+        branch_id: generatedBranchId,
+        branch_name: cleanBranchName,
+        branch_code: cleanBranchCode,
+        branch_location: cleanBranchLocation,
+        user_id: generatedOwnerId,
         password: ownerPin,
         plan: 'PROFESSIONAL',
+        auto_provision: true,
         force_new_tenant: forceNewTenant,
       };
 
-      // Authoritative cloud registration (Master Sheet: companies + Global_Users + branches + users + permissions + JWT + optional template sheet)
+      // 3. Authoritative ONLINE cloud registration on Master Google Sheet
+      //    (companies + Global_Users + branches + users + permissions + dedicated tenant spreadsheet + JWT)
       const cloudRes = await registerCompanyInCloud(registrationPayload);
 
       if (cloudRes.code === 'DUPLICATE_EMAIL' && !forceNewTenant) {
@@ -149,38 +150,75 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
         setExistingAccountModal({
           open: true,
           companyName: companyName.trim() || 'Existing Business',
-          companyId: cloudRes.existingCompanyId || company.company_id,
+          companyId: cloudRes.existingCompanyId || generatedCompanyId,
         });
         return;
       }
 
-      if (cloudRes.cloudSynced) {
-        clearPendingCloudRegistration(company.company_id);
-        const provisionedSheetId = String(cloudRes.sheet_id || cloudRes.spreadsheet_id || '').trim();
-        if (provisionedSheetId) {
-          saveCompany({ ...company, sheet_id: provisionedSheetId });
-          updateTenantSheetBinding(company.company_id, provisionedSheetId);
-        }
-        if (cloudRes.routing_epoch && cloudRes.routing_epoch > 0) {
-          setRoutingEpoch(company.company_id, cloudRes.routing_epoch);
-        }
-        if (cloudRes.token) {
-          setTenantAuthToken(company.company_id, cloudRes.token);
-        }
-      } else {
-        // Queue for automatic background cloud retry so account is guaranteed to reach Master Sheet
-        savePendingCloudRegistration(registrationPayload);
+      // STRICT ONLINE GUARANTEE: If Master Google Sheet did NOT confirm registration,
+      // DO NOT save a local-only tenant and DO NOT log in. Explicitly tell the user to try again.
+      if (!cloudRes.cloudSynced) {
+        const reason =
+          cloudRes.error ||
+          cloudRes.message ||
+          'Master Google Sheet could not be reached to confirm registration.';
+        setError(
+          `Cloud registration failed — your business was NOT registered on the Master Sheet. ${reason} Please check your internet connection and try again.`
+        );
+        setIsSubmitting(false);
+        return;
       }
 
-      // Register this device to this newly created company
+      // 4. Master Sheet confirmed! Now persist the cloud-confirmed tenant, branch, owner, and dedicated sheet locally.
+      const confirmedCompanyId = String(cloudRes.company_id || generatedCompanyId).trim();
+      const confirmedBranchId = String(cloudRes.branch_id || generatedBranchId).trim();
+      const confirmedOwnerId = String(cloudRes.user_id || generatedOwnerId).trim();
+      const sheetsCfg = getSheetsConfig();
+      const provisionedSheetId = sanitizeTenantSheetId(
+        confirmedCompanyId,
+        cloudRes.sheet_id || cloudRes.spreadsheet_id || '',
+        sheetsCfg.masterSpreadsheetId
+      );
+
+      const { company, branch, owner } = registerTenantCompany({
+        companyName,
+        businessCategory,
+        ownerName,
+        ownerEmail: cleanEmail,
+        ownerPhone,
+        branchName: cleanBranchName,
+        branchCode: cleanBranchCode,
+        branchLocation: cleanBranchLocation,
+        ownerPin,
+        companyId: confirmedCompanyId,
+        branchId: confirmedBranchId,
+        ownerId: confirmedOwnerId,
+        sheetId: provisionedSheetId,
+        offlineActivationCode: cloudRes.activation_code,
+        nextBillingDate: cloudRes.next_billing_date,
+        plan: 'PROFESSIONAL',
+      });
+
+      clearPendingCloudRegistration(company.company_id);
+      if (provisionedSheetId) {
+        updateTenantSheetBinding(company.company_id, provisionedSheetId);
+      }
+      if (cloudRes.routing_epoch && cloudRes.routing_epoch > 0) {
+        setRoutingEpoch(company.company_id, cloudRes.routing_epoch);
+      }
+      if (cloudRes.token) {
+        setTenantAuthToken(company.company_id, cloudRes.token);
+      }
+
+      // Register this device to this cloud-confirmed company
       try {
         localStorage.setItem('saimetric_device_registered', 'true');
         localStorage.setItem('saimetric_device_registered_company_id', company.company_id);
         localStorage.setItem('saimetric_device_registered_company_name', company.company_name);
-        localStorage.setItem('saimetric_device_registered_email', ownerEmail.trim().toLowerCase());
+        localStorage.setItem('saimetric_device_registered_email', cleanEmail);
         localStorage.setItem('saimetric_device_registered_branch_id', branch.branchId);
         localStorage.setItem('saimetric_device_registered_at', new Date().toISOString());
-        localStorage.setItem('saimetric_registration_cloud_synced', cloudRes.cloudSynced ? 'true' : 'pending');
+        localStorage.setItem('saimetric_registration_cloud_synced', 'true');
       } catch {
         // localStorage resilience
       }
@@ -197,7 +235,9 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
 
       onRegistrationSuccess(owner);
     } catch (err: any) {
-      setError(err?.message || 'Failed to setup company. Please try again.');
+      setError(
+        `Cloud registration failed — your business was NOT registered. ${err?.message || 'Unexpected network error.'} Please try again.`
+      );
       setIsSubmitting(false);
     }
   };

@@ -17,16 +17,52 @@ import {
 
 export type StocktakePersona = 'LEADER' | 'AUDITOR' | 'AUDITED_MANAGER' | 'COUNTER';
 
-const ACTIVE_SESSION_STATUSES = new Set([
+/**
+ * Draft/Prep statuses: sync freely across all devices (unlimited per branch),
+ * do NOT hold the live branch slot, do NOT trigger POS lockdown, and cannot be counted until activated.
+ */
+const DRAFT_SESSION_STATUSES = new Set([
   'DRAFT',
   'SCHEDULED',
+]);
+
+/**
+ * Live Execution statuses: max 1 per branch.
+ * Includes PAUSED so a paused floor count retains its branch slot until resumed or archived.
+ */
+const ACTIVE_SESSION_STATUSES = new Set([
+  'ACTIVE',
   'IN_PROGRESS',
   'COUNTING',
+  'PAUSED',
+  'RECOUNT',
   'RECOUNTING',
   'AUDIT_REVIEW',
   'CONSOLIDATED',
+  'PENDING_SIGNOFF',
   'READY_FOR_COMMITTAL',
 ]);
+
+const ARCHIVED_OR_CLOSED_STATUSES = new Set([
+  'APPROVED_POSTED',
+  'ARCHIVED',
+  'CANCELLED',
+]);
+
+export const isDraftStocktakeStatus = (status?: string): boolean => {
+  if (!status) return false;
+  return DRAFT_SESSION_STATUSES.has(String(status).toUpperCase().trim());
+};
+
+export const isPausedStocktakeStatus = (status?: string): boolean => {
+  if (!status) return false;
+  return String(status).toUpperCase().trim() === 'PAUSED';
+};
+
+export const isArchivedOrClosedStocktakeStatus = (status?: string): boolean => {
+  if (!status) return false;
+  return ARCHIVED_OR_CLOSED_STATUSES.has(String(status).toUpperCase().trim());
+};
 
 export const isActiveStocktakeStatus = (status?: string): boolean => {
   if (!status) return false;
@@ -37,11 +73,11 @@ export const isCountingPhaseStatus = (status?: string): boolean => {
   if (!status) return false;
   const s = String(status).toUpperCase().trim();
   return (
+    s === 'ACTIVE' ||
     s === 'IN_PROGRESS' ||
     s === 'COUNTING' ||
-    s === 'RECOUNTING' ||
-    s === 'AUDIT_REVIEW' ||
-    s === 'CONSOLIDATED'
+    s === 'RECOUNT' ||
+    s === 'RECOUNTING'
   );
 };
 
@@ -167,6 +203,16 @@ export const getActiveBranchStocktakeSessions = (branchId?: string): StocktakeSe
   });
 };
 
+export const getDraftBranchStocktakeSessions = (branchId?: string): StocktakeSession[] => {
+  const targetBranch = String(branchId || getCurrentBranchId() || '').trim().toUpperCase();
+  const sessions = getStocktakeSessions();
+  return sessions.filter((s) => {
+    const sessBranch = String(s.branchId || (s as any).branch_id || '').trim().toUpperCase();
+    const branchMatches = !targetBranch || !sessBranch || sessBranch === targetBranch;
+    return branchMatches && isDraftStocktakeStatus(s.status);
+  });
+};
+
 export const hasActiveBranchStocktakeSession = (branchId?: string): boolean => {
   return getActiveBranchStocktakeSessions(branchId).length > 0;
 };
@@ -214,7 +260,7 @@ export const getActiveLockdownSession = (branchId?: string): StocktakeSession | 
   const lockState = lockdowns[targetBranch];
   if (lockState?.isLocked && lockState.sessionId) {
     const linked = getStocktakeSessionById(lockState.sessionId);
-    if (linked && linked.status !== 'APPROVED_POSTED' && linked.status !== 'CANCELLED') {
+    if (linked && isActiveStocktakeStatus(linked.status)) {
       return linked;
     }
   }

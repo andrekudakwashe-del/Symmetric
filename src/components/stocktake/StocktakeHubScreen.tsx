@@ -30,6 +30,10 @@ import {
   ChevronUp,
   UserPlus,
   Users,
+  Play,
+  Pause,
+  Archive,
+  FileEdit,
 } from 'lucide-react';
 import { StocktakeSession, StocktakeCountType, Salesperson, TemporaryCasualAccount } from '../../types';
 import {
@@ -37,6 +41,11 @@ import {
   createStocktakeSession,
   saveStocktakeSession,
   deleteStocktakeSession,
+  activateStocktakeSession,
+  pauseStocktakeSession,
+  resumeStocktakeSession,
+  archiveStocktakeSession,
+  restoreArchivedDraftSession,
   getBranchLockdowns,
   authenticateCasualWorker,
   getSalespeople,
@@ -57,8 +66,12 @@ import {
   getPostCommitPendingVarianceSessions,
   getActiveCasualsForBranch,
   getActiveBranchStocktakeSessions,
+  getDraftBranchStocktakeSessions,
   hasActiveBranchStocktakeSession,
   isActiveStocktakeStatus,
+  isDraftStocktakeStatus,
+  isPausedStocktakeStatus,
+  isArchivedOrClosedStocktakeStatus,
 } from '../../services/stocktakeAccessService';
 import { meshSyncService } from '../../services/meshSyncService';
 import { StocktakeSessionDetailScreen, DetailTab } from './StocktakeSessionDetailScreen';
@@ -367,30 +380,9 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
         meshSyncService.broadcastCasualWorkers(getTemporaryCasuals());
       }
 
-      // Broadcast both STOCKTAKE_SESSION_STARTED and canonical SyncCore session envelope
-      meshSyncService.broadcastStocktakeSessionStarted({
-        sessionId: newSession.sessionId,
-        sessionName: newSession.title,
-        segments: newSession.segments,
-        startedBy: staffName,
-        startedAt: newSession.timestamp,
-        countType: newSession.countType,
-        branchId: newSession.branchId,
-        branchName: newSession.branchName,
-        isLockdownActive: newSession.isLockdownActive,
-        notes: newSession.notes,
-      });
+      // Broadcast single canonical SyncCore session envelope (DRAFT status syncs freely across Hub & Cloud;
+      // Branch POS Lockdown is NOT engaged until the draft is explicitly Activated).
       meshSyncService.broadcastStocktakeSession(newSession);
-      if (newSession.isLockdownActive) {
-        meshSyncService.broadcastStocktakeLockdown(
-          newSession.branchId,
-          newSession.sessionId,
-          true,
-          staffName,
-          `Lockdown initiated for ${newSession.title}`,
-          staffId
-        );
-      }
 
       loadSessions();
       setShowNewModal(false);
@@ -399,9 +391,11 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
       setConsultantName('');
       setConsultantPhone('');
       setConsultantPin('');
+      setHubNotice(`Draft stocktake "${newSession.title}" created & synced. Activate it when ready for counters to start.`);
+      setTimeout(() => setHubNotice(null), 6000);
       openSessionDetail(newSession, 'HOME');
     } catch (err: any) {
-      const msg = err?.message || 'Cannot start stocktake session.';
+      const msg = err?.message || 'Cannot create draft stocktake session.';
       setModalError(msg);
       setHubError(msg);
     }
@@ -444,9 +438,119 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
     setTimeout(() => setHubNotice(null), 4000);
   };
 
-  // Single-active-session governance for this branch
+  const handleActivateDraft = (e: React.MouseEvent, sess: StocktakeSession) => {
+    e.stopPropagation();
+    setHubError(null);
+    const actorId = effectiveUser?.id || currentUser?.id || '001';
+    const actorName = effectiveUser?.name || currentUser?.name || 'Supervisor';
+    const res = activateStocktakeSession(sess.sessionId, actorId, actorName);
+    if (!res.success || !res.session) {
+      setHubError(res.message);
+      return;
+    }
+    meshSyncService.broadcastStocktakeSession(res.session);
+    if (res.lockdownChanged && res.session.isLockdownActive) {
+      meshSyncService.broadcastStocktakeLockdown(
+        res.session.branchId,
+        res.session.sessionId,
+        true,
+        actorName,
+        `Lockdown activated for ${res.session.title}`,
+        actorId
+      );
+    }
+    loadSessions();
+    setHubNotice(res.message);
+    setTimeout(() => setHubNotice(null), 5000);
+    openSessionDetail(res.session, 'HOME');
+  };
+
+  const handleResumePaused = (e: React.MouseEvent, sess: StocktakeSession) => {
+    e.stopPropagation();
+    setHubError(null);
+    const actorId = effectiveUser?.id || currentUser?.id || '001';
+    const actorName = effectiveUser?.name || currentUser?.name || 'Supervisor';
+    const res = resumeStocktakeSession(sess.sessionId, actorId, actorName);
+    if (!res.success || !res.session) {
+      setHubError(res.message);
+      return;
+    }
+    meshSyncService.broadcastStocktakeSession(res.session);
+    if (res.lockdownChanged && res.session.isLockdownActive) {
+      meshSyncService.broadcastStocktakeLockdown(
+        res.session.branchId,
+        res.session.sessionId,
+        true,
+        actorName,
+        `Lockdown re-engaged upon resuming ${res.session.title}`,
+        actorId
+      );
+    }
+    loadSessions();
+    setHubNotice(res.message);
+    setTimeout(() => setHubNotice(null), 5000);
+  };
+
+  const handleQuickArchive = (e: React.MouseEvent, sess: StocktakeSession) => {
+    e.stopPropagation();
+    setHubError(null);
+    const actorId = effectiveUser?.id || currentUser?.id || '001';
+    const actorName = effectiveUser?.name || currentUser?.name || 'Supervisor';
+    const res = archiveStocktakeSession(
+      sess.sessionId,
+      actorId,
+      actorName,
+      isDraftStocktakeStatus(sess.status) ? 'Draft archived from Stocktake Hub' : 'Session archived from Stocktake Hub'
+    );
+    if (!res.success || !res.session) {
+      setHubError(res.message);
+      return;
+    }
+    meshSyncService.broadcastStocktakeSession(res.session);
+    meshSyncService.broadcastCasualWorkers(getTemporaryCasuals());
+    if (res.lockdownReleased) {
+      meshSyncService.broadcastStocktakeLockdown(
+        res.session.branchId,
+        res.session.sessionId,
+        false,
+        actorName,
+        `Stocktake ${res.session.sessionId} archived — branch lockdown released.`,
+        actorId
+      );
+    }
+    loadSessions();
+    setHubNotice(res.message);
+    setTimeout(() => setHubNotice(null), 5000);
+  };
+
+  const handleRestoreArchivedDraft = (e: React.MouseEvent, sess: StocktakeSession) => {
+    e.stopPropagation();
+    setHubError(null);
+    const actorId = effectiveUser?.id || currentUser?.id || '001';
+    const actorName = effectiveUser?.name || currentUser?.name || 'Supervisor';
+    const res = restoreArchivedDraftSession(sess.sessionId, actorId, actorName);
+    if (!res.success || !res.session) {
+      setHubError(res.message);
+      return;
+    }
+    meshSyncService.broadcastStocktakeSession(res.session);
+    loadSessions();
+    setHubNotice(res.message);
+    setTimeout(() => setHubNotice(null), 5000);
+  };
+
+  // Single-active-session governance for this branch (includes PAUSED so paused counts hold the floor slot)
   const activeBranchSessions = useMemo(() => {
     const list = getActiveBranchStocktakeSessions(activeBranchId);
+    if (currentUser?.restrictedToSessionId) {
+      return list.filter((s) => s.sessionId === currentUser.restrictedToSessionId);
+    }
+    return list;
+  }, [activeBranchId, sessions, currentUser?.restrictedToSessionId]);
+
+  // Unlimited synced DRAFT / SCHEDULED sessions for this branch
+  const draftBranchSessions = useMemo(() => {
+    const list = getDraftBranchStocktakeSessions(activeBranchId);
     if (currentUser?.restrictedToSessionId) {
       return list.filter((s) => s.sessionId === currentUser.restrictedToSessionId);
     }
@@ -458,10 +562,10 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
     [activeBranchId, sessions]
   );
 
-  // Closed archive sessions (APPROVED_POSTED / CANCELLED)
+  // Closed & Archived audit sessions (APPROVED_POSTED / ARCHIVED / CANCELLED)
   const q = (searchQuery || '').trim().toLowerCase();
   const closedSessions = sessions.filter((s) => {
-    if (isActiveStocktakeStatus(s.status)) return false;
+    if (!isArchivedOrClosedStocktakeStatus(s.status)) return false;
     if (currentUser?.restrictedToSessionId && s.sessionId !== currentUser.restrictedToSessionId) {
       return false;
     }
@@ -475,6 +579,8 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
     let matchesStatus = true;
     if (statusFilter === 'APPROVED') {
       matchesStatus = s.status === 'APPROVED_POSTED';
+    } else if (statusFilter === 'ARCHIVED') {
+      matchesStatus = s.status === 'ARCHIVED';
     } else if (statusFilter === 'CANCELLED') {
       matchesStatus = s.status === 'CANCELLED';
     }
@@ -633,7 +739,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
               </button>
             )}
 
-          {canCreateSession && !hasActiveSession && (
+          {canCreateSession && (
             <button
               onClick={() => {
                 handleSelectCountType(allowedCreateTypes[0] || 'DAILY_BLIND');
@@ -642,7 +748,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
               className="px-4 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-900/30 flex items-center gap-2 transition"
             >
               <Plus className="w-4 h-4" />
-              Initialize New Stocktake Session
+              New Draft Stocktake
             </button>
           )}
 
@@ -650,10 +756,20 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
             <button
               type="button"
               onClick={() => openSessionDetail(activeBranchSessions[0], 'HOME')}
-              className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-emerald-900/30 flex items-center gap-2 transition"
+              className={`px-4 py-2.5 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-2 transition ${
+                isPausedStocktakeStatus(activeBranchSessions[0].status)
+                  ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-900/30'
+                  : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-900/30'
+              }`}
             >
-              <ShieldCheck className="w-4 h-4" />
-              1 Active Session Open • Enter Command Home
+              {isPausedStocktakeStatus(activeBranchSessions[0].status) ? (
+                <Pause className="w-4 h-4" />
+              ) : (
+                <ShieldCheck className="w-4 h-4" />
+              )}
+              {isPausedStocktakeStatus(activeBranchSessions[0].status)
+                ? '1 Paused Session • Enter Command Home'
+                : '1 Live Session Open • Enter Command Home'}
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           )}
@@ -681,16 +797,16 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
         </div>
       )}
 
-      {/* SECTION 1: ACTIVE BRANCH SESSION HERO */}
+      {/* SECTION 1: LIVE BRANCH FLOOR STOCKTAKE (MAX 1 LIVE SESSION RULE) */}
       <section className="max-w-7xl mx-auto space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-2">
             <Layers className="w-3.5 h-3.5 text-blue-400" />
-            Active Branch Floor Stocktake (Max 1 Active Session Rule)
+            Live Branch Floor Stocktake (Max 1 Active Session Rule)
           </h2>
           {hasActiveSession && (
             <span className="text-[11px] font-semibold text-amber-300 bg-amber-950/50 border border-amber-800/60 px-2.5 py-0.5 rounded-full">
-              Single Active Session Rule Enforced
+              1 Live Session Active • Drafts May Still Be Prepared
             </span>
           )}
         </div>
@@ -701,12 +817,18 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
             const verifiedSegs = segs.filter((seg) => seg.status === 'VERIFIED').length;
             const totalSegs = segs.length;
             const hasRecounts = segs.some((seg) => seg.status === 'DISCREPANCY_RECOUNT');
+            const isPaused = isPausedStocktakeStatus(s.status);
+            const canControlSession = isStocktakeLeader(effectiveUser) || isStocktakeAuditor(effectiveUser, s);
 
             return (
               <div
                 key={s.sessionId}
                 onClick={() => openSessionDetail(s, 'HOME')}
-                className="bg-gradient-to-br from-slate-900 via-slate-900 to-blue-950/30 border border-blue-500/40 hover:border-blue-400 rounded-2xl p-6 cursor-pointer transition shadow-2xl space-y-4 group"
+                className={`bg-gradient-to-br from-slate-900 via-slate-900 rounded-2xl p-6 cursor-pointer transition shadow-2xl space-y-4 group border ${
+                  isPaused
+                    ? 'to-amber-950/30 border-amber-500/50 hover:border-amber-400'
+                    : 'to-blue-950/30 border-blue-500/40 hover:border-blue-400'
+                }`}
               >
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div className="space-y-1.5">
@@ -719,14 +841,16 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                       </span>
                       <span
                         className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${
-                          s.status === 'READY_FOR_COMMITTAL'
+                          isPaused
+                            ? 'bg-amber-950 text-amber-300 border-amber-600'
+                            : s.status === 'READY_FOR_COMMITTAL'
                             ? 'bg-emerald-950 text-emerald-300 border-emerald-700'
                             : s.status === 'RECOUNTING' || hasRecounts
                             ? 'bg-amber-950 text-amber-300 border-amber-700 animate-pulse'
-                            : 'bg-slate-800 text-slate-200 border-slate-700'
+                            : 'bg-emerald-950/80 text-emerald-300 border-emerald-700'
                         }`}
                       >
-                        {String(s.status || 'COUNTING').replace(/_/g, ' ')}
+                        {isPaused ? 'PAUSED — COUNTING LOCKED' : String(s.status || 'COUNTING').replace(/_/g, ' ')}
                       </span>
                       {s.isLockdownActive && (
                         <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-rose-950 text-rose-300 border border-rose-700 flex items-center gap-1">
@@ -757,46 +881,49 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
-                    {(isStocktakeLeader(effectiveUser) || isStocktakeAuditor(effectiveUser, s)) &&
-                      (pendingDeleteSessionId === s.sessionId ? (
-                        <div className="inline-flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-                          <button
-                            type="button"
-                            onClick={(e) => handleConfirmDeleteSession(e, s.sessionId)}
-                            className="px-2.5 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-bold"
-                          >
-                            Confirm Delete
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setPendingDeleteSessionId(null);
-                            }}
-                            className="px-2.5 py-1 bg-slate-800 text-slate-300 rounded-lg text-xs"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setPendingDeleteSessionId(s.sessionId);
-                          }}
-                          className="p-2 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-xl transition"
-                          title="Cancel / Delete Draft Session"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      ))}
+                  <div className="flex flex-wrap items-center gap-2">
+                    {canControlSession && isPaused && (
+                      <button
+                        type="button"
+                        onClick={(e) => handleResumePaused(e, s)}
+                        className="px-3.5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg transition"
+                      >
+                        <Play className="w-3.5 h-3.5" />
+                        Resume Counting
+                      </button>
+                    )}
+                    {canControlSession && (
+                      <button
+                        type="button"
+                        onClick={(e) => handleQuickArchive(e, s)}
+                        className="px-3 py-2.5 rounded-xl bg-slate-800 hover:bg-rose-950 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-700 text-xs font-bold flex items-center gap-1.5 transition"
+                        title="Cancel & Archive this live session to release the branch slot"
+                      >
+                        <Archive className="w-3.5 h-3.5" />
+                        Archive
+                      </button>
+                    )}
                     <span className="px-4 py-2.5 rounded-xl bg-blue-600 group-hover:bg-blue-500 text-white text-xs font-bold flex items-center gap-2 shadow-lg">
                       Open Command Home <ArrowRight className="w-4 h-4" />
                     </span>
                   </div>
                 </div>
+
+                {isPaused && (
+                  <div className="p-3.5 rounded-xl bg-amber-950/60 border border-amber-700/70 text-xs text-amber-100 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-start gap-2.5">
+                      <Pause className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                      <div>
+                        <strong>Counting Paused by {s.pausedByName || 'Auditor'}</strong>
+                        {s.pausedAt && ` at ${new Date(s.pausedAt).toLocaleString()}`}
+                        {s.pauseReason && <span className="block text-amber-200/90 mt-0.5">Reason: {s.pauseReason}</span>}
+                      </div>
+                    </div>
+                    <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-950/70 border border-amber-700/60 text-amber-200">
+                      {s.isLockdownActive ? 'POS Lockdown Held' : 'POS Trading Open'}
+                    </span>
+                  </div>
+                )}
 
                 <div className="bg-slate-950/80 p-3.5 rounded-xl border border-slate-800/80">
                   <div className="flex items-center justify-between text-xs mb-1.5">
@@ -808,7 +935,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                   <div className="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden">
                     <div
                       className={`h-full transition-all ${
-                        verifiedSegs === totalSegs && totalSegs > 0 ? 'bg-emerald-500' : 'bg-blue-500'
+                        verifiedSegs === totalSegs && totalSegs > 0 ? 'bg-emerald-500' : isPaused ? 'bg-amber-500' : 'bg-blue-500'
                       }`}
                       style={{ width: `${totalSegs > 0 ? (verifiedSegs / totalSegs) * 100 : 0}%` }}
                     />
@@ -834,13 +961,15 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
             );
           })
         ) : (
-          <div className="py-12 text-center bg-slate-900/60 rounded-2xl border border-slate-800 px-6">
-            <Layers className="w-12 h-12 text-slate-600 mx-auto mb-3 opacity-60" />
-            <h3 className="text-base font-bold text-slate-200">No Active Stocktake Running on Branch Floor</h3>
+          <div className="py-10 text-center bg-slate-900/60 rounded-2xl border border-slate-800 px-6">
+            <Layers className="w-11 h-11 text-slate-600 mx-auto mb-3 opacity-60" />
+            <h3 className="text-base font-bold text-slate-200">No Live Stocktake Running on Branch Floor</h3>
             <p className="text-xs text-slate-400 mt-1 max-w-xl mx-auto">
               {canCreateSession
-                ? 'Configure your branch floor segments ahead of time, then initialize a single active stocktake session for your team.'
-                : 'No active stocktake session is currently running for your branch. Wait for the Auditor or Manager to start one.'}
+                ? draftBranchSessions.length > 0
+                  ? 'Activate one of your synced draft stocktakes below to open counting terminals for your team.'
+                  : 'Create a synced Draft stocktake to configure floor zones, auditors, and casuals ahead of time, then Activate it when ready to count.'
+                : 'No active stocktake session is currently live for your branch. Counters unlock automatically once the Auditor or Manager activates a draft.'}
             </p>
             <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
               {(canCreateSession || isStocktakeLeader(effectiveUser) || isStocktakeAuditor(effectiveUser)) &&
@@ -855,7 +984,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                     Configure Branch Floor Map
                   </button>
                 )}
-              {canCreateSession && !hasActiveSession && (
+              {canCreateSession && (
                 <button
                   onClick={() => {
                     handleSelectCountType(allowedCreateTypes[0] || 'DAILY_BLIND');
@@ -864,13 +993,155 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                   className="px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold transition inline-flex items-center gap-2 shadow-lg shadow-blue-900/30"
                 >
                   <Plus className="w-4 h-4" />
-                  Initialize New Stocktake Session
+                  Create Draft Stocktake
                 </button>
               )}
             </div>
           </div>
         )}
       </section>
+
+      {/* SECTION 1.5: DRAFT STOCKTAKES (SYNCED ACROSS DEVICES — MUST BE ACTIVATED TO COUNT) */}
+      {draftBranchSessions.length > 0 && (
+        <section className="max-w-7xl mx-auto space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-xs font-bold uppercase tracking-wider text-indigo-300 flex items-center gap-2">
+              <FileEdit className="w-3.5 h-3.5 text-indigo-400" />
+              Draft Stocktakes — Synced &amp; Ready to Activate ({draftBranchSessions.length})
+            </h2>
+            <span className="text-[11px] text-slate-400">
+              All drafts sync freely across Hub &amp; Cloud • Counters cannot count until Activated
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {draftBranchSessions.map((d) => {
+              const segs = Array.isArray(d.segments) ? d.segments : [];
+              const canManageDraft =
+                canCreateSession || isStocktakeLeader(effectiveUser) || isStocktakeAuditor(effectiveUser, d);
+
+              return (
+                <div
+                  key={d.sessionId}
+                  onClick={() => openSessionDetail(d, 'HOME')}
+                  className="bg-slate-900/80 hover:bg-slate-900 border border-indigo-500/35 hover:border-indigo-400 rounded-2xl p-5 cursor-pointer transition shadow-lg flex flex-col justify-between gap-4 group"
+                >
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-xs font-bold px-2 py-0.5 rounded bg-indigo-950 text-indigo-300 border border-indigo-800">
+                          {d.sessionId}
+                        </span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                          DRAFT • SYNCED
+                        </span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+                          {String(d.countType || 'DAILY_BLIND').replace(/_/g, ' ')}
+                        </span>
+                        {d.lockdownRequested && (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-950/70 text-rose-300 border border-rose-800/70 flex items-center gap-1">
+                            <Lock className="w-2.5 h-2.5" /> Lockdown Armed
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <h3 className="text-base font-bold text-white group-hover:text-indigo-300 transition">
+                      {d.title}
+                    </h3>
+
+                    <div className="text-xs text-slate-400 flex flex-wrap items-center gap-2.5">
+                      <span className="flex items-center gap-1">
+                        <Calendar className="w-3.5 h-3.5" /> {d.date}
+                      </span>
+                      <span>•</span>
+                      <span>{segs.length} Floor Segment(s)</span>
+                      {d.stocktakeAuditorName && (
+                        <>
+                          <span>•</span>
+                          <span className="text-amber-300">Auditor: {d.stocktakeAuditorName}</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
+                    {canManageDraft ? (
+                      <>
+                        <button
+                          type="button"
+                          disabled={hasActiveSession}
+                          onClick={(e) => handleActivateDraft(e, d)}
+                          title={
+                            hasActiveSession
+                              ? 'Finish, commit, or archive the currently live branch stocktake before activating another draft.'
+                              : 'Activate this draft so counters can begin counting'
+                          }
+                          className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white text-xs font-bold flex items-center gap-1.5 shadow transition"
+                        >
+                          <Play className="w-3.5 h-3.5" />
+                          {hasActiveSession ? 'Waiting for Live Slot' : 'Activate & Start Counting'}
+                        </button>
+
+                        <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            type="button"
+                            onClick={(e) => handleQuickArchive(e, d)}
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-semibold flex items-center gap-1 transition"
+                            title="Archive Draft"
+                          >
+                            <Archive className="w-3.5 h-3.5" />
+                            Archive
+                          </button>
+                          {!d.everActivated &&
+                            (pendingDeleteSessionId === d.sessionId ? (
+                              <div className="inline-flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={(e) => handleConfirmDeleteSession(e, d.sessionId)}
+                                  className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white rounded text-[11px] font-bold"
+                                >
+                                  Delete
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setPendingDeleteSessionId(null);
+                                  }}
+                                  className="px-2 py-1 bg-slate-800 text-slate-300 rounded text-[11px]"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setPendingDeleteSessionId(d.sessionId);
+                                }}
+                                className="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-lg transition"
+                                title="Permanently Delete Draft"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            ))}
+                        </div>
+                      </>
+                    ) : (
+                      <span className="text-xs text-indigo-300/80 font-medium flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5" />
+                        Scheduled Draft — Awaiting Auditor/Manager Activation
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       {/* SECTION 2: POST-COMMIT VARIANCE REVIEWS DUE */}
       {pendingVarianceSessions.length > 0 && (
@@ -1062,6 +1333,14 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                     Approved
                   </button>
                   <button
+                    onClick={() => setStatusFilter('ARCHIVED')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition ${
+                      statusFilter === 'ARCHIVED' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Archived
+                  </button>
+                  <button
                     onClick={() => setStatusFilter('CANCELLED')}
                     className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition ${
                       statusFilter === 'CANCELLED' ? 'bg-rose-600 text-white' : 'text-slate-400 hover:text-slate-200'
@@ -1109,6 +1388,8 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                           className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${
                             s.status === 'APPROVED_POSTED'
                               ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                              : s.status === 'ARCHIVED'
+                              ? 'bg-indigo-950 text-indigo-300 border-indigo-800'
                               : 'bg-slate-800 text-slate-300 border-slate-700'
                           }`}
                         >
@@ -1133,6 +1414,12 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                         <div className="text-[11px] text-amber-300 mt-1 flex items-center gap-1">
                           <Shield className="w-3 h-3 text-amber-400" />
                           Auditor: <strong>{s.stocktakeAuditorName}</strong>
+                        </div>
+                      )}
+
+                      {s.archiveReason && (
+                        <div className="text-[11px] text-slate-400 mt-1.5 italic line-clamp-2">
+                          Archived: {s.archiveReason}
                         </div>
                       )}
 
@@ -1169,6 +1456,19 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                     <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs">
                       <span className="text-slate-400">Created: {s.createdByName}</span>
                       <div className="flex items-center gap-2">
+                        {s.status === 'ARCHIVED' &&
+                          !s.everActivated &&
+                          (isStocktakeLeader(effectiveUser) || isStocktakeAuditor(effectiveUser, s)) && (
+                            <button
+                              type="button"
+                              onClick={(e) => handleRestoreArchivedDraft(e, s)}
+                              className="px-2 py-1 rounded bg-indigo-950 hover:bg-indigo-900 text-indigo-300 border border-indigo-700/70 text-[10px] font-bold flex items-center gap-1 transition"
+                              title="Restore this never-activated archived draft"
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              Restore Draft
+                            </button>
+                          )}
                         {(isStocktakeLeader(effectiveUser) || isStocktakeAuditor(effectiveUser, s)) &&
                           (pendingDeleteSessionId === s.sessionId ? (
                             <div className="inline-flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
@@ -1229,9 +1529,14 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
             <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <div className="w-8 h-8 rounded-lg bg-blue-500/10 text-blue-400 flex items-center justify-center">
-                  <Layers className="w-4 h-4" />
+                  <FileEdit className="w-4 h-4" />
                 </div>
-                <h3 className="text-base font-bold text-white">Initialize New Stocktake Session</h3>
+                <div>
+                  <h3 className="text-base font-bold text-white">Create Draft Stocktake Session</h3>
+                  <p className="text-[11px] text-slate-400">
+                    Syncs across all devices immediately • Activate when ready for counters to begin
+                  </p>
+                </div>
               </div>
               <button onClick={() => setShowNewModal(false)} className="text-slate-400 hover:text-white">
                 ✕
@@ -1625,10 +1930,10 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                     <Lock className="w-4 h-4 text-rose-400 shrink-0" />
                     <div>
                       <strong className="text-rose-200 block font-semibold">
-                        Engage Store Lockdown upon Creation
+                        Arm Store POS Lockdown upon Activation
                       </strong>
                       <p className="text-[11px] text-rose-300/80">
-                        Locks POS till doors; sales will require supervisor override with audit logging.
+                        Draft stays open for prep; POS till doors lock automatically once you Activate this stocktake.
                       </p>
                     </div>
                   </div>
@@ -1696,7 +2001,7 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
                   type="submit"
                   className="px-5 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold shadow-lg"
                 >
-                  Start Session
+                  Create Synced Draft
                 </button>
               </div>
             </form>

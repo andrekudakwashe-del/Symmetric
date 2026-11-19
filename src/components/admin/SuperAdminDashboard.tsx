@@ -55,6 +55,11 @@ import {
   getSubscriptionStatus,
   getSheetsConfig,
   saveSheetsConfig,
+  saveSalesperson,
+  getOwnerDefaultPermissions,
+  isMasterSpreadsheetId,
+  sanitizeTenantSheetId,
+  DEFAULT_MASTER_SPREADSHEET_ID,
 } from '../../db/roomDatabase';
 import {
   isRealGoogleSheetId,
@@ -62,6 +67,8 @@ import {
   fetchCompaniesFromMasterSheet,
   initializeMasterSheetTabs,
   syncCompanyToCloud,
+  registerCompanyInCloud,
+  autoProvisionDedicatedTenantSheet,
 } from '../../services/googleSheetsSync';
 import {
   saveGlobalSystemConfig,
@@ -114,8 +121,12 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   const [newCompanyName, setNewCompanyName] = useState('');
   const [newOwnerEmail, setNewOwnerEmail] = useState('');
   const [newOwnerName, setNewOwnerName] = useState('');
+  const [newOwnerPin, setNewOwnerPin] = useState('123456');
   const [newPlan, setNewPlan] = useState<'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE'>('PROFESSIONAL');
   const [newSyncStrategy, setNewSyncStrategy] = useState<'CLOUD_ONLY' | 'HUB_ONLY' | 'HUB_CLOUD'>('HUB_CLOUD');
+  const [isCreatingCompany, setIsCreatingCompany] = useState(false);
+  const [createCompanyError, setCreateCompanyError] = useState<string | null>(null);
+  const [provisioningCompanyId, setProvisioningCompanyId] = useState<string | null>(null);
 
   // Payment Confirmation Modal State
   const [paymentPlan, setPaymentPlan] = useState<'STARTER' | 'PROFESSIONAL' | 'ENTERPRISE'>('PROFESSIONAL');
@@ -496,39 +507,179 @@ function setupMasterSheets() {
     return `${yyyy}_${mm}`;
   };
 
-  const handleCreateCompany = (e: React.FormEvent) => {
+  const handleCreateCompany = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCompanyName.trim()) return;
+    if (!newOwnerEmail.trim() || !newOwnerEmail.includes('@')) {
+      setCreateCompanyError('Please enter a valid owner email address.');
+      return;
+    }
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      setCreateCompanyError('You are offline. Tenant registration is an online process and requires connection to the Master Google Sheet. Reconnect and try again.');
+      return;
+    }
 
-    const companyId = `COMP-${Date.now().toString(36).toUpperCase()}`;
-    const cleanName = newCompanyName.trim().replace(/[^a-zA-Z0-9]/g, '_');
-    const newComp: Company = {
-      company_id: companyId,
-      company_name: newCompanyName.trim(),
-      owner_name: newOwnerName.trim() || 'Business Owner',
-      owner_email: newOwnerEmail.trim() || 'owner@example.com',
-      sheet_folder_id: '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
-      sheet_id: '', // Unlinked until dedicated sheet is linked or duplicated from master template
-      branch_isolation_mode: 'ROW_LEVEL',
-      trial_start_date: new Date().toISOString().split('T')[0],
-      subscription_status: 'TRIAL',
-      plan: newPlan,
-      package_id: newPlan === 'ENTERPRISE' ? 'pkg_enterprise' : newPlan === 'PROFESSIONAL' ? 'pkg_professional' : 'pkg_starter',
-      custom_max_branches: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 3 : 1,
-      custom_max_staff: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 15 : 5,
-      sync_strategy: newSyncStrategy,
-      next_billing_date: new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
-      offline_activation_code: `SAI-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
-      trial_days_remaining: 14,
-    };
+    setIsCreatingCompany(true);
+    setCreateCompanyError(null);
 
-    saveCompany(newComp);
-    syncCompanyToCloud(newComp).catch(() => {});
-    setNewCompanyName('');
-    setNewOwnerEmail('');
-    setNewOwnerName('');
-    setIsAddCompanyModalOpen(false);
-    showToast(`Registered ${newComp.company_name} with 14-day trial!`);
+    try {
+      const randSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+      const companyId = `COMP-${Date.now().toString(36).toUpperCase()}`;
+      const branchId = `BR-${randSuffix}-01`;
+      const ownerId = `USR-${randSuffix}-01`;
+      const cleanName = newCompanyName.trim();
+      const cleanOwnerName = newOwnerName.trim() || 'Business Owner';
+      const cleanOwnerEmail = newOwnerEmail.trim().toLowerCase();
+      const cleanPin = /^\d{4,6}$/.test(newOwnerPin.trim()) ? newOwnerPin.trim() : '123456';
+      const branchCode = `${cleanName.replace(/[^a-zA-Z]/g, '').slice(0, 3).toUpperCase() || 'HQ'}-01`;
+
+      // STRICT ONLINE REGISTRATION: Confirm on Master Google Sheet BEFORE saving locally!
+      const cloudRes = await registerCompanyInCloud(
+        {
+          company_id: companyId,
+          company_name: cleanName,
+          owner_name: cleanOwnerName,
+          owner_email: cleanOwnerEmail,
+          branch_id: branchId,
+          branch_name: 'Main Branch',
+          branch_code: branchCode,
+          branch_location: 'Central Store',
+          user_id: ownerId,
+          password: cleanPin,
+          plan: newPlan,
+          auto_provision: true,
+        },
+        masterWebhookInput.trim() || undefined
+      );
+
+      if (!cloudRes.cloudSynced) {
+        const errDetail =
+          cloudRes.error ||
+          cloudRes.message ||
+          'Master Google Sheet did not confirm registration.';
+        setCreateCompanyError(
+          `Cloud registration failed — "${cleanName}" was NOT saved to the Master Sheet. ${errDetail} Please try again.`
+        );
+        showToast(`⚠️ Registration failed on Master Sheet: ${errDetail}`);
+        setIsCreatingCompany(false);
+        return;
+      }
+
+      const finalCompanyId = String(cloudRes.company_id || companyId).trim();
+      const finalBranchId = String(cloudRes.branch_id || branchId).trim();
+      const finalOwnerId = String(cloudRes.user_id || ownerId).trim();
+      const masterId = masterSpreadsheetIdInput.trim() || DEFAULT_MASTER_SPREADSHEET_ID;
+      const dedicatedSheetId = sanitizeTenantSheetId(
+        finalCompanyId,
+        cloudRes.sheet_id || cloudRes.spreadsheet_id || '',
+        masterId
+      );
+
+      const newComp: Company = {
+        company_id: finalCompanyId,
+        company_name: cleanName,
+        owner_name: cleanOwnerName,
+        owner_email: cleanOwnerEmail,
+        sheet_folder_id: '',
+        sheet_id: dedicatedSheetId,
+        branch_isolation_mode: 'ROW_LEVEL',
+        trial_start_date: new Date().toISOString().split('T')[0],
+        subscription_status: 'TRIAL',
+        plan: newPlan,
+        package_id: newPlan === 'ENTERPRISE' ? 'pkg_enterprise' : newPlan === 'PROFESSIONAL' ? 'pkg_professional' : 'pkg_starter',
+        custom_max_branches: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 3 : 1,
+        custom_max_staff: newPlan === 'ENTERPRISE' ? 999 : newPlan === 'PROFESSIONAL' ? 15 : 5,
+        sync_strategy: newSyncStrategy,
+        next_billing_date: cloudRes.next_billing_date || new Date(Date.now() + 14 * 86400000).toISOString().split('T')[0],
+        offline_activation_code: cloudRes.activation_code || `SAI-${Math.random().toString(36).substring(2, 8).toUpperCase()}`,
+        trial_days_remaining: 14,
+      };
+
+      saveCompany(newComp);
+      saveBranch({
+        branchId: finalBranchId,
+        name: 'Main Branch',
+        code: branchCode,
+        location: 'Central Store',
+        isMain: true,
+        companyId: finalCompanyId,
+        company_id: finalCompanyId,
+      } as any);
+      saveSalesperson({
+        id: finalOwnerId,
+        name: cleanOwnerName,
+        role: 'OWNER',
+        email: cleanOwnerEmail,
+        pin: cleanPin,
+        phone: '',
+        active: 'Y',
+        companyId: finalCompanyId,
+        company_id: finalCompanyId,
+        branchId: finalBranchId,
+        branch_id: finalBranchId,
+        permissions: getOwnerDefaultPermissions(),
+      });
+
+      setCompanies(getCompanies());
+      setBranches(getAllBranches());
+      setNewCompanyName('');
+      setNewOwnerEmail('');
+      setNewOwnerName('');
+      setNewOwnerPin('123456');
+      setCreateCompanyError(null);
+      setIsAddCompanyModalOpen(false);
+
+      if (dedicatedSheetId) {
+        showToast(`✓ Registered ${newComp.company_name} on Master Sheet + dedicated sheet (${dedicatedSheetId.slice(0, 10)}...)!`);
+      } else if (cloudRes.provision_error) {
+        showToast(`✓ Registered ${newComp.company_name} on Master Sheet. Sheet auto-provisioning warning: ${cloudRes.provision_error} — click "Auto-Provision" to retry.`);
+      } else {
+        showToast(`✓ Registered ${newComp.company_name} on Master Sheet! Click "Auto-Provision" to create its dedicated sheet.`);
+      }
+      try {
+        confetti({ particleCount: 55, spread: 70, origin: { y: 0.6 } });
+      } catch {}
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      setCreateCompanyError(`Cloud registration failed: ${msg}. Please try again.`);
+      showToast(`⚠️ Registration failed: ${msg}`);
+    } finally {
+      setIsCreatingCompany(false);
+    }
+  };
+
+  const handleAutoProvisionSheet = async (comp: Company) => {
+    if (isCompanyMaster(comp)) {
+      showToast('HQ Master company uses the Master Spreadsheet by design.');
+      return;
+    }
+    setProvisioningCompanyId(comp.company_id);
+    setSheetLinkError(null);
+    try {
+      const res = await autoProvisionDedicatedTenantSheet(comp, masterWebhookInput.trim() || undefined);
+      setCompanies(getCompanies());
+      setBranches(getAllBranches());
+      if (res.success && res.sheet_id) {
+        showToast(`✓ ${res.message}`);
+        if (linkingSheetCompany && linkingSheetCompany.company_id === comp.company_id) {
+          setLinkingSheetCompany(null);
+          setSheetUrlOrIdInput('');
+        }
+        try {
+          confetti({ particleCount: 45, spread: 65, origin: { y: 0.65 } });
+        } catch {}
+      } else {
+        const errMsg = res.message || res.error || 'Could not auto-provision dedicated sheet. Please try again.';
+        setSheetLinkError(errMsg);
+        showToast(`⚠️ ${errMsg}`);
+      }
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      setSheetLinkError(errMsg);
+      showToast(`⚠️ Auto-provisioning failed: ${errMsg}`);
+    } finally {
+      setProvisioningCompanyId(null);
+    }
   };
 
   const handleOpenTenantPkgModal = (comp: Company) => {
@@ -593,20 +744,29 @@ function setupMasterSheets() {
     if (!linkingSheetCompany) return;
     const targetInput = overrideId || sheetUrlOrIdInput;
     const cleanId = extractGoogleSheetId(targetInput);
+    const masterId = masterSpreadsheetIdInput.trim() || DEFAULT_MASTER_SPREADSHEET_ID;
 
     if (!cleanId) {
       setSheetLinkError('Please provide a valid Google Sheet URL or Spreadsheet ID.');
       return;
     }
 
+    if (!isCompanyMaster(linkingSheetCompany) && isMasterSpreadsheetId(cleanId, masterId)) {
+      setSheetLinkError(
+        'Blocked: You cannot assign the Master SaaS Control Sheet to a regular tenant. Use "Auto-Provision Dedicated Sheet" or paste a unique tenant spreadsheet URL.'
+      );
+      return;
+    }
+
     const updated: Company = {
       ...linkingSheetCompany,
       sheet_id: cleanId,
+      sheet_folder_id: '',
     };
 
     saveCompany(updated);
     syncCompanyToCloud(updated).catch(() => {});
-    showToast(`✓ Linked Google Sheet for ${updated.company_name}!`);
+    showToast(`✓ Linked Dedicated Google Sheet for ${updated.company_name}!`);
     setLinkingSheetCompany(null);
     setSheetUrlOrIdInput('');
     setSheetLinkError(null);
@@ -679,9 +839,13 @@ function setupMasterSheets() {
   const isCompanyMaster = (comp: Company) =>
     comp.company_id === 'COMP-001' || comp.company_id === 'COMP-MASTER';
 
-  const companyHasValidSheet = (comp: Company) =>
-    isRealGoogleSheetId(comp.sheet_id) ||
-    (isCompanyMaster(comp) && isRealGoogleSheetId('1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE'));
+  const companyHasValidSheet = (comp: Company) => {
+    const masterId = masterSpreadsheetIdInput.trim() || DEFAULT_MASTER_SPREADSHEET_ID;
+    if (isCompanyMaster(comp)) {
+      return isRealGoogleSheetId(comp.sheet_id) || isRealGoogleSheetId(masterId);
+    }
+    return isRealGoogleSheetId(comp.sheet_id) && !isMasterSpreadsheetId(comp.sheet_id, masterId);
+  };
 
   const countActive = companies.filter((c) => {
     const s = getSubscriptionStatus(c);
@@ -1578,18 +1742,33 @@ function setupMasterSheets() {
                           </div>
                         </div>
                       ) : (
-                        <div className="flex items-center justify-between gap-2 pt-0.5">
+                        <div className="flex items-center justify-between gap-2 pt-0.5 flex-wrap">
                           <span className="text-[11px] text-amber-300 font-semibold flex items-center gap-1">
                             <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                            <span>Needs Sheet</span>
+                            <span>Needs Dedicated Sheet</span>
                           </span>
-                          <button
-                            type="button"
-                            onClick={() => handleOpenSheetLinkModal(comp)}
-                            className="px-3 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] shadow-sm transition active:scale-95"
-                          >
-                            Link Dedicated Sheet
-                          </button>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={provisioningCompanyId === comp.company_id}
+                              onClick={() => handleAutoProvisionSheet(comp)}
+                              className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-bold text-[11px] shadow-sm transition active:scale-95 flex items-center gap-1"
+                            >
+                              {provisioningCompanyId === comp.company_id ? (
+                                <RefreshCw className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <Zap className="w-3 h-3" />
+                              )}
+                              <span>{provisioningCompanyId === comp.company_id ? 'Creating...' : 'Auto-Provision'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenSheetLinkModal(comp)}
+                              className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] shadow-sm transition active:scale-95"
+                            >
+                              Link
+                            </button>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -1740,16 +1919,29 @@ function setupMasterSheets() {
                               </button>
                             </div>
                           ) : (
-                            <div className="flex items-center gap-1.5">
+                            <div className="flex items-center gap-1.5 flex-wrap">
                               <span className="px-2 py-0.5 rounded text-[10px] bg-amber-950/80 text-amber-300 border border-amber-800 font-semibold">
-                                ⚠️ Needs Sheet
+                                ⚠️ Needs Dedicated Sheet
                               </span>
+                              <button
+                                type="button"
+                                disabled={provisioningCompanyId === comp.company_id}
+                                onClick={() => handleAutoProvisionSheet(comp)}
+                                className="px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white text-[10px] font-bold transition cursor-pointer inline-flex items-center gap-1"
+                              >
+                                {provisioningCompanyId === comp.company_id ? (
+                                  <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                                ) : (
+                                  <Zap className="w-2.5 h-2.5" />
+                                )}
+                                <span>{provisioningCompanyId === comp.company_id ? 'Creating...' : 'Auto-Provision'}</span>
+                              </button>
                               <button
                                 type="button"
                                 onClick={() => handleOpenSheetLinkModal(comp)}
                                 className="px-2 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold transition cursor-pointer"
                               >
-                                Link Sheet
+                                Link
                               </button>
                             </div>
                           )}
@@ -2040,6 +2232,20 @@ function setupMasterSheets() {
               </div>
 
               <div>
+                <label className="text-xs font-bold text-slate-300">Owner Security PIN (4–6 digits)</label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={6}
+                  required
+                  value={newOwnerPin}
+                  onChange={(e) => setNewOwnerPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  placeholder="123456"
+                  className="w-full bg-slate-950 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs font-mono focus:outline-none focus:border-amber-500 mt-1"
+                />
+              </div>
+
+              <div>
                 <label className="text-xs font-bold text-slate-300">Plan</label>
                 <select
                   value={newPlan}
@@ -2065,23 +2271,42 @@ function setupMasterSheets() {
                 </select>
               </div>
 
+              {createCompanyError && (
+                <div className="p-3 rounded-xl bg-rose-950/70 border border-rose-500/50 text-[11px] text-rose-200 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <span>{createCompanyError}</span>
+                </div>
+              )}
+
               <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300">
-                ⭐ New tenant will be registered with a 14-day free trial. You can confirm their payment anytime right from this dashboard.
+                ☁️ Online Registration: Tenant will be registered directly on the Master Google Sheet and auto-provisioned with its own dedicated spreadsheet.
               </div>
 
               <div className="flex gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setIsAddCompanyModalOpen(false)}
-                  className="flex-1 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold"
+                  disabled={isCreatingCompany}
+                  onClick={() => {
+                    setCreateCompanyError(null);
+                    setIsAddCompanyModalOpen(false);
+                  }}
+                  className="flex-1 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 text-xs font-bold"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold"
+                  disabled={isCreatingCompany}
+                  className="flex-1 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-slate-950 text-xs font-bold flex items-center justify-center gap-1.5"
                 >
-                  Create Tenant
+                  {isCreatingCompany ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>Registering on Cloud...</span>
+                    </>
+                  ) : (
+                    <span>Create Tenant Online</span>
+                  )}
                 </button>
               </div>
             </form>
@@ -2181,13 +2406,26 @@ function setupMasterSheets() {
                 <span>Save Dedicated Sheet Link</span>
               </button>
 
-              <button
-                type="button"
-                onClick={() => handleSaveCompanySheetLink('1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE')}
-                className="w-full py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs border border-slate-700 transition"
-              >
-                Use Master Sheet for Now (Row-Level Isolated)
-              </button>
+              {!isCompanyMaster(linkingSheetCompany) && (
+                <button
+                  type="button"
+                  disabled={provisioningCompanyId === linkingSheetCompany.company_id}
+                  onClick={() => handleAutoProvisionSheet(linkingSheetCompany)}
+                  className="w-full py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-cyan-600 hover:from-indigo-500 hover:to-cyan-500 disabled:opacity-60 text-white font-bold text-xs shadow transition flex items-center justify-center space-x-1.5"
+                >
+                  {provisioningCompanyId === linkingSheetCompany.company_id ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Auto-Provisioning Dedicated Sheet in Google Drive...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="w-4 h-4" />
+                      <span>Auto-Provision New Dedicated Sheet (Recommended)</span>
+                    </>
+                  )}
+                </button>
+              )}
             </div>
           </div>
         </div>

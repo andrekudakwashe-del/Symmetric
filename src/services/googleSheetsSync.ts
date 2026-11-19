@@ -28,6 +28,10 @@ import {
   getSalespeopleForCompany,
   getOwnerDefaultPermissions,
   DEFAULT_MASTER_WEBHOOK_URL,
+  DEFAULT_MASTER_SPREADSHEET_ID,
+  isMasterCompanyId,
+  isMasterSpreadsheetId,
+  sanitizeTenantSheetId,
   getInventoryItems,
   updateTenantSheetBinding,
   pullTenantInventory,
@@ -1237,14 +1241,22 @@ export const initializeTenantBusinessTabs = async (params?: {
   const config = getSheetsConfig();
   const compId = params?.companyId || currentComp.company_id || 'COMP-001';
   const compName = params?.companyName || currentComp.company_name || 'Tenant';
-  const targetSheetId = (params?.sheetId || currentComp.sheet_id || config.spreadsheetId || '').trim();
+  const rawTargetSheetId = (params?.sheetId || currentComp.sheet_id || config.spreadsheetId || '').trim();
+  const targetSheetId = sanitizeTenantSheetId(compId, rawTargetSheetId, config.masterSpreadsheetId);
   const targetWebhook = (params?.webhookUrl || currentComp.webhook_url || config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL).trim();
   const initialProducts = params?.initialProducts || getInventoryItems();
+
+  if (!isMasterCompanyId(compId) && isMasterSpreadsheetId(rawTargetSheetId, config.masterSpreadsheetId)) {
+    return {
+      success: false,
+      message: 'Blocked: Cannot initialize tenant operational tabs inside the Master SaaS Control Spreadsheet. Use Auto-Provision Dedicated Sheet or link a unique spreadsheet for this tenant.',
+    };
+  }
 
   if (!targetSheetId || targetSheetId.length < 10) {
     return {
       success: false,
-      message: 'Please provide or link a valid Google Sheet ID (or URL) first.',
+      message: 'Please auto-provision or link a valid dedicated Google Sheet ID (or URL) first.',
     };
   }
 
@@ -1543,6 +1555,9 @@ export const fetchCompaniesFromMasterSheet = async (
     if (remoteList.length > 0) {
       remoteList.forEach((c) => {
         if (!c || !c.company_id) return;
+        const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+        const safeSheetId = sanitizeTenantSheetId(c.company_id, c.sheet_id, masterSheetId);
+        const safeFolderId = isMasterSpreadsheetId(c.sheet_folder_id, masterSheetId) ? '' : (c.sheet_folder_id || '');
         saveCompany({
           company_id: c.company_id,
           company_name: c.company_name || c.company_id,
@@ -1550,8 +1565,8 @@ export const fetchCompaniesFromMasterSheet = async (
           owner_email: c.owner_email || '',
           phone: c.phone || '',
           business_category: c.business_category || 'Wholesale & Retail',
-          sheet_folder_id: c.sheet_folder_id || '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
-          sheet_id: c.sheet_id || '',
+          sheet_folder_id: safeFolderId,
+          sheet_id: safeSheetId,
           trial_start_date: c.trial_start_date || new Date().toISOString().split('T')[0],
           subscription_status: c.subscription_status || 'TRIAL',
           plan: c.plan || 'PROFESSIONAL',
@@ -1740,6 +1755,7 @@ export interface CloudRegistrationPayload {
   user_id: string;
   password: string;
   plan?: string;
+  auto_provision?: boolean;
   force_new_tenant?: boolean;
 }
 
@@ -1753,6 +1769,11 @@ export interface CloudRegistrationResult {
   user_id?: string;
   sheet_id?: string;
   spreadsheet_id?: string;
+  dedicated_sheet_provisioned?: boolean;
+  provisioned_via?: string;
+  provision_error?: string;
+  activation_code?: string;
+  next_billing_date?: string;
   url?: string;
   routing_epoch?: number;
   token?: string;
@@ -1761,17 +1782,22 @@ export interface CloudRegistrationResult {
 }
 
 /**
- * Authoritative cross-device tenant registration:
+ * Authoritative online cross-device tenant registration:
  * Sends full `signup_company` payload via Express (/api/saas/signup) to Master Google Sheet
- * (creating companies + Global_Users + branches + users + permissions + optional template sheet + HS256 JWT),
+ * (creating companies + Global_Users + branches + users + permissions + dedicated tenant sheet + HS256 JWT),
  * with CORS-safe direct Apps Script fallback for static PWAs.
+ *
+ * STRICT ONLINE GUARANTEE: Returns `success: false, cloudSynced: false` with the exact cloud error
+ * if the Master Google Sheet does NOT confirm registration.
  */
 export const registerCompanyInCloud = async (
   payload: CloudRegistrationPayload,
   webhookUrl?: string
 ): Promise<CloudRegistrationResult> => {
   const config = getSheetsConfig();
-  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
+  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || DEFAULT_MASTER_WEBHOOK_URL || '').trim();
+  const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+  const clientRequestId = `REQ-SIGNUP-${payload.company_id}-${Date.now()}`;
 
   let serverCloudError = '';
 
@@ -1782,11 +1808,13 @@ export const registerCompanyInCloud = async (
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...payload,
+        clientRequestId,
+        auto_provision: payload.auto_provision !== false,
         full_name: payload.owner_name,
         pin: payload.password,
         webhookUrl: targetUrl || undefined,
       }),
-      signal: AbortSignal.timeout(30000),
+      signal: AbortSignal.timeout(48000),
     });
 
     const data = await res.json().catch(() => null);
@@ -1801,11 +1829,15 @@ export const registerCompanyInCloud = async (
     }
 
     if (res.ok && data && data.cloudSynced === true) {
-      const sid = String(data.sheet_id || data.spreadsheet_id || '').trim();
+      const sid = sanitizeTenantSheetId(
+        data.company_id || payload.company_id,
+        data.sheet_id || data.spreadsheet_id || '',
+        masterSheetId
+      );
       const ep = Number(data.routing_epoch || 1);
-      if (sid) updateTenantSheetBinding(payload.company_id, sid);
-      if (ep > 0) setRoutingEpoch(payload.company_id, ep);
-      if (data.token) setTenantAuthToken(payload.company_id, String(data.token));
+      if (sid) updateTenantSheetBinding(data.company_id || payload.company_id, sid);
+      if (ep > 0) setRoutingEpoch(data.company_id || payload.company_id, ep);
+      if (data.token) setTenantAuthToken(data.company_id || payload.company_id, String(data.token));
 
       return {
         success: true,
@@ -1815,21 +1847,31 @@ export const registerCompanyInCloud = async (
         user_id: data.user_id || payload.user_id,
         sheet_id: sid,
         spreadsheet_id: sid,
-        url: data.url || '',
+        dedicated_sheet_provisioned: Boolean(sid),
+        provisioned_via: data.provisioned_via || '',
+        provision_error: data.provision_error || undefined,
+        activation_code: data.activation_code || undefined,
+        next_billing_date: data.next_billing_date || undefined,
+        url: sid ? (data.url || `https://docs.google.com/spreadsheets/d/${sid}/edit`) : '',
         routing_epoch: ep,
         token: data.token,
         message: data.message || 'Registered and synced to Master Google Sheet.',
       };
     }
 
-    if (data?.cloudError) {
-      serverCloudError = String(data.cloudError);
+    if (data?.cloudError || data?.error || data?.message) {
+      serverCloudError = String(data.cloudError || data.error || data.message);
+    } else if (!res.ok) {
+      serverCloudError = `Server registration proxy returned HTTP ${res.status}`;
     }
   } catch (srvErr: any) {
-    serverCloudError = srvErr?.message || String(srvErr);
+    serverCloudError =
+      srvErr?.name === 'TimeoutError' || srvErr?.name === 'AbortError'
+        ? 'Server registration proxy timed out waiting for Master Google Sheet.'
+        : srvErr?.message || String(srvErr);
   }
 
-  // 2. Fallback: CORS-safe direct Apps Script POST (text/plain avoids OPTIONS preflight)
+  // 2. Fallback: CORS-safe direct Apps Script POST (reusing exact same clientRequestId for idempotency)
   if (targetUrl && targetUrl.startsWith('http')) {
     try {
       const directRes = await fetch(targetUrl, {
@@ -1837,65 +1879,240 @@ export const registerCompanyInCloud = async (
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({
           action: 'signup_company',
-          clientRequestId: `REQ-SIGNUP-${payload.company_id}-${Date.now()}`,
+          clientRequestId,
           ...payload,
+          auto_provision: payload.auto_provision !== false,
           full_name: payload.owner_name,
           pin: payload.password,
         }),
-        signal: AbortSignal.timeout(25000),
+        signal: AbortSignal.timeout(45000),
       });
 
-      if (directRes.ok) {
-        const text = await directRes.text();
-        let data: any = null;
-        try { data = JSON.parse(text); } catch { data = null; }
+      const text = await directRes.text();
+      let data: any = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = null;
+      }
 
-        if (data?.code === 'DUPLICATE_EMAIL') {
-          return {
-            success: false,
-            cloudSynced: false,
-            code: 'DUPLICATE_EMAIL',
-            existingCompanyId: data.existing_company_id,
-            error: data.error || 'An account with this email already exists.',
-          };
-        }
+      if (data?.code === 'DUPLICATE_EMAIL') {
+        return {
+          success: false,
+          cloudSynced: false,
+          code: 'DUPLICATE_EMAIL',
+          existingCompanyId: data.existing_company_id,
+          error: data.error || 'An account with this email already exists.',
+        };
+      }
 
-        if (data && (data.success === true || data.status === 'success')) {
-          const sid = String(data.sheet_id || data.spreadsheet_id || '').trim();
-          const ep = Number(data.routing_epoch || 1);
-          if (sid) updateTenantSheetBinding(payload.company_id, sid);
-          if (ep > 0) setRoutingEpoch(payload.company_id, ep);
-          if (data.token) setTenantAuthToken(payload.company_id, String(data.token));
+      if (directRes.ok && data && (data.success === true || data.status === 'success')) {
+        const sid = sanitizeTenantSheetId(
+          data.company_id || payload.company_id,
+          data.sheet_id || data.spreadsheet_id || '',
+          masterSheetId
+        );
+        const ep = Number(data.routing_epoch || 1);
+        if (sid) updateTenantSheetBinding(data.company_id || payload.company_id, sid);
+        if (ep > 0) setRoutingEpoch(data.company_id || payload.company_id, ep);
+        if (data.token) setTenantAuthToken(data.company_id || payload.company_id, String(data.token));
 
-          return {
-            success: true,
-            cloudSynced: true,
-            company_id: data.company_id || payload.company_id,
-            branch_id: data.branch_id || payload.branch_id,
-            user_id: data.user_id || payload.user_id,
-            sheet_id: sid,
-            spreadsheet_id: sid,
-            url: data.url || '',
-            routing_epoch: ep,
-            token: data.token,
-            message: 'Registered directly in Master Google Sheet.',
-          };
-        }
-        serverCloudError = String(data?.error || data?.message || serverCloudError || 'Master Sheet rejected registration');
+        return {
+          success: true,
+          cloudSynced: true,
+          company_id: data.company_id || payload.company_id,
+          branch_id: data.branch_id || payload.branch_id,
+          user_id: data.user_id || payload.user_id,
+          sheet_id: sid,
+          spreadsheet_id: sid,
+          dedicated_sheet_provisioned: Boolean(sid),
+          provisioned_via: data.provisioned_via || '',
+          provision_error: data.provision_error || undefined,
+          activation_code: data.activation_code || undefined,
+          next_billing_date: data.next_billing_date || undefined,
+          url: sid ? (data.url || `https://docs.google.com/spreadsheets/d/${sid}/edit`) : '',
+          routing_epoch: ep,
+          token: data.token,
+          message: 'Registered directly in Master Google Sheet.',
+        };
+      }
+
+      if (!data && text && text.trim().startsWith('<')) {
+        serverCloudError =
+          'Master Google Apps Script returned an HTML page instead of JSON. Please verify the Web App deployment ("Who has access: Anyone") and Master Webhook URL.';
+      } else {
+        serverCloudError = String(
+          data?.error ||
+            data?.message ||
+            serverCloudError ||
+            `Master Sheet rejected registration (HTTP ${directRes.status})`
+        );
       }
     } catch (directErr: any) {
-      serverCloudError = directErr?.message || String(directErr) || serverCloudError;
+      const directMsg =
+        directErr?.name === 'TimeoutError' || directErr?.name === 'AbortError'
+          ? 'Master Google Apps Script timed out after 45s. Please try again.'
+          : directErr?.message || String(directErr);
+      serverCloudError = serverCloudError ? `${serverCloudError} | Direct fallback: ${directMsg}` : directMsg;
     }
   }
 
+  const finalError =
+    serverCloudError ||
+    'Master Google Sheet webhook is not configured or unreachable. Please check your internet connection and try again.';
+
   return {
-    success: true,
+    success: false,
     cloudSynced: false,
     company_id: payload.company_id,
     branch_id: payload.branch_id,
     user_id: payload.user_id,
-    error: serverCloudError || 'Master Google Sheet webhook is not configured or unreachable.',
-    message: 'Registered locally; queued for automatic Master Sheet sync once cloud is reachable.',
+    error: finalError,
+    message: `Cloud registration failed: ${finalError}`,
+  };
+};
+
+/**
+ * Auto-provision a brand-new DEDICATED Google Sheet for a tenant via Apps Script `allocate_tenant`
+ * (copies TEMPLATE_TENANT or creates a fresh spreadsheet with all operational tabs).
+ * Strictly rejects any response that attempts to assign the Master Sheet ID to a non-master tenant.
+ */
+export const autoProvisionDedicatedTenantSheet = async (
+  company: Pick<Company, 'company_id' | 'company_name' | 'webhook_url'>,
+  webhookUrl?: string
+): Promise<{
+  success: boolean;
+  sheet_id?: string;
+  url?: string;
+  provisioned_via?: string;
+  message: string;
+  error?: string;
+}> => {
+  const config = getSheetsConfig();
+  const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+  const targetWebhook = (
+    webhookUrl ||
+    config.masterWebhookUrl ||
+    company.webhook_url ||
+    config.webhookUrl ||
+    DEFAULT_MASTER_WEBHOOK_URL ||
+    ''
+  ).trim();
+
+  if (isMasterCompanyId(company.company_id)) {
+    return {
+      success: false,
+      error: 'MASTER_COMPANY',
+      message: 'HQ Master company uses the Master Spreadsheet by design.',
+    };
+  }
+
+  let lastError = '';
+
+  // 1. Primary: Server proxy (/api/saas/provision-tenant-sheet)
+  try {
+    const res = await fetch('/api/saas/provision-tenant-sheet', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        company_id: company.company_id,
+        company_name: company.company_name,
+        webhookUrl: targetWebhook || undefined,
+        force_new: true,
+      }),
+      signal: AbortSignal.timeout(48000),
+    });
+
+    const data = await res.json().catch(() => null);
+    if (res.ok && data && data.success) {
+      const safeId = sanitizeTenantSheetId(
+        company.company_id,
+        data.sheet_id || data.spreadsheet_id || '',
+        masterSheetId
+      );
+      if (safeId && safeId.length >= 15) {
+        updateTenantSheetBinding(company.company_id, safeId);
+        if (data.routing_epoch) setRoutingEpoch(company.company_id, Number(data.routing_epoch));
+        return {
+          success: true,
+          sheet_id: safeId,
+          url: data.url || `https://docs.google.com/spreadsheets/d/${safeId}/edit`,
+          provisioned_via: data.provisioned_via || '',
+          message: data.message || `Dedicated Google Sheet provisioned for ${company.company_name}!`,
+        };
+      }
+      lastError = 'Server returned an empty or Master Sheet ID instead of a dedicated tenant sheet.';
+    } else if (data?.error || data?.message) {
+      lastError = String(data.error || data.message);
+    } else {
+      lastError = `Server provisioning endpoint returned HTTP ${res.status}`;
+    }
+  } catch (err: any) {
+    lastError =
+      err?.name === 'TimeoutError' || err?.name === 'AbortError'
+        ? 'Provisioning timed out waiting for Apps Script (48s).'
+        : err?.message || String(err);
+  }
+
+  // 2. Fallback: Direct CORS-safe Apps Script `allocate_tenant` call (sheet_id explicitly blank + force_new: true)
+  if (targetWebhook && targetWebhook.startsWith('http')) {
+    try {
+      const directRes = await fetch(targetWebhook, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'allocate_tenant',
+          clientRequestId: `REQ-PROV-DIRECT-${company.company_id}-${Date.now()}`,
+          company_id: company.company_id,
+          company_name: company.company_name,
+          sheet_id: '',
+          tenant_sheet_id: '',
+          force_new: true,
+        }),
+        signal: AbortSignal.timeout(45000),
+      });
+      const text = await directRes.text();
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+
+      if (directRes.ok && parsed && parsed.success !== false && !parsed.error) {
+        const safeId = sanitizeTenantSheetId(
+          company.company_id,
+          parsed.sheet_id || parsed.spreadsheet_id || '',
+          masterSheetId
+        );
+        if (safeId && safeId.length >= 15) {
+          updateTenantSheetBinding(company.company_id, safeId);
+          if (parsed.routing_epoch) setRoutingEpoch(company.company_id, Number(parsed.routing_epoch));
+          return {
+            success: true,
+            sheet_id: safeId,
+            url: parsed.url || `https://docs.google.com/spreadsheets/d/${safeId}/edit`,
+            provisioned_via: parsed.provisioned_via || '',
+            message: `Provisioned dedicated Google Sheet (${safeId.slice(0, 12)}...) for ${company.company_name}!`,
+          };
+        }
+        lastError =
+          'Apps Script did not return a dedicated tenant spreadsheet ID (rejected Master Sheet assignment). Deploy the latest Code.gs and run setupEnterpriseBackend().';
+      } else if (!parsed && text && text.trim().startsWith('<')) {
+        lastError =
+          'Apps Script returned HTML instead of JSON. Redeploy Code.gs as Web App (Who has access: Anyone).';
+      } else if (parsed?.error || parsed?.message) {
+        lastError = String(parsed.error || parsed.message);
+      }
+    } catch (directErr: any) {
+      if (!lastError) lastError = directErr?.message || String(directErr);
+    }
+  }
+
+  return {
+    success: false,
+    error: lastError || 'Failed to auto-provision dedicated Google Sheet.',
+    message: `Auto-provisioning failed: ${lastError || 'Could not reach Master Google Apps Script. Please try again.'}`,
   };
 };
 

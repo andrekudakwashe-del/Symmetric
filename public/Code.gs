@@ -597,10 +597,31 @@ function resolveTenantSpreadsheetStrict(spreadsheetId, companyId) {
   }
 }
 
+function isMasterCompanyId_(companyId) {
+  var c = String(companyId || "").trim().toUpperCase();
+  return c === "COMP-001" || c === "COMP-MASTER";
+}
+
+function isMasterSpreadsheetId_(sheetId, masterSs) {
+  var id = String(sheetId || "").trim();
+  if (!id) return false;
+  if (id === "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE") return true;
+  try {
+    if (masterSs && masterSs.getId() === id) return true;
+  } catch (e) {}
+  return false;
+}
+
 function resolveTargetSpreadsheet(masterSs, company_id, explicitSheetId) {
   var sheetId = String(explicitSheetId || "").trim();
+  if (sheetId && !isMasterCompanyId_(company_id) && isMasterSpreadsheetId_(sheetId, masterSs)) {
+    sheetId = "";
+  }
   if (!sheetId && company_id) {
-    sheetId = getSheetId(company_id, masterSs);
+    var storedId = getSheetId(company_id, masterSs);
+    if (storedId && (isMasterCompanyId_(company_id) || !isMasterSpreadsheetId_(storedId, masterSs))) {
+      sheetId = storedId;
+    }
   }
   if (sheetId && sheetId.length >= 15) {
     try {
@@ -1962,17 +1983,17 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
     case "stocktake_session":
       obj.SessionID = entityId;
       obj.Title = d.title || d.sessionName || entityId;
-      obj.Mode = d.mode || d.stocktakeType || "BLIND_DOUBLE_COUNT";
-      obj.Status = d.status || "IN_PROGRESS";
+      obj.Mode = d.mode || d.stocktakeType || d.countType || "BLIND_DOUBLE_COUNT";
+      obj.Status = d.status || "DRAFT";
       obj.StartedAt = d.startedAt || d.timestamp || isoClientUpdated;
       obj.StartedBy = d.startedBy || d.createdByName || "";
-      obj.AuditorID = d.auditorId || "";
-      obj.AuditorName = d.auditorName || "";
-      obj.LockdownRequired = Boolean(d.lockdownRequired || d.isLockdown);
-      obj.VarianceThreshold = d.varianceThreshold !== undefined ? d.varianceThreshold : "";
-      obj.CommentsDueBy = d.commentsDueBy || "";
-      obj.CommittedAt = d.committedAt || "";
-      obj.CommittedBy = d.committedBy || "";
+      obj.AuditorID = d.stocktakeAuditorId || d.auditorId || "";
+      obj.AuditorName = d.stocktakeAuditorName || d.auditorName || "";
+      obj.LockdownRequired = Boolean(d.lockdownRequested || d.lockdownRequired || d.isLockdownActive || d.isLockdown);
+      obj.VarianceThreshold = d.varianceThreshold !== undefined ? d.varianceThreshold : (d.varianceMaterialityThreshold !== undefined ? d.varianceMaterialityThreshold : "");
+      obj.CommentsDueBy = d.commentsDueBy || d.varianceCommentDeadline || "";
+      obj.CommittedAt = d.committedAt || d.approvedAt || "";
+      obj.CommittedBy = d.committedBy || d.approvedByName || d.approvedBy || "";
       obj.VarianceCommentsJSON = JSON.stringify(d.varianceComments || []);
       obj.UpdatedAt = isoClientUpdated;
       break;
@@ -2054,7 +2075,27 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
   obj.is_deleted = envelope.action === "DELETE" || Boolean(d && d.isDeleted);
   obj.server_received_at = metaObj.server_received_at || isoServerNow;
   obj.suspicious_backdate = Boolean(metaObj.suspicious_backdate);
-  obj.payload_json = JSON.stringify(cleanPayload);
+  var serializedPayload = JSON.stringify(cleanPayload);
+  // Google Sheets hard cell limit is 50,000 characters. For large stocktake sessions, compact nested
+  // blind count1/count2 arrays (which are already stored safely in StocktakeBlindVault / StocktakeSegments).
+  if (serializedPayload.length > 48000 && entityType === "stocktake_session" && cleanPayload && Array.isArray(cleanPayload.segments)) {
+    var compactPayload = {};
+    for (var pk in cleanPayload) {
+      if (cleanPayload.hasOwnProperty(pk)) compactPayload[pk] = cleanPayload[pk];
+    }
+    compactPayload.segments = cleanPayload.segments.map(function (seg) {
+      if (!seg || typeof seg !== "object") return seg;
+      var sCopy = {};
+      for (var sk in seg) {
+        if (seg.hasOwnProperty(sk)) sCopy[sk] = seg[sk];
+      }
+      if (Array.isArray(sCopy.count1) && sCopy.count1.length > 0) sCopy.count1 = [];
+      if (Array.isArray(sCopy.count2) && sCopy.count2.length > 0) sCopy.count2 = [];
+      return sCopy;
+    });
+    serializedPayload = JSON.stringify(compactPayload);
+  }
+  obj.payload_json = serializedPayload;
 
   return obj;
 }
@@ -2237,12 +2278,13 @@ function getAllTombstonesMap(ss, companyId) {
 }
 
 function checkActiveStocktakeSessionConflict(ss, companyId, branchId, incomingSessionId, incomingStatus, tombsMapOpt) {
+  // DRAFT & SCHEDULED sessions sync freely across branches without consuming the single live slot.
+  // PAUSED sessions retain the branch's live execution slot until resumed or archived.
   var activeStatuses = {
     "ACTIVE": true,
-    "DRAFT": true,
-    "SCHEDULED": true,
     "IN_PROGRESS": true,
     "COUNTING": true,
+    "PAUSED": true,
     "RECOUNT": true,
     "RECOUNTING": true,
     "AUDIT_REVIEW": true,
@@ -2250,7 +2292,7 @@ function checkActiveStocktakeSessionConflict(ss, companyId, branchId, incomingSe
     "PENDING_SIGNOFF": true,
     "READY_FOR_COMMITTAL": true
   };
-  var statusUpper = String(incomingStatus || "IN_PROGRESS").toUpperCase();
+  var statusUpper = String(incomingStatus || "DRAFT").toUpperCase();
   if (!activeStatuses[statusUpper]) return null;
   var sheet = ss.getSheetByName("StocktakeSessions");
   if (!sheet || sheet.getLastRow() < 2) return null;
@@ -3404,11 +3446,24 @@ function provisionTenantFromTemplate(req, masterSs) {
   var companyName = String(d.company_name || req.company_name || TENANT_COMPANY_NAME).trim();
   var explicitSheetId = String(req.tenant_sheet_id || req.sheet_id || d.sheet_id || "").trim();
   var folderId = String(d.folder_id || req.folder_id || "").trim();
+  var forceNew = d.force_new === true || req.force_new === true || String(d.force_new || req.force_new || "").toLowerCase() === "true";
   var cfg = getSystemConfigCached(masterSs);
   var tplId = String(cfg.TEMPLATE_TENANT_ID || PropertiesService.getScriptProperties().getProperty("TEMPLATE_TENANT_ID") || "").trim();
   var nowIso = new Date().toISOString();
 
-  // Case 1: Caller explicitly passed an existing Sheet ID (manual bind / Initialize Tabs)
+  // CRITICAL GUARD: Never allow a non-master tenant to be bound to the Master Spreadsheet!
+  // Also reject folderId if it was mistakenly set to the Master Spreadsheet ID.
+  if (explicitSheetId && !isMasterCompanyId_(companyId) && isMasterSpreadsheetId_(explicitSheetId, masterSs)) {
+    explicitSheetId = "";
+  }
+  if (forceNew) {
+    explicitSheetId = "";
+  }
+  if (folderId && isMasterSpreadsheetId_(folderId, masterSs)) {
+    folderId = "";
+  }
+
+  // Case 1: Caller explicitly passed an existing dedicated Sheet ID (manual bind / Initialize Tabs)
   if (explicitSheetId && explicitSheetId.length >= 15) {
     var existingSs = SpreadsheetApp.openById(explicitSheetId);
     var createdExplicit = setupTenantSpreadsheetTabs(existingSs, companyId, companyName);
@@ -3442,29 +3497,45 @@ function provisionTenantFromTemplate(req, masterSs) {
       routing_epoch: epochEx,
       schema_version: CURRENT_TENANT_SCHEMA_VERSION,
       createdTabs: createdExplicit,
+      provisioned_via: "EXPLICIT_DEDICATED_BIND",
       message: "Initialized tenant spreadsheet V7.0 cleanly."
     };
   }
 
-  // Case 2: Instant ~2s makeCopy provisioning from TEMPLATE_TENANT_ID (or fresh SpreadsheetApp.create fallback)
+  // Case 2: Instant ~2s makeCopy provisioning from TEMPLATE_TENANT_ID (with automatic fresh SpreadsheetApp.create fallback)
   var newFileId = "";
   var targetSs = null;
+  var provisionedVia = "FRESH_CREATE";
   var newName = "Saimetric_POS_" + companyId + "_" + companyName.replace(/[^A-Za-z0-9_-]+/g, "_").slice(0, 32);
 
-  if (tplId) {
-    var tplFile = DriveApp.getFileById(tplId);
-    var copyFile = null;
-    if (folderId) {
-      var targetFolder = DriveApp.getFolderById(folderId);
-      copyFile = tplFile.makeCopy(newName, targetFolder);
-    } else {
-      copyFile = tplFile.makeCopy(newName);
+  if (tplId && !isMasterSpreadsheetId_(tplId, masterSs)) {
+    try {
+      var tplFile = DriveApp.getFileById(tplId);
+      var copyFile = null;
+      if (folderId) {
+        try {
+          var targetFolder = DriveApp.getFolderById(folderId);
+          copyFile = tplFile.makeCopy(newName, targetFolder);
+        } catch (folderErr) {
+          copyFile = tplFile.makeCopy(newName);
+        }
+      } else {
+        copyFile = tplFile.makeCopy(newName);
+      }
+      newFileId = copyFile.getId();
+      targetSs = SpreadsheetApp.openById(newFileId);
+      provisionedVia = "TEMPLATE_MAKECOPY";
+    } catch (tplErr) {
+      // Fallback to fresh spreadsheet creation if template ID is stale or inaccessible
+      newFileId = "";
+      targetSs = null;
     }
-    newFileId = copyFile.getId();
-    targetSs = SpreadsheetApp.openById(newFileId);
-  } else {
+  }
+
+  if (!targetSs || !newFileId) {
     targetSs = SpreadsheetApp.create(newName);
     newFileId = targetSs.getId();
+    provisionedVia = "FRESH_CREATE";
     setupTenantSpreadsheetTabs(targetSs, companyId, companyName);
     var s1 = targetSs.getSheetByName("Sheet1");
     if (s1 && targetSs.getSheets().length > 1) {
@@ -3476,6 +3547,14 @@ function provisionTenantFromTemplate(req, masterSs) {
         fObj.moveTo(DriveApp.getFolderById(folderId));
       } catch (eMove) {}
     }
+  }
+
+  // Safety check: newly created spreadsheet must NEVER be the Master Spreadsheet
+  if (isMasterSpreadsheetId_(newFileId, masterSs)) {
+    return {
+      success: false,
+      error: "Provisioning guard prevented assigning Master Spreadsheet to tenant " + companyId
+    };
   }
 
   // Two-phase commit with Drive trash rollback if Master update fails
@@ -3514,7 +3593,7 @@ function provisionTenantFromTemplate(req, masterSs) {
       url: targetSs.getUrl(),
       routing_epoch: 1,
       schema_version: CURRENT_TENANT_SCHEMA_VERSION,
-      provisioned_via: tplId ? "TEMPLATE_MAKECOPY" : "FRESH_CREATE",
+      provisioned_via: provisionedVia,
       message: "Provisioned dedicated tenant spreadsheet cleanly."
     };
   } catch (commitErr) {
@@ -3761,6 +3840,15 @@ function handleSignup(req, ss) {
   var seq = allocateNextServerSeq(ss, companyId);
   var pwHash = hashPasswordSha256(password);
 
+  var safeIncomingSheetId = String(d.sheet_id || "").trim();
+  if (safeIncomingSheetId && !isMasterCompanyId_(companyId) && isMasterSpreadsheetId_(safeIncomingSheetId, ss)) {
+    safeIncomingSheetId = "";
+  }
+  var safeIncomingFolderId = String(d.folder_id || "").trim();
+  if (safeIncomingFolderId && isMasterSpreadsheetId_(safeIncomingFolderId, ss)) {
+    safeIncomingFolderId = "";
+  }
+
   var compRow = {
     company_id: companyId,
     company_name: companyName,
@@ -3775,10 +3863,10 @@ function handleSignup(req, ss) {
     expiry: trialEnd,
     trial_start_date: nowIso.split("T")[0],
     next_billing_date: trialEnd,
-    sheet_id: d.sheet_id || "",
-    url: d.sheet_id ? ("https://docs.google.com/spreadsheets/d/" + d.sheet_id + "/edit") : "",
+    sheet_id: safeIncomingSheetId,
+    url: safeIncomingSheetId ? ("https://docs.google.com/spreadsheets/d/" + safeIncomingSheetId + "/edit") : "",
     routing_epoch: 1,
-    provisioned_date: d.sheet_id ? nowIso.split("T")[0] : "",
+    provisioned_date: safeIncomingSheetId ? nowIso.split("T")[0] : "",
     webhook_url: d.webhook_url || "",
     branch_isolation_mode: d.branch_isolation_mode || "ROW_LEVEL",
     activation_code: activationCode,
@@ -3854,10 +3942,23 @@ function handleSignup(req, ss) {
 
   var perms = getSeedPermissions52();
   var pSheet = backfillSchemaColumns(ss, "permissions");
-  var pHeaders = pSheet.getRange(1, 1, 1, pSheet.getLastColumn()).getValues()[0];
+  var pLastCol = pSheet.getLastColumn();
+  var pLastRow = pSheet.getLastRow();
+  var pHeaders = pSheet.getRange(1, 1, 1, pLastCol).getValues()[0];
+  var existingPermMap = {};
+  if (pLastRow >= 2) {
+    var pIdCol = pHeaders.indexOf("perm_id");
+    if (pIdCol !== -1) {
+      var pIdVals = pSheet.getRange(2, pIdCol + 1, pLastRow - 1, 1).getValues();
+      for (var ep = 0; ep < pIdVals.length; ep++) {
+        var key = String(pIdVals[ep][0] || "").trim();
+        if (key) existingPermMap[key] = ep + 2;
+      }
+    }
+  }
+  var newPermRows = [];
   for (var p = 0; p < perms.length; p++) {
     var pId = companyId + "-" + p;
-    var existingPermRow = findRowIndexInSheet(pSheet, pHeaders, ["perm_id"], pId, companyId);
     var pObj = {
       perm_id: pId,
       company_id: companyId,
@@ -3868,28 +3969,48 @@ function handleSignup(req, ss) {
       description: perms[p].description || "",
       updated_at: nowIso
     };
-    if (existingPermRow > 0) updateRowByHeaders(pSheet, existingPermRow, pHeaders, pObj);
-    else writeRowByHeaders(pSheet, pHeaders, pObj);
+    var existingPermRow = existingPermMap[pId] || -1;
+    if (existingPermRow > 0) {
+      updateRowByHeaders(pSheet, existingPermRow, pHeaders, pObj);
+    } else {
+      var rowArr = [];
+      for (var hc = 0; hc < pHeaders.length; hc++) {
+        var hKey = String(pHeaders[hc] || "").trim();
+        rowArr.push(pObj.hasOwnProperty(hKey) ? pObj[hKey] : "");
+      }
+      newPermRows.push(rowArr);
+    }
+  }
+  if (newPermRows.length > 0) {
+    pSheet.getRange(pSheet.getLastRow() + 1, 1, newPermRows.length, pHeaders.length).setValues(newPermRows);
   }
 
-  // Auto-provision dedicated tenant spreadsheet via template makeCopy when auto_provision != false and template/sheet requested
+  // Always auto-provision a dedicated tenant spreadsheet (via TEMPLATE_TENANT makeCopy or fresh SpreadsheetApp.create fallback)
+  // unless explicitly opted out via auto_provision === false
   var provisionedInfo = null;
-  var cfg = getSystemConfigCached(ss);
-  if (d.auto_provision !== false && (d.sheet_id || cfg.TEMPLATE_TENANT_ID)) {
+  var provisionError = "";
+  if (d.auto_provision !== false) {
     try {
       var prov = provisionTenantFromTemplate({
         company_id: companyId,
         company_name: companyName,
-        sheet_id: d.sheet_id || "",
-        folder_id: d.folder_id || ""
+        sheet_id: safeIncomingSheetId,
+        folder_id: safeIncomingFolderId
       }, ss);
-      if (prov && prov.success) {
+      if (prov && prov.success && prov.sheet_id && (isMasterCompanyId_(companyId) || !isMasterSpreadsheetId_(prov.sheet_id, ss))) {
         provisionedInfo = prov;
+      } else if (prov && prov.error) {
+        provisionError = String(prov.error);
       }
-    } catch (provErr) {}
+    } catch (provErr) {
+      provisionError = provErr && provErr.message ? String(provErr.message) : String(provErr);
+    }
   }
 
-  var finalSheetId = (provisionedInfo && provisionedInfo.sheet_id) || d.sheet_id || "";
+  var finalSheetId = (provisionedInfo && provisionedInfo.sheet_id) || safeIncomingSheetId || "";
+  if (finalSheetId && !isMasterCompanyId_(companyId) && isMasterSpreadsheetId_(finalSheetId, ss)) {
+    finalSheetId = "";
+  }
   var finalEpoch = (provisionedInfo && provisionedInfo.routing_epoch) || 1;
   var jwtToken = signJwt({
     sub: ownerUserId,
@@ -3914,6 +4035,9 @@ function handleSignup(req, ss) {
     owner_email: ownerEmail,
     sheet_id: finalSheetId,
     spreadsheet_id: finalSheetId,
+    dedicated_sheet_provisioned: Boolean(finalSheetId && (isMasterCompanyId_(companyId) || !isMasterSpreadsheetId_(finalSheetId, ss))),
+    provisioned_via: (provisionedInfo && provisionedInfo.provisioned_via) || "",
+    provision_error: provisionError || undefined,
     url: (provisionedInfo && provisionedInfo.url) || compRow.url || "",
     routing_epoch: finalEpoch,
     schema_version: CURRENT_TENANT_SCHEMA_VERSION,
@@ -4922,9 +5046,30 @@ function handleSyncCompany(req, ss) {
     }
   }
 
+  // Never let a non-master tenant sync overwrite its sheet_id with the Master Sheet ID
+  var sanitizedSheetId = String(d.sheet_id || "").trim();
+  if (!isMasterCompanyId_(companyId) && isMasterSpreadsheetId_(sanitizedSheetId, ss)) {
+    sanitizedSheetId = "";
+  }
+  if (!sanitizedSheetId && existingRow > 0) {
+    var sheetIdx = headers.indexOf("sheet_id");
+    if (sheetIdx !== -1) {
+      var existingSheetVal = String(cSheet.getRange(existingRow, sheetIdx + 1).getValue() || "").trim();
+      if (existingSheetVal && (isMasterCompanyId_(companyId) || !isMasterSpreadsheetId_(existingSheetVal, ss))) {
+        sanitizedSheetId = existingSheetVal;
+      }
+    }
+  }
+  var sanitizedFolderId = String(d.sheet_folder_id || "").trim();
+  if (isMasterSpreadsheetId_(sanitizedFolderId, ss)) {
+    sanitizedFolderId = "";
+  }
+
   var rowObj = {
     ...d,
     company_id: companyId,
+    sheet_id: sanitizedSheetId,
+    sheet_folder_id: sanitizedFolderId,
     owner_email: String(d.owner_email || (d.owner && d.owner.email) || "").trim().toLowerCase(),
     owner_name: String(d.owner_name || (d.owner && (d.owner.name || d.owner.full_name)) || "").trim(),
     ...(resolvedPwHash ? { password_hash: resolvedPwHash } : {}),

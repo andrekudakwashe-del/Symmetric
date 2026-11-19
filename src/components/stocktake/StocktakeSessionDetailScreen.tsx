@@ -34,6 +34,9 @@ import {
   ClipboardCheck,
   ArrowRight,
   Pause,
+  Play,
+  Archive,
+  FileEdit,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -44,6 +47,12 @@ import {
 import {
   addStocktakeSegment,
   deleteStocktakeSegment,
+  deleteStocktakeSession,
+  activateStocktakeSession,
+  pauseStocktakeSession,
+  resumeStocktakeSession,
+  archiveStocktakeSession,
+  restoreArchivedDraftSession,
   submitSegmentCount,
   resolveSegmentRecount,
   consolidateStocktakeSession,
@@ -72,6 +81,10 @@ import {
   isStocktakeLeader,
   isStocktakeAuditor,
   canClaimSegmentSlot,
+  isDraftStocktakeStatus,
+  isPausedStocktakeStatus,
+  isArchivedOrClosedStocktakeStatus,
+  isCountingPhaseStatus,
 } from '../../services/stocktakeAccessService';
 import { meshSyncService } from '../../services/meshSyncService';
 import { DoubleCountTerminal } from './DoubleCountTerminal';
@@ -117,7 +130,19 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   const [session, setSession] = useState<StocktakeSession>(initialSession);
   const persona = resolveStocktakePersona(currentUser, session);
   const isApproved = session.status === 'APPROVED_POSTED';
+  const isDraft = isDraftStocktakeStatus(session.status);
+  const isPaused = isPausedStocktakeStatus(session.status);
+  const isArchivedOrClosed = isArchivedOrClosedStocktakeStatus(session.status);
+  const isCountable = isCountingPhaseStatus(session.status);
   const isBlindCounter = persona === 'COUNTER';
+
+  // Lifecycle modals (Pause / Archive / Delete Draft)
+  const [showPauseModal, setShowPauseModal] = useState(false);
+  const [pauseReasonInput, setPauseReasonInput] = useState('');
+  const [unlockPosOnPause, setUnlockPosOnPause] = useState(false);
+  const [showArchiveModal, setShowArchiveModal] = useState(false);
+  const [archiveReasonInput, setArchiveReasonInput] = useState('');
+  const [confirmDeleteDraft, setConfirmDeleteDraft] = useState(false);
   const canManageStructure = persona === 'LEADER' || persona === 'AUDITOR';
 
   const allowedTabs: DetailTab[] = (() => {
@@ -273,8 +298,21 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     }
   };
 
-  // Launch Double-Count Terminal for a segment (Enforcing Cross-Slot Blind Isolation)
+  // Launch Double-Count Terminal for a segment (Enforcing Cross-Slot Blind Isolation & Active Counting Phase)
   const handleLaunchTerminal = (segment: StocktakeSegment, slot: 'A' | 'B') => {
+    const isSlotAlreadyFinal = slot === 'A' ? Boolean(segment.count1Finalized) : Boolean(segment.count2Finalized);
+    if (!isCountable && (isBlindCounter || !isSlotAlreadyFinal)) {
+      showToast(
+        isDraft
+          ? 'This stocktake is still in DRAFT. Activate the session before counting can begin.'
+          : isPaused
+          ? `Stocktake is PAUSED${session.pauseReason ? ` (${session.pauseReason})` : ''}. Resume the session before continuing counts.`
+          : 'This stocktake session is closed/archived and read-only.',
+        true
+      );
+      return;
+    }
+
     const zoneAssignments = getZoneAssignments(session.sessionId);
     const zone = zoneAssignments.find((z) => z.zoneId === segment.segmentId);
     const mergedSeg = {
@@ -338,6 +376,18 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
   }, [session.sessionId]);
 
   const handleClaimZone = (segment: StocktakeSegment, slot: 'A' | 'B') => {
+    if (!isCountable) {
+      showToast(
+        isDraft
+          ? 'This stocktake is still in DRAFT. Activate the session before counters can claim zones.'
+          : isPaused
+          ? `Stocktake is PAUSED${session.pauseReason ? ` (${session.pauseReason})` : ''}. Resume counting before claiming zones.`
+          : 'This stocktake session is archived/closed and cannot be modified.',
+        true
+      );
+      return;
+    }
+
     const staffId = currentUser?.id || '001';
     const staffName = currentUser?.name || (slot === 'A' ? 'Counter A' : 'Counter B');
     const zoneAssignments = getZoneAssignments(session.sessionId);
@@ -585,6 +635,128 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     }
   };
 
+  // Lifecycle Action Handlers: Activate / Pause / Resume / Archive / Restore / Delete Draft
+  const handleActivateSession = () => {
+    const actorId = currentUser?.id || '001';
+    const actorName = currentUser?.name || 'Supervisor';
+    const res = activateStocktakeSession(session.sessionId, actorId, actorName);
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      if (res.lockdownChanged && res.session.isLockdownActive) {
+        meshSyncService.broadcastStocktakeLockdown(
+          res.session.branchId,
+          res.session.sessionId,
+          true,
+          actorName,
+          `Lockdown activated for ${res.session.title}`,
+          actorId
+        );
+      }
+      refreshSession(res.session);
+      showToast(res.message);
+    } else {
+      showToast(res.message, true);
+    }
+  };
+
+  const handleConfirmPauseSession = (e: React.FormEvent) => {
+    e.preventDefault();
+    const actorId = currentUser?.id || '001';
+    const actorName = currentUser?.name || 'Supervisor';
+    const res = pauseStocktakeSession(session.sessionId, actorId, actorName, pauseReasonInput, {
+      unlockPosDuringPause: unlockPosOnPause,
+    });
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      if (res.lockdownChanged) {
+        meshSyncService.broadcastStocktakeLockdown(
+          res.session.branchId,
+          res.session.sessionId,
+          false,
+          actorName,
+          `POS temporarily unlocked while stocktake ${res.session.sessionId} is paused: ${pauseReasonInput.trim()}`,
+          actorId
+        );
+      }
+      refreshSession(res.session);
+      setShowPauseModal(false);
+      setPauseReasonInput('');
+      setUnlockPosOnPause(false);
+      showToast(res.message);
+    } else {
+      showToast(res.message, true);
+    }
+  };
+
+  const handleResumeSession = () => {
+    const actorId = currentUser?.id || '001';
+    const actorName = currentUser?.name || 'Supervisor';
+    const res = resumeStocktakeSession(session.sessionId, actorId, actorName);
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      if (res.lockdownChanged && res.session.isLockdownActive) {
+        meshSyncService.broadcastStocktakeLockdown(
+          res.session.branchId,
+          res.session.sessionId,
+          true,
+          actorName,
+          `POS lockdown re-engaged upon resuming stocktake ${res.session.sessionId}`,
+          actorId
+        );
+      }
+      refreshSession(res.session);
+      showToast(res.message);
+    } else {
+      showToast(res.message, true);
+    }
+  };
+
+  const handleConfirmArchiveSession = (e: React.FormEvent) => {
+    e.preventDefault();
+    const actorId = currentUser?.id || '001';
+    const actorName = currentUser?.name || 'Supervisor';
+    const res = archiveStocktakeSession(session.sessionId, actorId, actorName, archiveReasonInput);
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      meshSyncService.broadcastCasualWorkers(getTemporaryCasuals());
+      if (res.lockdownReleased) {
+        meshSyncService.broadcastStocktakeLockdown(
+          res.session.branchId,
+          res.session.sessionId,
+          false,
+          actorName,
+          `Stocktake ${res.session.sessionId} archived — branch lockdown released.`,
+          actorId
+        );
+      }
+      refreshSession(res.session);
+      setShowArchiveModal(false);
+      setArchiveReasonInput('');
+      showToast(res.message);
+    } else {
+      showToast(res.message, true);
+    }
+  };
+
+  const handleRestoreDraftSession = () => {
+    const actorId = currentUser?.id || '001';
+    const actorName = currentUser?.name || 'Supervisor';
+    const res = restoreArchivedDraftSession(session.sessionId, actorId, actorName);
+    if (res.success && res.session) {
+      meshSyncService.broadcastStocktakeSession(res.session);
+      refreshSession(res.session);
+      showToast(res.message);
+    } else {
+      showToast(res.message, true);
+    }
+  };
+
+  const handleDeleteDraftSession = () => {
+    deleteStocktakeSession(session.sessionId);
+    setConfirmDeleteDraft(false);
+    onBack();
+  };
+
   // Lightweight local draft summary reader (supports sparse_v2 and legacy full-array drafts)
   const getLocalDraftCount = (segmentId: string, slot: 'A' | 'B'): number => {
     try {
@@ -698,14 +870,20 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                   className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${
                     session.status === 'APPROVED_POSTED'
                       ? 'bg-emerald-950 text-emerald-300 border-emerald-800'
+                      : isDraft
+                      ? 'bg-indigo-950 text-indigo-300 border-indigo-700'
+                      : isPaused
+                      ? 'bg-amber-950 text-amber-300 border-amber-600'
+                      : session.status === 'ARCHIVED' || session.status === 'CANCELLED'
+                      ? 'bg-slate-800 text-slate-400 border-slate-700'
                       : session.status === 'CONSOLIDATED'
                       ? 'bg-blue-950 text-blue-300 border-blue-800'
                       : session.status === 'RECOUNTING'
                       ? 'bg-amber-950 text-amber-300 border-amber-800 animate-pulse'
-                      : 'bg-slate-800 text-slate-300 border-slate-700'
+                      : 'bg-emerald-950/70 text-emerald-300 border-emerald-700'
                   }`}
                 >
-                  {String(session.status || 'COUNTING').replace(/_/g, ' ')}
+                  {isDraft ? 'DRAFT • SYNCED' : isPaused ? 'PAUSED' : String(session.status || 'COUNTING').replace(/_/g, ' ')}
                 </span>
               </div>
               <div className="text-xs text-slate-400 mt-1 flex flex-wrap items-center gap-4">
@@ -730,8 +908,99 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
             </div>
           </div>
 
-          {/* Action Hub (Strict Two-Man Integrity) */}
+          {/* Action Hub (Lifecycle Controls + Strict Two-Man Integrity) */}
           <div className="flex flex-wrap items-center gap-2">
+            {/* DRAFT Lifecycle Actions */}
+            {isDraft && canManageStructure && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleActivateSession}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-emerald-900/30 flex items-center gap-2 transition"
+                >
+                  <Play className="w-4 h-4" />
+                  Activate &amp; Start Counting
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setArchiveReasonInput('');
+                    setShowArchiveModal(true);
+                  }}
+                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                >
+                  <Archive className="w-3.5 h-3.5" />
+                  Archive Draft
+                </button>
+              </>
+            )}
+
+            {/* PAUSED Lifecycle Actions */}
+            {isPaused && canManageStructure && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleResumeSession}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-emerald-900/30 flex items-center gap-2 transition"
+                >
+                  <Play className="w-4 h-4" />
+                  Resume Stocktake
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setArchiveReasonInput('');
+                    setShowArchiveModal(true);
+                  }}
+                  className="px-3 py-2 bg-slate-800 hover:bg-rose-950 text-slate-200 hover:text-rose-200 border border-slate-700 hover:border-rose-700 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                >
+                  <Archive className="w-3.5 h-3.5" />
+                  Cancel &amp; Archive
+                </button>
+              </>
+            )}
+
+            {/* LIVE Lifecycle Actions (Pause / Archive) */}
+            {!isDraft && !isPaused && !isArchivedOrClosed && canManageStructure && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPauseReasonInput('');
+                    setUnlockPosOnPause(false);
+                    setShowPauseModal(true);
+                  }}
+                  className="px-3 py-2 bg-amber-950/80 hover:bg-amber-900 text-amber-200 border border-amber-700/80 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                >
+                  <Pause className="w-3.5 h-3.5 text-amber-400" />
+                  Pause Stocktake
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setArchiveReasonInput('');
+                    setShowArchiveModal(true);
+                  }}
+                  className="px-3 py-2 bg-slate-800 hover:bg-rose-950 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-700 rounded-xl text-xs font-bold flex items-center gap-1.5 transition"
+                >
+                  <Archive className="w-3.5 h-3.5" />
+                  Cancel &amp; Archive
+                </button>
+              </>
+            )}
+
+            {/* ARCHIVED Never-Activated Restore Action */}
+            {session.status === 'ARCHIVED' && !session.everActivated && canManageStructure && (
+              <button
+                type="button"
+                onClick={handleRestoreDraftSession}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold shadow-lg flex items-center gap-1.5 transition"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Restore to Draft
+              </button>
+            )}
+
             {session.certifiedByName && !isApproved && (
               <span className="px-3 py-1.5 rounded-xl bg-amber-950/70 border border-amber-700/70 text-amber-200 text-xs font-bold flex items-center gap-1.5">
                 <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
@@ -739,17 +1008,20 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
               </span>
             )}
 
-            {!isApproved && allSegmentsVerified && canManageStructure && (
+            {!isApproved && !isDraft && !isPaused && !isArchivedOrClosed && allSegmentsVerified && canManageStructure && (
               <button
                 onClick={handleConsolidate}
                 className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-900/30 flex items-center gap-2 transition"
               >
                 <Layers className="w-4 h-4" />
-                Consolidate & Compare SOH
+                Consolidate &amp; Compare SOH
               </button>
             )}
 
             {!isApproved &&
+              !isDraft &&
+              !isPaused &&
+              !isArchivedOrClosed &&
               session.consolidatedItems &&
               session.consolidatedItems.length > 0 &&
               persona === 'AUDITOR' &&
@@ -764,6 +1036,9 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
               )}
 
             {!isApproved &&
+              !isDraft &&
+              !isPaused &&
+              !isArchivedOrClosed &&
               session.consolidatedItems &&
               session.consolidatedItems.length > 0 &&
               persona === 'LEADER' && (
@@ -776,7 +1051,7 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                   }`}
                 >
                   <ShieldCheck className="w-4 h-4" />
-                  Authorize & Commit Stock
+                  Authorize &amp; Commit Stock
                 </button>
               )}
 
@@ -847,6 +1122,149 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl mx-auto w-full p-6 space-y-6">
+        {/* LIFECYCLE STATE BANNERS (DRAFT / PAUSED / ARCHIVED) */}
+        {isDraft && (
+          <div className="bg-indigo-950/60 border border-indigo-600/60 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4 shadow-lg">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 flex items-center justify-center shrink-0">
+                <FileEdit className="w-5 h-5" />
+              </div>
+              <div className="text-xs">
+                <h3 className="text-sm font-bold text-white">
+                  Draft Stocktake Session — Synced Across Devices
+                </h3>
+                <p className="text-indigo-200/90 mt-0.5 max-w-2xl">
+                  Floor zones, auditor assignments, and casual worker PINs can be prepared now and synced freely.
+                  <strong> Counting terminals remain locked</strong> until an Auditor or Leader activates this session.
+                  {session.lockdownRequested && ' Branch POS Lockdown is armed and will engage automatically upon activation.'}
+                </p>
+              </div>
+            </div>
+            {canManageStructure && (
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleActivateSession}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md transition"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  Activate &amp; Start Counting
+                </button>
+                {!session.everActivated &&
+                  (confirmDeleteDraft ? (
+                    <div className="inline-flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={handleDeleteDraftSession}
+                        className="px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold"
+                      >
+                        Confirm Delete
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteDraft(false)}
+                        className="px-3 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteDraft(true)}
+                      className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-rose-950 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-700 text-xs font-bold flex items-center gap-1.5 transition"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Delete Draft
+                    </button>
+                  ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {isPaused && (
+          <div className="bg-amber-950/60 border border-amber-600/70 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4 shadow-lg">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-amber-500/20 border border-amber-500/40 text-amber-300 flex items-center justify-center shrink-0">
+                <Pause className="w-5 h-5" />
+              </div>
+              <div className="text-xs space-y-0.5">
+                <h3 className="text-sm font-bold text-amber-100">
+                  Stocktake Paused — Counting Terminals Locked
+                </h3>
+                <p className="text-amber-200/90">
+                  Paused by <strong>{session.pausedByName || 'Auditor'}</strong>
+                  {session.pausedAt ? ` on ${new Date(session.pausedAt).toLocaleString()}` : ''}.
+                  {session.pauseReason ? ` Reason: "${session.pauseReason}"` : ''}
+                </p>
+                <p className="text-[11px] text-amber-300/80">
+                  {session.isLockdownActive
+                    ? 'POS Lockdown remains enforced while paused.'
+                    : 'POS tills are temporarily unlocked for trading during this pause.'}{' '}
+                  All recorded counts are preserved safely.
+                  {Array.isArray(session.pauseHistory) && session.pauseHistory.length > 0
+                    ? ` (${session.pauseHistory.length} pause event${session.pauseHistory.length === 1 ? '' : 's'} logged)`
+                    : ''}
+                </p>
+              </div>
+            </div>
+            {canManageStructure && (
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleResumeSession}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md transition"
+                >
+                  <Play className="w-3.5 h-3.5" />
+                  Resume Stocktake
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setArchiveReasonInput('');
+                    setShowArchiveModal(true);
+                  }}
+                  className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-rose-950 text-slate-200 hover:text-rose-200 border border-slate-700 hover:border-rose-700 text-xs font-bold flex items-center gap-1.5 transition"
+                >
+                  <Archive className="w-3.5 h-3.5" />
+                  Cancel &amp; Archive
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {(session.status === 'ARCHIVED' || session.status === 'CANCELLED') && (
+          <div className="bg-slate-900/90 border border-slate-700 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4 shadow-lg">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 rounded-xl bg-slate-800 border border-slate-700 text-slate-300 flex items-center justify-center shrink-0">
+                <Archive className="w-5 h-5" />
+              </div>
+              <div className="text-xs space-y-0.5">
+                <h3 className="text-sm font-bold text-slate-100">
+                  {session.status === 'ARCHIVED' ? 'Archived Stocktake (Read-Only Audit Record)' : 'Cancelled Stocktake (Read-Only)'}
+                </h3>
+                <p className="text-slate-400">
+                  {session.archivedByName ? `Archived by ${session.archivedByName}` : 'Archived'}
+                  {session.archivedAt ? ` on ${new Date(session.archivedAt).toLocaleString()}` : ''}.
+                  {session.archiveReason ? ` Reason: "${session.archiveReason}"` : ''}
+                </p>
+              </div>
+            </div>
+            {session.status === 'ARCHIVED' && !session.everActivated && canManageStructure && (
+              <button
+                type="button"
+                onClick={handleRestoreDraftSession}
+                className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center gap-1.5 shadow transition"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Restore to Draft
+              </button>
+            )}
+          </div>
+        )}
+
         {/* VIEW 0: ROLE-AWARE STOCKTAKE COMMAND HOME (NO HORIZONTAL SCROLLING) */}
         {activeView === 'HOME' && (
           <div className="space-y-6">
@@ -1579,9 +1997,19 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                         {(!isBlindCounter || !currentUser?.assignedGroup || currentUser.assignedGroup === 'GROUP_1') && (
                           <button
                             type="button"
-                            disabled={isSameUserOtherSlotA || (!claimCheckA.allowed && isBlindCounter)}
+                            disabled={
+                              isSameUserOtherSlotA ||
+                              (!claimCheckA.allowed && isBlindCounter) ||
+                              (!isCountable && (isBlindCounter || !isCount1Finalized))
+                            }
                             title={
-                              isSameUserOtherSlotA || !claimCheckA.allowed
+                              !isCountable && (isBlindCounter || !isCount1Finalized)
+                                ? isDraft
+                                  ? 'Activate this draft stocktake before counting'
+                                  : isPaused
+                                  ? 'Resume this paused stocktake before counting'
+                                  : 'Session is archived/closed'
+                                : isSameUserOtherSlotA || !claimCheckA.allowed
                                 ? claimCheckA.reason
                                 : 'Open Team A counting terminal'
                             }
@@ -1595,6 +2023,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                             className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-45 disabled:cursor-not-allowed ${
                               isCount1Finalized
                                 ? 'bg-slate-800 text-emerald-300 border border-emerald-700/60'
+                                : !isCountable
+                                ? 'bg-slate-800 text-slate-400 border border-slate-700'
                                 : isCount1Submitted
                                 ? 'bg-blue-600/20 text-blue-300 border border-blue-500/30 hover:bg-blue-600 hover:text-white'
                                 : isTeamAClaimed
@@ -1602,8 +2032,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                                 : 'bg-blue-600 text-white hover:bg-blue-500 shadow-sm'
                             }`}
                           >
-                            {isCount1Finalized ? <Lock className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
-                            {isSameUserOtherSlotA
+                            {isCount1Finalized || !isCountable ? <Lock className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
+                            {!isCountable && !isCount1Finalized
+                              ? isDraft
+                                ? 'Locked (Draft)'
+                                : isPaused
+                                ? 'Paused (Team A)'
+                                : 'Archived'
+                              : isSameUserOtherSlotA
                               ? 'Blocked (You Counted Team B)'
                               : isCount1Finalized
                               ? isBlindCounter
@@ -1620,9 +2056,19 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                         {(!isBlindCounter || !currentUser?.assignedGroup || currentUser.assignedGroup === 'GROUP_2') && (
                           <button
                             type="button"
-                            disabled={isSameUserOtherSlotB || (!claimCheckB.allowed && isBlindCounter)}
+                            disabled={
+                              isSameUserOtherSlotB ||
+                              (!claimCheckB.allowed && isBlindCounter) ||
+                              (!isCountable && (isBlindCounter || !isCount2Finalized))
+                            }
                             title={
-                              isSameUserOtherSlotB || !claimCheckB.allowed
+                              !isCountable && (isBlindCounter || !isCount2Finalized)
+                                ? isDraft
+                                  ? 'Activate this draft stocktake before counting'
+                                  : isPaused
+                                  ? 'Resume this paused stocktake before counting'
+                                  : 'Session is archived/closed'
+                                : isSameUserOtherSlotB || !claimCheckB.allowed
                                 ? claimCheckB.reason
                                 : 'Open Team B counting terminal'
                             }
@@ -1636,6 +2082,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                             className={`px-3 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-45 disabled:cursor-not-allowed ${
                               isCount2Finalized
                                 ? 'bg-slate-800 text-emerald-300 border border-emerald-700/60'
+                                : !isCountable
+                                ? 'bg-slate-800 text-slate-400 border border-slate-700'
                                 : isCount2Submitted
                                 ? 'bg-purple-600/20 text-purple-300 border border-purple-500/30 hover:bg-purple-600 hover:text-white'
                                 : isTeamBClaimed
@@ -1645,8 +2093,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                                 : 'bg-purple-600 text-white hover:bg-purple-500 shadow-sm'
                             }`}
                           >
-                            {isCount2Finalized ? <Lock className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
-                            {isSameUserOtherSlotB
+                            {isCount2Finalized || !isCountable ? <Lock className="w-3.5 h-3.5" /> : <UserCheck className="w-3.5 h-3.5" />}
+                            {!isCountable && !isCount2Finalized
+                              ? isDraft
+                                ? 'Locked (Draft)'
+                                : isPaused
+                                ? 'Paused (Team B)'
+                                : 'Archived'
+                              : isSameUserOtherSlotB
                               ? 'Blocked (You Counted Team A)'
                               : isCount2Finalized
                               ? isBlindCounter
@@ -2081,6 +2535,143 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                 >
                   <Unlock className="w-3.5 h-3.5" />
                   Confirm Unlock &amp; Sync
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Pause Stocktake Modal */}
+      {showPauseModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-slate-900 border border-amber-600/60 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2 text-amber-300 font-bold text-base">
+                <Pause className="w-5 h-5 text-amber-400" />
+                Pause Active Stocktake
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPauseModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmPauseSession} className="space-y-3.5 text-xs">
+              <p className="text-slate-300">
+                Pausing locks all counting terminals across the branch while preserving every recorded count and keeping this session&apos;s active slot reserved.
+              </p>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1">
+                  Pause Reason (Audit Log) *
+                </label>
+                <textarea
+                  rows={3}
+                  required
+                  value={pauseReasonInput}
+                  onChange={(e) => setPauseReasonInput(e.target.value)}
+                  placeholder="e.g. Shift changeover / overnight break / emergency supplier delivery"
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-amber-500"
+                />
+              </div>
+
+              {session.isLockdownActive && (
+                <label className="flex items-start gap-2.5 p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={unlockPosOnPause}
+                    onChange={(e) => setUnlockPosOnPause(e.target.checked)}
+                    className="mt-0.5 w-4 h-4 rounded bg-slate-900 border-slate-700 text-amber-500"
+                  />
+                  <div>
+                    <span className="font-semibold text-white block">
+                      Temporarily unlock POS for trading during pause
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Lockdown will automatically re-engage when you Resume the stocktake.
+                    </span>
+                  </div>
+                </label>
+              )}
+
+              <div className="pt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowPauseModal(false)}
+                  className="px-3.5 py-2 rounded-lg text-slate-300 hover:bg-slate-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold flex items-center gap-1.5"
+                >
+                  <Pause className="w-3.5 h-3.5" />
+                  Confirm Pause
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Archive / Cancel Stocktake Modal */}
+      {showArchiveModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-slate-900 border border-rose-600/60 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <div className="flex items-center gap-2 text-rose-300 font-bold text-base">
+                <Archive className="w-5 h-5 text-rose-400" />
+                {isDraft ? 'Archive Draft Stocktake' : 'Cancel & Archive Stocktake'}
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowArchiveModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmArchiveSession} className="space-y-3.5 text-xs">
+              <p className="text-slate-300">
+                {isDraft
+                  ? 'Moves this draft to the read-only Audit Archive. Never-activated drafts can be restored later.'
+                  : 'Closes this live stocktake as a read-only audit record, releases any active POS lockdown, deactivates casual PINs, and frees the branch slot for a new stocktake. No inventory SOH adjustments will be posted.'}
+              </p>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1">
+                  Archive Reason {!isDraft ? '*' : '(Optional)'}
+                </label>
+                <textarea
+                  rows={3}
+                  required={!isDraft}
+                  value={archiveReasonInput}
+                  onChange={(e) => setArchiveReasonInput(e.target.value)}
+                  placeholder={isDraft ? 'e.g. Postponed to next month' : 'e.g. Aborted due to unposted GRV batch — will restart after receiving'}
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-lg text-white focus:outline-none focus:ring-1 focus:ring-rose-500"
+                />
+              </div>
+
+              <div className="pt-2 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowArchiveModal(false)}
+                  className="px-3.5 py-2 rounded-lg text-slate-300 hover:bg-slate-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold flex items-center gap-1.5"
+                >
+                  <Archive className="w-3.5 h-3.5" />
+                  Confirm Archive
                 </button>
               </div>
             </form>
