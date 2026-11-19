@@ -293,21 +293,37 @@ export class SyncCore {
             return { accepted: false, reason: 'STALE_T2' };
           }
 
+          // 2b. Staff monotonic pinVersion guard: never revert a newer offline PIN/password with an older remote one
+          const isStaffRecord = envelope.entityType === 'staff';
+          const existingPinVer = isStaffRecord ? Number(existingRecord.pinVersion ?? existingRecord.pin_version ?? 0) : 0;
+          const incomingPinVer = isStaffRecord ? Number(envelope.data?.pinVersion ?? envelope.data?.pin_version ?? 0) : 0;
+          const incomingHasNewerPin =
+            isStaffRecord &&
+            Boolean(envelope.data?.pin_hash || envelope.data?.pinHash) &&
+            incomingPinVer > existingPinVer;
+          const localHasNewerPin =
+            isStaffRecord &&
+            Boolean(existingRecord.pin_hash || existingRecord.pinHash || existingRecord.pin) &&
+            existingPinVer > 0 &&
+            (incomingPinVer === 0 || existingPinVer > incomingPinVer);
+
           // 3. Monotonic logical version comparison takes precedence over wall-clock skew
-          if (existingVersion > 0 && incomingVersion > 0) {
-            if (incomingVersion < existingVersion) {
+          if (!incomingHasNewerPin) {
+            if (existingVersion > 0 && incomingVersion > 0) {
+              if (incomingVersion < existingVersion) {
+                return { accepted: false, reason: 'STALE_T2' };
+              }
+              if (incomingVersion === existingVersion && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
+                return { accepted: false, reason: 'STALE_T2' };
+              }
+            } else if (existingVersion > 0 && incomingVersion === 0 && existingSource === 'USER_EDIT') {
+              // An unversioned cloud/legacy row cannot blindly overwrite a versioned USER_EDIT unless strictly newer (> 60s)
+              if (incomingTs <= existingTs + 60000) {
+                return { accepted: false, reason: 'STALE_T2' };
+              }
+            } else if (existingTs - incomingTs > 60000) {
               return { accepted: false, reason: 'STALE_T2' };
             }
-            if (incomingVersion === existingVersion && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
-              return { accepted: false, reason: 'STALE_T2' };
-            }
-          } else if (existingVersion > 0 && incomingVersion === 0 && existingSource === 'USER_EDIT') {
-            // An unversioned cloud/legacy row cannot blindly overwrite a versioned USER_EDIT unless strictly newer (> 60s)
-            if (incomingTs <= existingTs + 60000) {
-              return { accepted: false, reason: 'STALE_T2' };
-            }
-          } else if (existingTs - incomingTs > 60000) {
-            return { accepted: false, reason: 'STALE_T2' };
           }
 
           // 4. Dirty local edit protection against cloud/bootstrap pulls that haven't strictly beaten local state
@@ -317,11 +333,26 @@ export class SyncCore {
             envelope.originDeviceId === 'MONGODB_CLOUD' ||
             envelope.originDeviceId === 'SERVER_BOOTSTRAP';
           const isLocalDirty = Boolean(existingRecord.isDirty || existingRecord.dirty || existingRecord.synced === false);
-          if (isCloudPull && isLocalDirty) {
+          if (isCloudPull && isLocalDirty && !incomingHasNewerPin) {
             const strictlyNewerVersion = incomingVersion > existingVersion && incomingVersion > 0;
             const strictlyNewerTs = incomingVersion === existingVersion && incomingTs > existingTs + 60000;
             if (!strictlyNewerVersion && !strictlyNewerTs) {
               return { accepted: false, reason: 'STALE_T2_DIRTY_LOCAL' };
+            }
+          }
+
+          // If remote non-PIN fields are newer but local PIN is strictly newer, preserve local PIN fields on the merged payload
+          if (localHasNewerPin && envelope.data && typeof envelope.data === 'object') {
+            if (existingRecord.pin !== undefined) (envelope.data as any).pin = existingRecord.pin;
+            if (existingRecord.pin_hash || existingRecord.pinHash) {
+              (envelope.data as any).pin_hash = existingRecord.pin_hash || existingRecord.pinHash;
+            }
+            if (existingRecord.pin_salt || existingRecord.pinSalt) {
+              (envelope.data as any).pin_salt = existingRecord.pin_salt || existingRecord.pinSalt;
+            }
+            (envelope.data as any).pinVersion = existingPinVer;
+            if (existingRecord.pinUpdatedAt) {
+              (envelope.data as any).pinUpdatedAt = existingRecord.pinUpdatedAt;
             }
           }
         }

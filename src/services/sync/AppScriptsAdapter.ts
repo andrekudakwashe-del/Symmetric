@@ -419,7 +419,16 @@ export class AppScriptsAdapter implements SyncAdapter {
         throw new Error(srvJson?.error || `Proxy ${proxyPath} returned HTTP ${srvRes.status}`);
       }
     } catch (proxyErr: any) {
-      if (!proxyUnavailable && proxyErr?.name !== 'TypeError' && proxyErr?.name !== 'TimeoutError') {
+      const isTimeout =
+        proxyErr?.name === 'TimeoutError' ||
+        proxyErr?.name === 'AbortError' ||
+        String(proxyErr?.message || '').toLowerCase().includes('timed out');
+      if (isTimeout) {
+        // Proxy already forwarded to Apps Script and timed out; do not fire a duplicate direct request.
+        this.applyBackoff(10_000, 'TIMEOUT');
+        throw new Error(`Google Apps Script ${action} timed out; queued for retry.`);
+      }
+      if (!proxyUnavailable && proxyErr?.name !== 'TypeError') {
         throw proxyErr;
       }
       proxyUnavailable = true;
@@ -427,12 +436,25 @@ export class AppScriptsAdapter implements SyncAdapter {
 
     // 2. Standalone PWA direct fetch to Apps Script (when proxy absent)
     if (proxyUnavailable) {
-      const directRes = await fetch(targetWebhook, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
+      let directRes: Response;
+      try {
+        directRes = await fetch(targetWebhook, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (directErr: any) {
+        const isTimeout =
+          directErr?.name === 'TimeoutError' ||
+          directErr?.name === 'AbortError' ||
+          String(directErr?.message || '').toLowerCase().includes('timed out');
+        if (isTimeout) {
+          this.applyBackoff(10_000, 'TIMEOUT');
+          throw new Error(`Google Apps Script ${action} timed out; queued for retry.`);
+        }
+        throw new Error(directErr?.message || `Google Apps Script ${action} network error; queued for retry.`);
+      }
 
       if (!directRes.ok) {
         throw new Error(`Google Apps Script ${action} failed with HTTP ${directRes.status}`);
@@ -591,7 +613,11 @@ export class AppScriptsAdapter implements SyncAdapter {
     }
 
     if (isOfflineModeForced() || (typeof navigator !== 'undefined' && !navigator.onLine)) {
-      throw new Error('Device offline; Apps Script record retained in offline queue for retry.');
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: 'Device offline; Apps Script record retained in offline queue for retry.',
+      };
     }
 
     const spec = ENTITY_REGISTRY[envelope.entityType];
@@ -632,30 +658,46 @@ export class AppScriptsAdapter implements SyncAdapter {
       creds.userBranchId !== 'ALL' &&
       targetBranch.toUpperCase() !== creds.userBranchId.toUpperCase()
     ) {
-      throw new Error(
-        `BRANCH_SECURITY_VIOLATION: User assigned to branch ${creds.userBranchId} attempted to sync data tagged for branch ${targetBranch}.`
-      );
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: `BRANCH_SECURITY_VIOLATION: User assigned to branch ${creds.userBranchId} attempted to sync data tagged for branch ${targetBranch}.`,
+      };
     }
 
     const cleanEnvelope = this.sanitizeEnvelopeForCloud(envelope, creds.companyId, creds.branchId);
-    const resData = await this.postAppsScriptAction(
-      '/api/sheets/push-envelopes',
-      'push_envelopes',
-      {
-        envelopes: [cleanEnvelope],
-        company_id: creds.companyId,
-        branch_id: creds.branchId,
-        user_id: creds.userId,
-        user_role: creds.userRole,
-        user_branch_id: creds.userBranchId,
-      },
-      15000
-    );
+    let resData: any;
+    try {
+      resData = await this.postAppsScriptAction(
+        '/api/sheets/push-envelopes',
+        'push_envelopes',
+        {
+          envelopes: [cleanEnvelope],
+          company_id: creds.companyId,
+          branch_id: creds.branchId,
+          user_id: creds.userId,
+          user_role: creds.userRole,
+          user_branch_id: creds.userBranchId,
+        },
+        25000
+      );
+    } catch (netErr: any) {
+      console.warn('[AppScriptsAdapter] broadcast deferred to offline queue:', netErr?.message || netErr);
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: netErr?.message || 'Google Apps Script request timed out; retained in offline queue.',
+      };
+    }
 
     if (Array.isArray(resData?.failed) && resData.failed.length > 0 && !(resData?.ackedPacketIds || []).includes(envelope.packetId)) {
       const firstErr = resData.failed[0]?.error || 'Google Apps Script rejected envelope write';
       this.processServerPushResponse([], resData, creds.companyId, creds.branchId);
-      throw new Error(firstErr);
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: firstErr,
+      };
     }
 
     if (this.dispatchedPacketIds.size > 5000) {

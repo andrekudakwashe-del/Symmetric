@@ -20,8 +20,18 @@ import {
   Wifi,
   LogIn,
 } from 'lucide-react';
-import { registerTenantCompany } from '../../db/roomDatabase';
-import { syncCompanyToCloud } from '../../services/googleSheetsSync';
+import {
+  registerTenantCompany,
+  saveCompany,
+  updateTenantSheetBinding,
+} from '../../db/roomDatabase';
+import { registerCompanyInCloud, CloudRegistrationPayload } from '../../services/googleSheetsSync';
+import {
+  fetchGlobalSystemConfig,
+  savePendingCloudRegistration,
+  clearPendingCloudRegistration,
+} from '../../services/systemConfig';
+import { setTenantAuthToken, setRoutingEpoch } from '../../services/sync/highWaterMarks';
 import { Salesperson } from '../../types';
 import confetti from 'canvas-confetti';
 
@@ -67,6 +77,9 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
   );
 
   useEffect(() => {
+    // Ensure this device adopts the global Master Apps Script Webhook URL before registration
+    fetchGlobalSystemConfig().catch(() => {});
+
     const handleOnline = () => {
       setIsOnline(true);
       setError((prev) => (prev?.includes('offline') || prev?.includes('Internet connection required') ? null : prev));
@@ -90,12 +103,15 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
     }
   };
 
-  const executeRegistration = async () => {
+  const executeRegistration = async (forceNewTenant: boolean = false) => {
     setIsSubmitting(true);
     setError(null);
     setExistingAccountModal(null);
 
     try {
+      // Ensure Master Webhook URL is loaded from server before dispatching signup
+      await fetchGlobalSystemConfig().catch(() => {});
+
       const { company, branch, owner } = registerTenantCompany({
         companyName,
         businessCategory,
@@ -108,34 +124,52 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
         ownerPin,
       });
 
-      // 1. Synchronize to central server store
-      try {
-        await fetch('/api/saas/signup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            company_name: company.company_name,
-            company_id: company.company_id,
-            owner_email: ownerEmail,
-            full_name: ownerName,
-            phone: ownerPhone,
-            business_category: businessCategory,
-            branch_name: branchName,
-            branch_code: branchCode,
-            branch_location: branchLocation,
-            password: ownerPin,
-            plan: 'PROFESSIONAL',
-          }),
+      const registrationPayload: CloudRegistrationPayload = {
+        company_id: company.company_id,
+        company_name: company.company_name,
+        owner_name: ownerName.trim(),
+        owner_email: ownerEmail.trim().toLowerCase(),
+        phone: ownerPhone.trim(),
+        business_category: businessCategory,
+        branch_id: branch.branchId,
+        branch_name: branch.name,
+        branch_code: branch.code,
+        branch_location: branch.location || branchLocation.trim(),
+        user_id: owner.id,
+        password: ownerPin,
+        plan: 'PROFESSIONAL',
+        force_new_tenant: forceNewTenant,
+      };
+
+      // Authoritative cloud registration (Master Sheet: companies + Global_Users + branches + users + permissions + JWT + optional template sheet)
+      const cloudRes = await registerCompanyInCloud(registrationPayload);
+
+      if (cloudRes.code === 'DUPLICATE_EMAIL' && !forceNewTenant) {
+        setIsSubmitting(false);
+        setExistingAccountModal({
+          open: true,
+          companyName: companyName.trim() || 'Existing Business',
+          companyId: cloudRes.existingCompanyId || company.company_id,
         });
-      } catch {
-        // resilient local fallback
+        return;
       }
 
-      // 2. Cloud sync to Master Google Sheet companies tab
-      try {
-        await syncCompanyToCloud(company, branch, owner);
-      } catch {
-        // non-blocking
+      if (cloudRes.cloudSynced) {
+        clearPendingCloudRegistration(company.company_id);
+        const provisionedSheetId = String(cloudRes.sheet_id || cloudRes.spreadsheet_id || '').trim();
+        if (provisionedSheetId) {
+          saveCompany({ ...company, sheet_id: provisionedSheetId });
+          updateTenantSheetBinding(company.company_id, provisionedSheetId);
+        }
+        if (cloudRes.routing_epoch && cloudRes.routing_epoch > 0) {
+          setRoutingEpoch(company.company_id, cloudRes.routing_epoch);
+        }
+        if (cloudRes.token) {
+          setTenantAuthToken(company.company_id, cloudRes.token);
+        }
+      } else {
+        // Queue for automatic background cloud retry so account is guaranteed to reach Master Sheet
+        savePendingCloudRegistration(registrationPayload);
       }
 
       // Register this device to this newly created company
@@ -143,9 +177,10 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
         localStorage.setItem('saimetric_device_registered', 'true');
         localStorage.setItem('saimetric_device_registered_company_id', company.company_id);
         localStorage.setItem('saimetric_device_registered_company_name', company.company_name);
-        localStorage.setItem('saimetric_device_registered_email', ownerEmail);
+        localStorage.setItem('saimetric_device_registered_email', ownerEmail.trim().toLowerCase());
         localStorage.setItem('saimetric_device_registered_branch_id', branch.branchId);
         localStorage.setItem('saimetric_device_registered_at', new Date().toISOString());
+        localStorage.setItem('saimetric_registration_cloud_synced', cloudRes.cloudSynced ? 'true' : 'pending');
       } catch {
         // localStorage resilience
       }
@@ -220,7 +255,7 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
       }
     }
 
-    await executeRegistration();
+    await executeRegistration(forceNewTenant);
   };
 
   return (

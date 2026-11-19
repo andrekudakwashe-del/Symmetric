@@ -88,13 +88,21 @@ export class MongoDBAdapter implements SyncAdapter {
     }
 
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      throw new Error('Device offline; MongoDB record retained in offline queue for retry.');
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: 'Device offline; MongoDB record retained in offline queue for retry.',
+      };
     }
 
     const dataApiUrl = String(config.credentials.url || '').trim().replace(/\/+$/, '');
     const dataApiKey = String(config.credentials.apiKey || '').trim();
     if (!dataApiUrl || !dataApiKey) {
-      throw new Error('MongoDB HTTP Data API URL/key missing; record retained in offline queue for retry.');
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: 'MongoDB HTTP Data API URL/key missing; record retained in offline queue for retry.',
+      };
     }
 
     const d: any =
@@ -104,35 +112,49 @@ export class MongoDBAdapter implements SyncAdapter {
     const collection = mapEntityTypeToCloudTable(envelope.entityType);
     const idVal = String(d.id || d.itemId || d.customerId || d.grvNumber || envelope.entityId);
 
-    const response = await fetch(`${dataApiUrl}/action/updateOne`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': dataApiKey,
-      },
-      body: JSON.stringify({
-        collection,
-        database: config.credentials.database || 'saimetric_pos',
-        filter: { id: idVal, company_id: compId },
-        update: {
-          $set: {
-            ...d,
-            id: idVal,
-            company_id: compId,
-            branch_id: branchId,
-            updatedAt: envelope.updatedAt || Date.now(),
-          },
+    let response: Response;
+    try {
+      response = await fetch(`${dataApiUrl}/action/updateOne`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'api-key': dataApiKey,
         },
-        upsert: true,
-      }),
-      signal: AbortSignal.timeout(12000),
-    });
+        body: JSON.stringify({
+          collection,
+          database: config.credentials.database || 'saimetric_pos',
+          filter: { id: idVal, company_id: compId },
+          update: {
+            $set: {
+              ...d,
+              id: idVal,
+              company_id: compId,
+              branch_id: branchId,
+              updatedAt: envelope.updatedAt || Date.now(),
+            },
+          },
+          upsert: true,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+    } catch (netErr: any) {
+      const isTimeout = netErr?.name === 'TimeoutError' || netErr?.name === 'AbortError';
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: isTimeout
+          ? 'MongoDB sync timed out; record retained in offline queue for retry.'
+          : netErr?.message || 'MongoDB network error; record retained in offline queue for retry.',
+      };
+    }
 
     if (!response.ok && response.status !== 200 && response.status !== 201) {
       const errText = await response.text().catch(() => '');
-      throw new Error(
-        `MongoDB sync failed with HTTP ${response.status}${errText ? `: ${errText}` : ''}`
-      );
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: `MongoDB sync failed with HTTP ${response.status}${errText ? `: ${errText}` : ''}`,
+      };
     }
 
     envelope.isCloudSynced = true;

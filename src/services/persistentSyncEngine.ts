@@ -700,7 +700,7 @@ class PersistentSyncEngine {
           webhook_url: targetUrl,
           ...payload,
         }),
-        signal: AbortSignal.timeout(12000),
+        signal: AbortSignal.timeout(20000),
       });
 
       if (srvRes.status === 200 || srvRes.status === 201 || srvRes.ok) {
@@ -718,18 +718,29 @@ class PersistentSyncEngine {
         throw new Error(errJson?.error || `Cloud proxy returned HTTP ${srvRes.status}`);
       }
     } catch (proxyErr: any) {
+      if (proxyErr?.name === 'TimeoutError' || proxyErr?.name === 'AbortError') {
+        throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+      }
       if (!proxyNotFound && proxyErr?.name !== 'TypeError') {
         throw proxyErr;
       }
     }
 
     // 2. Direct browser fetch to Apps Script (strict HTTP 200/201 verification - NO blind no-cors)
-    const directRes = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(12000),
-    });
+    let directRes: Response;
+    try {
+      directRes = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20000),
+      });
+    } catch (directErr: any) {
+      if (directErr?.name === 'TimeoutError' || directErr?.name === 'AbortError') {
+        throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+      }
+      throw new Error(directErr?.message || 'Cloud sync network error; record kept in offline queue for retry.');
+    }
 
     if (directRes.status !== 200 && directRes.status !== 201 && !directRes.ok) {
       throw new Error(`Google Apps Script webhook failed with HTTP ${directRes.status}`);

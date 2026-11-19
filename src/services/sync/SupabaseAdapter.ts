@@ -157,44 +157,58 @@ export class SupabaseAdapter implements SyncAdapter {
         }
       : basePayload;
 
-    let response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: sbKey,
-        Authorization: `Bearer ${sbKey}`,
-        Prefer: 'resolution=merge-duplicates,return=representation',
-      },
-      body: JSON.stringify([recordPayload]),
-      signal: AbortSignal.timeout(12000),
-    });
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: sbKey,
+          Authorization: `Bearer ${sbKey}`,
+          Prefer: 'resolution=merge-duplicates,return=representation',
+        },
+        body: JSON.stringify([recordPayload]),
+        signal: AbortSignal.timeout(15000),
+      });
 
-    if (response.status === 400 && shouldIncludeServerFields) {
-      const errPreview = await response.clone().text().catch(() => '');
-      if (
-        errPreview.includes('server_received_at') ||
-        errPreview.includes('suspicious_backdate') ||
-        errPreview.includes('PGRST204')
-      ) {
-        response = await fetch(endpoint, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            apikey: sbKey,
-            Authorization: `Bearer ${sbKey}`,
-            Prefer: 'resolution=merge-duplicates,return=representation',
-          },
-          body: JSON.stringify([basePayload]),
-          signal: AbortSignal.timeout(12000),
-        });
+      if (response.status === 400 && shouldIncludeServerFields) {
+        const errPreview = await response.clone().text().catch(() => '');
+        if (
+          errPreview.includes('server_received_at') ||
+          errPreview.includes('suspicious_backdate') ||
+          errPreview.includes('PGRST204')
+        ) {
+          response = await fetch(endpoint, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              apikey: sbKey,
+              Authorization: `Bearer ${sbKey}`,
+              Prefer: 'resolution=merge-duplicates,return=representation',
+            },
+            body: JSON.stringify([basePayload]),
+            signal: AbortSignal.timeout(15000),
+          });
+        }
       }
+    } catch (netErr: any) {
+      const isTimeout = netErr?.name === 'TimeoutError' || netErr?.name === 'AbortError';
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: isTimeout
+          ? 'Supabase sync timed out; record retained in offline queue for retry.'
+          : netErr?.message || 'Supabase network error; record retained in offline queue for retry.',
+      };
     }
 
     if (!response.ok && response.status !== 200 && response.status !== 201) {
       const errText = await response.text().catch(() => '');
-      throw new Error(
-        `Supabase sync failed with HTTP ${response.status}${errText ? `: ${errText}` : ''}`
-      );
+      return {
+        success: false,
+        packetId: envelope.packetId,
+        error: `Supabase sync failed with HTTP ${response.status}${errText ? `: ${errText}` : ''}`,
+      };
     }
 
     // Extract authoritative cloud server receipt time from HTTP Date header or returned Postgres row

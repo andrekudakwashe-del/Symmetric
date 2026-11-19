@@ -214,8 +214,10 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
         pushAllLocalTenantsToCloud(masterWebhookInput.trim()).then((pRes) => {
           setCompanies(getCompanies());
           setBranches(getAllBranches());
-          if (pRes.pushedCount > 0) {
-            showToast(`✓ Auto-pushed ${pRes.pushedCount} local tenants to Master Sheet!`);
+          if (pRes.cloudSynced && pRes.cloudPushedCount > 0) {
+            showToast(`✓ Auto-pushed ${pRes.cloudPushedCount} local tenants to Master Sheet!`);
+          } else if (!pRes.cloudSynced && pRes.error) {
+            showToast(`Webhook saved, but Master Sheet push failed: ${pRes.error}`);
           }
         });
       } else {
@@ -234,19 +236,24 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
       const res = await pushAllLocalTenantsToCloud(masterWebhookInput.trim());
       setCompanies(getCompanies());
       setBranches(getAllBranches());
-      showToast(`✓ Synchronized ${res.pushedCount} tenant companies across all devices & Master Sheet!`);
-      confetti({ particleCount: 50, spread: 70, origin: { y: 0.6 } });
+      if (res.cloudSynced) {
+        showToast(`✓ ${res.message}`);
+        confetti({ particleCount: 50, spread: 70, origin: { y: 0.6 } });
+      } else {
+        showToast(`⚠️ ${res.message || res.error || 'Could not push tenants to Master Google Sheet.'}`);
+      }
     } catch (err: any) {
       setCompanies(getCompanies());
       setBranches(getAllBranches());
-      showToast(`Sync notice: ${err.message || String(err)}`);
+      showToast(`Push failed: ${err.message || String(err)}`);
     } finally {
       setIsPushingTenants(false);
     }
   };
 
   const handleTestWebhookConnection = async () => {
-    if (!masterWebhookInput.trim() || !masterWebhookInput.startsWith('http')) {
+    const trimmedUrl = masterWebhookInput.trim();
+    if (!trimmedUrl || !trimmedUrl.startsWith('http')) {
       setWebhookTestFeedback({
         tested: true,
         success: false,
@@ -257,15 +264,46 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
     setIsTestingWebhook(true);
     setWebhookTestFeedback(null);
     try {
-      const testUrl = masterWebhookInput.includes('?')
-        ? `${masterWebhookInput}&action=get_companies`
-        : `${masterWebhookInput}?action=get_companies`;
-      await fetch(testUrl, { mode: 'no-cors' });
-      setWebhookTestFeedback({
-        tested: true,
-        success: true,
-        message: 'Webhook is reachable and responding (200 OK via Google Apps Script)',
-      });
+      // Save URL to server first so server proxy tests the exact entered URL without CORS issues
+      await saveGlobalSystemConfig({
+        masterWebhookUrl: trimmedUrl,
+        masterSpreadsheetId: masterSpreadsheetIdInput.trim(),
+      }).catch(() => {});
+
+      let data: any = null;
+      try {
+        const srvRes = await fetch('/api/saas/call-action?action=ping', {
+          signal: AbortSignal.timeout(15000),
+        });
+        if (srvRes.ok) {
+          data = await srvRes.json().catch(() => null);
+        }
+      } catch {
+        data = null;
+      }
+
+      if (!data || !data.version) {
+        const pingUrl = trimmedUrl.includes('?') ? `${trimmedUrl}&action=ping` : `${trimmedUrl}?action=ping`;
+        const directRes = await fetch(pingUrl, { signal: AbortSignal.timeout(15000) });
+        if (directRes.ok) {
+          const txt = await directRes.text();
+          try { data = JSON.parse(txt); } catch { data = null; }
+        }
+      }
+
+      if (data && data.success !== false && !data.error) {
+        setWebhookTestFeedback({
+          tested: true,
+          success: true,
+          message: `Connected to Master Apps Script (${data.version || 'Online'}${data.schema_version ? ` • Schema v${data.schema_version}` : ''})`,
+        });
+      } else {
+        setWebhookTestFeedback({
+          tested: true,
+          success: false,
+          message: `Apps Script responded with error: ${data?.error || data?.message || 'Invalid JSON response — redeploy Web App as "Anyone"'}`,
+        });
+      }
     } catch (err: any) {
       setWebhookTestFeedback({
         tested: true,
@@ -280,45 +318,30 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   const handleSyncFromMasterSheet = async () => {
     setIsSyncingWithMaster(true);
     try {
-      // 1. Sync from server store first
-      try {
-        const sRes = await fetch('/api/saas/companies?force=true', { signal: AbortSignal.timeout(5000) });
-        if (sRes.ok) {
-          const sData = await sRes.json();
-          if (sData && Array.isArray(sData.companies)) {
-            sData.companies.forEach((sc: any) => {
-              if (sc && sc.company_id) saveCompany(sc);
-            });
-          }
-          if (sData && Array.isArray(sData.branches)) {
-            sData.branches.forEach((sb: any) => {
-              const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
-              if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
-                saveBranch(sb, { fromSync: true });
-              }
-            });
-          }
-        }
-      } catch {
-        // ignore
+      const trimmedUrl = masterWebhookInput.trim();
+      if (trimmedUrl && trimmedUrl.startsWith('http')) {
+        await saveGlobalSystemConfig({
+          masterWebhookUrl: trimmedUrl,
+          masterSpreadsheetId: masterSpreadsheetIdInput.trim(),
+        }).catch(() => {});
       }
 
-      // 2. Fetch from Master Google Sheet
-      const res = await fetchCompaniesFromMasterSheet();
+      // Fetch authoritatively from Master Google Sheet (via server proxy -> direct fallback)
+      const res = await fetchCompaniesFromMasterSheet(trimmedUrl || undefined);
       setCompanies(getCompanies());
       setBranches(getAllBranches());
       const totalCount = getCompanies().length;
-      if (res.success) {
-        showToast(res.message || `Synced ${totalCount} companies from Master Google Sheet`);
-        setLastSyncStatus(`Last synced: ${new Date().toLocaleTimeString()} (${totalCount} tenants)`);
+      if (res.success && res.cloudSynced) {
+        showToast(`✓ ${res.message || `Synced ${totalCount} tenants from Master Google Sheet`}`);
+        setLastSyncStatus(`Last synced from Sheets: ${new Date().toLocaleTimeString()} (${totalCount} tenants)`);
       } else {
-        showToast(`Showing all ${totalCount} synchronized tenants.`);
-        setLastSyncStatus(`Active: ${new Date().toLocaleTimeString()} (${totalCount} tenants)`);
+        showToast(`⚠️ ${res.message || 'Could not pull from Master Google Sheet.'}`);
+        setLastSyncStatus(`Cloud pull failed: ${new Date().toLocaleTimeString()} (${totalCount} local tenants)`);
       }
     } catch (err: any) {
       setCompanies(getCompanies());
       setBranches(getAllBranches());
-      showToast(`Synchronized ${getCompanies().length} tenants`);
+      showToast(`Sync error: ${err.message || String(err)}`);
     } finally {
       setIsSyncingWithMaster(false);
     }

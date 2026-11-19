@@ -3,7 +3,7 @@ import {
   saveSheetsConfig,
   getCompanies,
   saveCompany,
-  getBranches,
+  getAllBranches,
   saveBranch,
   getSalespeopleForCompany,
   getAllSalespeople,
@@ -11,9 +11,66 @@ import {
   getOwnerDefaultPermissions,
   parseTimestampMs,
 } from '../db/roomDatabase';
-import { syncCompanyToCloud, fetchCompaniesFromMasterSheet } from './googleSheetsSync';
+import {
+  fetchCompaniesFromMasterSheet,
+  registerCompanyInCloud,
+  CloudRegistrationPayload,
+} from './googleSheetsSync';
 import { Company } from '../data/saasData';
 import { routeCloudRecordThroughSyncCore } from './sync/syncIngestBridge';
+
+const PENDING_REGISTRATIONS_KEY = 'saimetric_pending_cloud_registrations';
+
+export function savePendingCloudRegistration(payload: CloudRegistrationPayload): void {
+  try {
+    const raw = localStorage.getItem(PENDING_REGISTRATIONS_KEY);
+    const list: CloudRegistrationPayload[] = raw ? JSON.parse(raw) : [];
+    const filtered = list.filter((p) => p && p.company_id !== payload.company_id);
+    filtered.push(payload);
+    localStorage.setItem(PENDING_REGISTRATIONS_KEY, JSON.stringify(filtered));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function clearPendingCloudRegistration(companyId: string): void {
+  try {
+    const raw = localStorage.getItem(PENDING_REGISTRATIONS_KEY);
+    if (!raw) return;
+    const list: CloudRegistrationPayload[] = JSON.parse(raw);
+    const remaining = list.filter((p) => p && p.company_id !== companyId);
+    if (remaining.length === 0) localStorage.removeItem(PENDING_REGISTRATIONS_KEY);
+    else localStorage.setItem(PENDING_REGISTRATIONS_KEY, JSON.stringify(remaining));
+  } catch {
+    // ignore
+  }
+}
+
+export async function flushPendingCloudRegistrations(): Promise<number> {
+  try {
+    const raw = localStorage.getItem(PENDING_REGISTRATIONS_KEY);
+    if (!raw) return 0;
+    const list: CloudRegistrationPayload[] = JSON.parse(raw);
+    if (!Array.isArray(list) || list.length === 0) return 0;
+
+    let syncedCount = 0;
+    for (const item of list) {
+      if (!item || !item.company_id) continue;
+      const res = await registerCompanyInCloud(item);
+      if (res.cloudSynced || res.code === 'DUPLICATE_EMAIL') {
+        clearPendingCloudRegistration(item.company_id);
+        if (res.sheet_id) {
+          const existing = getCompanies().find((c) => c.company_id === item.company_id);
+          if (existing) saveCompany({ ...existing, sheet_id: res.sheet_id });
+        }
+        syncedCount++;
+      }
+    }
+    return syncedCount;
+  } catch {
+    return 0;
+  }
+}
 
 async function ingestBootstrapStaffRecord(su: any): Promise<void> {
   if (!su) return;
@@ -197,99 +254,220 @@ export async function saveGlobalSystemConfig(params: {
 }
 
 /**
- * Push all local tenant companies to the Master Google Sheet and central server.
- * Uses fast bulk synchronization with timeout protection so the UI never hangs.
+ * Push all local tenant companies, branches, and users to the Master Google Sheet and central server.
+ * Awaits real cloud confirmation (no silent no-cors masking) and reports honest sync status.
  */
 export async function pushAllLocalTenantsToCloud(
   targetWebhookUrl?: string
-): Promise<{ success: boolean; pushedCount: number; message: string }> {
+): Promise<{
+  success: boolean;
+  cloudSynced: boolean;
+  pushedCount: number;
+  cloudPushedCount: number;
+  branchesCount?: number;
+  usersCount?: number;
+  message: string;
+  error?: string;
+}> {
   const localCompanies = getCompanies();
-  const branches = getBranches();
+  const branches = getAllBranches();
   const config = getSheetsConfig();
   const effectiveUrl = (targetWebhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
 
-  // If a valid webhook is provided, broadcast and save to server configuration
+  // If a valid webhook is provided, persist it to server config BEFORE bulk syncing
   if (effectiveUrl && effectiveUrl.startsWith('http')) {
-    saveGlobalSystemConfig({
+    await saveGlobalSystemConfig({
       masterWebhookUrl: effectiveUrl,
       masterSpreadsheetId: config.masterSpreadsheetId,
     }).catch(() => {});
   }
 
-  // 1. Gather all local users across all companies
-  const allUsers: any[] = [];
-  localCompanies.forEach((comp) => {
-    const staff = getSalespeopleForCompany(comp.company_id);
-    allUsers.push(...staff);
-  });
-
-  // 2. Perform fast bulk sync to Server store
-  try {
-    const res = await fetch('/api/saas/sync-companies-bulk', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        companies: localCompanies,
-        branches,
-        users: allUsers,
-        masterWebhookUrl: effectiveUrl || undefined,
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data && Array.isArray(data.companies)) {
-        // Merge any server companies back into local database
-        data.companies.forEach((sc: any) => {
-          if (sc && sc.company_id) {
-            saveCompany(sc);
-          }
-        });
-      }
-      if (data && Array.isArray(data.branches)) {
-        data.branches.forEach((sb: any) => {
-          const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
-          if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
-            saveBranch(sb, { fromSync: true });
-          }
-        });
-      }
-      if (data && Array.isArray(data.users)) {
-        for (const su of data.users) {
-          await ingestBootstrapStaffRecord(su);
-        }
-      }
+  const BATCH_SIZE = 15;
+  const companyChunks: Company[][] = [];
+  if (localCompanies.length === 0) {
+    companyChunks.push([]);
+  } else {
+    for (let i = 0; i < localCompanies.length; i += BATCH_SIZE) {
+      companyChunks.push(localCompanies.slice(i, i + BATCH_SIZE));
     }
-  } catch (err) {
-    console.warn('Notice during bulk server sync:', err);
   }
 
-  // 3. Direct client-side dispatch to Google Apps Script (in case server has restricted outbound)
-  if (effectiveUrl && effectiveUrl.startsWith('http')) {
+  let totalCloudPushed = 0;
+  let totalCloudBranches = 0;
+  let totalCloudUsers = 0;
+  let successfulBatches = 0;
+  let lastCloudError = '';
+
+  for (let bIdx = 0; bIdx < companyChunks.length; bIdx++) {
+    const chunkCompanies = companyChunks[bIdx];
+    const chunkCompIds = new Set(chunkCompanies.map((c) => String(c.company_id || '').trim().toUpperCase()));
+    const chunkBranches =
+      companyChunks.length === 1
+        ? branches
+        : branches.filter((br: any) =>
+            chunkCompIds.has(String(br?.company_id || br?.companyId || br?.CompanyID || '').trim().toUpperCase())
+          );
+    const chunkUsers: any[] = [];
+    chunkCompanies.forEach((comp) => {
+      chunkUsers.push(...getSalespeopleForCompany(comp.company_id));
+    });
+
+    let batchSynced = false;
+    let batchPushed = 0;
+    let batchBranches = 0;
+    let batchUsers = 0;
+    let batchError = '';
+
+    // 2. Primary: Server proxy bulk sync (awaited, zero CORS, 30s timeout per batch)
     try {
-      await fetch(effectiveUrl, {
+      const res = await fetch('/api/saas/sync-companies-bulk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          action: 'sync_companies_bulk',
-          data: {
-            companies: getCompanies(),
-          },
+          companies: chunkCompanies,
+          branches: chunkBranches,
+          users: chunkUsers,
+          masterWebhookUrl: effectiveUrl || undefined,
         }),
-        mode: 'no-cors',
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(30000),
       });
-    } catch (err) {
-      console.warn('Notice pushing directly to Google Apps Script:', err);
+
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (bIdx === 0) {
+          if (data && Array.isArray(data.companies)) {
+            data.companies.forEach((sc: any) => {
+              if (sc && sc.company_id) {
+                saveCompany(sc);
+              }
+            });
+          }
+          if (data && Array.isArray(data.branches)) {
+            data.branches.forEach((sb: any) => {
+              const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
+              if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
+                saveBranch(sb, { fromSync: true });
+              }
+            });
+          }
+          if (data && Array.isArray(data.users)) {
+            for (const su of data.users) {
+              await ingestBootstrapStaffRecord(su);
+            }
+          }
+        }
+        if (data?.cloudSynced === true) {
+          batchSynced = true;
+          batchPushed = Number(data.cloudPushedCount ?? data.pushedCount ?? chunkCompanies.length);
+          batchBranches = Number(data.cloudBranchesCount ?? chunkBranches.length);
+          batchUsers = Number(data.cloudUsersCount ?? chunkUsers.length);
+        } else if (data?.cloudError) {
+          batchError = String(data.cloudError);
+        }
+      } else {
+        batchError = `Server returned HTTP ${res.status}`;
+      }
+    } catch (err: any) {
+      batchError =
+        err?.name === 'TimeoutError' || err?.name === 'AbortError'
+          ? `Batch ${bIdx + 1}/${companyChunks.length} timed out waiting for Master Sheet`
+          : err?.message || String(err);
+      console.warn(`Notice during bulk server sync (batch ${bIdx + 1}/${companyChunks.length}):`, err);
+    }
+
+    // 3. Fallback: Direct CORS-safe dispatch to Google Apps Script (text/plain avoids OPTIONS preflight, reads real JSON)
+    if (!batchSynced && effectiveUrl && effectiveUrl.startsWith('http')) {
+      try {
+        const directRes = await fetch(effectiveUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'bulk_sync_companies',
+            clientRequestId: `REQ-DIRECT-BULK-${Date.now()}-${bIdx}`,
+            companies: chunkCompanies,
+            branches: chunkBranches,
+            users: chunkUsers,
+            data: {
+              companies: chunkCompanies,
+              branches: chunkBranches,
+              users: chunkUsers,
+            },
+          }),
+          signal: AbortSignal.timeout(25000),
+        });
+
+        if (directRes.ok) {
+          const text = await directRes.text();
+          let parsed: any = null;
+          try { parsed = JSON.parse(text); } catch { parsed = null; }
+          if (parsed && parsed.success !== false && !parsed.error) {
+            batchSynced = true;
+            batchError = '';
+            batchPushed = Number(parsed.companies_count ?? parsed.count ?? chunkCompanies.length);
+            batchBranches = Number(parsed.branches_count ?? chunkBranches.length);
+            batchUsers = Number(parsed.users_count ?? chunkUsers.length);
+          } else if (parsed?.error || parsed?.message) {
+            batchError = String(parsed.error || parsed.message);
+          }
+        } else {
+          batchError = `Apps Script returned HTTP ${directRes.status}`;
+        }
+      } catch (err: any) {
+        const fallbackMsg =
+          err?.name === 'TimeoutError' || err?.name === 'AbortError'
+            ? `Direct Apps Script batch ${bIdx + 1}/${companyChunks.length} timed out`
+            : err?.message || String(err);
+        if (!batchError) batchError = fallbackMsg;
+        console.warn(`Notice pushing batch ${bIdx + 1}/${companyChunks.length} directly to Google Apps Script:`, err);
+      }
+    }
+
+    if (batchSynced) {
+      successfulBatches++;
+      totalCloudPushed += batchPushed;
+      totalCloudBranches += batchBranches;
+      totalCloudUsers += batchUsers;
+    } else if (batchError) {
+      lastCloudError = batchError;
     }
   }
 
-  const finalCompanies = getCompanies();
+  const allBatchesSynced = successfulBatches === companyChunks.length && successfulBatches > 0;
+  if (allBatchesSynced) {
+    const batchNote = companyChunks.length > 1 ? ` across ${companyChunks.length} batches` : '';
+    return {
+      success: true,
+      cloudSynced: true,
+      pushedCount: totalCloudPushed,
+      cloudPushedCount: totalCloudPushed,
+      branchesCount: totalCloudBranches,
+      usersCount: totalCloudUsers,
+      message: `Pushed ${totalCloudPushed} tenants, ${totalCloudBranches} branches, and ${totalCloudUsers} users to Master Google Sheet${batchNote}.`,
+    };
+  }
+
+  if (successfulBatches > 0) {
+    return {
+      success: false,
+      cloudSynced: false,
+      pushedCount: totalCloudPushed,
+      cloudPushedCount: totalCloudPushed,
+      branchesCount: totalCloudBranches,
+      usersCount: totalCloudUsers,
+      error: lastCloudError || 'Some batches failed to reach Master Google Sheet.',
+      message: `Partially pushed ${totalCloudPushed} tenants (${successfulBatches}/${companyChunks.length} batches succeeded). ${lastCloudError}`,
+    };
+  }
+
   return {
-    success: true,
-    pushedCount: finalCompanies.length,
-    message: `Synchronized ${finalCompanies.length} tenants across devices and Master Sheet.`,
+    success: false,
+    cloudSynced: false,
+    pushedCount: 0,
+    cloudPushedCount: 0,
+    error: lastCloudError || 'Master Google Sheet did not confirm the push.',
+    message: lastCloudError
+      ? `Master Sheet push failed: ${lastCloudError}`
+      : 'Master Google Sheet Webhook URL is not configured or unreachable.',
   };
 }
 
@@ -313,9 +491,12 @@ export async function initializeSystemConfigAndSync(): Promise<{
     // 1. Fetch server system config so this device adopts the master webhook
     await fetchGlobalSystemConfig();
 
+    // 1b. Flush any pending cloud registrations queued during temporary network issues
+    await flushPendingCloudRegistrations().catch(() => {});
+
     // 2. Query companies & users from server
     try {
-      const serverRes = await fetch('/api/saas/companies', { signal: AbortSignal.timeout(5000) });
+      const serverRes = await fetch('/api/saas/companies', { signal: AbortSignal.timeout(12000) });
       if (serverRes.ok) {
         const serverData = await serverRes.json();
         if (serverData && Array.isArray(serverData.companies)) {
@@ -349,7 +530,7 @@ export async function initializeSystemConfigAndSync(): Promise<{
     // 4. Send any local companies that server might not have to the server
     const allCurrent = getCompanies();
     if (allCurrent.length > 0) {
-      const branches = getBranches();
+      const branches = getAllBranches();
       const allUsers: any[] = [];
       allCurrent.forEach((comp) => {
         allUsers.push(...getSalespeopleForCompany(comp.company_id));
@@ -362,7 +543,7 @@ export async function initializeSystemConfigAndSync(): Promise<{
           branches,
           users: allUsers,
         }),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(15000),
       }).catch(() => {});
     }
 

@@ -404,7 +404,7 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
         webhook_url: targetWebhook,
         ...payloadData,
       }),
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(20000),
     });
 
     if (srvRes.status === 200 || srvRes.status === 201 || srvRes.ok) {
@@ -447,20 +447,31 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
       throw new Error(errJson?.error || `Cloud proxy returned HTTP ${srvRes.status}`);
     }
   } catch (proxyErr: any) {
+    if (proxyErr?.name === 'TimeoutError' || proxyErr?.name === 'AbortError') {
+      throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+    }
     if (!proxyNotFound && proxyErr?.name !== 'TypeError') {
       throw proxyErr;
     }
   }
 
   // 2. Direct browser fetch to Google Apps Script Webhook (strict CORS/HTTP verification - NO blind no-cors)
-  const directRes = await fetch(targetWebhook, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/plain;charset=utf-8',
-    },
-    body: JSON.stringify(payloadData),
-    signal: AbortSignal.timeout(10000),
-  });
+  let directRes: Response;
+  try {
+    directRes = await fetch(targetWebhook, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8',
+      },
+      body: JSON.stringify(payloadData),
+      signal: AbortSignal.timeout(20000),
+    });
+  } catch (directErr: any) {
+    if (directErr?.name === 'TimeoutError' || directErr?.name === 'AbortError') {
+      throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+    }
+    throw new Error(directErr?.message || 'Cloud sync network error; record kept in offline queue for retry.');
+  }
 
   if (directRes.status !== 200 && directRes.status !== 201 && !directRes.ok) {
     throw new Error(`Google Apps Script webhook failed with HTTP ${directRes.status}`);
@@ -1420,70 +1431,121 @@ export const fetchProductsFromSheet = async (
 };
 
 /**
- * Fetch all registered SaaS companies from the Master Google Sheet 'companies' tab.
- * Automatically synchronizes with local storage database so they appear in Super Admin Dashboard.
+ * Fetch all registered SaaS companies, branches, and users from the Master Google Sheet.
+ * Primary path routes through the Express server proxy (/api/saas/companies?force=true) to avoid
+ * browser CORS preflight rejections on Google Apps Script, with a CORS-safe direct fallback for static PWAs.
  */
 export const fetchCompaniesFromMasterSheet = async (
   webhookUrl?: string
-): Promise<{ success: boolean; companies: Company[]; message?: string }> => {
+): Promise<{
+  success: boolean;
+  cloudSynced?: boolean;
+  companies: Company[];
+  branchesCount?: number;
+  usersCount?: number;
+  message?: string;
+}> => {
   const config = getSheetsConfig();
-  const targetUrl = webhookUrl || config.masterWebhookUrl || config.webhookUrl;
+  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
 
-  if (!targetUrl || !targetUrl.startsWith('http')) {
+  let remoteList: any[] = [];
+  let remoteBranches: any[] = [];
+  let remoteUsers: any[] = [];
+  let cloudSynced = false;
+  let cloudError = '';
+
+  // 1. Primary: Server proxy (zero CORS, follows Google Apps Script 302 redirects cleanly)
+  try {
+    const queryParts = ['force=true'];
+    if (targetUrl && targetUrl.startsWith('http')) {
+      queryParts.push(`webhookUrl=${encodeURIComponent(targetUrl)}`);
+    }
+    const srvRes = await fetch(`/api/saas/companies?${queryParts.join('&')}`, {
+      method: 'GET',
+      signal: AbortSignal.timeout(20000),
+    });
+    if (srvRes.ok) {
+      const srvData = await srvRes.json().catch(() => null);
+      if (srvData) {
+        if (Array.isArray(srvData.companies)) remoteList = srvData.companies;
+        if (Array.isArray(srvData.branches)) remoteBranches = srvData.branches;
+        if (Array.isArray(srvData.users)) remoteUsers = srvData.users;
+        if (srvData.cloudSynced === true) {
+          cloudSynced = true;
+        } else if (srvData.cloudError) {
+          cloudError = String(srvData.cloudError);
+        }
+      }
+    }
+  } catch (srvErr: any) {
+    cloudError = srvErr?.message || String(srvErr);
+  }
+
+  // 2. Fallback: Direct CORS-safe browser call (no preflight headers) if server proxy unavailable or didn't sync
+  if (!cloudSynced && targetUrl && targetUrl.startsWith('http')) {
+    try {
+      const urlWithAction = targetUrl.includes('?')
+        ? `${targetUrl}&action=get_companies`
+        : `${targetUrl}?action=get_companies`;
+
+      let data: any = null;
+      try {
+        const res = await fetch(urlWithAction, {
+          method: 'GET',
+          signal: AbortSignal.timeout(18000),
+        });
+        if (res.ok) {
+          const txt = await res.text();
+          try { data = JSON.parse(txt); } catch { data = null; }
+        }
+      } catch {
+        data = null;
+      }
+
+      if (!data || data.success === false) {
+        const postRes = await fetch(targetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ action: 'get_companies' }),
+          signal: AbortSignal.timeout(18000),
+        });
+        if (postRes.ok) {
+          const txt = await postRes.text();
+          try { data = JSON.parse(txt); } catch { data = null; }
+        }
+      }
+
+      if (data && data.success !== false && !data.error) {
+        cloudSynced = true;
+        cloudError = '';
+        if (Array.isArray(data.companies)) remoteList = data.companies;
+        if (Array.isArray(data.branches)) remoteBranches = data.branches;
+        if (Array.isArray(data.users)) remoteUsers = data.users;
+      } else if (data?.error || data?.message) {
+        cloudError = String(data.error || data.message);
+      }
+    } catch (directErr: any) {
+      if (!cloudError) cloudError = directErr?.message || String(directErr);
+    }
+  }
+
+  if (!targetUrl && !cloudSynced && remoteList.length === 0) {
     const local = getCompanies();
     return {
-      success: true,
+      success: false,
+      cloudSynced: false,
       companies: local,
-      message: 'Using local database records (Master Webhook URL not set)',
+      message: 'Master Google Apps Script Webhook URL is not configured.',
     };
   }
 
   try {
-    const urlWithAction = targetUrl.includes('?')
-      ? `${targetUrl}&action=get_companies`
-      : `${targetUrl}?action=get_companies`;
-
-    const res = await fetch(urlWithAction, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(5000),
-    });
-
-    let remoteList: any[] = [];
-    let remoteUsers: any[] = [];
-    if (res.ok) {
-      const data = await res.json();
-      if (data && Array.isArray(data.companies)) {
-        remoteList = data.companies;
-      }
-      if (data && Array.isArray(data.users)) {
-        remoteUsers = data.users;
-      }
-    } else {
-      // Fallback to POST
-      const postRes = await fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'get_companies' }),
-        signal: AbortSignal.timeout(5000),
-      });
-      if (postRes.ok) {
-        const postData = await postRes.json();
-        if (postData && Array.isArray(postData.companies)) {
-          remoteList = postData.companies;
-        }
-        if (postData && Array.isArray(postData.users)) {
-          remoteUsers = postData.users;
-        }
-      }
-    }
-
     if (remoteList.length > 0) {
-      // Merge companies into local database
       remoteList.forEach((c) => {
+        if (!c || !c.company_id) return;
         saveCompany({
           company_id: c.company_id,
-          company_name: c.company_name,
+          company_name: c.company_name || c.company_id,
           owner_name: c.owner_name || 'Business Owner',
           owner_email: c.owner_email || '',
           phone: c.phone || '',
@@ -1494,12 +1556,11 @@ export const fetchCompaniesFromMasterSheet = async (
           subscription_status: c.subscription_status || 'TRIAL',
           plan: c.plan || 'PROFESSIONAL',
           next_billing_date: c.next_billing_date || '',
-          offline_activation_code: c.offline_activation_code || `SAI-${c.company_id.slice(-4)}`,
+          offline_activation_code: c.offline_activation_code || c.activation_code || `SAI-${String(c.company_id).slice(-4)}`,
           branch_isolation_mode: c.branch_isolation_mode || 'ROW_LEVEL',
           trial_days_remaining: c.trial_days_remaining,
         });
 
-        // Ensure newly synced company has an owner salesperson only when NO staff records (active or deleted) exist for that company
         const existingStaff = getSalespeopleForCompany(c.company_id);
         const existingAllCompanyStaff = getAllSalespeople().filter(
           (s) => String(s.companyId || (s as any).company_id || '').toUpperCase() === String(c.company_id || '').toUpperCase()
@@ -1525,6 +1586,15 @@ export const fetchCompaniesFromMasterSheet = async (
             },
             { fromSync: true }
           );
+        }
+      });
+    }
+
+    if (remoteBranches.length > 0) {
+      remoteBranches.forEach((sb: any) => {
+        const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
+        if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
+          saveBranch(sb, { fromSync: true });
         }
       });
     }
@@ -1625,26 +1695,208 @@ export const fetchCompaniesFromMasterSheet = async (
       }
     }
 
-    if (remoteList.length > 0 || remoteUsers.length > 0) {
+    if (cloudSynced) {
       return {
         success: true,
+        cloudSynced: true,
         companies: getCompanies(),
-        message: `Successfully synchronized ${remoteList.length} companies and ${remoteUsers.length} staff users from Master Google Sheet.`,
+        branchesCount: remoteBranches.length,
+        usersCount: remoteUsers.length,
+        message: `Synced ${remoteList.length} tenants, ${remoteBranches.length} branches, and ${remoteUsers.length} users from Master Google Sheet.`,
       };
     }
 
     return {
-      success: true,
+      success: false,
+      cloudSynced: false,
       companies: getCompanies(),
-      message: 'Master Sheet query completed. Local records retained.',
+      branchesCount: remoteBranches.length,
+      usersCount: remoteUsers.length,
+      message: cloudError
+        ? `Could not pull from Master Google Sheet: ${cloudError}`
+        : 'Master Sheet did not respond. Showing local cached tenants.',
     };
   } catch (err: any) {
     return {
       success: false,
+      cloudSynced: false,
       companies: getCompanies(),
       message: `Could not reach Master Sheet: ${err.message || String(err)}. Showing cached local companies.`,
     };
   }
+};
+
+export interface CloudRegistrationPayload {
+  company_id: string;
+  company_name: string;
+  owner_name: string;
+  owner_email: string;
+  phone?: string;
+  business_category?: string;
+  branch_id: string;
+  branch_name: string;
+  branch_code: string;
+  branch_location?: string;
+  user_id: string;
+  password: string;
+  plan?: string;
+  force_new_tenant?: boolean;
+}
+
+export interface CloudRegistrationResult {
+  success: boolean;
+  cloudSynced: boolean;
+  code?: string;
+  existingCompanyId?: string;
+  company_id?: string;
+  branch_id?: string;
+  user_id?: string;
+  sheet_id?: string;
+  spreadsheet_id?: string;
+  url?: string;
+  routing_epoch?: number;
+  token?: string;
+  message?: string;
+  error?: string;
+}
+
+/**
+ * Authoritative cross-device tenant registration:
+ * Sends full `signup_company` payload via Express (/api/saas/signup) to Master Google Sheet
+ * (creating companies + Global_Users + branches + users + permissions + optional template sheet + HS256 JWT),
+ * with CORS-safe direct Apps Script fallback for static PWAs.
+ */
+export const registerCompanyInCloud = async (
+  payload: CloudRegistrationPayload,
+  webhookUrl?: string
+): Promise<CloudRegistrationResult> => {
+  const config = getSheetsConfig();
+  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
+
+  let serverCloudError = '';
+
+  // 1. Primary: Server proxy (/api/saas/signup)
+  try {
+    const res = await fetch('/api/saas/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...payload,
+        full_name: payload.owner_name,
+        pin: payload.password,
+        webhookUrl: targetUrl || undefined,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+
+    const data = await res.json().catch(() => null);
+    if (res.status === 409 || data?.code === 'DUPLICATE_EMAIL') {
+      return {
+        success: false,
+        cloudSynced: false,
+        code: 'DUPLICATE_EMAIL',
+        existingCompanyId: data?.existing_company_id,
+        error: data?.message || data?.error || 'An account with this email already exists.',
+      };
+    }
+
+    if (res.ok && data && data.cloudSynced === true) {
+      const sid = String(data.sheet_id || data.spreadsheet_id || '').trim();
+      const ep = Number(data.routing_epoch || 1);
+      if (sid) updateTenantSheetBinding(payload.company_id, sid);
+      if (ep > 0) setRoutingEpoch(payload.company_id, ep);
+      if (data.token) setTenantAuthToken(payload.company_id, String(data.token));
+
+      return {
+        success: true,
+        cloudSynced: true,
+        company_id: data.company_id || payload.company_id,
+        branch_id: data.branch_id || payload.branch_id,
+        user_id: data.user_id || payload.user_id,
+        sheet_id: sid,
+        spreadsheet_id: sid,
+        url: data.url || '',
+        routing_epoch: ep,
+        token: data.token,
+        message: data.message || 'Registered and synced to Master Google Sheet.',
+      };
+    }
+
+    if (data?.cloudError) {
+      serverCloudError = String(data.cloudError);
+    }
+  } catch (srvErr: any) {
+    serverCloudError = srvErr?.message || String(srvErr);
+  }
+
+  // 2. Fallback: CORS-safe direct Apps Script POST (text/plain avoids OPTIONS preflight)
+  if (targetUrl && targetUrl.startsWith('http')) {
+    try {
+      const directRes = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'signup_company',
+          clientRequestId: `REQ-SIGNUP-${payload.company_id}-${Date.now()}`,
+          ...payload,
+          full_name: payload.owner_name,
+          pin: payload.password,
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+
+      if (directRes.ok) {
+        const text = await directRes.text();
+        let data: any = null;
+        try { data = JSON.parse(text); } catch { data = null; }
+
+        if (data?.code === 'DUPLICATE_EMAIL') {
+          return {
+            success: false,
+            cloudSynced: false,
+            code: 'DUPLICATE_EMAIL',
+            existingCompanyId: data.existing_company_id,
+            error: data.error || 'An account with this email already exists.',
+          };
+        }
+
+        if (data && (data.success === true || data.status === 'success')) {
+          const sid = String(data.sheet_id || data.spreadsheet_id || '').trim();
+          const ep = Number(data.routing_epoch || 1);
+          if (sid) updateTenantSheetBinding(payload.company_id, sid);
+          if (ep > 0) setRoutingEpoch(payload.company_id, ep);
+          if (data.token) setTenantAuthToken(payload.company_id, String(data.token));
+
+          return {
+            success: true,
+            cloudSynced: true,
+            company_id: data.company_id || payload.company_id,
+            branch_id: data.branch_id || payload.branch_id,
+            user_id: data.user_id || payload.user_id,
+            sheet_id: sid,
+            spreadsheet_id: sid,
+            url: data.url || '',
+            routing_epoch: ep,
+            token: data.token,
+            message: 'Registered directly in Master Google Sheet.',
+          };
+        }
+        serverCloudError = String(data?.error || data?.message || serverCloudError || 'Master Sheet rejected registration');
+      }
+    } catch (directErr: any) {
+      serverCloudError = directErr?.message || String(directErr) || serverCloudError;
+    }
+  }
+
+  return {
+    success: true,
+    cloudSynced: false,
+    company_id: payload.company_id,
+    branch_id: payload.branch_id,
+    user_id: payload.user_id,
+    error: serverCloudError || 'Master Google Sheet webhook is not configured or unreachable.',
+    message: 'Registered locally; queued for automatic Master Sheet sync once cloud is reachable.',
+  };
 };
 
 /**
@@ -1655,13 +1907,16 @@ export const syncCompanyToCloud = async (
   branch?: any,
   owner?: any,
   webhookUrl?: string
-): Promise<{ success: boolean; message?: string }> => {
+): Promise<{ success: boolean; cloudSynced?: boolean; message?: string }> => {
   const config = getSheetsConfig();
-  const targetUrl = webhookUrl || config.masterWebhookUrl || config.webhookUrl;
+  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
 
-  // 1. Always notify local backend server store so all devices see the company immediately
+  let cloudSynced = false;
+  let cloudError = '';
+
+  // 1. Primary: Notify backend server store & let server forward to Master Sheet (zero CORS)
   try {
-    fetch('/api/saas/sync-company', {
+    const srvRes = await fetch('/api/saas/sync-company', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1669,19 +1924,33 @@ export const syncCompanyToCloud = async (
         branch,
         owner,
       }),
-    }).catch(() => {});
-  } catch {
-    // ignore
+      signal: AbortSignal.timeout(18000),
+    });
+    if (srvRes.ok) {
+      const srvData = await srvRes.json().catch(() => null);
+      if (srvData?.cloudSynced === true) {
+        cloudSynced = true;
+        return { success: true, cloudSynced: true, message: srvData.cloudSyncStatus || 'Synchronized to Master Google Sheet' };
+      }
+      if (srvData?.cloudError) cloudError = String(srvData.cloudError);
+    }
+  } catch (e: any) {
+    cloudError = e?.message || String(e);
   }
 
   if (!targetUrl || !targetUrl.startsWith('http')) {
-    return { success: true, message: 'Saved locally & registered on server store (Master Webhook URL not set)' };
+    return {
+      success: true,
+      cloudSynced: false,
+      message: 'Saved locally & registered on server store (Master Webhook URL not set)',
+    };
   }
 
+  // 2. Fallback: CORS-safe direct Apps Script POST (no preflight, reads real JSON response)
   try {
-    await fetch(targetUrl, {
+    const directRes = await fetch(targetUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({
         action: 'sync_company',
         data: {
@@ -1690,12 +1959,29 @@ export const syncCompanyToCloud = async (
           owner,
         },
       }),
-      mode: 'no-cors', // resilient cross-origin invocation
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(18000),
     });
-    return { success: true, message: 'Dispatched to Master Google Sheet' };
+    if (directRes.ok) {
+      const txt = await directRes.text();
+      let parsed: any = null;
+      try { parsed = JSON.parse(txt); } catch { parsed = null; }
+      if (parsed && parsed.success !== false && !parsed.error) {
+        cloudSynced = true;
+        return { success: true, cloudSynced: true, message: 'Synchronized to Master Google Sheet' };
+      }
+      cloudError = String(parsed?.error || parsed?.message || cloudError);
+    }
+    return {
+      success: false,
+      cloudSynced,
+      message: cloudError ? `Master Sheet sync failed: ${cloudError}` : 'Master Sheet did not confirm company sync',
+    };
   } catch (err: any) {
-    return { success: false, message: `Sync warning: ${err.message || String(err)}` };
+    return {
+      success: false,
+      cloudSynced: false,
+      message: `Sync warning: ${err.message || String(err)}`,
+    };
   }
 };
 

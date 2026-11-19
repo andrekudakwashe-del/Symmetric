@@ -37,7 +37,15 @@ export const saveAndSyncThroughBridge = async (
   envelope: SyncEnvelope
 ): Promise<BroadcastResult | null> => {
   if (!_saveAndSyncHandler) return null;
-  return await _saveAndSyncHandler(envelope);
+  try {
+    return await _saveAndSyncHandler(envelope);
+  } catch (err: any) {
+    return {
+      success: false,
+      packetId: envelope.packetId,
+      error: err?.message || 'Sync deferred to offline queue',
+    };
+  }
 };
 
 export const registerTombstoneLookup = (fn: () => BridgeTombstoneRecord[]): void => {
@@ -107,24 +115,53 @@ export const routeCloudRecordThroughSyncCore = async (
       if (incomingTs <= 0 && (existingTs > 0 || existingVersion > 0 || existingSource === 'USER_EDIT')) {
         return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
       }
-      if (existingVersion > 0 && incomingVersion > 0) {
-        if (incomingVersion < existingVersion) {
+      const isStaffRecord = envelope.entityType === 'staff';
+      const existingPinVer = isStaffRecord ? Number(existingRecord.pinVersion ?? existingRecord.pin_version ?? 0) : 0;
+      const incomingPinVer = isStaffRecord ? Number(envelope.data?.pinVersion ?? envelope.data?.pin_version ?? 0) : 0;
+      const incomingHasNewerPin =
+        isStaffRecord &&
+        Boolean(envelope.data?.pin_hash || envelope.data?.pinHash) &&
+        incomingPinVer > existingPinVer;
+      const localHasNewerPin =
+        isStaffRecord &&
+        Boolean(existingRecord.pin_hash || existingRecord.pinHash || existingRecord.pin) &&
+        existingPinVer > 0 &&
+        (incomingPinVer === 0 || existingPinVer > incomingPinVer);
+
+      if (!incomingHasNewerPin) {
+        if (existingVersion > 0 && incomingVersion > 0) {
+          if (incomingVersion < existingVersion) {
+            return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
+          }
+          if (incomingVersion === existingVersion && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
+            return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
+          }
+        } else if (existingVersion > 0 && incomingVersion === 0 && existingSource === 'USER_EDIT') {
+          if (incomingTs <= existingTs + 60000) {
+            return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
+          }
+        } else if (existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
           return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
         }
-        if (incomingVersion === existingVersion && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
-          return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
+
+        const isLocalDirty = Boolean(existingRecord.isDirty || existingRecord.dirty || existingRecord.synced === false);
+        if (isLocalDirty && incomingVersion <= existingVersion && incomingTs <= existingTs + 60000) {
+          return { accepted: false, reason: 'STALE_T2_DIRTY_LOCAL' };
         }
-      } else if (existingVersion > 0 && incomingVersion === 0 && existingSource === 'USER_EDIT') {
-        if (incomingTs <= existingTs + 60000) {
-          return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
-        }
-      } else if (existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
-        return { accepted: false, reason: 'STALE_T2_BOOT_GUARD' };
       }
 
-      const isLocalDirty = Boolean(existingRecord.isDirty || existingRecord.dirty || existingRecord.synced === false);
-      if (isLocalDirty && incomingVersion <= existingVersion && incomingTs <= existingTs + 60000) {
-        return { accepted: false, reason: 'STALE_T2_DIRTY_LOCAL' };
+      if (localHasNewerPin && envelope.data && typeof envelope.data === 'object') {
+        if (existingRecord.pin !== undefined) (envelope.data as any).pin = existingRecord.pin;
+        if (existingRecord.pin_hash || existingRecord.pinHash) {
+          (envelope.data as any).pin_hash = existingRecord.pin_hash || existingRecord.pinHash;
+        }
+        if (existingRecord.pin_salt || existingRecord.pinSalt) {
+          (envelope.data as any).pin_salt = existingRecord.pin_salt || existingRecord.pinSalt;
+        }
+        (envelope.data as any).pinVersion = existingPinVer;
+        if (existingRecord.pinUpdatedAt) {
+          (envelope.data as any).pinUpdatedAt = existingRecord.pinUpdatedAt;
+        }
       }
     }
   }
