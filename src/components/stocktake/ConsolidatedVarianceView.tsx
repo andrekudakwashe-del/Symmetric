@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useDeferredValue } from 'react';
 import {
   Search,
   Filter,
@@ -20,6 +20,10 @@ import {
   EyeOff,
   ClipboardCheck,
   ShieldAlert,
+  ArrowUpDown,
+  ArrowDown,
+  ArrowUp,
+  X,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -47,7 +51,11 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
   onBatchRequestRecount,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   const [filterType, setFilterType] = useState<'ALL' | 'VARIANCES' | 'SHORTAGES' | 'OVERAGES' | 'MATCH' | 'FLAGGED'>('ALL');
+  const [sortBy, setSortBy] = useState<
+    'ABS_COST_DESC' | 'COST_ASC' | 'COST_DESC' | 'ABS_UNITS_DESC' | 'ABS_RETAIL_DESC' | 'NAME_ASC' | 'DEFAULT'
+  >('ABS_COST_DESC');
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
   const [selectedForRecount, setSelectedForRecount] = useState<string[]>([]);
 
@@ -71,36 +79,83 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
     }
   }, [session.sessionId, session.consolidatedItems?.length, verifiedSegmentsCount, onConsolidateAgain]);
 
-  // Filter items
-  const q = (searchQuery || '').trim().toLowerCase();
-  const filteredItems = consolidated.filter((item) => {
-    const matchesSearch =
-      q === '' ||
-      (item.itemName && item.itemName.toLowerCase().includes(q)) ||
-      (item.sku && item.sku.toLowerCase().includes(q)) ||
-      (item.barcode && item.barcode.includes(searchQuery));
+  // Filter & Sort items (memoized for snappy typing & sorting)
+  const filteredItems = useMemo(() => {
+    const q = (deferredSearchQuery || '').trim().toLowerCase();
+    const matched = consolidated.filter((item) => {
+      const matchesSearch =
+        q === '' ||
+        (item.itemName && item.itemName.toLowerCase().includes(q)) ||
+        (item.sku && item.sku.toLowerCase().includes(q)) ||
+        (item.category && item.category.toLowerCase().includes(q)) ||
+        (item.barcode && String(item.barcode).toLowerCase().includes(q));
 
-    let matchesFilter = true;
-    if (filterType === 'VARIANCES') {
-      matchesFilter = item.varianceTotalUnits !== 0;
-    } else if (filterType === 'SHORTAGES') {
-      matchesFilter = item.varianceTotalUnits < 0;
-    } else if (filterType === 'OVERAGES') {
-      matchesFilter = item.varianceTotalUnits > 0;
-    } else if (filterType === 'MATCH') {
-      matchesFilter = item.varianceTotalUnits === 0;
-    } else if (filterType === 'FLAGGED') {
-      matchesFilter = !!item.recountRequested;
+      let matchesFilter = true;
+      if (filterType === 'VARIANCES') {
+        matchesFilter = item.varianceTotalUnits !== 0;
+      } else if (filterType === 'SHORTAGES') {
+        matchesFilter = item.varianceTotalUnits < 0;
+      } else if (filterType === 'OVERAGES') {
+        matchesFilter = item.varianceTotalUnits > 0;
+      } else if (filterType === 'MATCH') {
+        matchesFilter = item.varianceTotalUnits === 0;
+      } else if (filterType === 'FLAGGED') {
+        matchesFilter = !!item.recountRequested;
+      }
+
+      return matchesSearch && matchesFilter;
+    });
+
+    if (sortBy === 'DEFAULT') return matched;
+
+    return [...matched].sort((a, b) => {
+      if (sortBy === 'ABS_COST_DESC') {
+        const diff = Math.abs(Number(b.varianceCostValue || 0)) - Math.abs(Number(a.varianceCostValue || 0));
+        if (Math.abs(diff) > 0.0001) return diff;
+        return Math.abs(Number(b.varianceTotalUnits || 0)) - Math.abs(Number(a.varianceTotalUnits || 0));
+      }
+      if (sortBy === 'COST_ASC') {
+        // Most negative shortage ($) at the top
+        return Number(a.varianceCostValue || 0) - Number(b.varianceCostValue || 0);
+      }
+      if (sortBy === 'COST_DESC') {
+        // Largest positive overage ($) at the top
+        return Number(b.varianceCostValue || 0) - Number(a.varianceCostValue || 0);
+      }
+      if (sortBy === 'ABS_UNITS_DESC') {
+        const diff = Math.abs(Number(b.varianceTotalUnits || 0)) - Math.abs(Number(a.varianceTotalUnits || 0));
+        if (diff !== 0) return diff;
+        return Math.abs(Number(b.varianceCostValue || 0)) - Math.abs(Number(a.varianceCostValue || 0));
+      }
+      if (sortBy === 'ABS_RETAIL_DESC') {
+        return Math.abs(Number(b.varianceRetailValue || 0)) - Math.abs(Number(a.varianceRetailValue || 0));
+      }
+      if (sortBy === 'NAME_ASC') {
+        return String(a.itemName || '').localeCompare(String(b.itemName || ''));
+      }
+      return 0;
+    });
+  }, [consolidated, deferredSearchQuery, filterType, sortBy]);
+
+  const { totalSKUs, matchCount, shortageCount, overageCount, flaggedCount } = useMemo(() => {
+    let matches = 0;
+    let shortages = 0;
+    let overages = 0;
+    let flagged = 0;
+    for (const i of consolidated) {
+      if (i.varianceTotalUnits === 0) matches++;
+      else if (i.varianceTotalUnits < 0) shortages++;
+      else overages++;
+      if (i.recountRequested) flagged++;
     }
-
-    return matchesSearch && matchesFilter;
-  });
-
-  const totalSKUs = consolidated.length;
-  const matchCount = consolidated.filter((i) => i.varianceTotalUnits === 0).length;
-  const shortageCount = consolidated.filter((i) => i.varianceTotalUnits < 0).length;
-  const overageCount = consolidated.filter((i) => i.varianceTotalUnits > 0).length;
-  const flaggedCount = consolidated.filter((i) => i.recountRequested).length;
+    return {
+      totalSKUs: consolidated.length,
+      matchCount: matches,
+      shortageCount: shortages,
+      overageCount: overages,
+      flaggedCount: flagged,
+    };
+  }, [consolidated]);
 
   const handleStartRecount = (item: StocktakeConsolidatedItem) => {
     setEditingSkuId(item.itemId);
@@ -143,7 +198,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
       'Status',
     ];
 
-    const rows = consolidated.map((i) => [
+    const rows = filteredItems.map((i) => [
       `"${i.sku}"`,
       `"${String(i.itemName || '').replace(/"/g, '""')}"`,
       `"${i.category}"`,
@@ -379,22 +434,78 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
         </div>
       </div>
 
-      {/* Action Toolbar & Filters */}
-      <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2 flex-1 min-w-[260px]">
-          <div className="relative flex-1">
-            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+      {/* Action Toolbar, Full-Width Search, Variance Sorting & Filters */}
+      <div className="bg-slate-800/80 p-3.5 rounded-xl border border-slate-700 space-y-3">
+        {/* Row 1: Prominent Full-Width Search Input + Sort by Variance Value */}
+        <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+          <div className="relative flex-1 min-w-0">
+            <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
-              type="text"
+              type="search"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search variance items by SKU, name, barcode..."
-              className="w-full pl-9 pr-4 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              placeholder="Search variance items by item name, SKU, category, or barcode..."
+              aria-label="Search consolidated variance items"
+              className="w-full pl-10 pr-24 py-2.5 bg-slate-950 border border-slate-600 focus:border-blue-500 rounded-xl text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/40 shadow-inner"
             />
+            <div className="absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+              <span className="text-[11px] font-mono text-slate-400 bg-slate-900 border border-slate-700/80 px-2 py-0.5 rounded-md pointer-events-none">
+                {filteredItems.length}/{totalSKUs}
+              </span>
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="p-1 rounded-md text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                  title="Clear search"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
           </div>
 
-          <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-700/80 text-xs">
+          <div className="flex items-center gap-2 shrink-0 bg-slate-950 border border-slate-700 rounded-xl px-3 py-1.5">
+            <ArrowUpDown className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+            <label htmlFor="variance-sort-select" className="text-[11px] font-semibold text-slate-400 whitespace-nowrap">
+              Sort:
+            </label>
+            <select
+              id="variance-sort-select"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as any)}
+              className="bg-transparent text-xs font-semibold text-white focus:outline-none cursor-pointer pr-1"
+            >
+              <option value="ABS_COST_DESC" className="bg-slate-900 text-white">
+                Largest Variance Value ($ Abs)
+              </option>
+              <option value="COST_ASC" className="bg-slate-900 text-white">
+                Biggest Shortages ($ First)
+              </option>
+              <option value="COST_DESC" className="bg-slate-900 text-white">
+                Biggest Overages ($ First)
+              </option>
+              <option value="ABS_UNITS_DESC" className="bg-slate-900 text-white">
+                Largest Unit Variance
+              </option>
+              <option value="ABS_RETAIL_DESC" className="bg-slate-900 text-white">
+                Largest Retail Variance ($)
+              </option>
+              <option value="NAME_ASC" className="bg-slate-900 text-white">
+                Item Name (A–Z)
+              </option>
+              <option value="DEFAULT" className="bg-slate-900 text-white">
+                Default Catalog Order
+              </option>
+            </select>
+          </div>
+        </div>
+
+        {/* Row 2: Filter Pills (Wrapped Cleanly) + Action Buttons */}
+        <div className="flex flex-wrap items-center justify-between gap-2.5">
+          <div className="flex flex-wrap items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-700/80 text-xs">
             <button
+              type="button"
               onClick={() => setFilterType('ALL')}
               className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${
                 filterType === 'ALL' ? 'bg-slate-700 text-white' : 'text-slate-400 hover:text-slate-200'
@@ -403,6 +514,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
               All ({totalSKUs})
             </button>
             <button
+              type="button"
               onClick={() => setFilterType('VARIANCES')}
               className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${
                 filterType === 'VARIANCES'
@@ -413,6 +525,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
               Variances ({shortageCount + overageCount})
             </button>
             <button
+              type="button"
               onClick={() => setFilterType('SHORTAGES')}
               className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${
                 filterType === 'SHORTAGES' ? 'bg-rose-600 text-white' : 'text-slate-400 hover:text-slate-200'
@@ -421,6 +534,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
               Shortages ({shortageCount})
             </button>
             <button
+              type="button"
               onClick={() => setFilterType('OVERAGES')}
               className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${
                 filterType === 'OVERAGES'
@@ -430,8 +544,20 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
             >
               Overages ({overageCount})
             </button>
+            <button
+              type="button"
+              onClick={() => setFilterType('MATCH')}
+              className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${
+                filterType === 'MATCH'
+                  ? 'bg-slate-600 text-white'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Matched ({matchCount})
+            </button>
             {flaggedCount > 0 && (
               <button
+                type="button"
                 onClick={() => setFilterType('FLAGGED')}
                 className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${
                   filterType === 'FLAGGED'
@@ -443,47 +569,49 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
               </button>
             )}
           </div>
-        </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {session.status !== 'APPROVED_POSTED' && queuedRecountCount > 0 && onOpenBlindRecountSheet && (
+          <div className="flex flex-wrap items-center gap-2">
+            {session.status !== 'APPROVED_POSTED' && queuedRecountCount > 0 && onOpenBlindRecountSheet && (
+              <button
+                type="button"
+                onClick={onOpenBlindRecountSheet}
+                className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-sm animate-pulse"
+              >
+                <EyeOff className="w-3.5 h-3.5" />
+                Open Blind Recount Sheet ({queuedRecountCount})
+              </button>
+            )}
+            {session.status !== 'APPROVED_POSTED' && (shortageCount + overageCount > 0 || selectedForRecount.length > 0) && (
+              <button
+                type="button"
+                onClick={handleDispatchBlindRecount}
+                className="px-3 py-1.5 bg-amber-600/90 hover:bg-amber-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-sm"
+                title="Send selected SKUs (or all variance SKUs) to strict Blind Recount Sheet"
+              >
+                <ClipboardCheck className="w-3.5 h-3.5" />
+                {selectedForRecount.length > 0
+                  ? `Dispatch Selected (${selectedForRecount.length}) to Blind Sheet`
+                  : 'Dispatch Variances to Blind Recount Sheet'}
+              </button>
+            )}
             <button
               type="button"
-              onClick={onOpenBlindRecountSheet}
-              className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-sm animate-pulse"
+              onClick={onConsolidateAgain}
+              className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
+              title="Refresh consolidation calculations from segment counts"
             >
-              <EyeOff className="w-3.5 h-3.5" />
-              Open Blind Recount Sheet ({queuedRecountCount})
+              <RotateCcw className="w-3.5 h-3.5" />
+              Recalculate
             </button>
-          )}
-          {session.status !== 'APPROVED_POSTED' && (shortageCount + overageCount > 0 || selectedForRecount.length > 0) && (
             <button
               type="button"
-              onClick={handleDispatchBlindRecount}
-              className="px-3 py-1.5 bg-amber-600/90 hover:bg-amber-500 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition shadow-sm"
-              title="Send selected SKUs (or all variance SKUs) to strict Blind Recount Sheet"
+              onClick={handleExportCSV}
+              className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
             >
-              <ClipboardCheck className="w-3.5 h-3.5" />
-              {selectedForRecount.length > 0
-                ? `Dispatch Selected (${selectedForRecount.length}) to Blind Sheet`
-                : 'Dispatch Variances to Blind Recount Sheet'}
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              Export Variance CSV
             </button>
-          )}
-          <button
-            onClick={onConsolidateAgain}
-            className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
-            title="Refresh consolidation calculations from segment counts"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            Recalculate
-          </button>
-          <button
-            onClick={handleExportCSV}
-            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shadow-sm"
-          >
-            <FileSpreadsheet className="w-3.5 h-3.5" />
-            Export Variance CSV
-          </button>
+          </div>
         </div>
       </div>
 
@@ -496,15 +624,73 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                 {session.status !== 'APPROVED_POSTED' && (
                   <th className="py-3 px-2.5 text-center">Sel</th>
                 )}
-                <th className="py-3 px-3">SKU & Item Name</th>
+                <th className="py-3 px-3">
+                  <button
+                    type="button"
+                    onClick={() => setSortBy(sortBy === 'NAME_ASC' ? 'DEFAULT' : 'NAME_ASC')}
+                    className={`inline-flex items-center gap-1 hover:text-white transition ${sortBy === 'NAME_ASC' ? 'text-blue-300' : ''}`}
+                    title="Sort by Item Name"
+                  >
+                    <span>SKU & Item Name</span>
+                    <ArrowUpDown className="w-3 h-3" />
+                  </button>
+                </th>
                 <th className="py-3 px-3 text-center">Packaging</th>
                 <th className="py-3 px-3 text-right">System SOH</th>
                 <th className="py-3 px-3 text-right">Original Count / Var</th>
                 <th className="py-3 px-3 text-left">Recount Sheet</th>
                 <th className="py-3 px-3 text-right">Net Physical Count</th>
-                <th className="py-3 px-3 text-center">Unit Variance</th>
-                <th className="py-3 px-3 text-right">Cost Variance ($)</th>
-                <th className="py-3 px-3 text-right">Retail Variance ($)</th>
+                <th className="py-3 px-3 text-center">
+                  <button
+                    type="button"
+                    onClick={() => setSortBy('ABS_UNITS_DESC')}
+                    className={`inline-flex items-center gap-1 hover:text-white transition ${sortBy === 'ABS_UNITS_DESC' ? 'text-amber-300' : ''}`}
+                    title="Sort by Largest Unit Variance"
+                  >
+                    <span>Unit Variance</span>
+                    {sortBy === 'ABS_UNITS_DESC' ? <ArrowDown className="w-3 h-3" /> : <ArrowUpDown className="w-3 h-3 opacity-60" />}
+                  </button>
+                </th>
+                <th className="py-3 px-3 text-right">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSortBy(
+                        sortBy === 'ABS_COST_DESC'
+                          ? 'COST_ASC'
+                          : sortBy === 'COST_ASC'
+                          ? 'COST_DESC'
+                          : 'ABS_COST_DESC'
+                      )
+                    }
+                    className={`inline-flex items-center gap-1 hover:text-white transition ${
+                      sortBy === 'ABS_COST_DESC' || sortBy === 'COST_ASC' || sortBy === 'COST_DESC'
+                        ? 'text-amber-300'
+                        : ''
+                    }`}
+                    title="Click to cycle: Largest Abs ($) → Biggest Shortages ($) → Biggest Overages ($)"
+                  >
+                    <span>Cost Variance ($)</span>
+                    {sortBy === 'COST_ASC' ? (
+                      <ArrowUp className="w-3 h-3" />
+                    ) : sortBy === 'ABS_COST_DESC' || sortBy === 'COST_DESC' ? (
+                      <ArrowDown className="w-3 h-3" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 opacity-60" />
+                    )}
+                  </button>
+                </th>
+                <th className="py-3 px-3 text-right">
+                  <button
+                    type="button"
+                    onClick={() => setSortBy('ABS_RETAIL_DESC')}
+                    className={`inline-flex items-center gap-1 hover:text-white transition ${sortBy === 'ABS_RETAIL_DESC' ? 'text-amber-300' : ''}`}
+                    title="Sort by Largest Retail Variance ($)"
+                  >
+                    <span>Retail Variance ($)</span>
+                    {sortBy === 'ABS_RETAIL_DESC' ? <ArrowDown className="w-3 h-3" /> : <ArrowUpDown className="w-3 h-3 opacity-60" />}
+                  </button>
+                </th>
                 <th className="py-3 px-3 text-center">Status</th>
                 <th className="py-3 px-3 text-center">Actions & Recount</th>
               </tr>

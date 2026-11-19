@@ -4798,31 +4798,38 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 8. TRANSACTIONAL DATA: STOCK MOVEMENTS (APPEND-ONLY, DEDUPLICATED)
+      // 8. TRANSACTIONAL DATA: STOCK MOVEMENTS (APPEND-ONLY, DEDUPLICATED, BATCH-READY)
       // =====================================================================
-      const movPayload = packet.movement || payload;
+      const movRawPayload = packet.movements || packet.movement || payload;
       const isStockMovementPkt =
         pType === 'STOCK_MOVEMENT' ||
         pType === 'STOCK_MOVEMENT_RECORD' ||
+        pType === 'STOCK_MOVEMENT_BATCH' ||
         entityType === 'stock_movement' ||
-        sheetName === 'StockMovement';
-      const rawMovId = movPayload && (movPayload.id || movPayload.movementId || movPayload.txnId);
-      if (isStockMovementPkt && movPayload && rawMovId) {
-        const mId = String(rawMovId).trim();
-        const baseMovId = stripHubStockMovementDupSuffix(mId);
-        const movItemId = String(movPayload.itemId || '').trim();
-        const isDupClone =
-          mId !== baseMovId &&
-          stockMovementsStore.some((m) => {
-            const existingId = String(m.id || m.movementId || m.txnId || '').trim();
-            const existingBase = stripHubStockMovementDupSuffix(existingId);
-            const existingItemId = String(m.itemId || '').trim();
-            return existingBase === baseMovId && (!movItemId || !existingItemId || existingItemId === movItemId);
-          });
+        sheetName === 'StockMovement' ||
+        sheetName === 'StockMovements';
+      if (isStockMovementPkt && movRawPayload) {
+        const movList = Array.isArray(movRawPayload) ? movRawPayload : [movRawPayload];
+        let acceptedCount = 0;
+        for (const movPayload of movList) {
+          const rawMovId = movPayload && (movPayload.id || movPayload.movementId || movPayload.txnId);
+          if (!movPayload || !rawMovId) continue;
+          const mId = String(rawMovId).trim();
+          const baseMovId = stripHubStockMovementDupSuffix(mId);
+          const movItemId = String(movPayload.itemId || '').trim();
+          const isDupClone =
+            mId !== baseMovId &&
+            stockMovementsStore.some((m) => {
+              const existingId = String(m.id || m.movementId || m.txnId || '').trim();
+              const existingBase = stripHubStockMovementDupSuffix(existingId);
+              const existingItemId = String(m.itemId || '').trim();
+              return existingBase === baseMovId && (!movItemId || !existingItemId || existingItemId === movItemId);
+            });
 
-        if (isDupClone) {
-          console.log(`[Termux Hub] 🛡️ Ignored duplicate echo Stock Movement [${mId}] (base [${baseMovId}] already exists)`);
-        } else {
+          if (isDupClone) {
+            console.log(`[Termux Hub] 🛡️ Ignored duplicate echo Stock Movement [${mId}] (base [${baseMovId}] already exists)`);
+            continue;
+          }
           const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, movPayload);
           const exIdx = stockMovementsStore.findIndex((m) => {
             const existingId = String(m.id || m.movementId || m.txnId || '').trim();
@@ -4840,10 +4847,13 @@ wss.on('connection', (ws, req) => {
             stockMovementsStore[exIdx] = { ...stockMovementsStore[exIdx], ...normalizedMov };
           } else {
             stockMovementsStore.unshift(normalizedMov);
-            console.log(`[Termux Hub] 📥 Accepted Stock Movement [${mId}] (Append-Only)`);
           }
-          scheduleSave();
+          acceptedCount++;
           if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'STOCK_MOVEMENT', mId);
+        }
+        if (acceptedCount > 0) {
+          console.log(`[Termux Hub] 📥 Accepted ${acceptedCount} Stock Movement(s) (Append-Only)`);
+          scheduleSave();
         }
       }
 

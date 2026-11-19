@@ -33,6 +33,7 @@ import {
   MapPin,
   ClipboardCheck,
   ArrowRight,
+  Pause,
 } from 'lucide-react';
 import {
   StocktakeSession,
@@ -50,7 +51,8 @@ import {
   requestBatchVarianceRecount,
   submitSkuVarianceRecount,
   certifyStocktakeReady,
-  approveAndCommitStocktake,
+  approveAndCommitStocktakeAsync,
+  StocktakeCommitProgress,
   reopenFinalizedSegmentSlot,
   getStocktakeSessionById,
   getAllStocktakeSessions,
@@ -547,9 +549,20 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     }
   };
 
-  // Final Leader/Owner Committal
-  const handleApprove = (adminId: string, adminName: string, notes?: string) => {
-    const res = approveAndCommitStocktake(session.sessionId, adminId, adminName, notes);
+  // Final Leader/Owner Committal (Chunked Async for Smooth Storage, Hub & Cloud Sync)
+  const handleApprove = async (
+    adminId: string,
+    adminName: string,
+    notes?: string,
+    onProgress?: (progress: StocktakeCommitProgress) => void
+  ) => {
+    const res = await approveAndCommitStocktakeAsync(
+      session.sessionId,
+      adminId,
+      adminName,
+      notes,
+      onProgress
+    );
     if (res.success && res.session) {
       meshSyncService.broadcastStocktakeSession(res.session);
       meshSyncService.broadcastCasualWorkers(getTemporaryCasuals());
@@ -572,6 +585,23 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     }
   };
 
+  // Lightweight local draft summary reader (supports sparse_v2 and legacy full-array drafts)
+  const getLocalDraftCount = (segmentId: string, slot: 'A' | 'B'): number => {
+    try {
+      const raw = localStorage.getItem(
+        `saimetric_stocktake_draft_${session.sessionId}_${segmentId}_${slot}`
+      );
+      if (!raw) return 0;
+      const parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.lines)) return 0;
+      return parsed.lines.filter(
+        (l: any) => (Number(l?.totalUnits) || 0) > 0 || Boolean(l?.wasCounted)
+      ).length;
+    } catch {
+      return 0;
+    }
+  };
+
   const handlePrintCertificate = () => {
     window.print();
   };
@@ -587,6 +617,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
         currentUser={currentUser}
         initialCounterSlot={terminalCounterSlot}
         onSaveCount={handleSaveCountFromTerminal}
+        onPaused={(countedCount, segName, slot) => {
+          setActiveTerminalSegment(null);
+          showToast(
+            countedCount > 0
+              ? `Paused "${segName}" (Team ${slot}) — ${countedCount} counted item(s) saved safely on this device.`
+              : `Paused "${segName}" (Team ${slot}) — you can resume anytime.`
+          );
+        }}
         onBack={() => setActiveTerminalSegment(null)}
       />
     );
@@ -1298,6 +1336,17 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                   String(mergedForCheck.counterAId).trim().toUpperCase() === cleanStaff
                 );
 
+                const draftCountA =
+                  !isCount1Finalized &&
+                  !(isBlindCounter && currentUser?.assignedGroup === 'GROUP_2')
+                    ? getLocalDraftCount(seg.segmentId, 'A')
+                    : 0;
+                const draftCountB =
+                  !isCount2Finalized &&
+                  !(isBlindCounter && currentUser?.assignedGroup === 'GROUP_1')
+                    ? getLocalDraftCount(seg.segmentId, 'B')
+                    : 0;
+
                 return (
                   <div
                     key={`${seg.segmentId}-${segIdx}`}
@@ -1360,12 +1409,17 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                       <div className="grid grid-cols-2 gap-3 mt-4">
                         {/* Counter A Box */}
                         <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800">
-                          <div className="flex items-center justify-between text-xs">
+                          <div className="flex items-center justify-between text-xs gap-1">
                             <span className="font-semibold text-blue-400">Count 1 (Team A)</span>
-                            <div className="flex items-center gap-1">
+                            <div className="flex items-center gap-1 flex-wrap justify-end">
                               {isCount1Finalized && (
                                 <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-0.5">
                                   <Lock className="w-2.5 h-2.5" /> FINALIZED
+                                </span>
+                              )}
+                              {draftCountA > 0 && (
+                                <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-700/80 flex items-center gap-0.5">
+                                  <Pause className="w-2.5 h-2.5" /> Paused ({draftCountA})
                                 </span>
                               )}
                               {isCount1Submitted ? (
@@ -1381,6 +1435,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                                 ? 'Finalized & Locked'
                                 : isCount1Submitted
                                 ? 'Count Submitted (Blind)'
+                                : draftCountA > 0
+                                ? `Paused Draft (${draftCountA} items)`
                                 : isTeamAClaimed
                                 ? 'Counting in Progress...'
                                 : 'Not Started'
@@ -1390,6 +1446,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                               ? effectiveStatus === 'VERIFIED' && verifiedUnits > 0
                                 ? `${verifiedUnits} units (Verified)`
                                 : 'Count Submitted (Vaulted)'
+                              : draftCountA > 0
+                              ? `Paused Draft (${draftCountA} items)`
                               : isTeamAClaimed
                               ? 'Counting in Progress...'
                               : 'Not Started'}
@@ -1397,6 +1455,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                           <div className="text-[11px] text-slate-400 mt-0.5 truncate">
                             {isCount1Submitted
                               ? `Submitted by ${teamAName}`
+                              : draftCountA > 0
+                              ? 'Saved locally on this device'
                               : isTeamAClaimed
                               ? `Claimed by ${teamAName}`
                               : 'Awaiting counter'}
@@ -1405,12 +1465,17 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
 
                         {/* Counter B Box */}
                         <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800">
-                          <div className="flex items-center justify-between text-xs">
+                          <div className="flex items-center justify-between text-xs gap-1">
                             <span className="font-semibold text-purple-400">Count 2 (Team B)</span>
-                            <div className="flex items-center gap-1">
+                            <div className="flex items-center gap-1 flex-wrap justify-end">
                               {isCount2Finalized && (
                                 <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800 flex items-center gap-0.5">
                                   <Lock className="w-2.5 h-2.5" /> FINALIZED
+                                </span>
+                              )}
+                              {draftCountB > 0 && (
+                                <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-950/90 text-amber-300 border border-amber-700/80 flex items-center gap-0.5">
+                                  <Pause className="w-2.5 h-2.5" /> Paused ({draftCountB})
                                 </span>
                               )}
                               {isCount2Submitted ? (
@@ -1426,6 +1491,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                                 ? 'Finalized & Locked'
                                 : isCount2Submitted
                                 ? 'Count Submitted (Blind)'
+                                : draftCountB > 0
+                                ? `Paused Draft (${draftCountB} items)`
                                 : isTeamBClaimed
                                 ? 'Counting in Progress...'
                                 : 'Not Started'
@@ -1435,6 +1502,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                               ? effectiveStatus === 'VERIFIED' && verifiedUnits > 0
                                 ? `${verifiedUnits} units (Verified)`
                                 : 'Count Submitted (Vaulted)'
+                              : draftCountB > 0
+                              ? `Paused Draft (${draftCountB} items)`
                               : isTeamBClaimed
                               ? 'Counting in Progress...'
                               : 'Not Started'}
@@ -1442,6 +1511,8 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
                           <div className="text-[11px] text-slate-400 mt-0.5 truncate">
                             {isCount2Submitted
                               ? `Submitted by ${teamBName}`
+                              : draftCountB > 0
+                              ? 'Saved locally on this device'
                               : isTeamBClaimed
                               ? `Claimed by ${teamBName}`
                               : 'Awaiting counter'}

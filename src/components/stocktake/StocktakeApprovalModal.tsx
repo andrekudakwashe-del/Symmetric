@@ -15,13 +15,18 @@ import {
   Unlock,
 } from 'lucide-react';
 import { StocktakeSession, Salesperson } from '../../types';
-import { verifySalespersonPin } from '../../db/roomDatabase';
+import { verifySalespersonPin, StocktakeCommitProgress } from '../../db/roomDatabase';
 import { isStocktakeLeader, isStocktakeAuditor } from '../../services/stocktakeAccessService';
 
 interface StocktakeApprovalModalProps {
   session: StocktakeSession;
   currentUser: Salesperson | null;
-  onApprove: (adminId: string, adminName: string, notes?: string) => void;
+  onApprove: (
+    adminId: string,
+    adminName: string,
+    notes?: string,
+    onProgress?: (progress: StocktakeCommitProgress) => void
+  ) => void | Promise<void>;
   onCertifyReady?: (auditorId: string, auditorName: string, notes?: string) => void;
   onClose: () => void;
 }
@@ -37,6 +42,7 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
   const [notes, setNotes] = useState('');
   const [pinError, setPinError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [commitProgress, setCommitProgress] = useState<StocktakeCommitProgress | null>(null);
 
   const consolidated = session.consolidatedItems || [];
   const varianceItems = consolidated.filter((i) => i.varianceTotalUnits !== 0);
@@ -58,8 +64,9 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
   const countedItemsOnly = consolidated.filter((i) => i.wasCountedInSession !== false);
   const hasAuditorCertification = Boolean(session.certifiedByName || session.status === 'READY_FOR_COMMITTAL');
 
-  const handleConfirmApproval = (e: React.FormEvent) => {
+  const handleConfirmApproval = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     setPinError('');
 
     if (!currentUser || !isAuthorized) {
@@ -83,15 +90,23 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
     }
 
     setIsSubmitting(true);
-    setTimeout(() => {
+    try {
       if (isLeader) {
-        onApprove(actorId, actorName, notes);
+        await onApprove(actorId, actorName, notes, (progress) => {
+          setCommitProgress(progress);
+        });
       } else if (isAuditorCertMode && onCertifyReady) {
         onCertifyReady(actorId, actorName, notes);
       }
+    } finally {
       setIsSubmitting(false);
-    }, 300);
+      setCommitProgress(null);
+    }
   };
+
+  const progressPercent = commitProgress
+    ? Math.min(100, Math.round((commitProgress.processed / Math.max(1, commitProgress.total)) * 100))
+    : 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-sm animate-fadeIn">
@@ -115,8 +130,9 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
           </div>
           <button
             type="button"
+            disabled={isSubmitting}
             onClick={onClose}
-            className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition"
+            className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition disabled:opacity-40 disabled:cursor-not-allowed"
           >
             <X className="w-5 h-5" />
           </button>
@@ -271,7 +287,7 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
               </label>
               <textarea
                 rows={2}
-                disabled={!isAuthorized}
+                disabled={!isAuthorized || isSubmitting}
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
                 placeholder="e.g., Physical counts verified across all floor locations. Customer goods left behind reconciled."
@@ -279,14 +295,36 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
               />
             </div>
           </div>
+
+          {/* Live Chunked Committal Progress */}
+          {isSubmitting && commitProgress && (
+            <div className="bg-blue-950/50 border border-blue-700/70 rounded-xl p-4 space-y-2.5 animate-fadeIn">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-blue-200">{commitProgress.message}</span>
+                <span className="font-mono font-bold text-blue-300">
+                  {progressPercent}% ({commitProgress.processed}/{commitProgress.total})
+                </span>
+              </div>
+              <div className="w-full h-2.5 bg-slate-900 rounded-full overflow-hidden border border-slate-700">
+                <div
+                  className="h-full bg-gradient-to-r from-blue-500 to-emerald-400 transition-all duration-150"
+                  style={{ width: `${progressPercent}%` }}
+                />
+              </div>
+              <p className="text-[11px] text-slate-400">
+                Committing in paced chunks to keep local storage, Local Hub, and cloud sync smooth. Please keep this window open until complete.
+              </p>
+            </div>
+          )}
         </form>
 
         {/* Footer */}
         <div className="px-6 py-4 bg-slate-800/90 border-t border-slate-700 flex items-center justify-between">
           <button
             type="button"
+            disabled={isSubmitting}
             onClick={onClose}
-            className="px-4 py-2 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-700 transition"
+            className="px-4 py-2 rounded-lg text-xs font-medium text-slate-300 hover:bg-slate-700 transition disabled:opacity-40 disabled:cursor-not-allowed"
           >
             Cancel
           </button>
@@ -300,7 +338,9 @@ export const StocktakeApprovalModal: React.FC<StocktakeApprovalModalProps> = ({
           >
             <ShieldCheck className="w-4 h-4" />
             {isSubmitting
-              ? 'Processing...'
+              ? commitProgress
+                ? `Committing ${progressPercent}%...`
+                : 'Processing...'
               : isAuditorCertMode
               ? 'Certify Counts Ready for Owner'
               : 'Authorize & Commit to Inventory Master'}

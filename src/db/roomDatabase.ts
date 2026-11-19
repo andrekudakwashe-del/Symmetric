@@ -21688,6 +21688,463 @@ export const approveAndCommitStocktake = (
   };
 };
 
+export interface StocktakeCommitProgress {
+  phase: 'PREPARING' | 'LOCAL_SAVE' | 'SYNC_DISPATCH' | 'FINALIZING';
+  processed: number;
+  total: number;
+  message: string;
+}
+
+/**
+ * Chunked, non-blocking Stocktake Committal to Inventory Master.
+ * - Eliminates O(N^2) localStorage/IndexedDB write storms (writes INVENTORY_ITEMS, PRODUCTS, and STOCK_MOVEMENTS once).
+ * - Yields between 40-SKU computation chunks so the UI remains 60fps responsive with a live progress bar.
+ * - Dispatches IndexedDB cloud sync items & Local Hub mesh updates in paced 20-item batches so tills and Apps Script are never flooded.
+ */
+export const approveAndCommitStocktakeAsync = async (
+  sessionId: string,
+  adminId: string,
+  adminName: string,
+  notes?: string,
+  onProgress?: (progress: StocktakeCommitProgress) => void
+): Promise<{ success: boolean; message: string; adjustmentsCount: number; session?: StocktakeSession }> => {
+  const yieldTick = (ms = 0) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  const initialSession = getStocktakeSessionById(sessionId);
+  if (!initialSession) {
+    return { success: false, message: `Session ${sessionId} not found.`, adjustmentsCount: 0 };
+  }
+
+  if (initialSession.status === 'APPROVED_POSTED') {
+    return { success: false, message: `This stocktake session was already approved and posted.`, adjustmentsCount: 0 };
+  }
+
+  // Two-Man Integrity Check: ONLY Store Owner / Leader can commit to Inventory Master
+  const sessionUser = getSessionUser();
+  const userRole = String(sessionUser?.role || '').toUpperCase().trim();
+  const userEmail = String(sessionUser?.email || '').toLowerCase().trim();
+  const matchedAdmin = getSalespeople().find(
+    (sp) => String(sp.id || '').trim().toUpperCase() === String(adminId || '').trim().toUpperCase()
+  );
+  const adminRole = String(matchedAdmin?.role || '').toUpperCase().trim();
+  const adminEmail = String(matchedAdmin?.email || '').toLowerCase().trim();
+
+  const isLeaderByUser =
+    userRole === 'OWNER' ||
+    userRole === 'SUPER_ADMIN' ||
+    userRole === 'SUPER_ADMINISTRATOR' ||
+    userRole === 'ADMIN' ||
+    userEmail === 'andrekudakwashe@gmail.com';
+  const isLeaderByAdmin =
+    adminId === '001' ||
+    adminRole === 'OWNER' ||
+    adminRole === 'SUPER_ADMIN' ||
+    adminRole === 'SUPER_ADMINISTRATOR' ||
+    adminRole === 'ADMIN' ||
+    adminEmail === 'andrekudakwashe@gmail.com';
+
+  if (!isLeaderByUser && !isLeaderByAdmin) {
+    return {
+      success: false,
+      message: `Access Restricted: Two-Man Integrity requires the Store Owner / Leader to authorize Inventory Master committal. Auditors may certify readiness cleanly, but cannot overwrite stock.`,
+      adjustmentsCount: 0,
+    };
+  }
+
+  onProgress?.({
+    phase: 'PREPARING',
+    processed: 0,
+    total: 1,
+    message: 'Preparing consolidated variance adjustments...',
+  });
+  await yieldTick(0);
+
+  if (!initialSession.consolidatedItems || initialSession.consolidatedItems.length === 0) {
+    const consResult = consolidateStocktakeSession(sessionId, true);
+    if (!consResult.success) {
+      return { success: false, message: consResult.message, adjustmentsCount: 0 };
+    }
+  }
+
+  const session = getStocktakeSessionById(sessionId) || initialSession;
+  const timestamp = new Date().toISOString();
+  const nowMs = Date.now();
+  const dateStr = session.date || timestamp.split('T')[0];
+  const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
+  const thresholdUsd = Number(session.varianceMaterialityThreshold ?? 10);
+  const minUnits = Number(session.varianceMinUnitThreshold ?? 5);
+  const reviewWindowHours = Math.max(1, Number(session.varianceReviewWindowHours ?? 72));
+  let hasVariancesRequiringExplanation = false;
+
+  const currentCompany = getCurrentCompanyId() || 'COMP-001';
+  const currentBranch = session.branchId || getCurrentBranchId() || 'BR-MAIN';
+  const activeBr = getCurrentBranch();
+
+  // Filter items that will actually be adjusted
+  const eligibleItems = (session.consolidatedItems || []).filter((cItem) => {
+    if (!isFullLockdown && cItem.wasCountedInSession === false) return false;
+    return cItem.varianceTotalUnits !== 0;
+  });
+
+  const totalToAdjust = eligibleItems.length;
+  const allRawInventory = getRawStoredInventoryItems();
+  const rawStockMovements = getRawStoredStockMovements();
+
+  // Build O(1) lookup index for active tenant inventory
+  const compUpper = String(currentCompany).trim().toUpperCase();
+  const invIndexById = new Map<string, number>();
+  for (let i = 0; i < allRawInventory.length; i++) {
+    const it = allRawInventory[i];
+    if (!it) continue;
+    const itComp = String(it.company_id || (it as any).companyId || '').trim().toUpperCase();
+    const matchesTenant = !itComp || itComp === compUpper || itComp === 'DEFAULT' || itComp === 'COMP-001';
+    if (!matchesTenant) continue;
+    const key = String(it.itemId || (it as any).id || '').trim().toUpperCase();
+    if (key && !invIndexById.has(key)) {
+      invIndexById.set(key, i);
+    }
+  }
+
+  const updatedMasters: InventoryItem[] = [];
+  const createdMovements: StockMovementEntry[] = [];
+  const COMPUTE_CHUNK = 40;
+
+  for (let start = 0; start < eligibleItems.length; start += COMPUTE_CHUNK) {
+    const slice = eligibleItems.slice(start, start + COMPUTE_CHUNK);
+    for (const cItem of slice) {
+      hasVariancesRequiringExplanation = true;
+      const absCost = Math.abs(Number(cItem.varianceCostValue || 0));
+      const absUnits = Math.abs(Number(cItem.varianceTotalUnits || 0));
+      cItem.requiresExplanation = absCost >= thresholdUsd || absUnits >= minUnits;
+      cItem.ownerAckStatus = cItem.requiresExplanation ? 'PENDING' : 'ACKNOWLEDGED';
+
+      const cleanKey = String(cItem.itemId || '').trim().toUpperCase();
+      const idx = invIndexById.get(cleanKey);
+      if (idx === undefined) continue;
+
+      const invItem = allRawInventory[idx];
+      const upc = Math.max(1, invItem.unitsPerCase || cItem.unitsPerCase || 1);
+      const effectiveUnits = Math.max(
+        0,
+        cItem.adjustedPhysicalUnits !== undefined
+          ? Number(cItem.adjustedPhysicalUnits)
+          : Number(cItem.countedTotalUnits || 0)
+      );
+      const prevCases = invItem.stockCases;
+      const prevSingles = invItem.stockSingles;
+      const newCases = Math.floor(effectiveUnits / upc);
+      const newSingles = effectiveUnits % upc;
+      const newTotalUnits = effectiveUnits;
+
+      const itemComp = invItem.company_id || (invItem as any).companyId || currentCompany;
+      const itemBr = invItem.branch_id || (invItem as any).branchId || currentBranch;
+
+      const updatedMaster: InventoryItem = {
+        ...invItem,
+        itemId: invItem.itemId || cItem.itemId,
+        id: invItem.itemId || cItem.itemId,
+        company_id: itemComp,
+        companyId: itemComp,
+        branch_id: itemBr,
+        branchId: itemBr,
+        stockCases: newCases,
+        stockSingles: newSingles,
+        totalUnits: newTotalUnits,
+        lastUpdated: timestamp,
+        updatedAt: nowMs,
+        version: Number((invItem as any).version || 0) + 1,
+        mutationSource: 'USER_EDIT' as any,
+      } as InventoryItem;
+
+      allRawInventory[idx] = updatedMaster;
+      updatedMasters.push(updatedMaster);
+
+      const randSuffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+      const txnId = `TXN-${dateStr.replace(/-/g, '')}-${nowMs.toString().slice(-6)}-${cItem.itemId}-${randSuffix}`;
+      const movement: StockMovementEntry = {
+        id: txnId,
+        txnId,
+        movementId: txnId,
+        movementType: 'ADJUSTMENT',
+        date: dateStr,
+        staffId: adminId,
+        staffName: adminName,
+        itemId: updatedMaster.itemId,
+        itemName: updatedMaster.itemName,
+        txnType: 'ADJUSTMENT',
+        qtyCases: cItem.varianceCases,
+        qtySingles: cItem.varianceSingles,
+        casesChange: cItem.varianceCases,
+        singlesChange: cItem.varianceSingles,
+        closingCases: newCases,
+        closingSingles: newSingles,
+        resultingStockCases: newCases,
+        resultingStockSingles: newSingles,
+        promptShown: `Stocktake Audit Approval #${sessionId} (${session.countType})`,
+        actionTaken: cItem.varianceTotalUnits < 0 ? 'STOCKTAKE_SHRINKAGE_ADJUSTMENT' : 'STOCKTAKE_OVERAGE_ADJUSTMENT',
+        referenceId: `${sessionId} (Approved by ${adminName})`,
+        triggerRule: 'Leader Stocktake Committal',
+        reason: `Physical count variance adjustment: ${cItem.varianceTotalUnits >= 0 ? `+${cItem.varianceTotalUnits}` : cItem.varianceTotalUnits} units. Previous: ${prevCases}cs/${prevSingles}ea -> New: ${newCases}cs/${newSingles}ea`,
+        timestamp,
+        synced: false,
+        company_id: itemComp,
+        companyId: itemComp,
+        branch_id: itemBr,
+        branchId: itemBr,
+      } as any;
+
+      createdMovements.push(movement);
+    }
+
+    onProgress?.({
+      phase: 'LOCAL_SAVE',
+      processed: Math.min(start + slice.length, totalToAdjust),
+      total: Math.max(1, totalToAdjust),
+      message: `Applying stock adjustments (${Math.min(start + slice.length, totalToAdjust)} / ${totalToAdjust} SKUs)...`,
+    });
+    await yieldTick(0);
+  }
+
+  // Single atomic-style bulk write to INVENTORY_ITEMS, PRODUCTS, and STOCK_MOVEMENTS (eliminates O(N^2) serialization)
+  if (updatedMasters.length > 0) {
+    const dedupMap = new Map<string, InventoryItem>();
+    for (const m of updatedMasters) {
+      const mId = String(m.itemId || (m as any).id || '').trim().toUpperCase();
+      const mComp = String(m.company_id || (m as any).companyId || 'DEFAULT').trim().toUpperCase();
+      if (mId) dedupMap.set(`${mId}::${mComp}`, m);
+    }
+    for (const it of allRawInventory) {
+      if (!it) continue;
+      const itId = String(it.itemId || (it as any).id || '').trim().toUpperCase();
+      if (!itId) continue;
+      const itComp = String(it.company_id || (it as any).companyId || 'DEFAULT').trim().toUpperCase();
+      const key = `${itId}::${itComp}`;
+      if (!dedupMap.has(key)) {
+        dedupMap.set(key, it);
+      }
+    }
+    const cleanAllItems = Array.from(dedupMap.values());
+    setStored(STORAGE_KEYS.INVENTORY_ITEMS, cleanAllItems);
+
+    try {
+      const prodMap = new Map<string, Product>();
+      cleanAllItems.forEach((item) => {
+        const p = inventoryItemToProduct(item);
+        if (p.id && !prodMap.has(p.id)) prodMap.set(p.id, p);
+      });
+      setStored(STORAGE_KEYS.PRODUCTS, Array.from(prodMap.values()));
+    } catch (e) {
+      console.warn('[Stocktake Bulk Commit] Sync products error:', e);
+    }
+
+    // Prepend new stock movements in one write
+    const nextMovements = [...createdMovements.slice().reverse(), ...rawStockMovements];
+    setStored(STORAGE_KEYS.STOCK_MOVEMENTS, nextMovements);
+
+    notifyListeners();
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: { bulkCount: updatedMasters.length } }));
+    }
+  }
+
+  // Paced, chunked sync dispatch to IndexedDB queue & Local Hub / Mesh (20 items per wave)
+  const SYNC_CHUNK = 20;
+  const totalSyncItems = updatedMasters.length;
+  for (let start = 0; start < totalSyncItems; start += SYNC_CHUNK) {
+    const invBatch = updatedMasters.slice(start, start + SYNC_CHUNK);
+    const movBatch = createdMovements.slice(start, start + SYNC_CHUNK);
+
+    for (let i = 0; i < invBatch.length; i++) {
+      const normalized = invBatch[i];
+      const invReqId =
+        typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : `req_stk_inv_${Date.now()}_${start + i}`;
+
+      // Enqueue to unbounded IndexedDB persistentSyncEngine directly (avoids 150-cap localStorage drop)
+      persistentSyncEngine
+        .enqueueWrite({
+          action: 'insert',
+          sheetName: 'InventoryMaster',
+          priority: 'HIGH',
+          payload: {
+            company_id: normalized.company_id || currentCompany,
+            branch_id: normalized.branch_id || currentBranch,
+            target_branch_id: normalized.branch_id || currentBranch,
+            user_branch_id: sessionUser?.branch_id || currentBranch,
+            user_id: sessionUser?.user_id || adminId || 'USR-001',
+            user_role: sessionUser?.role || 'OWNER',
+            clientRequestId: invReqId,
+            ItemID: normalized.itemId,
+            CompanyID: normalized.company_id || currentCompany,
+            BranchID: normalized.branch_id || currentBranch,
+            ItemName: normalized.itemName,
+            UnitsPerCase: normalized.unitsPerCase,
+            CostPerCase: normalized.costPerCase,
+            CostPerUnit: normalized.costPerUnit,
+            SellingPrice: normalized.sellPriceUnit,
+            StockCases: normalized.stockCases,
+            StockSingles: normalized.stockSingles,
+            TotalUnits: normalized.totalUnits,
+            SKU: normalized.sku || '',
+            Barcode: normalized.barcode || '',
+            Category: normalized.category || 'General',
+            version: (normalized as any).version || 1,
+            mutationSource: 'USER_EDIT',
+            updatedAt: nowMs,
+          },
+        })
+        .catch(() => {});
+
+      // Notify mesh / SyncCore listeners in paced waves
+      inventoryCreationListeners.forEach((fn) => {
+        try {
+          fn(normalized);
+        } catch (e) {
+          console.error('inventoryCreationListener error:', e);
+        }
+      });
+
+      const mov = movBatch[i];
+      if (mov) {
+        const movReqId =
+          typeof crypto !== 'undefined' && crypto.randomUUID
+            ? crypto.randomUUID()
+            : `req_stk_mov_${Date.now()}_${start + i}`;
+        const movPayload = {
+          company_id: (mov as any).company_id || currentCompany,
+          branch_id: (mov as any).branch_id || currentBranch,
+          target_branch_id: (mov as any).branch_id || currentBranch,
+          user_branch_id: sessionUser?.branch_id || currentBranch,
+          user_id: sessionUser?.user_id || adminId || 'USR-001',
+          user_role: sessionUser?.role || 'OWNER',
+          clientRequestId: movReqId,
+          ...mov,
+        };
+        try {
+          notifyDatabaseMutation({
+            mutationId: `sync_${Date.now()}_${start + i}`,
+            sheetName: 'StockMovements',
+            action: 'INSERT',
+            companyId: movPayload.company_id,
+            branchId: movPayload.branch_id,
+            target_branch_id: movPayload.target_branch_id,
+            branchCode: activeBr?.code || 'HQ-01',
+            entityType: 'stock_movement',
+            recordId: String(mov.id || mov.movementId || mov.txnId),
+            payload: movPayload,
+            timestamp: nowMs,
+            clientRequestId: movReqId,
+            fromSync: false,
+          } as any);
+        } catch {}
+
+        persistentSyncEngine
+          .enqueueWrite({
+            action: 'insert',
+            sheetName: 'StockMovements',
+            priority: 'NORMAL',
+            payload: movPayload,
+          })
+          .catch(() => {});
+      }
+    }
+
+    onProgress?.({
+      phase: 'SYNC_DISPATCH',
+      processed: Math.min(start + invBatch.length, totalSyncItems),
+      total: Math.max(1, totalSyncItems),
+      message: `Syncing batch ${Math.floor(start / SYNC_CHUNK) + 1}/${Math.max(1, Math.ceil(totalSyncItems / SYNC_CHUNK))} (${Math.min(start + invBatch.length, totalSyncItems)} / ${totalSyncItems} SKUs)...`,
+    });
+
+    // Brief yield between 20-item waves so WebSocket / Hub / UI stay fluid
+    await yieldTick(25);
+  }
+
+  onProgress?.({
+    phase: 'FINALIZING',
+    processed: Math.max(1, totalToAdjust),
+    total: Math.max(1, totalToAdjust),
+    message: 'Finalizing audit certificate & releasing store lockdown...',
+  });
+  await yieldTick(0);
+
+  session.status = 'APPROVED_POSTED';
+  session.approvedBy = adminId;
+  session.approvedByName = adminName;
+  session.approvedAt = timestamp;
+  session.varianceMaterialityThreshold = thresholdUsd;
+  session.varianceMinUnitThreshold = minUnits;
+  session.varianceReviewWindowHours = reviewWindowHours;
+  session.varianceReviewStatus = hasVariancesRequiringExplanation
+    ? 'PENDING_MANAGER_COMMENTS'
+    : 'NOT_REQUIRED';
+  if (hasVariancesRequiringExplanation) {
+    session.varianceCommentDeadline = new Date(nowMs + reviewWindowHours * 60 * 60 * 1000).toISOString();
+  }
+  if (notes) {
+    session.notes = (session.notes ? `${session.notes}\n` : '') + `[Approval Note]: ${notes}`;
+  }
+
+  if (Array.isArray(session.guestPasses) && session.guestPasses.length > 0) {
+    session.guestPasses = session.guestPasses.map((gp) => ({
+      ...gp,
+      active: false,
+      revokedAt: gp.revokedAt || timestamp,
+      updatedAt: nowMs,
+    }));
+  }
+
+  const allCasuals = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
+  let casualsChanged = false;
+  const updatedCasuals = allCasuals.map((c) => {
+    if (c.sessionId === sessionId && c.active) {
+      casualsChanged = true;
+      return {
+        ...c,
+        active: false,
+        updatedAt: nowMs,
+        lastUpdated: timestamp,
+        version: Number(c.version || 0) + 1,
+        mutationSource: 'USER_EDIT' as const,
+      };
+    }
+    return c;
+  });
+  if (casualsChanged) {
+    setStored(STORAGE_KEYS.TEMPORARY_CASUALS, updatedCasuals);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
+    }
+  }
+
+  if (session.isLockdownActive || isFullLockdown) {
+    setBranchLockdown(
+      session.branchId || getCurrentBranchId(),
+      false,
+      undefined,
+      adminId,
+      adminName,
+      `Stocktake ${session.sessionId} committed and approved by ${adminName}. Store lockdown released.`
+    );
+    session.isLockdownActive = false;
+  }
+
+  const savedSession = saveStocktakeSession(session);
+  const adjustmentsCount = updatedMasters.length;
+  const scopeMsg = isFullLockdown
+    ? 'Full Storewide Lockdown inventory overwrite committed'
+    : `Targeted count (${session.countType}) committed for counted lines only (uncounted inventory untouched)`;
+
+  return {
+    success: true,
+    message: `Stocktake approved successfully! ${adjustmentsCount} inventory item(s) updated in Inventory Master (chunked). ${scopeMsg}. Temporary casuals & guest passes deactivated.`,
+    adjustmentsCount,
+    session: savedSession,
+  };
+};
+
 // ============================================================================
 // PHASE 2: CROSS-BRANCH VISITING COUNTER GUEST PASSES
 // ============================================================================
