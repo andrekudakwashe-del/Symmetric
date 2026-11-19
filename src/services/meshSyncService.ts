@@ -132,6 +132,7 @@ import {
   claimZoneSlot,
   updateZoneFromHubStatus,
   ingestStocktakeSessionFromMesh,
+  resolveConflictingLocalStocktakeSession,
   saveStocktakeSegment,
   updateZoneClaim,
   markZoneVerified,
@@ -3235,8 +3236,26 @@ class MeshSyncManager {
       pTypeUpper === 'STOCKTAKE_SLOT_LOCKED' ||
       pTypeUpper === 'STOCKTAKE_SESSION_CONFLICT'
     ) {
+      let enrichedDetail: any = packet;
+      if (pTypeUpper === 'STOCKTAKE_SESSION_CONFLICT') {
+        const rejectedId = String(packet.sessionId || '').trim();
+        if (rejectedId) {
+          this.localHubAdapter.removeQueuedPacketsByEntityId(rejectedId);
+        }
+        const res = resolveConflictingLocalStocktakeSession(
+          rejectedId,
+          packet.existingSession,
+          packet.existingLockdown || null
+        );
+        enrichedDetail = {
+          ...packet,
+          hadOfflineCounts: res.hadOfflineCounts,
+          resolved: res.resolved,
+        };
+        this.requestStocktakeSessionList();
+      }
       if (typeof window !== 'undefined') {
-        window.dispatchEvent(new CustomEvent('saimetric_stocktake_rejected', { detail: packet }));
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_rejected', { detail: enrichedDetail }));
         window.dispatchEvent(new Event('saimetric_stocktake_updated'));
       }
       return;
@@ -3246,6 +3265,21 @@ class MeshSyncManager {
       const sessions = packet.sessions || packet.payload?.sessions || [];
       const segments = packet.segments || packet.payload?.segments || [];
       const zoneAssignments = packet.zoneAssignments || packet.payload?.zoneAssignments || [];
+      const stocktakeTombstones = packet.tombstones || packet.payload?.tombstones || [];
+      const branchLockdowns = packet.branchLockdowns || packet.payload?.branchLockdowns || null;
+
+      // Apply stocktake tombstones BEFORE ingesting sessions so deleted sessions are purged first
+      if (Array.isArray(stocktakeTombstones) && stocktakeTombstones.length > 0) {
+        stocktakeTombstones.forEach((tomb: any) => {
+          if (tomb && tomb.entityId) {
+            applyTombstone({
+              entityType: tomb.entityType || 'stocktake_session',
+              entityId: tomb.entityId,
+              deletedAt: tomb.deletedAt || tomb.updatedAt || Date.now(),
+            });
+          }
+        });
+      }
 
       if (Array.isArray(zoneAssignments) && zoneAssignments.length > 0) {
         saveZoneAssignmentsBatch(zoneAssignments.filter((z: any) => z && z.sessionId && z.zoneId));
@@ -3272,6 +3306,14 @@ class MeshSyncManager {
               class: 'T2',
             };
             void this.ingestEnvelopeThroughSyncCore(sessEnv, originName);
+          }
+        });
+      }
+
+      if (branchLockdowns && typeof branchLockdowns === 'object') {
+        Object.values(branchLockdowns).forEach((lk: any) => {
+          if (lk && lk.branchId) {
+            syncLockdownFromHub(lk);
           }
         });
       }
@@ -8860,6 +8902,21 @@ class MeshSyncManager {
         topicSuffix: 'stocktake/lockdown_broadcast',
       }
     );
+  }
+
+  public requestStocktakeSessionList(): void {
+    if (!this.isLocalHubConnected) return;
+    try {
+      this.localHubAdapter.sendControlPacket({
+        type: 'STOCKTAKE_SESSION_LIST_REQUEST',
+        action: 'STOCKTAKE_SESSION_LIST_REQUEST',
+        deviceId: this.config.deviceId,
+        deviceName: this.config.deviceName,
+        timestamp: Date.now(),
+      });
+    } catch (e) {
+      console.warn('[MeshSync] Error sending STOCKTAKE_SESSION_LIST_REQUEST:', e);
+    }
   }
 
   public broadcastStocktakeSession(session: StocktakeSession): void {

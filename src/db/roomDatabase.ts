@@ -18922,21 +18922,51 @@ export const deleteStocktakeSession = (sessionId: string, options?: { fromSync?:
   const cleanId = (sessionId || '').trim().toUpperCase();
   const tomb = recordTombstone('stocktake_session', cleanId, options);
   const sessions = getRawStoredStocktakeSessions();
+  const targetSession = sessions.find((s) => (s.sessionId || '').trim().toUpperCase() === cleanId);
   const filtered = sessions.filter((s) => (s.sessionId || '').trim().toUpperCase() !== cleanId);
   const removed = filtered.length !== sessions.length;
   if (removed) {
     setStored(STORAGE_KEYS.STOCKTAKE_SESSIONS, filtered);
     notifyListeners();
   }
+
+  // Only release branch lockdown if THIS deleted session owned the active lock
+  // (never accidentally unlock a different winning active session!)
+  try {
+    const lockdowns = getBranchLockdowns();
+    const targetBranch = targetSession?.branchId || (targetSession as any)?.branch_id;
+    let lockdownUpdated = false;
+    Object.keys(lockdowns).forEach((brKey) => {
+      const lk = lockdowns[brKey];
+      if (!lk || !lk.isLocked) return;
+      const lkSess = String(lk.sessionId || '').trim().toUpperCase();
+      if (lkSess && lkSess === cleanId && (!targetBranch || brKey.toUpperCase() === String(targetBranch).trim().toUpperCase())) {
+        setBranchLockdown(brKey, false, cleanId, undefined, undefined, `Stocktake ${cleanId} deleted — lockdown released`);
+        lockdownUpdated = true;
+      }
+    });
+    if (lockdownUpdated) {
+      notifyListeners();
+    }
+  } catch {}
+
   if (!options?.fromSync) {
     try {
       enqueueSync('StocktakeSessions' as any, 'DELETE', {
         id: cleanId,
         sessionId: cleanId,
-        deletedAt: new Date(tomb.deletedAt).toISOString(),
+        branchId: targetSession?.branchId || getCurrentBranchId(),
+        deletedAt: tomb.deletedAt,
+        deletedAtIso: new Date(tomb.deletedAt).toISOString(),
       });
     } catch {}
     dispatchTombstoneThroughSyncCore(tomb);
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('saimetric_stocktake_updated', { detail: { deletedSessionId: cleanId } })
+    );
   }
   return removed;
 };
@@ -19222,6 +19252,53 @@ export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
   if (!lockdown || !lockdown.branchId) return;
   const lockdowns = getBranchLockdowns();
   const existing = lockdowns[lockdown.branchId];
+
+  // Bind branch lockdown to the branch's active authoritative stocktake session:
+  // A losing/conflicting offline session must NEVER hijack or accidentally unlock an active branch lockdown.
+  const incomingSessId = String(lockdown.sessionId || '').trim().toUpperCase();
+  const existingSessId = String(existing?.sessionId || '').trim().toUpperCase();
+  if (
+    existing?.isLocked &&
+    existingSessId &&
+    incomingSessId &&
+    incomingSessId !== existingSessId &&
+    !lockdown.isLocked
+  ) {
+    console.warn(
+      `[Lockdown Guard] 🛡️ Rejected cross-session unlock for ${lockdown.branchId} (incoming ${incomingSessId} !== active lock ${existingSessId})`
+    );
+    return;
+  }
+  if (incomingSessId) {
+    const activeStatuses = new Set([
+      'DRAFT',
+      'SCHEDULED',
+      'IN_PROGRESS',
+      'COUNTING',
+      'RECOUNTING',
+      'AUDIT_REVIEW',
+      'CONSOLIDATED',
+      'READY_FOR_COMMITTAL',
+      'ACTIVE',
+      'PENDING_SIGNOFF',
+      'RECOUNT',
+    ]);
+    const branchActiveSession = getRawStoredStocktakeSessions().find((s) => {
+      const sBr = String((s as any).branch_id || s.branchId || '').trim().toUpperCase();
+      const targetBr = String(lockdown.branchId || '').trim().toUpperCase();
+      return sBr === targetBr && activeStatuses.has(String(s.status || '').toUpperCase().trim());
+    });
+    if (
+      branchActiveSession &&
+      String(branchActiveSession.sessionId || '').trim().toUpperCase() !== incomingSessId
+    ) {
+      console.warn(
+        `[Lockdown Guard] 🛡️ Ignored branch_lockdown update for session ${incomingSessId} because active session is ${branchActiveSession.sessionId}`
+      );
+      return;
+    }
+  }
+
   const existingTime = parseTimestampMs(
     existing?.updatedAt || existing?.lastUpdated || existing?.lockedAt || 0
   );
@@ -19247,6 +19324,156 @@ export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
     window.dispatchEvent(new CustomEvent('saimetric_stocktake_lockdown_updated', { detail: normalized }));
     window.dispatchEvent(new CustomEvent('saimetric_lockdown_updated', { detail: normalized }));
   }
+};
+
+/**
+ * Self-healing conflict resolution when two devices create offline stocktake sessions
+ * on the same branch under the One-Active-Stocktake Rule:
+ *  - Ingests the authoritative winning session from Hub/Cloud.
+ *  - Quarantines the losing local session as CANCELLED (read-only) without losing offline counts
+ *    and without broadcasting a destructive unlock that would break the winning session's lockdown.
+ */
+export const resolveConflictingLocalStocktakeSession = (
+  rejectedSessionId: string,
+  winningSession?: any,
+  winningLockdown?: BranchLockdownState | null
+): {
+  resolved: boolean;
+  hadOfflineCounts: boolean;
+  rejectedSessionId: string;
+  winningSessionId?: string;
+} => {
+  const cleanRejectedId = String(rejectedSessionId || '').trim().toUpperCase();
+  let winningSessionId: string | undefined;
+
+  // 1. Ingest the authoritative winning session first
+  if (winningSession && (winningSession.sessionId || winningSession.id)) {
+    const winId = String(winningSession.sessionId || winningSession.id).trim();
+    winningSessionId = winId;
+    if (winId.toUpperCase() !== cleanRejectedId) {
+      try {
+        ingestStocktakeSessionFromMesh({
+          ...winningSession,
+          sessionId: winId,
+          sessionName: winningSession.sessionName || winningSession.title,
+          title: winningSession.title || winningSession.sessionName || winId,
+          segments: winningSession.segments || [],
+          startedBy: winningSession.startedBy || winningSession.createdByName || winningSession.createdBy,
+          startedAt: winningSession.startedAt || winningSession.timestamp,
+          updatedAt: winningSession.updatedAt || Date.now(),
+        });
+      } catch (e) {
+        console.warn('[StocktakeConflict] Failed to ingest winning session:', e);
+      }
+    }
+  }
+
+  // 2. Quarantine the losing offline session locally (never delete offline counts!)
+  let hadOfflineCounts = false;
+  if (cleanRejectedId && (!winningSessionId || winningSessionId.toUpperCase() !== cleanRejectedId)) {
+    const allSessions = getRawStoredStocktakeSessions();
+    const losing = allSessions.find(
+      (s) => String(s.sessionId || '').trim().toUpperCase() === cleanRejectedId
+    );
+    if (losing) {
+      const segHasCounts = (losing.segments || []).some(
+        (seg: any) =>
+          (Array.isArray(seg.count1) && seg.count1.some((l: any) => Number(l?.totalUnits || 0) > 0 || l?.wasCounted)) ||
+          (Array.isArray(seg.count2) && seg.count2.some((l: any) => Number(l?.totalUnits || 0) > 0 || l?.wasCounted)) ||
+          (Array.isArray(seg.verifiedCounts) && seg.verifiedCounts.some((l: any) => Number(l?.totalUnits || 0) > 0))
+      );
+      let draftHasCounts = false;
+      try {
+        const prefix = `saimetric_stocktake_draft_${losing.sessionId}_`;
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith(prefix)) {
+            const raw = localStorage.getItem(k);
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (
+                parsed &&
+                Array.isArray(parsed.lines) &&
+                parsed.lines.some((l: any) => Number(l?.totalUnits || 0) > 0 || l?.wasCounted)
+              ) {
+                draftHasCounts = true;
+                break;
+              }
+            }
+          }
+        }
+      } catch {}
+
+      hadOfflineCounts = Boolean(segHasCounts || draftHasCounts || (losing.totalCountedUnits || 0) > 0);
+      const winLabel = winningSessionId || 'active branch session';
+      const conflictNote = hadOfflineCounts
+        ? `[Superseded Offline Conflict — Counts Preserved Read-Only] Branch already had active stocktake ${winLabel}. Review or re-enter your offline counts into ${winLabel}.`
+        : `[Superseded Duplicate] Replaced by authoritative active stocktake ${winLabel}.`;
+
+      if (losing.status !== 'CANCELLED' && losing.status !== 'APPROVED_POSTED') {
+        const nextNotes = losing.notes && losing.notes.includes(conflictNote)
+          ? losing.notes
+          : [losing.notes, conflictNote].filter(Boolean).join('\n');
+        saveStocktakeSession(
+          {
+            ...losing,
+            status: 'CANCELLED',
+            isLockdownActive: false,
+            notes: nextNotes,
+          },
+          { fromSync: true }
+        );
+      }
+
+      // 3. Reconcile local branch lockdown safely:
+      //    If local lockdown belonged to the losing session, either bind to winningLockdown / winningSession or release.
+      const brId = losing.branchId || (losing as any).branch_id || getCurrentBranchId();
+      const currentLock = getBranchLockdowns()[brId];
+      if (
+        currentLock &&
+        String(currentLock.sessionId || '').trim().toUpperCase() === cleanRejectedId
+      ) {
+        if (winningLockdown && winningLockdown.branchId) {
+          syncLockdownFromHub(winningLockdown);
+        } else if (winningSession && winningSession.isLockdownActive && winningSessionId) {
+          setBranchLockdown(
+            brId,
+            true,
+            winningSessionId,
+            winningSession.createdBy,
+            winningSession.createdByName || winningSession.startedBy,
+            `Locked under authoritative active stocktake ${winningSessionId}`
+          );
+        } else {
+          setBranchLockdown(
+            brId,
+            false,
+            winningSessionId || cleanRejectedId,
+            undefined,
+            undefined,
+            `Released duplicate offline lockdown from superseded session ${cleanRejectedId}`
+          );
+        }
+      } else if (winningLockdown && winningLockdown.branchId) {
+        syncLockdownFromHub(winningLockdown);
+      }
+    } else if (winningLockdown && winningLockdown.branchId) {
+      syncLockdownFromHub(winningLockdown);
+    }
+  } else if (winningLockdown && winningLockdown.branchId) {
+    syncLockdownFromHub(winningLockdown);
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_stocktake_updated'));
+  }
+
+  return {
+    resolved: true,
+    hadOfflineCounts,
+    rejectedSessionId: cleanRejectedId,
+    winningSessionId,
+  };
 };
 
 export const ingestStocktakeSessionFromMesh = (data: {
@@ -20308,10 +20535,11 @@ export const captureLiveInventoryFreeze = (
 };
 
 export const getNextStocktakeSessionId = (): string => {
-  const sessions = getStocktakeSessions();
+  const sessions = getRawStoredStocktakeSessions();
   const dateStr = new Date().toISOString().split('T')[0].replace(/-/g, '');
   const count = sessions.length + 1;
-  return `STK-${dateStr}-${String(count).padStart(3, '0')}`;
+  const randSuffix = Math.random().toString(36).substring(2, 6).toUpperCase().padEnd(4, 'X');
+  return `STK-${dateStr}-${String(count).padStart(3, '0')}-${randSuffix}`;
 };
 
 export const createStocktakeSession = (params: {

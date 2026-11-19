@@ -21,6 +21,7 @@ import {
   markRecordsCloudSynced,
   parseTimestampMs,
   resolveEntityType,
+  resolveConflictingLocalStocktakeSession,
   annotateSaleCloudReceiptMetadata,
   DEFAULT_MASTER_WEBHOOK_URL,
 } from '../../db/roomDatabase';
@@ -584,6 +585,54 @@ export class AppScriptsAdapter implements SyncAdapter {
     }
   }
 
+  private resolveStocktakeConflictFailures(envelopes: SyncEnvelope[], resData: any): void {
+    const failedList = Array.isArray(resData?.failed) ? resData.failed : [];
+    const conflictList = Array.isArray(resData?.conflicts) ? resData.conflicts : [];
+    if (failedList.length === 0) return;
+
+    const failedByPkt = new Map<string, string>();
+    failedList.forEach((f: any) => {
+      if (f?.packetId) failedByPkt.set(String(f.packetId), String(f.error || ''));
+    });
+
+    const winningSessionConflict = conflictList.find(
+      (c: any) => c && String(c.entityType || '').toLowerCase() === 'stocktake_session' && c.data
+    );
+    const winningLockdownConflict = conflictList.find(
+      (c: any) => c && String(c.entityType || '').toLowerCase() === 'branch_lockdown' && c.data
+    );
+
+    for (const env of envelopes) {
+      const errStr = failedByPkt.get(env.packetId) || '';
+      if (errStr === 'ACTIVE_STOCKTAKE_ALREADY_EXISTS' && env.entityType === 'stocktake_session') {
+        const res = resolveConflictingLocalStocktakeSession(
+          env.entityId,
+          winningSessionConflict?.data,
+          winningLockdownConflict?.data || null
+        );
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('saimetric_stocktake_rejected', {
+              detail: {
+                type: 'STOCKTAKE_SESSION_CONFLICT',
+                sessionId: env.entityId,
+                existingSessionId: res.winningSessionId || winningSessionConflict?.entityId,
+                existingSessionName:
+                  winningSessionConflict?.data?.title ||
+                  winningSessionConflict?.data?.sessionName ||
+                  res.winningSessionId,
+                hadOfflineCounts: res.hadOfflineCounts,
+                message: `Only 1 active stocktake is allowed per branch. Switched to active cloud session ${
+                  winningSessionConflict?.data?.title || res.winningSessionId || ''
+                }.`,
+              },
+            })
+          );
+        }
+      }
+    }
+  }
+
   async broadcast(envelope: SyncEnvelope): Promise<BroadcastResult> {
     const creds = this.resolveTargetCredentials();
     if (creds.config.databaseType !== this.myDatabaseType) {
@@ -693,6 +742,13 @@ export class AppScriptsAdapter implements SyncAdapter {
     if (Array.isArray(resData?.failed) && resData.failed.length > 0 && !(resData?.ackedPacketIds || []).includes(envelope.packetId)) {
       const firstErr = resData.failed[0]?.error || 'Google Apps Script rejected envelope write';
       this.processServerPushResponse([], resData, creds.companyId, creds.branchId);
+      this.resolveStocktakeConflictFailures([cleanEnvelope], resData);
+      if (firstErr === 'ACTIVE_STOCKTAKE_ALREADY_EXISTS' || firstErr === 'BRANCH_LOCKDOWN_SESSION_MISMATCH') {
+        return {
+          success: true,
+          packetId: envelope.packetId,
+        };
+      }
       return {
         success: false,
         packetId: envelope.packetId,
@@ -915,19 +971,31 @@ export class AppScriptsAdapter implements SyncAdapter {
           const ackedEnvelopes: SyncEnvelope[] = [];
           chunk.forEach((item, idx) => {
             const env = envelopes[idx];
-            if (ackedSet.has(env.packetId) || (ackedSet.size === 0 && !failedMap.has(env.packetId))) {
+            const failErr = failedMap.get(env.packetId);
+            if (
+              ackedSet.has(env.packetId) ||
+              (ackedSet.size === 0 && !failErr) ||
+              failErr === 'ACTIVE_STOCKTAKE_ALREADY_EXISTS' ||
+              failErr === 'BRANCH_LOCKDOWN_SESSION_MISMATCH'
+            ) {
               updateSyncQueueItem(item.id, { status: 'synced', error: undefined });
-              ackedEnvelopes.push(env);
+              if (!failErr) ackedEnvelopes.push(env);
             } else {
               updateSyncQueueItem(item.id, {
                 status: 'failed',
                 retries: (item.retries || 0) + 1,
-                error: failedMap.get(env.packetId) || 'Cloud write failed',
+                error: failErr || 'Cloud write failed',
               });
             }
           });
-          if (ackedEnvelopes.length > 0) {
+          if (
+            ackedEnvelopes.length > 0 ||
+            (Array.isArray(resData?.conflicts) && resData.conflicts.length > 0)
+          ) {
             this.processServerPushResponse(ackedEnvelopes, resData, creds.companyId, creds.branchId);
+          }
+          if (failedMap.size > 0) {
+            this.resolveStocktakeConflictFailures(envelopes, resData);
           }
         } catch (batchErr: any) {
           chunk.forEach((item) => {
@@ -962,7 +1030,7 @@ export class AppScriptsAdapter implements SyncAdapter {
           const p = item.payload || {};
           const rawEntity = String(p.entityType || resolveEntityType(item.sheetName || '') || 'audit_log');
           const eType = ENTITY_REGISTRY[rawEntity] ? rawEntity : 'audit_log';
-          const eId = String(p.id || p.itemId || p.InvoiceID || p.grvNumber || item.clientRequestId || item.id);
+          const eId = String(p.id || p.itemId || p.InvoiceID || p.grvNumber || p.sessionId || item.clientRequestId || item.id);
           const idbMut: MutationSource = p.mutationSource === 'SEED' ? 'SEED' : 'USER_EDIT';
           return this.sanitizeEnvelopeForCloud(
             {
@@ -998,17 +1066,41 @@ export class AppScriptsAdapter implements SyncAdapter {
             25000
           );
           const ackedSet = new Set<string>(Array.isArray(resData?.ackedPacketIds) ? resData.ackedPacketIds.map(String) : []);
+          const idbFailedMap = new Map<string, string>();
+          if (Array.isArray(resData?.failed)) {
+            resData.failed.forEach((f: any) => {
+              if (f?.packetId) idbFailedMap.set(String(f.packetId), String(f.error || 'Sync failed'));
+            });
+          }
           const ackedEnvelopes: SyncEnvelope[] = [];
           for (let k = 0; k < chunk.length; k++) {
             const item = chunk[k];
             const env = envelopes[k];
-            if (ackedSet.has(env.packetId) || ackedSet.size === 0) {
+            const failErr = idbFailedMap.get(env.packetId);
+            if (
+              ackedSet.has(env.packetId) ||
+              (ackedSet.size === 0 && !failErr) ||
+              failErr === 'ACTIVE_STOCKTAKE_ALREADY_EXISTS' ||
+              failErr === 'BRANCH_LOCKDOWN_SESSION_MISMATCH'
+            ) {
               await updateSyncItem(item.id, { status: 'done', lastError: undefined });
-              ackedEnvelopes.push(env);
+              if (!failErr) ackedEnvelopes.push(env);
+            } else {
+              await updateSyncItem(item.id, {
+                status: 'failed',
+                retries: (item.retries || 0) + 1,
+                lastError: failErr || 'Cloud write failed',
+              });
             }
           }
-          if (ackedEnvelopes.length > 0) {
+          if (
+            ackedEnvelopes.length > 0 ||
+            (Array.isArray(resData?.conflicts) && resData.conflicts.length > 0)
+          ) {
             this.processServerPushResponse(ackedEnvelopes, resData, creds.companyId, creds.branchId);
+          }
+          if (idbFailedMap.size > 0) {
+            this.resolveStocktakeConflictFailures(envelopes, resData);
           }
         } catch (idbErr: any) {
           for (const item of chunk) {

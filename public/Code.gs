@@ -2236,8 +2236,20 @@ function getAllTombstonesMap(ss, companyId) {
   return map;
 }
 
-function checkActiveStocktakeSessionConflict(ss, companyId, branchId, incomingSessionId, incomingStatus) {
-  var activeStatuses = { "ACTIVE": true, "IN_PROGRESS": true, "COUNTING": true, "PENDING_SIGNOFF": true, "RECOUNT": true };
+function checkActiveStocktakeSessionConflict(ss, companyId, branchId, incomingSessionId, incomingStatus, tombsMapOpt) {
+  var activeStatuses = {
+    "ACTIVE": true,
+    "DRAFT": true,
+    "SCHEDULED": true,
+    "IN_PROGRESS": true,
+    "COUNTING": true,
+    "RECOUNT": true,
+    "RECOUNTING": true,
+    "AUDIT_REVIEW": true,
+    "CONSOLIDATED": true,
+    "PENDING_SIGNOFF": true,
+    "READY_FOR_COMMITTAL": true
+  };
   var statusUpper = String(incomingStatus || "IN_PROGRESS").toUpperCase();
   if (!activeStatuses[statusUpper]) return null;
   var sheet = ss.getSheetByName("StocktakeSessions");
@@ -2249,6 +2261,10 @@ function checkActiveStocktakeSessionConflict(ss, companyId, branchId, incomingSe
   var bIdx = h.indexOf("BranchID");
   var stIdx = h.indexOf("Status");
   var delIdx = h.indexOf("is_deleted");
+  var cliUpdIdx = h.indexOf("client_updated_at");
+  var srvUpdIdx = h.indexOf("server_updated_at");
+  var updIdx = h.indexOf("UpdatedAt");
+  var incomingUpper = String(incomingSessionId || "").trim().toUpperCase();
   for (var i = 1; i < vals.length; i++) {
     if (delIdx !== -1 && (vals[i][delIdx] === true || String(vals[i][delIdx]).toUpperCase() === "TRUE")) continue;
     var rc = cIdx !== -1 ? String(vals[i][cIdx] || "").trim().toUpperCase() : "";
@@ -2257,11 +2273,30 @@ function checkActiveStocktakeSessionConflict(ss, companyId, branchId, incomingSe
     if (branchId && rb && rb !== String(branchId).trim().toUpperCase()) continue;
     var existingId = sIdIdx !== -1 ? String(vals[i][sIdIdx] || "").trim().toUpperCase() : "";
     var existingStatus = stIdx !== -1 ? String(vals[i][stIdx] || "").trim().toUpperCase() : "";
-    if (existingId && existingId !== String(incomingSessionId || "").trim().toUpperCase() && activeStatuses[existingStatus]) {
-      return extractExistingEnvelopeState(sheet, i + 1, h);
+    if (!existingId || existingId === incomingUpper || !activeStatuses[existingStatus]) continue;
+    if (tombsMapOpt) {
+      var tombMs = tombsMapOpt["stocktake_session::" + existingId] || 0;
+      if (tombMs > 0) {
+        var rowUpdatedMs = Math.max(
+          cliUpdIdx !== -1 ? parseTimestampMsSafe(vals[i][cliUpdIdx]) : 0,
+          srvUpdIdx !== -1 ? parseTimestampMsSafe(vals[i][srvUpdIdx]) : 0,
+          updIdx !== -1 ? parseTimestampMsSafe(vals[i][updIdx]) : 0
+        );
+        if (rowUpdatedMs === 0 || tombMs >= rowUpdatedMs) continue;
+      }
     }
+    return extractExistingEnvelopeState(sheet, i + 1, h);
   }
   return null;
+}
+
+function getBranchLockdownState(ss, companyId, branchId) {
+  var sheet = ss.getSheetByName("BranchLockdowns");
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var rowIdx = findRowIndexInSheet(sheet, headers, ["BranchID", "branchId", "entity_id"], branchId, companyId);
+  if (rowIdx <= 0) return null;
+  return extractExistingEnvelopeState(sheet, rowIdx, headers);
 }
 
 function isSegmentSlotUnlocked(ss, companyId, sessionId, segmentId, slot) {
@@ -2371,7 +2406,7 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
       var targetIdForTomb = entityType === "tombstone"
         ? String((d && d.entityId) || entityId).trim()
         : entityId;
-      var deletedAtMs = Number((d && d.deletedAt) || env.updatedAt || Date.now());
+      var deletedAtMs = parseTimestampMsSafe(d && d.deletedAt) || parseTimestampMsSafe(env.updatedAt) || Date.now();
       var tombSeq = allocateNextServerSeq(targetSs, envComp);
       maxServerSeq = Math.max(maxServerSeq, tombSeq);
 
@@ -2420,6 +2455,40 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
             if (srvUpdCol !== -1) delSh.getRange(foundDelRow, srvUpdCol + 1).setValue(serverNowIso);
           }
         }
+        // If a deleted stocktake_session currently owns BranchLockdowns, auto-release that lockdown
+        if (targetTypeForTomb === "stocktake_session") {
+          var lockSh = targetSs.getSheetByName("BranchLockdowns");
+          if (lockSh && lockSh.getLastRow() >= 2) {
+            var lockVals = lockSh.getDataRange().getValues();
+            var lockH = lockVals[0];
+            var lkSessCol = lockH.indexOf("SessionID");
+            var lkIsCol = lockH.indexOf("IsLocked");
+            var lkSeqCol = lockH.indexOf("server_seq");
+            var lkUpdCol = lockH.indexOf("server_updated_at");
+            var lkPayCol = lockH.indexOf("payload_json");
+            var targetUpper = targetIdForTomb.toUpperCase();
+            for (var lr = 1; lr < lockVals.length; lr++) {
+              var rowSess = lkSessCol !== -1 ? String(lockVals[lr][lkSessCol] || "").trim().toUpperCase() : "";
+              var rowLocked = lkIsCol !== -1 && (lockVals[lr][lkIsCol] === true || String(lockVals[lr][lkIsCol]).toUpperCase() === "TRUE");
+              if (rowLocked && rowSess === targetUpper) {
+                var unlockSeq = allocateNextServerSeq(targetSs, envComp);
+                maxServerSeq = Math.max(maxServerSeq, unlockSeq);
+                if (lkIsCol !== -1) lockSh.getRange(lr + 1, lkIsCol + 1).setValue(false);
+                if (lkSeqCol !== -1) lockSh.getRange(lr + 1, lkSeqCol + 1).setValue(unlockSeq);
+                if (lkUpdCol !== -1) lockSh.getRange(lr + 1, lkUpdCol + 1).setValue(serverNowIso);
+                if (lkPayCol !== -1 && lockVals[lr][lkPayCol]) {
+                  try {
+                    var parsedLk = JSON.parse(String(lockVals[lr][lkPayCol]));
+                    parsedLk.isLocked = false;
+                    parsedLk.updatedAt = Date.now();
+                    parsedLk.lastUpdated = serverNowIso;
+                    lockSh.getRange(lr + 1, lkPayCol + 1).setValue(JSON.stringify(parsedLk));
+                  } catch (lpe) {}
+                }
+              }
+            }
+          }
+        }
       }
 
       if (env.packetId) putCacheSafe("done:" + compUpper + ":" + String(env.packetId).trim(), "1", CACHE_TTL_SEC);
@@ -2453,7 +2522,7 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
     var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
 
     if (entityType === "stocktake_session") {
-      var sessionConflict = checkActiveStocktakeSessionConflict(targetSs, envComp, envBranch, entityId, d.status);
+      var sessionConflict = checkActiveStocktakeSessionConflict(targetSs, envComp, envBranch, entityId, d.status, tombsMap);
       if (sessionConflict) {
         conflicts.push({
           entityType: "stocktake_session",
@@ -2462,7 +2531,42 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
           updatedAt: sessionConflict.updatedAt,
           data: sessionConflict.data
         });
+        var winLockState = getBranchLockdownState(targetSs, envComp, envBranch);
+        if (winLockState && winLockState.data) {
+          conflicts.push({
+            entityType: "branch_lockdown",
+            entityId: winLockState.raw.BranchID || envBranch,
+            reason: "ACTIVE_STOCKTAKE_LOCKDOWN",
+            updatedAt: winLockState.updatedAt,
+            data: winLockState.data
+          });
+        }
         failed.push({ packetId: env.packetId, error: "ACTIVE_STOCKTAKE_ALREADY_EXISTS" });
+        continue;
+      }
+    }
+
+    if (entityType === "branch_lockdown" && d && d.sessionId) {
+      var lockSessionConflict = checkActiveStocktakeSessionConflict(targetSs, envComp, envBranch, d.sessionId, "COUNTING", tombsMap);
+      if (lockSessionConflict) {
+        conflicts.push({
+          entityType: "stocktake_session",
+          entityId: lockSessionConflict.raw.SessionID || lockSessionConflict.raw.entity_id,
+          reason: "BRANCH_LOCKDOWN_SESSION_MISMATCH",
+          updatedAt: lockSessionConflict.updatedAt,
+          data: lockSessionConflict.data
+        });
+        var curLockState = getBranchLockdownState(targetSs, envComp, envBranch);
+        if (curLockState && curLockState.data) {
+          conflicts.push({
+            entityType: "branch_lockdown",
+            entityId: curLockState.raw.BranchID || envBranch,
+            reason: "BRANCH_LOCKDOWN_SESSION_MISMATCH",
+            updatedAt: curLockState.updatedAt,
+            data: curLockState.data
+          });
+        }
+        failed.push({ packetId: env.packetId, error: "BRANCH_LOCKDOWN_SESSION_MISMATCH" });
         continue;
       }
     }

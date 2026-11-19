@@ -37,6 +37,7 @@ import {
   createStocktakeSession,
   saveStocktakeSession,
   deleteStocktakeSession,
+  getBranchLockdowns,
   authenticateCasualWorker,
   getSalespeople,
   getBranches,
@@ -160,17 +161,27 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
 
   useEffect(() => {
     loadSessions();
+    // Always request fresh stocktake sessions, tombstones, and lockdowns from Hub on view mount
+    meshSyncService.requestStocktakeSessionList();
     const handleUpdate = () => {
       loadSessions();
       setSelectedSession((prev) => {
         if (!prev) return null;
-        return getStocktakeSessions().find((s) => s.sessionId === prev.sessionId) || prev;
+        return getStocktakeSessions().find((s) => s.sessionId === prev.sessionId) || null;
       });
     };
     const handleRejected = (evt: Event) => {
       const detail = (evt as CustomEvent)?.detail;
-      const reason = detail?.reason || detail?.message || 'Action rejected by Hub stocktake governance.';
-      setHubError(reason);
+      if (detail?.type === 'STOCKTAKE_SESSION_CONFLICT') {
+        const winName = detail?.existingSessionName || detail?.existingSessionId || 'active branch session';
+        const msg = detail?.hadOfflineCounts
+          ? `Branch already has active stocktake "${winName}". Your offline session was preserved read-only under Closed Archive so no counts were lost.`
+          : `Branch already has active stocktake "${winName}". Switched to the active session and archived the duplicate.`;
+        setHubError(msg);
+      } else {
+        const reason = detail?.reason || detail?.message || 'Action rejected by Hub stocktake governance.';
+        setHubError(reason);
+      }
       loadSessions();
     };
     window.addEventListener('saimetric_stocktake_updated', handleUpdate);
@@ -398,7 +409,32 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
 
   const handleConfirmDeleteSession = (e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation();
+    const cleanId = String(sessionId || '').trim().toUpperCase();
+    const targetSess = sessions.find(
+      (s) => String(s.sessionId || '').trim().toUpperCase() === cleanId
+    );
+    const targetBrId = targetSess?.branchId || activeBranchId;
+    const currentLock = getBranchLockdowns()[targetBrId];
+    const ownsActiveLock = Boolean(
+      currentLock &&
+        currentLock.isLocked &&
+        String(currentLock.sessionId || '').trim().toUpperCase() === cleanId
+    );
+
     deleteStocktakeSession(sessionId);
+
+    // Broadcast lockdown release ONLY if the deleted session owned the active branch lock
+    if (ownsActiveLock) {
+      meshSyncService.broadcastStocktakeLockdown(
+        targetBrId,
+        sessionId,
+        false,
+        currentUser?.name || 'Supervisor',
+        `Stocktake ${sessionId} deleted — branch lockdown released.`,
+        currentUser?.id
+      );
+    }
+
     setPendingDeleteSessionId(null);
     loadSessions();
     if (selectedSession?.sessionId === sessionId) {

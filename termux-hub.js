@@ -1763,7 +1763,8 @@ function purgeEntityFromHubStores(entityType, entityId, tombstoneDeletedAt) {
       if (candidate !== cleanUpper) return true;
       if (tombstoneDeletedAt !== undefined) {
         const itemTs = getTimestamp(item);
-        if (itemTs > tombstoneDeletedAt) return true;
+        // Allow up to 120s clock skew between deleting client and Hub-stamped item
+        if (itemTs > tombstoneDeletedAt + 120000) return true;
       }
       return false;
     });
@@ -1800,6 +1801,57 @@ function purgeEntityFromHubStores(entityType, entityId, tombstoneDeletedAt) {
   }
   if (!norm || norm === 'stocktake_session') {
     stocktakeSessionsStore = removeFrom(stocktakeSessionsStore, (s) => s.sessionId || s.id);
+    // Also cascade-purge orphaned segments & zone assignments belonging to the deleted session
+    const segBefore = stocktakeSegmentsStore.length;
+    stocktakeSegmentsStore = stocktakeSegmentsStore.filter(
+      (seg) => !seg || String(seg.sessionId || '').trim().toUpperCase() !== cleanUpper
+    );
+    if (stocktakeSegmentsStore.length !== segBefore) purged = true;
+
+    const zoneBefore = zoneAssignmentsStore.length;
+    zoneAssignmentsStore = zoneAssignmentsStore.filter(
+      (z) => !z || String(z.sessionId || '').trim().toUpperCase() !== cleanUpper
+    );
+    if (zoneAssignmentsStore.length !== zoneBefore) purged = true;
+
+    // Release branch lockdown ONLY if locked by this deleted session
+    if (branchLockdownsStore && typeof branchLockdownsStore === 'object') {
+      const releaseNow = Date.now();
+      const releaseIso = new Date(releaseNow).toISOString();
+      for (const brKey of Object.keys(branchLockdownsStore)) {
+        const lk = branchLockdownsStore[brKey];
+        if (lk && lk.isLocked && String(lk.sessionId || '').trim().toUpperCase() === cleanUpper) {
+          const unlockedState = {
+            ...lk,
+            branchId: lk.branchId || brKey,
+            isLocked: false,
+            lockedAt: undefined,
+            reason: `Auto-released: stocktake session ${cleanUpper} was deleted`,
+            updatedAt: releaseNow,
+            lastUpdated: releaseIso,
+            isCloudSynced: false,
+          };
+          branchLockdownsStore[brKey] = unlockedState;
+          purged = true;
+          try {
+            if (typeof wss !== 'undefined' && wss && wss.clients) {
+              const unlockMsg = JSON.stringify({
+                type: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                action: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                ...unlockedState,
+                origin_device_id: 'LOCAL_HUB',
+                timestamp: releaseNow,
+              });
+              wss.clients.forEach((client) => {
+                if (client && client.readyState === WebSocket.OPEN) {
+                  try { client.send(unlockMsg); } catch (e) {}
+                }
+              });
+            }
+          } catch (e) {}
+        }
+      }
+    }
   }
   return purged;
 }
@@ -2901,15 +2953,76 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 0.4 STOCKTAKE BRANCH LOCKDOWN BROADCAST (LWW)
+      // 0.4 STOCKTAKE BRANCH LOCKDOWN BROADCAST (SESSION-BOUND + LWW)
       // =====================================================================
+      const ACTIVE_FLOOR_STATUSES_SET = new Set([
+        'ACTIVE',
+        'DRAFT',
+        'SCHEDULED',
+        'IN_PROGRESS',
+        'COUNTING',
+        'RECOUNT',
+        'RECOUNTING',
+        'AUDIT_REVIEW',
+        'CONSOLIDATED',
+        'PENDING_SIGNOFF',
+        'READY_FOR_COMMITTAL',
+      ]);
+
       if (pType === 'STOCKTAKE_LOCKDOWN_BROADCAST') {
         const brId = packet.branchId || packet.branch_id || hubBranchId;
+        const brNorm = String(brId || '').trim().toUpperCase();
         const hubNow = Date.now();
         const hubIso = new Date(hubNow).toISOString();
         const incomingTime = getTimestamp(packet) || hubNow;
-        const existingLock = branchLockdownsStore[brId];
+        const existingLock = branchLockdownsStore[brId] || branchLockdownsStore[brNorm];
         const existingTime = existingLock ? getTimestamp(existingLock) : 0;
+
+        // Bind lockdown strictly to the branch's authoritative active stocktake session
+        const activeSessionForBranch = stocktakeSessionsStore.find((s) => {
+          if (!s || !s.sessionId) return false;
+          if (isTombstoned(s.sessionId, 'stocktake_session', getTimestamp(s))) return false;
+          const sBranch = String(s.branchId || hubBranchId || '').trim().toUpperCase();
+          const sStatus = String(s.status || '').toUpperCase();
+          return (!brNorm || !sBranch || sBranch === brNorm) && ACTIVE_FLOOR_STATUSES_SET.has(sStatus);
+        });
+        const incomingSessId = String(packet.sessionId || '').trim().toUpperCase();
+        const activeSessId = activeSessionForBranch ? String(activeSessionForBranch.sessionId || '').trim().toUpperCase() : '';
+        const existingLockSessId = existingLock && existingLock.sessionId ? String(existingLock.sessionId).trim().toUpperCase() : '';
+
+        if (activeSessId && incomingSessId && incomingSessId !== activeSessId) {
+          console.log(
+            `[Termux Hub] 🛡️ Lockdown Session Guard: Rejected lockdown packet for ${brId} from non-active session [${incomingSessId}] while [${activeSessId}] is active.`
+          );
+          if (existingLock) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                action: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                ...existingLock,
+                origin_device_id: 'LOCAL_HUB',
+                timestamp: hubNow,
+              }));
+            } catch (e) {}
+          }
+          return;
+        }
+        if (existingLock && existingLock.isLocked && existingLockSessId && !packet.isLocked && incomingSessId && incomingSessId !== existingLockSessId) {
+          console.log(
+            `[Termux Hub] 🛡️ Lockdown Unlock Guard: Rejected unlock for ${brId} from mismatched session [${incomingSessId}] (owned by [${existingLockSessId}]).`
+          );
+          try {
+            ws.send(JSON.stringify({
+              type: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+              action: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+              ...existingLock,
+              origin_device_id: 'LOCAL_HUB',
+              timestamp: hubNow,
+            }));
+          } catch (e) {}
+          return;
+        }
+
         if (existingLock && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
           console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_LOCKDOWN_BROADCAST for ${brId}`);
           return;
@@ -2924,9 +3037,10 @@ wss.on('connection', (ws, req) => {
           reason: packet.reason,
           updatedAt: incomingTime,
           lastUpdated: packet.lastUpdated || hubIso,
+          isCloudSynced: false,
         };
         scheduleSave();
-        console.log(`[Termux Hub] 🔒 Branch Lockdown status changed: ${brId} isLocked=${packet.isLocked}`);
+        console.log(`[Termux Hub] 🔒 Branch Lockdown status changed: ${brId} isLocked=${packet.isLocked} session=${packet.sessionId || 'N/A'}`);
 
         wss.clients.forEach((client) => {
           if (client !== ws && client.readyState === WebSocket.OPEN) {
@@ -2959,28 +3073,27 @@ wss.on('connection', (ws, req) => {
           }
           const sIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
           const existing = sIdx >= 0 ? stocktakeSessionsStore[sIdx] : null;
-          const ACTIVE_FLOOR_STATUSES = new Set([
-            'DRAFT',
-            'SCHEDULED',
-            'IN_PROGRESS',
-            'COUNTING',
-            'RECOUNTING',
-            'AUDIT_REVIEW',
-            'CONSOLIDATED',
-            'READY_FOR_COMMITTAL',
-          ]);
           const targetBranchNorm = String(packet.branchId || sess.branchId || existing?.branchId || hubBranchId || '')
             .trim()
             .toUpperCase();
           const incomingStatusNorm = String(packet.status || sess.status || 'COUNTING').toUpperCase();
-          if (!existing && ACTIVE_FLOOR_STATUSES.has(incomingStatusNorm)) {
+          if (!existing && ACTIVE_FLOOR_STATUSES_SET.has(incomingStatusNorm)) {
             const conflictingActive = stocktakeSessionsStore.find((s) => {
               if (!s || s.sessionId === sessionId) return false;
+              if (isTombstoned(s.sessionId, 'stocktake_session', getTimestamp(s))) return false;
               const sBranch = String(s.branchId || hubBranchId || '').trim().toUpperCase();
               const sStatus = String(s.status || '').toUpperCase();
-              return (!targetBranchNorm || !sBranch || sBranch === targetBranchNorm) && ACTIVE_FLOOR_STATUSES.has(sStatus);
+              return (!targetBranchNorm || !sBranch || sBranch === targetBranchNorm) && ACTIVE_FLOOR_STATUSES_SET.has(sStatus);
             });
             if (conflictingActive) {
+              const conflictBranchKey = conflictingActive.branchId || targetBranchNorm || hubBranchId;
+              const existingLockdown =
+                branchLockdownsStore[conflictBranchKey] ||
+                branchLockdownsStore[String(conflictBranchKey || '').toUpperCase()] ||
+                Object.values(branchLockdownsStore || {}).find(
+                  (lk) => lk && String(lk.sessionId || '').trim().toUpperCase() === String(conflictingActive.sessionId || '').trim().toUpperCase()
+                ) ||
+                null;
               console.log(
                 `[Termux Hub] ⚠️ Rejected duplicate active stocktake [${sessionId}] on branch ${targetBranchNorm}: [${conflictingActive.sessionId}] is already ${conflictingActive.status}.`
               );
@@ -2990,6 +3103,8 @@ wss.on('connection', (ws, req) => {
                   sessionId,
                   existingSessionId: conflictingActive.sessionId,
                   existingSessionName: conflictingActive.title || conflictingActive.sessionName || conflictingActive.sessionId,
+                  existingSession: conflictingActive,
+                  existingLockdown,
                   message: `Only 1 active floor stocktake session is allowed per branch. Close or commit "${conflictingActive.title || conflictingActive.sessionName}" first.`,
                   timestamp: hubNow,
                 }));
@@ -3225,13 +3340,20 @@ wss.on('connection', (ws, req) => {
             }));
           } catch (e) {}
 
-          // Broadcast to all other peers
+          // Broadcast to all other peers with canonical branch/company/timestamp metadata
           const sessBroadcastStr = JSON.stringify({
             type: 'STOCKTAKE_SESSION_STARTED',
             action: 'STOCKTAKE_SESSION_STARTED',
             sessionId,
+            branchId: sessionObj.branchId || hubBranchId,
+            companyId: sessionObj.companyId || hubTenantId,
+            company_id: sessionObj.companyId || hubTenantId,
             session: sessionObj,
             payload: sessionObj,
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
+            origin_device_id: packet.origin_device_id || 'LOCAL_HUB',
             timestamp: hubNow,
           });
           wss.clients.forEach((client) => {
@@ -3305,18 +3427,26 @@ wss.on('connection', (ws, req) => {
 
       if (pType === 'STOCKTAKE_SESSION_LIST_REQUEST') {
         try {
+          const liveSessions = stocktakeSessionsStore.filter(
+            (s) => s && s.sessionId && !isTombstoned(s.sessionId, 'stocktake_session', getTimestamp(s))
+          );
+          const sessionTombstones = tombstonesStore.filter(
+            (t) => t && normalizeHubEntityType(t.entityType) === 'stocktake_session'
+          );
           ws.send(
             JSON.stringify({
               type: 'STOCKTAKE_SESSION_LIST',
               action: 'STOCKTAKE_SESSION_LIST',
-              sessions: stocktakeSessionsStore,
+              sessions: liveSessions,
               segments: stocktakeSegmentsStore,
               zoneAssignments: zoneAssignmentsStore,
+              tombstones: sessionTombstones,
+              branchLockdowns: branchLockdownsStore || {},
               timestamp: Date.now(),
             })
           );
           console.log(
-            `[Termux Hub] 📋 Replied to STOCKTAKE_SESSION_LIST_REQUEST with ${stocktakeSessionsStore.length} session(s), ${stocktakeSegmentsStore.length} segment(s), and ${zoneAssignmentsStore.length} zone assignments.`
+            `[Termux Hub] 📋 Replied to STOCKTAKE_SESSION_LIST_REQUEST with ${liveSessions.length} session(s), ${stocktakeSegmentsStore.length} segment(s), ${zoneAssignmentsStore.length} zone assignments, and ${sessionTombstones.length} tombstone(s).`
           );
         } catch (e) {}
         return;
@@ -6492,10 +6622,26 @@ async function syncEdgeToCloudSupabase() {
       }
       if (eType === 'branch_lockdown') {
         const brKey = String(rec.branchId || rec.branch_id || cId || hubBranchId).trim().toUpperCase();
-        const ex = branchLockdownsStore[brKey];
+        const ex = branchLockdownsStore[brKey] || branchLockdownsStore[rec.branchId || rec.branch_id || hubBranchId];
         const exTs = ex ? getRecordTimestamp(ex) : 0;
+        const ACTIVE_LOCK_STATUSES = new Set([
+          'ACTIVE', 'DRAFT', 'SCHEDULED', 'IN_PROGRESS', 'COUNTING',
+          'RECOUNT', 'RECOUNTING', 'AUDIT_REVIEW', 'CONSOLIDATED',
+          'PENDING_SIGNOFF', 'READY_FOR_COMMITTAL',
+        ]);
+        const activeSessForBr = stocktakeSessionsStore.find((s) => {
+          if (!s || !s.sessionId) return false;
+          if (isTombstoned(s.sessionId, 'stocktake_session', getTimestamp(s))) return false;
+          const sBr = String(s.branchId || hubBranchId || '').trim().toUpperCase();
+          return (!brKey || !sBr || sBr === brKey) && ACTIVE_LOCK_STATUSES.has(String(s.status || '').toUpperCase());
+        });
+        const incSessId = String(rec.sessionId || '').trim().toUpperCase();
+        const actSessId = activeSessForBr ? String(activeSessForBr.sessionId || '').trim().toUpperCase() : '';
+        if (actSessId && incSessId && incSessId !== actSessId) {
+          return false;
+        }
         if (ex && exTs > 0 && exTs > cloudTs + 60000) return false;
-        branchLockdownsStore[brKey] = rec;
+        branchLockdownsStore[rec.branchId || brKey] = { ...rec, isCloudSynced: true };
         return true;
       }
 
@@ -6630,7 +6776,9 @@ async function syncEdgeToCloudSupabase() {
     const newlyPulledEnvelopes = [];
 
     // STEP A: Collect & push all unsynced records across all Hub stores via push_envelopes
+    // TOMBSTONE MUST be pushed first so Cloud marks deleted sessions before new sessions arrive!
     const pushSources = [
+      { hubType: 'TOMBSTONE', store: tombstonesStore },
       { hubType: 'SALE', store: salesStore },
       { hubType: 'CUSTOMER_CHANGE', store: customerChangesStore },
       { hubType: 'CREDIT_SALE', store: creditSalesStore },
@@ -6655,7 +6803,6 @@ async function syncEdgeToCloudSupabase() {
       { hubType: 'STOCKTAKE_SESSION', store: stocktakeSessionsStore },
       { hubType: 'STOCKTAKE_SEGMENT', store: stocktakeSegmentsStore },
       { hubType: 'STOCKTAKE_ZONE_ASSIGNMENT', store: zoneAssignmentsStore },
-      { hubType: 'TOMBSTONE', store: tombstonesStore },
       { hubType: 'INVENTORY', store: inventoryStore },
       { hubType: 'CUSTOMER', store: customersStore },
       { hubType: 'STAFF', store: salespeopleStore },
@@ -6708,23 +6855,102 @@ async function syncEdgeToCloudSupabase() {
           }
           const ackedSet = new Set(Array.isArray(pushRes.json.ackedPacketIds) ? pushRes.json.ackedPacketIds.map(String) : []);
           const flaggedSet = new Set(Array.isArray(pushRes.json.flaggedBackdateIds) ? pushRes.json.flaggedBackdateIds.map(String) : []);
+          const failedMap = new Map();
+          if (Array.isArray(pushRes.json.failed)) {
+            for (const f of pushRes.json.failed) {
+              if (f && f.packetId) failedMap.set(String(f.packetId), String(f.error || 'FAILED'));
+            }
+          }
           const srvIso = pushRes.json.server_received_at || new Date().toISOString();
 
+          // Ingest conflicts FIRST (supports both { winner } and Code.gs direct { entityType, entityId, data })
+          let cloudWinningSession = null;
+          let cloudWinningLockdown = null;
+          if (Array.isArray(pushRes.json.conflicts)) {
+            for (const c of pushRes.json.conflicts) {
+              if (!c) continue;
+              const candidateEnv = c.winner || (c.entityType && c.data ? c : null);
+              if (candidateEnv) {
+                const cType = String(candidateEnv.entityType || '').trim().toLowerCase();
+                if (cType === 'stocktake_session' && candidateEnv.data) {
+                  cloudWinningSession = candidateEnv.data;
+                } else if (cType === 'branch_lockdown' && candidateEnv.data) {
+                  cloudWinningLockdown = candidateEnv.data;
+                }
+                if (ingestCloudEnvelopeIntoHub(candidateEnv)) {
+                  newlyPulledEnvelopes.push(candidateEnv);
+                }
+              }
+            }
+          }
+
           for (const pair of chunk) {
-            if (ackedSet.size === 0 || ackedSet.has(pair.env.packetId)) {
+            const pId = String(pair.env.packetId);
+            const failErr = failedMap.get(pId);
+            if (failErr) {
+              if (failErr === 'ACTIVE_STOCKTAKE_ALREADY_EXISTS' && pair.hubType === 'STOCKTAKE_SESSION') {
+                const rejSessId = pair.rec.sessionId || pair.env.entityId;
+                const nowMs = Date.now();
+                const nowIso = new Date(nowMs).toISOString();
+                pair.rec.status = 'CANCELLED';
+                pair.rec.isCloudSynced = true;
+                pair.rec.updatedAt = nowMs;
+                pair.rec.lastUpdated = nowIso;
+                pair.rec.notes = `${pair.rec.notes ? pair.rec.notes + ' | ' : ''}Auto-archived by Cloud: active stocktake already exists on this branch.`;
+
+                // Release local Hub lockdown if it was bound to the rejected session
+                if (branchLockdownsStore && typeof branchLockdownsStore === 'object') {
+                  for (const brK of Object.keys(branchLockdownsStore)) {
+                    const lk = branchLockdownsStore[brK];
+                    if (lk && String(lk.sessionId || '').trim().toUpperCase() === String(rejSessId || '').trim().toUpperCase()) {
+                      if (cloudWinningLockdown) {
+                        branchLockdownsStore[brK] = { ...cloudWinningLockdown, isCloudSynced: true };
+                      } else {
+                        branchLockdownsStore[brK] = {
+                          ...lk,
+                          isLocked: false,
+                          lockedAt: undefined,
+                          updatedAt: nowMs,
+                          lastUpdated: nowIso,
+                          isCloudSynced: true,
+                        };
+                      }
+                    }
+                  }
+                }
+                scheduleSave();
+                // Notify connected PWA clients so they quarantine the losing session locally
+                try {
+                  if (typeof wss !== 'undefined' && wss && wss.clients) {
+                    const conflictNotice = JSON.stringify({
+                      type: 'STOCKTAKE_SESSION_CONFLICT',
+                      sessionId: rejSessId,
+                      existingSessionId: cloudWinningSession?.sessionId || '',
+                      existingSessionName: cloudWinningSession?.title || cloudWinningSession?.sessionName || cloudWinningSession?.sessionId || 'Active Cloud Session',
+                      existingSession: cloudWinningSession,
+                      existingLockdown: cloudWinningLockdown,
+                      message: `Cloud already has an active stocktake session. Local session ${rejSessId} was archived read-only.`,
+                      timestamp: nowMs,
+                    });
+                    wss.clients.forEach((client) => {
+                      if (client && client.readyState === WebSocket.OPEN) {
+                        try { client.send(conflictNotice); } catch (e) {}
+                      }
+                    });
+                  }
+                } catch (e) {}
+              } else if (failErr === 'BRANCH_LOCKDOWN_SESSION_MISMATCH' && pair.hubType === 'BRANCH_LOCKDOWN') {
+                pair.rec.isCloudSynced = true;
+              }
+              continue;
+            }
+
+            if (ackedSet.has(pId) || (ackedSet.size === 0 && failedMap.size === 0)) {
               pair.rec.isCloudSynced = true;
               if (!pair.rec.server_received_at) pair.rec.server_received_at = srvIso;
               if (flaggedSet.has(pair.env.entityId)) pair.rec.suspicious_backdate = true;
               if (pair.env.class === 'T1') {
                 broadcastCloudSyncAck(null, pair.hubType, pair.env.entityId);
-              }
-            }
-          }
-
-          if (Array.isArray(pushRes.json.conflicts)) {
-            for (const c of pushRes.json.conflicts) {
-              if (c && c.winner && ingestCloudEnvelopeIntoHub(c.winner)) {
-                newlyPulledEnvelopes.push(c.winner);
               }
             }
           }

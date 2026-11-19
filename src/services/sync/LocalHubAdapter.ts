@@ -508,8 +508,14 @@ export class LocalHubAdapter implements SyncAdapter {
             p.payload.account_id ||
             p.payload.sessionId));
 
-      const matches = pItemId && String(pItemId).trim().toUpperCase() === cleanTargetId;
-      return !matches;
+      const pSessionId =
+        p.sessionId ||
+        (p.session && (p.session.sessionId || p.session.id)) ||
+        (p.payload && (p.payload.sessionId || (p.payload.session && p.payload.session.sessionId)));
+
+      const matchesPrimary = pItemId && String(pItemId).trim().toUpperCase() === cleanTargetId;
+      const matchesSession = pSessionId && String(pSessionId).trim().toUpperCase() === cleanTargetId;
+      return !(matchesPrimary || matchesSession);
     });
 
     const removed = initialLen - this.pendingQueue.length;
