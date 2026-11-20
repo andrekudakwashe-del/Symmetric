@@ -10,8 +10,8 @@ import {
   DEFAULT_MASTER_WEBHOOK_URL,
   getSheetsConfig,
   getCurrentCompany,
-  getCompanies,
 } from '../../../db/roomDatabase';
+import { pingGasDeployment, resolveSafeGasTarget } from '../../sync/gasTransport';
 import { roomBackendAdapter } from './RoomAdapter';
 
 export class SheetsAppScriptAdapter implements IBackendAdapter {
@@ -22,23 +22,32 @@ export class SheetsAppScriptAdapter implements IBackendAdapter {
   readonly description = 'Cloud multi-branch spreadsheet sync powered by Google Apps Script webhooks. Transparent, accessible, and spreadsheet-native.';
 
   isConfigured(config: TenantBackendConfig): boolean {
-    const webhook =
-      config.sheets?.webhookUrl ||
-      config.sheets?.masterWebhookUrl ||
-      getSheetsConfig().masterWebhookUrl ||
-      DEFAULT_MASTER_WEBHOOK_URL;
-    return !!webhook && webhook.startsWith('http');
+    const companyId = (config as any).companyId || getCurrentCompany()?.company_id || '';
+    const target = resolveSafeGasTarget({
+      companyId,
+      webhookUrl:
+        config.sheets?.webhookUrl ||
+        config.sheets?.masterWebhookUrl ||
+        getSheetsConfig().masterWebhookUrl ||
+        DEFAULT_MASTER_WEBHOOK_URL,
+      spreadsheetId: config.sheets?.spreadsheetId,
+    });
+    return !!target.webhookUrl && target.webhookUrl.startsWith('http');
   }
 
   async testConnection(config: TenantBackendConfig): Promise<BackendConnectionTestResult> {
-    const start = Date.now();
-    const webhookUrl =
-      config.sheets?.webhookUrl ||
-      config.sheets?.masterWebhookUrl ||
-      getSheetsConfig().masterWebhookUrl ||
-      DEFAULT_MASTER_WEBHOOK_URL;
+    const companyId = (config as any).companyId || getCurrentCompany()?.company_id || '';
+    const target = resolveSafeGasTarget({
+      companyId,
+      webhookUrl:
+        config.sheets?.webhookUrl ||
+        config.sheets?.masterWebhookUrl ||
+        getSheetsConfig().masterWebhookUrl ||
+        DEFAULT_MASTER_WEBHOOK_URL,
+      spreadsheetId: config.sheets?.spreadsheetId,
+    });
 
-    if (!webhookUrl) {
+    if (!target.webhookUrl) {
       return {
         success: false,
         latencyMs: 0,
@@ -47,39 +56,35 @@ export class SheetsAppScriptAdapter implements IBackendAdapter {
       };
     }
 
-    try {
-      const testUrl = webhookUrl.includes('?')
-        ? `${webhookUrl}&action=get_companies`
-        : `${webhookUrl}?action=get_companies`;
-
-      // Use no-cors or timeout to probe Google Apps Script endpoint
-      await fetch(testUrl, {
-        method: 'GET',
-        mode: 'no-cors',
-        signal: AbortSignal.timeout(6000),
-      });
-
-      const latency = Date.now() - start;
+    const ping = await pingGasDeployment(target.webhookUrl, 18_000);
+    if (ping.online && !ping.isLegacyDeployment) {
       return {
         success: true,
-        latencyMs: latency,
+        latencyMs: ping.latencyMs,
         testedAt: new Date().toISOString(),
-        message: 'Google Apps Script Webhook is active and responding (HTTP 200 OK).',
+        message: `Google Apps Script ${ping.version || 'V7.0'} is online (${ping.latencyMs}ms).`,
         details: {
-          webhookUrl,
-          sheetId: config.sheets?.spreadsheetId || 'Default Shared Sheet',
-          isolationMode: config.sheets?.isolationMode || 'ROW_LEVEL',
+          webhookUrl: target.webhookUrl,
+          version: ping.version,
+          schemaVersion: ping.schemaVersion,
+          sheetId: target.spreadsheetId || 'Dedicated Sheet Pending',
+          blockedMasterSheetLeak: target.blockedMasterSheetLeak,
+          isolationMode: config.sheets?.isolationMode || 'DEDICATED_SHEET',
         },
       };
-    } catch (err: any) {
-      return {
-        success: false,
-        latencyMs: Date.now() - start,
-        testedAt: new Date().toISOString(),
-        message: `Apps Script ping failed: ${err.message || String(err)}`,
-        details: { webhookUrl },
-      };
     }
+
+    return {
+      success: false,
+      latencyMs: ping.latencyMs,
+      testedAt: new Date().toISOString(),
+      message: ping.error || 'Apps Script health check failed. Verify V7.0 Web App deployment.',
+      details: {
+        webhookUrl: target.webhookUrl,
+        isLegacyDeployment: ping.isLegacyDeployment,
+        schemaVersion: ping.schemaVersion,
+      },
+    };
   }
 
   async exportSnapshot(companyId: string): Promise<TenantDataSnapshot> {

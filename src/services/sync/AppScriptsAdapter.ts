@@ -24,7 +24,16 @@ import {
   resolveConflictingLocalStocktakeSession,
   annotateSaleCloudReceiptMetadata,
   DEFAULT_MASTER_WEBHOOK_URL,
+  isMasterCompanyId,
 } from '../../db/roomDatabase';
+import {
+  fetchWithTimeout,
+  GAS_TIMEOUTS,
+  isTimeoutError,
+  parseGasResponseText,
+  resolveSafeGasTarget,
+  sleepMs,
+} from './gasTransport';
 import { getPendingSyncQueueItems, updateSyncItem } from '../../db/indexedDBService';
 import {
   getCloudCatchupSeq,
@@ -223,7 +232,8 @@ export class AppScriptsAdapter implements SyncAdapter {
     const config = getActiveCloudConfig();
     const currentComp = getCurrentCompany();
     const sheetsCfg = getSheetsConfig();
-    const targetWebhook = String(
+    const companyId = String(currentComp.company_id || '').trim();
+    const rawWebhook = String(
       config.credentials.webhookUrl ||
         config.credentials.url ||
         currentComp.webhook_url ||
@@ -232,14 +242,18 @@ export class AppScriptsAdapter implements SyncAdapter {
         DEFAULT_MASTER_WEBHOOK_URL ||
         ''
     ).trim();
-    const targetSheetId = String(
+    const rawSheetId = String(
       config.credentials.sheetId ||
         config.credentials.spreadsheetId ||
         currentComp.sheet_id ||
         sheetsCfg.spreadsheetId ||
         ''
     ).trim();
-    const companyId = currentComp.company_id || 'COMP-001';
+    const safeTarget = resolveSafeGasTarget({
+      companyId,
+      webhookUrl: rawWebhook,
+      spreadsheetId: rawSheetId,
+    });
     const branchId = getCurrentBranchId() || 'BR-MAIN';
     const sessionUser = getSessionUser();
     const userRole = String(sessionUser?.role || 'CASHIER').toUpperCase();
@@ -248,8 +262,9 @@ export class AppScriptsAdapter implements SyncAdapter {
     return {
       config,
       sheetsCfg,
-      targetWebhook,
-      targetSheetId,
+      targetWebhook: safeTarget.webhookUrl,
+      targetSheetId: safeTarget.spreadsheetId,
+      blockedMasterSheetLeak: safeTarget.blockedMasterSheetLeak,
       companyId,
       branchId,
       userRole,
@@ -371,8 +386,22 @@ export class AppScriptsAdapter implements SyncAdapter {
   ): Promise<any> {
     const creds = this.resolveTargetCredentials();
     const { targetWebhook, targetSheetId } = creds;
+    if (!creds.companyId) {
+      throw new Error('MISSING_COMPANY_ID: Active tenant company_id is required before syncing with Google Apps Script.');
+    }
     if (!targetWebhook || !targetWebhook.startsWith('http')) {
       throw new Error('No Google Apps Script webhook URL configured; record remains queued for retry.');
+    }
+    if (
+      action === 'push_envelopes' &&
+      !isMasterCompanyId(creds.companyId) &&
+      (creds.blockedMasterSheetLeak || !targetSheetId)
+    ) {
+      throw new Error(
+        creds.blockedMasterSheetLeak
+          ? `MASTER_SHEET_WRITE_BLOCKED: Refused to write tenant ${creds.companyId} envelopes to the Master Sheet.`
+          : `DEDICATED_SHEET_REQUIRED: Tenant ${creds.companyId} does not have a dedicated spreadsheet ID provisioned yet.`
+      );
     }
 
     const jwtToken = getTenantAuthToken(creds.companyId);
@@ -381,6 +410,7 @@ export class AppScriptsAdapter implements SyncAdapter {
     const payload = {
       ...body,
       action,
+      company_id: creds.companyId,
       tenant_sheet_id: targetSheetId,
       sheet_id: targetSheetId,
       spreadsheet_id: targetSheetId,
@@ -392,39 +422,51 @@ export class AppScriptsAdapter implements SyncAdapter {
     // 1. Try local Express proxy (zero CORS, handles redirects cleanly)
     let proxyUnavailable = false;
     try {
-      const srvRes = await fetch(proxyPath, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(jwtToken ? { Authorization: `Bearer ${jwtToken}` } : {}),
+      const srvRes = await fetchWithTimeout(
+        proxyPath,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(jwtToken ? { Authorization: `Bearer ${jwtToken}` } : {}),
+          },
+          body: JSON.stringify({ webhook_url: targetWebhook, ...payload }),
         },
-        body: JSON.stringify({ webhook_url: targetWebhook, ...payload }),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-
-      const srvJson = await srvRes.json().catch(() => null);
-      if (srvRes.ok) {
-        if (srvJson && srvJson.success !== false && srvJson.status !== 'error' && !(typeof srvJson.httpStatus === 'number' && srvJson.httpStatus >= 400)) {
-          return srvJson;
-        }
-        return await this.handleStructuredGasResponse(srvJson, creds, proxyPath, action, body, timeoutMs, allowRetry);
-      }
-
-      if (srvJson && (srvJson.code || srvJson.httpStatus)) {
-        return await this.handleStructuredGasResponse(srvJson, creds, proxyPath, action, body, timeoutMs, allowRetry);
-      }
+        timeoutMs
+      );
 
       if (srvRes.status === 404 || srvRes.status >= 502) {
         proxyUnavailable = true;
       } else {
-        throw new Error(srvJson?.error || `Proxy ${proxyPath} returned HTTP ${srvRes.status}`);
+        const rawText = await srvRes.text();
+        const parsed = parseGasResponseText(rawText, srvRes.status);
+        const srvJson = parsed.data;
+        if (srvRes.ok) {
+          if (
+            srvJson &&
+            srvJson.success !== false &&
+            srvJson.status !== 'error' &&
+            !(typeof srvJson.httpStatus === 'number' && srvJson.httpStatus >= 400)
+          ) {
+            return srvJson;
+          }
+          if (srvJson) {
+            return await this.handleStructuredGasResponse(srvJson, creds, proxyPath, action, body, timeoutMs, allowRetry);
+          }
+          throw new Error(parsed.error || `Apps Script ${action} returned an unreadable response`);
+        }
+
+        if (srvJson && (srvJson.code || srvJson.httpStatus)) {
+          return await this.handleStructuredGasResponse(srvJson, creds, proxyPath, action, body, timeoutMs, allowRetry);
+        }
+
+        throw new Error(srvJson?.error || parsed.error || `Proxy ${proxyPath} returned HTTP ${srvRes.status}`);
       }
     } catch (proxyErr: any) {
-      const isTimeout =
-        proxyErr?.name === 'TimeoutError' ||
-        proxyErr?.name === 'AbortError' ||
+      const timedOut =
+        isTimeoutError(proxyErr) ||
         String(proxyErr?.message || '').toLowerCase().includes('timed out');
-      if (isTimeout) {
+      if (timedOut) {
         // Proxy already forwarded to Apps Script and timed out; do not fire a duplicate direct request.
         this.applyBackoff(10_000, 'TIMEOUT');
         throw new Error(`Google Apps Script ${action} timed out; queued for retry.`);
@@ -435,42 +477,136 @@ export class AppScriptsAdapter implements SyncAdapter {
       proxyUnavailable = true;
     }
 
-    // 2. Standalone PWA direct fetch to Apps Script (when proxy absent)
+    // 2. Standalone PWA direct fetch to Apps Script (when Express proxy is absent, e.g. Vercel)
     if (proxyUnavailable) {
+      const buildDirectPullUrl = (sinceSeqOverride?: number): string => {
+        const sep = targetWebhook.includes('?') ? '&' : '?';
+        const q = new URLSearchParams({
+          action: 'pull_catchup',
+          company_id: creds.companyId,
+          branch_id: String(body.branch_id || creds.branchId || 'ALL'),
+          user_role: creds.userRole,
+          sheet_id: targetSheetId,
+          tenant_sheet_id: targetSheetId,
+          routing_epoch: String(routingEpoch),
+          since_seq: String(sinceSeqOverride ?? body.since_seq ?? 0),
+          since_ts: String(body.since_ts ?? 0),
+          limit: String(body.limit ?? 100),
+          cursor: String(body.cursor ?? 0),
+          _t: String(Date.now()),
+        });
+        if (jwtToken) q.set('jwt', jwtToken);
+        return `${targetWebhook}${sep}${q.toString()}`;
+      };
+
+      // For pull_catchup in standalone mode, prefer CORS-friendly GET first (avoids 302 POST redirect issues on mobile WebViews)
+      if (action === 'pull_catchup') {
+        try {
+          const getRes = await fetchWithTimeout(
+            buildDirectPullUrl(),
+            { method: 'GET', redirect: 'follow' },
+            timeoutMs
+          );
+          const getText = await getRes.text();
+          const parsedGet = parseGasResponseText(getText, getRes.status);
+          if (getRes.ok && parsedGet.data) {
+            if (
+              parsedGet.data.success === false ||
+              parsedGet.data.status === 'error' ||
+              (typeof parsedGet.data.httpStatus === 'number' && parsedGet.data.httpStatus >= 400)
+            ) {
+              return await this.handleStructuredGasResponse(parsedGet.data, creds, proxyPath, action, body, timeoutMs, allowRetry);
+            }
+            return parsedGet.data;
+          }
+        } catch (getErr: any) {
+          if (isTimeoutError(getErr)) {
+            this.applyBackoff(10_000, 'TIMEOUT');
+            throw new Error(`Google Apps Script ${action} timed out; queued for retry.`);
+          }
+        }
+      }
+
       let directRes: Response;
       try {
-        directRes = await fetch(targetWebhook, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(timeoutMs),
-        });
+        directRes = await fetchWithTimeout(
+          targetWebhook,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify(payload),
+            redirect: 'follow',
+          },
+          timeoutMs
+        );
       } catch (directErr: any) {
-        const isTimeout =
-          directErr?.name === 'TimeoutError' ||
-          directErr?.name === 'AbortError' ||
+        const timedOut =
+          isTimeoutError(directErr) ||
           String(directErr?.message || '').toLowerCase().includes('timed out');
-        if (isTimeout) {
+        if (timedOut) {
           this.applyBackoff(10_000, 'TIMEOUT');
           throw new Error(`Google Apps Script ${action} timed out; queued for retry.`);
         }
+
+        // Read-back verification recovery for push_envelopes when mobile WebView hits CORS 302 "Failed to fetch"
+        // after Apps Script already executed doPost and committed the envelopes.
+        if (action === 'push_envelopes' && Array.isArray(body.envelopes) && body.envelopes.length > 0) {
+          const expectedIds = body.envelopes
+            .map((e: any) => String(e?.packetId || '').trim())
+            .filter(Boolean);
+          if (expectedIds.length > 0) {
+            try {
+              await sleepMs(1800);
+              const prevSeq = Math.max(0, getCloudCatchupSeq(creds.companyId, creds.branchId) - 1);
+              const verifyRes = await fetchWithTimeout(
+                buildDirectPullUrl(prevSeq),
+                { method: 'GET', redirect: 'follow' },
+                GAS_TIMEOUTS.READ_CLIENT_MS
+              );
+              if (verifyRes.ok) {
+                const verifyText = await verifyRes.text();
+                const parsedVerify = parseGasResponseText(verifyText, verifyRes.status);
+                const pulled = Array.isArray(parsedVerify.data?.envelopes) ? parsedVerify.data.envelopes : [];
+                const seenPacketIds = new Set<string>(
+                  pulled.map((e: any) => String(e?.packetId || '').trim()).filter(Boolean)
+                );
+                const confirmedIds = expectedIds.filter((pid) => seenPacketIds.has(pid));
+                if (confirmedIds.length === expectedIds.length) {
+                  return {
+                    success: true,
+                    ackedPacketIds: confirmedIds,
+                    server_seq: parsedVerify.data?.server_seq,
+                    server_received_at: parsedVerify.data?.server_received_at || new Date().toISOString(),
+                    verifiedViaReadBack: true,
+                  };
+                }
+              }
+            } catch {
+              // Fall through to honest failure so unverified envelopes stay queued
+            }
+          }
+        }
+
         throw new Error(directErr?.message || `Google Apps Script ${action} network error; queued for retry.`);
       }
 
+      const directText = await directRes.text();
+      const parsedDirect = parseGasResponseText(directText, directRes.status);
       if (!directRes.ok) {
-        throw new Error(`Google Apps Script ${action} failed with HTTP ${directRes.status}`);
+        throw new Error(parsedDirect.error || `Google Apps Script ${action} failed with HTTP ${directRes.status}`);
       }
-
-      const directJson = await directRes.json().catch(() => null);
+      const directJson = parsedDirect.data;
+      if (!directJson) {
+        throw new Error(parsedDirect.error || `Google Apps Script ${action} returned an invalid response`);
+      }
       if (
-        directJson &&
-        (directJson.success === false ||
-          directJson.status === 'error' ||
-          (typeof directJson.httpStatus === 'number' && directJson.httpStatus >= 400))
+        directJson.success === false ||
+        directJson.status === 'error' ||
+        (typeof directJson.httpStatus === 'number' && directJson.httpStatus >= 400)
       ) {
         return await this.handleStructuredGasResponse(directJson, creds, proxyPath, action, body, timeoutMs, allowRetry);
       }
-      return directJson || { success: true };
+      return directJson;
     }
 
     return { success: false };
@@ -728,7 +864,7 @@ export class AppScriptsAdapter implements SyncAdapter {
           user_role: creds.userRole,
           user_branch_id: creds.userBranchId,
         },
-        25000
+        GAS_TIMEOUTS.WRITE_CLIENT_MS
       );
     } catch (netErr: any) {
       console.warn('[AppScriptsAdapter] broadcast deferred to offline queue:', netErr?.message || netErr);
@@ -816,7 +952,7 @@ export class AppScriptsAdapter implements SyncAdapter {
             limit: 250,
             cursor,
           },
-          28000
+          GAS_TIMEOUTS.READ_CLIENT_MS
         );
 
         const srvTsMs = resData?.server_received_at ? Date.parse(resData.server_received_at) : Date.now();
@@ -958,7 +1094,7 @@ export class AppScriptsAdapter implements SyncAdapter {
               user_role: creds.userRole,
               user_branch_id: creds.userBranchId,
             },
-            25000
+            GAS_TIMEOUTS.WRITE_CLIENT_MS
           );
           const ackedSet = new Set<string>(Array.isArray(resData?.ackedPacketIds) ? resData.ackedPacketIds.map(String) : []);
           const failedMap = new Map<string, string>();
@@ -1063,7 +1199,7 @@ export class AppScriptsAdapter implements SyncAdapter {
               user_role: creds.userRole,
               user_branch_id: creds.userBranchId,
             },
-            25000
+            GAS_TIMEOUTS.WRITE_CLIENT_MS
           );
           const ackedSet = new Set<string>(Array.isArray(resData?.ackedPacketIds) ? resData.ackedPacketIds.map(String) : []);
           const idbFailedMap = new Map<string, string>();

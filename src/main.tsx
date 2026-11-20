@@ -9,23 +9,21 @@ if ('serviceWorker' in navigator) {
   const isIframe = typeof window !== 'undefined' && window.self !== window.top;
 
   if (import.meta.env.DEV || isIframe) {
-    // DEV MODE:
-    // Ensure Service Worker does NOT auto-reload the page when a new update is found in Dev mode.
-    // It should only log a console message: [SW] New version available.
+    // DEV / PREVIEW IFRAME MODE:
+    // Actively unregister any previously installed Service Workers so stale cached HTML/assets
+    // can never intercept Vite dev modules or blank out the preview iframe.
     navigator.serviceWorker.getRegistrations().then((registrations) => {
       for (const reg of registrations) {
-        reg.onupdatefound = () => {
-          const installing = reg.installing;
-          if (installing) {
-            installing.onstatechange = () => {
-              if (installing.state === 'installed') {
-                console.log('[SW] New version available');
-              }
-            };
-          }
-        };
+        reg.unregister().catch(() => {});
       }
     }).catch(() => {});
+    if (typeof caches !== 'undefined') {
+      caches.keys().then((keys) => {
+        for (const k of keys) {
+          caches.delete(k).catch(() => {});
+        }
+      }).catch(() => {});
+    }
   } else {
     // PRODUCTION MODE (e.g., Vercel deployment):
     // Smart Update (Update-on-Reload) Pattern

@@ -3750,9 +3750,22 @@ class MeshSyncManager {
     if (!packet || typeof packet !== 'object') return;
     const targetDeviceId = String(packet.targetDeviceId || packet.deviceId || '').trim();
     const isForThisDevice = !targetDeviceId || targetDeviceId === this.config.deviceId;
+    const wasBlocked = packet.packetAccepted === false || packet.alertType === 'VOID_REFUND_BLOCKED';
+    const resolvedAlertType =
+      packet.alertType === 'VOID_REFUND_BLOCKED' ||
+      packet.alertType === 'HUB_FLAGGED_BACKDATE' ||
+      packet.alertType === 'SUSPICIOUS_BACKDATE' ||
+      packet.alertType === 'CLOCK_TAMPERING' ||
+      packet.alertType === 'HUB_REJECTED_BACKDATE'
+        ? packet.alertType
+        : wasBlocked
+        ? 'VOID_REFUND_BLOCKED'
+        : 'HUB_FLAGGED_BACKDATE';
     const msg =
       packet.message ||
-      `Security Lock: Backdated transaction rejected from ${targetDeviceId || 'terminal'}. Enable Automatic Date & Time.`;
+      (wasBlocked
+        ? `Security Lock: Void/Refund blocked from ${targetDeviceId || 'terminal'} due to clock drift. Enable Automatic Date & Time.`
+        : `Clock Flag: Backdated packet from ${targetDeviceId || 'terminal'} was accepted by Hub and flagged for review. Voids & refunds restricted until Automatic Date & Time is enabled.`);
 
     triggerClockTamperLock(msg, {
       deviceId: targetDeviceId || this.config.deviceId,
@@ -3761,17 +3774,21 @@ class MeshSyncManager {
       invoiceId: packet.invoiceId || packet.entityId,
       claimedTimestamp: typeof packet.claimedTimestamp === 'number' ? packet.claimedTimestamp : undefined,
       hubTimestamp: typeof packet.hubTimestamp === 'number' ? packet.hubTimestamp : undefined,
+      serverReceivedAt: typeof packet.serverReceivedAt === 'string' ? packet.serverReceivedAt : undefined,
       lockCurrentDevice: isForThisDevice,
+      alertType: resolvedAlertType,
     });
 
-    if (isForThisDevice) {
+    // Only remove from pending Hub queue if the Hub explicitly rejected a high-risk Void/Refund packet.
+    // Normal sales/cash logs flagged by the Hub stay synced uninterrupted.
+    if (isForThisDevice && wasBlocked) {
       this.localHubAdapter.removePendingPacketById(packet.packetId, packet.entityId || packet.invoiceId);
       if (packet.invoiceId && this.pendingSaleAcks.has(String(packet.invoiceId))) {
         this.pendingSaleAcks.delete(String(packet.invoiceId));
       }
     }
 
-    this.addLog('SECURITY_DROP', msg, targetDeviceId || 'Local Hub', this.config.deviceName);
+    this.addLog(wasBlocked ? 'SECURITY_DROP' : 'CONFLICT_RESOLVED', msg, targetDeviceId || 'Local Hub', this.config.deviceName);
   }
 
   private async drainQueueToLocalHub() {
@@ -6590,13 +6607,16 @@ class MeshSyncManager {
         if (sa && sa.message) {
           recordSecurityAlert({
             id: sa.id,
-            type: 'HUB_REJECTED_BACKDATE',
+            type:
+              sa.alertType ||
+              (sa.type && sa.type !== 'SECURITY_ALERT' ? sa.type : 'HUB_FLAGGED_BACKDATE'),
             deviceId: sa.deviceId || sa.targetDeviceId || 'UNKNOWN-DEVICE',
             deviceName: sa.deviceName,
             packetType: sa.packetType,
             invoiceId: sa.invoiceId,
             claimedTimestamp: sa.claimedTimestamp,
             hubTimestamp: sa.hubTimestamp,
+            serverReceivedAt: sa.serverReceivedAt,
             driftMs: sa.driftMs,
             message: sa.message,
             createdAt: sa.timestamp || sa.createdAt,

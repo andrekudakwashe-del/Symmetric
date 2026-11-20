@@ -6,6 +6,7 @@ import { Salesperson } from '../../types';
 import { getTenantBackendConfig } from './adapterRegistry';
 import { getCompanies, getSalespeopleForCompany, saveSalesperson, verifySalespersonPin } from '../../db/roomDatabase';
 import { authenticateStaffWithAppsScript, authenticateOwnerWithAppsScript } from '../googleSheetsSync';
+import { fetchWithTimeout, GAS_TIMEOUTS } from '../sync/gasTransport';
 
 export interface AuthResult {
   status: 'success' | 'error';
@@ -106,18 +107,22 @@ export class BackendAuthService {
       }
     }
 
-    // Try central server owner-login
+    // Try central server owner-login (28s client timeout > 20s server proxy timeout)
     try {
-      const res = await fetch('/api/saas/owner-login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: cleanEmail, password: passwordOrPin }),
-        signal: AbortSignal.timeout(6000),
-      });
+      const res = await fetchWithTimeout(
+        '/api/saas/owner-login',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: cleanEmail, password: passwordOrPin }),
+        },
+        GAS_TIMEOUTS.AUTH_CLIENT_MS
+      );
 
       if (res.ok) {
         const data = await res.json();
-        if (data.status === 'success' || data.success === true) {
+        const resolvedServerCompId = String(data?.company_id || data?.businessId || '').trim();
+        if ((data.status === 'success' || data.success === true) && resolvedServerCompId) {
           return {
             status: 'success',
             success: true,
@@ -128,8 +133,8 @@ export class BackendAuthService {
             sheet_id: data.sheet_id || data.spreadsheet_id,
             spreadsheet_id: data.spreadsheet_id || data.sheet_id,
             routing_epoch: typeof data.routing_epoch === 'number' ? data.routing_epoch : undefined,
-            businessId: data.company_id || data.businessId,
-            company_id: data.company_id || data.businessId,
+            businessId: resolvedServerCompId,
+            company_id: resolvedServerCompId,
             company_name: data.company_name,
             branch_id: data.branch_id || 'BR-MAIN',
             role: (data.role || 'OWNER').toUpperCase(),
@@ -140,8 +145,8 @@ export class BackendAuthService {
               name: data.full_name,
               email: cleanEmail,
               role: (data.role || 'OWNER').toUpperCase() as any,
-              companyId: data.company_id || data.businessId,
-              company_id: data.company_id || data.businessId,
+              companyId: resolvedServerCompId,
+              company_id: resolvedServerCompId,
               branchId: data.branch_id || 'BR-MAIN',
               branch_id: data.branch_id || 'BR-MAIN',
               active: 'Y',
@@ -156,7 +161,10 @@ export class BackendAuthService {
     // Fall back to Google Apps Script owner auth
     try {
       const appsScriptRes = await authenticateOwnerWithAppsScript(cleanEmail, passwordOrPin);
-      if (appsScriptRes.status === 'success' || appsScriptRes.success === true) {
+      const resolvedGasCompId = String(
+        (appsScriptRes as any).company_id || appsScriptRes.businessId || companyId || ''
+      ).trim();
+      if ((appsScriptRes.status === 'success' || appsScriptRes.success === true) && resolvedGasCompId) {
         return {
           status: 'success',
           success: true,
@@ -167,8 +175,8 @@ export class BackendAuthService {
           sheet_id: appsScriptRes.sheet_id || appsScriptRes.spreadsheet_id,
           spreadsheet_id: appsScriptRes.spreadsheet_id || appsScriptRes.sheet_id,
           routing_epoch: typeof appsScriptRes.routing_epoch === 'number' ? appsScriptRes.routing_epoch : undefined,
-          businessId: appsScriptRes.businessId || companyId || 'COMP-001',
-          company_id: appsScriptRes.businessId || companyId || 'COMP-001',
+          businessId: resolvedGasCompId,
+          company_id: resolvedGasCompId,
           company_name: appsScriptRes.company_name,
           branch_id: appsScriptRes.branch_id || 'BR-MAIN',
           role: (appsScriptRes.role || 'OWNER').toUpperCase(),
@@ -179,8 +187,8 @@ export class BackendAuthService {
             name: appsScriptRes.full_name || 'Business Owner',
             email: cleanEmail,
             role: (appsScriptRes.role || 'OWNER').toUpperCase() as any,
-            companyId: appsScriptRes.businessId || companyId || 'COMP-001',
-            company_id: appsScriptRes.businessId || companyId || 'COMP-001',
+            companyId: resolvedGasCompId,
+            company_id: resolvedGasCompId,
             branchId: appsScriptRes.branch_id || 'BR-MAIN',
             branch_id: appsScriptRes.branch_id || 'BR-MAIN',
             active: 'Y',
@@ -292,7 +300,7 @@ export class BackendAuthService {
     if (backendType === 'firebase' && config?.firebaseConfig?.apiKey) {
       try {
         const email = `${staffId.toLowerCase()}@tenant.${config.firebaseConfig.projectId}.saimetric.internal`;
-        const res = await fetch(
+        const res = await fetchWithTimeout(
           `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${config.firebaseConfig.apiKey}`,
           {
             method: 'POST',
@@ -302,8 +310,8 @@ export class BackendAuthService {
               password: passwordOrSecret,
               returnSecureToken: true,
             }),
-            signal: AbortSignal.timeout(6000),
-          }
+          },
+          15_000
         );
 
         if (res.ok) {
@@ -327,18 +335,21 @@ export class BackendAuthService {
       try {
         const cleanUrl = config.supabaseConfig.projectUrl.replace(/\/+$/, '');
         const email = `${staffId.toLowerCase()}@enterprise.${companyId.toLowerCase()}.saimetric.internal`;
-        const res = await fetch(`${cleanUrl}/auth/v1/token?grant_type=password`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            apikey: config.supabaseConfig.anonKey || config.supabaseConfig.serviceRoleKey,
+        const res = await fetchWithTimeout(
+          `${cleanUrl}/auth/v1/token?grant_type=password`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              apikey: config.supabaseConfig.anonKey || config.supabaseConfig.serviceRoleKey,
+            },
+            body: JSON.stringify({
+              email,
+              password: passwordOrSecret,
+            }),
           },
-          body: JSON.stringify({
-            email,
-            password: passwordOrSecret,
-          }),
-          signal: AbortSignal.timeout(6000),
-        });
+          15_000
+        );
 
         if (res.ok) {
           const data = await res.json();

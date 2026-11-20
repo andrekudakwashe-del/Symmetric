@@ -38,10 +38,12 @@ import {
   Eye,
   Package,
   Server,
+  Trash2,
 } from 'lucide-react';
 import { PackageSetupView } from './PackageSetupView';
 import { BackendAdapterHub } from './BackendAdapterHub';
 import { getPackages, assignCompanyPackage } from '../../services/packageService';
+import { fetchWithTimeout, pingGasDeployment } from '../../services/sync/gasTransport';
 import {
   getCompanies,
   saveCompany,
@@ -75,6 +77,9 @@ import {
   fetchGlobalSystemConfig,
   pushAllLocalTenantsToCloud,
   initializeSystemConfigAndSync,
+  purgeTestCompaniesEverywhere,
+  deleteTenantCompany,
+  PurgeTestCompaniesResult,
 } from '../../services/systemConfig';
 import { Company, SaaSBranch } from '../../data/saasData';
 import { Salesperson } from '../../types';
@@ -170,6 +175,21 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   const [isTestingWebhook, setIsTestingWebhook] = useState(false);
   const [webhookTestFeedback, setWebhookTestFeedback] = useState<{ tested: boolean; success: boolean; message: string } | null>(null);
 
+  // Safe Test-Tenant Purge & Single-Tenant Delete state
+  const [isPurgeModalOpen, setIsPurgeModalOpen] = useState(false);
+  const [isPurgingTestCompanies, setIsPurgingTestCompanies] = useState(false);
+  const [purgeTrashDriveSheets, setPurgeTrashDriveSheets] = useState(true);
+  const [purgeResultFeedback, setPurgeResultFeedback] = useState<PurgeTestCompaniesResult | null>(null);
+  const [companyToDelete, setCompanyToDelete] = useState<Company | null>(null);
+  const [deleteTrashDriveSheet, setDeleteTrashDriveSheet] = useState(true);
+  const [isDeletingCompany, setIsDeletingCompany] = useState(false);
+
+  const isProtectedCoreCompany = (c: Company) => {
+    const id = String(c?.company_id || '').trim().toUpperCase();
+    return id === 'COMP-001' || id === 'COMP-MASTER';
+  };
+  const testCompaniesCount = companies.filter((c) => !isProtectedCoreCompany(c)).length;
+
   useEffect(() => {
     const unsub = subscribeRoomDatabase(() => {
       setCompanies(getCompanies());
@@ -262,6 +282,54 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
     }
   };
 
+  const handleConfirmPurgeTestCompanies = async () => {
+    setIsPurgingTestCompanies(true);
+    setPurgeResultFeedback(null);
+    try {
+      const res = await purgeTestCompaniesEverywhere({
+        keepCompanyIds: ['COMP-001', 'COMP-MASTER'],
+        trashDedicatedSheets: purgeTrashDriveSheets,
+        webhookUrl: masterWebhookInput.trim() || undefined,
+      });
+      setPurgeResultFeedback(res);
+      setCompanies(getCompanies());
+      setBranches(getAllBranches());
+      if (res.cloudPurged) {
+        showToast(`✓ ${res.message}`);
+        confetti({ particleCount: 55, spread: 70, origin: { y: 0.6 } });
+      } else {
+        showToast(`⚠️ ${res.message}`);
+      }
+    } catch (err: any) {
+      showToast(`Purge error: ${err?.message || String(err)}`);
+    } finally {
+      setIsPurgingTestCompanies(false);
+    }
+  };
+
+  const handleConfirmDeleteSingleCompany = async () => {
+    if (!companyToDelete) return;
+    setIsDeletingCompany(true);
+    try {
+      const res = await deleteTenantCompany(companyToDelete.company_id, {
+        trashDedicatedSheet: deleteTrashDriveSheet,
+        webhookUrl: masterWebhookInput.trim() || undefined,
+      });
+      setCompanies(getCompanies());
+      setBranches(getAllBranches());
+      if (res.success) {
+        showToast(res.cloudDeleted ? `✓ ${res.message}` : `⚠️ ${res.message}`);
+        setCompanyToDelete(null);
+      } else {
+        showToast(`⚠️ ${res.message}`);
+      }
+    } catch (err: any) {
+      showToast(`Delete failed: ${err?.message || String(err)}`);
+    } finally {
+      setIsDeletingCompany(false);
+    }
+  };
+
   const handleTestWebhookConnection = async () => {
     const trimmedUrl = masterWebhookInput.trim();
     if (!trimmedUrl || !trimmedUrl.startsWith('http')) {
@@ -283,9 +351,7 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
 
       let data: any = null;
       try {
-        const srvRes = await fetch('/api/saas/call-action?action=ping', {
-          signal: AbortSignal.timeout(15000),
-        });
+        const srvRes = await fetchWithTimeout('/api/saas/call-action?action=ping', { method: 'GET' }, 20_000);
         if (srvRes.ok) {
           data = await srvRes.json().catch(() => null);
         }
@@ -294,11 +360,18 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
       }
 
       if (!data || !data.version) {
-        const pingUrl = trimmedUrl.includes('?') ? `${trimmedUrl}&action=ping` : `${trimmedUrl}?action=ping`;
-        const directRes = await fetch(pingUrl, { signal: AbortSignal.timeout(15000) });
-        if (directRes.ok) {
-          const txt = await directRes.text();
-          try { data = JSON.parse(txt); } catch { data = null; }
+        const ping = await pingGasDeployment(trimmedUrl, 20_000);
+        if (ping.online && !ping.isLegacyDeployment) {
+          data = {
+            success: true,
+            version: ping.version,
+            schema_version: ping.schemaVersion,
+          };
+        } else {
+          data = {
+            success: false,
+            error: ping.error || 'Apps Script ping failed',
+          };
         }
       }
 
@@ -1454,6 +1527,21 @@ function setupMasterSheets() {
                 <ExternalLink className="w-3.5 h-3.5 text-slate-400" />
                 <span>Open Master Sheet</span>
               </a>
+
+              {testCompaniesCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPurgeResultFeedback(null);
+                    setIsPurgeModalOpen(true);
+                  }}
+                  className="px-3 py-2 rounded-xl bg-rose-600/20 hover:bg-rose-600/35 text-rose-300 hover:text-rose-200 text-xs font-bold border border-rose-500/40 flex items-center gap-1.5 transition active:scale-95 cursor-pointer"
+                  title="Safely remove all test companies while preserving Saimetric Demo (COMP-001) and Super Admin"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Purge Test Companies ({testCompaniesCount})</span>
+                </button>
+              )}
             </div>
 
             {/* Toggle technical architecture info */}
@@ -1837,6 +1925,22 @@ function setupMasterSheets() {
                         <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
                       </button>
                     </div>
+
+                    {!isProtectedCoreCompany(comp) && (
+                      <div className="pt-1 border-t border-slate-800/80 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDeleteTrashDriveSheet(true);
+                            setCompanyToDelete(comp);
+                          }}
+                          className="px-2.5 py-1 rounded-lg bg-rose-950/70 hover:bg-rose-900/80 text-rose-300 border border-rose-500/30 text-[11px] font-semibold flex items-center gap-1 transition cursor-pointer"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>Delete Company</span>
+                        </button>
+                      </div>
+                    )}
                   </div>
                 );
               })
@@ -2049,6 +2153,20 @@ function setupMasterSheets() {
                                 title="Suspend account"
                               >
                                 <Ban className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+
+                            {!isProtectedCoreCompany(comp) && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setDeleteTrashDriveSheet(true);
+                                  setCompanyToDelete(comp);
+                                }}
+                                className="p-1 rounded-lg hover:bg-rose-950/80 text-rose-400 hover:text-rose-200 cursor-pointer"
+                                title="Permanently delete tenant company"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
                               </button>
                             )}
                           </div>
@@ -2853,6 +2971,208 @@ function setupMasterSheets() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Purge All Test Companies (Keep Demo Only) Confirmation Modal */}
+      {isPurgeModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-rose-500/40 rounded-3xl max-w-lg w-full p-5 sm:p-6 shadow-2xl space-y-4 animate-fadeIn">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+                <Trash2 className="w-5 h-5 text-rose-400" />
+                <span>Purge Test Companies (Keep Demo Only)</span>
+              </h3>
+              <button
+                type="button"
+                disabled={isPurgingTestCompanies}
+                onClick={() => setIsPurgeModalOpen(false)}
+                className="text-slate-400 hover:text-white disabled:opacity-40 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs text-slate-300">
+              <div className="p-3 rounded-2xl bg-emerald-950/40 border border-emerald-500/30 space-y-1">
+                <div className="font-bold text-emerald-300 flex items-center gap-1.5">
+                  <Shield className="w-4 h-4" />
+                  <span>Strictly Protected (Will NEVER Be Deleted)</span>
+                </div>
+                <ul className="list-disc list-inside text-emerald-200/90 space-y-0.5 pl-1">
+                  <li><strong>COMP-001</strong> — Saimetric Demo Enterprise &amp; its branches/users</li>
+                  <li><strong>COMP-MASTER</strong> — Super Admin (andrekudakwashe@gmail.com)</li>
+                  <li>Master Control Spreadsheet (<span className="font-mono text-[10px]">1gtbI5TK...49rfPE</span>)</li>
+                </ul>
+              </div>
+
+              <div className="p-3 rounded-2xl bg-rose-950/40 border border-rose-500/30 space-y-1">
+                <div className="font-bold text-rose-300 flex items-center gap-1.5">
+                  <AlertTriangle className="w-4 h-4" />
+                  <span>Will Be Removed ({testCompaniesCount} Test Companies)</span>
+                </div>
+                <p className="text-rose-200/90 leading-relaxed">
+                  Deletes all non-demo companies, branches, staff accounts, subscriptions, and stale duplicate branch rows from the Master Google Sheet, server store, and this browser so they cannot resurrect.
+                </p>
+              </div>
+
+              <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-slate-950/70 border border-slate-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={purgeTrashDriveSheets}
+                  onChange={(e) => setPurgeTrashDriveSheets(e.target.checked)}
+                  disabled={isPurgingTestCompanies}
+                  className="mt-0.5 rounded border-slate-600 accent-rose-500"
+                />
+                <span className="text-[11px] text-slate-300 leading-relaxed">
+                  <strong className="text-white block">Move test companies&apos; dedicated Google Sheets to Drive Trash</strong>
+                  Recoverable from Google Drive Trash for 30 days. Master Spreadsheet is explicitly skipped.
+                </span>
+              </label>
+
+              {purgeResultFeedback && (
+                <div
+                  className={`p-3 rounded-2xl border text-[11px] space-y-1.5 ${
+                    purgeResultFeedback.cloudPurged
+                      ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-200'
+                      : 'bg-amber-950/50 border-amber-500/40 text-amber-200'
+                  }`}
+                >
+                  <div className="font-bold flex items-center gap-1.5">
+                    {purgeResultFeedback.cloudPurged ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                    )}
+                    <span>{purgeResultFeedback.message}</span>
+                  </div>
+                  <div className="text-[10px] opacity-90 flex flex-wrap gap-x-3 gap-y-1">
+                    <span>Kept: {purgeResultFeedback.keptCompanies.join(', ') || 'COMP-001'}</span>
+                    <span>Local removed: {purgeResultFeedback.removedLocalCompanies}</span>
+                    {purgeResultFeedback.trashedSheetsCount > 0 && (
+                      <span>Drive sheets trashed: {purgeResultFeedback.trashedSheetsCount}</span>
+                    )}
+                    {purgeResultFeedback.tabStats?.branches && (
+                      <span>
+                        Branches tab: {purgeResultFeedback.tabStats.branches.before} → {purgeResultFeedback.tabStats.branches.after} rows
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isPurgingTestCompanies}
+                onClick={() => setIsPurgeModalOpen(false)}
+                className="flex-1 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-bold cursor-pointer"
+              >
+                {purgeResultFeedback ? 'Done' : 'Cancel'}
+              </button>
+              {!purgeResultFeedback?.cloudPurged && (
+                <button
+                  type="button"
+                  disabled={isPurgingTestCompanies}
+                  onClick={handleConfirmPurgeTestCompanies}
+                  className="flex-1 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-black flex items-center justify-center gap-1.5 shadow-md shadow-rose-600/20 cursor-pointer"
+                >
+                  {isPurgingTestCompanies ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Purging...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 className="w-4 h-4" />
+                      <span>Purge Test Companies</span>
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Single Company Confirmation Modal */}
+      {companyToDelete && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-rose-500/40 rounded-3xl max-w-md w-full p-5 sm:p-6 shadow-2xl space-y-4 animate-fadeIn">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                <Trash2 className="w-5 h-5 text-rose-400" />
+                <span>Delete Tenant Company</span>
+              </h3>
+              <button
+                type="button"
+                disabled={isDeletingCompany}
+                onClick={() => setCompanyToDelete(null)}
+                className="text-slate-400 hover:text-white disabled:opacity-40 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-xs text-slate-300">
+              <div className="p-3 rounded-2xl bg-slate-950 border border-slate-800 space-y-1">
+                <div className="text-sm font-bold text-white">{companyToDelete.company_name}</div>
+                <div className="font-mono text-amber-400 text-[11px]">{companyToDelete.company_id}</div>
+                {companyToDelete.owner_email && (
+                  <div className="text-slate-400 text-[11px]">{companyToDelete.owner_email}</div>
+                )}
+              </div>
+
+              <p className="text-slate-300 leading-relaxed">
+                This removes this company, its branches, and its staff from the Master Google Sheet, server store, and local browser cache.
+              </p>
+
+              {isRealGoogleSheetId(companyToDelete.sheet_id) && !isMasterSpreadsheetId(companyToDelete.sheet_id) && (
+                <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-slate-950/70 border border-slate-800 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={deleteTrashDriveSheet}
+                    onChange={(e) => setDeleteTrashDriveSheet(e.target.checked)}
+                    disabled={isDeletingCompany}
+                    className="mt-0.5 rounded border-slate-600 accent-rose-500"
+                  />
+                  <span className="text-[11px] text-slate-300">
+                    Also move dedicated sheet <span className="font-mono text-emerald-300">{companyToDelete.sheet_id?.slice(0, 14)}…</span> to Google Drive Trash
+                  </span>
+                </label>
+              )}
+            </div>
+
+            <div className="flex gap-2 pt-2">
+              <button
+                type="button"
+                disabled={isDeletingCompany}
+                onClick={() => setCompanyToDelete(null)}
+                className="flex-1 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-bold cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingCompany}
+                onClick={handleConfirmDeleteSingleCompany}
+                className="flex-1 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-black flex items-center justify-center gap-1.5 cursor-pointer"
+              >
+                {isDeletingCompany ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Deleting...</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Delete Permanently</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}

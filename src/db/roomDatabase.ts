@@ -5918,13 +5918,21 @@ export const addCashLog = (
   const securityState = getClockSecurityState();
   const isManualClientWrite = !options?.fromSync && !entry.fromMesh && !entry.skipSync;
   const trustedToday = getTrustedTodayDateString();
-  if (
+  const isFlaggedBackdatedCash = Boolean(
     securityState.isClockTampered &&
-    isManualClientWrite &&
-    entry.date &&
-    entry.date < trustedToday
-  ) {
-    throw new Error('Security Lock: Please enable Automatic Date & Time in your phone settings to process backdated cash entries.');
+      isManualClientWrite &&
+      entry.date &&
+      entry.date < trustedToday
+  );
+  if (isFlaggedBackdatedCash) {
+    (entry as any).suspicious_backdate = true;
+    recordSecurityAlert({
+      type: 'SUSPICIOUS_BACKDATE',
+      deviceId: (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'LOCAL-PWA',
+      packetType: 'CASH_LOG',
+      claimedDate: entry.date,
+      message: `Cash entry recorded while device clock is out of sync (claimed ${entry.date}, trusted ${trustedToday}). Synced to Hub & Cloud and flagged for audit.`,
+    });
   }
 
   const all = getRawStoredCashLogs();
@@ -7002,14 +7010,22 @@ export const addCustomerChange = (
 ): CustomerChangeEntry => {
   const securityState = getClockSecurityState();
   const isManualEntry = Boolean(options?.isManual || (entry as any).isManual);
+  const trustedToday = getTrustedTodayDateString();
   if (
     securityState.isClockTampered &&
     !options?.fromSync &&
     isManualEntry &&
     entry.date &&
-    entry.date < getTrustedTodayDateString()
+    entry.date < trustedToday
   ) {
-    throw new Error('Security Lock: Please enable Automatic Date & Time in your phone settings to process backdated change entries.');
+    (entry as any).suspicious_backdate = true;
+    recordSecurityAlert({
+      type: 'SUSPICIOUS_BACKDATE',
+      deviceId: (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'LOCAL-PWA',
+      packetType: 'CUSTOMER_CHANGE',
+      claimedDate: entry.date,
+      message: `Customer change entry recorded while device clock is out of sync (claimed ${entry.date}, trusted ${trustedToday}). Synced and flagged for audit.`,
+    });
   }
   const all = getRawStoredCustomerChanges();
   const currentCompany = getCurrentCompanyId();
@@ -7372,15 +7388,23 @@ export const addCreditSale = (
   options?: { fromSync?: boolean }
 ): CreditSaleEntry => {
   const securityState = getClockSecurityState();
+  const trustedToday = getTrustedTodayDateString();
   if (
     securityState.isClockTampered &&
     !options?.fromSync &&
     !entry.fromMesh &&
     entry.isManual &&
     entry.date &&
-    entry.date < getTrustedTodayDateString()
+    entry.date < trustedToday
   ) {
-    throw new Error('Security Lock: Please enable Automatic Date & Time in your phone settings to process backdated credit entries.');
+    (entry as any).suspicious_backdate = true;
+    recordSecurityAlert({
+      type: 'SUSPICIOUS_BACKDATE',
+      deviceId: (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'LOCAL-PWA',
+      packetType: 'CREDIT_SALE',
+      claimedDate: entry.date,
+      message: `Credit sale recorded while device clock is out of sync (claimed ${entry.date}, trusted ${trustedToday}). Synced and flagged for audit.`,
+    });
   }
   const all = getRawStoredCreditSales();
   const currentCompany = getCurrentCompanyId();
@@ -10225,7 +10249,7 @@ export const refundSaleInvoice = (params: {
   if (getClockSecurityState().isClockTampered) {
     return {
       success: false,
-      message: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+      message: 'Security Lock: Refunds and voids are restricted while device clock drift is detected. Please enable Automatic Date & Time in your device settings.',
     };
   }
   const allSales = getRawStoredSales();
@@ -10394,7 +10418,7 @@ export const voidSaleInvoice = (params: {
   if (getClockSecurityState().isClockTampered) {
     return {
       success: false,
-      message: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+      message: 'Security Lock: Voids and refunds are restricted while device clock drift is detected. Please enable Automatic Date & Time in your device settings.',
     };
   }
   const allSales = getRawStoredSales();
@@ -10981,7 +11005,7 @@ export const editSaleInvoice = (params: {
   if (getClockSecurityState().isClockTampered) {
     return {
       success: false,
-      message: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+      message: 'Security Lock: Editing completed receipts is restricted while device clock drift is detected. Please enable Automatic Date & Time in your device settings.',
     };
   }
   const allSales = getRawStoredSales();
@@ -23215,6 +23239,132 @@ export function saveCompany(company: Company): void {
     window.dispatchEvent(new CustomEvent('saas_company_updated', { detail: cleanCompany }));
     window.dispatchEvent(new CustomEvent('saas_packages_updated', { detail: cleanCompany }));
   }
+}
+
+const PROTECTED_LOCAL_COMPANY_IDS = new Set(['COMP-001', 'COMP-MASTER']);
+const PROTECTED_SUPER_ADMIN_EMAIL = 'andrekudakwashe@gmail.com';
+
+/**
+ * Authoritatively prune browser localStorage companies, branches, staff, and pending
+ * cloud registrations to only the allowed company IDs.
+ * COMP-001 (Saimetric Demo) and COMP-MASTER (Super Admin) are always protected.
+ */
+export function pruneLocalCompaniesToAllowlist(keepCompanyIds: string[]): {
+  removedCompanies: number;
+  removedBranches: number;
+  removedUsers: number;
+  keptCompanyIds: string[];
+} {
+  const keepSet = new Set<string>(PROTECTED_LOCAL_COMPANY_IDS);
+  (keepCompanyIds || []).forEach((id) => {
+    const clean = String(id || '').trim().toUpperCase();
+    if (clean) keepSet.add(clean);
+  });
+
+  const isKept = (cid?: string | null): boolean => {
+    const norm = String(cid || '').trim().toUpperCase();
+    if (!norm) return false;
+    return keepSet.has(norm);
+  };
+
+  // 1. Prune companies
+  const currentCompanies = getCompanies();
+  const keptCompanies = currentCompanies.filter((c) => isKept(c.company_id));
+  if (keptCompanies.length === 0 && SEED_COMPANIES.length > 0) {
+    keptCompanies.push(sanitizeCompanyRecord_({ ...SEED_COMPANIES[0] }));
+  }
+  const removedCompanies = Math.max(0, currentCompanies.length - keptCompanies.length);
+  setStored(STORAGE_KEYS.COMPANIES, keptCompanies);
+
+  // 2. Prune branches
+  const currentBranches = getStored<any[]>(STORAGE_KEYS.BRANCHES, []);
+  const keptBranches = currentBranches.filter((b) => {
+    const cid = b?.company_id || b?.companyId || b?.CompanyID || '';
+    return isKept(cid);
+  });
+  const removedBranches = Math.max(0, currentBranches.length - keptBranches.length);
+  setStored(STORAGE_KEYS.BRANCHES, keptBranches);
+
+  // 3. Prune salespeople / users (always preserve SUPER_ADMIN / protected email)
+  const currentUsers = getStored<any[]>(STORAGE_KEYS.SALESPEOPLE, []);
+  const keptUsers = currentUsers.filter((u) => {
+    const role = String(u?.role || '').trim().toUpperCase();
+    const email = String(u?.email || '').trim().toLowerCase();
+    if (role === 'SUPER_ADMIN' || email === PROTECTED_SUPER_ADMIN_EMAIL) return true;
+    const cid = u?.company_id || u?.companyId || u?.CompanyID || '';
+    return isKept(cid);
+  });
+  const removedUsers = Math.max(0, currentUsers.length - keptUsers.length);
+  setStored(STORAGE_KEYS.SALESPEOPLE, keptUsers);
+
+  // 4. Prune pending cloud registrations queue so purged tenants never re-upload on boot
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const rawPending = localStorage.getItem('saimetric_pending_cloud_registrations');
+      if (rawPending) {
+        const parsed = JSON.parse(rawPending);
+        if (Array.isArray(parsed)) {
+          const filteredPending = parsed.filter((item: any) => {
+            const cid = item?.company?.company_id || item?.company_id || '';
+            return isKept(cid);
+          });
+          localStorage.setItem('saimetric_pending_cloud_registrations', JSON.stringify(filteredPending));
+        }
+      }
+    } catch {
+      // ignore storage parse error
+    }
+  }
+
+  // 5. Reset active company pointer if it pointed to a pruned company
+  const activeCompId = getStored<string>(STORAGE_KEYS.CURRENT_COMPANY_ID, 'COMP-001');
+  if (!isKept(activeCompId)) {
+    setStored(STORAGE_KEYS.CURRENT_COMPANY_ID, 'COMP-001');
+    setStored(STORAGE_KEYS.CURRENT_BRANCH_ID, 'BR-MAIN');
+  }
+
+  if (removedCompanies > 0 || removedBranches > 0 || removedUsers > 0) {
+    notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saas_company_updated', { detail: { pruned: true, keptCompanyIds: Array.from(keepSet) } }));
+    }
+  }
+
+  return {
+    removedCompanies,
+    removedBranches,
+    removedUsers,
+    keptCompanyIds: keptCompanies.map((c) => c.company_id),
+  };
+}
+
+/**
+ * Remove a single non-protected tenant company and its branches/staff from local storage.
+ */
+export function deleteLocalCompany(companyId: string): {
+  success: boolean;
+  message: string;
+  removedCompanies?: number;
+  removedBranches?: number;
+  removedUsers?: number;
+} {
+  const cleanId = String(companyId || '').trim();
+  const normId = cleanId.toUpperCase();
+  if (!cleanId) {
+    return { success: false, message: 'Company ID is required.' };
+  }
+  if (PROTECTED_LOCAL_COMPANY_IDS.has(normId)) {
+    return { success: false, message: `${cleanId} is a protected core workspace and cannot be deleted.` };
+  }
+  const keepIds = getCompanies()
+    .map((c) => c.company_id)
+    .filter((id) => String(id || '').trim().toUpperCase() !== normId);
+  const res = pruneLocalCompaniesToAllowlist(keepIds);
+  return {
+    success: true,
+    message: `Removed ${cleanId} from local browser storage.`,
+    ...res,
+  };
 }
 
 export function getCurrentCompanyId(): string {

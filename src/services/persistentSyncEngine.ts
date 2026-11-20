@@ -36,6 +36,13 @@ import {
   CURRENT_SAAS_SCHEMA_VERSION,
 } from '../db/indexedDBService';
 import {
+  fetchWithTimeout,
+  GAS_TIMEOUTS,
+  isTimeoutError,
+  parseGasResponseText,
+  resolveSafeGasTarget,
+} from './sync/gasTransport';
+import {
   getCurrentCompany,
   getCurrentCompanyId,
   getCurrentBranch,
@@ -43,6 +50,7 @@ import {
   getSessionUser,
   getSheetsConfig,
   saveSheetsConfig,
+  isMasterCompanyId,
   saveCompany,
   saveBranch,
   saveSalesperson,
@@ -416,8 +424,8 @@ class PersistentSyncEngine {
       );
 
       if (invItems.length > 0) {
-        for (let i = 0; i < invItems.length; i += 50) {
-          const chunk = invItems.slice(i, i + 50);
+        for (let i = 0; i < invItems.length; i += 20) {
+          const chunk = invItems.slice(i, i + 20);
           const clientRequestId = `INV-BATCH-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
           const itemsPayload = chunk.map((b) => ({
             ...b.payload,
@@ -426,18 +434,21 @@ class PersistentSyncEngine {
           }));
 
           try {
-            const batchRes = await fetch('/api/sheets/sync-batch', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                company_id: activeCompId,
-                branch_id: getCurrentBranchId(),
-                action: 'sync_inventory',
-                items: itemsPayload,
-                clientRequestId,
-              }),
-              signal: AbortSignal.timeout(25000),
-            });
+            const batchRes = await fetchWithTimeout(
+              '/api/sheets/sync-batch',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  company_id: activeCompId,
+                  branch_id: getCurrentBranchId(),
+                  action: 'sync_inventory',
+                  items: itemsPayload,
+                  clientRequestId,
+                }),
+              },
+              GAS_TIMEOUTS.WRITE_CLIENT_MS
+            );
 
             if (batchRes.ok) {
               const resData = await batchRes.json().catch(() => null);
@@ -464,35 +475,38 @@ class PersistentSyncEngine {
         }
       }
 
-      // 3. High-Speed Bulk Batch Path: Other transactional sheets (Sales, CashLog, Audit_Log, etc. in batches of 25)
+      // 3. High-Speed Bulk Batch Path: Other transactional sheets (Sales, CashLog, Audit_Log, etc. in bounded batches of 15)
       const remainingAfterInv = await getPendingSyncQueueItems(now, activeCompId);
       const nonInvItems = remainingAfterInv.filter(
         (i) => i.sheetName !== 'InventoryMaster' && i.sheetName !== 'Products' && i.action !== 'sync_inventory' && i.action !== 'upsert_product'
       );
 
       if (nonInvItems.length > 1) {
-        for (let i = 0; i < nonInvItems.length; i += 25) {
-          const chunk = nonInvItems.slice(i, i + 25);
+        for (let i = 0; i < nonInvItems.length; i += 15) {
+          const chunk = nonInvItems.slice(i, i + 15);
           const clientRequestId = `BATCH-TX-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
           try {
-            const batchRes = await fetch('/api/sheets/sync-batch', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                company_id: activeCompId,
-                branch_id: getCurrentBranchId(),
-                action: 'batch_sync_writes',
-                items: chunk.map((c) => ({
-                  id: c.id,
-                  sheet: c.sheetName,
-                  action: c.action,
-                  payload: c.payload,
-                  clientRequestId: c.clientRequestId,
-                })),
-                clientRequestId,
-              }),
-              signal: AbortSignal.timeout(25000),
-            });
+            const batchRes = await fetchWithTimeout(
+              '/api/sheets/sync-batch',
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  company_id: activeCompId,
+                  branch_id: getCurrentBranchId(),
+                  action: 'batch_sync_writes',
+                  items: chunk.map((c) => ({
+                    id: c.id,
+                    sheet: c.sheetName,
+                    action: c.action,
+                    payload: c.payload,
+                    clientRequestId: c.clientRequestId,
+                  })),
+                  clientRequestId,
+                }),
+              },
+              GAS_TIMEOUTS.WRITE_CLIENT_MS
+            );
 
             if (batchRes.ok) {
               const resData = await batchRes.json().catch(() => null);
@@ -686,40 +700,85 @@ class PersistentSyncEngine {
       throw new Error(`AppScripts sync disabled: active databaseType is ${activeCloud.databaseType}`);
     }
 
-    if (!targetUrl || !targetUrl.startsWith('http')) {
+    const safeTarget = resolveSafeGasTarget({
+      companyId: payload.company_id,
+      webhookUrl: targetUrl,
+      spreadsheetId:
+        item.payload?.tenant_sheet_id ||
+        item.payload?.sheet_id ||
+        item.payload?.spreadsheet_id ||
+        currentComp.sheet_id ||
+        config.spreadsheetId ||
+        '',
+    });
+    const cleanTargetUrl = safeTarget.webhookUrl;
+    if (!cleanTargetUrl || !cleanTargetUrl.startsWith('http')) {
       throw new Error('No Google Apps Script webhook URL configured; record remains in offline queue for retry.');
     }
+
+    const sheetLower = String(item.sheetName || '').toLowerCase();
+    const isMasterControlAction =
+      item.action === 'upsert_staff' ||
+      item.action === 'create_branch' ||
+      item.action === 'sync_company' ||
+      sheetLower === 'companies' ||
+      sheetLower === 'branches' ||
+      sheetLower === 'users' ||
+      sheetLower === 'salespeople';
+    if (
+      !isMasterControlAction &&
+      payload.company_id &&
+      !isMasterCompanyId(payload.company_id) &&
+      (safeTarget.blockedMasterSheetLeak || !safeTarget.spreadsheetId)
+    ) {
+      throw new Error(
+        safeTarget.blockedMasterSheetLeak
+          ? `MASTER_SHEET_WRITE_BLOCKED: Refused to write tenant ${payload.company_id} row to Master Sheet.`
+          : `DEDICATED_SHEET_REQUIRED: Tenant ${payload.company_id} has no dedicated spreadsheet provisioned yet.`
+      );
+    }
+
+    const cleanPayload = {
+      ...payload,
+      tenant_sheet_id: safeTarget.spreadsheetId,
+      sheet_id: safeTarget.spreadsheetId,
+      spreadsheet_id: safeTarget.spreadsheetId,
+    };
 
     // 1. Try server-side proxy route (/api/sheets/sync-row) - requires verified HTTP 200/201
     let proxyNotFound = false;
     try {
-      const srvRes = await fetch('/api/sheets/sync-row', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          webhook_url: targetUrl,
-          ...payload,
-        }),
-        signal: AbortSignal.timeout(20000),
-      });
+      const srvRes = await fetchWithTimeout(
+        '/api/sheets/sync-row',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            webhook_url: cleanTargetUrl,
+            ...cleanPayload,
+          }),
+        },
+        GAS_TIMEOUTS.WRITE_CLIENT_MS
+      );
 
       if (srvRes.status === 200 || srvRes.status === 201 || srvRes.ok) {
-        const json = await srvRes.json().catch(() => null);
+        const parsed = parseGasResponseText(await srvRes.text(), srvRes.status);
+        const json = parsed.data;
         if (json && json.success !== false && json.status !== 'error') {
           return json;
         }
-        throw new Error(json?.error || json?.message || 'Google Apps Script rejected write');
+        throw new Error(json?.error || json?.message || parsed.error || 'Google Apps Script rejected write');
       }
 
-      if (srvRes.status === 404) {
+      if (srvRes.status === 404 || srvRes.status >= 502) {
         proxyNotFound = true;
       } else {
         const errJson = await srvRes.json().catch(() => null);
         throw new Error(errJson?.error || `Cloud proxy returned HTTP ${srvRes.status}`);
       }
     } catch (proxyErr: any) {
-      if (proxyErr?.name === 'TimeoutError' || proxyErr?.name === 'AbortError') {
-        throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+      if (isTimeoutError(proxyErr)) {
+        throw new Error('Cloud sync timed out (55s); record kept in offline queue for retry.');
       }
       if (!proxyNotFound && proxyErr?.name !== 'TypeError') {
         throw proxyErr;
@@ -729,24 +788,32 @@ class PersistentSyncEngine {
     // 2. Direct browser fetch to Apps Script (strict HTTP 200/201 verification - NO blind no-cors)
     let directRes: Response;
     try {
-      directRes = await fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(20000),
-      });
+      directRes = await fetchWithTimeout(
+        cleanTargetUrl,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(cleanPayload),
+          redirect: 'follow',
+        },
+        GAS_TIMEOUTS.WRITE_CLIENT_MS
+      );
     } catch (directErr: any) {
-      if (directErr?.name === 'TimeoutError' || directErr?.name === 'AbortError') {
-        throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+      if (isTimeoutError(directErr)) {
+        throw new Error('Cloud sync timed out (55s); record kept in offline queue for retry.');
       }
       throw new Error(directErr?.message || 'Cloud sync network error; record kept in offline queue for retry.');
     }
 
+    const parsedDirect = parseGasResponseText(await directRes.text(), directRes.status);
     if (directRes.status !== 200 && directRes.status !== 201 && !directRes.ok) {
-      throw new Error(`Google Apps Script webhook failed with HTTP ${directRes.status}`);
+      throw new Error(parsedDirect.error || `Google Apps Script webhook failed with HTTP ${directRes.status}`);
+    }
+    if (!parsedDirect.data || parsedDirect.data.success === false || parsedDirect.data.status === 'error') {
+      throw new Error(parsedDirect.data?.error || parsedDirect.data?.message || parsedDirect.error || 'Google Apps Script rejected write');
     }
 
-    return await directRes.json().catch(() => ({ success: true }));
+    return parsedDirect.data;
   }
 
   // ==================== WORK STREAM B: DELTA REFRESH ====================
@@ -1498,13 +1565,18 @@ class PersistentSyncEngine {
     };
 
     // 1. Direct GET to Google Apps Script if URL available
-    if (targetUrl && targetUrl.startsWith('http')) {
+    const safeActionTarget = resolveSafeGasTarget({ companyId: compId, webhookUrl: targetUrl });
+    if (safeActionTarget.webhookUrl && safeActionTarget.webhookUrl.startsWith('http')) {
       try {
-        const queryUrl = `${targetUrl}${targetUrl.includes('?') ? '&' : '?'}action=${encodeURIComponent(action)}&${new URLSearchParams(fullParams).toString()}`;
-        const res = await fetch(queryUrl, { signal: AbortSignal.timeout(8000) });
+        const queryUrl = `${safeActionTarget.webhookUrl}${safeActionTarget.webhookUrl.includes('?') ? '&' : '?'}action=${encodeURIComponent(action)}&${new URLSearchParams(fullParams).toString()}`;
+        const res = await fetchWithTimeout(
+          queryUrl,
+          { method: 'GET', redirect: 'follow' },
+          GAS_TIMEOUTS.READ_CLIENT_MS
+        );
         if (res.ok) {
-          const json = await res.json().catch(() => null);
-          if (json) return await handleControlResponse(json);
+          const parsed = parseGasResponseText(await res.text(), res.status);
+          if (parsed.data) return await handleControlResponse(parsed.data);
         }
       } catch (e) {
         // Fallback to proxy
@@ -1513,11 +1585,13 @@ class PersistentSyncEngine {
 
     // 2. Server proxy fallback
     try {
-      const proxyRes = await fetch(
+      const proxyRes = await fetchWithTimeout(
         `/api/saas/call-action?action=${encodeURIComponent(action)}&${new URLSearchParams(fullParams).toString()}`,
         {
+          method: 'GET',
           headers: jwt ? { Authorization: `Bearer ${jwt}` } : undefined,
-        }
+        },
+        GAS_TIMEOUTS.READ_CLIENT_MS
       );
       const json = await proxyRes.json().catch(() => null);
       if (json) return await handleControlResponse(json);

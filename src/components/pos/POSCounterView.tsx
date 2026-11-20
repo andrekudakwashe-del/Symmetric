@@ -328,7 +328,7 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
     if (cart.length === 0) return;
     if (clockSecurity.isClockTampered) {
       setClockLockNotice(
-        'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.'
+        'Clock Restriction: Voiding/clearing carts and processing refunds are locked until Automatic Date & Time is enabled (normal sales & Hub sync remain active).'
       );
       return;
     }
@@ -815,7 +815,7 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
             <ShieldAlert className="w-4 h-4 shrink-0" />
             <span className="font-bold">
               {clockLockNotice ||
-                'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.'}
+                'Clock Restriction: Voids & refunds are locked until Automatic Date & Time is enabled (sales & Hub sync continue normally).'}
             </span>
           </div>
           <button

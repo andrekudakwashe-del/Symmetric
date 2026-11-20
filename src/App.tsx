@@ -23,21 +23,6 @@ import { BottomNavigation } from './components/layout/BottomNavigation';
 import { LoginScreen } from './components/auth/LoginScreen';
 import { TrialExpiredLockScreen } from './components/auth/TrialExpiredLockScreen';
 import { HomeDashboard } from './components/dashboard/HomeDashboard';
-import { POSRegister } from './components/pos/POSRegister';
-import { POSOrdersHistory } from './components/pos/POSOrdersHistory';
-import { CashBalancingModule } from './components/forms/CashBalancingModule';
-import { Form1CashCount } from './components/forms/Form1CashCount';
-import { Form2CashLog } from './components/forms/Form2CashLog';
-import { Form3SalesEntry } from './components/forms/Form3SalesEntry';
-import { Form4Reconciliation } from './components/forms/Form4Reconciliation';
-import { CustomerListScreen } from './components/customers/CustomerListScreen';
-import { CustomerChangeReport } from './components/reports/CustomerChangeReport';
-import { CustomerCreditReport } from './components/reports/CustomerCreditReport';
-import { SalesReport } from './components/reports/SalesReport';
-import { StaffAccessManagementScreen } from './components/admin/StaffAccessManagementScreen';
-import { DirectGoodsReceivedView } from './components/inventory/DirectGoodsReceivedView';
-import { InventoryMasterView } from './components/inventory/InventoryMasterView';
-import { BluetoothPrinterModal } from './components/common/BluetoothPrinterModal';
 import { getActiveCartItemCount, subscribeToPOSCart } from './utils/posCartStorage';
 import { historyNavigationService } from './services/historyNavigationService';
 import { OfflineIndicator } from './components/pwa/OfflineIndicator';
@@ -56,10 +41,21 @@ import {
 import { isTabAllowedUnderLockdownOrStocktake } from './services/stocktakeAccessService';
 import { prefetchAppModules } from './services/modulePrefetcher';
 import { lazyWithRetry } from './utils/lazyWithRetry';
-import { P2PMeshSyncHub } from './components/sync/P2PMeshSyncHub';
 import { isDeviceTimeAutomatic } from './utils/clockSecurity';
 
-// Resilient lazy-loaded secondary admin & heavy setup modules (with automatic retry on network drops)
+// Resilient lazy-loaded operational & admin modules (dramatically reduces initial startup payload)
+const POSRegister = lazyWithRetry(() => import('./components/pos/POSRegister').then(m => ({ default: m.POSRegister })), 'POSRegister');
+const POSOrdersHistory = lazyWithRetry(() => import('./components/pos/POSOrdersHistory').then(m => ({ default: m.POSOrdersHistory })), 'POSOrdersHistory');
+const CashBalancingModule = lazyWithRetry(() => import('./components/forms/CashBalancingModule').then(m => ({ default: m.CashBalancingModule })), 'CashBalancingModule');
+const CustomerListScreen = lazyWithRetry(() => import('./components/customers/CustomerListScreen').then(m => ({ default: m.CustomerListScreen })), 'CustomerListScreen');
+const CustomerChangeReport = lazyWithRetry(() => import('./components/reports/CustomerChangeReport').then(m => ({ default: m.CustomerChangeReport })), 'CustomerChangeReport');
+const CustomerCreditReport = lazyWithRetry(() => import('./components/reports/CustomerCreditReport').then(m => ({ default: m.CustomerCreditReport })), 'CustomerCreditReport');
+const SalesReport = lazyWithRetry(() => import('./components/reports/SalesReport').then(m => ({ default: m.SalesReport })), 'SalesReport');
+const StaffAccessManagementScreen = lazyWithRetry(() => import('./components/admin/StaffAccessManagementScreen').then(m => ({ default: m.StaffAccessManagementScreen })), 'StaffAccessManagementScreen');
+const DirectGoodsReceivedView = lazyWithRetry(() => import('./components/inventory/DirectGoodsReceivedView').then(m => ({ default: m.DirectGoodsReceivedView })), 'DirectGoodsReceivedView');
+const InventoryMasterView = lazyWithRetry(() => import('./components/inventory/InventoryMasterView').then(m => ({ default: m.InventoryMasterView })), 'InventoryMasterView');
+const BluetoothPrinterModal = lazyWithRetry(() => import('./components/common/BluetoothPrinterModal').then(m => ({ default: m.BluetoothPrinterModal })), 'BluetoothPrinterModal');
+const P2PMeshSyncHub = lazyWithRetry(() => import('./components/sync/P2PMeshSyncHub').then(m => ({ default: m.P2PMeshSyncHub })), 'P2PMeshSyncHub');
 const AuditLogView = lazyWithRetry(() => import('./components/admin/AuditLogView').then(m => ({ default: m.AuditLogView })), 'AuditLogView');
 const GoogleSheetsSyncModal = lazyWithRetry(() => import('./components/sheets/GoogleSheetsSyncModal').then(m => ({ default: m.GoogleSheetsSyncModal })), 'GoogleSheetsSyncModal');
 const SalespersonManagementModal = lazyWithRetry(() => import('./components/admin/SalespersonManagementModal').then(m => ({ default: m.SalespersonManagementModal })), 'SalespersonManagementModal');

@@ -15,9 +15,57 @@
     <meta name="description" content="Saimetric V5.0 Multi-Tenant SaaS POS and inventory system with Branch Isolation, 52-Permission RBAC Matrix, Direct Supplier Deliveries (GRV) with Cashier lock &amp; Supervisor approval, Sharding by Customer &amp; Month, P2P WiFi Mesh Sync, and Google Apps Script backend router." />
     <meta property="og:title" content="SAIMETRIC" />
     <meta property="og:description" content="Saimetric V5.0 Multi-Tenant SaaS POS and inventory system with Branch Isolation, 52-Permission RBAC Matrix, Direct Supplier Deliveries (GRV) with Cashier lock &amp; Supervisor approval, Sharding by Customer &amp; Month, P2P WiFi Mesh Sync, and Google Apps Script backend router." />
+    <style>
+      html, body { margin: 0; padding: 0; background: #0f172a; color: #f1f5f9; font-family: system-ui, -apple-system, sans-serif; min-height: 100%; }
+      #boot-loader { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 24px; text-align: center; }
+      #boot-spinner { width: 34px; height: 34px; border: 3px solid rgba(129, 140, 248, 0.25); border-top-color: #818cf8; border-radius: 50%; animation: bootspin 0.8s linear infinite; }
+      #boot-err { display: none; max-width: 420px; background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 16px; text-align: left; font-size: 12px; color: #fca5a5; word-break: break-word; }
+      #boot-reload { display: none; margin-top: 8px; padding: 10px 18px; border-radius: 10px; border: 0; background: #6366f1; color: #fff; font-weight: 700; font-size: 13px; cursor: pointer; }
+      @keyframes bootspin { to { transform: rotate(360deg); } }
+    </style>
   </head>
   <body class="bg-slate-900 text-slate-100 antialiased selection:bg-indigo-500 selection:text-white">
-    <div id="root"></div>
+    <div id="root">
+      <div id="boot-loader">
+        <div id="boot-spinner"></div>
+        <div id="boot-status" style="font-size:13px;font-weight:600;color:#cbd5e1;letter-spacing:0.04em;">Loading SAIMETRIC POS…</div>
+        <div id="boot-err"></div>
+        <button id="boot-reload" type="button" onclick="window.location.reload()">Reload App</button>
+      </div>
+    </div>
+    <script>
+      (function () {
+        var showBootError = function (msg) {
+          var errEl = document.getElementById('boot-err');
+          var btnEl = document.getElementById('boot-reload');
+          var stEl = document.getElementById('boot-status');
+          if (!errEl) return;
+          if (stEl) stEl.textContent = 'Startup Interrupted';
+          errEl.style.display = 'block';
+          errEl.textContent = String(msg || 'Failed to load application scripts.');
+          if (btnEl) btnEl.style.display = 'inline-block';
+        };
+        window.addEventListener('error', function (e) {
+          if (document.getElementById('boot-loader')) {
+            showBootError((e && (e.message || (e.error && e.error.message))) || 'Script failed to load.');
+          }
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          if (document.getElementById('boot-loader')) {
+            var r = e && e.reason;
+            showBootError((r && (r.message || String(r))) || 'Unhandled startup error.');
+          }
+        });
+        setTimeout(function () {
+          if (document.getElementById('boot-loader')) {
+            var btnEl = document.getElementById('boot-reload');
+            var stEl = document.getElementById('boot-status');
+            if (stEl) stEl.textContent = 'Still loading modules — tap Reload if stuck';
+            if (btnEl) btnEl.style.display = 'inline-block';
+          }
+        }, 12000);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

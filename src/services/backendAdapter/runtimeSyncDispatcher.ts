@@ -4,8 +4,15 @@
 import { BackendType, TenantBackendConfig } from './types';
 import { getTenantBackendConfig, getBackendAdapter } from './adapterRegistry';
 import { circuitBreakerFailover } from './circuitBreakerFailover';
-import { getCurrentCompany, getCompanies, getStored, setStored, STORAGE_KEYS, markRecordsCloudSynced } from '../../db/roomDatabase';
+import { getCurrentCompany, getCompanies, isMasterCompanyId, markRecordsCloudSynced } from '../../db/roomDatabase';
 import { SyncQueueItem } from '../../types';
+import {
+  fetchWithTimeout,
+  GAS_TIMEOUTS,
+  isTimeoutError,
+  parseGasResponseText,
+  resolveSafeGasTarget,
+} from '../sync/gasTransport';
 
 export interface RuntimeDispatchResult {
   success: boolean;
@@ -122,9 +129,25 @@ export class RuntimeSyncDispatcherService {
     companyId: string,
     startTime: number
   ): Promise<RuntimeDispatchResult> {
-    const webhookUrl = config.sheets.webhookUrl || '';
+    const cleanCompanyId = String(companyId || '').trim();
+    if (!cleanCompanyId) {
+      return {
+        success: false,
+        backendType: 'sheets_appscript',
+        recordsProcessed: 0,
+        latencyMs: Date.now() - startTime,
+        message: 'Cannot sync row without an explicit company_id.',
+        error: 'MISSING_COMPANY_ID',
+      };
+    }
 
-    if (!webhookUrl || !webhookUrl.startsWith('http')) {
+    const safeTarget = resolveSafeGasTarget({
+      companyId: cleanCompanyId,
+      webhookUrl: config.sheets.webhookUrl || config.sheets.masterWebhookUrl,
+      spreadsheetId: config.sheets.spreadsheetId,
+    });
+
+    if (!safeTarget.webhookUrl || !safeTarget.webhookUrl.startsWith('http')) {
       return {
         success: false,
         backendType: 'sheets_appscript',
@@ -135,71 +158,160 @@ export class RuntimeSyncDispatcherService {
       };
     }
 
+    // Strict Multi-Tenant Sheet Isolation: non-master tenants MUST NOT write operational rows to the Master Sheet
+    const sheetLower = String(item.sheetName || '').toLowerCase();
+    const isMasterControlTab =
+      sheetLower === 'companies' ||
+      sheetLower === 'branches' ||
+      sheetLower === 'users' ||
+      sheetLower === 'salespeople' ||
+      sheetLower === 'staff';
+    if (
+      !isMasterControlTab &&
+      !isMasterCompanyId(cleanCompanyId) &&
+      (safeTarget.blockedMasterSheetLeak || !safeTarget.spreadsheetId)
+    ) {
+      return {
+        success: false,
+        backendType: 'sheets_appscript',
+        recordsProcessed: 0,
+        latencyMs: Date.now() - startTime,
+        message: `Blocked write to Master Sheet for tenant ${cleanCompanyId}. Dedicated tenant spreadsheet must be provisioned first.`,
+        error: safeTarget.blockedMasterSheetLeak ? 'MASTER_SHEET_WRITE_BLOCKED' : 'DEDICATED_SHEET_REQUIRED',
+      };
+    }
+
     const payload = {
-      webhook_url: webhookUrl,
+      webhook_url: safeTarget.webhookUrl,
       sheetName: item.sheetName,
       action: item.action,
-      company_id: companyId,
-      tenant_sheet_id: config.sheets.spreadsheetId,
+      company_id: cleanCompanyId,
+      tenant_sheet_id: safeTarget.spreadsheetId,
+      spreadsheet_id: safeTarget.spreadsheetId,
       data: item.payload,
       clientRequestId: item.payload?.clientRequestId || item.id,
       timestamp: new Date().toISOString(),
     };
 
-    try {
-      const res = await fetch('/api/sheets/sync-row', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(8000),
-      });
+    const finalizeSuccess = (msg?: string): RuntimeDispatchResult => {
+      const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
+      markRecordsCloudSynced(
+        [recId, item.id].filter(Boolean),
+        [payload.clientRequestId].filter(Boolean),
+        item.sheetName,
+        false
+      );
+      return {
+        success: true,
+        backendType: 'sheets_appscript',
+        recordsProcessed: 1,
+        latencyMs: Date.now() - startTime,
+        message: msg || 'Dispatched to Google Sheet tab.',
+      };
+    };
 
-      if (res.status === 200 || res.status === 201 || res.ok) {
-        const data = await res.json().catch(() => null);
-        if (data && data.success !== false && data.status !== 'error') {
-          const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');
-          markRecordsCloudSynced(
-            [recId, item.id].filter(Boolean),
-            [payload.clientRequestId].filter(Boolean),
-            item.sheetName,
-            false
-          );
-          return {
-            success: true,
-            backendType: 'sheets_appscript',
-            recordsProcessed: 1,
-            latencyMs: Date.now() - startTime,
-            message: data?.message || 'Dispatched to Google Sheet tab.',
-          };
+    let proxyUnavailable = false;
+    try {
+      const res = await fetchWithTimeout(
+        '/api/sheets/sync-row',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        },
+        GAS_TIMEOUTS.WRITE_CLIENT_MS
+      );
+
+      if (res.status === 404 || res.status >= 502) {
+        proxyUnavailable = true;
+      } else {
+        const rawText = await res.text();
+        const parsed = parseGasResponseText(rawText, res.status);
+        if (res.ok && parsed.data && parsed.data.success !== false && parsed.data.status !== 'error') {
+          return finalizeSuccess(parsed.data.message);
         }
         return {
           success: false,
           backendType: 'sheets_appscript',
           recordsProcessed: 0,
           latencyMs: Date.now() - startTime,
-          message: data?.error || 'Google Apps Script rejected write.',
-          error: data?.error || 'SCRIPT_REJECTED',
+          message: parsed.data?.error || parsed.error || `Google Sheets proxy returned HTTP ${res.status}`,
+          error: parsed.data?.code || parsed.data?.error || `HTTP_${res.status}`,
         };
       }
-
-      return {
-        success: false,
-        backendType: 'sheets_appscript',
-        recordsProcessed: 0,
-        latencyMs: Date.now() - startTime,
-        message: `Google Sheets proxy returned HTTP ${res.status}`,
-        error: `HTTP_${res.status}`,
-      };
     } catch (err: any) {
-      return {
-        success: false,
-        backendType: 'sheets_appscript',
-        recordsProcessed: 0,
-        latencyMs: Date.now() - startTime,
-        message: err?.message || 'Failed to dispatch to Google Sheets.',
-        error: String(err),
-      };
+      if (isTimeoutError(err)) {
+        return {
+          success: false,
+          backendType: 'sheets_appscript',
+          recordsProcessed: 0,
+          latencyMs: Date.now() - startTime,
+          message: 'Google Sheets sync timed out (55s); retained in offline queue for retry.',
+          error: 'TIMEOUT',
+        };
+      }
+      if (err?.name === 'TypeError') {
+        proxyUnavailable = true;
+      } else {
+        return {
+          success: false,
+          backendType: 'sheets_appscript',
+          recordsProcessed: 0,
+          latencyMs: Date.now() - startTime,
+          message: err?.message || 'Failed to dispatch to Google Sheets.',
+          error: String(err),
+        };
+      }
     }
+
+    // Standalone PWA direct fallback (e.g. Vercel deployment without Express proxy)
+    if (proxyUnavailable) {
+      try {
+        const directRes = await fetchWithTimeout(
+          safeTarget.webhookUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify(payload),
+            redirect: 'follow',
+          },
+          GAS_TIMEOUTS.WRITE_CLIENT_MS
+        );
+        const rawText = await directRes.text();
+        const parsed = parseGasResponseText(rawText, directRes.status);
+        if (directRes.ok && parsed.data && parsed.data.success !== false && parsed.data.status !== 'error') {
+          return finalizeSuccess(parsed.data.message);
+        }
+        return {
+          success: false,
+          backendType: 'sheets_appscript',
+          recordsProcessed: 0,
+          latencyMs: Date.now() - startTime,
+          message: parsed.data?.error || parsed.error || `Google Apps Script returned HTTP ${directRes.status}`,
+          error: parsed.data?.code || parsed.data?.error || `HTTP_${directRes.status}`,
+        };
+      } catch (directErr: any) {
+        return {
+          success: false,
+          backendType: 'sheets_appscript',
+          recordsProcessed: 0,
+          latencyMs: Date.now() - startTime,
+          message: isTimeoutError(directErr)
+            ? 'Direct Apps Script sync timed out (55s); retained in offline queue.'
+            : directErr?.message || 'Direct Apps Script dispatch failed; retained in offline queue.',
+          error: isTimeoutError(directErr) ? 'TIMEOUT' : String(directErr),
+        };
+      }
+    }
+
+    return {
+      success: false,
+      backendType: 'sheets_appscript',
+      recordsProcessed: 0,
+      latencyMs: Date.now() - startTime,
+      message: 'Failed to dispatch to Google Sheets.',
+      error: 'DISPATCH_FAILED',
+    };
   }
 
   /**
@@ -246,12 +358,15 @@ export class RuntimeSyncDispatcherService {
     }
 
     try {
-      const res = await fetch(firestoreUrl, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fields }),
-        signal: AbortSignal.timeout(6000),
-      });
+      const res = await fetchWithTimeout(
+        firestoreUrl,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fields }),
+        },
+        15_000
+      );
 
       if (res.ok) {
         return {
@@ -330,17 +445,20 @@ export class RuntimeSyncDispatcherService {
     const token = serviceRoleKey || anonKey || '';
 
     try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          apikey: token,
-          Authorization: `Bearer ${token}`,
-          Prefer: 'resolution=merge-duplicates',
+      const res = await fetchWithTimeout(
+        endpoint,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: token,
+            Authorization: `Bearer ${token}`,
+            Prefer: 'resolution=merge-duplicates',
+          },
+          body: JSON.stringify([item.payload]),
         },
-        body: JSON.stringify([item.payload]),
-        signal: AbortSignal.timeout(6000),
-      });
+        15_000
+      );
 
       if (res.ok || res.status === 200 || res.status === 201) {
         const recId = String(item.payload?.id || item.payload?.itemId || item.id || '');

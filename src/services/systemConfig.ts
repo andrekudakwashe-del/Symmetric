@@ -3,6 +3,8 @@ import {
   saveSheetsConfig,
   getCompanies,
   saveCompany,
+  pruneLocalCompaniesToAllowlist,
+  deleteLocalCompany,
   getAllBranches,
   saveBranch,
   getSalespeopleForCompany,
@@ -20,6 +22,7 @@ import {
 } from './googleSheetsSync';
 import { Company } from '../data/saasData';
 import { routeCloudRecordThroughSyncCore } from './sync/syncIngestBridge';
+import { fetchWithTimeout, GAS_TIMEOUTS, isTimeoutError, parseGasResponseText } from './sync/gasTransport';
 
 const PENDING_REGISTRATIONS_KEY = 'saimetric_pending_cloud_registrations';
 
@@ -288,7 +291,7 @@ export async function pushAllLocalTenantsToCloud(
     }).catch(() => {});
   }
 
-  const BATCH_SIZE = 15;
+  const BATCH_SIZE = 10;
   const companyChunks: Company[][] = [];
   if (localCompanies.length === 0) {
     companyChunks.push([]);
@@ -324,19 +327,22 @@ export async function pushAllLocalTenantsToCloud(
     let batchUsers = 0;
     let batchError = '';
 
-    // 2. Primary: Server proxy bulk sync (awaited, zero CORS, 30s timeout per batch)
+    // 2. Primary: Server proxy bulk sync (awaited, zero CORS, 75s client timeout > 65s server timeout)
     try {
-      const res = await fetch('/api/saas/sync-companies-bulk', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          companies: chunkCompanies,
-          branches: chunkBranches,
-          users: chunkUsers,
-          masterWebhookUrl: effectiveUrl || undefined,
-        }),
-        signal: AbortSignal.timeout(30000),
-      });
+      const res = await fetchWithTimeout(
+        '/api/saas/sync-companies-bulk',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            companies: chunkCompanies,
+            branches: chunkBranches,
+            users: chunkUsers,
+            masterWebhookUrl: effectiveUrl || undefined,
+          }),
+        },
+        GAS_TIMEOUTS.HEAVY_CLIENT_MS
+      );
 
       if (res.ok) {
         const data = await res.json().catch(() => null);
@@ -374,55 +380,56 @@ export async function pushAllLocalTenantsToCloud(
         batchError = `Server returned HTTP ${res.status}`;
       }
     } catch (err: any) {
-      batchError =
-        err?.name === 'TimeoutError' || err?.name === 'AbortError'
-          ? `Batch ${bIdx + 1}/${companyChunks.length} timed out waiting for Master Sheet`
-          : err?.message || String(err);
+      batchError = isTimeoutError(err)
+        ? `Batch ${bIdx + 1}/${companyChunks.length} timed out waiting for Master Sheet`
+        : err?.message || String(err);
       console.warn(`Notice during bulk server sync (batch ${bIdx + 1}/${companyChunks.length}):`, err);
     }
 
     // 3. Fallback: Direct CORS-safe dispatch to Google Apps Script (text/plain avoids OPTIONS preflight, reads real JSON)
     if (!batchSynced && effectiveUrl && effectiveUrl.startsWith('http')) {
       try {
-        const directRes = await fetch(effectiveUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({
-            action: 'bulk_sync_companies',
-            clientRequestId: `REQ-DIRECT-BULK-${Date.now()}-${bIdx}`,
-            companies: chunkCompanies,
-            branches: chunkBranches,
-            users: chunkUsers,
-            data: {
+        const directRes = await fetchWithTimeout(
+          effectiveUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'bulk_sync_companies',
+              clientRequestId: `REQ-DIRECT-BULK-${Date.now()}-${bIdx}`,
               companies: chunkCompanies,
               branches: chunkBranches,
               users: chunkUsers,
-            },
-          }),
-          signal: AbortSignal.timeout(25000),
-        });
+              data: {
+                companies: chunkCompanies,
+                branches: chunkBranches,
+                users: chunkUsers,
+              },
+            }),
+            redirect: 'follow',
+          },
+          GAS_TIMEOUTS.WRITE_CLIENT_MS
+        );
 
         if (directRes.ok) {
-          const text = await directRes.text();
-          let parsed: any = null;
-          try { parsed = JSON.parse(text); } catch { parsed = null; }
+          const parsedBody = parseGasResponseText(await directRes.text(), directRes.status);
+          const parsed = parsedBody.data;
           if (parsed && parsed.success !== false && !parsed.error) {
             batchSynced = true;
             batchError = '';
             batchPushed = Number(parsed.companies_count ?? parsed.count ?? chunkCompanies.length);
             batchBranches = Number(parsed.branches_count ?? chunkBranches.length);
             batchUsers = Number(parsed.users_count ?? chunkUsers.length);
-          } else if (parsed?.error || parsed?.message) {
-            batchError = String(parsed.error || parsed.message);
+          } else if (parsed?.error || parsed?.message || parsedBody.error) {
+            batchError = String(parsed?.error || parsed?.message || parsedBody.error);
           }
         } else {
           batchError = `Apps Script returned HTTP ${directRes.status}`;
         }
       } catch (err: any) {
-        const fallbackMsg =
-          err?.name === 'TimeoutError' || err?.name === 'AbortError'
-            ? `Direct Apps Script batch ${bIdx + 1}/${companyChunks.length} timed out`
-            : err?.message || String(err);
+        const fallbackMsg = isTimeoutError(err)
+          ? `Direct Apps Script batch ${bIdx + 1}/${companyChunks.length} timed out`
+          : err?.message || String(err);
         if (!batchError) batchError = fallbackMsg;
         console.warn(`Notice pushing batch ${bIdx + 1}/${companyChunks.length} directly to Google Apps Script:`, err);
       }
@@ -501,8 +508,13 @@ export async function initializeSystemConfigAndSync(): Promise<{
     await flushPendingCloudRegistrations().catch(() => {});
 
     // 2. Query companies & users from server
+    let authoritativeCloudIds: string[] | null = null;
     try {
-      const serverRes = await fetch('/api/saas/companies', { signal: AbortSignal.timeout(12000) });
+      const serverRes = await fetchWithTimeout(
+        '/api/saas/companies',
+        { method: 'GET' },
+        GAS_TIMEOUTS.READ_CLIENT_MS
+      );
       if (serverRes.ok) {
         const serverData = await serverRes.json();
         if (serverData && Array.isArray(serverData.companies)) {
@@ -511,6 +523,11 @@ export async function initializeSystemConfigAndSync(): Promise<{
               saveCompany(sc);
             }
           });
+          if (serverData.cloudSynced === true && serverData.companies.length > 0) {
+            authoritativeCloudIds = serverData.companies
+              .map((sc: any) => String(sc?.company_id || '').trim())
+              .filter(Boolean);
+          }
         }
         if (serverData && Array.isArray(serverData.branches)) {
           serverData.branches.forEach((sb: any) => {
@@ -532,25 +549,41 @@ export async function initializeSystemConfigAndSync(): Promise<{
 
     // 3. Query Master Google Sheet (if configured)
     const masterRes = await fetchCompaniesFromMasterSheet().catch(() => null);
+    if (masterRes?.cloudSynced && Array.isArray(masterRes.companies) && masterRes.companies.length > 0) {
+      authoritativeCloudIds = masterRes.companies
+        .map((mc) => String(mc?.company_id || '').trim())
+        .filter(Boolean);
+    }
 
-    // 4. Send any local companies that server might not have to the server
+    // 3b. If we received an authoritative cloud company list, prune local deleted tenants
+    // so purged test companies never resurrect from stale browser localStorage.
+    if (authoritativeCloudIds && authoritativeCloudIds.length > 0) {
+      pruneLocalCompaniesToAllowlist(authoritativeCloudIds);
+    }
+
+    // 4. Only push local companies back to server when we did NOT get an authoritative cloud list
+    // (prevents stale browsers from re-seeding purged companies into server memory).
     const allCurrent = getCompanies();
-    if (allCurrent.length > 0) {
+    if (!authoritativeCloudIds && allCurrent.length > 0) {
       const branches = getAllBranches();
       const allUsers: any[] = [];
       allCurrent.forEach((comp) => {
         allUsers.push(...getSalespeopleForCompany(comp.company_id));
       });
-      fetch('/api/saas/sync-companies-bulk', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          companies: allCurrent,
-          branches,
-          users: allUsers,
-        }),
-        signal: AbortSignal.timeout(15000),
-      }).catch(() => {});
+      fetchWithTimeout(
+        '/api/saas/sync-companies-bulk',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            companies: allCurrent,
+            branches,
+            users: allUsers,
+            skipCloudPush: true,
+          }),
+        },
+        20_000
+      ).catch(() => {});
     }
 
     return {
@@ -563,4 +596,257 @@ export async function initializeSystemConfigAndSync(): Promise<{
   });
 
   return inFlightSync;
+}
+
+export interface PurgeTestCompaniesResult {
+  success: boolean;
+  cloudPurged: boolean;
+  cloudError?: string;
+  removedCompanies: string[];
+  keptCompanies: string[];
+  removedLocalCompanies: number;
+  removedLocalBranches: number;
+  removedLocalUsers: number;
+  trashedSheetsCount: number;
+  tabStats?: Record<string, { before: number; after: number; removed: number }>;
+  message: string;
+}
+
+/**
+ * Authoritatively purge all non-allowlisted test companies across Master Google Sheet,
+ * server memory/disk, and local browser storage. COMP-001 and COMP-MASTER are always kept.
+ */
+export async function purgeTestCompaniesEverywhere(options?: {
+  keepCompanyIds?: string[];
+  trashDedicatedSheets?: boolean;
+  webhookUrl?: string;
+}): Promise<PurgeTestCompaniesResult> {
+  const keepCompanyIds = Array.from(
+    new Set(['COMP-001', 'COMP-MASTER', ...(options?.keepCompanyIds || [])])
+  );
+  const trashDedicatedSheets = options?.trashDedicatedSheets !== false;
+  const sheetsConfig = getSheetsConfig();
+  const targetWebhook = sanitizeMasterWebhookUrl(
+    options?.webhookUrl || sheetsConfig.masterWebhookUrl || sheetsConfig.webhookUrl || ''
+  );
+
+  let cloudPurged = false;
+  let cloudError = '';
+  let removedCompanies: string[] = [];
+  let trashedSheetsCount = 0;
+  let tabStats: Record<string, { before: number; after: number; removed: number }> | undefined;
+  let serverMessage = '';
+
+  // 1. Primary: Server proxy (handles Master Sheet purge + server-saas-data.json prune)
+  try {
+    const res = await fetchWithTimeout(
+      '/api/saas/purge-test-companies',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          keep_company_ids: keepCompanyIds,
+          trash_dedicated_sheets: trashDedicatedSheets,
+          webhookUrl: targetWebhook || undefined,
+        }),
+      },
+      75_000
+    );
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data) {
+        cloudPurged = Boolean(data.cloudPurged);
+        if (data.cloudError) cloudError = String(data.cloudError);
+        if (Array.isArray(data.removedCompanies)) removedCompanies = data.removedCompanies;
+        trashedSheetsCount = Number(data.trashedSheetsCount || 0);
+        tabStats = data.tabStats;
+        if (data.message) serverMessage = String(data.message);
+      }
+    } else {
+      cloudError = `Server returned HTTP ${res.status}`;
+    }
+  } catch (err: any) {
+    cloudError = isTimeoutError(err)
+      ? 'Purge request timed out while waiting for Master Google Sheet.'
+      : err?.message || String(err);
+  }
+
+  // 2. Fallback: Direct Apps Script POST (for standalone PWA without Express proxy)
+  if (!cloudPurged && targetWebhook && targetWebhook.startsWith('http') && !cloudError.toLowerCase().includes('unknown action')) {
+    try {
+      const directRes = await fetchWithTimeout(
+        targetWebhook,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'purge_test_companies',
+            keep_company_ids: keepCompanyIds,
+            trash_dedicated_sheets: trashDedicatedSheets,
+          }),
+          redirect: 'follow',
+        },
+        70_000
+      );
+      if (directRes.ok) {
+        const parsedBody = parseGasResponseText(await directRes.text(), directRes.status);
+        const parsed = parsedBody.data;
+        if (parsed && parsed.success !== false && !parsed.error) {
+          cloudPurged = true;
+          cloudError = '';
+          if (Array.isArray(parsed.removed_companies)) removedCompanies = parsed.removed_companies;
+          trashedSheetsCount = Number(parsed.trashed_sheets_count || 0);
+          tabStats = parsed.tab_stats;
+          serverMessage = String(parsed.message || '');
+        } else if (parsed?.error || parsedBody.error) {
+          cloudError = String(parsed?.error || parsedBody.error);
+        }
+      }
+    } catch (directErr: any) {
+      if (!cloudError) cloudError = directErr?.message || String(directErr);
+    }
+  }
+
+  // 3. Always prune local browser storage so purged tenants vanish immediately
+  const localRes = pruneLocalCompaniesToAllowlist(keepCompanyIds);
+
+  const needsRedeploy = /unknown action|html/i.test(cloudError);
+  const message = cloudPurged
+    ? serverMessage ||
+      `Purged ${Math.max(removedCompanies.length, localRes.removedCompanies)} test companies everywhere` +
+        (trashedSheetsCount > 0 ? ` and trashed ${trashedSheetsCount} dedicated Drive sheet(s).` : '.')
+    : needsRedeploy
+    ? `Cleaned ${localRes.removedCompanies} test companies locally & on server, but Master Sheet Apps Script needs to be updated with the latest Code.gs (New Version) before cloud purge can run.`
+    : `Cleaned ${localRes.removedCompanies} test companies locally & on server. Master Sheet warning: ${cloudError || 'unreachable'}`;
+
+  return {
+    success: true,
+    cloudPurged,
+    cloudError: cloudError || undefined,
+    removedCompanies,
+    keptCompanies: localRes.keptCompanyIds,
+    removedLocalCompanies: localRes.removedCompanies,
+    removedLocalBranches: localRes.removedBranches,
+    removedLocalUsers: localRes.removedUsers,
+    trashedSheetsCount,
+    tabStats,
+    message,
+  };
+}
+
+export interface DeleteTenantCompanyResult {
+  success: boolean;
+  cloudDeleted: boolean;
+  cloudError?: string;
+  trashedSheetsCount: number;
+  message: string;
+}
+
+/**
+ * Authoritatively delete a single non-protected tenant company across Master Sheet, server, and local storage.
+ */
+export async function deleteTenantCompany(
+  companyId: string,
+  options?: { trashDedicatedSheet?: boolean; webhookUrl?: string }
+): Promise<DeleteTenantCompanyResult> {
+  const cleanId = String(companyId || '').trim();
+  const normId = cleanId.toUpperCase();
+  if (!cleanId || normId === 'COMP-001' || normId === 'COMP-MASTER') {
+    return {
+      success: false,
+      cloudDeleted: false,
+      trashedSheetsCount: 0,
+      message: `${cleanId || 'This company'} is a protected core workspace and cannot be deleted.`,
+    };
+  }
+
+  const trashDedicatedSheets = options?.trashDedicatedSheet !== false;
+  const sheetsConfig = getSheetsConfig();
+  const targetWebhook = sanitizeMasterWebhookUrl(
+    options?.webhookUrl || sheetsConfig.masterWebhookUrl || sheetsConfig.webhookUrl || ''
+  );
+
+  let cloudDeleted = false;
+  let cloudError = '';
+  let trashedSheetsCount = 0;
+
+  try {
+    const res = await fetchWithTimeout(
+      '/api/saas/delete-company',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: cleanId,
+          trash_dedicated_sheets: trashDedicatedSheets,
+          webhookUrl: targetWebhook || undefined,
+        }),
+      },
+      55_000
+    );
+    const data = await res.json().catch(() => null);
+    if (res.ok && data && data.success !== false) {
+      cloudDeleted = Boolean(data.cloudDeleted);
+      if (data.cloudError) cloudError = String(data.cloudError);
+      trashedSheetsCount = Number(data.trashedSheetsCount || 0);
+    } else if (data?.error) {
+      return {
+        success: false,
+        cloudDeleted: false,
+        cloudError: String(data.error),
+        trashedSheetsCount: 0,
+        message: String(data.error),
+      };
+    }
+  } catch (err: any) {
+    cloudError = err?.message || String(err);
+  }
+
+  if (!cloudDeleted && targetWebhook && targetWebhook.startsWith('http') && !cloudError.toLowerCase().includes('unknown action')) {
+    try {
+      const directRes = await fetchWithTimeout(
+        targetWebhook,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'delete_company',
+            company_id: cleanId,
+            trash_dedicated_sheets: trashDedicatedSheets,
+          }),
+          redirect: 'follow',
+        },
+        50_000
+      );
+      if (directRes.ok) {
+        const parsedBody = parseGasResponseText(await directRes.text(), directRes.status);
+        if (parsedBody.data && parsedBody.data.success !== false && !parsedBody.data.error) {
+          cloudDeleted = true;
+          cloudError = '';
+          trashedSheetsCount = Number(parsedBody.data.trashed_sheets_count || 0);
+        } else if (parsedBody.data?.error || parsedBody.error) {
+          cloudError = String(parsedBody.data?.error || parsedBody.error);
+        }
+      }
+    } catch (directErr: any) {
+      if (!cloudError) cloudError = directErr?.message || String(directErr);
+    }
+  }
+
+  deleteLocalCompany(cleanId);
+
+  const needsRedeploy = /unknown action|html/i.test(cloudError);
+  const message = cloudDeleted
+    ? `Deleted ${cleanId} from Master Sheet, server, and this device.`
+    : needsRedeploy
+    ? `Removed ${cleanId} locally & on server. Redeploy latest Code.gs to also delete from Master Sheet.`
+    : `Removed ${cleanId} locally & on server. Master Sheet notice: ${cloudError || 'unreachable'}`;
+
+  return {
+    success: true,
+    cloudDeleted,
+    cloudError: cloudError || undefined,
+    trashedSheetsCount,
+    message,
+  };
 }

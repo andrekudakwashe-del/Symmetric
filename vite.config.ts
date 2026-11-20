@@ -9,6 +9,12 @@ export default defineConfig(() => {
       react(),
       tailwindcss(),
     ],
+    esbuild: {
+      sourcemap: false,
+    },
+    css: {
+      devSourcemap: false,
+    },
     resolve: {
       alias: {
         '@': path.resolve(__dirname, './src'),

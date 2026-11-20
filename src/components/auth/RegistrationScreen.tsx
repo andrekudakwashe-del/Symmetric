@@ -161,9 +161,9 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
         const reason =
           cloudRes.error ||
           cloudRes.message ||
-          'Master Google Sheet could not be reached to confirm registration.';
+          'Master Google Sheet did not confirm registration.';
         setError(
-          `Cloud registration failed — your business was NOT registered on the Master Sheet. ${reason} Please check your internet connection and try again.`
+          `Cloud registration failed — your business was NOT confirmed on the Master Sheet. ${reason} Please try again.`
         );
         setIsSubmitting(false);
         return;
@@ -277,10 +277,12 @@ export const RegistrationScreen: React.FC<RegistrationScreenProps> = ({
     if (!forceNewTenant) {
       setIsSubmitting(true);
       try {
-        const lookupRes = await fetch(`/api/saas/call-action?action=lookup_company&email=${encodeURIComponent(ownerEmail.trim())}`);
+        const cleanInputEmail = ownerEmail.trim().toLowerCase();
+        const lookupRes = await fetch(`/api/saas/call-action?action=lookup_company&email=${encodeURIComponent(cleanInputEmail)}`);
         if (lookupRes.ok) {
           const lookupData = await lookupRes.json();
-          if (lookupData.exists && lookupData.company) {
+          const matchedEmail = String(lookupData?.company?.owner_email || '').trim().toLowerCase();
+          if (lookupData.exists && lookupData.company && matchedEmail && matchedEmail === cleanInputEmail) {
             setIsSubmitting(false);
             setExistingAccountModal({
               open: true,

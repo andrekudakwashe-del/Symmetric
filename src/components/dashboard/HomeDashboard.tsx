@@ -424,19 +424,30 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                     </span>
                   </h3>
                   <p className="text-xs text-rose-200/80">
-                    Hub-rejected backdated packets and Cloud-flagged transactions where claimed date predates server receipt day.
+                    Flagged clock-drift &amp; backdated packets — all sales and operational data continue syncing to Hub &amp; Cloud uninterrupted. Voids, refunds, and receipt edits are restricted until Automatic Date &amp; Time is restored.
                   </p>
                 </div>
               </div>
-              {clockSecurity.alerts.some((a) => a.acknowledged) && (
-                <button
-                  type="button"
-                  onClick={() => clockSecurity.clearAcknowledgedAlerts()}
-                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold border border-slate-700 shrink-0"
-                >
-                  Clear Acknowledged
-                </button>
-              )}
+              <div className="flex items-center gap-2 shrink-0 flex-wrap">
+                {unacknowledgedSecurityAlerts.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => clockSecurity.acknowledgeAllAlerts()}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 text-xs font-bold border border-emerald-500/40"
+                  >
+                    Acknowledge All ({unacknowledgedSecurityAlerts.length})
+                  </button>
+                )}
+                {clockSecurity.alerts.some((a) => a.acknowledged) && (
+                  <button
+                    type="button"
+                    onClick={() => clockSecurity.clearAcknowledgedAlerts()}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold border border-slate-700"
+                  >
+                    Clear Acknowledged
+                  </button>
+                )}
+              </div>
             </div>
 
             {unacknowledgedSecurityAlerts.length > 0 && (
@@ -451,7 +462,13 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                   >
                     <div className="space-y-0.5">
                       <div className="font-bold text-white flex items-center gap-2 flex-wrap">
-                        <span className="px-1.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-mono text-[10px]">
+                        <span
+                          className={`px-1.5 py-0.5 rounded font-mono text-[10px] ${
+                            alert.type === 'HUB_FLAGGED_BACKDATE' || alert.type === 'SUSPICIOUS_BACKDATE'
+                              ? 'bg-amber-500/20 text-amber-300'
+                              : 'bg-rose-500/20 text-rose-300'
+                          }`}
+                        >
                           {alert.type}
                         </span>
                         <span>Device: {alert.deviceId}</span>
@@ -462,7 +479,7 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
                       <div className="text-rose-200/90">{alert.message}</div>
                       <div className="text-[10px] text-slate-400 font-mono">
                         Logged: {new Date(alert.createdAt).toLocaleString()}
-                        {alert.serverReceivedAt ? ` • Cloud Receipt: ${alert.serverReceivedAt}` : ''}
+                        {alert.serverReceivedAt ? ` • Received: ${alert.serverReceivedAt}` : ''}
                       </div>
                     </div>
                     <button

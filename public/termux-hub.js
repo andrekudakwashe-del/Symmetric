@@ -364,44 +364,88 @@ function validatePacketClock(ws, packet, recordObj, deviceId, packetTypeLabel) {
   }
 
   if (pktTs > 0 && pktTs < hubNow - 300000) {
-    console.warn(`[Termux Hub] 🛡️ SECURITY ALERT: Clock Tampering detected from [${originDev}]. Rejected backdated transaction.`);
+    const isVoidOrRefundPacket = Boolean(
+      packetTypeLabel === 'VOID' ||
+      packetTypeLabel === 'REFUND' ||
+      recordObj?.status === 'Voided' ||
+      recordObj?.status === 'Refunded' ||
+      recordObj?.voidedAt ||
+      recordObj?.refundedAt
+    );
+
+    const invId = recordObj?.id || packet?.invoice_id || packet?.id || undefined;
+    const hubNowIso = new Date(hubNow).toISOString();
+
+    if (recordObj && typeof recordObj === 'object') {
+      recordObj.suspicious_backdate = true;
+      recordObj.clock_tamper_flagged = true;
+      if (!recordObj.server_received_at) {
+        recordObj.server_received_at = hubNowIso;
+      }
+    }
+
+    const alertType = isVoidOrRefundPacket ? 'VOID_REFUND_BLOCKED' : 'HUB_FLAGGED_BACKDATE';
+    const alertMsg = isVoidOrRefundPacket
+      ? `Security Lock: Backdated ${recordObj?.status || 'Void/Refund'} blocked from ${originDev}. Please enable Automatic Date & Time.`
+      : `Clock Flag: Backdated ${packetTypeLabel} from ${originDev} was ACCEPTED and synced to Hub (flagged for audit). Voids & refunds restricted until Automatic Date & Time is enabled.`;
+
+    console.warn(`[Termux Hub] 🛡️ ${isVoidOrRefundPacket ? 'BLOCKED VOID/REFUND' : 'FLAGGED & ACCEPTED'} (${packetTypeLabel}) from [${originDev}].`);
+
+    // Deduplicate generic alerts for same device + invoice (or same device within 15m when no invoiceId)
+    const recentDup = securityAlertsStore.some((a) => {
+      if (!a || a.deviceId !== originDev) return false;
+      if (invId && a.invoiceId === invId && (a.alertType || a.type) === alertType) return true;
+      if (!invId && (a.alertType || a.type) === alertType) {
+        const prevMs = Date.parse(a.timestamp || a.createdAt || '');
+        if (Number.isFinite(prevMs) && hubNow - prevMs < 15 * 60 * 1000) return true;
+      }
+      return false;
+    });
+
     const alertPacket = {
       id: `SEC-${hubNow}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
       type: 'SECURITY_ALERT',
       action: 'SECURITY_ALERT',
+      alertType,
+      packetAccepted: !isVoidOrRefundPacket,
       reason: 'CLOCK_TAMPERING',
       targetDeviceId: originDev,
       deviceId: originDev,
       deviceName: packet?.origin_device_name || packet?.originDeviceName || originDev,
       packetType: packetTypeLabel,
       packetId: packet?.packet_id || packet?.packetId || undefined,
-      invoiceId: recordObj?.id || packet?.invoice_id || packet?.id || undefined,
+      invoiceId: invId,
       claimedTimestamp: pktTs,
       hubTimestamp: hubNow,
+      serverReceivedAt: hubNowIso,
       driftMs: pktTs - hubNow,
       origin_device_id: 'LOCAL_HUB',
       origin_device_name: 'Termux Local Hub',
-      timestamp: new Date(hubNow).toISOString(),
-      message: `Security Lock: Backdated ${packetTypeLabel} rejected from ${originDev}. Please enable Automatic Date & Time.`,
+      timestamp: hubNowIso,
+      message: alertMsg,
     };
 
-    securityAlertsStore.unshift(alertPacket);
-    if (securityAlertsStore.length > 200) {
-      securityAlertsStore = securityAlertsStore.slice(0, 200);
-    }
-    scheduleSave();
-
-    const serializedAlert = JSON.stringify(alertPacket);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send(serializedAlert); } catch (e) {}
-    }
-    wss.clients.forEach((client) => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        try { client.send(serializedAlert); } catch (e) {}
+    if (!recentDup) {
+      securityAlertsStore.unshift(alertPacket);
+      if (securityAlertsStore.length > 200) {
+        securityAlertsStore = securityAlertsStore.slice(0, 200);
       }
-    });
+      scheduleSave();
 
-    return { accepted: false, alert: alertPacket };
+      const serializedAlert = JSON.stringify(alertPacket);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(serializedAlert); } catch (e) {}
+      }
+      wss.clients.forEach((client) => {
+        if (client !== ws && client.readyState === WebSocket.OPEN) {
+          try { client.send(serializedAlert); } catch (e) {}
+        }
+      });
+    }
+
+    // Critical policy: NEVER drop normal sales/cash operational data from reaching the Hub.
+    // Only block high-risk Void/Refund reversals when device clock tampering is detected.
+    return { accepted: !isVoidOrRefundPacket, flagged: true, alert: alertPacket };
   }
 
   return { accepted: true };

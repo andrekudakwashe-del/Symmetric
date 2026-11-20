@@ -128,7 +128,7 @@ var MASTER_CONTROL_ACTIONS = [
   "sync_company", "bulk_sync_companies", "sync_companies_bulk",
   "provision_tenant_sheet", "initialize_tenant_sheet", "init_tenant_tabs",
   "allocate_tenant", "generate_master_template", "run_fleet_migration",
-  "bump_routing_epoch"
+  "bump_routing_epoch", "purge_test_companies", "delete_company"
 ];
 
 var WRITE_ACTIONS = [
@@ -141,6 +141,7 @@ var WRITE_ACTIONS = [
   "provision_tenant_sheet", "initialize_tenant_sheet", "init_tenant_tabs",
   "allocate_tenant", "generate_master_template", "run_fleet_migration", "bump_routing_epoch",
   "migrate_tenant", "merge_duplicate_companies", "seed_sample_data",
+  "purge_test_companies", "delete_company",
   "setup_sheets", "init_master_sheet", "upsert_product",
   "push_envelopes", "sync_entity", "sync_sale", "sync_staff_member", "sync_customer",
   "approve_stocktake", "stocktake_blind_submit", "unlock_stocktake_segment",
@@ -1752,6 +1753,12 @@ function doPost(e) {
       case "bump_routing_epoch":
         result = handleBumpRoutingEpoch(req, masterSs);
         break;
+      case "purge_test_companies":
+        result = handlePurgeTestCompanies(req, masterSs);
+        break;
+      case "delete_company":
+        result = handleDeleteCompany(req, masterSs);
+        break;
       default:
         result = { success: false, error: "Unknown action: " + actionNorm };
     }
@@ -2114,7 +2121,7 @@ function sanitizePayloadForCloud(entityType, d) {
   return copy;
 }
 
-function writeRowByHeaders(sheet, headers, rowObj) {
+function buildRowArrayByHeaders(headers, rowObj) {
   var row = [];
   for (var i = 0; i < headers.length; i++) {
     var h = String(headers[i]).trim();
@@ -2126,22 +2133,32 @@ function writeRowByHeaders(sheet, headers, rowObj) {
     }
     row.push(val);
   }
-  sheet.appendRow(row);
+  return row;
+}
+
+function writeRowByHeaders(sheet, headers, rowObj) {
+  sheet.appendRow(buildRowArrayByHeaders(headers, rowObj));
 }
 
 function updateRowByHeaders(sheet, rowIndex, headers, rowObj) {
-  var row = [];
-  for (var i = 0; i < headers.length; i++) {
-    var h = String(headers[i]).trim();
-    var val = rowObj[h];
-    if (val === undefined) val = rowObj[h.toLowerCase()];
-    if (val === undefined) val = "";
-    if (val !== null && typeof val === "object" && !(val instanceof Date)) {
-      val = JSON.stringify(val);
-    }
-    row.push(val);
-  }
+  var row = buildRowArrayByHeaders(headers, rowObj);
   sheet.getRange(rowIndex, 1, 1, headers.length).setValues([row]);
+}
+
+function flushPendingSheetAppends(pendingAppendsBySheet) {
+  if (!pendingAppendsBySheet) return 0;
+  var totalFlushed = 0;
+  for (var key in pendingAppendsBySheet) {
+    if (!pendingAppendsBySheet.hasOwnProperty(key)) continue;
+    var bucket = pendingAppendsBySheet[key];
+    if (!bucket || !bucket.sheet || !bucket.rows || bucket.rows.length === 0) continue;
+    var startRow = Math.max(2, bucket.sheet.getLastRow() + 1);
+    bucket.sheet.getRange(startRow, 1, bucket.rows.length, bucket.headers.length).setValues(bucket.rows);
+    totalFlushed += bucket.rows.length;
+    bucket.rows = [];
+    bucket.keyMap = {};
+  }
+  return totalFlushed;
 }
 
 function findRowIndexInSheet(sheet, headers, idColNames, targetId, companyId) {
@@ -2398,6 +2415,15 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
   var compUpper = String(companyId || TENANT_COMPANY_ID).trim().toUpperCase();
 
   var tombsMap = getAllTombstonesMap(targetSs, companyId);
+  var pendingAppendsBySheet = {};
+  var sheetHeadersCache = {};
+  var getCachedSheetHeaders = function(sh) {
+    var sName = sh.getName();
+    if (!sheetHeadersCache[sName]) {
+      sheetHeadersCache[sName] = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    }
+    return sheetHeadersCache[sName];
+  };
 
   for (var i = 0; i < envelopes.length; i++) {
     var env = envelopes[i];
@@ -2561,7 +2587,7 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
     var sheet = MONTHLY_SHARD_TABS[baseTabName]
       ? getOrCreateMonthlySheet(targetSs, baseTabName, recDateStr)
       : backfillSchemaColumns(targetSs, baseTabName);
-    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var headers = getCachedSheetHeaders(sheet);
 
     if (entityType === "stocktake_session") {
       var sessionConflict = checkActiveStocktakeSessionConflict(targetSs, envComp, envBranch, entityId, d.status, tombsMap);
@@ -2829,10 +2855,36 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
 
     var rowObj = buildRowObjectForEntity(entityType, entityId, d, env, metaClock, seq, envComp, envBranch);
 
+    var requiresImmediateWrite = (
+      entityType === "stocktake_session" ||
+      entityType === "branch_lockdown" ||
+      entityType === "stocktake_count_submission" ||
+      entityType === "stocktake_segment_unlock"
+    );
+
     if (existingRowIdx > 0) {
       updateRowByHeaders(matchedSheet, existingRowIdx, headers, rowObj);
-    } else {
+    } else if (requiresImmediateWrite) {
       writeRowByHeaders(matchedSheet, headers, rowObj);
+    } else {
+      var mSheetName = matchedSheet.getName();
+      if (!pendingAppendsBySheet[mSheetName]) {
+        pendingAppendsBySheet[mSheetName] = {
+          sheet: matchedSheet,
+          headers: headers,
+          rows: [],
+          keyMap: {}
+        };
+      }
+      var bucket = pendingAppendsBySheet[mSheetName];
+      var dedupeRowKey = String(envComp || "").toUpperCase() + "::" + String(entityId || "").toUpperCase();
+      var rowArr = buildRowArrayByHeaders(headers, rowObj);
+      if (bucket.keyMap.hasOwnProperty(dedupeRowKey)) {
+        bucket.rows[bucket.keyMap[dedupeRowKey]] = rowArr;
+      } else {
+        bucket.keyMap[dedupeRowKey] = bucket.rows.length;
+        bucket.rows.push(rowArr);
+      }
     }
 
     // V7 Zero-Master-Open Hot Path:
@@ -2858,6 +2910,9 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
       suspicious_backdate: metaClock.suspicious_backdate
     });
   }
+
+  // Commit all newly inserted rows per target sheet in a single batched setValues() RPC per tab
+  flushPendingSheetAppends(pendingAppendsBySheet);
 
   if (maxServerSeq > 0) {
     flushTenantSeqMeta(targetSs, companyId, maxServerSeq);
@@ -4620,7 +4675,9 @@ function handleGetBranchesSince(req, ss) {
 }
 
 function handleLookupCompany(req, ss) {
-  var q = String(req.company_id || req.email || req.query || "").trim().toLowerCase();
+  var emailQ = String(req.email || req.owner_email || "").trim().toLowerCase();
+  var compQ = String(req.company_id || req.companyId || "").trim().toLowerCase();
+  var q = String(compQ || emailQ || req.query || "").trim().toLowerCase();
   var cSheet = ss.getSheetByName("companies");
   if (!cSheet || cSheet.getLastRow() < 2) return { success: true, exists: false, error: "No companies registered" };
   var data = cSheet.getDataRange().getValues();
@@ -4630,9 +4687,15 @@ function handleLookupCompany(req, ss) {
     for (var c = 0; c < h.length; c++) {
       if (h[c] !== "password_hash") obj[h[c]] = data[i][c];
     }
-    if (String(obj.company_id || "").toLowerCase() === q ||
-        String(obj.owner_email || "").toLowerCase() === q ||
-        String(obj.company_name || "").toLowerCase() === q) {
+    if (emailQ && !compQ) {
+      if (String(obj.owner_email || "").trim().toLowerCase() === emailQ) {
+        return { success: true, exists: true, company: obj };
+      }
+    } else if (
+      String(obj.company_id || "").trim().toLowerCase() === q ||
+      String(obj.owner_email || "").trim().toLowerCase() === q ||
+      String(obj.company_name || "").trim().toLowerCase() === q
+    ) {
       return { success: true, exists: true, company: obj };
     }
   }
@@ -5183,84 +5246,235 @@ function handleBulkSyncCompanies(req, ss) {
   }
 
   var syncedBranches = 0;
-  for (var b = 0; b < branchesList.length; b++) {
-    var br = branchesList[b];
-    if (!br) continue;
-    var bComp = String(br.company_id || br.companyId || br.CompanyID || "").trim();
-    var bId = String(br.branch_id || br.branchId || br.id || "").trim();
-    if (!bComp || !bId) continue;
-    var bRes = handleCreateBranch({
-      company_id: bComp,
-      branch_id: bId,
-      branch_name: br.branch_name || br.name || bId,
-      branch_code: br.branch_code || br.code || bId,
-      location: br.location || br.address || "",
-      address: br.address || br.location || "",
-      is_main: Boolean(br.isMain || br.is_main || bId === "BR-MAIN"),
-      is_active: br.is_active !== false
-    }, ss);
-    if (bRes && bRes.success) syncedBranches++;
+  var nowIso = new Date().toISOString();
+  var pendingBulkAppends = {};
+
+  var queueBulkAppend = function(sheetObj, headersArr, dedupeKey, rowObj) {
+    var sName = sheetObj.getName();
+    if (!pendingBulkAppends[sName]) {
+      pendingBulkAppends[sName] = { sheet: sheetObj, headers: headersArr, rows: [], keyMap: {} };
+    }
+    var bucket = pendingBulkAppends[sName];
+    var rowArr = buildRowArrayByHeaders(headersArr, rowObj);
+    if (bucket.keyMap.hasOwnProperty(dedupeKey)) {
+      bucket.rows[bucket.keyMap[dedupeKey]] = rowArr;
+    } else {
+      bucket.keyMap[dedupeKey] = bucket.rows.length;
+      bucket.rows.push(rowArr);
+    }
+  };
+
+  // Batch-index existing branches in one read instead of N per-row scans
+  if (branchesList.length > 0) {
+    var bSheet = backfillSchemaColumns(ss, "branches");
+    var bVals = bSheet.getDataRange().getValues();
+    var bHeaders = bVals[0] || [];
+    var bIdCol = bHeaders.indexOf("branch_id");
+    var bEntCol = bHeaders.indexOf("entity_id");
+    var bCompCol = bHeaders.indexOf("company_id");
+    var existingBranchRows = {};
+    for (var brRow = 1; brRow < bVals.length; brRow++) {
+      var rComp = bCompCol !== -1 ? String(bVals[brRow][bCompCol] || "").trim().toUpperCase() : "";
+      var rId = String((bIdCol !== -1 ? bVals[brRow][bIdCol] : "") || (bEntCol !== -1 ? bVals[brRow][bEntCol] : "") || "").trim().toUpperCase();
+      if (rComp && rId) existingBranchRows[rComp + "::" + rId] = brRow + 1;
+    }
+
+    for (var b = 0; b < branchesList.length; b++) {
+      var br = branchesList[b];
+      if (!br) continue;
+      var bComp = String(br.company_id || br.companyId || br.CompanyID || "").trim();
+      var bId = String(br.branch_id || br.branchId || br.id || "").trim();
+      if (!bComp || !bId) continue;
+      var bKey = bComp.toUpperCase() + "::" + bId.toUpperCase();
+      var bSeq = allocateNextServerSeq(ss, bComp);
+      var bRowObj = {
+        branch_id: bId,
+        company_id: bComp,
+        branch_name: br.branch_name || br.name || bId,
+        branch_code: br.branch_code || br.code || bId,
+        location: br.location || br.address || "",
+        location_code: br.location_code || br.branch_code || br.code || bId,
+        address: br.address || br.location || "",
+        phone: br.phone || "",
+        is_main: Boolean(br.isMain || br.is_main || bId === "BR-MAIN"),
+        is_active: br.is_active !== false,
+        created_at: br.created_at || nowIso,
+        updated_at: nowIso,
+        entity_type: "branch",
+        entity_id: bId,
+        version: Number(br.version || 1),
+        mutation_source: br.mutationSource || "USER_EDIT",
+        client_updated_at: nowIso,
+        server_updated_at: nowIso,
+        server_seq: bSeq,
+        is_deleted: false,
+        server_received_at: nowIso,
+        suspicious_backdate: false,
+        payload_json: JSON.stringify({
+          id: bId,
+          branchId: bId,
+          branch_id: bId,
+          company_id: bComp,
+          name: br.branch_name || br.name || bId,
+          code: br.branch_code || br.code || bId,
+          location: br.location || br.address || "",
+          is_active: br.is_active !== false,
+          updatedAt: Date.now()
+        })
+      };
+      if (existingBranchRows[bKey]) {
+        updateRowByHeaders(bSheet, existingBranchRows[bKey], bHeaders, bRowObj);
+      } else {
+        queueBulkAppend(bSheet, bHeaders, bKey, bRowObj);
+      }
+      syncedBranches++;
+    }
   }
 
   var syncedUsers = 0;
-  var nowIso = new Date().toISOString();
   var gSheet = null;
   var gHeaders = null;
+  var existingGlobalRows = {};
   try {
     gSheet = backfillSchemaColumns(ss, "Global_Users");
-    gHeaders = gSheet.getRange(1, 1, 1, gSheet.getLastColumn()).getValues()[0];
+    var gVals = gSheet.getDataRange().getValues();
+    gHeaders = gVals[0] || [];
+    var gUidCol = gHeaders.indexOf("user_id");
+    var gEmailCol = gHeaders.indexOf("email");
+    var gCompCol = gHeaders.indexOf("company_id");
+    for (var gr = 1; gr < gVals.length; gr++) {
+      var gc = gCompCol !== -1 ? String(gVals[gr][gCompCol] || "").trim().toUpperCase() : "";
+      var gu = gUidCol !== -1 ? String(gVals[gr][gUidCol] || "").trim().toUpperCase() : "";
+      var ge = gEmailCol !== -1 ? String(gVals[gr][gEmailCol] || "").trim().toLowerCase() : "";
+      if (gc && gu) existingGlobalRows[gc + "::U::" + gu] = gr + 1;
+      if (gc && ge) existingGlobalRows[gc + "::E::" + ge] = gr + 1;
+    }
   } catch (e) {}
 
-  for (var u = 0; u < usersList.length; u++) {
-    var usr = usersList[u];
-    if (!usr) continue;
-    var uComp = String(usr.company_id || usr.companyId || "").trim();
-    var uId = String(usr.user_id || usr.id || "").trim();
-    if (!uComp || !uId) continue;
-    var uBr = String(usr.branch_id || usr.branchId || "BR-MAIN").trim();
-    handleUpsertStaff({
-      company_id: uComp,
-      branch_id: uBr,
-      user_id: uId,
-      full_name: usr.full_name || usr.name || "Staff Member",
-      email: usr.email || "",
-      phone: usr.phone || "",
-      role: String(usr.role || "CASHIER").toUpperCase(),
-      pin: usr.pin || "",
-      pin_hash: usr.pin_hash || usr.password_hash || "",
-      pin_salt: usr.pin_salt || "",
-      pinVersion: usr.pinVersion || usr.pin_version || 0,
-      pinUpdatedAt: usr.pinUpdatedAt || usr.pin_updated_at || 0,
-      assignedBranchIds: usr.assignedBranchIds || [],
-      branchAssignments: usr.branchAssignments || [],
-      permissions: usr.permissions || {},
-      is_active: usr.active !== "N" && usr.is_active !== false
-    }, ss, ss, uComp, uBr);
-    syncedUsers++;
+  if (usersList.length > 0) {
+    var uSheet = backfillSchemaColumns(ss, "users");
+    var uVals = uSheet.getDataRange().getValues();
+    var uHeaders = uVals[0] || [];
+    var uIdCol = uHeaders.indexOf("user_id");
+    var uEntCol = uHeaders.indexOf("entity_id");
+    var uCompCol = uHeaders.indexOf("company_id");
+    var uPinHashCol = uHeaders.indexOf("pin_hash");
+    var uPinSaltCol = uHeaders.indexOf("pin_salt");
+    var uPinVerCol = uHeaders.indexOf("pin_version");
+    var uPinUpdCol = uHeaders.indexOf("pin_updated_at");
+    var existingUserRows = {};
+    for (var ur = 1; ur < uVals.length; ur++) {
+      var uc = uCompCol !== -1 ? String(uVals[ur][uCompCol] || "").trim().toUpperCase() : "";
+      var uiKey = String((uIdCol !== -1 ? uVals[ur][uIdCol] : "") || (uEntCol !== -1 ? uVals[ur][uEntCol] : "") || "").trim().toUpperCase();
+      if (uc && uiKey) existingUserRows[uc + "::" + uiKey] = { rowIdx: ur + 1, rowVals: uVals[ur] };
+    }
 
-    var uEmail = String(usr.email || "").trim().toLowerCase();
-    var uRole = String(usr.role || "").trim().toUpperCase();
-    if (gSheet && gHeaders && uEmail && (uRole === "OWNER" || uRole === "ADMIN" || uRole === "SUPER_ADMIN")) {
-      try {
-        var pwHash = String(usr.password_hash || usr.pin_hash || "").trim();
-        if (!pwHash && usr.pin) pwHash = hashPasswordSha256(String(usr.pin).trim());
-        var gRowIdx = findRowIndexInSheet(gSheet, gHeaders, ["user_id", "email"], uId, uComp);
-        var gObj = {
-          user_id: uId,
-          email: uEmail,
-          password_hash: pwHash,
-          company_id: uComp,
-          role: uRole,
-          full_name: usr.full_name || usr.name || "Owner",
-          branch_id: uBr,
-          is_active: usr.active !== "N" && usr.is_active !== false,
-          updated_at: nowIso
-        };
-        if (gRowIdx > 0) updateRowByHeaders(gSheet, gRowIdx, gHeaders, gObj);
-        else writeRowByHeaders(gSheet, gHeaders, gObj);
-      } catch (gErr2) {}
+    for (var u = 0; u < usersList.length; u++) {
+      var usr = usersList[u];
+      if (!usr) continue;
+      var uComp = String(usr.company_id || usr.companyId || "").trim();
+      var uId = String(usr.user_id || usr.id || "").trim();
+      if (!uComp || !uId) continue;
+      var uBr = String(usr.branch_id || usr.branchId || "BR-MAIN").trim();
+      var uKey = uComp.toUpperCase() + "::" + uId.toUpperCase();
+      var exU = existingUserRows[uKey];
+
+      var resolvedPinHash = String(usr.pin_hash || usr.password_hash || "").trim();
+      var resolvedPinSalt = String(usr.pin_salt || "").trim();
+      if (!resolvedPinHash && usr.pin) {
+        resolvedPinHash = hashPasswordSha256(String(usr.pin).trim());
+      }
+      var resolvedPinVersion = Number(usr.pinVersion || usr.pin_version || 0);
+      var resolvedPinUpdatedAt = usr.pinUpdatedAt ? new Date(Number(usr.pinUpdatedAt)).toISOString() : "";
+
+      if (exU) {
+        var prevPinHash = uPinHashCol !== -1 ? String(exU.rowVals[uPinHashCol] || "").trim() : "";
+        var prevPinVer = uPinVerCol !== -1 ? Number(exU.rowVals[uPinVerCol] || 0) : 0;
+        if (prevPinHash && (!resolvedPinHash || (prevPinVer > 0 && (resolvedPinVersion === 0 || prevPinVer > resolvedPinVersion)))) {
+          resolvedPinHash = prevPinHash;
+          resolvedPinSalt = (uPinSaltCol !== -1 ? String(exU.rowVals[uPinSaltCol] || "") : "") || resolvedPinSalt;
+          resolvedPinVersion = Math.max(prevPinVer, resolvedPinVersion);
+          resolvedPinUpdatedAt = (uPinUpdCol !== -1 ? String(exU.rowVals[uPinUpdCol] || "") : "") || resolvedPinUpdatedAt;
+        }
+      }
+
+      var sanitizedUser = sanitizePayloadForCloud("staff", usr);
+      sanitizedUser.id = uId;
+      sanitizedUser.pin_hash = resolvedPinHash;
+      if (resolvedPinSalt) sanitizedUser.pin_salt = resolvedPinSalt;
+      if (resolvedPinVersion > 0) sanitizedUser.pinVersion = resolvedPinVersion;
+
+      var uSeq = allocateNextServerSeq(ss, uComp);
+      var uRowObj = {
+        user_id: uId,
+        company_id: uComp,
+        branch_id: uBr,
+        full_name: usr.full_name || usr.name || "Staff Member",
+        email: usr.email || "",
+        phone: usr.phone || "",
+        role: String(usr.role || "CASHIER").toUpperCase(),
+        pin_hash: resolvedPinHash,
+        pin_salt: resolvedPinSalt,
+        pin_version: resolvedPinVersion,
+        pin_updated_at: resolvedPinUpdatedAt,
+        assigned_branch_ids: JSON.stringify(usr.assignedBranchIds || []),
+        branch_assignments_json: JSON.stringify(usr.branchAssignments || []),
+        permissions_json: JSON.stringify(usr.permissions || {}),
+        is_active: usr.active !== "N" && usr.is_active !== false,
+        created_at: usr.created_at || nowIso,
+        updated_at: nowIso,
+        entity_type: "staff",
+        entity_id: uId,
+        version: Number(usr.version || 1),
+        mutation_source: usr.mutationSource || "USER_EDIT",
+        client_updated_at: nowIso,
+        server_updated_at: nowIso,
+        server_seq: uSeq,
+        is_deleted: false,
+        server_received_at: nowIso,
+        suspicious_backdate: false,
+        payload_json: JSON.stringify(sanitizedUser)
+      };
+
+      if (exU) {
+        updateRowByHeaders(uSheet, exU.rowIdx, uHeaders, uRowObj);
+      } else {
+        queueBulkAppend(uSheet, uHeaders, uKey, uRowObj);
+      }
+      syncedUsers++;
+
+      var uEmail = String(usr.email || "").trim().toLowerCase();
+      var uRole = String(usr.role || "").trim().toUpperCase();
+      if (gSheet && gHeaders && uEmail && (uRole === "OWNER" || uRole === "ADMIN" || uRole === "SUPER_ADMIN")) {
+        try {
+          var pwHash = resolvedPinHash;
+          var gRowIdx =
+            existingGlobalRows[uComp.toUpperCase() + "::U::" + uId.toUpperCase()] ||
+            existingGlobalRows[uComp.toUpperCase() + "::E::" + uEmail] ||
+            -1;
+          var gObj = {
+            user_id: uId,
+            email: uEmail,
+            password_hash: pwHash,
+            company_id: uComp,
+            role: uRole,
+            full_name: usr.full_name || usr.name || "Owner",
+            branch_id: uBr,
+            is_active: usr.active !== "N" && usr.is_active !== false,
+            updated_at: nowIso
+          };
+          if (gRowIdx > 0) {
+            updateRowByHeaders(gSheet, gRowIdx, gHeaders, gObj);
+          } else {
+            queueBulkAppend(gSheet, gHeaders, uComp.toUpperCase() + "::" + uEmail, gObj);
+          }
+        } catch (gErr2) {}
+      }
     }
   }
+
+  // Commit all newly inserted branches, users, and Global_Users in ONE batched setValues() per tab
+  flushPendingSheetAppends(pendingBulkAppends);
 
   return {
     success: true,
@@ -5370,4 +5584,337 @@ function getSeedPermissions52() {
 
 function seedSampleData(req, ss, companyId, branchId) {
   return { success: true, message: "Sample data hook ready for " + companyId };
+}
+
+// ============================================================================
+// SAFE TEST-TENANT PURGE & SINGLE-TENANT DELETE (PROTECTING COMP-001 & MASTER)
+// ============================================================================
+
+var PROTECTED_COMPANY_IDS_MAP = {
+  "COMP-001": true,
+  "COMP-MASTER": true
+};
+var PROTECTED_MASTER_SHEET_ID_FALLBACK = "1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE";
+var PROTECTED_SUPER_ADMIN_EMAIL = "andrekudakwashe@gmail.com";
+
+function findHeaderColIndex_(headers, candidates) {
+  for (var i = 0; i < headers.length; i++) {
+    var h = String(headers[i] || "").trim().toLowerCase().replace(/[\s\-]+/g, "_");
+    for (var c = 0; c < candidates.length; c++) {
+      if (h === candidates[c]) return i;
+    }
+  }
+  return -1;
+}
+
+function rewriteMasterTabByFilter_(ss, tabName, filterFn) {
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet) return { exists: false, before: 0, after: 0, removed: 0 };
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow <= 1 || lastCol < 1) {
+    return { exists: true, before: 0, after: 0, removed: 0 };
+  }
+
+  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  var headers = values[0];
+  var keptRows = [headers];
+  var beforeDataRows = values.length - 1;
+
+  for (var r = 1; r < values.length; r++) {
+    var row = values[r];
+    if (filterFn(row, headers, r)) {
+      keptRows.push(row);
+    }
+  }
+
+  var afterDataRows = keptRows.length - 1;
+  var removed = Math.max(0, beforeDataRows - afterDataRows);
+
+  if (removed > 0 || keptRows.length < values.length) {
+    sheet.getRange(1, 1, keptRows.length, lastCol).setValues(keptRows);
+    var excessStart = keptRows.length + 1;
+    var maxRows = sheet.getMaxRows();
+    if (excessStart <= maxRows) {
+      // Clear leftover values first; delete excess rows cleanly leaving at least 1 empty row if needed
+      if (lastRow >= excessStart) {
+        sheet.getRange(excessStart, 1, lastRow - keptRows.length, lastCol).clearContent();
+      }
+      var rowsToDelete = maxRows - Math.max(keptRows.length + 5, 20);
+      if (rowsToDelete > 0) {
+        try {
+          sheet.deleteRows(Math.max(keptRows.length + 5, 20) + 1, rowsToDelete);
+        } catch (delErr) {}
+      }
+    }
+  }
+
+  return {
+    exists: true,
+    before: beforeDataRows,
+    after: afterDataRows,
+    removed: removed
+  };
+}
+
+/**
+ * Safely purge all non-allowlisted companies from Master Control Plane tabs.
+ * - Always protects COMP-001 (Saimetric Demo), COMP-MASTER, SUPER_ADMIN, and Master Spreadsheet.
+ * - Deduplicates bloated branches tab in-memory and writes each tab in ONE setValues() call.
+ * - Optionally moves removed companies' dedicated Google Drive spreadsheets to Trash.
+ */
+function handlePurgeTestCompanies(req, masterSs) {
+  var ss = masterSs || getMasterSpreadsheet();
+  var masterId = String(ss.getId() || PROTECTED_MASTER_SHEET_ID_FALLBACK).trim();
+  var keepList = Array.isArray(req && req.keep_company_ids) ? req.keep_company_ids : ["COMP-001", "COMP-MASTER"];
+  var keepSet = { "COMP-001": true, "COMP-MASTER": true };
+  for (var k = 0; k < keepList.length; k++) {
+    var kid = String(keepList[k] || "").trim().toUpperCase();
+    if (kid) keepSet[kid] = true;
+  }
+
+  var trashDedicatedSheets = !(req && req.trash_dedicated_sheets === false);
+  var dryRun = !!(req && req.dry_run === true);
+
+  // 1. Inspect companies tab first to collect removed company IDs & their dedicated sheet IDs
+  var removedCompanyIds = [];
+  var keptCompanyIds = [];
+  var dedicatedSheetsToTrash = {};
+  var compSheet = ss.getSheetByName("companies");
+  if (compSheet && compSheet.getLastRow() > 1 && compSheet.getLastColumn() >= 1) {
+    var compVals = compSheet.getDataRange().getValues();
+    var cHeaders = compVals[0];
+    var cidIdx = findHeaderColIndex_(cHeaders, ["company_id", "companyid", "id"]);
+    var sidIdx = findHeaderColIndex_(cHeaders, ["sheet_id", "sheetid", "dedicated_sheet_id", "spreadsheet_id"]);
+    var fidIdx = findHeaderColIndex_(cHeaders, ["sheet_folder_id", "folder_id"]);
+
+    if (cidIdx >= 0) {
+      var seenComp = {};
+      for (var r = 1; r < compVals.length; r++) {
+        var cidRaw = String(compVals[r][cidIdx] || "").trim();
+        var cidNorm = cidRaw.toUpperCase();
+        if (!cidNorm) continue;
+        if (keepSet[cidNorm]) {
+          if (!seenComp[cidNorm]) {
+            seenComp[cidNorm] = true;
+            keptCompanyIds.push(cidRaw);
+          }
+        } else {
+          if (!seenComp[cidNorm]) {
+            seenComp[cidNorm] = true;
+            removedCompanyIds.push(cidRaw);
+          }
+          var sids = [];
+          if (sidIdx >= 0) sids.push(String(compVals[r][sidIdx] || "").trim());
+          if (fidIdx >= 0) sids.push(String(compVals[r][fidIdx] || "").trim());
+          for (var si = 0; si < sids.length; si++) {
+            var sid = sids[si];
+            if (
+              sid &&
+              sid.length >= 25 &&
+              sid !== masterId &&
+              sid !== PROTECTED_MASTER_SHEET_ID_FALLBACK &&
+              sid.indexOf("http") !== 0
+            ) {
+              dedicatedSheetsToTrash[sid] = cidRaw;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (dryRun) {
+    return {
+      success: true,
+      dry_run: true,
+      kept_companies: keptCompanyIds,
+      removed_companies: removedCompanyIds,
+      removed_count: removedCompanyIds.length,
+      dedicated_sheets_to_trash: Object.keys(dedicatedSheetsToTrash),
+      master_sheet_protected: masterId
+    };
+  }
+
+  var lock = LockService.getScriptLock();
+  var gotLock = lock.tryLock(25000);
+  if (!gotLock) {
+    return { success: false, error: "Could not acquire Master Control Plane lock. Retry shortly." };
+  }
+
+  var tabStats = {};
+  var trashedSheets = [];
+  var trashErrors = [];
+
+  try {
+    // 2. Rewrite companies tab (deduplicate kept rows by company_id)
+    var seenKeepCompanies = {};
+    tabStats.companies = rewriteMasterTabByFilter_(ss, "companies", function(row, headers) {
+      var cidIdx = findHeaderColIndex_(headers, ["company_id", "companyid", "id"]);
+      if (cidIdx < 0) return true;
+      var cid = String(row[cidIdx] || "").trim().toUpperCase();
+      if (!cid || !keepSet[cid]) return false;
+      if (seenKeepCompanies[cid]) return false;
+      seenKeepCompanies[cid] = true;
+      return true;
+    });
+
+    // 3. Rewrite branches & Branches tabs (also deduplicates bloated 46k+ rows by company_id::branch_id)
+    var branchTabs = ["branches", "Branches"];
+    for (var bt = 0; bt < branchTabs.length; bt++) {
+      var seenBranches = {};
+      tabStats[branchTabs[bt]] = rewriteMasterTabByFilter_(ss, branchTabs[bt], function(row, headers) {
+        var cidIdx = findHeaderColIndex_(headers, ["company_id", "companyid"]);
+        var bidIdx = findHeaderColIndex_(headers, ["branch_id", "branchid", "id"]);
+        if (cidIdx < 0) return true;
+        var cid = String(row[cidIdx] || "").trim().toUpperCase();
+        if (!cid || !keepSet[cid]) return false;
+        var bid = bidIdx >= 0 ? String(row[bidIdx] || "").trim().toUpperCase() : "";
+        var key = cid + "::" + bid;
+        if (bid && seenBranches[key]) return false;
+        if (bid) seenBranches[key] = true;
+        return true;
+      });
+    }
+
+    // 4. Rewrite users & Global_Users (always preserve SUPER_ADMIN & protected admin email)
+    var userTabs = ["users", "Global_Users"];
+    for (var ut = 0; ut < userTabs.length; ut++) {
+      var seenUsers = {};
+      tabStats[userTabs[ut]] = rewriteMasterTabByFilter_(ss, userTabs[ut], function(row, headers) {
+        var cidIdx = findHeaderColIndex_(headers, ["company_id", "companyid"]);
+        var roleIdx = findHeaderColIndex_(headers, ["role", "user_role"]);
+        var emailIdx = findHeaderColIndex_(headers, ["email", "user_email"]);
+        var uidIdx = findHeaderColIndex_(headers, ["user_id", "userid", "id"]);
+        var role = roleIdx >= 0 ? String(row[roleIdx] || "").trim().toUpperCase() : "";
+        var email = emailIdx >= 0 ? String(row[emailIdx] || "").trim().toLowerCase() : "";
+        if (role === "SUPER_ADMIN" || email === PROTECTED_SUPER_ADMIN_EMAIL) {
+          var sKey = "SA::" + email + "::" + (uidIdx >= 0 ? String(row[uidIdx] || "").trim() : "");
+          if (seenUsers[sKey]) return false;
+          seenUsers[sKey] = true;
+          return true;
+        }
+        if (cidIdx < 0) return true;
+        var cid = String(row[cidIdx] || "").trim().toUpperCase();
+        if (!cid || !keepSet[cid]) return false;
+        var uKey = cid + "::" + (email || (uidIdx >= 0 ? String(row[uidIdx] || "").trim() : ""));
+        if (seenUsers[uKey]) return false;
+        seenUsers[uKey] = true;
+        return true;
+      });
+    }
+
+    // 5. Rewrite Subscriptions, permissions, request_log
+    var otherTabs = ["Subscriptions", "permissions", "request_log"];
+    for (var ot = 0; ot < otherTabs.length; ot++) {
+      tabStats[otherTabs[ot]] = rewriteMasterTabByFilter_(ss, otherTabs[ot], function(row, headers) {
+        var cidIdx = findHeaderColIndex_(headers, ["company_id", "companyid"]);
+        if (cidIdx < 0) return true;
+        var cid = String(row[cidIdx] || "").trim().toUpperCase();
+        if (!cid) return false;
+        return !!keepSet[cid];
+      });
+    }
+
+    // 6. Move removed test companies' dedicated Drive spreadsheets to Trash (NEVER Master Sheet)
+    if (trashDedicatedSheets) {
+      var sheetIds = Object.keys(dedicatedSheetsToTrash);
+      for (var t = 0; t < sheetIds.length; t++) {
+        var targetSid = sheetIds[t];
+        if (!targetSid || targetSid === masterId || targetSid === PROTECTED_MASTER_SHEET_ID_FALLBACK) {
+          continue;
+        }
+        try {
+          var file = DriveApp.getFileById(targetSid);
+          if (file && !file.isTrashed()) {
+            file.setTrashed(true);
+            trashedSheets.push({ sheet_id: targetSid, company_id: dedicatedSheetsToTrash[targetSid] });
+          }
+        } catch (driveErr) {
+          trashErrors.push({ sheet_id: targetSid, error: driveErr && driveErr.message ? driveErr.message : String(driveErr) });
+        }
+      }
+    }
+
+    // 7. Invalidate tenant routing cache entries for removed companies
+    try {
+      for (var rc = 0; rc < removedCompanyIds.length; rc++) {
+        CACHE.remove("tenant_ctx_" + removedCompanyIds[rc]);
+        CACHE.remove("route_" + removedCompanyIds[rc]);
+      }
+      CACHE.remove("all_companies_v1");
+    } catch (cErr) {}
+
+    SpreadsheetApp.flush();
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+
+  return {
+    success: true,
+    kept_companies: keptCompanyIds,
+    removed_companies: removedCompanyIds,
+    removed_count: removedCompanyIds.length,
+    trashed_sheets: trashedSheets,
+    trashed_sheets_count: trashedSheets.length,
+    trash_errors: trashErrors,
+    tab_stats: tabStats,
+    master_sheet_protected: masterId,
+    message: "Purged " + removedCompanyIds.length + " test companies from Master Sheet" +
+      (trashedSheets.length > 0 ? " and moved " + trashedSheets.length + " dedicated Drive sheet(s) to Trash." : ".")
+  };
+}
+
+/**
+ * Safely delete a single non-protected tenant company across all Master Sheet tabs.
+ * Refuses COMP-001 and COMP-MASTER.
+ */
+function handleDeleteCompany(req, masterSs) {
+  var ss = masterSs || getMasterSpreadsheet();
+  var targetId = String((req && (req.company_id || req.companyId)) || "").trim();
+  var targetNorm = targetId.toUpperCase();
+  if (!targetId) {
+    return { success: false, code: "MISSING_COMPANY_ID", error: "company_id is required." };
+  }
+  if (PROTECTED_COMPANY_IDS_MAP[targetNorm]) {
+    return { success: false, code: "PROTECTED_COMPANY", error: targetId + " is a protected core workspace and cannot be deleted." };
+  }
+
+  // Build allowlist of all currently existing companies EXCEPT targetNorm
+  var keepIds = ["COMP-001", "COMP-MASTER"];
+  var compSheet = ss.getSheetByName("companies");
+  if (compSheet && compSheet.getLastRow() > 1 && compSheet.getLastColumn() >= 1) {
+    var vals = compSheet.getDataRange().getValues();
+    var cidIdx = findHeaderColIndex_(vals[0], ["company_id", "companyid", "id"]);
+    if (cidIdx >= 0) {
+      for (var r = 1; r < vals.length; r++) {
+        var cid = String(vals[r][cidIdx] || "").trim();
+        if (cid && cid.toUpperCase() !== targetNorm) {
+          keepIds.push(cid);
+        }
+      }
+    }
+  }
+
+  var res = handlePurgeTestCompanies({
+    keep_company_ids: keepIds,
+    trash_dedicated_sheets: !(req && req.trash_dedicated_sheets === false)
+  }, ss);
+  res.deleted_company_id = targetId;
+  return res;
+}
+
+/**
+ * Standalone one-click function runnable directly inside the Google Apps Script editor.
+ * Keeps ONLY COMP-001 (Saimetric Demo) and COMP-MASTER (Super Admin), deduplicates the
+ * bloated branches tab, and moves removed test companies' dedicated Drive sheets to Trash.
+ */
+function purgeAllTestCompaniesKeepDemo() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet() || getMasterSpreadsheet();
+  var res = handlePurgeTestCompanies({
+    keep_company_ids: ["COMP-001", "COMP-MASTER"],
+    trash_dedicated_sheets: true
+  }, ss);
+  Logger.log(JSON.stringify(res, null, 2));
+  return res;
 }

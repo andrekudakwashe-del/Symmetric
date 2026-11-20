@@ -899,11 +899,11 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
             <ShieldAlert className="w-5 h-5 text-white shrink-0 animate-pulse mt-0.5 sm:mt-0" />
             <div>
               <div className="font-black text-xs sm:text-sm tracking-tight">
-                Security Lock: Please enable Automatic Date &amp; Time in your phone settings to process refunds.
+                Clock Warning: Voids &amp; Refunds Restricted — Enable Automatic Date &amp; Time.
               </div>
               {clockSecurity.reason && (
                 <div className="text-[11px] text-red-100 font-medium mt-0.5">
-                  {clockSecurity.reason} (Normal POS sales remain enabled; refunds, voids &amp; backdating are locked.)
+                  {clockSecurity.reason} (Sales &amp; Hub/Cloud sync continue normally and are flagged for audit; voids, refunds &amp; receipt edits are locked.)
                 </div>
               )}
             </div>

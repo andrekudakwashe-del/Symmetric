@@ -147,7 +147,7 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     if (invoice.status === 'Refunded' || invoice.status === 'Voided') return;
     if (clockSecurity.isClockTampered) {
       setActionNotice({
-        text: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+        text: 'Clock Restriction: Refunds and voids are locked while device clock drift is detected. Please enable Automatic Date & Time in your device settings.',
         type: 'error',
       });
       return;
@@ -278,7 +278,7 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
   const handleTriggerEdit = (sale: SaleInvoice) => {
     if (clockSecurity.isClockTampered) {
       setActionNotice({
-        text: 'Security Lock: Please enable Automatic Date & Time in your phone settings to process refunds.',
+        text: 'Clock Restriction: Editing completed receipts is locked while device clock drift is detected. Please enable Automatic Date & Time in your device settings.',
         type: 'error',
       });
       return;
@@ -367,10 +367,12 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
             <ShieldAlert className="w-5 h-5 text-white shrink-0 animate-pulse mt-0.5 sm:mt-0" />
             <div>
               <div className="font-black text-xs sm:text-sm">
-                Security Lock: Please enable Automatic Date &amp; Time in your phone settings to process refunds.
+                Clock Restriction: Voids, Refunds, Exchanges &amp; Receipt Edits Locked — Enable Automatic Date &amp; Time.
               </div>
               {clockSecurity.reason && (
-                <div className="text-[11px] text-red-100 mt-0.5">{clockSecurity.reason}</div>
+                <div className="text-[11px] text-red-100 mt-0.5">
+                  {clockSecurity.reason} (Sales &amp; Hub/Cloud sync continue normally and are flagged for review.)
+                </div>
               )}
             </div>
           </div>

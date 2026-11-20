@@ -49,6 +49,12 @@ import {
   autoProvisionDedicatedTenantSheet,
 } from '../../services/googleSheetsSync';
 import {
+  fetchWithTimeout,
+  GAS_TIMEOUTS,
+  parseGasResponseText,
+  resolveSafeGasTarget,
+} from '../../services/sync/gasTransport';
+import {
   FileSpreadsheet,
   RefreshCw,
   Copy,
@@ -1371,40 +1377,96 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                       type="button"
                       onClick={async () => {
                         if (!webhookUrl || !webhookUrl.startsWith('http')) {
-                          alert('Please enter your Google Apps Script URL first!');
+                          setSyncStatusMsg('Please enter your Google Apps Script URL first.');
                           return;
                         }
-                        const cleanSheetId = extractGoogleSheetId(tenantSpreadsheetId) || currentComp.sheet_id;
+                        const rawSheetId = extractGoogleSheetId(tenantSpreadsheetId) || currentComp.sheet_id || '';
+                        const safeTarget = resolveSafeGasTarget({
+                          companyId: currentComp.company_id,
+                          webhookUrl: webhookUrl.trim(),
+                          spreadsheetId: rawSheetId,
+                        });
+                        if (
+                          !isMasterCompanyId(currentComp.company_id) &&
+                          (safeTarget.blockedMasterSheetLeak || !safeTarget.spreadsheetId)
+                        ) {
+                          setSyncStatusMsg(
+                            'Blocked: Link or auto-provision a dedicated tenant Google Sheet first (cannot write operational test rows to the Master Sheet).'
+                          );
+                          return;
+                        }
                         setIsSyncing(true);
-                        setSyncStatusMsg('Sending a TEST ROW with branch isolation metadata...');
+                        setSyncStatusMsg('Sending a verified TEST ROW with branch isolation metadata...');
+                        const testPayload = {
+                          action: 'INSERT',
+                          sheet: 'Sales',
+                          company_id: currentComp.company_id,
+                          company_name: currentComp.company_name,
+                          tenant_sheet_id: safeTarget.spreadsheetId,
+                          sheet_id: safeTarget.spreadsheetId,
+                          spreadsheet_id: safeTarget.spreadsheetId,
+                          branch_id: currentBranch.branchId,
+                          user_branch_id: currentBranch.branchId,
+                          user_role: 'CASHIER',
+                          clientRequestId: `TEST-ROW-${Date.now()}`,
+                          data: {
+                            TestNotice: 'Option A Verified with Branch Isolation!',
+                            TenantCompanyID: currentComp.company_id,
+                            BranchID: currentBranch.branchId,
+                            Timestamp: new Date().toLocaleString(),
+                            Amount: '$120.00',
+                            Status: 'LIVE_ISOLATED',
+                            tenant_sheet_id: safeTarget.spreadsheetId,
+                          },
+                        };
                         try {
-                          await fetch(webhookUrl.trim(), {
-                            method: 'POST',
-                            mode: 'no-cors',
-                            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                            body: JSON.stringify({
-                              action: 'INSERT',
-                              sheet: 'Sales',
-                              company_id: currentComp.company_id,
-                              company_name: currentComp.company_name,
-                              tenant_sheet_id: cleanSheetId,
-                              sheet_id: cleanSheetId,
-                              branch_id: currentBranch.branchId,
-                              user_branch_id: currentBranch.branchId,
-                              user_role: 'CASHIER',
-                              data: {
-                                TestNotice: 'Option A Verified with Branch Isolation!',
-                                TenantCompanyID: currentComp.company_id,
-                                BranchID: currentBranch.branchId,
-                                Timestamp: new Date().toLocaleString(),
-                                Amount: '$120.00',
-                                Status: 'LIVE_ISOLATED',
-                                tenant_sheet_id: cleanSheetId,
+                          let verified = false;
+                          let errMsg = '';
+                          try {
+                            const srvRes = await fetchWithTimeout(
+                              '/api/sheets/sync-row',
+                              {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ webhook_url: safeTarget.webhookUrl, ...testPayload }),
                               },
-                            }),
-                          });
-                          setSyncStatusMsg('✓ TEST ROW SENT! Check your dedicated tenant Google Sheet now.');
-                          confetti({ particleCount: 50, spread: 70, origin: { y: 0.6 } });
+                              GAS_TIMEOUTS.WRITE_CLIENT_MS
+                            );
+                            if (srvRes.status !== 404 && srvRes.status < 502) {
+                              const parsed = parseGasResponseText(await srvRes.text(), srvRes.status);
+                              if (srvRes.ok && parsed.data && parsed.data.success !== false && parsed.data.status !== 'error') {
+                                verified = true;
+                              } else {
+                                errMsg = parsed.data?.error || parsed.error || `HTTP ${srvRes.status}`;
+                              }
+                            }
+                          } catch {}
+
+                          if (!verified && !errMsg) {
+                            const directRes = await fetchWithTimeout(
+                              safeTarget.webhookUrl,
+                              {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                                body: JSON.stringify(testPayload),
+                                redirect: 'follow',
+                              },
+                              GAS_TIMEOUTS.WRITE_CLIENT_MS
+                            );
+                            const parsed = parseGasResponseText(await directRes.text(), directRes.status);
+                            if (directRes.ok && parsed.data && parsed.data.success !== false && parsed.data.status !== 'error') {
+                              verified = true;
+                            } else {
+                              errMsg = parsed.data?.error || parsed.error || `HTTP ${directRes.status}`;
+                            }
+                          }
+
+                          if (verified) {
+                            setSyncStatusMsg('✓ TEST ROW VERIFIED! Confirmed written to your dedicated tenant Google Sheet.');
+                            confetti({ particleCount: 50, spread: 70, origin: { y: 0.6 } });
+                          } else {
+                            setSyncStatusMsg(`Test row failed: ${errMsg || 'Google Apps Script did not confirm write.'}`);
+                          }
                         } catch (err: any) {
                           setSyncStatusMsg(`Connection test error: ${err?.message || 'Network error'}`);
                         } finally {

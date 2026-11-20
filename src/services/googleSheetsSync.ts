@@ -22,6 +22,7 @@ import {
   getCompanies,
   getBranches,
   saveCompany,
+  pruneLocalCompaniesToAllowlist,
   saveBranch,
   saveSalesperson,
   getAllSalespeople,
@@ -58,6 +59,14 @@ import {
   isAppScriptsIngestPaused,
   routeCloudRecordThroughSyncCore,
 } from './sync/syncIngestBridge';
+import {
+  fetchWithTimeout,
+  GAS_TIMEOUTS,
+  isTimeoutError,
+  parseGasResponseText,
+  resolveSafeGasTarget,
+  sleepMs,
+} from './sync/gasTransport';
 import { buildUnifiedCodeGs } from './codeGsTemplate';
 import { getTenantAuthToken, setTenantAuthToken, setRoutingEpoch } from './sync/highWaterMarks';
 
@@ -357,13 +366,36 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
     return true;
   }
 
-  // Resolve target webhook (tenant-dedicated webhook takes precedence over global default)
-  const targetWebhook =
-    (currentComp.webhook_url && currentComp.webhook_url.startsWith('http')
-      ? currentComp.webhook_url
-      : config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL).trim();
+  // Resolve sanitized target webhook and tenant sheet ID (prevents legacy V1 URLs & Master Sheet leakage)
+  const safeTarget = resolveSafeGasTarget({
+    companyId,
+    webhookUrl:
+      currentComp.webhook_url && currentComp.webhook_url.startsWith('http')
+        ? currentComp.webhook_url
+        : config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL,
+    spreadsheetId: currentComp.sheet_id || config.spreadsheetId || '',
+  });
+  const targetWebhook = safeTarget.webhookUrl;
+  const targetSheetId = safeTarget.spreadsheetId;
 
-  const targetSheetId = (currentComp.sheet_id || config.spreadsheetId || '').trim();
+  const sheetLower = String(item.sheetName || '').toLowerCase();
+  const isMasterControlTab =
+    sheetLower === 'companies' ||
+    sheetLower === 'branches' ||
+    sheetLower === 'users' ||
+    sheetLower === 'salespeople' ||
+    sheetLower === 'staff';
+  if (
+    !isMasterControlTab &&
+    !isMasterCompanyId(companyId) &&
+    (safeTarget.blockedMasterSheetLeak || !targetSheetId)
+  ) {
+    throw new Error(
+      safeTarget.blockedMasterSheetLeak
+        ? `MASTER_SHEET_WRITE_BLOCKED: Refused to write tenant ${companyId} data to the Master Sheet.`
+        : `DEDICATED_SHEET_REQUIRED: Tenant ${companyId} does not have a dedicated spreadsheet provisioned yet.`
+    );
+  }
 
   const payloadData = {
     action: item.action,
@@ -402,18 +434,23 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
   // 1. Try server-side proxy route (/api/sheets/sync-row) - requires verified HTTP 200/201
   let proxyNotFound = false;
   try {
-    const srvRes = await fetch('/api/sheets/sync-row', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        webhook_url: targetWebhook,
-        ...payloadData,
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
+    const srvRes = await fetchWithTimeout(
+      '/api/sheets/sync-row',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          webhook_url: targetWebhook,
+          ...payloadData,
+        }),
+      },
+      GAS_TIMEOUTS.WRITE_CLIENT_MS
+    );
 
     if (srvRes.status === 200 || srvRes.status === 201 || srvRes.ok) {
-      const srvData = await srvRes.json().catch(() => null);
+      const srvText = await srvRes.text();
+      const parsedSrv = parseGasResponseText(srvText, srvRes.status);
+      const srvData = parsedSrv.data;
       if (srvData && srvData.success !== false && srvData.status !== 'error') {
         const recId = String(item.payload?.id || item.payload?.itemId || item.payload?.InvoiceID || item.id || '');
         const srvTsMs = srvData.server_received_at ? Date.parse(srvData.server_received_at) : Date.now();
@@ -442,18 +479,18 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
         );
         return true;
       }
-      throw new Error(srvData?.error || srvData?.message || 'Google Apps Script rejected write');
+      throw new Error(srvData?.error || srvData?.message || parsedSrv.error || 'Google Apps Script rejected write');
     }
 
-    if (srvRes.status === 404) {
+    if (srvRes.status === 404 || srvRes.status >= 502) {
       proxyNotFound = true;
     } else {
       const errJson = await srvRes.json().catch(() => null);
       throw new Error(errJson?.error || `Cloud proxy returned HTTP ${srvRes.status}`);
     }
   } catch (proxyErr: any) {
-    if (proxyErr?.name === 'TimeoutError' || proxyErr?.name === 'AbortError') {
-      throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+    if (isTimeoutError(proxyErr)) {
+      throw new Error('Cloud sync timed out (55s); record kept in offline queue for retry.');
     }
     if (!proxyNotFound && proxyErr?.name !== 'TypeError') {
       throw proxyErr;
@@ -463,26 +500,35 @@ export const syncItemToGoogleSheets = async (item: SyncQueueItem): Promise<boole
   // 2. Direct browser fetch to Google Apps Script Webhook (strict CORS/HTTP verification - NO blind no-cors)
   let directRes: Response;
   try {
-    directRes = await fetch(targetWebhook, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'text/plain;charset=utf-8',
+    directRes = await fetchWithTimeout(
+      targetWebhook,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'text/plain;charset=utf-8',
+        },
+        body: JSON.stringify(payloadData),
+        redirect: 'follow',
       },
-      body: JSON.stringify(payloadData),
-      signal: AbortSignal.timeout(20000),
-    });
+      GAS_TIMEOUTS.WRITE_CLIENT_MS
+    );
   } catch (directErr: any) {
-    if (directErr?.name === 'TimeoutError' || directErr?.name === 'AbortError') {
-      throw new Error('Cloud sync timed out; record kept in offline queue for retry.');
+    if (isTimeoutError(directErr)) {
+      throw new Error('Cloud sync timed out (55s); record kept in offline queue for retry.');
     }
     throw new Error(directErr?.message || 'Cloud sync network error; record kept in offline queue for retry.');
   }
 
+  const directRawText = await directRes.text();
+  const parsedDirect = parseGasResponseText(directRawText, directRes.status);
   if (directRes.status !== 200 && directRes.status !== 201 && !directRes.ok) {
-    throw new Error(`Google Apps Script webhook failed with HTTP ${directRes.status}`);
+    throw new Error(parsedDirect.error || `Google Apps Script webhook failed with HTTP ${directRes.status}`);
+  }
+  if (!parsedDirect.data || parsedDirect.data.success === false || parsedDirect.data.status === 'error') {
+    throw new Error(parsedDirect.data?.error || parsedDirect.data?.message || parsedDirect.error || 'Google Apps Script rejected write');
   }
 
-  const directData = await directRes.json().catch(() => null);
+  const directData = parsedDirect.data;
   const directTsMs = directData?.server_received_at
     ? Date.parse(directData.server_received_at)
     : Date.now();
@@ -1243,8 +1289,13 @@ export const initializeTenantBusinessTabs = async (params?: {
   const compId = params?.companyId || currentComp.company_id || 'COMP-001';
   const compName = params?.companyName || currentComp.company_name || 'Tenant';
   const rawTargetSheetId = (params?.sheetId || currentComp.sheet_id || config.spreadsheetId || '').trim();
-  const targetSheetId = sanitizeTenantSheetId(compId, rawTargetSheetId, config.masterSpreadsheetId);
-  const targetWebhook = (params?.webhookUrl || currentComp.webhook_url || config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL).trim();
+  const safeInitTarget = resolveSafeGasTarget({
+    companyId: compId,
+    webhookUrl: params?.webhookUrl || currentComp.webhook_url || config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL,
+    spreadsheetId: rawTargetSheetId,
+  });
+  const targetSheetId = safeInitTarget.spreadsheetId;
+  const targetWebhook = safeInitTarget.webhookUrl;
   const initialProducts = params?.initialProducts || getInventoryItems();
 
   if (!isMasterCompanyId(compId) && isMasterSpreadsheetId(rawTargetSheetId, config.masterSpreadsheetId)) {
@@ -1262,75 +1313,108 @@ export const initializeTenantBusinessTabs = async (params?: {
   }
 
   // 1. First try server-side proxy route (/api/sheets/init-tenant-tabs) - robust, follows redirects, no CORS issues
+  let initProxyUnavailable = false;
   try {
-    const srvRes = await fetch('/api/sheets/init-tenant-tabs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        company_id: compId,
-        company_name: compName,
-        sheet_id: targetSheetId,
-        webhook_url: targetWebhook,
-        initial_products: initialProducts,
-      }),
-      signal: AbortSignal.timeout(28000),
-    });
+    const srvRes = await fetchWithTimeout(
+      '/api/sheets/init-tenant-tabs',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: compId,
+          company_name: compName,
+          sheet_id: targetSheetId,
+          webhook_url: targetWebhook,
+          initial_products: initialProducts,
+        }),
+      },
+      GAS_TIMEOUTS.HEAVY_CLIENT_MS
+    );
 
-    const srvData = await srvRes.json().catch(() => null);
-    if (srvRes.ok && srvData && srvData.success) {
-      updateTenantSheetBinding(compId, targetSheetId, targetWebhook);
-      const updatedComp = { ...currentComp, sheet_id: targetSheetId, webhook_url: targetWebhook };
-      saveCompany(updatedComp);
-      syncCompanyToCloud(updatedComp).catch(() => {});
-      pullTenantInventory(compId).catch(() => {});
+    if (srvRes.status === 404 || srvRes.status >= 502) {
+      initProxyUnavailable = true;
+    } else {
+      const srvText = await srvRes.text();
+      const parsedSrv = parseGasResponseText(srvText, srvRes.status);
+      const srvData = parsedSrv.data;
+      if (srvRes.ok && srvData && srvData.success) {
+        updateTenantSheetBinding(compId, targetSheetId, targetWebhook);
+        const updatedComp = { ...currentComp, sheet_id: targetSheetId, webhook_url: targetWebhook };
+        saveCompany(updatedComp);
+        syncCompanyToCloud(updatedComp).catch(() => {});
+        pullTenantInventory(compId).catch(() => {});
 
-      return {
-        success: true,
-        message: srvData.message || `✓ Initialized 25 business tabs and populated ${initialProducts.length} product(s) in Google Sheets!`,
-        createdTabs: srvData.tabs,
-        sheetId: targetSheetId,
-      };
-    } else if (srvData && srvData.message) {
+        return {
+          success: true,
+          message: srvData.message || `✓ Initialized 25 business tabs and populated ${initialProducts.length} product(s) in Google Sheets!`,
+          createdTabs: srvData.tabs,
+          sheetId: targetSheetId,
+        };
+      }
       return {
         success: false,
-        message: srvData.message,
+        message: srvData?.message || srvData?.error || parsedSrv.error || `Tab initialization failed (HTTP ${srvRes.status}).`,
       };
     }
   } catch (err: any) {
+    if (isTimeoutError(err)) {
+      return {
+        success: false,
+        message: 'Google Apps Script timed out while initializing tenant tabs. Please check the spreadsheet or retry.',
+      };
+    }
+    initProxyUnavailable = true;
     console.warn('[initializeTenantBusinessTabs] Server proxy attempt failed, trying direct webhook:', err);
   }
 
-  // 2. Direct Webhook fallback
-  if (targetWebhook && targetWebhook.startsWith('http')) {
+  // 2. Direct CORS-verified Webhook fallback (NO blind mode: 'no-cors' false success)
+  if (initProxyUnavailable && targetWebhook && targetWebhook.startsWith('http')) {
     try {
-      await fetch(targetWebhook, {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'initialize_tenant_sheet',
-          company_id: compId,
-          company_name: compName,
-          tenant_sheet_id: targetSheetId,
-          sheet_id: targetSheetId,
-          initial_products: initialProducts,
-        }),
-      });
+      const directRes = await fetchWithTimeout(
+        targetWebhook,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'initialize_tenant_sheet',
+            company_id: compId,
+            company_name: compName,
+            tenant_sheet_id: targetSheetId,
+            sheet_id: targetSheetId,
+            initial_products: initialProducts,
+          }),
+          redirect: 'follow',
+        },
+        GAS_TIMEOUTS.HEAVY_CLIENT_MS
+      );
 
-      updateTenantSheetBinding(compId, targetSheetId, targetWebhook);
-      const updatedComp = { ...currentComp, sheet_id: targetSheetId, webhook_url: targetWebhook };
-      saveCompany(updatedComp);
-      syncCompanyToCloud(updatedComp).catch(() => {});
+      const directText = await directRes.text();
+      const parsedDirect = parseGasResponseText(directText, directRes.status);
+      const directData = parsedDirect.data;
+      if (directRes.ok && directData && directData.success !== false && !directData.error) {
+        updateTenantSheetBinding(compId, targetSheetId, targetWebhook);
+        const updatedComp = { ...currentComp, sheet_id: targetSheetId, webhook_url: targetWebhook };
+        saveCompany(updatedComp);
+        syncCompanyToCloud(updatedComp).catch(() => {});
+
+        return {
+          success: true,
+          message: directData.message || `✓ Initialized tenant business tabs for ${compName} (${targetSheetId.slice(0, 8)}...).`,
+          createdTabs: directData.tabs,
+          sheetId: targetSheetId,
+        };
+      }
 
       return {
-        success: true,
-        message: `✓ Business tabs initialization dispatched for ${compName}! Open Google Sheet (${targetSheetId.slice(0, 8)}...) to verify.`,
-        sheetId: targetSheetId,
+        success: false,
+        message: directData?.error || directData?.message || parsedDirect.error || `Google Apps Script rejected tab initialization (HTTP ${directRes.status}).`,
       };
     } catch (directErr: any) {
       return {
         success: false,
-        message: `Failed to contact Google Apps Script Webhook: ${directErr?.message || String(directErr)}`,
+        message: isTimeoutError(directErr)
+          ? 'Google Apps Script timed out while initializing tenant tabs. Please retry.'
+          : `Failed to verify tab initialization with Google Apps Script: ${directErr?.message || String(directErr)}`,
       };
     }
   }
@@ -1396,7 +1480,11 @@ export const fetchProductsFromSheet = async (
 
   // 1. Try server endpoint
   try {
-    const res = await fetch(`/api/saas/call-action?action=get_inventory&company_id=${encodeURIComponent(compId)}&sheet_id=${encodeURIComponent(sheetId || '')}`);
+    const res = await fetchWithTimeout(
+      `/api/saas/call-action?action=get_inventory&company_id=${encodeURIComponent(compId)}&sheet_id=${encodeURIComponent(sheetId || '')}`,
+      { method: 'GET' },
+      GAS_TIMEOUTS.READ_CLIENT_MS
+    );
     if (res.ok) {
       const data = await res.json();
       if (data && data.success && Array.isArray(data.items)) {
@@ -1412,14 +1500,20 @@ export const fetchProductsFromSheet = async (
   } catch (err) {}
 
   // 2. Direct call to Google Apps Script
-  if (targetWebhook && targetWebhook.startsWith('http')) {
+  const safeInvWebhook = sanitizeMasterWebhookUrl(targetWebhook);
+  if (safeInvWebhook && safeInvWebhook.startsWith('http')) {
     try {
-      const url = targetWebhook.includes('?')
-        ? `${targetWebhook}&action=get_inventory&company_id=${encodeURIComponent(compId)}&sheet_id=${encodeURIComponent(sheetId || '')}`
-        : `${targetWebhook}?action=get_inventory&company_id=${encodeURIComponent(compId)}&sheet_id=${encodeURIComponent(sheetId || '')}`;
-      const res = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(10000) });
+      const url = safeInvWebhook.includes('?')
+        ? `${safeInvWebhook}&action=get_inventory&company_id=${encodeURIComponent(compId)}&sheet_id=${encodeURIComponent(sheetId || '')}`
+        : `${safeInvWebhook}?action=get_inventory&company_id=${encodeURIComponent(compId)}&sheet_id=${encodeURIComponent(sheetId || '')}`;
+      const res = await fetchWithTimeout(
+        url,
+        { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'follow' },
+        GAS_TIMEOUTS.READ_CLIENT_MS
+      );
       if (res.ok) {
-        const data = await res.json();
+        const parsed = parseGasResponseText(await res.text(), res.status);
+        const data = parsed.data;
         if (data && data.items && Array.isArray(data.items)) {
           await ingestViaSyncCore(data.items);
           return {
@@ -1459,7 +1553,7 @@ export const fetchCompaniesFromMasterSheet = async (
   message?: string;
 }> => {
   const config = getSheetsConfig();
-  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
+  const targetUrl = sanitizeMasterWebhookUrl(webhookUrl || config.masterWebhookUrl || config.webhookUrl || '');
 
   let remoteList: any[] = [];
   let remoteBranches: any[] = [];
@@ -1473,10 +1567,11 @@ export const fetchCompaniesFromMasterSheet = async (
     if (targetUrl && targetUrl.startsWith('http')) {
       queryParts.push(`webhookUrl=${encodeURIComponent(targetUrl)}`);
     }
-    const srvRes = await fetch(`/api/saas/companies?${queryParts.join('&')}`, {
-      method: 'GET',
-      signal: AbortSignal.timeout(20000),
-    });
+    const srvRes = await fetchWithTimeout(
+      `/api/saas/companies?${queryParts.join('&')}`,
+      { method: 'GET' },
+      GAS_TIMEOUTS.READ_CLIENT_MS
+    );
     if (srvRes.ok) {
       const srvData = await srvRes.json().catch(() => null);
       if (srvData) {
@@ -1503,28 +1598,35 @@ export const fetchCompaniesFromMasterSheet = async (
 
       let data: any = null;
       try {
-        const res = await fetch(urlWithAction, {
-          method: 'GET',
-          signal: AbortSignal.timeout(18000),
-        });
+        const res = await fetchWithTimeout(
+          urlWithAction,
+          { method: 'GET', redirect: 'follow' },
+          GAS_TIMEOUTS.READ_CLIENT_MS
+        );
         if (res.ok) {
-          const txt = await res.text();
-          try { data = JSON.parse(txt); } catch { data = null; }
+          const parsed = parseGasResponseText(await res.text(), res.status);
+          data = parsed.data;
+          if (!data && parsed.error) cloudError = parsed.error;
         }
       } catch {
         data = null;
       }
 
       if (!data || data.success === false) {
-        const postRes = await fetch(targetUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({ action: 'get_companies' }),
-          signal: AbortSignal.timeout(18000),
-        });
+        const postRes = await fetchWithTimeout(
+          targetUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ action: 'get_companies' }),
+            redirect: 'follow',
+          },
+          GAS_TIMEOUTS.READ_CLIENT_MS
+        );
         if (postRes.ok) {
-          const txt = await postRes.text();
-          try { data = JSON.parse(txt); } catch { data = null; }
+          const parsed = parseGasResponseText(await postRes.text(), postRes.status);
+          data = parsed.data;
+          if (!data && parsed.error) cloudError = parsed.error;
         }
       }
 
@@ -1712,6 +1814,14 @@ export const fetchCompaniesFromMasterSheet = async (
     }
 
     if (cloudSynced) {
+      if (remoteList.length > 0) {
+        const remoteIds = remoteList
+          .map((c) => String(c?.company_id || '').trim())
+          .filter(Boolean);
+        if (remoteIds.length > 0) {
+          pruneLocalCompaniesToAllowlist(remoteIds);
+        }
+      }
       return {
         success: true,
         cloudSynced: true,
@@ -1791,6 +1901,89 @@ export interface CloudRegistrationResult {
  * STRICT ONLINE GUARANTEE: Returns `success: false, cloudSynced: false` with the exact cloud error
  * if the Master Google Sheet does NOT confirm registration.
  */
+// Shared fetchWithTimeout and sleepMs imported from ./sync/gasTransport
+
+const verifyCompanyOnMasterSheet = async (
+  companyId: string,
+  ownerEmail: string,
+  targetUrl: string,
+  masterSheetId: string,
+  attempts: number = 3
+): Promise<{
+  verified: boolean;
+  company?: any;
+  sheetId?: string;
+}> => {
+  const cleanId = String(companyId || '').trim();
+  const cleanEmail = String(ownerEmail || '').trim().toLowerCase();
+  if (!cleanId && !cleanEmail) return { verified: false };
+
+  const queryOne = async (): Promise<any | null> => {
+    // Try direct CORS-friendly GET to Apps Script first (~2s)
+    if (targetUrl && targetUrl.startsWith('http')) {
+      try {
+        const sep = targetUrl.includes('?') ? '&' : '?';
+        const lookupUrl = `${targetUrl}${sep}action=lookup_company&company_id=${encodeURIComponent(cleanId)}&_t=${Date.now()}`;
+        const res = await fetchWithTimeout(lookupUrl, { method: 'GET', redirect: 'follow' }, 15000);
+        if (res.ok) {
+          const text = await res.text();
+          const parsed = JSON.parse(text);
+          if (parsed?.success && parsed?.exists && parsed?.company) {
+            return parsed.company;
+          }
+        }
+      } catch {
+        // Fall through to server proxy lookup
+      }
+    }
+
+    // Fallback: Server proxy call-action lookup_company
+    try {
+      const res = await fetchWithTimeout(
+        '/api/saas/call-action',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'lookup_company',
+            company_id: cleanId,
+            webhookUrl: targetUrl || undefined,
+          }),
+        },
+        15000
+      );
+      if (res.ok) {
+        const parsed = await res.json().catch(() => null);
+        if (parsed?.success && parsed?.exists && parsed?.company) {
+          return parsed.company;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  };
+
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await sleepMs(2500 + i * 1500);
+    const found = await queryOne();
+    if (found && String(found.company_id || '').trim().toUpperCase() === cleanId.toUpperCase()) {
+      let sid = sanitizeTenantSheetId(cleanId, found.sheet_id || found.spreadsheet_id || '', masterSheetId);
+      // If company row just landed and dedicated sheet is still being provisioned, give Apps Script one short window
+      if (!sid && i < attempts - 1) {
+        await sleepMs(4500);
+        const refreshed = await queryOne();
+        if (refreshed) {
+          sid = sanitizeTenantSheetId(cleanId, refreshed.sheet_id || refreshed.spreadsheet_id || '', masterSheetId);
+          return { verified: true, company: refreshed, sheetId: sid };
+        }
+      }
+      return { verified: true, company: found, sheetId: sid };
+    }
+  }
+  return { verified: false };
+};
+
 export const registerCompanyInCloud = async (
   payload: CloudRegistrationPayload,
   webhookUrl?: string
@@ -1802,23 +1995,66 @@ export const registerCompanyInCloud = async (
   const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
   const clientRequestId = `REQ-SIGNUP-${payload.company_id}-${Date.now()}`;
 
+  const buildConfirmedResult = (
+    sourceData: any,
+    message: string
+  ): CloudRegistrationResult => {
+    const confirmedCompId = String(sourceData?.company_id || payload.company_id).trim();
+    const sid = sanitizeTenantSheetId(
+      confirmedCompId,
+      sourceData?.sheet_id || sourceData?.spreadsheet_id || '',
+      masterSheetId
+    );
+    const ep = Number(sourceData?.routing_epoch || 1);
+    if (sid) updateTenantSheetBinding(confirmedCompId, sid);
+    if (ep > 0) setRoutingEpoch(confirmedCompId, ep);
+    if (sourceData?.token) setTenantAuthToken(confirmedCompId, String(sourceData.token));
+
+    return {
+      success: true,
+      cloudSynced: true,
+      company_id: confirmedCompId,
+      branch_id: sourceData?.branch_id || payload.branch_id,
+      user_id: sourceData?.user_id || payload.user_id,
+      sheet_id: sid,
+      spreadsheet_id: sid,
+      dedicated_sheet_provisioned: Boolean(sid),
+      provisioned_via: sourceData?.provisioned_via || '',
+      provision_error: sourceData?.provision_error || undefined,
+      activation_code: sourceData?.activation_code || sourceData?.offline_activation_code || undefined,
+      next_billing_date: sourceData?.next_billing_date || undefined,
+      url: sid ? (sourceData?.url || `https://docs.google.com/spreadsheets/d/${sid}/edit`) : '',
+      routing_epoch: ep,
+      token: sourceData?.token,
+      message,
+    };
+  };
+
   let serverCloudError = '';
+  let proxyExisted = false;
 
   // 1. Primary: Server proxy (/api/saas/signup)
   try {
-    const res = await fetch('/api/saas/signup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...payload,
-        clientRequestId,
-        auto_provision: payload.auto_provision !== false,
-        full_name: payload.owner_name,
-        pin: payload.password,
-        webhookUrl: targetUrl || undefined,
-      }),
-      signal: AbortSignal.timeout(48000),
-    });
+    const res = await fetchWithTimeout(
+      '/api/saas/signup',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...payload,
+          clientRequestId,
+          auto_provision: payload.auto_provision !== false,
+          full_name: payload.owner_name,
+          pin: payload.password,
+          webhookUrl: targetUrl || undefined,
+        }),
+      },
+      70000
+    );
+
+    if (res.status !== 404) {
+      proxyExisted = true;
+    }
 
     const data = await res.json().catch(() => null);
     if (res.status === 409 || data?.code === 'DUPLICATE_EMAIL') {
@@ -1832,39 +2068,15 @@ export const registerCompanyInCloud = async (
     }
 
     if (res.ok && data && data.cloudSynced === true) {
-      const sid = sanitizeTenantSheetId(
-        data.company_id || payload.company_id,
-        data.sheet_id || data.spreadsheet_id || '',
-        masterSheetId
+      return buildConfirmedResult(
+        data,
+        data.message || 'Registered and synced to Master Google Sheet.'
       );
-      const ep = Number(data.routing_epoch || 1);
-      if (sid) updateTenantSheetBinding(data.company_id || payload.company_id, sid);
-      if (ep > 0) setRoutingEpoch(data.company_id || payload.company_id, ep);
-      if (data.token) setTenantAuthToken(data.company_id || payload.company_id, String(data.token));
-
-      return {
-        success: true,
-        cloudSynced: true,
-        company_id: data.company_id || payload.company_id,
-        branch_id: data.branch_id || payload.branch_id,
-        user_id: data.user_id || payload.user_id,
-        sheet_id: sid,
-        spreadsheet_id: sid,
-        dedicated_sheet_provisioned: Boolean(sid),
-        provisioned_via: data.provisioned_via || '',
-        provision_error: data.provision_error || undefined,
-        activation_code: data.activation_code || undefined,
-        next_billing_date: data.next_billing_date || undefined,
-        url: sid ? (data.url || `https://docs.google.com/spreadsheets/d/${sid}/edit`) : '',
-        routing_epoch: ep,
-        token: data.token,
-        message: data.message || 'Registered and synced to Master Google Sheet.',
-      };
     }
 
     if (data?.cloudError || data?.error || data?.message) {
       serverCloudError = String(data.cloudError || data.error || data.message);
-    } else if (!res.ok) {
+    } else if (!res.ok && res.status !== 404) {
       serverCloudError = `Server registration proxy returned HTTP ${res.status}`;
     }
   } catch (srvErr: any) {
@@ -1874,22 +2086,49 @@ export const registerCompanyInCloud = async (
         : srvErr?.message || String(srvErr);
   }
 
-  // 2. Fallback: CORS-safe direct Apps Script POST (reusing exact same clientRequestId for idempotency)
+  // If the server proxy existed and dispatched to Google (but timed out or errored), verify Master Sheet BEFORE sending another POST!
+  if (proxyExisted) {
+    const verifiedAfterProxy = await verifyCompanyOnMasterSheet(
+      payload.company_id,
+      payload.owner_email,
+      targetUrl,
+      masterSheetId,
+      2
+    );
+    if (verifiedAfterProxy.verified && verifiedAfterProxy.company) {
+      return buildConfirmedResult(
+        {
+          ...verifiedAfterProxy.company,
+          sheet_id: verifiedAfterProxy.sheetId || verifiedAfterProxy.company.sheet_id || '',
+        },
+        'Confirmed on Master Google Sheet after verification.'
+      );
+    }
+  }
+
+  // 2. Fallback: Direct Apps Script POST (used on static hosts like Vercel where /api/saas/signup is 404, or if server proxy was unreachable)
   if (targetUrl && targetUrl.startsWith('http')) {
+    const directBody = JSON.stringify({
+      action: 'signup_company',
+      clientRequestId,
+      ...payload,
+      auto_provision: payload.auto_provision !== false,
+      full_name: payload.owner_name,
+      pin: payload.password,
+    });
+
+    let directPostThrewNetworkOrCors = false;
     try {
-      const directRes = await fetch(targetUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'signup_company',
-          clientRequestId,
-          ...payload,
-          auto_provision: payload.auto_provision !== false,
-          full_name: payload.owner_name,
-          pin: payload.password,
-        }),
-        signal: AbortSignal.timeout(45000),
-      });
+      const directRes = await fetchWithTimeout(
+        targetUrl,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: directBody,
+          redirect: 'follow',
+        },
+        65000
+      );
 
       const text = await directRes.text();
       let data: any = null;
@@ -1910,34 +2149,7 @@ export const registerCompanyInCloud = async (
       }
 
       if (directRes.ok && data && (data.success === true || data.status === 'success')) {
-        const sid = sanitizeTenantSheetId(
-          data.company_id || payload.company_id,
-          data.sheet_id || data.spreadsheet_id || '',
-          masterSheetId
-        );
-        const ep = Number(data.routing_epoch || 1);
-        if (sid) updateTenantSheetBinding(data.company_id || payload.company_id, sid);
-        if (ep > 0) setRoutingEpoch(data.company_id || payload.company_id, ep);
-        if (data.token) setTenantAuthToken(data.company_id || payload.company_id, String(data.token));
-
-        return {
-          success: true,
-          cloudSynced: true,
-          company_id: data.company_id || payload.company_id,
-          branch_id: data.branch_id || payload.branch_id,
-          user_id: data.user_id || payload.user_id,
-          sheet_id: sid,
-          spreadsheet_id: sid,
-          dedicated_sheet_provisioned: Boolean(sid),
-          provisioned_via: data.provisioned_via || '',
-          provision_error: data.provision_error || undefined,
-          activation_code: data.activation_code || undefined,
-          next_billing_date: data.next_billing_date || undefined,
-          url: sid ? (data.url || `https://docs.google.com/spreadsheets/d/${sid}/edit`) : '',
-          routing_epoch: ep,
-          token: data.token,
-          message: 'Registered directly in Master Google Sheet.',
-        };
+        return buildConfirmedResult(data, 'Registered directly in Master Google Sheet.');
       }
 
       if (!data && text && text.trim().startsWith('<')) {
@@ -1952,17 +2164,74 @@ export const registerCompanyInCloud = async (
         );
       }
     } catch (directErr: any) {
+      directPostThrewNetworkOrCors = true;
       const directMsg =
         directErr?.name === 'TimeoutError' || directErr?.name === 'AbortError'
-          ? 'Master Google Apps Script timed out after 45s. Please try again.'
+          ? 'Master Google Apps Script took longer than 65s to respond.'
           : directErr?.message || String(directErr);
-      serverCloudError = serverCloudError ? `${serverCloudError} | Direct fallback: ${directMsg}` : directMsg;
+      serverCloudError = serverCloudError ? `${serverCloudError} | Direct sync: ${directMsg}` : directMsg;
+    }
+
+    // 3. Post-POST Master Sheet Verification Recovery:
+    // On mobile browsers / WebViews (e.g. Android GBox / Chrome), Google Apps Script's 302 redirect from
+    // script.google.com -> script.googleusercontent.com can fail CORS read AFTER doPost already wrote the tenant!
+    // Verify via GET lookup_company before ever reporting failure.
+    if (directPostThrewNetworkOrCors) {
+      const verifiedAfterDirect = await verifyCompanyOnMasterSheet(
+        payload.company_id,
+        payload.owner_email,
+        targetUrl,
+        masterSheetId,
+        3
+      );
+      if (verifiedAfterDirect.verified && verifiedAfterDirect.company) {
+        return buildConfirmedResult(
+          {
+            ...verifiedAfterDirect.company,
+            sheet_id: verifiedAfterDirect.sheetId || verifiedAfterDirect.company.sheet_id || '',
+          },
+          'Registered and verified on Master Google Sheet.'
+        );
+      }
+
+      // If the browser blocked the CORS POST before transmitting, send via no-cors ONLY with strict read-back verification.
+      try {
+        await fetchWithTimeout(
+          targetUrl,
+          {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: directBody,
+          },
+          20000
+        );
+        await sleepMs(4000);
+        const verifiedAfterNoCors = await verifyCompanyOnMasterSheet(
+          payload.company_id,
+          payload.owner_email,
+          targetUrl,
+          masterSheetId,
+          4
+        );
+        if (verifiedAfterNoCors.verified && verifiedAfterNoCors.company) {
+          return buildConfirmedResult(
+            {
+              ...verifiedAfterNoCors.company,
+              sheet_id: verifiedAfterNoCors.sheetId || verifiedAfterNoCors.company.sheet_id || '',
+            },
+            'Registered and verified on Master Google Sheet.'
+          );
+        }
+      } catch {
+        // Strict online guarantee: never assume success without Master Sheet verification
+      }
     }
   }
 
   const finalError =
     serverCloudError ||
-    'Master Google Sheet webhook is not configured or unreachable. Please check your internet connection and try again.';
+    'Master Google Sheet webhook could not be reached to confirm registration.';
 
   return {
     success: false,
@@ -2014,17 +2283,20 @@ export const autoProvisionDedicatedTenantSheet = async (
 
   // 1. Primary: Server proxy (/api/saas/provision-tenant-sheet)
   try {
-    const res = await fetch('/api/saas/provision-tenant-sheet', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        company_id: company.company_id,
-        company_name: company.company_name,
-        webhookUrl: targetWebhook || undefined,
-        force_new: true,
-      }),
-      signal: AbortSignal.timeout(48000),
-    });
+    const res = await fetchWithTimeout(
+      '/api/saas/provision-tenant-sheet',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          company_id: company.company_id,
+          company_name: company.company_name,
+          webhookUrl: targetWebhook || undefined,
+          force_new: true,
+        }),
+      },
+      70000
+    );
 
     const data = await res.json().catch(() => null);
     if (res.ok && data && data.success) {
@@ -2047,33 +2319,38 @@ export const autoProvisionDedicatedTenantSheet = async (
       lastError = 'Server returned an empty or Master Sheet ID instead of a dedicated tenant sheet.';
     } else if (data?.error || data?.message) {
       lastError = String(data.error || data.message);
-    } else {
+    } else if (res.status !== 404) {
       lastError = `Server provisioning endpoint returned HTTP ${res.status}`;
     }
   } catch (err: any) {
     lastError =
       err?.name === 'TimeoutError' || err?.name === 'AbortError'
-        ? 'Provisioning timed out waiting for Apps Script (48s).'
+        ? 'Provisioning timed out waiting for Apps Script (70s).'
         : err?.message || String(err);
   }
 
-  // 2. Fallback: Direct CORS-safe Apps Script `allocate_tenant` call (sheet_id explicitly blank + force_new: true)
+  // 2. Fallback: Direct Apps Script `allocate_tenant` call (sheet_id explicitly blank + force_new: true)
   if (targetWebhook && targetWebhook.startsWith('http')) {
+    let directThrew = false;
     try {
-      const directRes = await fetch(targetWebhook, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({
-          action: 'allocate_tenant',
-          clientRequestId: `REQ-PROV-DIRECT-${company.company_id}-${Date.now()}`,
-          company_id: company.company_id,
-          company_name: company.company_name,
-          sheet_id: '',
-          tenant_sheet_id: '',
-          force_new: true,
-        }),
-        signal: AbortSignal.timeout(45000),
-      });
+      const directRes = await fetchWithTimeout(
+        targetWebhook,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            action: 'allocate_tenant',
+            clientRequestId: `REQ-PROV-DIRECT-${company.company_id}-${Date.now()}`,
+            company_id: company.company_id,
+            company_name: company.company_name,
+            sheet_id: '',
+            tenant_sheet_id: '',
+            force_new: true,
+          }),
+          redirect: 'follow',
+        },
+        65000
+      );
       const text = await directRes.text();
       let parsed: any = null;
       try {
@@ -2108,7 +2385,22 @@ export const autoProvisionDedicatedTenantSheet = async (
         lastError = String(parsed.error || parsed.message);
       }
     } catch (directErr: any) {
+      directThrew = true;
       if (!lastError) lastError = directErr?.message || String(directErr);
+    }
+
+    if (directThrew) {
+      const verified = await verifyCompanyOnMasterSheet(company.company_id, '', targetWebhook, masterSheetId, 3);
+      if (verified.verified && verified.sheetId && verified.sheetId.length >= 15) {
+        updateTenantSheetBinding(company.company_id, verified.sheetId);
+        return {
+          success: true,
+          sheet_id: verified.sheetId,
+          url: verified.company?.url || `https://docs.google.com/spreadsheets/d/${verified.sheetId}/edit`,
+          provisioned_via: 'MASTER_SHEET_VERIFIED',
+          message: `Provisioned & verified dedicated Google Sheet (${verified.sheetId.slice(0, 12)}...) for ${company.company_name}!`,
+        };
+      }
     }
   }
 
@@ -2129,23 +2421,26 @@ export const syncCompanyToCloud = async (
   webhookUrl?: string
 ): Promise<{ success: boolean; cloudSynced?: boolean; message?: string }> => {
   const config = getSheetsConfig();
-  const targetUrl = (webhookUrl || config.masterWebhookUrl || config.webhookUrl || '').trim();
+  const targetUrl = sanitizeMasterWebhookUrl(webhookUrl || config.masterWebhookUrl || config.webhookUrl || '');
 
   let cloudSynced = false;
   let cloudError = '';
 
   // 1. Primary: Notify backend server store & let server forward to Master Sheet (zero CORS)
   try {
-    const srvRes = await fetch('/api/saas/sync-company', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...company,
-        branch,
-        owner,
-      }),
-      signal: AbortSignal.timeout(18000),
-    });
+    const srvRes = await fetchWithTimeout(
+      '/api/saas/sync-company',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...company,
+          branch,
+          owner,
+        }),
+      },
+      GAS_TIMEOUTS.WRITE_CLIENT_MS
+    );
     if (srvRes.ok) {
       const srvData = await srvRes.json().catch(() => null);
       if (srvData?.cloudSynced === true) {
@@ -2168,28 +2463,31 @@ export const syncCompanyToCloud = async (
 
   // 2. Fallback: CORS-safe direct Apps Script POST (no preflight, reads real JSON response)
   try {
-    const directRes = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({
-        action: 'sync_company',
-        data: {
-          ...company,
-          branch,
-          owner,
-        },
-      }),
-      signal: AbortSignal.timeout(18000),
-    });
+    const directRes = await fetchWithTimeout(
+      targetUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({
+          action: 'sync_company',
+          data: {
+            ...company,
+            branch,
+            owner,
+          },
+        }),
+        redirect: 'follow',
+      },
+      GAS_TIMEOUTS.WRITE_CLIENT_MS
+    );
     if (directRes.ok) {
-      const txt = await directRes.text();
-      let parsed: any = null;
-      try { parsed = JSON.parse(txt); } catch { parsed = null; }
-      if (parsed && parsed.success !== false && !parsed.error) {
+      const parsed = parseGasResponseText(await directRes.text(), directRes.status);
+      const parsedData = parsed.data;
+      if (parsedData && parsedData.success !== false && !parsedData.error) {
         cloudSynced = true;
         return { success: true, cloudSynced: true, message: 'Synchronized to Master Google Sheet' };
       }
-      cloudError = String(parsed?.error || parsed?.message || cloudError);
+      cloudError = String(parsedData?.error || parsedData?.message || parsed.error || cloudError);
     }
     return {
       success: false,
@@ -2234,30 +2532,34 @@ export const authenticateOwnerWithAppsScript = async (
   rawPassword: string
 ): Promise<OwnerAuthResponse> => {
   const config = getSheetsConfig();
-  const targetWebhook = config.masterWebhookUrl || config.webhookUrl;
+  const targetWebhook = sanitizeMasterWebhookUrl(config.masterWebhookUrl || config.webhookUrl);
   const cleanEmail = email.trim().toLowerCase();
 
   // 1. Primary: Server Proxy (/api/saas/owner-login) - Fast local in-memory auth, zero CORS, follows redirects
   try {
-    const srvRes = await fetch('/api/saas/owner-login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'login_owner',
-        email: cleanEmail,
-        password: rawPassword,
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
+    const srvRes = await fetchWithTimeout(
+      '/api/saas/owner-login',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'login_owner',
+          email: cleanEmail,
+          password: rawPassword,
+        }),
+      },
+      GAS_TIMEOUTS.AUTH_CLIENT_MS
+    );
 
     if (srvRes.ok) {
       const srvData = await srvRes.json();
-      if (srvData && (srvData.status === 'success' || srvData.success === true)) {
+      const resolvedSrvComp = String(srvData?.company_id || srvData?.businessId || '').trim();
+      if (srvData && (srvData.status === 'success' || srvData.success === true) && resolvedSrvComp) {
         return {
           status: 'success',
           role: srvData.role || 'owner',
-          businessId: srvData.businessId || srvData.company_id || 'COMP-001',
-          company_id: srvData.company_id || srvData.businessId || 'COMP-001',
+          businessId: resolvedSrvComp,
+          company_id: resolvedSrvComp,
           company_name: srvData.company_name || srvData.companyName || '',
           branch_id: srvData.branch_id || 'BR-MAIN',
           user_id: srvData.user_id,
@@ -2323,30 +2625,34 @@ export const authenticateOwnerWithAppsScript = async (
   // 3. Optional Direct Webhook fallback for standalone static PWAs without local server
   if (targetWebhook && targetWebhook.startsWith('http')) {
     try {
-      const response = await fetch(targetWebhook, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'text/plain;charset=utf-8',
+      const response = await fetchWithTimeout(
+        targetWebhook,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain;charset=utf-8',
+          },
+          body: JSON.stringify({
+            action: 'login_owner',
+            email: cleanEmail,
+            password: rawPassword,
+          }),
+          redirect: 'follow',
         },
-        body: JSON.stringify({
-          action: 'login_owner',
-          email: cleanEmail,
-          password: rawPassword,
-        }),
-        signal: AbortSignal.timeout(8000),
-      });
+        GAS_TIMEOUTS.AUTH_CLIENT_MS
+      );
 
       if (response.ok) {
-        const text = await response.text();
-        let data: any = null;
-        try { data = JSON.parse(text); } catch { data = null; }
+        const parsed = parseGasResponseText(await response.text(), response.status);
+        const data = parsed.data;
+        const resolvedDirectComp = String(data?.company_id || data?.businessId || '').trim();
 
-        if (data && (data.status === 'success' || data.success === true)) {
+        if (data && (data.status === 'success' || data.success === true) && resolvedDirectComp) {
           return {
             status: 'success',
             role: data.role || 'owner',
-            businessId: data.businessId || data.company_id || 'COMP-001',
-            company_id: data.company_id || data.businessId || 'COMP-001',
+            businessId: resolvedDirectComp,
+            company_id: resolvedDirectComp,
             company_name: data.company_name || data.companyName || '',
             branch_id: data.branch_id || 'BR-MAIN',
             user_id: data.user_id,
@@ -2469,22 +2775,25 @@ export const authenticateStaffWithAppsScript = async (
 
   // 1. Primary: Server Proxy (/api/saas/staff-login) - Fast local in-memory auth, zero CORS, follows redirects
   try {
-    const srvRes = await fetch('/api/saas/staff-login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+    const srvRes = await fetchWithTimeout(
+      '/api/saas/staff-login',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          action: 'login_staff',
+          businessId: cleanCompId,
+          company_id: cleanCompId,
+          userId: cleanStaffId,
+          staffId: cleanStaffId,
+          name: cleanStaffName,
+          pin: cleanPin,
+        }),
       },
-      body: JSON.stringify({
-        action: 'login_staff',
-        businessId: cleanCompId,
-        company_id: cleanCompId,
-        userId: cleanStaffId,
-        staffId: cleanStaffId,
-        name: cleanStaffName,
-        pin: cleanPin,
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
+      GAS_TIMEOUTS.AUTH_CLIENT_MS
+    );
 
     if (srvRes.ok) {
       const srvData = await srvRes.json();
@@ -2573,7 +2882,7 @@ export const authenticateStaffWithAppsScript = async (
 
   // 3. Optional Direct Webhook fallback for standalone static PWAs without local server
   const config = getSheetsConfig();
-  const appsScriptUrl = config.masterWebhookUrl || config.webhookUrl;
+  const appsScriptUrl = sanitizeMasterWebhookUrl(config.masterWebhookUrl || config.webhookUrl);
 
   if (appsScriptUrl && appsScriptUrl.startsWith('http')) {
     try {
@@ -2588,23 +2897,22 @@ export const authenticateStaffWithAppsScript = async (
         pinHash,
       };
 
-      const response = await fetch(appsScriptUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'text/plain;charset=utf-8',
+      const response = await fetchWithTimeout(
+        appsScriptUrl,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain;charset=utf-8',
+          },
+          body: JSON.stringify(payload),
+          redirect: 'follow',
         },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(8000),
-      });
+        GAS_TIMEOUTS.AUTH_CLIENT_MS
+      );
 
       if (response.ok) {
-        const text = await response.text();
-        let data: any = null;
-        try {
-          data = JSON.parse(text);
-        } catch {
-          data = null;
-        }
+        const parsed = parseGasResponseText(await response.text(), response.status);
+        const data = parsed.data;
 
         if (data && (data.status === 'success' || data.success === true)) {
           return {
@@ -2679,11 +2987,16 @@ export const refreshCloudJwtToken = async (
   routing_epoch?: number;
   error?: string;
 }> => {
-  const cleanComp = String(companyId || getCurrentCompanyId() || 'COMP-001').trim();
+  const cleanComp = String(companyId || getCurrentCompanyId() || '').trim();
+  if (!cleanComp) {
+    return { success: false, error: 'MISSING_COMPANY_ID: company_id is required to refresh JWT token.' };
+  }
   const currentJwt = getTenantAuthToken(cleanComp);
   const config = getSheetsConfig();
   const comp = getCompanies().find((c) => c.company_id === cleanComp);
-  const targetWebhook = String(comp?.webhook_url || config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL || '').trim();
+  const targetWebhook = sanitizeMasterWebhookUrl(
+    comp?.webhook_url || config.webhookUrl || config.masterWebhookUrl || DEFAULT_MASTER_WEBHOOK_URL || ''
+  );
 
   const reqPayload = {
     action: 'refresh_token',
@@ -2713,15 +3026,18 @@ export const refreshCloudJwtToken = async (
   };
 
   try {
-    const proxyRes = await fetch('/api/saas/call-action', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(currentJwt ? { Authorization: `Bearer ${currentJwt}` } : {}),
+    const proxyRes = await fetchWithTimeout(
+      '/api/saas/call-action',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(currentJwt ? { Authorization: `Bearer ${currentJwt}` } : {}),
+        },
+        body: JSON.stringify(reqPayload),
       },
-      body: JSON.stringify(reqPayload),
-      signal: AbortSignal.timeout(8000),
-    });
+      GAS_TIMEOUTS.AUTH_CLIENT_MS
+    );
     if (proxyRes.ok) {
       const json = await proxyRes.json().catch(() => null);
       const applied = applyRefreshData(json);
@@ -2731,17 +3047,21 @@ export const refreshCloudJwtToken = async (
 
   if (targetWebhook && targetWebhook.startsWith('http')) {
     try {
-      const directRes = await fetch(targetWebhook, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify(reqPayload),
-        signal: AbortSignal.timeout(8000),
-      });
+      const directRes = await fetchWithTimeout(
+        targetWebhook,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify(reqPayload),
+          redirect: 'follow',
+        },
+        GAS_TIMEOUTS.AUTH_CLIENT_MS
+      );
       if (directRes.ok) {
-        const json = await directRes.json().catch(() => null);
-        const applied = applyRefreshData(json);
+        const parsed = parseGasResponseText(await directRes.text(), directRes.status);
+        const applied = applyRefreshData(parsed.data);
         if (applied?.success) return applied;
-        return { success: false, error: json?.error || 'Refresh rejected' };
+        return { success: false, error: parsed.data?.error || parsed.error || 'Refresh rejected' };
       }
     } catch (err: any) {
       return { success: false, error: err?.message || 'Refresh network failure' };

@@ -16,7 +16,12 @@ export type TrustedTimeSource =
 
 export interface ClockSecurityAlert {
   id: string;
-  type: 'CLOCK_TAMPERING' | 'HUB_REJECTED_BACKDATE' | 'SUSPICIOUS_BACKDATE';
+  type:
+    | 'CLOCK_TAMPERING'
+    | 'HUB_FLAGGED_BACKDATE'
+    | 'VOID_REFUND_BLOCKED'
+    | 'HUB_REJECTED_BACKDATE'
+    | 'SUSPICIOUS_BACKDATE';
   deviceId: string;
   deviceName?: string;
   staffName?: string;
@@ -141,7 +146,10 @@ export function recordSecurityAlert(alert: Omit<ClockSecurityAlert, 'id' | 'crea
     acknowledged: Boolean(alert.acknowledged),
   };
 
-  // Avoid duplicate alerts for identical invoice/packet IDs
+  const nowMs = Date.parse(newAlert.createdAt) || Date.now();
+
+  // Deduplicate identical invoice alerts AND collapse repeated CLOCK_TAMPERING / HUB_FLAGGED_BACKDATE
+  // alerts from the same device within 15 minutes so the review panel doesn't flood with 100+ copies.
   const filtered = existing.filter((a) => {
     if (newAlert.id && a.id === newAlert.id) return false;
     if (
@@ -150,6 +158,18 @@ export function recordSecurityAlert(alert: Omit<ClockSecurityAlert, 'id' | 'crea
       a.type === newAlert.type
     ) {
       return false;
+    }
+    if (
+      !newAlert.invoiceId &&
+      !a.invoiceId &&
+      !a.acknowledged &&
+      a.deviceId === newAlert.deviceId &&
+      a.type === newAlert.type
+    ) {
+      const prevMs = Date.parse(a.createdAt || '');
+      if (Number.isFinite(prevMs) && Math.abs(nowMs - prevMs) < 15 * 60 * 1000) {
+        return false;
+      }
     }
     return true;
   });
@@ -163,6 +183,13 @@ export function recordSecurityAlert(alert: Omit<ClockSecurityAlert, 'id' | 'crea
 export function acknowledgeSecurityAlert(alertId: string): void {
   const existing = getSecurityAlerts();
   const next = existing.map((a) => (a.id === alertId ? { ...a, acknowledged: true } : a));
+  saveSecurityAlerts(next);
+  notifyClockSecurityListeners();
+}
+
+export function acknowledgeAllSecurityAlerts(): void {
+  const existing = getSecurityAlerts();
+  const next = existing.map((a) => ({ ...a, acknowledged: true }));
   saveSecurityAlerts(next);
   notifyClockSecurityListeners();
 }
@@ -236,11 +263,18 @@ async function fetchNetworkServerTimeMs(): Promise<number | null> {
 
   try {
     const t0 = Date.now();
-    const res = await fetch('/api/health', {
-      method: 'GET',
-      cache: 'no-store',
-      signal: AbortSignal.timeout(3500),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    let res: Response;
+    try {
+      res = await fetch('/api/health', {
+        method: 'GET',
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
     const t1 = Date.now();
     const rttHalf = Math.max(0, Math.round((t1 - t0) / 2));
 
@@ -328,7 +362,8 @@ export function reportTrustedTimeSample(
 }
 
 /**
- * Triggers a security lock directly (e.g., when Termux Hub rejects a packet and sends `SECURITY_ALERT`).
+ * Triggers the void/refund security restriction when clock tampering or a flagged Hub packet is detected.
+ * Operational data (sales, cash logs, sync packets) continues flowing to the Hub & Cloud uninterrupted.
  */
 export function triggerClockTamperLock(
   reason: string,
@@ -339,7 +374,9 @@ export function triggerClockTamperLock(
     invoiceId?: string;
     claimedTimestamp?: number;
     hubTimestamp?: number;
+    serverReceivedAt?: string;
     lockCurrentDevice?: boolean;
+    alertType?: ClockSecurityAlert['type'];
   }
 ): ClockSecurityAlert {
   const lockThisDevice = meta?.lockCurrentDevice !== false;
@@ -361,13 +398,14 @@ export function triggerClockTamperLock(
   }
 
   const alert = recordSecurityAlert({
-    type: 'HUB_REJECTED_BACKDATE',
+    type: meta?.alertType || 'HUB_FLAGGED_BACKDATE',
     deviceId: meta?.deviceId || 'UNKNOWN-DEVICE',
     deviceName: meta?.deviceName,
     packetType: meta?.packetType,
     invoiceId: meta?.invoiceId,
     claimedTimestamp: meta?.claimedTimestamp,
     hubTimestamp: meta?.hubTimestamp,
+    serverReceivedAt: meta?.serverReceivedAt,
     driftMs: driftMs ?? undefined,
     message: reason,
   });
@@ -625,6 +663,7 @@ export function useClockSecurity() {
     alerts,
     recheckClock: isDeviceTimeAutomatic,
     acknowledgeAlert: acknowledgeSecurityAlert,
+    acknowledgeAllAlerts: acknowledgeAllSecurityAlerts,
     clearAcknowledgedAlerts: clearAcknowledgedSecurityAlerts,
   };
 }

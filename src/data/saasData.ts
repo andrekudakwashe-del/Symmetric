@@ -154,7 +154,7 @@ export const MASTER_PERMISSIONS_52: PermissionRule[] = [
   { id: 'p52', role: 'SUPERVISOR', module: 'reports', action: 'profit_margin', allowed: true, label: 'View Gross Margin & Profit Reports', section: 'Financial Reports', restricted: true },
 ];
 
-// Seed Company
+// Seed Company (COMP-001 Demo only; test companies removed so they never resurrect)
 export const SEED_COMPANIES: Company[] = [
   {
     company_id: 'COMP-001',
@@ -169,23 +169,6 @@ export const SEED_COMPANIES: Company[] = [
     plan: 'ENTERPRISE',
     next_billing_date: '2027-08-01',
     backend_type: 'sheets_appscript',
-  },
-  {
-    company_id: 'COMP-002',
-    company_name: 'Metro Supermarkets Bulawayo',
-    owner_name: 'Metro General Manager',
-    owner_email: 'metro_owner@customer.com',
-    phone: '+263 77 999 8888',
-    business_category: 'Wholesale & Retail',
-    sheet_folder_id: '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
-    sheet_id: '', // Unlinked by default until real Google Sheet is linked or created from template
-    webhook_url: '',
-    branch_isolation_mode: 'ROW_LEVEL',
-    trial_start_date: '2026-08-15',
-    subscription_status: 'ACTIVE',
-    plan: 'PROFESSIONAL',
-    next_billing_date: '2027-08-15',
-    backend_type: 'room',
   },
 ];
 
@@ -211,17 +194,6 @@ export const SEED_BRANCHES: SaaSBranch[] = [
     sheet_id: '1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE',
     tab_prefix: 'BR-002',
     manager_user_id: 'USR-002',
-    is_active: true,
-  },
-  {
-    branch_id: 'BR-METRO-01',
-    company_id: 'COMP-002',
-    branch_name: 'Bulawayo Branch',
-    branch_code: 'BUL-01',
-    address: '8th Avenue Market, Bulawayo',
-    sheet_id: '1Metro_Bulawayo_Tenant_Sheet_COMP002_Dedicated',
-    tab_prefix: 'BR-METRO-01',
-    manager_user_id: 'USR-METRO-01',
     is_active: true,
   },
 ];
@@ -266,17 +238,5 @@ export const SEED_USERS: SaaSUser[] = [
     pin: '0000',
     is_active: true,
     phone: '+263 73 555 1212',
-  },
-  {
-    user_id: 'USR-METRO-01',
-    company_id: 'COMP-002',
-    branch_id: 'BR-METRO-01',
-    full_name: 'Metro General Manager',
-    email: 'metro_owner@customer.com',
-    password_hash: 'Pass123',
-    role: 'OWNER',
-    pin: '9999',
-    is_active: true,
-    phone: '+263 77 999 8888',
   },
 ];
