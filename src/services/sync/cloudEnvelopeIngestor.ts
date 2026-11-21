@@ -78,14 +78,25 @@ import {
   reopenFinalizedSegmentSlot,
   ingestStocktakeSessionFromMesh,
   updateSheetsConfig,
+  getStored,
+  setStored,
+  STORAGE_KEYS,
+  updateProductStock,
 } from '../../db/roomDatabase';
 import { getMovements, addMovement } from '../../db/cashLedger';
 import {
   getWallets,
   saveWallets,
+  adjustWalletBalance,
+  getWalletTransfers,
+  getOwnerDrawings,
+  WALLET_STORAGE_KEYS,
   getInternalConsumptions,
   ingestMeshInternalConsumption,
 } from '../walletService';
+import { payablesLedger } from '../payablesLedger';
+import { getAllCustomerLedgerEntries, addCustomerLedgerEntry } from '../../db/customerLedger';
+import { getAllTripManifests, saveTripManifest } from '../tripManifestService';
 import {
   getRoleDefinitionsUpdatedAt,
   ingestMeshRoleDefinitions,
@@ -106,6 +117,17 @@ import {
   getLastStocktakeSessionSync,
   setLastStocktakeSessionSync,
 } from './highWaterMarks';
+
+export interface CloudEnvelopeApplyOptions {
+  /** Default true for cloud pulls; MUST be false for WhatsApp file imports so records flow to Hub/Cloud normally. */
+  markCloudSynced?: boolean;
+  /** Golden Rule of Balances: if entity already exists locally, IGNORE incoming absolute balance/quantity fields and update metadata only. */
+  protectExistingBalances?: boolean;
+  /** When true (WhatsApp file imports), newly ingested remote GRVs/GRNs apply their +qty stock delta once (idempotent via referenceId check). */
+  applyRemoteT1StockDeltas?: boolean;
+  /** Optional callback fired whenever an existing local entity's balance is protected from overwrite. */
+  onBalanceProtected?: (entityType: string, entityId: string) => void;
+}
 
 export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any | undefined {
   if (!envelope || !envelope.entityType) return undefined;
@@ -240,6 +262,48 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
         const maxTs = Math.max(...casuals.map((c: any) => extractRecordTimestamp(c)), 0);
         return maxTs > 0 ? { updatedAt: maxTs } : undefined;
       }
+      case 'stock_batch': {
+        const batches = getStored<any[]>(STORAGE_KEYS.STOCK_BATCHES, []);
+        const found = batches.find((b: any) => String(b.id || b.batchId || '').trim().toUpperCase() === cleanUpper);
+        if (!found) return undefined;
+        const ts = extractRecordTimestamp(found);
+        return { ...found, updatedAt: ts };
+      }
+      case 'procurement_trip': {
+        const found = getAllTripManifests().find(
+          (t: any) => String(t.id || t.tripNumber || '').trim().toUpperCase() === cleanUpper
+        );
+        if (!found) return undefined;
+        const ts = extractRecordTimestamp(found);
+        return { ...found, updatedAt: ts };
+      }
+      case 'packaging_variant': {
+        const variants = getStored<any[]>('saimetric_packaging_variants', []);
+        const found = variants.find((v: any) => String(v.id || '').trim().toUpperCase() === cleanUpper);
+        if (!found) return undefined;
+        const ts = extractRecordTimestamp(found);
+        return { ...found, updatedAt: ts };
+      }
+      case 'company': {
+        const companies = getStored<any[]>(STORAGE_KEYS.COMPANIES, []);
+        const found = companies.find(
+          (c: any) => String(c.company_id || c.id || '').trim().toUpperCase() === cleanUpper
+        );
+        if (!found) return undefined;
+        const ts = extractRecordTimestamp(found);
+        return { ...found, updatedAt: ts };
+      }
+      case 'credit_policy': {
+        const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_credit_policy') : null;
+        if (!raw) return undefined;
+        try {
+          const parsed = JSON.parse(raw);
+          const ts = extractRecordTimestamp(parsed);
+          return ts > 0 ? { ...parsed, updatedAt: ts } : undefined;
+        } catch {
+          return undefined;
+        }
+      }
       default:
         return undefined;
     }
@@ -247,16 +311,18 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
 
   switch (envelope.entityType) {
     case 'sale': {
-      const isSaleUpdate =
-        envelope.action === 'UPSERT' ||
-        Boolean(envelope.meta?.isSaleUpdate) ||
-        d?.status === 'Refunded' ||
-        d?.status === 'Voided' ||
-        d?.mobileVerificationStatus === 'VERIFIED' ||
-        d?.mobileVerificationStatus === 'FLAGGED' ||
-        Boolean(d?.hasExchanges);
-      if (isSaleUpdate) return undefined;
-      return getAllSales().find((s: any) => String(s.id || '').trim().toUpperCase() === cleanUpper);
+      const existing = getAllSales().find((s: any) => String(s.id || '').trim().toUpperCase() === cleanUpper);
+      if (!existing) return undefined;
+      const incomingExchanges = Array.isArray(d?.exchanges) ? d.exchanges.length : 0;
+      const existingExchanges = Array.isArray((existing as any).exchanges) ? (existing as any).exchanges.length : 0;
+      const statusAdvanced =
+        (d?.status === 'Refunded' && existing.status !== 'Refunded') ||
+        (d?.status === 'Voided' && existing.status !== 'Voided') ||
+        (d?.mobileVerificationStatus === 'VERIFIED' && (existing as any).mobileVerificationStatus !== 'VERIFIED') ||
+        (d?.mobileVerificationStatus === 'FLAGGED' && (existing as any).mobileVerificationStatus !== 'FLAGGED') ||
+        incomingExchanges > existingExchanges;
+      if (statusAdvanced) return undefined;
+      return existing;
     }
     case 'expense': {
       const existing = getRawStoredExpenses().find(
@@ -330,13 +396,46 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
       return getRawStoredAdminSales().find((a: any) => String(a.id || '').trim().toUpperCase() === cleanUpper);
     case 'cash_count':
       return getRawStoredCashCounts().find((c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper);
-    case 'supplier_invoice_voucher':
-      return getRawStoredSupplierInvoiceVouchers().find(
+    case 'supplier_invoice_voucher': {
+      const existing = getRawStoredSupplierInvoiceVouchers().find(
         (v: any) => String(v.voucherId || v.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (!existing) return undefined;
+      const prevPaid = Number((existing as any).paidAmount || 0);
+      const nextPaid = Number(d?.paidAmount || 0);
+      if (nextPaid > prevPaid || (d?.status === 'PAID' && (existing as any).status !== 'PAID')) {
+        return undefined;
+      }
+      return existing;
+    }
+    case 'supplier_payable': {
+      const existing = payablesLedger
+        .getAllPayables()
+        .find((p: any) => String(p.id || '').trim().toUpperCase() === cleanUpper);
+      if (!existing) return undefined;
+      const statusRank = (s?: string) => (s === 'PAID' ? 2 : s === 'PARTIAL' ? 1 : 0);
+      if (statusRank(d?.status) > statusRank(existing.status)) return undefined;
+      return existing;
+    }
+    case 'customer_ledger':
+      return getAllCustomerLedgerEntries().find(
+        (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
+      );
+    case 'wallet_transfer':
+      return getWalletTransfers().find(
+        (t: any) => String(t.id || '').trim().toUpperCase() === cleanUpper
+      );
+    case 'owner_drawing':
+      return getOwnerDrawings().find(
+        (o: any) => String(o.id || '').trim().toUpperCase() === cleanUpper
       );
     case 'business_day_closure':
       return getRawStoredBusinessDayClosures().find(
         (b: any) => String(b.id || '').trim().toUpperCase() === cleanUpper
+      );
+    case 'electronic_settlement':
+      return getStored<any[]>(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, []).find(
+        (e: any) => String(e.id || '').trim().toUpperCase() === cleanUpper
       );
     default:
       return undefined;
@@ -345,12 +444,16 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
 
 export function applyCloudEnvelopeToRoomDb(
   envelope: SyncEnvelope,
-  _originName: string = 'APPS_SCRIPT_CLOUD'
+  _originName: string = 'APPS_SCRIPT_CLOUD',
+  options?: CloudEnvelopeApplyOptions
 ): void {
   if (!envelope || !envelope.entityType) return;
   const d: any = envelope.data || {};
   const compId = d?.company_id || d?.companyId || getCurrentCompanyId() || 'COMP-001';
   const branchId = d?.branch_id || d?.branchId || envelope.targetBranchId || getCurrentBranchId() || 'BR-MAIN';
+  const markCloudSynced = options?.markCloudSynced !== false;
+  const protectBalances = Boolean(options?.protectExistingBalances);
+  const applyRemoteT1StockDeltas = Boolean(options?.applyRemoteT1StockDeltas);
 
   if (envelope.action === 'DELETE') {
     if (envelope.entityId) {
@@ -368,14 +471,70 @@ export function applyCloudEnvelopeToRoomDb(
 
   switch (envelope.entityType) {
     case 'sale': {
-      const saleId = envelope.entityId || d.id || d.InvoiceID;
+      const saleId = String(d.id || d.InvoiceID || d.invoice_id || envelope.entityId || '').trim();
       if (!saleId || !d) return;
+      const rawTs = d.timestamp || d.Timestamp || (envelope.updatedAt ? new Date(envelope.updatedAt).toISOString() : new Date().toISOString());
+      const derivedDate =
+        d.date ||
+        d.Date ||
+        (typeof rawTs === 'string' && /^\d{4}-\d{2}-\d{2}/.test(rawTs)
+          ? rawTs.slice(0, 10)
+          : new Date().toISOString().split('T')[0]);
+      const resolvedTotal = Number(d.total ?? d.Total ?? d.subtotal ?? d.Subtotal ?? 0);
+      const resolvedSubtotal = Number(d.subtotal ?? d.Subtotal ?? resolvedTotal);
+      const resolvedDiscount = Number(d.discount ?? d.Discount ?? 0);
+      const resolvedSummary = String(d.itemsSummary ?? d.ItemsSummary ?? '').trim();
+      let resolvedItems = Array.isArray(d.items) ? d.items : [];
+      if (resolvedItems.length === 0 && resolvedSummary) {
+        // Reconstruct readable line items from legacy ItemsSummary (e.g. "10x Spuds, 2x Milk")
+        const parts = resolvedSummary.split(',').map((s: string) => s.trim()).filter(Boolean);
+        resolvedItems = parts.map((part: string, idx: number) => {
+          const m = part.match(/^(\d+(?:\.\d+)?)\s*x\s*(.+)$/i);
+          const qty = m ? Number(m[1]) || 1 : 1;
+          const name = m ? m[2].trim() : part;
+          const unitPrice = parts.length === 1 && qty > 0 ? Math.round((resolvedSubtotal / qty) * 100) / 100 : 0;
+          return {
+            id: `LEGACY-ITEM-${saleId}-${idx}`,
+            name,
+            quantity: qty,
+            unitPrice,
+            price: unitPrice,
+            total: parts.length === 1 ? resolvedSubtotal : 0,
+          };
+        });
+      }
+      const resolvedTotalQty = Number(
+        d.totalQty ??
+          d.TotalQty ??
+          (Array.isArray(resolvedItems)
+            ? resolvedItems.reduce((sum: number, it: any) => sum + (Number(it?.quantity) || 0), 0)
+            : 0)
+      );
       const ingested = ingestMeshSale({
         ...d,
         id: saleId,
+        date: derivedDate,
+        timestamp: rawTs,
+        time: d.time || d.Time || '',
+        customerId: d.customerId || d.CustomerID || 'C_WALKIN',
+        customerName: d.customerName || d.CustomerName || 'Walk-in Customer',
+        items: resolvedItems,
+        itemsSummary: resolvedSummary || (resolvedItems.length > 0 ? resolvedItems.map((it: any) => `${it.quantity}x ${it.name}`).join(', ') : ''),
+        totalQty: resolvedTotalQty,
+        subtotal: resolvedSubtotal,
+        discount: resolvedDiscount,
+        total: resolvedTotal,
+        amountTendered: Number(d.amountTendered ?? d.AmountTendered ?? resolvedTotal),
+        changeGiven: Number(d.changeGiven ?? d.ChangeGiven ?? 0),
+        paymentMethod: d.paymentMethod || d.PaymentMethod || 'Cash',
+        currency: d.currency || d.Currency || 'USD',
+        exchangeRate: Number(d.exchangeRate ?? d.ExchangeRate ?? d.exchange_rate ?? 1),
+        staffId: d.staffId || d.StaffID || 'USR-001',
+        staffName: d.staffName || d.StaffName || 'Staff',
+        status: d.status || d.Status || 'Completed',
         company_id: compId,
-        branch_id: d.branch_id || d.branchId || branchId,
-        isCloudSynced: true,
+        branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+        isCloudSynced: markCloudSynced,
         fromMesh: true,
       } as any);
       if (ingested && typeof window !== 'undefined') {
@@ -387,17 +546,104 @@ export function applyCloudEnvelopeToRoomDb(
     }
 
     case 'inventory_item': {
-      if (!d || (!d.itemId && !d.id)) return;
-      const ts = parseTimestampMs(envelope.hubTimestamp ?? envelope.updatedAt ?? d.updatedAt ?? d.lastUpdated) || Date.now();
+      const resolvedItemId = String(
+        d?.itemId || d?.ItemID || d?.ProductID || d?.productId || d?.id || envelope.entityId || ''
+      ).trim();
+      if (!d || !resolvedItemId) return;
+      // Guard against legacy corrupted rows where entityId collided on user_id ("USR-001") without an ItemID
+      if (/^USR-/i.test(resolvedItemId) && !d.itemId && !d.ItemID && !d.ProductID) return;
+      const existingInv = getRawStoredInventoryItems().find(
+        (it: any) => String(it.itemId || it.id || '').trim().toUpperCase() === resolvedItemId.toUpperCase()
+      );
+      const existingTs = existingInv
+        ? Math.max(
+            parseTimestampMs((existingInv as any).hubTimestamp),
+            parseTimestampMs((existingInv as any).updatedAt),
+            parseTimestampMs((existingInv as any).lastUpdated)
+          )
+        : 0;
+      const rawIncomingTs =
+        parseTimestampMs(envelope.hubTimestamp ?? envelope.updatedAt ?? d.updatedAt ?? d.lastUpdated ?? d.LastUpdated) ||
+        Date.now();
+      // Preserve SyncCore-approved writes when version won despite slight clock skew
+      const ts = existingInv && protectBalances ? Math.max(rawIncomingTs, existingTs) : rawIncomingTs;
+      const unitsPerCase = Math.max(1, Number(d.unitsPerCase ?? d.UnitsPerCase ?? d.CaseSize ?? 1) || 1);
+      const sellPriceUnit = Number(
+        d.sellPriceUnit ?? d.SellPriceUnit ?? d.SellingPrice ?? d.price ?? 0
+      );
+      const sellPriceCase = Number(
+        d.sellPriceCase ?? d.SellPriceCase ?? sellPriceUnit * unitsPerCase
+      );
+      const costPerUnit = Number(
+        d.costPerUnit ?? d.CostPerUnit ?? d.costPriceUnit ?? d.CostPriceUnit ?? d.costPrice ?? d.CostPrice ?? 0
+      );
+      const costPerCase = Number(
+        d.costPerCase ?? d.CostPerCase ?? d.costPriceCase ?? d.CostPriceCase ?? costPerUnit * unitsPerCase
+      );
+
+      // GOLDEN RULE OF BALANCES:
+      // If inventory item ALREADY EXISTS locally during file import, IGNORE incoming stock snapshot & update metadata only!
+      let stockCases = Number(d.stockCases ?? d.StockCases ?? 0);
+      let stockSingles = Number(d.stockSingles ?? d.StockSingles ?? 0);
+      let totalUnits = Number(
+        d.totalUnits ?? d.TotalUnits ?? d.stockQuantity ?? d.StockQuantity ?? stockCases * unitsPerCase + stockSingles
+      );
+      let safeBranchOverrides = d.branchOverrides;
+
+      if (protectBalances && existingInv) {
+        stockCases = Number(existingInv.stockCases ?? 0);
+        stockSingles = Number(existingInv.stockSingles ?? 0);
+        totalUnits = Number(existingInv.totalUnits ?? stockCases * unitsPerCase + stockSingles);
+        if (existingInv.branchOverrides || d.branchOverrides) {
+          const mergedOverrides: Record<string, any> = { ...(existingInv.branchOverrides || {}) };
+          if (d.branchOverrides && typeof d.branchOverrides === 'object') {
+            for (const [bKey, incomingOv] of Object.entries<any>(d.branchOverrides)) {
+              const curOv: any = mergedOverrides[bKey] || {};
+              mergedOverrides[bKey] = {
+                ...curOv,
+                ...incomingOv,
+                // Preserve any existing branch-level stock fields
+                ...(curOv.totalUnits !== undefined ? { totalUnits: curOv.totalUnits } : {}),
+                ...(curOv.stockCases !== undefined ? { stockCases: curOv.stockCases } : {}),
+                ...(curOv.stockSingles !== undefined ? { stockSingles: curOv.stockSingles } : {}),
+                ...(curOv.stockQuantity !== undefined ? { stockQuantity: curOv.stockQuantity } : {}),
+              };
+            }
+          }
+          safeBranchOverrides = mergedOverrides;
+        }
+        options?.onBalanceProtected?.('inventory_item', resolvedItemId);
+      }
+
       const ingested = ingestMeshInventoryItem({
         ...d,
-        itemId: d.itemId || d.id || envelope.entityId,
+        id: resolvedItemId,
+        itemId: resolvedItemId,
+        itemName: d.itemName || d.ItemName || d.name || d.Name || resolvedItemId,
+        sku: d.sku ?? d.SKU ?? '',
+        barcode: d.barcode ?? d.Barcode ?? '',
+        category: d.category || d.Category || 'General',
+        unitsPerCase,
+        sellPriceUnit,
+        sellPriceCase,
+        costPerUnit,
+        costPerCase,
+        stockCases,
+        stockSingles:
+          protectBalances && existingInv
+            ? stockSingles
+            : d.stockSingles !== undefined || d.StockSingles !== undefined
+            ? stockSingles
+            : totalUnits - stockCases * unitsPerCase,
+        totalUnits,
+        ...(safeBranchOverrides !== undefined ? { branchOverrides: safeBranchOverrides } : {}),
+        reorderLevelUnits: Number(d.reorderLevelUnits ?? d.reorderLevel ?? d.ReorderLevel ?? 5),
         updatedAt: ts,
         hubTimestamp: ts,
-        lastUpdated: d.lastUpdated || new Date(ts).toISOString(),
+        lastUpdated: d.lastUpdated || d.LastUpdated || new Date(ts).toISOString(),
         company_id: compId,
-        branch_id: d.branch_id || 'ALL',
-        isCloudSynced: true,
+        branch_id: d.branch_id || d.branchId || d.BranchID || 'ALL',
+        isCloudSynced: markCloudSynced,
         fromMesh: true,
       });
       if (ingested && typeof window !== 'undefined') {
@@ -407,69 +653,265 @@ export function applyCloudEnvelopeToRoomDb(
       break;
     }
 
-    case 'cash_log':
-      if (d && ingestMeshCashLog({ ...d, isCloudSynced: true, fromMesh: true } as any) && typeof window !== 'undefined') {
+    case 'cash_log': {
+      const logId = String(d.id || d.LogID || d.logId || envelope.entityId || '').trim();
+      if (
+        d &&
+        ingestMeshCashLog({
+          ...d,
+          id: logId || undefined,
+          timestamp: d.timestamp || d.Timestamp || new Date(envelope.updatedAt || Date.now()).toISOString(),
+          date: d.date || d.Date || (typeof (d.timestamp || d.Timestamp) === 'string' ? String(d.timestamp || d.Timestamp).slice(0, 10) : new Date().toISOString().split('T')[0]),
+          staffId: d.staffId || d.StaffID || '',
+          staffName: d.staffName || d.StaffName || '',
+          line: d.line || d.Line || 'Cash',
+          description: d.description || d.Description || '',
+          in: Number(d.in ?? d.In ?? 0),
+          out: Number(d.out ?? d.Out ?? 0),
+          reference: d.reference || d.Reference || '',
+          category: d.category || d.Category || '',
+          company_id: compId,
+          branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+          isCloudSynced: markCloudSynced,
+          fromMesh: true,
+        } as any) &&
+        typeof window !== 'undefined'
+      ) {
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
       }
       break;
+    }
 
-    case 'customer_change':
-      if (d && ingestMeshCustomerChange({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+    case 'customer_change': {
+      const chgId = String(d.id || d.changeId || d.ChangeID || d.Reference || d.reference || envelope.entityId || '').trim();
+      const chgTs = d.timestamp || d.Timestamp || new Date(envelope.updatedAt || Date.now()).toISOString();
+      if (
+        d &&
+        chgId &&
+        ingestMeshCustomerChange({
+          ...d,
+          id: chgId,
+          changeId: chgId,
+          timestamp: chgTs,
+          date: d.date || d.Date || String(chgTs).slice(0, 10),
+          staffId: d.staffId || d.StaffID || '',
+          staffName: d.staffName || d.StaffName || '',
+          customerId: d.customerId || d.CustomerID || '',
+          customerName: d.customerName || d.CustomerName || '',
+          in: Number(d.in ?? d.In ?? 0),
+          out: Number(d.out ?? d.Out ?? 0),
+          notes: d.notes || d.Notes || '',
+          reference: d.reference || d.Reference || chgId,
+          company_id: compId,
+          branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+          isCloudSynced: markCloudSynced,
+        }) &&
+        typeof window !== 'undefined'
+      ) {
         window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: d }));
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
       break;
+    }
 
-    case 'credit_sale':
-      if (d && ingestMeshCreditSale({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+    case 'credit_sale': {
+      const crId = String(d.id || d.creditId || d.CreditID || envelope.entityId || '').trim();
+      const crTs = d.timestamp || d.Timestamp || new Date(envelope.updatedAt || Date.now()).toISOString();
+      if (
+        d &&
+        crId &&
+        ingestMeshCreditSale({
+          ...d,
+          id: crId,
+          creditId: crId,
+          timestamp: crTs,
+          date: d.date || d.Date || String(crTs).slice(0, 10),
+          staffId: d.staffId || d.StaffID || '',
+          staffName: d.staffName || d.StaffName || '',
+          customerId: d.customerId || d.CustomerID || '',
+          customerName: d.customerName || d.CustomerName || '',
+          amount: Number(d.amount ?? d.Amount ?? 0),
+          in: Number(d.in ?? d.In ?? 0),
+          out: Number(d.out ?? d.Out ?? d.amount ?? d.Amount ?? 0),
+          itemDescription: d.itemDescription || d.ItemDescription || '',
+          dueDate: d.dueDate || d.DueDate || '',
+          notes: d.notes || d.Notes || '',
+          status: d.status || d.Status || 'Outstanding',
+          company_id: compId,
+          branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+          isCloudSynced: markCloudSynced,
+        }) &&
+        typeof window !== 'undefined'
+      ) {
         window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: d }));
         window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
       break;
+    }
 
     case 'credit_group':
-      if (d && ingestMeshCreditGroup({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+      if (d && ingestMeshCreditGroup({ ...d, isCloudSynced: markCloudSynced }) && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_credit_groups_updated', { detail: d }));
       }
       break;
 
     case 'stock_movement':
-      if (d && ingestMeshStockMovement({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+      if (d && ingestMeshStockMovement({ ...d, isCloudSynced: markCloudSynced }) && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
       }
       break;
 
-    case 'direct_grv':
-      if (d && ingestMeshGRV({ ...d, isCloudSynced: true, fromMesh: true } as any) && typeof window !== 'undefined') {
+    case 'direct_grv': {
+      if (!d) break;
+      const grvKey = String(d.grvNumber || d.id || envelope.entityId || '').trim().toUpperCase();
+      const alreadyExists = getRawStoredDirectGrvs().some(
+        (g: any) => String(g.grvNumber || g.id || '').trim().toUpperCase() === grvKey
+      );
+      const ingested = ingestMeshGRV({ ...d, isCloudSynced: markCloudSynced, fromMesh: true } as any);
+      // Golden Rule T1 Ledger Delta: When a brand-new remote GRV arrives via WhatsApp file, apply its +qty delta ONCE
+      if (
+        ingested &&
+        !alreadyExists &&
+        applyRemoteT1StockDeltas &&
+        String(d.status || '').toUpperCase() !== 'REJECTED' &&
+        Array.isArray(d.items)
+      ) {
+        const refId = String(d.grvNumber || d.id || '').trim();
+        const alreadyHasMov = getRawStoredStockMovements().some(
+          (m: any) =>
+            refId &&
+            (String(m.referenceId || '').trim().toUpperCase() === refId.toUpperCase() ||
+              String(m.reference || '').trim().toUpperCase() === refId.toUpperCase())
+        );
+        if (!alreadyHasMov) {
+          for (const line of d.items) {
+            const targetItemId = line?.itemId || line?.productId || line?.id;
+            const unitsPerCase = Math.max(1, Number(line?.unitsPerCase) || 1);
+            const qtyUnits =
+              Number(line?.totalUnitsReceived ?? line?.totalUnits ?? line?.quantity) ||
+              (Number(line?.casesReceived ?? line?.receivedCases ?? 0) * unitsPerCase +
+                Number(line?.singlesReceived ?? line?.receivedSingles ?? 0));
+            if (targetItemId && qtyUnits > 0) {
+              updateProductStock(targetItemId, qtyUnits, undefined, undefined, {
+                staffId: d.receivedById || d.staffId || 'ADMIN',
+                staffName: d.receivedBy || d.staffName || 'Remote GRV',
+                referenceId: refId,
+                reason: `WhatsApp Sync GRV Receipt: +${qtyUnits} ${line.itemName || ''} (GRV #${refId})`,
+                actionTaken: 'GRV_RECEIPT',
+                txnType: 'ADJUSTMENT',
+                fromMesh: true,
+              });
+            }
+          }
+        }
+      }
+      if (ingested && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
       break;
+    }
 
-    case 'goods_received':
-      if (d && ingestMeshGoodsReceived({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+    case 'goods_received': {
+      const grnId = String(d.id || d.grnId || d.GRNID || d.reference || envelope.entityId || '').trim();
+      const grnTs = d.timestamp || d.Timestamp || new Date(envelope.updatedAt || Date.now()).toISOString();
+      if (!d || !grnId) break;
+      const alreadyExists = getRawStoredGoodsReceived().some(
+        (g: any) => String(g.id || g.grnId || g.reference || '').trim().toUpperCase() === grnId.toUpperCase()
+      );
+      const ingested = ingestMeshGoodsReceived({
+        ...d,
+        id: grnId,
+        grnId,
+        timestamp: grnTs,
+        date: d.date || d.Date || String(grnTs).slice(0, 10),
+        invoiceNo: d.invoiceNo || d.InvoiceNo || '',
+        supplier: d.supplier || d.Supplier || d.supplierName || d.SupplierName || '',
+        itemId: d.itemId || d.ItemID || '',
+        itemName: d.itemName || d.ItemName || '',
+        receivedCases: Number(d.receivedCases ?? d.ReceivedCases ?? 0),
+        receivedSingles: Number(d.receivedSingles ?? d.ReceivedSingles ?? 0),
+        costPerCase: Number(d.costPerCase ?? d.CostPerCase ?? 0),
+        costPerUnit: Number(d.costPerUnit ?? d.CostPerUnit ?? 0),
+        lineTotal: Number(d.lineTotal ?? d.LineTotal ?? d.totalAmount ?? d.TotalAmount ?? 0),
+        staffId: d.staffId || d.StaffID || '',
+        company_id: compId,
+        branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+        isCloudSynced: markCloudSynced,
+      });
+      if (ingested && !alreadyExists && applyRemoteT1StockDeltas) {
+        const alreadyHasMov = getRawStoredStockMovements().some(
+          (m: any) => String(m.referenceId || m.reference || '').trim().toUpperCase() === grnId.toUpperCase()
+        );
+        const itemId = d.itemId || d.ItemID;
+        if (!alreadyHasMov && itemId) {
+          const invMatch = getRawStoredInventoryItems().find((it: any) => it.itemId === itemId || it.id === itemId);
+          const upc = Math.max(1, Number(d.unitsPerCase || invMatch?.unitsPerCase || 1));
+          const deltaUnits =
+            Number(d.totalUnits ?? d.quantity) ||
+            Number(d.receivedCases ?? d.ReceivedCases ?? 0) * upc + Number(d.receivedSingles ?? d.ReceivedSingles ?? 0);
+          if (deltaUnits > 0) {
+            updateProductStock(itemId, deltaUnits, undefined, undefined, {
+              staffId: d.staffId || d.StaffID || 'ADMIN',
+              staffName: d.staffName || 'Remote GRN',
+              referenceId: grnId,
+              reason: `WhatsApp Sync GRN Receipt: +${deltaUnits} ${d.itemName || ''} (GRN #${grnId})`,
+              actionTaken: 'GRN_RECEIPT',
+              txnType: 'ADJUSTMENT',
+              fromMesh: true,
+            });
+          }
+        }
+      }
+      if (ingested && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
       }
       break;
+    }
 
-    case 'expense':
-      if (d) {
-        addExpense({ ...d, isCloudSynced: true, fromMesh: true }, { fromSync: true });
+    case 'expense': {
+      const expId = String(d.id || d.ExpenseID || d.expenseId || envelope.entityId || '').trim();
+      const expTs = d.timestamp || d.Timestamp || new Date(envelope.updatedAt || Date.now()).toISOString();
+      if (d && expId) {
+        addExpense(
+          {
+            ...d,
+            id: expId,
+            timestamp: expTs,
+            date: d.date || d.Date || String(expTs).slice(0, 10),
+            category: d.category || d.Category || 'General',
+            vendorOrCustomer: d.vendorOrCustomer || d.VendorOrCustomer || '',
+            amount: Number(d.amount ?? d.Amount ?? 0),
+            paymentMethod: d.paymentMethod || d.PaymentMethod || 'Cash',
+            staffId: d.staffId || d.StaffID || '',
+            staffName: d.staffName || d.StaffName || '',
+            description: d.description || d.Description || '',
+            receiptRef: d.receiptRef || d.ReceiptRef || '',
+            status: d.status || d.Status || 'approved',
+            approvedByName: d.approvedByName || d.ApprovedBy || undefined,
+            company_id: compId,
+            branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+            isCloudSynced: markCloudSynced,
+            fromMesh: true,
+          } as any,
+          { fromSync: true }
+        );
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
           window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         }
       }
       break;
+    }
 
     case 'internal_consumption':
-      if (d && d.id && ingestMeshInternalConsumption({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+      if (d && d.id && ingestMeshInternalConsumption({ ...d, isCloudSynced: markCloudSynced }) && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_internal_consumption_updated', { detail: d }));
         window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
@@ -480,7 +922,7 @@ export function applyCloudEnvelopeToRoomDb(
       if (d && d.id) {
         const cur = getMovements();
         if (!cur.some((m) => m.id === d.id)) {
-          addMovement({ ...d, isCloudSynced: true, fromMesh: true });
+          addMovement({ ...d, isCloudSynced: markCloudSynced, fromMesh: true });
           if (typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
             window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
@@ -490,14 +932,14 @@ export function applyCloudEnvelopeToRoomDb(
       break;
 
     case 'cash_lift':
-      if (d && ingestMeshCashLift({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+      if (d && ingestMeshCashLift({ ...d, isCloudSynced: markCloudSynced }) && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
       break;
 
     case 'cash_transfer':
-      if (d && ingestMeshCashTransfer({ ...d, isCloudSynced: true }) && typeof window !== 'undefined') {
+      if (d && ingestMeshCashTransfer({ ...d, isCloudSynced: markCloudSynced }) && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated', { detail: d }));
         window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: d }));
         window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
@@ -511,8 +953,22 @@ export function applyCloudEnvelopeToRoomDb(
         const list = getWallets();
         const idx = list.findIndex((w) => w.id === targetId);
         if (idx >= 0) {
-          list[idx] = { ...list[idx], ...d, id: targetId as any };
+          if (protectBalances) {
+            // GOLDEN RULE: Wallet ALREADY EXISTS locally — preserve balance & expectedBalance; update metadata only
+            const existingWallet = list[idx];
+            list[idx] = {
+              ...existingWallet,
+              ...d,
+              id: targetId as any,
+              balance: existingWallet.balance,
+              expectedBalance: existingWallet.expectedBalance,
+            };
+            options?.onBalanceProtected?.('wallet', targetId);
+          } else {
+            list[idx] = { ...list[idx], ...d, id: targetId as any };
+          }
         } else {
+          // NEW wallet locally — accept starting balance
           list.push({ ...d, id: targetId as any });
         }
         saveWallets(list);
@@ -520,10 +976,50 @@ export function applyCloudEnvelopeToRoomDb(
       break;
     }
 
+    case 'wallet_transfer': {
+      const trId = String(d.id || envelope.entityId || '').trim();
+      if (d && trId) {
+        const list = getWalletTransfers();
+        if (!list.some((t) => String(t.id).toUpperCase() === trId.toUpperCase())) {
+          const entry = { ...d, id: trId, isCloudSynced: markCloudSynced };
+          setStored(WALLET_STORAGE_KEYS.TRANSFERS, [entry, ...list]);
+          // Apply T1 wallet transfer delta ONCE
+          const amt = Number(d.amount || 0);
+          if (amt > 0 && d.fromWalletId && d.toWalletId) {
+            adjustWalletBalance(d.fromWalletId, -amt);
+            adjustWalletBalance(d.toWalletId, amt);
+          }
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('saimetric_wallets_updated'));
+          }
+        }
+      }
+      break;
+    }
+
+    case 'owner_drawing': {
+      const drId = String(d.id || envelope.entityId || '').trim();
+      if (d && drId) {
+        const list = getOwnerDrawings();
+        if (!list.some((o) => String(o.id).toUpperCase() === drId.toUpperCase())) {
+          const entry = { ...d, id: drId, isCloudSynced: markCloudSynced };
+          setStored(WALLET_STORAGE_KEYS.OWNER_DRAWINGS, [entry, ...list]);
+          const amt = Number(d.amount || 0);
+          if (amt > 0 && d.walletId) {
+            adjustWalletBalance(d.walletId, -amt);
+          }
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent('saimetric_wallets_updated'));
+          }
+        }
+      }
+      break;
+    }
+
     case 'staff':
       if (d && d.id) {
         const staffTime = extractRecordTimestamp(d) || envelope.updatedAt || 0;
-        ingestMeshStaff({ ...d, isCloudSynced: true, fromMesh: true } as any, { fromSync: true });
+        ingestMeshStaff({ ...d, isCloudSynced: markCloudSynced, fromMesh: true } as any, { fromSync: true });
         if (staffTime > 0) setLastStaffSync(Math.max(getLastStaffSync(), staffTime));
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
@@ -560,16 +1056,47 @@ export function applyCloudEnvelopeToRoomDb(
       break;
     }
 
-    case 'customer':
-      if (d && (d.customerId || d.id)) {
+    case 'customer': {
+      const custId = String(d?.customerId || d?.CustomerID || d?.id || envelope.entityId || '').trim();
+      if (d && custId) {
+        const existingCust: any = getRawStoredCustomers().find(
+          (c: any) => String(c.customerId || c.id || '').trim().toUpperCase() === custId.toUpperCase()
+        );
         const custTime = extractRecordTimestamp(d) || envelope.updatedAt || 0;
-        ingestMeshCustomer({ ...d, isCloudSynced: true, fromMesh: true }, { fromSync: true });
+        const payload: any = {
+          ...d,
+          id: custId,
+          customerId: custId,
+          name: d.name || d.Name || d.CustomerName || '',
+          phone: d.phone ?? d.Phone ?? '',
+          email: d.email ?? d.Email ?? '',
+          address: d.address ?? d.Address ?? '',
+          createdDate: d.createdDate || d.CreatedDate || new Date().toISOString().split('T')[0],
+          createdBy: d.createdBy || d.CreatedBy || '',
+          company_id: compId,
+          branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+          isCloudSynced: markCloudSynced,
+          fromMesh: true,
+        };
+        if (protectBalances && existingCust) {
+          // GOLDEN RULE: Preserve existing customer balance/debt/loyalty/store-credit fields; update metadata only
+          if (existingCust.currentBalance !== undefined) payload.currentBalance = existingCust.currentBalance;
+          if (existingCust.outstandingDebt !== undefined) payload.outstandingDebt = existingCust.outstandingDebt;
+          if (existingCust.balance !== undefined) payload.balance = existingCust.balance;
+          if (existingCust.loyaltyPoints !== undefined) payload.loyaltyPoints = existingCust.loyaltyPoints;
+          if (existingCust.storeCredit !== undefined) payload.storeCredit = existingCust.storeCredit;
+          const existingTs = extractRecordTimestamp(existingCust);
+          if (existingTs > custTime) payload.updatedAt = existingTs;
+          options?.onBalanceProtected?.('customer', custId);
+        }
+        ingestMeshCustomer(payload, { fromSync: true });
         if (custTime > 0) setLastCustomerSync(Math.max(getLastCustomerSync(), custTime));
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
         }
       }
       break;
+    }
 
     case 'branch':
       if (d && isValidBranchRecord(d) && (d.branchId || d.id || d.branch_id || d.BranchID)) {
@@ -577,7 +1104,14 @@ export function applyCloudEnvelopeToRoomDb(
         const lowerBr = rawBrId.toLowerCase();
         const canonBrId = lowerBr === '1' || lowerBr === 'br-main' || lowerBr === 'br001' ? 'BR-MAIN' : rawBrId;
         const brTime = extractRecordTimestamp(d) || envelope.updatedAt || 0;
-        const normalized = { ...d, branchId: canonBrId, id: canonBrId, branch_id: canonBrId, isCloudSynced: true, fromMesh: true };
+        const normalized = {
+          ...d,
+          branchId: canonBrId,
+          id: canonBrId,
+          branch_id: canonBrId,
+          isCloudSynced: markCloudSynced,
+          fromMesh: true,
+        };
         saveBranch(normalized, { fromSync: true });
         if (brTime > 0) setLastBranchSync(Math.max(getLastBranchSync(), brTime));
         if (typeof window !== 'undefined') {
@@ -588,8 +1122,19 @@ export function applyCloudEnvelopeToRoomDb(
 
     case 'cash_account':
       if (d && (d.account_id || d.id)) {
+        const accId = String(d.account_id || d.id).trim();
+        const existingAcc: any = getRawStoredCashAccounts().find(
+          (a: any) => String(a.account_id || a.id || '').trim().toUpperCase() === accId.toUpperCase()
+        );
         const accTime = extractRecordTimestamp(d) || envelope.updatedAt || 0;
-        saveCashAccount({ ...d, isCloudSynced: true, fromMesh: true }, { fromSync: true });
+        const accPayload: any = { ...d, isCloudSynced: markCloudSynced, fromMesh: true };
+        if (protectBalances && existingAcc) {
+          // GOLDEN RULE: Preserve live local CashAccount balance; update account metadata only
+          accPayload.current_balance = existingAcc.current_balance;
+          if (existingAcc.balance !== undefined) accPayload.balance = existingAcc.balance;
+          options?.onBalanceProtected?.('cash_account', accId);
+        }
+        saveCashAccount(accPayload, { fromSync: true });
         if (accTime > 0) setLastCashAccountSync(Math.max(getLastCashAccountSync(), accTime));
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: d }));
@@ -600,15 +1145,24 @@ export function applyCloudEnvelopeToRoomDb(
 
     case 'supplier':
       if (d && (d.supplierId || d.id || d.SupplierID)) {
-        addSupplier(
-          {
-            ...d,
-            supplierId: d.supplierId || d.id || d.SupplierID,
-            name: d.name || d.Name || d.SupplierName || '',
-            isCloudSynced: true,
-          },
-          { fromSync: true }
+        const supId = String(d.supplierId || d.id || d.SupplierID).trim();
+        const existingSup: any = getRawStoredSuppliers().find(
+          (s: any) => String(s.supplierId || s.id || s.SupplierID || '').trim().toUpperCase() === supId.toUpperCase()
         );
+        const supPayload: any = {
+          ...d,
+          supplierId: supId,
+          name: d.name || d.Name || d.SupplierName || '',
+          isCloudSynced: markCloudSynced,
+        };
+        if (protectBalances && existingSup) {
+          // GOLDEN RULE: Preserve existing supplier balance fields; update supplier directory metadata only
+          if (existingSup.balance !== undefined) supPayload.balance = existingSup.balance;
+          if (existingSup.outstandingBalance !== undefined) supPayload.outstandingBalance = existingSup.outstandingBalance;
+          if (existingSup.currentBalance !== undefined) supPayload.currentBalance = existingSup.currentBalance;
+          options?.onBalanceProtected?.('supplier', supId);
+        }
+        addSupplier(supPayload, { fromSync: true });
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_suppliers_updated', { detail: d }));
         }
@@ -639,7 +1193,10 @@ export function applyCloudEnvelopeToRoomDb(
 
     case 'cash_count':
       if (d && (d.id || d.staffId)) {
-        saveFinalCashCount({ ...d, id: d.id || envelope.entityId, company_id: compId, branch_id: branchId }, { fromSync: true });
+        saveFinalCashCount(
+          { ...d, id: d.id || envelope.entityId, company_id: compId, branch_id: branchId, isCloudSynced: markCloudSynced },
+          { fromSync: true }
+        );
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_cash_counts_updated', { detail: d }));
         }
@@ -648,13 +1205,162 @@ export function applyCloudEnvelopeToRoomDb(
 
     case 'supplier_invoice_voucher':
       if (d && (d.voucherId || d.id)) {
-        saveSupplierInvoiceVoucher({ ...d, voucherId: d.voucherId || d.id, isCloudSynced: true }, { fromSync: true });
+        const vId = String(d.voucherId || d.id).trim();
+        const existingV: any = getRawStoredSupplierInvoiceVouchers().find(
+          (v: any) => String(v.voucherId || v.id || '').trim().toUpperCase() === vId.toUpperCase()
+        );
+        const voucherPayload: any = { ...d, voucherId: vId, isCloudSynced: markCloudSynced };
+        if (protectBalances && existingV) {
+          // Monotonic protection: never reduce paidAmount or revert PAID status
+          const prevPaid = Number(existingV.paidAmount || 0);
+          const nextPaid = Number(d.paidAmount || 0);
+          if (nextPaid < prevPaid) {
+            voucherPayload.paidAmount = prevPaid;
+            if (existingV.balanceDue !== undefined) voucherPayload.balanceDue = existingV.balanceDue;
+            if (existingV.remainingBalance !== undefined) voucherPayload.remainingBalance = existingV.remainingBalance;
+            voucherPayload.status = existingV.status;
+            options?.onBalanceProtected?.('supplier_invoice_voucher', vId);
+          }
+        }
+        saveSupplierInvoiceVoucher(voucherPayload, { fromSync: true });
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_vouchers_updated', { detail: d }));
           window.dispatchEvent(new Event('saimetric_supplier_invoices_updated'));
         }
       }
       break;
+
+    case 'supplier_payable': {
+      const pId = String(d.id || envelope.entityId || '').trim();
+      if (d && pId) {
+        const allPayables = payablesLedger.getAllPayables();
+        const idx = allPayables.findIndex((p) => String(p.id).toUpperCase() === pId.toUpperCase());
+        if (idx >= 0) {
+          const existing = allPayables[idx];
+          const rank = (s?: string) => (s === 'PAID' ? 2 : s === 'PARTIAL' ? 1 : 0);
+          if (protectBalances) {
+            // Preserve payable amount; allow monotonic status advancement only
+            const nextStatus = rank(d.status) > rank(existing.status) ? d.status : existing.status;
+            allPayables[idx] = {
+              ...existing,
+              dueDate: d.dueDate ?? existing.dueDate,
+              status: nextStatus,
+              updatedAt: d.updatedAt || existing.updatedAt,
+            };
+            options?.onBalanceProtected?.('supplier_payable', pId);
+          } else {
+            allPayables[idx] = { ...existing, ...d, id: pId };
+          }
+          payablesLedger.saveAllPayables(allPayables);
+        } else {
+          payablesLedger.saveAllPayables([{ ...d, id: pId }, ...allPayables]);
+        }
+      }
+      break;
+    }
+
+    case 'customer_ledger': {
+      const clId = String(d.id || envelope.entityId || '').trim();
+      if (d && clId) {
+        const existing = getAllCustomerLedgerEntries().some(
+          (e) => String(e.id).toUpperCase() === clId.toUpperCase()
+        );
+        if (!existing) {
+          addCustomerLedgerEntry({ ...d, id: clId });
+        }
+      }
+      break;
+    }
+
+    case 'stock_batch': {
+      const bId = String(d.id || d.batchId || envelope.entityId || '').trim();
+      if (d && bId) {
+        const batches = getStored<any[]>(STORAGE_KEYS.STOCK_BATCHES, []);
+        const idx = batches.findIndex((b: any) => String(b.id || b.batchId || '').toUpperCase() === bId.toUpperCase());
+        if (idx >= 0) {
+          const existing = batches[idx];
+          if (protectBalances) {
+            // GOLDEN RULE: Preserve live batch remainingUnits/qty; update metadata only
+            batches[idx] = {
+              ...existing,
+              ...d,
+              id: bId,
+              ...(existing.remainingUnits !== undefined ? { remainingUnits: existing.remainingUnits } : {}),
+              ...(existing.quantityRemaining !== undefined ? { quantityRemaining: existing.quantityRemaining } : {}),
+              ...(existing.qty !== undefined ? { qty: existing.qty } : {}),
+              ...(existing.unitsRemaining !== undefined ? { unitsRemaining: existing.unitsRemaining } : {}),
+            };
+            options?.onBalanceProtected?.('stock_batch', bId);
+          } else {
+            batches[idx] = { ...existing, ...d, id: bId };
+          }
+        } else {
+          batches.unshift({ ...d, id: bId });
+        }
+        setStored(STORAGE_KEYS.STOCK_BATCHES, batches);
+      }
+      break;
+    }
+
+    case 'procurement_trip': {
+      const tId = String(d.id || d.tripNumber || envelope.entityId || '').trim();
+      if (d && tId) {
+        const existing = getAllTripManifests().find(
+          (t) => String(t.id || t.tripNumber).toUpperCase() === tId.toUpperCase()
+        );
+        if (existing && protectBalances) {
+          const exStatus = String(existing.status || '').toUpperCase();
+          if (exStatus === 'FINALIZED' || exStatus === 'COMPLETED') {
+            // Protect finalized procurement trip financial totals from older drafts
+            options?.onBalanceProtected?.('procurement_trip', tId);
+            break;
+          }
+        }
+        saveTripManifest({ ...d, id: d.id || tId });
+      }
+      break;
+    }
+
+    case 'packaging_variant': {
+      const pvId = String(d.id || envelope.entityId || '').trim();
+      if (d && pvId) {
+        const list = getStored<any[]>('saimetric_packaging_variants', []);
+        const idx = list.findIndex((v: any) => String(v.id || '').toUpperCase() === pvId.toUpperCase());
+        if (idx >= 0) list[idx] = { ...list[idx], ...d, id: pvId };
+        else list.push({ ...d, id: pvId });
+        setStored('saimetric_packaging_variants', list);
+      }
+      break;
+    }
+
+    case 'company': {
+      const cId = String(d.company_id || d.id || envelope.entityId || '').trim();
+      if (d && cId) {
+        const normalizedCompany = {
+          ...d,
+          company_id: cId,
+          ...(d.company_name !== undefined && d.company_name !== null ? { company_name: String(d.company_name).trim() } : {}),
+          ...(d.owner_email !== undefined && d.owner_email !== null ? { owner_email: String(d.owner_email).trim() } : {}),
+          ...(d.owner_name !== undefined && d.owner_name !== null ? { owner_name: String(d.owner_name).trim() } : {}),
+          ...(d.phone !== undefined && d.phone !== null ? { phone: String(d.phone) } : {}),
+        };
+        const list = getStored<any[]>(STORAGE_KEYS.COMPANIES, []);
+        const idx = list.findIndex((c: any) => String(c.company_id || c.id || '').toUpperCase() === cId.toUpperCase());
+        if (idx >= 0) list[idx] = { ...list[idx], ...normalizedCompany, company_id: cId };
+        else list.push(normalizedCompany);
+        setStored(STORAGE_KEYS.COMPANIES, list);
+      }
+      break;
+    }
+
+    case 'credit_policy': {
+      if (d && typeof d === 'object' && typeof localStorage !== 'undefined') {
+        try {
+          localStorage.setItem('saimetric_credit_policy', JSON.stringify(d));
+        } catch {}
+      }
+      break;
+    }
 
     case 'business_day_closure':
       if (d && (d.id || d.date)) {
@@ -704,6 +1410,10 @@ export function applyCloudEnvelopeToRoomDb(
     case 'supervisor_approval':
     case 'audit_log':
       if (d) {
+        // Ignore legacy misrouted inventory/operational payloads that landed in AuditLog before routing fix
+        if ((d.ItemID || d.ProductID) && d.ItemName && !d.action && !d.Action) {
+          break;
+        }
         const ingested = ingestMeshSupervisorApproval({ ...d, fromMesh: true } as any);
         if (ingested && typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_audit_log_updated', { detail: d }));
@@ -711,14 +1421,39 @@ export function applyCloudEnvelopeToRoomDb(
       }
       break;
 
-    case 'reconciliation':
+    case 'reconciliation': {
       if (d) {
-        saveReconciliation(d);
+        const recId = String(d.id || d.ReconID || d.reconId || envelope.entityId || `REC-${Date.now()}`).trim();
+        const recTs = d.timestamp || d.Timestamp || new Date(envelope.updatedAt || Date.now()).toISOString();
+        saveReconciliation(
+          {
+            ...d,
+            id: recId,
+            timestamp: recTs,
+            date: d.date || d.Date || String(recTs).slice(0, 10),
+            staffId: d.staffId || d.StaffID || '',
+            staffName: d.staffName || d.StaffName || '',
+            openingFloat: Number(d.openingFloat ?? d.OpeningFloat ?? 0),
+            cashSales: Number(d.cashSales ?? d.CashSales ?? 0),
+            otherCashIn: Number(d.otherCashIn ?? d.OtherCashIn ?? 0),
+            cashExpenses: Number(d.cashExpenses ?? d.CashExpenses ?? 0),
+            bankDrops: Number(d.bankDrops ?? d.BankDrops ?? 0),
+            expectedCash: Number(d.expectedCash ?? d.ExpectedCash ?? 0),
+            actualCashCount: Number(d.actualCashCount ?? d.ActualCashCount ?? 0),
+            variance: Number(d.variance ?? d.Variance ?? 0),
+            status: d.status || d.Status || 'submitted',
+            notes: d.notes || d.Notes || '',
+            company_id: compId,
+            branch_id: d.branch_id || d.branchId || d.BranchID || branchId,
+          } as any,
+          { fromSync: true }
+        );
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_reconciliations_updated', { detail: d }));
         }
       }
       break;
+    }
 
     case 'system_settings':
       if (d) {
@@ -884,6 +1619,16 @@ export function applyCloudEnvelopeToRoomDb(
       const sObj = d?.session && typeof d.session === 'object' ? { ...d, ...d.session } : d;
       const sId = sObj?.sessionId || sObj?.id || envelope.entityId;
       if (sId) {
+        if (protectBalances) {
+          const existingSession: any = getRawStoredStocktakeSessions().find(
+            (s: any) => String(s.sessionId || s.id || '').toUpperCase() === String(sId).toUpperCase()
+          );
+          const exStatus = String(existingSession?.status || '').toUpperCase();
+          if (existingSession && (exStatus === 'FINALIZED' || exStatus === 'COMPLETED' || exStatus === 'APPROVED')) {
+            options?.onBalanceProtected?.('stocktake_session', String(sId));
+            break;
+          }
+        }
         ingestStocktakeSessionFromMesh({
           ...sObj,
           sessionId: sId,

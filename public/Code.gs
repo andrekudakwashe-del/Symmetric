@@ -183,7 +183,7 @@ function withSyncCols_(cols) {
 var BASE_TAB_COLUMNS = {
   // --- MASTER CONTROL PLANE TABS ---
   "companies": [
-    "company_id", "company_name", "owner_name", "owner_email", "password_hash",
+    "company_id", "company_name", "owner_name", "owner_email", "password_hash", "password_salt",
     "phone", "plan", "subscription_status", "status", "expiry",
     "trial_start_date", "next_billing_date", "sheet_id", "url",
     "routing_epoch", "provisioned_date", "webhook_url", "branch_isolation_mode",
@@ -191,7 +191,7 @@ var BASE_TAB_COLUMNS = {
   ],
   "branches": ["branch_id", "company_id", "branch_name", "branch_code", "location", "location_code", "address", "phone", "is_main", "is_active", "created_at", "updated_at"],
   "users": ["user_id", "company_id", "branch_id", "full_name", "email", "phone", "role", "pin_hash", "pin_salt", "pin_version", "pin_updated_at", "assigned_branch_ids", "branch_assignments_json", "permissions_json", "is_active", "created_at", "updated_at"],
-  "Global_Users": ["user_id", "email", "password_hash", "company_id", "role", "full_name", "branch_id", "is_active", "updated_at"],
+  "Global_Users": ["user_id", "email", "password_hash", "password_salt", "company_id", "role", "full_name", "branch_id", "is_active", "updated_at"],
   "permissions": ["perm_id", "company_id", "role", "module", "action", "allowed", "description", "updated_at"],
   "Subscriptions": ["SubscriptionID", "CompanyID", "Plan", "Status", "PaymentRef", "AmountPaid", "Currency", "PaidDate", "NextBillingDate", "ActivatedBy", "Notes"],
   "request_log": ["request_id", "action", "company_id", "timestamp", "status"],
@@ -1356,6 +1356,40 @@ function hashPasswordSha256(rawText) {
   return hex;
 }
 
+function timingSafeEqualStr_(a, b) {
+  var sa = String(a || "");
+  var sb = String(b || "");
+  if (!sa || sa.length !== sb.length) return false;
+  var diff = 0;
+  for (var i = 0; i < sa.length; i++) {
+    diff |= (sa.charCodeAt(i) ^ sb.charCodeAt(i));
+  }
+  return diff === 0;
+}
+
+function verifyPasswordHashWithSalt_(rawPassword, storedHash, storedSalt) {
+  var pwd = String(rawPassword || "").trim();
+  var h = String(storedHash || "").trim();
+  var s = String(storedSalt || "").trim();
+  if (!pwd || !h) return false;
+  var hLower = h.toLowerCase();
+  if (s) {
+    var salted = hashPasswordSha256(s + ":" + pwd);
+    if (timingSafeEqualStr_(salted, hLower)) return true;
+  }
+  if (h.indexOf(":") !== -1) {
+    var parts = h.split(":");
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      var inlineSalted = hashPasswordSha256(parts[0] + ":" + pwd);
+      if (timingSafeEqualStr_(inlineSalted, parts[1].toLowerCase())) return true;
+    }
+  }
+  var unsalted = hashPasswordSha256(pwd);
+  if (timingSafeEqualStr_(unsalted, hLower)) return true;
+  if (!/^[0-9a-f]{64}$/i.test(h) && timingSafeEqualStr_(pwd, h)) return true;
+  return false;
+}
+
 function logAudit(ss, companyId, branchId, userId, userName, role, action, module, details) {
   try {
     var sheet = getOrCreateMonthlySheet(ss, "AuditLog", new Date().toISOString().split("T")[0]);
@@ -1802,30 +1836,112 @@ function resolveTabForEntityType(entityType, data, explicitTab) {
   return "AuditLog";
 }
 
-function extractEntityIdFromPayload(entityType, entityId, d) {
-  if (entityId && String(entityId).trim()) return String(entityId).trim();
-  if (!d || typeof d !== "object") return "";
-  var candidates = [
-    d.id, d.entityId, d.itemId, d.ProductID, d.InvoiceID, d.invoice_id,
-    d.user_id, d.staffId, d.customerId, d.CustomerID, d.branchId, d.branch_id,
-    d.account_id, d.AccountID, d.transfer_id, d.TransferID, d.grvNumber, d.grnId,
-    d.supplierId, d.SupplierID, d.voucherId, d.VoucherID, d.creditId, d.changeId,
-    d.sessionId, d.segmentId, d.zoneId, d.ZoneID, d.casualId, d.CasualID,
-    d.unlockId, d.proposalId, d.key
-  ];
-  for (var i = 0; i < candidates.length; i++) {
-    if (candidates[i] !== undefined && candidates[i] !== null && String(candidates[i]).trim() !== "") {
-      return String(candidates[i]).trim();
+function firstNonEmptyVal_(arr) {
+  for (var i = 0; i < arr.length; i++) {
+    if (arr[i] !== undefined && arr[i] !== null && String(arr[i]).trim() !== "") {
+      return String(arr[i]).trim();
     }
   }
-  if (entityType === "branch_lockdown") return String(d.branchId || d.branch_id || "BR-MAIN").trim();
-  if (entityType === "multi_currency") return "MULTI_CURRENCY_CONFIG";
-  if (entityType === "permissions_matrix") return "PERMISSIONS_MATRIX";
-  if (entityType === "role_configs") return "ROLE_CONFIGS";
-  if (entityType === "system_settings") return "SYSTEM_SETTINGS";
-  if (entityType === "sheets_config") return "SHEETS_CONFIG";
-  if (entityType === "inventory_category") return String(d.categoryId || d.name || "CATEGORIES_SNAPSHOT").trim();
-  if (entityType === "casual_worker" && Array.isArray(d)) return "CASUAL_WORKERS_BATCH";
+  return "";
+}
+
+function extractEntityIdFromPayload(entityType, entityId, d) {
+  var normType = String(entityType || "").trim().toLowerCase();
+  var cleanEnvId = entityId !== undefined && entityId !== null ? String(entityId).trim() : "";
+
+  if (d && typeof d === "object") {
+    // Heal legacy corrupted inventory envelopes where entityId was mistakenly set to "USR-001"
+    if (normType === "inventory_item") {
+      var invId = firstNonEmptyVal_([d.itemId, d.ItemID, d.ProductID, d.productId, d.id]);
+      if (invId) return invId;
+    }
+    if (cleanEnvId) return cleanEnvId;
+
+    // Entity-specific primary ID extraction FIRST (never allow user_id to hijack non-staff records)
+    switch (normType) {
+      case "sale":
+        return firstNonEmptyVal_([d.InvoiceID, d.invoice_id, d.invoiceId, d.id, d.entityId]);
+      case "customer":
+        return firstNonEmptyVal_([d.customerId, d.CustomerID, d.id, d.entityId]);
+      case "customer_change":
+        return firstNonEmptyVal_([d.changeId, d.ChangeID, d.id, d.Reference, d.reference, d.entityId]);
+      case "credit_sale":
+        return firstNonEmptyVal_([d.creditId, d.CreditID, d.id, d.entityId]);
+      case "credit_group":
+        return firstNonEmptyVal_([d.groupId, d.GroupID, d.id, d.entityId]);
+      case "expense":
+        return firstNonEmptyVal_([d.ExpenseID, d.expenseId, d.id, d.entityId]);
+      case "cash_log":
+        return firstNonEmptyVal_([d.LogID, d.logId, d.id, d.entityId]);
+      case "cash_lift":
+        return firstNonEmptyVal_([d.LiftID, d.liftId, d.id, d.entityId]);
+      case "cash_movement":
+        return firstNonEmptyVal_([d.MovementID, d.movementId, d.id, d.entityId]);
+      case "cash_account":
+        return firstNonEmptyVal_([d.account_id, d.AccountID, d.accountId, d.id, d.entityId]);
+      case "cash_transfer":
+        return firstNonEmptyVal_([d.transfer_id, d.TransferID, d.transferId, d.id, d.entityId]);
+      case "direct_grv":
+        return firstNonEmptyVal_([d.grvNumber, d.GRVNumber, d.GRVID, d.id, d.entityId]);
+      case "goods_received":
+        return firstNonEmptyVal_([d.grnId, d.GRNID, d.id, d.reference, d.entityId]);
+      case "stock_movement":
+        return firstNonEmptyVal_([d.movementId, d.txnId, d.MovementID, d.id, d.entityId]);
+      case "reconciliation":
+        return firstNonEmptyVal_([d.ReconID, d.reconId, d.id, d.entityId]);
+      case "supplier":
+        return firstNonEmptyVal_([d.supplierId, d.SupplierID, d.id, d.entityId]);
+      case "supplier_invoice_voucher":
+        return firstNonEmptyVal_([d.voucherId, d.VoucherID, d.id, d.entityId]);
+      case "staff":
+        return firstNonEmptyVal_([d.id, d.UserID, d.user_id, d.staffId, d.entityId]);
+      case "branch":
+        return firstNonEmptyVal_([d.branchId, d.BranchID, d.branch_id, d.id, d.entityId]);
+      case "audit_log":
+      case "supervisor_approval":
+        return firstNonEmptyVal_([d.AuditID, d.auditId, d.id, d.entityId]);
+      case "branch_lockdown":
+        return firstNonEmptyVal_([d.branchId, d.branch_id, d.BranchID]) || "BR-MAIN";
+      case "multi_currency":
+        return "MULTI_CURRENCY_CONFIG";
+      case "permissions_matrix":
+        return "PERMISSIONS_MATRIX";
+      case "role_configs":
+        return "ROLE_CONFIGS";
+      case "system_settings":
+        return "SYSTEM_SETTINGS";
+      case "sheets_config":
+        return "SHEETS_CONFIG";
+      case "inventory_category":
+        return firstNonEmptyVal_([d.categoryId, d.CategoryID, d.id, d.name]) || "CATEGORIES_SNAPSHOT";
+      case "casual_worker":
+        if (Array.isArray(d)) return "CASUAL_WORKERS_BATCH";
+        return firstNonEmptyVal_([d.casualId, d.CasualID, d.id, d.entityId]);
+      default:
+        break;
+    }
+
+    // Generic fallback WITHOUT user_id/staffId so logged-in user_id never hijacks operational rows
+    var fallback = firstNonEmptyVal_([
+      d.id, d.entityId, d.itemId, d.ItemID, d.ProductID, d.InvoiceID, d.invoice_id,
+      d.ExpenseID, d.expenseId, d.LogID, d.logId, d.customerId, d.CustomerID,
+      d.CreditID, d.creditId, d.ChangeID, d.changeId, d.GRNID, d.grnId, d.grvNumber,
+      d.account_id, d.AccountID, d.transfer_id, d.TransferID, d.supplierId, d.SupplierID,
+      d.voucherId, d.VoucherID, d.ReconID, d.sessionId, d.segmentId, d.zoneId, d.ZoneID,
+      d.casualId, d.CasualID, d.unlockId, d.proposalId, d.branchId, d.branch_id, d.key
+    ]);
+    if (fallback) return fallback;
+  }
+
+  if (cleanEnvId) return cleanEnvId;
+  if (normType === "branch_lockdown") return "BR-MAIN";
+  if (normType === "multi_currency") return "MULTI_CURRENCY_CONFIG";
+  if (normType === "permissions_matrix") return "PERMISSIONS_MATRIX";
+  if (normType === "role_configs") return "ROLE_CONFIGS";
+  if (normType === "system_settings") return "SYSTEM_SETTINGS";
+  if (normType === "sheets_config") return "SHEETS_CONFIG";
+  if (normType === "inventory_category") return "CATEGORIES_SNAPSHOT";
+  if (normType === "casual_worker" && Array.isArray(d)) return "CASUAL_WORKERS_BATCH";
   return "";
 }
 
@@ -1851,46 +1967,100 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
 
   switch (entityType) {
     case "sale":
+      var saleTotalVal = d.total !== undefined ? Number(d.total) : (d.Total !== undefined ? Number(d.Total) : 0);
+      var saleSubVal = d.subtotal !== undefined ? Number(d.subtotal) : (d.Subtotal !== undefined ? Number(d.Subtotal) : saleTotalVal);
+      var saleDiscVal = d.discount !== undefined ? Number(d.discount) : (d.Discount !== undefined ? Number(d.Discount) : 0);
+      var saleItemsSum = d.itemsSummary || d.ItemsSummary || "";
+      if (!saleItemsSum && Array.isArray(d.items) && d.items.length > 0) {
+        saleItemsSum = d.items.map(function(it) {
+          return (Number(it && it.quantity) || 1) + "x " + ((it && (it.name || it.itemName)) || "Item");
+        }).join(", ");
+      }
+      var saleTotalQty = d.totalQty !== undefined ? d.totalQty : (d.TotalQty !== undefined ? d.TotalQty : "");
+      if (saleTotalQty === "" && Array.isArray(d.items) && d.items.length > 0) {
+        var qSum = 0;
+        for (var qi = 0; qi < d.items.length; qi++) {
+          qSum += Number((d.items[qi] && d.items[qi].quantity) || 0);
+        }
+        saleTotalQty = qSum;
+      }
+      var saleTs = d.timestamp || d.Timestamp || isoClientUpdated;
+      var saleDate = d.date || d.Date || (typeof saleTs === "string" && /^\d{4}-\d{2}-\d{2}/.test(saleTs) ? saleTs.slice(0, 10) : isoServerNow.split("T")[0]);
       obj.InvoiceID = entityId;
-      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
-      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.Date = saleDate;
+      obj.Timestamp = saleTs;
       obj.Time = d.time || d.Time || "";
       obj.StaffID = d.staffId || d.StaffID || "";
       obj.StaffName = d.staffName || d.StaffName || "";
       obj.CustomerName = d.customerName || d.CustomerName || "Walk-in";
-      obj.ItemsSummary = d.itemsSummary || (Array.isArray(d.items) ? d.items.length + " item(s)" : "");
-      obj.TotalQty = d.totalQty !== undefined ? d.totalQty : "";
-      obj.Subtotal = d.subtotal !== undefined ? d.subtotal : (d.total || 0);
-      obj.Discount = d.discount || 0;
-      obj.Total = d.total !== undefined ? d.total : 0;
-      obj.TaxAmount = d.taxAmount || 0;
+      obj.ItemsSummary = saleItemsSum;
+      obj.TotalQty = saleTotalQty;
+      obj.Subtotal = saleSubVal;
+      obj.Discount = saleDiscVal;
+      obj.Total = saleTotalVal;
+      obj.TaxAmount = Number(d.taxAmount !== undefined ? d.taxAmount : (d.TaxAmount !== undefined ? d.TaxAmount : 0));
       obj.PaymentMethod = d.paymentMethod || d.PaymentMethod || "Cash";
-      obj.Currency = d.currency || "USD";
-      obj.ExchangeRate = d.exchangeRate || 1;
-      obj.AmountTendered = d.amountTendered !== undefined ? d.amountTendered : (d.total || 0);
-      obj.ChangeGiven = d.changeGiven || 0;
-      obj.Status = d.status || "Completed";
-      obj.ReceiptHash = d.receiptHash || "";
-      obj.Notes = d.notes || "";
+      obj.Currency = d.currency || d.Currency || "USD";
+      obj.ExchangeRate = Number(d.exchangeRate !== undefined ? d.exchangeRate : (d.ExchangeRate !== undefined ? d.ExchangeRate : (d.exchange_rate || 1)));
+      obj.AmountTendered = Number(d.amountTendered !== undefined ? d.amountTendered : (d.AmountTendered !== undefined ? d.AmountTendered : saleTotalVal));
+      obj.ChangeGiven = Number(d.changeGiven !== undefined ? d.changeGiven : (d.ChangeGiven !== undefined ? d.ChangeGiven : 0));
+      obj.Status = d.status || d.Status || "Completed";
+      obj.ReceiptHash = d.receiptHash || d.ReceiptHash || "";
+      obj.Notes = d.notes || d.Notes || "";
       obj.SyncedAt = isoServerNow;
       break;
     case "inventory_item":
+      var invCaseSize = Math.max(1, Number(d.caseSize || d.unitsPerCase || d.UnitsPerCase || d.CaseSize || 1) || 1);
+      var invSellUnit = Number(
+        d.sellPriceUnit !== undefined ? d.sellPriceUnit :
+        (d.SellPriceUnit !== undefined ? d.SellPriceUnit :
+        (d.SellingPrice !== undefined ? d.SellingPrice :
+        (d.price !== undefined ? d.price : 0)))
+      );
+      var invSellCase = Number(
+        d.sellPriceCase !== undefined ? d.sellPriceCase :
+        (d.SellPriceCase !== undefined ? d.SellPriceCase : invSellUnit * invCaseSize)
+      );
+      var invCostUnit = Number(
+        d.costPriceUnit !== undefined ? d.costPriceUnit :
+        (d.costPerUnit !== undefined ? d.costPerUnit :
+        (d.CostPriceUnit !== undefined ? d.CostPriceUnit :
+        (d.CostPerUnit !== undefined ? d.CostPerUnit :
+        (d.costPrice !== undefined ? d.costPrice :
+        (d.CostPrice !== undefined ? d.CostPrice : 0)))))
+      );
+      var invCostCase = Number(
+        d.costPriceCase !== undefined ? d.costPriceCase :
+        (d.costPerCase !== undefined ? d.costPerCase :
+        (d.CostPriceCase !== undefined ? d.CostPriceCase :
+        (d.CostPerCase !== undefined ? d.CostPerCase : invCostUnit * invCaseSize)))
+      );
+      var invTotalUnits = Number(
+        d.totalUnits !== undefined ? d.totalUnits :
+        (d.TotalUnits !== undefined ? d.TotalUnits :
+        (d.stockQuantity !== undefined ? d.stockQuantity :
+        (d.StockQuantity !== undefined ? d.StockQuantity : 0)))
+      );
       obj.ProductID = entityId;
-      obj.ItemName = d.itemName || d.name || d.ItemName || "";
+      obj.ItemName = d.itemName || d.ItemName || d.name || d.Name || "";
       obj.SKU = d.sku || d.SKU || "";
       obj.Barcode = d.barcode || d.Barcode || "";
       obj.Category = d.category || d.Category || "General";
-      obj.UnitType = d.unitType || d.unit || "Unit";
-      obj.CaseSize = d.caseSize || d.unitsPerCase || 1;
-      obj.SellPriceUnit = d.sellPriceUnit !== undefined ? d.sellPriceUnit : (d.price || 0);
-      obj.SellPriceCase = d.sellPriceCase || 0;
-      obj.CostPriceUnit = d.costPriceUnit !== undefined ? d.costPriceUnit : (d.costPrice || 0);
-      obj.CostPriceCase = d.costPriceCase || 0;
-      obj.TotalUnits = d.totalUnits !== undefined ? d.totalUnits : (d.stockQuantity || 0);
-      obj.ReorderLevel = d.reorderLevelUnits !== undefined ? d.reorderLevelUnits : (d.reorderLevel || 5);
-      obj.SupplierName = d.supplierName || "";
-      obj.LastUpdated = d.lastUpdated || isoClientUpdated;
-      obj.Active = d.active !== false && d.active !== "N" ? "Y" : "N";
+      obj.UnitType = d.unitType || d.UnitType || d.unit || "Unit";
+      obj.CaseSize = invCaseSize;
+      obj.SellPriceUnit = invSellUnit;
+      obj.SellPriceCase = invSellCase;
+      obj.CostPriceUnit = invCostUnit;
+      obj.CostPriceCase = invCostCase;
+      obj.TotalUnits = invTotalUnits;
+      obj.ReorderLevel = Number(
+        d.reorderLevelUnits !== undefined ? d.reorderLevelUnits :
+        (d.reorderLevel !== undefined ? d.reorderLevel :
+        (d.ReorderLevel !== undefined ? d.ReorderLevel : 5))
+      );
+      obj.SupplierName = d.supplierName || d.SupplierName || "";
+      obj.LastUpdated = d.lastUpdated || d.LastUpdated || isoClientUpdated;
+      obj.Active = d.active !== false && d.active !== "N" && d.Active !== "N" ? "Y" : "N";
       obj.SyncedAt = isoServerNow;
       break;
     case "staff":
@@ -1944,32 +2114,214 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
       break;
     case "customer":
       obj.CustomerID = entityId;
-      obj.CustomerName = d.name || d.customerName || "";
-      obj.Phone = d.phone || "";
-      obj.Email = d.email || "";
-      obj.Address = d.address || "";
-      obj.CreditLimit = d.creditLimit || 0;
-      obj.CurrentBalance = d.currentBalance || d.creditBalance || 0;
-      obj.ChangeBalance = d.changeBalance || 0;
+      obj.CustomerName = d.name || d.Name || d.customerName || d.CustomerName || "";
+      obj.Phone = d.phone || d.Phone || "";
+      obj.Email = d.email || d.Email || "";
+      obj.Address = d.address || d.Address || "";
+      obj.CreditLimit = Number(d.creditLimit !== undefined ? d.creditLimit : (d.CreditLimit || 0));
+      obj.CurrentBalance = Number(d.currentBalance !== undefined ? d.currentBalance : (d.creditBalance !== undefined ? d.creditBalance : (d.CurrentBalance || 0)));
+      obj.ChangeBalance = Number(d.changeBalance !== undefined ? d.changeBalance : (d.ChangeBalance || 0));
+      obj.Notes = d.notes || d.Notes || "";
       obj.UpdatedAt = isoClientUpdated;
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "customer_change":
+      obj.ChangeID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.CustomerID = d.customerId || d.CustomerID || "";
+      obj.CustomerName = d.customerName || d.CustomerName || "";
+      obj.In = Number(d.in !== undefined ? d.in : (d.In || 0));
+      obj.Out = Number(d.out !== undefined ? d.out : (d.Out || 0));
+      obj.BalanceAfter = Number(d.balanceAfter !== undefined ? d.balanceAfter : (d.BalanceAfter || 0));
+      obj.InvoiceRef = d.reference || d.Reference || d.invoiceRef || d.InvoiceRef || "";
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.Notes = d.notes || d.Notes || "";
+      obj.Status = d.status || d.Status || "Recorded";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "credit_sale":
+      obj.CreditID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.CustomerID = d.customerId || d.CustomerID || "";
+      obj.CustomerName = d.customerName || d.CustomerName || "";
+      obj.Phone = d.phone || d.Phone || "";
+      obj.CreditGroupID = d.creditGroupId || d.CreditGroupID || "";
+      obj.Amount = Number(d.amount !== undefined ? d.amount : (d.Amount || 0));
+      obj.PaidAmount = Number(d.paidAmount !== undefined ? d.paidAmount : (d.PaidAmount || d.in || d.In || 0));
+      obj.In = Number(d.in !== undefined ? d.in : (d.In || 0));
+      obj.Out = Number(d.out !== undefined ? d.out : (d.Out !== undefined ? d.Out : obj.Amount));
+      obj.Balance = Number(d.balance !== undefined ? d.balance : (d.Balance !== undefined ? d.Balance : Math.max(0, obj.Out - obj.In)));
+      obj.DueDate = d.dueDate || d.DueDate || "";
+      obj.ItemDescription = d.itemDescription || d.ItemDescription || "";
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.Status = d.status || d.Status || "Outstanding";
+      obj.Notes = d.notes || d.Notes || "";
       obj.SyncedAt = isoServerNow;
       break;
     case "cash_log":
       obj.LogID = entityId;
-      obj.Date = d.date || isoServerNow.split("T")[0];
-      obj.Timestamp = d.timestamp || isoClientUpdated;
-      obj.StaffID = d.staffId || "";
-      obj.StaffName = d.staffName || "";
-      obj.AccountID = d.accountId || "";
-      obj.Category = d.category || "";
-      obj.Description = d.description || "";
-      obj.In = d.in || 0;
-      obj.Out = d.out || 0;
-      obj.Currency = d.currency || "USD";
-      obj.PaymentMethod = d.paymentMethod || "Cash";
-      obj.Reference = d.reference || "";
-      obj.Status = d.status || "Posted";
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.AccountID = d.accountId || d.AccountID || "";
+      obj.Category = d.category || d.Category || d.line || d.Line || "";
+      obj.Description = d.description || d.Description || "";
+      obj.In = Number(d.in !== undefined ? d.in : (d.In || 0));
+      obj.Out = Number(d.out !== undefined ? d.out : (d.Out || 0));
+      obj.Currency = d.currency || d.Currency || "USD";
+      obj.PaymentMethod = d.paymentMethod || d.PaymentMethod || "Cash";
+      obj.Reference = d.reference || d.Reference || "";
+      obj.Status = d.status || d.Status || "Posted";
       obj.SyncedAt = isoServerNow;
+      break;
+    case "expense":
+      obj.ExpenseID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.Category = d.category || d.Category || "General";
+      obj.Description = d.description || d.Description || "";
+      obj.VendorOrCustomer = d.vendorOrCustomer || d.VendorOrCustomer || "";
+      obj.Amount = Number(d.amount !== undefined ? d.amount : (d.Amount || 0));
+      obj.Currency = d.currency || d.Currency || "USD";
+      obj.PaymentMethod = d.paymentMethod || d.PaymentMethod || "Cash";
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.ReceiptRef = d.receiptRef || d.ReceiptRef || "";
+      obj.Status = d.status || d.Status || "approved";
+      obj.ApprovedBy = d.approvedByName || d.ApprovedBy || d.approvedBy || "";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "supplier":
+      obj.SupplierID = entityId;
+      obj.SupplierName = d.name || d.Name || d.SupplierName || "";
+      obj.Category = d.category || d.Category || "";
+      obj.ContactPerson = d.contactPerson || d.ContactPerson || "";
+      obj.Phone = d.phone || d.Phone || "";
+      obj.Email = d.email || d.Email || "";
+      obj.Address = d.address || d.Address || "";
+      obj.City = d.city || d.City || "";
+      obj.PaymentTerms = d.paymentTerms || d.PaymentTerms || "";
+      obj.TaxNumber = d.taxNumber || d.TaxNumber || "";
+      obj.Balance = Number(d.balance !== undefined ? d.balance : (d.Balance || 0));
+      obj.Status = d.status || d.Status || "Active";
+      obj.UpdatedAt = isoClientUpdated;
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "supplier_invoice_voucher":
+      obj.VoucherID = entityId;
+      obj.InvoiceNo = d.invoiceNumber || d.invoiceNo || d.InvoiceNo || "";
+      obj.SupplierID = d.supplierId || d.SupplierID || "";
+      obj.SupplierName = d.supplierName || d.SupplierName || "";
+      obj.Date = d.invoiceDate || d.date || d.Date || isoServerNow.split("T")[0];
+      obj.DueDate = d.dueDate || d.DueDate || "";
+      obj.TotalAmount = Number(d.totalAmount !== undefined ? d.totalAmount : (d.TotalAmount || 0));
+      obj.PaidAmount = Number(d.paidAmount !== undefined ? d.paidAmount : (d.PaidAmount || 0));
+      obj.Status = d.status || d.Status || "Pending";
+      obj.Notes = d.notes || d.Notes || "";
+      obj.UpdatedAt = isoClientUpdated;
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "direct_grv":
+      obj.GRVID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.GRVNumber = d.grvNumber || d.GRVNumber || entityId;
+      obj.SupplierName = d.supplierName || d.SupplierName || d.supplier || "";
+      obj.InvoiceNumber = d.invoiceNumber || d.InvoiceNumber || "";
+      obj.ItemsCount = Array.isArray(d.items) ? d.items.length : Number(d.itemsCount || d.ItemsCount || 0);
+      obj.TotalCost = Number(d.totalCost !== undefined ? d.totalCost : (d.TotalCost || 0));
+      obj.CashPaid = Number(d.cashPaid !== undefined ? d.cashPaid : (d.CashPaid || 0));
+      obj.PaymentMethod = d.paymentMethod || d.PaymentMethod || "Cash";
+      obj.AccountID = d.accountId || d.AccountID || "";
+      obj.Status = d.status || d.Status || "APPROVED";
+      obj.RecordedBy = d.recordedByName || d.recordedBy || d.staffName || d.RecordedBy || "";
+      obj.ApprovedBy = d.approvedByName || d.approvedBy || d.ApprovedBy || "";
+      obj.Notes = d.notes || d.Notes || "";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "goods_received":
+      obj.GRNID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.SupplierID = d.supplierId || d.SupplierID || "";
+      obj.SupplierName = d.supplier || d.Supplier || d.supplierName || d.SupplierName || "";
+      obj.InvoiceRef = d.invoiceNo || d.InvoiceNo || d.invoiceRef || d.InvoiceRef || "";
+      obj.TotalAmount = Number(d.lineTotal !== undefined ? d.lineTotal : (d.LineTotal !== undefined ? d.LineTotal : (d.totalAmount || d.TotalAmount || 0)));
+      obj.ItemsCount = Number(d.itemsCount || d.ItemsCount || 1);
+      obj.Status = d.status || d.Status || "Received";
+      obj.ReceivedBy = d.staffName || d.staffId || d.StaffID || d.ReceivedBy || "";
+      obj.Notes = d.notes || d.Notes || (d.itemName || d.ItemName || "");
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "stock_movement":
+      obj.MovementID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.ProductID = d.itemId || d.ItemID || d.ProductID || "";
+      obj.ProductName = d.itemName || d.ItemName || d.ProductName || "";
+      obj.MovementType = d.movementType || d.txnType || d.MovementType || "ADJUSTMENT";
+      obj.QtyChange = Number(d.singlesChange !== undefined ? d.singlesChange : (d.qtyChange !== undefined ? d.qtyChange : (d.QtyChange || 0)));
+      obj.BalanceBefore = Number(d.balanceBefore !== undefined ? d.balanceBefore : (d.BalanceBefore || 0));
+      obj.BalanceAfter = Number(d.closingSingles !== undefined ? d.closingSingles : (d.resultingStockSingles !== undefined ? d.resultingStockSingles : (d.BalanceAfter || 0)));
+      obj.ReferenceID = d.referenceId || d.ReferenceID || "";
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.Notes = d.reason || d.notes || d.Notes || "";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "reconciliation":
+      obj.ReconID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.OpeningFloat = Number(d.openingFloat !== undefined ? d.openingFloat : (d.OpeningFloat || 0));
+      obj.CashSales = Number(d.cashSales !== undefined ? d.cashSales : (d.CashSales || 0));
+      obj.OtherCashIn = Number(d.otherCashIn !== undefined ? d.otherCashIn : (d.OtherCashIn || 0));
+      obj.CashExpenses = Number(d.cashExpenses !== undefined ? d.cashExpenses : (d.CashExpenses || 0));
+      obj.BankDrops = Number(d.bankDrops !== undefined ? d.bankDrops : (d.BankDrops || 0));
+      obj.ExpectedCash = Number(d.expectedCash !== undefined ? d.expectedCash : (d.ExpectedCash || 0));
+      obj.ActualCashCount = Number(d.actualCashCount !== undefined ? d.actualCashCount : (d.ActualCashCount || 0));
+      obj.Variance = Number(d.variance !== undefined ? d.variance : (d.Variance || 0));
+      obj.Status = d.status || d.Status || "submitted";
+      obj.Notes = d.notes || d.Notes || "";
+      obj.ApprovedBy = d.approvedByName || d.approvedBy || d.ApprovedBy || "";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "cash_lift":
+      obj.LiftID = entityId;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.StaffID = d.staffId || d.StaffID || "";
+      obj.StaffName = d.staffName || d.StaffName || "";
+      obj.Amount = Number(d.amount !== undefined ? d.amount : (d.Amount || 0));
+      obj.Currency = d.currency || d.Currency || "USD";
+      obj.DestinationAccount = d.destinationAccount || d.DestinationAccount || "";
+      obj.AuthorizedBy = d.authorizedBy || d.supervisorName || d.AuthorizedBy || "";
+      obj.Notes = d.notes || d.Notes || "";
+      obj.Status = d.status || d.Status || "Completed";
+      obj.SyncedAt = isoServerNow;
+      break;
+    case "audit_log":
+    case "supervisor_approval":
+      obj.AuditID = entityId;
+      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
+      obj.UserID = d.staffId || d.userId || d.UserID || d.user_id || "";
+      obj.UserName = d.staffName || d.userName || d.UserName || "";
+      obj.AuthorizedByName = d.authorizedByName || d.AuthorizedByName || "";
+      obj.Role = d.staffRole || d.role || d.Role || d.user_role || "";
+      obj.Action = d.action || d.Action || "";
+      obj.Module = d.module || d.Module || "";
+      obj.EntityID = d.referenceId || d.targetId || d.EntityID || entityId;
+      obj.Details = d.details || d.Details || "";
+      obj.IPOrDevice = d.deviceId || d.IPOrDevice || envelope.originDeviceId || "";
+      obj.Status = d.severity || d.status || d.Status || "INFO";
       break;
     case "cash_transfer":
       obj.TransferID = entityId;
@@ -2930,11 +3282,12 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
   };
 }
 
-function mirrorOwnerCredentialsToMasterDirectory(masterSs, compId, staffId, role, email, fullName, brId, resolvedPinHash, isActive, nowIso) {
+function mirrorOwnerCredentialsToMasterDirectory(masterSs, compId, staffId, role, email, fullName, brId, resolvedPinHash, isActive, nowIso, resolvedPinSalt) {
   if (!masterSs || !compId || !resolvedPinHash) return;
   var roleUp = String(role || "").toUpperCase().trim();
   var emailLower = String(email || "").trim().toLowerCase();
   var compUp = String(compId).trim().toUpperCase();
+  var cleanSalt = String(resolvedPinSalt || "").trim();
   var touchedCompany = false;
 
   // 1. Mirror into Master `Global_Users` (for OWNER/ADMIN/SUPER_ADMIN or any existing Global_Users row)
@@ -2951,6 +3304,7 @@ function mirrorOwnerCredentialsToMasterDirectory(masterSs, compId, staffId, role
         user_id: staffId,
         email: emailLower,
         password_hash: resolvedPinHash,
+        password_salt: cleanSalt,
         company_id: compId,
         role: roleUp || "OWNER",
         full_name: fullName || "Business Owner",
@@ -2963,14 +3317,15 @@ function mirrorOwnerCredentialsToMasterDirectory(masterSs, compId, staffId, role
     }
   } catch (gErr) {}
 
-  // 2. Mirror into Master `companies.password_hash` when user is OWNER or matches owner_email
+  // 2. Mirror into Master `companies.password_hash` + `companies.password_salt` when user is OWNER or matches owner_email
   try {
-    var cSheet = masterSs.getSheetByName("companies");
+    var cSheet = backfillSchemaColumns(masterSs, "companies");
     if (cSheet && cSheet.getLastRow() >= 2) {
       var cData = cSheet.getDataRange().getValues();
       var cHeaders = cData[0];
       var cidIdx = cHeaders.indexOf("company_id");
       var pwIdx = cHeaders.indexOf("password_hash");
+      var saltIdx = cHeaders.indexOf("password_salt");
       var oeIdx = cHeaders.indexOf("owner_email");
       var updIdx = cHeaders.indexOf("updated_at");
       if (cidIdx !== -1 && pwIdx !== -1) {
@@ -2980,6 +3335,7 @@ function mirrorOwnerCredentialsToMasterDirectory(masterSs, compId, staffId, role
           var isOwnerMatch = (roleUp === "OWNER") || (emailLower && compOwnerEmail && emailLower === compOwnerEmail);
           if (isOwnerMatch) {
             cSheet.getRange(r + 1, pwIdx + 1).setValue(resolvedPinHash);
+            if (saltIdx !== -1) cSheet.getRange(r + 1, saltIdx + 1).setValue(cleanSalt);
             if (updIdx !== -1) cSheet.getRange(r + 1, updIdx + 1).setValue(nowIso);
             touchedCompany = true;
           }
@@ -3070,7 +3426,7 @@ function mirrorStaffToMasterUsers(masterSs, compId, brId, staffId, d, seq, nowIs
 
     if (pinAccepted && resolvedPinHash) {
       mirrorOwnerCredentialsToMasterDirectory(
-        masterSs, compId, staffId, resolvedRole, emailLower, resolvedName, brId, resolvedPinHash, resolvedActive, nowIso
+        masterSs, compId, staffId, resolvedRole, emailLower, resolvedName, brId, resolvedPinHash, resolvedActive, nowIso, resolvedPinSalt
       );
     }
   } catch (e) {}
@@ -3123,13 +3479,19 @@ function reconstructDataFromLegacyRow(entityType, rawObj) {
       out.id = rawObj.InvoiceID || rawObj.entity_id || "";
       out.date = rawObj.Date || "";
       out.timestamp = rawObj.Timestamp || rawObj.client_updated_at || "";
+      out.time = rawObj.Time || "";
       out.staffId = rawObj.StaffID || "";
       out.staffName = rawObj.StaffName || "";
       out.customerName = rawObj.CustomerName || "Walk-in";
+      out.itemsSummary = rawObj.ItemsSummary || "";
+      out.totalQty = Number(rawObj.TotalQty || 0);
       out.total = Number(rawObj.Total || 0);
       out.subtotal = Number(rawObj.Subtotal || out.total || 0);
       out.discount = Number(rawObj.Discount || 0);
+      out.amountTendered = Number(rawObj.AmountTendered || out.total || 0);
+      out.changeGiven = Number(rawObj.ChangeGiven || 0);
       out.paymentMethod = rawObj.PaymentMethod || "Cash";
+      out.currency = rawObj.Currency || "USD";
       out.status = rawObj.Status || "Completed";
       break;
     case "inventory_item":
@@ -3140,9 +3502,14 @@ function reconstructDataFromLegacyRow(entityType, rawObj) {
       out.sku = rawObj.SKU || "";
       out.barcode = rawObj.Barcode || "";
       out.category = rawObj.Category || "General";
+      out.unitsPerCase = Math.max(1, Number(rawObj.CaseSize || rawObj.UnitsPerCase || 1) || 1);
       out.sellPriceUnit = Number(rawObj.SellPriceUnit !== undefined && rawObj.SellPriceUnit !== "" ? rawObj.SellPriceUnit : (rawObj.SellingPrice || 0));
+      out.sellPriceCase = Number(rawObj.SellPriceCase !== undefined && rawObj.SellPriceCase !== "" ? rawObj.SellPriceCase : (out.sellPriceUnit * out.unitsPerCase));
       out.price = out.sellPriceUnit;
-      out.costPriceUnit = Number(rawObj.CostPriceUnit !== undefined && rawObj.CostPriceUnit !== "" ? rawObj.CostPriceUnit : (rawObj.CostPrice || 0));
+      out.costPriceUnit = Number(rawObj.CostPriceUnit !== undefined && rawObj.CostPriceUnit !== "" ? rawObj.CostPriceUnit : (rawObj.CostPerUnit || rawObj.CostPrice || 0));
+      out.costPerUnit = out.costPriceUnit;
+      out.costPriceCase = Number(rawObj.CostPriceCase !== undefined && rawObj.CostPriceCase !== "" ? rawObj.CostPriceCase : (rawObj.CostPerCase || (out.costPriceUnit * out.unitsPerCase)));
+      out.costPerCase = out.costPriceCase;
       out.totalUnits = Number(rawObj.TotalUnits !== undefined && rawObj.TotalUnits !== "" ? rawObj.TotalUnits : (rawObj.StockQuantity || 0));
       out.lastUpdated = rawObj.LastUpdated || rawObj.client_updated_at || "";
       break;
@@ -4106,7 +4473,7 @@ function handleOwnerLogin(req, ss) {
   var d = mergeReqPayload(req);
   var email = String(d.email || d.owner_email || "").trim().toLowerCase();
   var password = String(d.password || "").trim();
-  if (!email) return { status: "error", success: false, message: "Email is required" };
+  if (!email || !password) return { status: "error", success: false, message: "Email and password are required" };
 
   var cSheet = ss.getSheetByName("companies");
   if (!cSheet || cSheet.getLastRow() < 2) {
@@ -4116,30 +4483,106 @@ function handleOwnerLogin(req, ss) {
   var h = data[0];
   var emCol = h.indexOf("owner_email");
   var pwCol = h.indexOf("password_hash");
+  var pwSaltCol = h.indexOf("password_salt");
   var idCol = h.indexOf("company_id");
-  var passHash = hashPasswordSha256(password);
+
+  var buildSafeCompanyObj = function(rowVals) {
+    var obj = {};
+    for (var c = 0; c < h.length; c++) {
+      if (h[c] !== "password_hash" && h[c] !== "password_salt") obj[h[c]] = rowVals[c];
+    }
+    return obj;
+  };
+
+  var findCompanyById = function(targetCompId) {
+    var tUp = String(targetCompId || "").trim().toUpperCase();
+    if (!tUp || idCol === -1) return null;
+    for (var ci = 1; ci < data.length; ci++) {
+      if (String(data[ci][idCol] || "").trim().toUpperCase() === tUp) {
+        return { rowIndex: ci + 1, obj: buildSafeCompanyObj(data[ci]) };
+      }
+    }
+    return null;
+  };
 
   var matchedCompanyObj = null;
   var matchedUserId = "";
   var matchedRole = "OWNER";
   var matchedBranchId = "";
   var matchedFullName = "";
+  var emailFoundInAnyTab = false;
 
-  // 1. Primary lookup in `companies` tab by owner_email
+  // Helper to verify password against Master `users` tab (supports salted pin_hash + pin_salt and unsalted pin_hash)
+  var verifyAgainstMasterUsersTab = function(targetEmail, optionalCompanyId) {
+    var uSheet = ss.getSheetByName("users");
+    if (!uSheet || uSheet.getLastRow() < 2) return null;
+    var uData = uSheet.getDataRange().getValues();
+    var uH = uData[0];
+    var uEmCol = uH.indexOf("email");
+    var uCompCol = uH.indexOf("company_id");
+    var uIdCol = uH.indexOf("user_id");
+    var uRoleCol = uH.indexOf("role");
+    var uNameCol = uH.indexOf("full_name");
+    var uBrCol = uH.indexOf("branch_id");
+    var uHashCol = uH.indexOf("pin_hash");
+    var uSaltCol = uH.indexOf("pin_salt");
+    var uActCol = uH.indexOf("is_active");
+    var optUp = String(optionalCompanyId || "").trim().toUpperCase();
+
+    for (var ui = 1; ui < uData.length; ui++) {
+      var rowEm = uEmCol !== -1 ? String(uData[ui][uEmCol] || "").trim().toLowerCase() : "";
+      var rowComp = uCompCol !== -1 ? String(uData[ui][uCompCol] || "").trim() : "";
+      if (rowEm !== targetEmail) continue;
+      if (optUp && rowComp.toUpperCase() !== optUp) continue;
+      if (uActCol !== -1 && (uData[ui][uActCol] === false || String(uData[ui][uActCol]).toUpperCase() === "FALSE")) continue;
+      emailFoundInAnyTab = true;
+      var uHash = uHashCol !== -1 ? String(uData[ui][uHashCol] || "").trim() : "";
+      var uSalt = uSaltCol !== -1 ? String(uData[ui][uSaltCol] || "").trim() : "";
+      if (verifyPasswordHashWithSalt_(password, uHash, uSalt)) {
+        return {
+          company_id: rowComp,
+          user_id: uIdCol !== -1 ? String(uData[ui][uIdCol] || "").trim() : "",
+          role: uRoleCol !== -1 ? String(uData[ui][uRoleCol] || "OWNER").trim().toUpperCase() : "OWNER",
+          full_name: uNameCol !== -1 ? String(uData[ui][uNameCol] || "").trim() : "",
+          branch_id: uBrCol !== -1 ? String(uData[ui][uBrCol] || "").trim() : "",
+          pin_hash: uHash,
+          pin_salt: uSalt
+        };
+      }
+    }
+    return null;
+  };
+
+  // 1. Primary lookup in `companies` tab by owner_email (supports salted & unsalted password_hash + self-healing from `users` tab)
   for (var i = 1; i < data.length; i++) {
-    if (emCol !== -1 && String(data[i][emCol]).trim().toLowerCase() === email) {
+    if (emCol !== -1 && String(data[i][emCol] || "").trim().toLowerCase() === email) {
+      emailFoundInAnyTab = true;
       var storedHash = pwCol !== -1 ? String(data[i][pwCol] || "").trim() : "";
-      if (storedHash && storedHash !== passHash && storedHash !== password && password !== "Pass123") {
-        return { status: "error", success: false, message: "Invalid email or password" };
+      var storedSalt = pwSaltCol !== -1 ? String(data[i][pwSaltCol] || "").trim() : "";
+      var compObj = buildSafeCompanyObj(data[i]);
+      if (verifyPasswordHashWithSalt_(password, storedHash, storedSalt)) {
+        matchedCompanyObj = compObj;
+        matchedUserId = "USR-" + compObj.company_id + "-01";
+        matchedFullName = compObj.owner_name || compObj.company_name;
+        break;
       }
-      var obj = {};
-      for (var c = 0; c < h.length; c++) {
-        if (h[c] !== "password_hash") obj[h[c]] = data[i][c];
+      // Legacy self-heal path: if companies.password_hash was overwritten with a salted user pin_hash without password_salt,
+      // verify cryptographically against the authoritative Master `users` row for this company & email.
+      var healedUser = verifyAgainstMasterUsersTab(email, compObj.company_id);
+      if (healedUser) {
+        matchedCompanyObj = compObj;
+        matchedUserId = healedUser.user_id || ("USR-" + compObj.company_id + "-01");
+        matchedRole = healedUser.role || "OWNER";
+        matchedBranchId = healedUser.branch_id || "";
+        matchedFullName = healedUser.full_name || compObj.owner_name || compObj.company_name;
+        try {
+          mirrorOwnerCredentialsToMasterDirectory(
+            ss, compObj.company_id, matchedUserId, matchedRole, email, matchedFullName,
+            matchedBranchId || "BR-MAIN", healedUser.pin_hash, true, new Date().toISOString(), healedUser.pin_salt
+          );
+        } catch (healErr) {}
+        break;
       }
-      matchedCompanyObj = obj;
-      matchedUserId = "USR-" + obj.company_id + "-01";
-      matchedFullName = obj.owner_name || obj.company_name;
-      break;
     }
   }
 
@@ -4151,6 +4594,7 @@ function handleOwnerLogin(req, ss) {
       var gH = gData[0];
       var gEmCol = gH.indexOf("email");
       var gPwCol = gH.indexOf("password_hash");
+      var gSaltCol = gH.indexOf("password_salt");
       var gCompCol = gH.indexOf("company_id");
       var gUidCol = gH.indexOf("user_id");
       var gRoleCol = gH.indexOf("role");
@@ -4158,33 +4602,56 @@ function handleOwnerLogin(req, ss) {
       var gBrCol = gH.indexOf("branch_id");
       for (var g = 1; g < gData.length; g++) {
         if (gEmCol !== -1 && String(gData[g][gEmCol] || "").trim().toLowerCase() === email) {
+          emailFoundInAnyTab = true;
           var gStored = gPwCol !== -1 ? String(gData[g][gPwCol] || "").trim() : "";
-          if (gStored && gStored !== passHash && gStored !== password && password !== "Pass123") {
-            return { status: "error", success: false, message: "Invalid email or password" };
-          }
+          var gSalt = gSaltCol !== -1 ? String(gData[g][gSaltCol] || "").trim() : "";
           var gCompId = gCompCol !== -1 ? String(gData[g][gCompCol] || "").trim() : "";
-          matchedUserId = gUidCol !== -1 ? String(gData[g][gUidCol] || "").trim() : ("USR-" + gCompId + "-01");
-          matchedRole = gRoleCol !== -1 ? String(gData[g][gRoleCol] || "OWNER").trim().toUpperCase() : "OWNER";
-          matchedFullName = gNameCol !== -1 ? String(gData[g][gNameCol] || "").trim() : "";
-          matchedBranchId = gBrCol !== -1 ? String(gData[g][gBrCol] || "").trim() : "";
-          for (var ci = 1; ci < data.length; ci++) {
-            if (idCol !== -1 && String(data[ci][idCol] || "").trim().toUpperCase() === gCompId.toUpperCase()) {
-              var cObj = {};
-              for (var cc = 0; cc < h.length; cc++) {
-                if (h[cc] !== "password_hash") cObj[h[cc]] = data[ci][cc];
-              }
-              matchedCompanyObj = cObj;
-              break;
+          var verifiedViaGlobal = verifyPasswordHashWithSalt_(password, gStored, gSalt);
+          var healedFromUsers = !verifiedViaGlobal ? verifyAgainstMasterUsersTab(email, gCompId) : null;
+          if (!verifiedViaGlobal && !healedFromUsers) continue;
+          matchedUserId = (healedFromUsers && healedFromUsers.user_id) || (gUidCol !== -1 ? String(gData[g][gUidCol] || "").trim() : ("USR-" + gCompId + "-01"));
+          matchedRole = (healedFromUsers && healedFromUsers.role) || (gRoleCol !== -1 ? String(gData[g][gRoleCol] || "OWNER").trim().toUpperCase() : "OWNER");
+          matchedFullName = (healedFromUsers && healedFromUsers.full_name) || (gNameCol !== -1 ? String(gData[g][gNameCol] || "").trim() : "");
+          matchedBranchId = (healedFromUsers && healedFromUsers.branch_id) || (gBrCol !== -1 ? String(gData[g][gBrCol] || "").trim() : "");
+          var foundComp = findCompanyById(gCompId);
+          if (foundComp) {
+            matchedCompanyObj = foundComp.obj;
+            if (healedFromUsers) {
+              try {
+                mirrorOwnerCredentialsToMasterDirectory(
+                  ss, gCompId, matchedUserId, matchedRole, email, matchedFullName,
+                  matchedBranchId || "BR-MAIN", healedFromUsers.pin_hash, true, new Date().toISOString(), healedFromUsers.pin_salt
+                );
+              } catch (healErr2) {}
             }
+            break;
           }
-          break;
         }
       }
     }
   }
 
+  // 3. Final fallback lookup in Master `users` tab by email (supports any owner/staff user with salted or unsalted pin_hash)
   if (!matchedCompanyObj) {
-    return { status: "error", success: false, message: "Account not found" };
+    var verifiedDirectUser = verifyAgainstMasterUsersTab(email, "");
+    if (verifiedDirectUser && verifiedDirectUser.company_id) {
+      var compFromUser = findCompanyById(verifiedDirectUser.company_id);
+      if (compFromUser) {
+        matchedCompanyObj = compFromUser.obj;
+        matchedUserId = verifiedDirectUser.user_id || ("USR-" + verifiedDirectUser.company_id + "-01");
+        matchedRole = verifiedDirectUser.role || "OWNER";
+        matchedBranchId = verifiedDirectUser.branch_id || "";
+        matchedFullName = verifiedDirectUser.full_name || compFromUser.obj.owner_name || compFromUser.obj.company_name;
+      }
+    }
+  }
+
+  if (!matchedCompanyObj) {
+    return {
+      status: "error",
+      success: false,
+      message: emailFoundInAnyTab ? "Invalid email or password" : "Account not found"
+    };
   }
 
   var br = matchedBranchId || getTenantPrimaryBranch(matchedCompanyObj.company_id, ss);
@@ -4580,7 +5047,8 @@ function handleUpsertStaff(req, masterSs, targetSs, companyId, branchId) {
       rowObj.branch_id,
       resolvedPinHash,
       rowObj.is_active,
-      nowIso
+      nowIso,
+      resolvedPinSalt
     );
   }
 
@@ -4606,7 +5074,7 @@ function handleGetTenantContext(req, ss) {
   if (!comp) return { success: false, error: "Tenant not found: " + companyId };
   var out = {};
   for (var k in comp) {
-    if (comp.hasOwnProperty(k) && k !== "password_hash" && k !== "_rowIndex") out[k] = comp[k];
+    if (comp.hasOwnProperty(k) && k !== "password_hash" && k !== "password_salt" && k !== "_rowIndex") out[k] = comp[k];
   }
   var compUpper = companyId.toUpperCase();
   var propEp = Number(PropertiesService.getScriptProperties().getProperty("ROUTE_EPOCH_" + compUpper) || "1");
@@ -4685,7 +5153,7 @@ function handleLookupCompany(req, ss) {
   for (var i = 1; i < data.length; i++) {
     var obj = {};
     for (var c = 0; c < h.length; c++) {
-      if (h[c] !== "password_hash") obj[h[c]] = data[i][c];
+      if (h[c] !== "password_hash" && h[c] !== "password_salt") obj[h[c]] = data[i][c];
     }
     if (emailQ && !compQ) {
       if (String(obj.owner_email || "").trim().toLowerCase() === emailQ) {
@@ -4789,62 +5257,72 @@ function handleMergeDuplicateCompanies(req, ss) {
 // 7. V5.0/V7.0 OPERATIONAL & SAAS HANDLERS (USING MERGED PAYLOAD)
 // ============================================================================
 
+function extendObj_(base, extra) {
+  var out = {};
+  if (base && typeof base === "object") {
+    for (var k1 in base) {
+      if (base.hasOwnProperty(k1)) out[k1] = base[k1];
+    }
+  }
+  if (extra && typeof extra === "object") {
+    for (var k2 in extra) {
+      if (extra.hasOwnProperty(k2)) out[k2] = extra[k2];
+    }
+  }
+  return out;
+}
+
 function handleAddDirectGRV(req, ss, masterSsOpt, companyId, branchId) {
   var d = mergeReqPayload(req);
   d.id = d.id || d.grvNumber || ("GRV-" + Date.now());
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     entityType: "direct_grv",
     entityId: d.id,
     data: d
-  }, masterSsOpt, ss, companyId, branchId);
+  }), masterSsOpt, ss, companyId, branchId);
 }
 
 function handleApproveDirectGRV(req, ss, masterSsOpt, companyId, branchId) {
   var d = mergeReqPayload(req);
   d.status = "Approved";
   d.approvedAt = new Date().toISOString();
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     entityType: "direct_grv",
     entityId: d.id || d.grvNumber,
     data: d
-  }, masterSsOpt, ss, companyId, branchId);
+  }), masterSsOpt, ss, companyId, branchId);
 }
 
 function handleSubmitEOD(req, ss, masterSsOpt, companyId, branchId) {
   var d = mergeReqPayload(req);
   d.status = d.status || "SUBMITTED";
   d.id = d.id || ("REC-" + (d.date || new Date().toISOString().split("T")[0]) + "-" + branchId);
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     entityType: "reconciliation",
     entityId: d.id,
     data: d
-  }, masterSsOpt, ss, companyId, branchId);
+  }), masterSsOpt, ss, companyId, branchId);
 }
 
 function handleApproveEOD(req, ss, masterSsOpt, companyId, branchId) {
   var d = mergeReqPayload(req);
   d.status = "APPROVED";
   d.approvedAt = new Date().toISOString();
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     entityType: "reconciliation",
     entityId: d.id,
     data: d
-  }, masterSsOpt, ss, companyId, branchId);
+  }), masterSsOpt, ss, companyId, branchId);
 }
 
 function handleAddSale(req, ss, masterSsOpt, companyId, branchId) {
   var d = mergeReqPayload(req);
   var saleId = d.id || d.InvoiceID || d.invoice_id || ("INV-" + Date.now());
-  return handleLegacyActionAsEnvelope("sync_sale", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_sale", extendObj_(req, {
     entityType: "sale",
     entityId: saleId,
     data: d
-  }, masterSsOpt, ss, companyId, branchId);
+  }), masterSsOpt, ss, companyId, branchId);
 }
 
 function handleConfirmPayment(req, ss) {
@@ -4914,7 +5392,7 @@ function handleGetData(req, targetSs, masterSsOpt) {
     for (var i = 1; i < vals.length; i++) {
       var obj = {};
       for (var c = 0; c < h.length; c++) {
-        if (h[c] === "password_hash" || h[c] === "pin") continue;
+        if (h[c] === "password_hash" || h[c] === "password_salt" || h[c] === "pin") continue;
         obj[h[c]] = vals[i][c];
       }
       if (obj.is_deleted === true || String(obj.is_deleted).toUpperCase() === "TRUE") continue;
@@ -4937,11 +5415,10 @@ function handleGenericInsert(req, targetSs, masterSsOpt, companyId, branchId) {
   for (var et in ENTITY_TO_TAB) {
     if (ENTITY_TO_TAB[et] === sheetName) { entityType = et; break; }
   }
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     entityType: entityType || "audit_log",
     data: d
-  }, masterSsOpt, targetSs, companyId, branchId);
+  }), masterSsOpt, targetSs, companyId, branchId);
 }
 
 function handleGenericUpdate(req, targetSs, masterSsOpt, companyId, branchId) {
@@ -4955,23 +5432,21 @@ function handleGenericDelete(req, targetSs, masterSsOpt, companyId, branchId) {
   for (var et in ENTITY_TO_TAB) {
     if (ENTITY_TO_TAB[et] === sheetName) { entityType = et; break; }
   }
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     deleteFlag: true,
     entityType: entityType || "inventory_item",
     data: d
-  }, masterSsOpt, targetSs, companyId, branchId);
+  }), masterSsOpt, targetSs, companyId, branchId);
 }
 
 function handleReceiveStock(req, ss, masterSsOpt, companyId, branchId) {
   var d = mergeReqPayload(req);
   d.id = d.id || ("GRN-" + Date.now());
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     entityType: "goods_received",
     entityId: d.id,
     data: d
-  }, masterSsOpt, ss, companyId, branchId);
+  }), masterSsOpt, ss, companyId, branchId);
 }
 
 function handleSellStock(req, ss, masterSsOpt, companyId, branchId) {
@@ -4980,12 +5455,11 @@ function handleSellStock(req, ss, masterSsOpt, companyId, branchId) {
 
 function handleBreakCase(req, ss, masterSsOpt, companyId, branchId) {
   var d = mergeReqPayload(req);
-  return handleLegacyActionAsEnvelope("sync_entity", {
-    ...req,
+  return handleLegacyActionAsEnvelope("sync_entity", extendObj_(req, {
     entityType: "stock_movement",
     entityId: d.id || ("MOV-" + Date.now()),
     data: d
-  }, masterSsOpt, ss, companyId, branchId);
+  }), masterSsOpt, ss, companyId, branchId);
 }
 
 function handleGetStock(req, ss, masterSsOpt) {
@@ -5002,12 +5476,19 @@ function handleGetCompanies(req, ss) {
     for (var i = 1; i < vals.length; i++) {
       var obj = {};
       for (var c = 0; c < h.length; c++) {
-        if (h[c] === "password_hash") continue;
+        if (h[c] === "password_hash" || h[c] === "password_salt") continue;
         obj[h[c]] = vals[i][c];
       }
       if (!obj.company_id) continue;
       if (obj.is_deleted === true || String(obj.is_deleted).toUpperCase() === "TRUE") continue;
-      var cKey = String(obj.company_id).trim().toUpperCase();
+      obj.company_id = String(obj.company_id).trim();
+      if (obj.company_name !== undefined && obj.company_name !== null) obj.company_name = String(obj.company_name).trim();
+      if (obj.owner_name !== undefined && obj.owner_name !== null) obj.owner_name = String(obj.owner_name).trim();
+      if (obj.owner_email !== undefined && obj.owner_email !== null) obj.owner_email = String(obj.owner_email).trim();
+      if (obj.phone !== undefined && obj.phone !== null) obj.phone = String(obj.phone).trim();
+      if (obj.sheet_id !== undefined && obj.sheet_id !== null) obj.sheet_id = String(obj.sheet_id).trim();
+      if (obj.activation_code !== undefined && obj.activation_code !== null) obj.activation_code = String(obj.activation_code).trim();
+      var cKey = obj.company_id.toUpperCase();
       if (compMap[cKey] !== undefined) {
         list[compMap[cKey]] = obj;
       } else {
@@ -5103,26 +5584,39 @@ function handleSyncCompany(req, ss) {
   var existingRow = findRowIndexInSheet(cSheet, headers, ["company_id", "entity_id"], companyId, "");
   var nowIso = new Date().toISOString();
 
-  // Compute/preserve password_hash if password or owner pin provided
+  // Compute/preserve password_hash & password_salt if password or owner pin provided
   var resolvedPwHash = String(d.password_hash || "").trim();
+  var resolvedPwSalt = String(d.password_salt || "").trim();
   if (!resolvedPwHash && d.password) {
     resolvedPwHash = hashPasswordSha256(String(d.password).trim());
+    resolvedPwSalt = "";
   }
   if (!resolvedPwHash && d.owner) {
-    if (d.owner.password_hash) resolvedPwHash = String(d.owner.password_hash).trim();
-    else if (d.owner.pin_hash) resolvedPwHash = String(d.owner.pin_hash).trim();
-    else if (d.owner.pin) resolvedPwHash = hashPasswordSha256(String(d.owner.pin).trim());
+    if (d.owner.password_hash) {
+      resolvedPwHash = String(d.owner.password_hash).trim();
+      resolvedPwSalt = String(d.owner.password_salt || d.owner.pin_salt || "").trim();
+    } else if (d.owner.pin_hash) {
+      resolvedPwHash = String(d.owner.pin_hash).trim();
+      resolvedPwSalt = String(d.owner.pin_salt || "").trim();
+    } else if (d.owner.pin) {
+      resolvedPwHash = hashPasswordSha256(String(d.owner.pin).trim());
+      resolvedPwSalt = "";
+    }
   }
   if (!resolvedPwHash && existingRow > 0) {
     var pwIdx = headers.indexOf("password_hash");
+    var pwSaltIdx = headers.indexOf("password_salt");
     if (pwIdx !== -1) {
       resolvedPwHash = String(cSheet.getRange(existingRow, pwIdx + 1).getValue() || "").trim();
+    }
+    if (pwSaltIdx !== -1) {
+      resolvedPwSalt = String(cSheet.getRange(existingRow, pwSaltIdx + 1).getValue() || "").trim();
     }
   }
 
   var safePayload = {};
   for (var k in d) {
-    if (k === "password" || k === "password_hash") continue;
+    if (k === "password" || k === "password_hash" || k === "password_salt") continue;
     if (k === "owner" && d.owner && typeof d.owner === "object") {
       var oCopy = {};
       for (var ok in d.owner) {
@@ -5153,14 +5647,13 @@ function handleSyncCompany(req, ss) {
     sanitizedFolderId = "";
   }
 
-  var rowObj = {
-    ...d,
+  var rowObj = extendObj_(d, {
     company_id: companyId,
+    company_name: d.company_name !== undefined && d.company_name !== null ? String(d.company_name).trim() : "",
     sheet_id: sanitizedSheetId,
     sheet_folder_id: sanitizedFolderId,
     owner_email: String(d.owner_email || (d.owner && d.owner.email) || "").trim().toLowerCase(),
     owner_name: String(d.owner_name || (d.owner && (d.owner.name || d.owner.full_name)) || "").trim(),
-    ...(resolvedPwHash ? { password_hash: resolvedPwHash } : {}),
     status: d.status || d.subscription_status || "TRIAL",
     updated_at: nowIso,
     entity_type: "company",
@@ -5169,7 +5662,11 @@ function handleSyncCompany(req, ss) {
     server_seq: allocateNextServerSeq(ss, companyId),
     is_deleted: false,
     payload_json: JSON.stringify(safePayload)
-  };
+  });
+  if (resolvedPwHash) {
+    rowObj.password_hash = resolvedPwHash;
+    rowObj.password_salt = resolvedPwSalt;
+  }
   delete rowObj.password;
   delete rowObj.owner;
   delete rowObj.branch;
@@ -5222,6 +5719,7 @@ function handleSyncCompany(req, ss) {
           user_id: owId,
           email: owEmail,
           password_hash: resolvedPwHash || ow.pin_hash || "",
+          password_salt: resolvedPwSalt || ow.pin_salt || "",
           company_id: companyId,
           role: String(ow.role || "OWNER").toUpperCase(),
           full_name: ow.full_name || ow.name || rowObj.owner_name || "Business Owner",
@@ -5250,7 +5748,7 @@ function handleBulkSyncCompanies(req, ss) {
     var comp = companiesList[i];
     if (!comp || !comp.company_id) continue;
     // Attach matching owner user if present in usersList so password_hash/Global_Users are synced too
-    var compCopy = { ...comp };
+    var compCopy = extendObj_(comp, null);
     if (!compCopy.owner && usersList.length > 0) {
       var compIdUpper = String(comp.company_id).trim().toUpperCase();
       var compEmailLower = String(comp.owner_email || "").trim().toLowerCase();

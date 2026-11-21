@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Shield,
   Lock,
@@ -7,17 +7,20 @@ import {
   AlertTriangle,
   RefreshCw,
   X,
-  FileCheck,
   Calendar,
   Layers,
   Sparkles,
+  ShieldCheck,
 } from 'lucide-react';
 import {
   createEncryptedBackupFile,
+  generateDatabasePayload,
   downloadBackupFileToDevice,
   calculateDeltaCutoff,
   getLastBackupTimestamp,
   BackupType,
+  BackupDateRange,
+  MAX_RECOMMENDED_BACKUP_BYTES,
 } from '../../services/databaseBackupService';
 
 interface DatabaseBackupModalProps {
@@ -30,6 +33,22 @@ interface DatabaseBackupModalProps {
   onSuccess?: (fileName: string) => void;
 }
 
+function formatDateInput(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function getDaysAgoDateStr(daysAgo: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - daysAgo);
+  return formatDateInput(d);
+}
+
+function formatBytesHuman(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
 export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
   isOpen,
   onClose,
@@ -39,7 +58,15 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
   clearanceRole,
   onSuccess,
 }) => {
+  const todayStr = formatDateInput(new Date());
+  const defaultDeltaStart = calculateDeltaCutoff().cutoffIso.slice(0, 10);
+
   const [backupType, setBackupType] = useState<BackupType>(defaultType);
+  const [startDate, setStartDate] = useState<string>(
+    defaultType === 'EOD_HANDOVER' ? todayStr : defaultDeltaStart
+  );
+  const [endDate, setEndDate] = useState<string>(todayStr);
+  const [includeT1InMaster, setIncludeT1InMaster] = useState<boolean>(true);
   const [password, setPassword] = useState<string>('');
   const [confirmPassword, setConfirmPassword] = useState<string>('');
   const [showPassword, setShowPassword] = useState<boolean>(false);
@@ -47,11 +74,81 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [downloadSuccessName, setDownloadSuccessName] = useState<string | null>(null);
+  const [downloadMeta, setDownloadMeta] = useState<{
+    t1Count: number;
+    t2Count: number;
+    fileSizeBytes: number;
+    exceeds15MB: boolean;
+  } | null>(null);
+
+  const [previewStats, setPreviewStats] = useState<{
+    t1Count: number;
+    t2Count: number;
+    estimatedBytes: number;
+    exceeds15MB: boolean;
+  } | null>(null);
+
+  // Sync sensible default date ranges when switching backup type
+  const handleSelectBackupType = (nextType: BackupType) => {
+    setBackupType(nextType);
+    if (nextType === 'EOD_HANDOVER') {
+      setStartDate(todayStr);
+      setEndDate(todayStr);
+    } else if (nextType === 'DELTA') {
+      setStartDate(defaultDeltaStart);
+      setEndDate(todayStr);
+    } else if (nextType === 'ADMIN_MASTER_UPDATE') {
+      setStartDate(getDaysAgoDateStr(7));
+      setEndDate(todayStr);
+    }
+  };
+
+  // Compute live T1/T2 counts & >15MB size preview whenever mode or date range changes
+  useEffect(() => {
+    if (!isOpen) return;
+    let cancelled = false;
+
+    const effectiveRange: BackupDateRange | undefined =
+      backupType === 'FULL'
+        ? undefined
+        : backupType === 'ADMIN_MASTER_UPDATE' && !includeT1InMaster
+        ? undefined
+        : { startDate, endDate };
+
+    const timer = setTimeout(async () => {
+      try {
+        const preview = await generateDatabasePayload(
+          backupType,
+          staffName,
+          undefined,
+          clearanceLevel,
+          clearanceRole,
+          effectiveRange
+        );
+        if (!cancelled) {
+          // Account for ~33% Base64 encryption overhead when estimating final .saimetric.enc size
+          const estEncBytes = Math.round((preview.manifest.estimatedBytes || 0) * 1.35);
+          setPreviewStats({
+            t1Count: preview.manifest.t1Count || 0,
+            t2Count: preview.manifest.t2Count || 0,
+            estimatedBytes: estEncBytes,
+            exceeds15MB: estEncBytes > MAX_RECOMMENDED_BACKUP_BYTES,
+          });
+        }
+      } catch {
+        // Non-fatal preview error
+      }
+    }, 120);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [isOpen, backupType, startDate, endDate, includeT1InMaster, staffName, clearanceLevel, clearanceRole]);
 
   if (!isOpen) return null;
 
   const lastBackupStr = getLastBackupTimestamp();
-  const deltaInfo = calculateDeltaCutoff();
 
   const handleGenerateBackup = async () => {
     setErrorMsg(null);
@@ -65,21 +162,40 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
       return;
     }
 
+    if (backupType !== 'FULL' && startDate && endDate && startDate > endDate) {
+      setErrorMsg('Start Date cannot be after End Date.');
+      return;
+    }
+
     setIsProcessing(true);
 
     try {
-      const { fileName, encryptedContent, manifest } = await createEncryptedBackupFile(
-        backupType,
-        password,
-        staffName,
-        shiftNotes.trim() || undefined,
-        clearanceLevel,
-        clearanceRole
-      );
+      const effectiveRange: BackupDateRange | undefined =
+        backupType === 'FULL'
+          ? undefined
+          : backupType === 'ADMIN_MASTER_UPDATE' && !includeT1InMaster
+          ? undefined
+          : { startDate, endDate };
 
-      // Download file to user's device
+      const { fileName, encryptedContent, manifest, fileSizeBytes, exceeds15MB } =
+        await createEncryptedBackupFile(
+          backupType,
+          password,
+          staffName,
+          shiftNotes.trim() || undefined,
+          clearanceLevel,
+          clearanceRole,
+          effectiveRange
+        );
+
       downloadBackupFileToDevice(fileName, encryptedContent);
       setDownloadSuccessName(fileName);
+      setDownloadMeta({
+        t1Count: manifest.t1Count || 0,
+        t2Count: manifest.t2Count || 0,
+        fileSizeBytes,
+        exceeds15MB,
+      });
 
       if (onSuccess) {
         onSuccess(fileName);
@@ -93,7 +209,7 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-slate-800 rounded-3xl max-w-lg w-full p-6 shadow-2xl relative space-y-5 animate-fadeIn">
+      <div className="bg-slate-900 border border-slate-800 rounded-3xl max-w-lg w-full p-6 shadow-2xl relative space-y-4 animate-fadeIn max-h-[92vh] overflow-y-auto">
         {/* Header */}
         <div className="flex items-start justify-between pb-3 border-b border-slate-800">
           <div className="flex items-center gap-3">
@@ -102,10 +218,10 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
             </span>
             <div>
               <h3 className="text-base font-bold text-white flex items-center gap-2">
-                Generate Encrypted Backup
+                Export Hexagonal WhatsApp Sync File
               </h3>
               <p className="text-xs text-slate-400">
-                AES-256 encrypted file ready to save locally or upload to Google Drive
+                AES-256-GCM encrypted SyncEnvelopes with HMAC-SHA256 tamper protection
               </p>
             </div>
           </div>
@@ -120,15 +236,44 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
         {/* Success State */}
         {downloadSuccessName ? (
           <div className="space-y-4 py-2">
-            <div className="p-4 rounded-2xl bg-emerald-950/80 border border-emerald-600/60 text-emerald-200 text-xs space-y-2">
+            <div className="p-4 rounded-2xl bg-emerald-950/80 border border-emerald-600/60 text-emerald-200 text-xs space-y-2.5">
               <div className="flex items-center gap-2 font-bold text-sm text-emerald-300">
                 <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                <span>Backup Created &amp; Downloaded!</span>
+                <span>Sync File Created &amp; Downloaded!</span>
               </div>
               <p className="font-mono text-[11px] text-white break-all">{downloadSuccessName}</p>
+              {downloadMeta && (
+                <div className="grid grid-cols-3 gap-2 pt-1 font-mono text-[11px]">
+                  <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                    <span className="text-slate-400 block text-[10px]">T1 Ledger</span>
+                    <strong className="text-emerald-300">{downloadMeta.t1Count}</strong>
+                  </div>
+                  <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                    <span className="text-slate-400 block text-[10px]">T2 Config</span>
+                    <strong className="text-indigo-300">{downloadMeta.t2Count}</strong>
+                  </div>
+                  <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                    <span className="text-slate-400 block text-[10px]">File Size</span>
+                    <strong className={downloadMeta.exceeds15MB ? 'text-amber-300' : 'text-white'}>
+                      {formatBytesHuman(downloadMeta.fileSizeBytes)}
+                    </strong>
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center gap-1.5 text-[11px] text-emerald-300">
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>HMAC-SHA256 Signed — any post-export file edit will be automatically rejected on import.</span>
+              </div>
+              {downloadMeta?.exceeds15MB && (
+                <div className="p-2.5 rounded-xl bg-amber-950/70 border border-amber-500/60 text-amber-200 text-[11px] flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <span>
+                    This file exceeds 15 MB ({formatBytesHuman(downloadMeta.fileSizeBytes)}). For faster WhatsApp delivery, select a shorter date range next time.
+                  </span>
+                </div>
+              )}
               <p className="text-[11px] text-slate-300">
-                The encrypted file has been downloaded to your device downloads folder. You can now safely upload it to
-                Google Drive, send via email, or copy to a USB flash drive.
+                Send this file via WhatsApp, email, or USB. The receiver's app will route all envelopes safely through SyncCore without overwriting live balances.
               </p>
             </div>
 
@@ -149,14 +294,15 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
               </div>
             )}
 
-            {/* Backup Type Choice */}
+            {/* Backup Type Choice — Bi-Directional (Unrestricted by Role) */}
             <div className="space-y-2">
-              <label className="block text-xs font-bold text-slate-300">1. Select Backup / Export Purpose</label>
+              <label className="block text-xs font-bold text-slate-300">
+                1. Select Sync Export Mode (Bi-Directional: Admin or Salesperson)
+              </label>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
-                {/* EOD Handover Option for Supervisors */}
                 <button
                   type="button"
-                  onClick={() => setBackupType('EOD_HANDOVER')}
+                  onClick={() => handleSelectBackupType('EOD_HANDOVER')}
                   className={`p-3 rounded-2xl border text-left transition ${
                     backupType === 'EOD_HANDOVER'
                       ? 'bg-emerald-950 border-emerald-500 text-white shadow-sm ring-1 ring-emerald-500/50'
@@ -165,17 +311,16 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                 >
                   <strong className="block text-xs mb-1 text-emerald-300 flex items-center gap-1.5">
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    EOD Supervisor Handover
+                    Shift / EOD Handover
                   </strong>
                   <span className="text-[10px] block opacity-80 leading-relaxed">
-                    Designed for supervisors to send to off-site owner. Includes today's sales, drawer cash count, cash lifts, and shift scorecard.
+                    Exports selected date range T1 transactions (Sales, Cash Logs, GRVs, Expenses) + full T2 config + shift scorecard.
                   </span>
                 </button>
 
-                {/* Admin Master Push for Owner */}
                 <button
                   type="button"
-                  onClick={() => setBackupType('ADMIN_MASTER_UPDATE')}
+                  onClick={() => handleSelectBackupType('ADMIN_MASTER_UPDATE')}
                   className={`p-3 rounded-2xl border text-left transition ${
                     backupType === 'ADMIN_MASTER_UPDATE'
                       ? 'bg-amber-950 border-amber-500 text-white shadow-sm ring-1 ring-amber-500/50'
@@ -184,17 +329,16 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                 >
                   <strong className="block text-xs mb-1 text-amber-300 flex items-center gap-1.5">
                     <Shield className="w-3.5 h-3.5 text-amber-400" />
-                    Owner Master Push (Catalog &amp; Rates)
+                    Catalog, Prices &amp; GRVs Push
                   </strong>
                   <span className="text-[10px] block opacity-80 leading-relaxed">
-                    For Company Owner. Exports products, prices, pack ratios, rates &amp; permissions. 🛡️ Safe: Cannot overwrite branch sales.
+                    Full T2 catalog, prices, staff &amp; rates + optional date-range T1 GRVs &amp; supplier payments. Live balances protected.
                   </span>
                 </button>
 
-                {/* Daily Delta */}
                 <button
                   type="button"
-                  onClick={() => setBackupType('DELTA')}
+                  onClick={() => handleSelectBackupType('DELTA')}
                   className={`p-3 rounded-2xl border text-left transition ${
                     backupType === 'DELTA'
                       ? 'bg-indigo-950 border-indigo-500 text-white shadow-sm ring-1 ring-indigo-500/50'
@@ -203,17 +347,16 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                 >
                   <strong className="block text-xs mb-1 text-indigo-300 flex items-center gap-1.5">
                     <Sparkles className="w-3.5 h-3.5" />
-                    Daily Delta Archive
+                    Smart Date-Range Sync
                   </strong>
                   <span className="text-[10px] block opacity-80 leading-relaxed">
-                    Fast delta backup with changes since {lastBackupStr ? lastBackupStr.split('T')[0] : 'month start'}.
+                    T1 transactions in your date range (since {lastBackupStr ? lastBackupStr.split('T')[0] : 'month start'}) + full T2 catalog.
                   </span>
                 </button>
 
-                {/* Full Snapshot */}
                 <button
                   type="button"
-                  onClick={() => setBackupType('FULL')}
+                  onClick={() => handleSelectBackupType('FULL')}
                   className={`p-3 rounded-2xl border text-left transition ${
                     backupType === 'FULL'
                       ? 'bg-indigo-950 border-indigo-500 text-white shadow-sm ring-1 ring-indigo-500/50'
@@ -225,17 +368,118 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                     Full System Snapshot
                   </strong>
                   <span className="text-[10px] block opacity-80 leading-relaxed">
-                    Complete archive of the entire database. Best for fresh device setups or disaster recovery.
+                    All historical T1 ledger events + full T2 config. Best for fresh device setup or disaster recovery.
                   </span>
                 </button>
               </div>
             </div>
 
+            {/* Smart T1 Date Range Filter */}
+            {backupType !== 'FULL' && (
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-300 flex items-center gap-1.5">
+                    <Calendar className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>T1 Transactions Date Range</span>
+                  </label>
+                  <div className="flex items-center gap-1">
+                    {[
+                      { label: 'Today', days: 0 },
+                      { label: '7d', days: 7 },
+                      { label: '30d', days: 30 },
+                    ].map((preset) => (
+                      <button
+                        key={preset.label}
+                        type="button"
+                        onClick={() => {
+                          setStartDate(getDaysAgoDateStr(preset.days));
+                          setEndDate(todayStr);
+                        }}
+                        className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] font-semibold text-slate-300"
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {backupType === 'ADMIN_MASTER_UPDATE' && (
+                  <label className="flex items-center gap-2 text-[11px] text-amber-200 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={includeT1InMaster}
+                      onChange={(e) => setIncludeT1InMaster(e.target.checked)}
+                      className="rounded border-slate-600 bg-slate-900 text-amber-500"
+                    />
+                    <span>Include T1 GRVs, Stock Movements &amp; Supplier Payments in this date range</span>
+                  </label>
+                )}
+
+                {(backupType !== 'ADMIN_MASTER_UPDATE' || includeT1InMaster) && (
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <span className="block text-[10px] text-slate-400 mb-1">Start Date</span>
+                      <input
+                        type="date"
+                        value={startDate}
+                        max={endDate || todayStr}
+                        onChange={(e) => setStartDate(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <div>
+                      <span className="block text-[10px] text-slate-400 mb-1">End Date</span>
+                      <input
+                        type="date"
+                        value={endDate}
+                        min={startDate}
+                        onChange={(e) => setEndDate(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-2.5 py-1.5 text-xs text-white font-mono focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <p className="text-[10px] text-slate-400 leading-relaxed">
+                  All T2 Config (Inventory prices, Staff, Customers, Suppliers, Wallets) is always exported as a complete snapshot while existing live balances are protected on import.
+                </p>
+              </div>
+            )}
+
+            {/* Live Envelope & File Size Preview + 15MB Warning Guard */}
+            {previewStats && (
+              <div
+                className={`p-3 rounded-2xl border text-xs space-y-1.5 ${
+                  previewStats.exceeds15MB
+                    ? 'bg-amber-950/60 border-amber-500/70 text-amber-100'
+                    : 'bg-slate-950 border-slate-800 text-slate-300'
+                }`}
+              >
+                <div className="flex items-center justify-between font-mono text-[11px]">
+                  <span>
+                    T1 Events: <strong className="text-emerald-400">{previewStats.t1Count}</strong> • T2 Config:{' '}
+                    <strong className="text-indigo-400">{previewStats.t2Count}</strong>
+                  </span>
+                  <span className={previewStats.exceeds15MB ? 'text-amber-300 font-bold' : 'text-slate-300'}>
+                    Est. {formatBytesHuman(previewStats.estimatedBytes)}
+                  </span>
+                </div>
+                {previewStats.exceeds15MB && (
+                  <div className="flex items-start gap-2 text-[11px] text-amber-300 pt-1">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>
+                      <strong>File Exceeds 15 MB!</strong> Please select a shorter date range for reliable WhatsApp transfer and faster mobile import.
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Optional Shift Notes if EOD Handover */}
             {backupType === 'EOD_HANDOVER' && (
               <div className="space-y-1">
                 <label className="block text-xs font-bold text-slate-300">
-                  Supervisor Shift Handover Notes (Optional)
+                  Shift Handover Notes (Optional)
                 </label>
                 <input
                   type="text"
@@ -244,18 +488,6 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                   placeholder="e.g. End of day till counted, $20 customer change left behind, stock variance zero"
                   className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-emerald-500"
                 />
-              </div>
-            )}
-
-            {/* Owner Master Push Guidance */}
-            {backupType === 'ADMIN_MASTER_UPDATE' && (
-              <div className="p-3 bg-amber-950/40 border border-amber-500/40 rounded-xl text-amber-200 text-xs space-y-1">
-                <strong className="font-bold flex items-center gap-1 text-amber-300">
-                  <span>🛡️ Protected Master Push Guard</span>
-                </strong>
-                <p className="text-[11px] text-amber-300/80 leading-relaxed">
-                  This bundle only contains catalog items, prices, packaging ratios, exchange rates, and permissions. When the supervisor uploads this at the branch terminal, today's counter sales, till cash logs, and customer debt ledger will be 100% preserved.
-                </p>
               </div>
             )}
 
@@ -297,8 +529,7 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                 />
               </div>
               <p className="text-[10px] text-amber-400/90 leading-normal">
-                ⚠️ Keep this password safe. Saimetric encrypts the file client-side; without this password, the backup
-                file cannot be decrypted if the device is lost.
+                Encrypted client-side with AES-256-GCM + HMAC-SHA256 tamper seal. Share the password separately from the WhatsApp file.
               </p>
             </div>
 
@@ -321,12 +552,12 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
                 {isProcessing ? (
                   <>
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                    <span>Encrypting &amp; Generating...</span>
+                    <span>Signing &amp; Encrypting...</span>
                   </>
                 ) : (
                   <>
                     <Download className="w-3.5 h-3.5" />
-                    <span>Download Encrypted Backup</span>
+                    <span>Export Signed Sync File</span>
                   </>
                 )}
               </button>
@@ -337,3 +568,4 @@ export const DatabaseBackupModal: React.FC<DatabaseBackupModalProps> = ({
     </div>
   );
 };
+

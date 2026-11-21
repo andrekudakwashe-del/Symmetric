@@ -51,6 +51,7 @@ const BackendAdapterHub = lazyWithRetry(
 );
 import { getPackages, assignCompanyPackage } from '../../services/packageService';
 import { fetchWithTimeout, pingGasDeployment } from '../../services/sync/gasTransport';
+import { CODE_GS_TEMPLATE } from '../../services/codeGsTemplate';
 import {
   getCompanies,
   saveCompany,
@@ -168,7 +169,8 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   const [isViewCodeModalOpen, setIsViewCodeModalOpen] = useState(false);
   const [fullCodeContent, setFullCodeContent] = useState<string>('');
   const [isLoadingCode, setIsLoadingCode] = useState(false);
-  const [codeLineCount, setCodeLineCount] = useState<number>(2208);
+  const [codeLineCount, setCodeLineCount] = useState<number>(() => CODE_GS_TEMPLATE.split('\n').length);
+  const codeSizeKb = Math.max(1, Math.round((fullCodeContent || CODE_GS_TEMPLATE).length / 1024));
 
   // Global Master Webhook Configuration State
   const [masterWebhookInput, setMasterWebhookInput] = useState(() => {
@@ -474,28 +476,41 @@ function setupMasterSheets() {
     showToast('Copied setupMasterSheets script to clipboard!');
   };
 
+  const loadCanonicalCodeGs = async (): Promise<string> => {
+    const isValidGas = (txt: string) =>
+      Boolean(txt && txt.includes('function setupEnterpriseBackend') && !/^\s*<!doctype|^\s*<html/i.test(txt));
+
+    for (const url of ['/Code.gs', '/api/download/code-gs']) {
+      try {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (res.ok) {
+          const txt = await res.text();
+          if (isValidGas(txt)) return txt;
+        }
+      } catch {}
+    }
+    return CODE_GS_TEMPLATE;
+  };
+
   const handleCopyEntireCodeGs = async () => {
     try {
-      const res = await fetch('/api/download/code-gs');
-      if (!res.ok) throw new Error('Could not fetch Code.gs');
-      const text = await res.text();
+      const text = await loadCanonicalCodeGs();
       const count = text.split('\n').length;
+      setCodeLineCount(count);
       await navigator.clipboard.writeText(text);
       setCopiedFullCode(true);
       setTimeout(() => setCopiedFullCode(false), 3000);
       showToast(`✓ Copied complete Code.gs (${count.toLocaleString()} lines) to clipboard!`);
     } catch {
-      showToast('Unable to copy automatically. Click "View Code" to copy manually or download.');
+      showToast('Unable to copy automatically. Click "View Code" or "Download" to get Code.gs.');
     }
   };
 
   const handleDownloadCodeGs = async () => {
     try {
-      showToast('Preparing full Code.gs (2,208 lines)...');
-      const res = await fetch('/api/download/code-gs');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
+      const text = await loadCanonicalCodeGs();
       const lines = text.split('\n').length;
+      setCodeLineCount(lines);
 
       const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
@@ -508,9 +523,8 @@ function setupMasterSheets() {
       URL.revokeObjectURL(url);
 
       showToast(`✓ Downloaded Code.gs (${lines.toLocaleString()} lines)!`);
-    } catch (err: any) {
-      window.open('/api/download/code-gs', '_blank');
-      showToast('Opening Code.gs in new tab...');
+    } catch {
+      showToast('Could not trigger download. Open View Code to copy Code.gs.');
     }
   };
 
@@ -518,19 +532,12 @@ function setupMasterSheets() {
     setIsViewCodeModalOpen(true);
     setIsLoadingCode(true);
     try {
-      const res = await fetch('/api/code-gs-content');
-      if (res.ok) {
-        const data = await res.json();
-        setFullCodeContent(data.code || '');
-        setCodeLineCount(data.lineCount || data.code?.split('\n').length || 2208);
-      } else {
-        const textRes = await fetch('/api/download/code-gs');
-        const text = await textRes.text();
-        setFullCodeContent(text);
-        setCodeLineCount(text.split('\n').length);
-      }
+      const text = await loadCanonicalCodeGs();
+      setFullCodeContent(text);
+      setCodeLineCount(text.split('\n').length);
     } catch {
-      showToast('Could not load code preview.');
+      setFullCodeContent(CODE_GS_TEMPLATE);
+      setCodeLineCount(CODE_GS_TEMPLATE.split('\n').length);
     } finally {
       setIsLoadingCode(false);
     }
@@ -905,11 +912,11 @@ function setupMasterSheets() {
   };
 
   const handleCopyActivationCode = (comp: Company) => {
-    const code = comp.offline_activation_code || `SAI-${comp.company_id.slice(-6)}`;
+    const code = comp.offline_activation_code || `SAI-${String(comp.company_id || '').slice(-6)}`;
     navigator.clipboard.writeText(code);
     setCopiedCodeId(comp.company_id);
     setTimeout(() => setCopiedCodeId(null), 3000);
-    showToast(`Copied activation key for ${comp.company_name}: ${code}`);
+    showToast(`Copied activation key for ${String(comp.company_name ?? '')}: ${code}`);
   };
 
   const handleSwitchToTenant = (comp: Company) => {
@@ -947,13 +954,13 @@ function setupMasterSheets() {
   const countNeedsSheet = companies.filter((c) => !companyHasValidSheet(c)).length;
 
   const filteredCompanies = companies.filter((c) => {
-    const term = (searchTerm || '').toLowerCase().trim();
+    const term = String(searchTerm || '').toLowerCase().trim();
     const matchesSearch =
       !term ||
-      (c.company_name && c.company_name.toLowerCase().includes(term)) ||
-      (c.owner_email && c.owner_email.toLowerCase().includes(term)) ||
-      (c.company_id && c.company_id.toLowerCase().includes(term)) ||
-      (c.owner_name && c.owner_name.toLowerCase().includes(term));
+      String(c?.company_name ?? '').toLowerCase().includes(term) ||
+      String(c?.owner_email ?? '').toLowerCase().includes(term) ||
+      String(c?.company_id ?? '').toLowerCase().includes(term) ||
+      String(c?.owner_name ?? '').toLowerCase().includes(term);
 
     if (!matchesSearch) return false;
 
@@ -1643,13 +1650,13 @@ function setupMasterSheets() {
                 <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
                   <span className="text-slate-400 font-bold block text-[11px]">Apps Script Router</span>
                   <div className="flex items-center justify-between gap-1 flex-wrap">
-                    <span className="font-mono text-[11px] text-white">Code.gs (2,208 Lines)</span>
+                    <span className="font-mono text-[11px] text-white">Code.gs ({codeLineCount.toLocaleString()} Lines)</span>
                     <div className="flex items-center gap-1">
                       <button
                         type="button"
                         onClick={handleOpenViewCodeModal}
                         className="px-2 py-0.5 rounded bg-indigo-900/60 hover:bg-indigo-800 text-indigo-300 text-[10px] font-bold flex items-center gap-1 border border-indigo-700/50 cursor-pointer"
-                        title="View and copy all 2,208 lines directly in browser"
+                        title={`View and copy all ${codeLineCount.toLocaleString()} lines directly in browser`}
                       >
                         <Eye className="w-3 h-3" />
                         View / Copy
@@ -1770,7 +1777,7 @@ function setupMasterSheets() {
                 const sub = getSubscriptionStatus(comp);
                 const isMaster = isCompanyMaster(comp);
                 const hasValidSheet = companyHasValidSheet(comp);
-                const code = comp.offline_activation_code || `SAI-${comp.company_id.slice(-6)}`;
+                const code = comp.offline_activation_code || `SAI-${String(comp.company_id || '').slice(-6)}`;
                 const dedicatedSheetId = isRealGoogleSheetId(comp.sheet_id)
                   ? comp.sheet_id!
                   : isMaster
@@ -1999,7 +2006,7 @@ function setupMasterSheets() {
                   filteredCompanies.map((comp) => {
                     const sub = getSubscriptionStatus(comp);
                     const isMaster = isCompanyMaster(comp);
-                    const code = comp.offline_activation_code || `SAI-${comp.company_id.slice(-6)}`;
+                    const code = comp.offline_activation_code || `SAI-${String(comp.company_id || '').slice(-6)}`;
                     const hasValidSheet = companyHasValidSheet(comp);
                     const dedicatedSheetId = isRealGoogleSheetId(comp.sheet_id)
                       ? comp.sheet_id!
@@ -2690,7 +2697,7 @@ function setupMasterSheets() {
                   <FileSpreadsheet className="w-3.5 h-3.5 text-indigo-400" />
                   <span>Latest Code.gs Master Script</span>
                 </span>
-                <span className="text-[10px] text-emerald-400 font-mono font-bold">2,208 lines</span>
+                <span className="text-[10px] text-emerald-400 font-mono font-bold">{codeLineCount.toLocaleString()} lines</span>
               </div>
               <p className="text-[11px] text-slate-400 leading-relaxed">
                 Contains the complete multi-tenant router, Subscriptions tracking tab, 52-permission RBAC seed, automatic self-healing tabs, and monthly auto-partitioning.
@@ -2702,7 +2709,7 @@ function setupMasterSheets() {
                   className="flex-1 py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center justify-center gap-1.5 shadow-md shadow-indigo-600/20 active:scale-95 transition cursor-pointer"
                 >
                   {copiedFullCode ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedFullCode ? 'Copied 2,208 Lines!' : 'Copy Full Code.gs'}</span>
+                  <span>{copiedFullCode ? `Copied ${codeLineCount.toLocaleString()} Lines!` : 'Copy Full Code.gs'}</span>
                 </button>
 
                 <button
@@ -2776,7 +2783,7 @@ function setupMasterSheets() {
                       {codeLineCount.toLocaleString()} Lines
                     </span>
                     <span className="text-[10px] text-slate-400 font-mono hidden sm:inline">
-                      ~85 KB
+                      ~{codeSizeKb} KB
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-400">Complete Google Apps Script multi-tenant router and tabs generator</p>

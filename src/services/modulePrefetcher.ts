@@ -32,6 +32,10 @@ let isPrefetchInitiated = false;
 
 export function prefetchAppModules(): void {
   if (isPrefetchInitiated || typeof window === 'undefined') return;
+  // In Vite dev mode (including AI Studio Preview), dynamic imports trigger dozens of unbundled
+  // HTTP requests per module and can trip the preview proxy rate limiter ("Rate exceeded.").
+  // Prefetching is only beneficial for built production chunks.
+  if (import.meta.env.DEV) return;
   isPrefetchInitiated = true;
 
   const runPrefetchQueue = async () => {

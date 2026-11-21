@@ -16,17 +16,55 @@ export type SyncCoreIngestBridgeFn = (
   onAcceptedPersist?: (envelope: SyncEnvelope) => void | Promise<void>
 ) => Promise<{ accepted: boolean; reason?: string }>;
 
+export type SyncCoreIngestBatchBridgeFn = (
+  envelopes: SyncEnvelope[],
+  options?: {
+    lwwToleranceMs?: number;
+    allowSelfOrigin?: boolean;
+    isFileImport?: boolean;
+    lookupExisting?: (envelope: SyncEnvelope) => any | Promise<any>;
+    onAcceptedPersist?: (envelope: SyncEnvelope, existingRecord?: any) => void | Promise<void>;
+    onProgress?: (progress: {
+      processed: number;
+      total: number;
+      accepted: number;
+      rejected: number;
+      currentEntityType?: string;
+    }) => void;
+  }
+) => Promise<{
+  processed: number;
+  accepted: number;
+  rejected: number;
+  t1Accepted: number;
+  t1Deduped: number;
+  t2Accepted: number;
+  t2StaleRejected: number;
+  resurrectionBlocked: number;
+  selfOriginSkipped: number;
+  reasons: Record<string, number>;
+}>;
+
 export type SyncCoreSaveAndSyncBridgeFn = (
   envelope: SyncEnvelope
 ) => Promise<BroadcastResult>;
 
 let _ingestHandler: SyncCoreIngestBridgeFn | null = null;
+let _ingestBatchHandler: SyncCoreIngestBatchBridgeFn | null = null;
 let _saveAndSyncHandler: SyncCoreSaveAndSyncBridgeFn | null = null;
 let _appScriptsPausedChecker: (() => boolean) | null = null;
 let _tombstoneLookupProvider: (() => BridgeTombstoneRecord[]) | null = null;
 
 export const registerSyncCoreIngestBridge = (fn: SyncCoreIngestBridgeFn): void => {
   _ingestHandler = fn;
+};
+
+export const registerSyncCoreIngestBatchBridge = (fn: SyncCoreIngestBatchBridgeFn): void => {
+  _ingestBatchHandler = fn;
+};
+
+export const getSyncCoreIngestBatchBridge = (): SyncCoreIngestBatchBridgeFn | null => {
+  return _ingestBatchHandler;
 };
 
 export const registerSyncCoreSaveAndSyncBridge = (fn: SyncCoreSaveAndSyncBridgeFn): void => {

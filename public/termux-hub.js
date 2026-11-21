@@ -88,6 +88,93 @@ let cloudRoutingEpoch = 1;
 let cloudBackoffUntil = 0;
 let cloudSpreadsheetId = '';
 let cloudJwtToken = '';
+let cloudGatewayUrl = '';
+let lastPolicyFetchAt = 0;
+
+// Cloud-driven runtime policy (auto-updated via SYNC_CLOUD_CONFIG and Gateway/Apps Script ping)
+// Enables tuning timeouts, batch sizes, intervals, and security guards without rebuilding the APK/Hub.
+const DEFAULT_HUB_RUNTIME_POLICY = {
+  protocolVersion: '4.0',
+  pushBatchSize: 20,
+  pullMaxPages: 12,
+  requestTimeoutMs: 45000,
+  syncIntervalMs: 5 * 60 * 1000,
+  clockDriftToleranceMs: 5 * 60 * 1000,
+  blockBackdatedVoidsOnly: true,
+  blockedBackdateActions: ['VOID', 'REFUND'],
+  blockedMasterSheetIds: ['1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE'],
+  t2EntityTypes: [],
+  globalBranchEntityTypes: [],
+  retentionDays: 30,
+  maxStorageMb: 2048,
+  genericBucketMaxItems: 5000,
+};
+let hubRuntimePolicy = { ...DEFAULT_HUB_RUNTIME_POLICY };
+let cloudSyncIntervalHandle = null;
+
+function applyHubRuntimePolicy(incoming) {
+  if (!incoming || typeof incoming !== 'object') return false;
+  const prevInterval = hubRuntimePolicy.syncIntervalMs;
+  const clamp = (val, min, max, fallback) => {
+    const n = Number(val);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+  };
+  const normalizeStrList = (arr, upper, fallback) => {
+    if (!Array.isArray(arr)) return fallback;
+    const cleaned = arr
+      .map((s) => String(s || '').trim())
+      .filter(Boolean)
+      .map((s) => (upper ? s.toUpperCase() : s.toLowerCase()));
+    return Array.from(new Set(cleaned));
+  };
+  hubRuntimePolicy = {
+    protocolVersion: String(incoming.protocolVersion || hubRuntimePolicy.protocolVersion || '4.0'),
+    pushBatchSize: clamp(incoming.pushBatchSize, 5, 50, hubRuntimePolicy.pushBatchSize),
+    pullMaxPages: clamp(incoming.pullMaxPages, 2, 25, hubRuntimePolicy.pullMaxPages),
+    requestTimeoutMs: clamp(incoming.requestTimeoutMs, 10000, 90000, hubRuntimePolicy.requestTimeoutMs),
+    syncIntervalMs: clamp(incoming.syncIntervalMs, 30000, 30 * 60 * 1000, hubRuntimePolicy.syncIntervalMs),
+    clockDriftToleranceMs: clamp(incoming.clockDriftToleranceMs, 60000, 30 * 60 * 1000, hubRuntimePolicy.clockDriftToleranceMs),
+    blockBackdatedVoidsOnly:
+      incoming.blockBackdatedVoidsOnly !== undefined
+        ? Boolean(incoming.blockBackdatedVoidsOnly)
+        : hubRuntimePolicy.blockBackdatedVoidsOnly,
+    blockedBackdateActions:
+      Array.isArray(incoming.blockedBackdateActions) && incoming.blockedBackdateActions.length > 0
+        ? normalizeStrList(incoming.blockedBackdateActions, true, hubRuntimePolicy.blockedBackdateActions)
+        : hubRuntimePolicy.blockedBackdateActions,
+    blockedMasterSheetIds: Array.isArray(incoming.blockedMasterSheetIds) && incoming.blockedMasterSheetIds.length > 0
+      ? incoming.blockedMasterSheetIds.map((s) => String(s || '').trim()).filter(Boolean)
+      : hubRuntimePolicy.blockedMasterSheetIds,
+    t2EntityTypes: Array.isArray(incoming.t2EntityTypes)
+      ? normalizeStrList(incoming.t2EntityTypes, false, hubRuntimePolicy.t2EntityTypes)
+      : hubRuntimePolicy.t2EntityTypes,
+    globalBranchEntityTypes: Array.isArray(incoming.globalBranchEntityTypes)
+      ? normalizeStrList(incoming.globalBranchEntityTypes, false, hubRuntimePolicy.globalBranchEntityTypes)
+      : hubRuntimePolicy.globalBranchEntityTypes,
+    retentionDays: clamp(incoming.retentionDays, 7, 3650, hubRuntimePolicy.retentionDays),
+    maxStorageMb: clamp(incoming.maxStorageMb, 64, 16384, hubRuntimePolicy.maxStorageMb),
+    genericBucketMaxItems: clamp(incoming.genericBucketMaxItems, 500, 50000, hubRuntimePolicy.genericBucketMaxItems),
+  };
+  if (hubRuntimePolicy.syncIntervalMs !== prevInterval && typeof restartCloudSyncTimer === 'function') {
+    restartCloudSyncTimer();
+  }
+  return true;
+}
+
+function isHubMasterTenant(companyId) {
+  const u = String(companyId || '').trim().toUpperCase();
+  return u === 'COMP-001' || u === 'COMP-MASTER' || u === 'MASTER';
+}
+
+function isBlockedMasterSheetWrite(companyId, spreadsheetId) {
+  if (isHubMasterTenant(companyId)) return false;
+  const sid = String(spreadsheetId || '').trim();
+  if (!sid) return true;
+  const blockedList = Array.isArray(hubRuntimePolicy.blockedMasterSheetIds)
+    ? hubRuntimePolicy.blockedMasterSheetIds
+    : DEFAULT_HUB_RUNTIME_POLICY.blockedMasterSheetIds;
+  return blockedList.includes(sid);
+}
 
 // Universal Encrypted Cloud Configuration (Database-Agnostic)
 const CLOUD_CONFIG_FILE = path.join(process.cwd(), 'hub-cloud-config.enc');
@@ -155,12 +242,19 @@ function loadEncryptedCloudConfig() {
     if (parsed && typeof parsed === 'object') {
       cloudConfig = parsed;
       const creds = parsed.credentials && typeof parsed.credentials === 'object' ? parsed.credentials : {};
+      if (parsed.companyId && String(parsed.companyId).trim()) {
+        hubTenantId = String(parsed.companyId).trim();
+      }
       if (creds.token || creds.jwt) cloudJwtToken = String(creds.token || creds.jwt).trim();
       if (creds.spreadsheetId || creds.sheetId) cloudSpreadsheetId = String(creds.spreadsheetId || creds.sheetId).trim();
+      if (parsed.gatewayUrl || creds.gatewayUrl) cloudGatewayUrl = String(parsed.gatewayUrl || creds.gatewayUrl).trim();
+      if (parsed.runtimePolicy && typeof parsed.runtimePolicy === 'object') {
+        applyHubRuntimePolicy(parsed.runtimePolicy);
+      }
       if (Number(creds.routingEpoch || creds.routing_epoch) > 0) {
         cloudRoutingEpoch = Math.max(cloudRoutingEpoch, Number(creds.routingEpoch || creds.routing_epoch));
       }
-      console.log('[Termux Hub] 🔓 Loaded and decrypted Cloud Config from hub-cloud-config.enc. DB Type:', cloudConfig.databaseType || 'unknown');
+      console.log('[Termux Hub] 🔓 Loaded and decrypted Cloud Config from hub-cloud-config.enc. DB Type:', cloudConfig.databaseType || 'unknown', '| Tenant:', hubTenantId, cloudGatewayUrl ? '| Gateway: enabled' : '');
       return cloudConfig;
     }
   } catch (err) {
@@ -254,35 +348,45 @@ function handleHubAppsScriptErrorResponse(json) {
 function resolveCloudAdapterConfig() {
   if (cloudConfig && typeof cloudConfig === 'object') {
     if (String(cloudConfig.strategy || '').toUpperCase() === 'HUB_ONLY') {
-      return { databaseType: 'none', credentials: {} };
+      return { databaseType: 'none', credentials: {}, gatewayUrl: '', useUnifiedGateway: false };
     }
     const rawDbType = String(cloudConfig.databaseType || '').toLowerCase().trim();
     const creds = (cloudConfig.credentials && typeof cloudConfig.credentials === 'object') ? cloudConfig.credentials : {};
-    if (rawDbType === 'supabase') {
-      return { databaseType: 'supabase', credentials: creds };
-    }
-    if (rawDbType === 'mongodb' || rawDbType === 'mongo') {
-      return { databaseType: 'mongodb', credentials: creds };
-    }
-    if (rawDbType === 'appscripts' || rawDbType === 'sheets_appscript' || rawDbType === 'google_sheets') {
-      return { databaseType: 'appscripts', credentials: creds };
-    }
-    if (rawDbType === 'firebase') {
-      return { databaseType: 'firebase', credentials: creds };
-    }
-    if (rawDbType) {
-      return { databaseType: rawDbType, credentials: creds };
-    }
+    const gwUrl = String(cloudConfig.gatewayUrl || creds.gatewayUrl || cloudGatewayUrl || '').trim();
+    const normalizedDbType =
+      rawDbType === 'mongo'
+        ? 'mongodb'
+        : rawDbType === 'sheets_appscript' || rawDbType === 'google_sheets'
+        ? 'appscripts'
+        : rawDbType || (gwUrl ? 'gateway' : 'none');
+
+    // Freeze-Once Rule: Prefer the single frozen 3-action envelope protocol (ping/push_envelopes/pull_catchup)
+    // whenever talking to Apps Script OR via the unified Cloud Sync Gateway (which handles Supabase/Firebase/future DBs server-side).
+    const useUnifiedGateway = Boolean(
+      normalizedDbType === 'appscripts' ||
+      normalizedDbType === 'gateway' ||
+      (gwUrl && (normalizedDbType === 'supabase' || normalizedDbType === 'firebase' || normalizedDbType === 'mongodb' || normalizedDbType !== 'none'))
+    );
+
+    return {
+      databaseType: normalizedDbType,
+      credentials: creds,
+      gatewayUrl: gwUrl,
+      useUnifiedGateway,
+    };
   }
 
   // Fallback to CLI/Env configuration if encrypted cloudConfig is not yet present
+  if (cloudGatewayUrl) {
+    return { databaseType: 'gateway', credentials: { url: cloudSyncUrl }, gatewayUrl: cloudGatewayUrl, useUnifiedGateway: true };
+  }
   if (supabaseUrl && supabaseKey) {
-    return { databaseType: 'supabase', credentials: { url: supabaseUrl, apiKey: supabaseKey } };
+    return { databaseType: 'supabase', credentials: { url: supabaseUrl, apiKey: supabaseKey }, gatewayUrl: '', useUnifiedGateway: false };
   }
   if (cloudSyncUrl) {
-    return { databaseType: 'appscripts', credentials: { url: cloudSyncUrl } };
+    return { databaseType: 'appscripts', credentials: { url: cloudSyncUrl }, gatewayUrl: '', useUnifiedGateway: true };
   }
-  return { databaseType: 'none', credentials: {} };
+  return { databaseType: 'none', credentials: {}, gatewayUrl: '', useUnifiedGateway: false };
 }
 
 function mapEntityTypeToTable(entityType) {
@@ -363,14 +467,16 @@ function validatePacketClock(ws, packet, recordObj, deviceId, packetTypeLabel) {
     return { accepted: true, delayedOfflineSync: true };
   }
 
-  if (pktTs > 0 && pktTs < hubNow - 300000) {
+  const driftToleranceMs = Number(hubRuntimePolicy.clockDriftToleranceMs) || 300000;
+  if (pktTs > 0 && pktTs < hubNow - driftToleranceMs) {
+    const blockedActions = Array.isArray(hubRuntimePolicy.blockedBackdateActions) && hubRuntimePolicy.blockedBackdateActions.length > 0
+      ? hubRuntimePolicy.blockedBackdateActions
+      : DEFAULT_HUB_RUNTIME_POLICY.blockedBackdateActions;
+    const upperLabel = String(packetTypeLabel || '').trim().toUpperCase();
     const isVoidOrRefundPacket = Boolean(
-      packetTypeLabel === 'VOID' ||
-      packetTypeLabel === 'REFUND' ||
-      recordObj?.status === 'Voided' ||
-      recordObj?.status === 'Refunded' ||
-      recordObj?.voidedAt ||
-      recordObj?.refundedAt
+      blockedActions.includes(upperLabel) ||
+      (blockedActions.includes('VOID') && (recordObj?.status === 'Voided' || recordObj?.voidedAt)) ||
+      (blockedActions.includes('REFUND') && (recordObj?.status === 'Refunded' || recordObj?.refundedAt))
     );
 
     const invId = recordObj?.id || packet?.invoice_id || packet?.id || undefined;
@@ -386,10 +492,10 @@ function validatePacketClock(ws, packet, recordObj, deviceId, packetTypeLabel) {
 
     const alertType = isVoidOrRefundPacket ? 'VOID_REFUND_BLOCKED' : 'HUB_FLAGGED_BACKDATE';
     const alertMsg = isVoidOrRefundPacket
-      ? `Security Lock: Backdated ${recordObj?.status || 'Void/Refund'} blocked from ${originDev}. Please enable Automatic Date & Time.`
+      ? `Security Lock: Backdated ${recordObj?.status || packetTypeLabel || 'Void/Refund'} blocked from ${originDev}. Please enable Automatic Date & Time.`
       : `Clock Flag: Backdated ${packetTypeLabel} from ${originDev} was ACCEPTED and synced to Hub (flagged for audit). Voids & refunds restricted until Automatic Date & Time is enabled.`;
 
-    console.warn(`[Termux Hub] 🛡️ ${isVoidOrRefundPacket ? 'BLOCKED VOID/REFUND' : 'FLAGGED & ACCEPTED'} (${packetTypeLabel}) from [${originDev}].`);
+    console.warn(`[Termux Hub] 🛡️ ${isVoidOrRefundPacket ? 'BLOCKED BACKDATED ACTION' : 'FLAGGED & ACCEPTED'} (${packetTypeLabel}) from [${originDev}].`);
 
     // Deduplicate generic alerts for same device + invoice (or same device within 15m when no invoiceId)
     const recentDup = securityAlertsStore.some((a) => {
@@ -560,6 +666,31 @@ const T2_CANONICAL_TYPES = new Set([
   'sheets_config',
 ]);
 
+const GLOBAL_BRANCH_CANONICAL_TYPES = new Set([
+  'inventory_item',
+  'staff',
+  'branch',
+  'supplier',
+  'inventory_category',
+  'permissions_matrix',
+  'role_configs',
+  'multi_currency',
+]);
+
+function isCanonicalT2Type(rawType) {
+  const c = String(rawType || '').trim().toLowerCase();
+  if (!c) return false;
+  if (T2_CANONICAL_TYPES.has(c)) return true;
+  return Array.isArray(hubRuntimePolicy.t2EntityTypes) && hubRuntimePolicy.t2EntityTypes.includes(c);
+}
+
+function isHubGlobalBranchEntityType(rawType) {
+  const c = String(rawType || '').trim().toLowerCase();
+  if (!c) return false;
+  if (GLOBAL_BRANCH_CANONICAL_TYPES.has(c)) return true;
+  return Array.isArray(hubRuntimePolicy.globalBranchEntityTypes) && hubRuntimePolicy.globalBranchEntityTypes.includes(c);
+}
+
 function mapHubEntityToCanonicalType(entityType) {
   const t = String(entityType || '').trim().toUpperCase();
   if (t === 'SALE' || t === 'SALE_UPDATE' || t === 'SALES') return 'sale';
@@ -575,6 +706,7 @@ function mapHubEntityToCanonicalType(entityType) {
   if (t === 'CASH_ACCOUNT' || t === 'CASH_ACCOUNTS') return 'cash_account';
   if (t === 'CASH_TRANSFER' || t === 'CASH_TRANSFERS') return 'cash_transfer';
   if (t === 'GRV' || t === 'DIRECT_GRV' || t === 'DIRECT_GRVS') return 'direct_grv';
+  if (t === 'GOODS_RECEIVED' || t === 'GRN' || t === 'GOODSRECEIVED') return 'goods_received';
   if (t === 'EXPENSE' || t === 'EXPENSES') return 'expense';
   if (t === 'INTERNAL_CONSUMPTION' || t === 'SHOP_USE' || t === 'INTERNAL_CONSUMPTIONS') return 'internal_consumption';
   if (t === 'STOCK_MOVEMENT' || t === 'STOCK_MOVEMENTS') return 'stock_movement';
@@ -605,9 +737,14 @@ function getHubCanonicalEntityId(record, canonicalType) {
   if (canonicalType === 'sale' || canonicalType === 'admin_sale') {
     return String(record.id || record.invoice_id || record.InvoiceID || record.sale_id || '').trim();
   }
-  if (canonicalType === 'inventory_item') return String(record.itemId || record.id || record.ItemID || '').trim();
+  if (canonicalType === 'inventory_item') return String(record.itemId || record.ItemID || record.ProductID || record.id || '').trim();
   if (canonicalType === 'staff' || canonicalType === 'casual_worker') return String(record.id || record.staffId || record.pin_hash || '').trim();
-  if (canonicalType === 'customer') return String(record.customerId || record.id || '').trim();
+  if (canonicalType === 'customer') return String(record.customerId || record.CustomerID || record.id || '').trim();
+  if (canonicalType === 'customer_change') return String(record.id || record.changeId || record.ChangeID || '').trim();
+  if (canonicalType === 'credit_sale') return String(record.id || record.creditId || record.CreditID || '').trim();
+  if (canonicalType === 'expense') return String(record.id || record.expenseId || record.ExpenseID || '').trim();
+  if (canonicalType === 'goods_received') return String(record.id || record.grnId || record.GRNID || record.grn_id || '').trim();
+  if (canonicalType === 'reconciliation') return String(record.id || record.reconciliationId || record.date || '').trim();
   if (canonicalType === 'branch' || canonicalType === 'branch_lockdown') return String(record.branchId || record.branch_id || record.id || hubBranchId || 'BR-MAIN').trim();
   if (canonicalType === 'cash_account') return String(record.account_id || record.id || '').trim();
   if (canonicalType === 'cash_transfer') return String(record.transfer_id || record.id || '').trim();
@@ -623,7 +760,83 @@ function getHubCanonicalEntityId(record, canonicalType) {
   if (canonicalType === 'role_configs') return 'ROLE_CONFIGS';
   if (canonicalType === 'multi_currency') return 'MULTI_CURRENCY_CONFIG';
   if (canonicalType === 'tombstone') return String(record.id || `${record.entityType || 'entity'}::${record.entityId || ''}`).trim();
-  return String(record.id || record.logId || record.cashLogId || record.changeId || record.creditId || record.movementId || record.countId || record.closureId || record.settlementId || '').trim();
+  return String(record.id || record.entityId || record.recordId || record.logId || record.cashLogId || record.changeId || record.creditId || record.movementId || record.countId || record.closureId || record.settlementId || '').trim();
+}
+
+function normalizeIncomingCloudRecord(eType, rawData, fallbackId) {
+  if (!rawData || typeof rawData !== 'object') return rawData;
+  const d = { ...rawData };
+  if (eType === 'inventory_item') {
+    const trueId = String(d.itemId || d.ItemID || d.ProductID || d.id || '').trim();
+    const safeId = trueId && !/^USR-/i.test(trueId) ? trueId : (fallbackId && !/^USR-/i.test(fallbackId) ? fallbackId : trueId || fallbackId);
+    if (safeId) {
+      d.itemId = safeId;
+      d.id = safeId;
+    }
+    if (!d.itemName && (d.ItemName || d.Name || d.name || d.ProductName)) {
+      d.itemName = d.ItemName || d.Name || d.name || d.ProductName;
+    }
+    if (!d.category && d.Category) d.category = d.Category;
+    if (d.unitsPerCase === undefined && (d.UnitsPerCase !== undefined || d.CaseSize !== undefined)) {
+      d.unitsPerCase = Math.max(1, Number(d.UnitsPerCase || d.CaseSize || 1) || 1);
+    }
+    if (d.costPerUnit === undefined) {
+      const cu = d.costPriceUnit ?? d.CostPriceUnit ?? d.CostPerUnit ?? d.costPrice ?? d.CostPrice;
+      if (cu !== undefined) d.costPerUnit = Number(cu) || 0;
+    }
+    if (d.costPerCase === undefined) {
+      const cc = d.costPriceCase ?? d.CostPriceCase ?? d.CostPerCase;
+      if (cc !== undefined) d.costPerCase = Number(cc) || 0;
+      else if (d.costPerUnit !== undefined) d.costPerCase = Number(d.costPerUnit) * Math.max(1, Number(d.unitsPerCase || 1));
+    }
+    if (d.sellPriceUnit === undefined) {
+      const su = d.SellPriceUnit ?? d.SellingPrice ?? d.price;
+      if (su !== undefined) d.sellPriceUnit = Number(su) || 0;
+    }
+    if (d.sellPriceCase === undefined) {
+      const sc = d.SellPriceCase;
+      if (sc !== undefined) d.sellPriceCase = Number(sc) || 0;
+    }
+    if (d.totalUnits === undefined && (d.TotalUnits !== undefined || d.StockQuantity !== undefined)) {
+      d.totalUnits = Number(d.TotalUnits ?? d.StockQuantity ?? 0) || 0;
+    }
+  } else if (eType === 'sale') {
+    const sid = String(d.id || d.invoice_id || d.InvoiceID || fallbackId || '').trim();
+    if (sid) d.id = sid;
+    if (d.total === undefined && d.Total !== undefined) d.total = Number(d.Total) || 0;
+    if (d.subtotal === undefined && d.Subtotal !== undefined) d.subtotal = Number(d.Subtotal) || 0;
+    if (d.discount === undefined && d.Discount !== undefined) d.discount = Number(d.Discount) || 0;
+    if (d.amountTendered === undefined && d.AmountTendered !== undefined) d.amountTendered = Number(d.AmountTendered) || 0;
+    if (d.changeGiven === undefined && (d.ChangeGiven !== undefined || d.ChangeDue !== undefined)) {
+      d.changeGiven = Number(d.ChangeGiven ?? d.ChangeDue ?? 0) || 0;
+    }
+    if (!d.itemsSummary && d.ItemsSummary) d.itemsSummary = String(d.ItemsSummary);
+    if (!d.paymentMethod && d.PaymentMethod) d.paymentMethod = String(d.PaymentMethod);
+    if (!d.staffName && (d.StaffName || d.Cashier)) d.staffName = String(d.StaffName || d.Cashier);
+    if (!d.customerName && d.CustomerName) d.customerName = String(d.CustomerName);
+    if (!d.currency && d.Currency) d.currency = String(d.Currency);
+    if (!d.date && d.Date) d.date = String(d.Date);
+  } else if (eType === 'expense') {
+    if (!d.id && (d.ExpenseID || fallbackId)) d.id = String(d.ExpenseID || fallbackId);
+    if (!d.description && d.Description) d.description = String(d.Description);
+    if (!d.category && d.Category) d.category = String(d.Category);
+    if (d.amount === undefined && d.Amount !== undefined) d.amount = Number(d.Amount) || 0;
+    if (!d.date && d.Date) d.date = String(d.Date);
+  } else if (eType === 'customer') {
+    const cid = String(d.customerId || d.CustomerID || d.id || fallbackId || '').trim();
+    if (cid) { d.customerId = cid; d.id = cid; }
+    if (!d.name && d.Name) d.name = String(d.Name);
+    if (!d.phone && d.Phone) d.phone = String(d.Phone);
+  } else if (eType === 'customer_change') {
+    if (!d.id && (d.ChangeID || fallbackId)) d.id = String(d.ChangeID || fallbackId);
+    if (!d.customerName && d.CustomerName) d.customerName = String(d.CustomerName);
+    if (d.amount === undefined && d.Amount !== undefined) d.amount = Number(d.Amount) || 0;
+  } else if (eType === 'credit_sale') {
+    if (!d.id && (d.CreditID || fallbackId)) d.id = String(d.CreditID || fallbackId);
+    if (!d.customerName && d.CustomerName) d.customerName = String(d.CustomerName);
+    if (d.totalAmount === undefined && d.TotalAmount !== undefined) d.totalAmount = Number(d.TotalAmount) || 0;
+  }
+  return d;
 }
 
 function buildHubSyncEnvelope(entityType, record) {
@@ -641,14 +854,7 @@ function buildHubSyncEnvelope(entityType, record) {
   const targetBranch =
     cleanData.targetBranchId ||
     cleanData.target_branch_id ||
-    (canonicalType === 'inventory_item' ||
-    canonicalType === 'staff' ||
-    canonicalType === 'branch' ||
-    canonicalType === 'supplier' ||
-    canonicalType === 'inventory_category' ||
-    canonicalType === 'permissions_matrix' ||
-    canonicalType === 'role_configs' ||
-    canonicalType === 'multi_currency'
+    (isHubGlobalBranchEntityType(canonicalType)
       ? 'ALL'
       : cleanData.branch_id || hubBranchId || 'ALL');
 
@@ -668,7 +874,7 @@ function buildHubSyncEnvelope(entityType, record) {
     } catch (_) {}
   }
 
-  const isT2Mutable = T2_CANONICAL_TYPES.has(canonicalType);
+  const isT2Mutable = isCanonicalT2Type(canonicalType);
   const versionNum = Number(cleanData.version || 1);
   // T2 mutable records must emit a fresh packetId per revision so Cloud's packet dedupe ring never drops updates
   const resolvedPacketId = isT2Mutable
@@ -690,23 +896,45 @@ function buildHubSyncEnvelope(entityType, record) {
   };
 }
 
-async function postAppsScriptJson(targetUrl, bodyObj) {
+async function postAppsScriptJson(targetUrl, bodyObj, timeoutMsOverride) {
   const postStr = JSON.stringify(bodyObj);
+  const timeoutMs = Number(timeoutMsOverride) || Number(hubRuntimePolicy.requestTimeoutMs) || 45000;
+  const isGateway = Boolean(cloudGatewayUrl && targetUrl === cloudGatewayUrl);
+  const contentType = isGateway ? 'application/json' : 'text/plain;charset=utf-8';
+
+  const parseSafeJson = (rawText) => {
+    const trimmed = String(rawText || '').trim();
+    if (!trimmed) return { json: null, isHtml: false };
+    if (trimmed.startsWith('<')) return { json: null, isHtml: true };
+    try {
+      return { json: JSON.parse(trimmed), isHtml: false };
+    } catch (_) {
+      return { json: null, isHtml: false };
+    }
+  };
+
   if (typeof fetch === 'function') {
-    const res = await fetch(targetUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: postStr,
-    });
-    const text = await res.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch (_) {}
-    return {
-      ok: res.ok,
-      status: res.status,
-      dateHeader: res.headers && res.headers.get ? res.headers.get('date') : null,
-      json,
-    };
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      const res = await fetch(targetUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': contentType },
+        body: postStr,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      const text = await res.text();
+      const parsed = parseSafeJson(text);
+      return {
+        ok: res.ok && !parsed.isHtml,
+        status: res.status,
+        isHtml: parsed.isHtml,
+        dateHeader: res.headers && res.headers.get ? res.headers.get('date') : null,
+        json: parsed.json,
+      };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
   return await new Promise((resolve, reject) => {
     const isHttps = targetUrl.startsWith('https:');
@@ -718,27 +946,79 @@ async function postAppsScriptJson(targetUrl, bodyObj) {
       path: url.pathname + (url.search || ''),
       method: 'POST',
       headers: {
-        'Content-Type': 'text/plain;charset=utf-8',
+        'Content-Type': contentType,
         'Content-Length': Buffer.byteLength(postStr),
       },
     }, (res) => {
       let chunks = '';
       res.on('data', (d) => { chunks += d; });
       res.on('end', () => {
-        let json = null;
-        try { json = JSON.parse(chunks); } catch (_) {}
+        const parsed = parseSafeJson(chunks);
         resolve({
-          ok: res.statusCode >= 200 && res.statusCode < 300,
+          ok: res.statusCode >= 200 && res.statusCode < 300 && !parsed.isHtml,
           status: res.statusCode,
+          isHtml: parsed.isHtml,
           dateHeader: res.headers ? res.headers.date : null,
-          json,
+          json: parsed.json,
         });
       });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Cloud request timed out after ${Math.round(timeoutMs / 1000)}s`));
     });
     req.on('error', reject);
     req.write(postStr);
     req.end();
   });
+}
+
+async function fetchCloudGatewayPolicy(targetUrl) {
+  if (!targetUrl || Date.now() - lastPolicyFetchAt < 15 * 60 * 1000) return;
+  lastPolicyFetchAt = Date.now();
+  try {
+    const pingUrl = `${targetUrl}${targetUrl.includes('?') ? '&' : '?'}action=ping`;
+    if (typeof fetch === 'function') {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 15000) : null;
+      try {
+        const res = await fetch(pingUrl, { method: 'GET', ...(controller ? { signal: controller.signal } : {}) });
+        const text = await res.text();
+        if (res.ok && text && !text.trim().startsWith('<')) {
+          const json = JSON.parse(text);
+          if (json && json.policy && typeof json.policy === 'object') {
+            applyHubRuntimePolicy(json.policy);
+            scheduleSave();
+            console.log(`[Edge-to-Cloud] 🧭 Synced cloud runtime policy (v${hubRuntimePolicy.protocolVersion}, batch=${hubRuntimePolicy.pushBatchSize}, pages=${hubRuntimePolicy.pullMaxPages}, timeout=${Math.round(hubRuntimePolicy.requestTimeoutMs / 1000)}s)`);
+          }
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+  } catch (err) {
+    console.log(`[Edge-to-Cloud] Policy ping notice: ${err.message}`);
+  }
+}
+
+function resolveUnifiedGatewayTarget(adapterCfg) {
+  if (adapterCfg.gatewayUrl) {
+    return {
+      url: adapterCfg.gatewayUrl,
+      isCloudGateway: true,
+      extraGatewayFields: {
+        backend_type: adapterCfg.databaseType,
+        credentials: adapterCfg.credentials || {},
+      },
+    };
+  }
+  const url = String(
+    adapterCfg.credentials.url ||
+    adapterCfg.credentials.webhookUrl ||
+    adapterCfg.credentials.masterWebhookUrl ||
+    cloudSyncUrl ||
+    ''
+  ).trim();
+  return { url, isCloudGateway: false, extraGatewayFields: {} };
 }
 
 function pushToCloud(entityType, record) {
@@ -775,6 +1055,65 @@ function pushToCloud(entityType, record) {
         });
       }
     };
+
+    // Freeze-Once Unified Cloud Gateway / Apps Script Adapter (Canonical Frozen 3-Action Protocol)
+    if (adapterCfg.useUnifiedGateway) {
+      if (cloudBackoffUntil > Date.now()) {
+        return;
+      }
+      const target = resolveUnifiedGatewayTarget(adapterCfg);
+      if (!target.url) return;
+
+      const authFields = getHubCloudAuthFields();
+      if (adapterCfg.databaseType === 'appscripts' && isBlockedMasterSheetWrite(hubTenantId, authFields.spreadsheet_id)) {
+        console.warn(`[Edge Gateway] 🛡️ Blocked write for non-master tenant ${hubTenantId}: dedicated spreadsheet_id required (Master Sheet protected).`);
+        return;
+      }
+
+      const envelope = buildHubSyncEnvelope(entityType, record);
+      postAppsScriptJson(target.url, {
+        action: 'push_envelopes',
+        company_id: hubTenantId,
+        branch_id: hubBranchId,
+        user_id: `HUB-${hubBranchId}`,
+        user_role: 'OWNER',
+        user_branch_id: hubBranchId,
+        ...authFields,
+        ...target.extraGatewayFields,
+        envelopes: [envelope],
+        timestamp: Date.now(),
+      }).then((res) => {
+        if (!res.ok) {
+          console.log(`[Edge Gateway] Cloud HTTP ${res.status}${res.isHtml ? ' (HTML error page)' : ''} for ${canonicalType}`);
+          return;
+        }
+        const json = res.json;
+        if (json && json.policy && typeof json.policy === 'object') {
+          applyHubRuntimePolicy(json.policy);
+        }
+        if (json && (json.success === false || json.status === 'error' || (typeof json.httpStatus === 'number' && json.httpStatus >= 400))) {
+          handleHubAppsScriptErrorResponse(json);
+          return;
+        }
+        if (json && typeof json.current_routing_epoch === 'number' && json.current_routing_epoch > cloudRoutingEpoch) {
+          cloudRoutingEpoch = json.current_routing_epoch;
+        }
+        if (json && json.server_received_at) record.server_received_at = json.server_received_at;
+        if (json && Array.isArray(json.flaggedBackdateIds) && json.flaggedBackdateIds.includes(envelope.entityId)) {
+          record.suspicious_backdate = true;
+        } else if (json && json.suspicious_backdate !== undefined) {
+          record.suspicious_backdate = Boolean(json.suspicious_backdate);
+        }
+        if (canonicalType === 'sale' || canonicalType === 'cash_log') {
+          annotateCloudBackdateFlag(entityType, record, res.dateHeader || null);
+        }
+        console.log(`[Edge Gateway] ☁️ Pushed canonical envelope ${canonicalType}:${envelope.entityId} via ${target.isCloudGateway ? 'Cloud Sync Gateway' : 'Apps Script'}`);
+        markCloudSyncedAndAck();
+      }).catch((err) => {
+        console.log(`[Edge Gateway] Cloud bridge notice for ${canonicalType}: ${err.message}`);
+      });
+      return;
+    }
 
     if (adapterCfg.databaseType === 'supabase') {
       const sbUrl = String(adapterCfg.credentials.url || adapterCfg.credentials.projectUrl || '').trim().replace(/\/+$/, '');
@@ -873,58 +1212,6 @@ function pushToCloud(entityType, record) {
       }).catch(() => {});
       return;
     }
-
-    // Default / App Scripts Adapter (Canonical V7.0 push_envelopes)
-    if (cloudBackoffUntil > Date.now()) {
-      return;
-    }
-    const targetUrl = String(
-      adapterCfg.credentials.url ||
-      adapterCfg.credentials.webhookUrl ||
-      adapterCfg.credentials.masterWebhookUrl ||
-      cloudSyncUrl ||
-      ''
-    ).trim();
-    if (!targetUrl) return;
-
-    const envelope = buildHubSyncEnvelope(entityType, record);
-    postAppsScriptJson(targetUrl, {
-      action: 'push_envelopes',
-      company_id: hubTenantId,
-      branch_id: hubBranchId,
-      user_id: `HUB-${hubBranchId}`,
-      user_role: 'OWNER',
-      user_branch_id: hubBranchId,
-      ...getHubCloudAuthFields(),
-      envelopes: [envelope],
-      timestamp: Date.now(),
-    }).then((res) => {
-      if (!res.ok) {
-        console.log(`[Edge Gateway] Apps Script HTTP ${res.status} for ${canonicalType}`);
-        return;
-      }
-      const json = res.json;
-      if (json && (json.success === false || json.status === 'error' || (typeof json.httpStatus === 'number' && json.httpStatus >= 400))) {
-        handleHubAppsScriptErrorResponse(json);
-        return;
-      }
-      if (json && typeof json.current_routing_epoch === 'number' && json.current_routing_epoch > cloudRoutingEpoch) {
-        cloudRoutingEpoch = json.current_routing_epoch;
-      }
-      if (json && json.server_received_at) record.server_received_at = json.server_received_at;
-      if (json && Array.isArray(json.flaggedBackdateIds) && json.flaggedBackdateIds.includes(envelope.entityId)) {
-        record.suspicious_backdate = true;
-      } else if (json && json.suspicious_backdate !== undefined) {
-        record.suspicious_backdate = Boolean(json.suspicious_backdate);
-      }
-      if (canonicalType === 'sale' || canonicalType === 'cash_log') {
-        annotateCloudBackdateFlag(entityType, record, res.dateHeader || null);
-      }
-      console.log(`[Edge Gateway] ☁️ Pushed canonical envelope ${canonicalType}:${envelope.entityId} to Apps Script`);
-      markCloudSyncedAndAck();
-    }).catch((err) => {
-      console.log(`[Edge Gateway] Cloud bridge notice for ${canonicalType}: ${err.message}`);
-    });
   } catch (err) {
     console.log(`[Edge Gateway] Cloud push notice: ${err.message}`);
   }
@@ -1028,6 +1315,53 @@ let securityAlertsStore = [];
 // Business Day Closures & EOD Archives
 let businessDayClosuresStore = [];
 let electronicSettlementsStore = [];
+
+// Schema-Agnostic Generic Envelope Store (handles reconciliation, goods_received, and ANY future entityType without APK rebuilds)
+// Structure: { [entityType: string]: { [entityId: string]: { ...record, _entityType, _entityId, _class, _updatedAt, isCloudSynced } } }
+let genericEntitiesStore = {};
+
+function upsertGenericEntityInHub(entityType, entityId, dataObj, meta = {}) {
+  const eType = String(entityType || '').trim().toLowerCase();
+  const eId = String(entityId || '').trim();
+  if (!eType || !eId || !dataObj || typeof dataObj !== 'object') return false;
+  if (!genericEntitiesStore[eType] || typeof genericEntitiesStore[eType] !== 'object') {
+    genericEntitiesStore[eType] = {};
+  }
+  const bucket = genericEntitiesStore[eType];
+  const existing = bucket[eId];
+  const incomingTs = parseHubTimestampMs(meta.updatedAt || dataObj.updatedAt || dataObj.lastUpdated || dataObj.timestamp) || Date.now();
+  const entityClass = meta.class || (isCanonicalT2Type(eType) ? 'T2' : 'T1');
+  if (existing) {
+    const existingTs = parseHubTimestampMs(existing._updatedAt || existing.updatedAt || existing.lastUpdated) || 0;
+    if (entityClass === 'T2' && existingTs > 0 && existingTs > incomingTs + 60000) {
+      return false;
+    }
+  }
+  const merged = {
+    ...(existing || {}),
+    ...dataObj,
+    id: dataObj.id || eId,
+    company_id: dataObj.company_id || dataObj.companyId || hubTenantId,
+    branch_id: dataObj.branch_id || dataObj.branchId || hubBranchId,
+    _entityType: eType,
+    _entityId: eId,
+    _class: entityClass,
+    _updatedAt: incomingTs,
+    updatedAt: incomingTs,
+    ...(meta.isCloudSynced === true ? { isCloudSynced: true } : { isCloudSynced: existing?.isCloudSynced === true && meta.isCloudSynced !== false }),
+  };
+  bucket[eId] = merged;
+  // Cap per-entity-type generic bucket via cloud-controlled runtime policy (default 5000) to protect mobile device RAM
+  const bucketMaxItems = Math.max(500, Number(hubRuntimePolicy.genericBucketMaxItems) || 5000);
+  const keys = Object.keys(bucket);
+  if (keys.length > bucketMaxItems) {
+    keys
+      .sort((a, b) => (bucket[a]?._updatedAt || 0) - (bucket[b]?._updatedAt || 0))
+      .slice(0, keys.length - bucketMaxItems)
+      .forEach((k) => delete bucket[k]);
+  }
+  return true;
+}
 
 // Secret holding vault for blind double-counting backed by hub-blind-vault.json:
 // Structure: { [sessionId]: { [zoneId]: { A: null, B: null } } }
@@ -1265,10 +1599,11 @@ function getTimestamp(rec) {
   return isNaN(tm) ? 0 : tm;
 }
 
-// 30-Day Disk Rotation & 2GB CCTV Safety Trim
-// Safe Pruning: ONLY delete records older than ROTATION_DAYS AND isCloudSynced === true!
+// Cloud-Controlled Disk Rotation (default 30 days) & Storage Safety Trim (default 2GB)
+// Safe Pruning: ONLY delete records older than effectiveRetentionDays AND isCloudSynced === true!
 function pruneOldRecords() {
-  const cutoffTime = Date.now() - (ROTATION_DAYS * 24 * 60 * 60 * 1000);
+  const effectiveRetentionDays = Math.max(7, Number(hubRuntimePolicy.retentionDays) || ROTATION_DAYS);
+  const cutoffTime = Date.now() - (effectiveRetentionDays * 24 * 60 * 60 * 1000);
   const shouldRetain = (rec) => {
     const isOld = getTimestamp(rec) < cutoffTime && Boolean(rec.date);
     if (!isOld) return true; // Retain recent records
@@ -1294,6 +1629,23 @@ function pruneOldRecords() {
   vouchersStore = vouchersStore.filter(shouldRetain);
   businessDayClosuresStore = businessDayClosuresStore.filter(shouldRetain);
   electronicSettlementsStore = electronicSettlementsStore.filter(shouldRetain);
+
+  // Additive pruning for cloud-synced T1 records inside genericEntitiesStore (never prunes T2 or unsynced records)
+  if (genericEntitiesStore && typeof genericEntitiesStore === 'object') {
+    for (const [gType, bucket] of Object.entries(genericEntitiesStore)) {
+      if (!bucket || typeof bucket !== 'object') continue;
+      if (isCanonicalT2Type(gType)) continue;
+      for (const [gId, rec] of Object.entries(bucket)) {
+        if (!rec || typeof rec !== 'object') continue;
+        if (rec._class === 'T2') continue;
+        if (rec.isCloudSynced !== true) continue;
+        const recTs = Number(rec._updatedAt || getTimestamp(rec)) || 0;
+        if (recTs > 0 && recTs < cutoffTime) {
+          delete bucket[gId];
+        }
+      }
+    }
+  }
 }
 
 // Load persistent data if exists
@@ -1309,6 +1661,13 @@ function loadData() {
       if (parsed.lastAppsScriptServerSeq) lastAppsScriptServerSeq = Number(parsed.lastAppsScriptServerSeq) || 0;
       if (parsed.cloudRoutingEpoch) cloudRoutingEpoch = Math.max(1, Number(parsed.cloudRoutingEpoch) || 1);
       if (parsed.cloudSpreadsheetId) cloudSpreadsheetId = String(parsed.cloudSpreadsheetId || '').trim();
+      if (parsed.cloudGatewayUrl) cloudGatewayUrl = String(parsed.cloudGatewayUrl || '').trim();
+      if (parsed.hubRuntimePolicy && typeof parsed.hubRuntimePolicy === 'object') {
+        applyHubRuntimePolicy(parsed.hubRuntimePolicy);
+      }
+      if (parsed.genericEntities && typeof parsed.genericEntities === 'object') {
+        genericEntitiesStore = parsed.genericEntities;
+      }
       if (Array.isArray(parsed.sales)) salesStore = parsed.sales;
       if (Array.isArray(parsed.inventory)) inventoryStore = parsed.inventory;
       if (Array.isArray(parsed.directGrvs)) directGrvsStore = parsed.directGrvs;
@@ -1414,6 +1773,8 @@ function saveData() {
       lastAppsScriptServerSeq,
       cloudRoutingEpoch,
       cloudSpreadsheetId,
+      cloudGatewayUrl,
+      hubRuntimePolicy,
       sales: salesStore,
       inventory: inventoryStore,
       directGrvs: directGrvsStore,
@@ -1448,22 +1809,31 @@ function saveData() {
       permissionsMatrix: permissionsMatrixStore,
       roleConfigs: roleConfigsStore,
       multiCurrency: multiCurrencyStore,
+      genericEntities: genericEntitiesStore,
       savedAt: new Date().toISOString(),
     };
 
     const serialized = JSON.stringify(payload, null, 2);
     const byteSize = Buffer.byteLength(serialized, 'utf8');
-    if (byteSize > MAX_STORAGE_BYTES) {
-      // 2GB Guard: Check if unsynced records exist. NEVER delete unsynced records to save space!
+    const effectiveMaxStorageMb = Math.max(64, Number(hubRuntimePolicy.maxStorageMb) || 2048);
+    const effectiveMaxBytes = effectiveMaxStorageMb * 1024 * 1024;
+    if (byteSize > effectiveMaxBytes) {
+      // Storage Guard: Check if unsynced records exist. NEVER delete unsynced records to save space!
+      const hasUnsyncedGeneric = Object.values(genericEntitiesStore || {}).some((bucket) =>
+        bucket && typeof bucket === 'object'
+          ? Object.values(bucket).some((r) => r && r.isCloudSynced !== true)
+          : false
+      );
       const hasUnsynced =
         salesStore.some((s) => s.isCloudSynced !== true) ||
         directGrvsStore.some((g) => g.isCloudSynced !== true) ||
-        expensesStore.some((e) => e.isCloudSynced !== true);
+        expensesStore.some((e) => e.isCloudSynced !== true) ||
+        hasUnsyncedGeneric;
       if (hasUnsynced) {
-        console.error(`[Termux Hub] ❌ CRITICAL: Hub storage (${(byteSize / (1024 * 1024 * 1024)).toFixed(2)} GB) exceeds 2GB limit, but unsynced transactions are present. Cannot prune unsynced records!`);
-        throw new Error('Termux Hub storage capacity reached (2GB) with un-synced cloud transactions. Please restore cloud connectivity.');
+        console.error(`[Termux Hub] ❌ CRITICAL: Hub storage (${(byteSize / (1024 * 1024)).toFixed(1)} MB) exceeds ${effectiveMaxStorageMb} MB policy limit, but unsynced transactions are present. Cannot prune unsynced records!`);
+        throw new Error(`Termux Hub storage capacity reached (${effectiveMaxStorageMb} MB) with un-synced cloud transactions. Please restore cloud connectivity.`);
       } else {
-        console.warn(`[Termux Hub] Warning: Hub data exceeds 2GB limit. Trimming already-synced oldest records...`);
+        console.warn(`[Termux Hub] Warning: Hub data exceeds ${effectiveMaxStorageMb} MB limit. Trimming already-synced oldest records...`);
         salesStore = salesStore.filter((s) => s.isCloudSynced !== true).concat(salesStore.filter((s) => s.isCloudSynced === true).slice(0, 2500));
         directGrvsStore = directGrvsStore.filter((g) => g.isCloudSynced !== true).concat(directGrvsStore.filter((g) => g.isCloudSynced === true).slice(0, 500));
       }
@@ -1742,18 +2112,24 @@ function normalizeHubEntityType(rawType) {
 
 function isHubT2EntityType(rawType) {
   const n = normalizeHubEntityType(rawType);
-  return [
-    'inventory_item',
-    'customer',
-    'staff',
-    'supplier',
-    'branch',
-    'inventory_category',
-    'cash_account',
-    'credit_group',
-    'casual_worker',
-    'stocktake_session',
-  ].includes(n);
+  if (
+    [
+      'inventory_item',
+      'customer',
+      'staff',
+      'supplier',
+      'branch',
+      'inventory_category',
+      'cash_account',
+      'credit_group',
+      'casual_worker',
+      'stocktake_session',
+    ].includes(n)
+  ) {
+    return true;
+  }
+  const canon = mapHubEntityToCanonicalType(rawType);
+  return Array.isArray(hubRuntimePolicy.t2EntityTypes) && (hubRuntimePolicy.t2EntityTypes.includes(n) || hubRuntimePolicy.t2EntityTypes.includes(canon));
 }
 
 function getTombstoneRecordId(rec, norm) {
@@ -1770,21 +2146,26 @@ function getTombstoneRecordId(rec, norm) {
   if (n === 'credit_group') return String(rec.groupId || rec.id || '').trim();
   if (n === 'casual_worker') return String(rec.id || rec.pin_hash || '').trim();
   if (n === 'stocktake_session') return String(rec.sessionId || rec.id || '').trim();
-  return String(getEntityId(rec, norm) || rec.id || '').trim();
+  return String(getEntityId(rec, norm) || rec._entityId || rec.id || '').trim();
 }
 
 function isCatalogTombstoneType(rawType) {
   const n = normalizeHubEntityType(rawType);
-  return [
-    'inventory_item',
-    'customer',
-    'staff',
-    'supplier',
-    'branch',
-    'inventory_category',
-    'credit_group',
-    'casual_worker',
-  ].includes(n);
+  if (
+    [
+      'inventory_item',
+      'customer',
+      'staff',
+      'supplier',
+      'branch',
+      'inventory_category',
+      'credit_group',
+      'casual_worker',
+    ].includes(n)
+  ) {
+    return true;
+  }
+  return isHubGlobalBranchEntityType(n) || isHubGlobalBranchEntityType(mapHubEntityToCanonicalType(rawType));
 }
 
 function findHubTombstone(entityId, entityType) {
@@ -1920,6 +2301,31 @@ function purgeEntityFromHubStores(entityType, entityId, tombstoneDeletedAt) {
       }
     }
   }
+
+  // Additive tombstone purge for schema-agnostic genericEntitiesStore buckets (future & generic entities)
+  if (genericEntitiesStore && typeof genericEntitiesStore === 'object') {
+    const canonGen = entityType ? mapHubEntityToCanonicalType(entityType) : '';
+    const targetBuckets = !norm
+      ? Object.keys(genericEntitiesStore)
+      : Array.from(new Set([norm, canonGen].filter(Boolean)));
+    for (const bKey of targetBuckets) {
+      const bucket = genericEntitiesStore[bKey];
+      if (!bucket || typeof bucket !== 'object') continue;
+      for (const recKey of Object.keys(bucket)) {
+        const rec = bucket[recKey];
+        if (!rec) continue;
+        const candidateId = String(rec._entityId || rec.id || recKey || '').trim().toUpperCase();
+        if (candidateId !== cleanUpper && String(recKey).trim().toUpperCase() !== cleanUpper) continue;
+        if (tombstoneDeletedAt !== undefined) {
+          const itemTs = Number(rec._updatedAt || getTimestamp(rec)) || 0;
+          if (itemTs > tombstoneDeletedAt + 120000) continue;
+        }
+        delete bucket[recKey];
+        purged = true;
+      }
+    }
+  }
+
   return purged;
 }
 
@@ -2007,8 +2413,16 @@ function getStoreByEntityType(norm) {
     case 'category':
     case 'inventory_category':
       return categoriesStore;
-    default:
+    default: {
+      if (genericEntitiesStore && typeof genericEntitiesStore === 'object') {
+        const directBucket = genericEntitiesStore[norm];
+        if (directBucket && typeof directBucket === 'object') return Object.values(directBucket);
+        const canonKey = mapHubEntityToCanonicalType(norm);
+        const canonBucket = canonKey ? genericEntitiesStore[canonKey] : null;
+        if (canonBucket && typeof canonBucket === 'object') return Object.values(canonBucket);
+      }
       return [];
+    }
   }
 }
 
@@ -2059,7 +2473,7 @@ function getEntityId(rec, norm) {
     case 'inventory_category':
       return rec.categoryId || rec.id || rec.categoryName;
     default:
-      return rec.id;
+      return rec._entityId || rec.id || rec.entityId || null;
   }
 }
 
@@ -2105,8 +2519,89 @@ function getRecordTotal(rec, norm) {
     case 'customer':
       return Number(rec.creditLimit) || 0;
     default:
-      return 0;
+      return Number(rec.total ?? rec.totalAmount ?? rec.amount ?? rec.points ?? 0) || 0;
   }
+}
+
+// Generic Local Query API helper (supports BOTH dedicated stores and genericEntitiesStore without APK rebuilds)
+function queryHubEntities(queryOpts = {}) {
+  const rawType = String(queryOpts.entityType || queryOpts.entity || '').trim().toLowerCase();
+  if (!rawType) {
+    return { entityType: '', records: [], count: 0, totalMatched: 0, truncated: false };
+  }
+  const canonType = mapHubEntityToCanonicalType(rawType);
+  const reqComp = String(queryOpts.companyId || queryOpts.company_id || hubTenantId || 'COMP-001').trim().toUpperCase();
+  const reqBranchRaw = String(queryOpts.branchId || queryOpts.branch_id || queryOpts.branchCode || 'ALL').trim().toUpperCase();
+  const reqBranch = reqBranchRaw || 'ALL';
+  const dateFromMs = queryOpts.dateFrom ? (typeof queryOpts.dateFrom === 'number' ? queryOpts.dateFrom : new Date(queryOpts.dateFrom).getTime()) : 0;
+  const dateToMs = queryOpts.dateTo ? (typeof queryOpts.dateTo === 'number' ? queryOpts.dateTo : new Date(queryOpts.dateTo).getTime()) : Infinity;
+  const filterStatus = queryOpts.status ? String(queryOpts.status).trim().toLowerCase() : '';
+  const limitNum = Math.min(1000, Math.max(1, Number(queryOpts.limit) || 200));
+
+  const getStoreForQuery = () => {
+    const primary = getStoreByEntityType(rawType);
+    if (primary.length > 0) return primary;
+    const byCanon = getStoreByEntityType(canonType);
+    if (byCanon.length > 0) return byCanon;
+    switch (canonType) {
+      case 'cash_lift': return cashLiftsStore;
+      case 'cash_movement': return cashMovementsStore;
+      case 'cash_transfer': return cashTransfersStore;
+      case 'cash_account': return cashAccountsStore;
+      case 'credit_group': return creditGroupsStore;
+      case 'internal_consumption': return internalConsumptionsStore;
+      case 'admin_sale': return adminSalesStore;
+      case 'cash_count': return cashCountsStore;
+      case 'supplier_invoice_voucher': return vouchersStore;
+      case 'business_day_closure': return businessDayClosuresStore;
+      case 'electronic_settlement': return electronicSettlementsStore;
+      case 'casual_worker': return casualWorkersStore;
+      case 'stocktake_session': return stocktakeSessionsStore;
+      case 'stocktake_segment': return stocktakeSegmentsStore;
+      case 'stocktake_zone_assignment': return zoneAssignmentsStore;
+      default: return [];
+    }
+  };
+
+  const sourceList = getStoreForQuery();
+  const isGlobal = isHubGlobalBranchEntityType(canonType) || isHubGlobalBranchEntityType(rawType);
+  const isT2 = isHubT2EntityType(canonType) || isCanonicalT2Type(canonType);
+
+  const matched = [];
+  for (const rec of sourceList) {
+    if (!rec || typeof rec !== 'object') continue;
+    const recComp = String(rec.companyId || rec.company_id || hubTenantId || 'COMP-001').trim().toUpperCase();
+    if (reqComp !== 'ALL' && recComp !== reqComp) continue;
+    if (!isGlobal && reqBranch !== 'ALL') {
+      const recBranch = String(rec.branchId || rec.branch_id || rec.branchCode || hubBranchId || '').trim().toUpperCase();
+      if (recBranch && recBranch !== 'ALL' && recBranch !== reqBranch) continue;
+    }
+    const id = getEntityId(rec, canonType) || rec._entityId || rec.id;
+    const recTs = getRecordTimestamp(rec);
+    if (isT2 && id && isTombstoned(id, canonType, recTs)) continue;
+    if (dateFromMs > 0 && Number.isFinite(dateFromMs) && recTs > 0 && recTs < dateFromMs) continue;
+    if (Number.isFinite(dateToMs) && recTs > 0 && recTs > dateToMs) continue;
+    if (filterStatus && String(rec.status || '').trim().toLowerCase() !== filterStatus) continue;
+
+    // Strip any sensitive credential fields defensively
+    const safeRec = { ...rec };
+    if ('pin' in safeRec) delete safeRec.pin;
+    if ('rawPin' in safeRec) delete safeRec.rawPin;
+    if ('password' in safeRec) delete safeRec.password;
+    if ('passwordHash' in safeRec) delete safeRec.passwordHash;
+    matched.push(safeRec);
+  }
+
+  matched.sort((a, b) => getRecordTimestamp(b) - getRecordTimestamp(a));
+  const totalMatched = matched.length;
+  const sliced = matched.slice(0, limitNum);
+  return {
+    entityType: canonType,
+    records: sliced,
+    count: sliced.length,
+    totalMatched,
+    truncated: totalMatched > sliced.length,
+  };
 }
 
 function computeIdsChecksum(ids) {
@@ -2519,25 +3014,41 @@ wss.on('connection', (ws, req) => {
         if (packet.config && typeof packet.config === 'object') {
           cloudConfig = packet.config;
           const creds = cloudConfig.credentials && typeof cloudConfig.credentials === 'object' ? cloudConfig.credentials : {};
+          const incomingCompanyId = String(cloudConfig.companyId || packet.companyId || packet.company_id || '').trim();
           const incomingTok = String(creds.token || creds.jwt || packet.token || packet.jwt || '').trim();
           const incomingSid = String(creds.spreadsheetId || creds.sheetId || packet.spreadsheet_id || '').trim();
+          const incomingGw = String(cloudConfig.gatewayUrl || creds.gatewayUrl || packet.gatewayUrl || '').trim();
           const incomingEpoch = Number(creds.routingEpoch || creds.routing_epoch || packet.routing_epoch || 0);
+          if (incomingCompanyId) {
+            if (hubTenantId !== incomingCompanyId) {
+              lastAppsScriptServerSeq = 0;
+              lastCloudSyncTimestamp = 0;
+            }
+            hubTenantId = incomingCompanyId;
+          }
           if (incomingTok) {
             cloudJwtToken = incomingTok;
             cloudBackoffUntil = 0; // Fresh token clears auth backoff immediately
           }
           if (incomingSid) cloudSpreadsheetId = incomingSid;
+          if (incomingGw) cloudGatewayUrl = incomingGw;
           if (incomingEpoch > 0) cloudRoutingEpoch = Math.max(cloudRoutingEpoch, incomingEpoch);
+          if (cloudConfig.runtimePolicy && typeof cloudConfig.runtimePolicy === 'object') {
+            applyHubRuntimePolicy(cloudConfig.runtimePolicy);
+          }
           encryptAndSaveCloudConfig(cloudConfig);
           scheduleSave();
-          console.log('[Termux Hub] 🔒 Received and encrypted Cloud Config. DB Type:', packet.config.databaseType);
+          console.log('[Termux Hub] 🔒 Received and encrypted Cloud Config. DB Type:', packet.config.databaseType, '| Tenant:', hubTenantId, cloudGatewayUrl ? '| Unified Gateway: ON' : '');
           try {
             ws.send(JSON.stringify({
               type: 'SYNC_CLOUD_CONFIG_ACK',
               action: 'SYNC_CLOUD_CONFIG_ACK',
               success: true,
               databaseType: packet.config.databaseType || 'unknown',
+              companyId: hubTenantId,
+              protocolVersion: hubRuntimePolicy.protocolVersion,
               routing_epoch: cloudRoutingEpoch,
+              policy: hubRuntimePolicy,
               timestamp: Date.now(),
             }));
           } catch (e) {}
@@ -2751,6 +3262,7 @@ wss.on('connection', (ws, req) => {
         permissionsMatrixStore = { rules: [], updatedAt: 0 };
         roleConfigsStore = { definitions: null, updatedAt: 0 };
         multiCurrencyStore = { config: null, updatedAt: 0 };
+        genericEntitiesStore = {};
         lastAppsScriptServerSeq = 0;
 
         hubBranchId = packet.new_branch_id || 'UNASSIGNED';
@@ -6346,6 +6858,40 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
+      // 9.8 GENERIC LOCAL QUERY API (FUTURE-PROOF REPORTS & KPI QUERIES)
+      // =====================================================================
+      const isGenericQueryReq = pType === 'QUERY_ENTITIES' || pType === 'QUERY_ENTITIES_REQUEST';
+      if (isGenericQueryReq) {
+        const queryResult = queryHubEntities({
+          entityType: packet.entityType || packet.entity || packet.targetEntity,
+          companyId: packet.companyId || packet.company_id || hubTenantId,
+          branchId: packet.branchId || packet.branch_id || packet.branchCode || 'ALL',
+          dateFrom: packet.dateFrom || packet.startDate,
+          dateTo: packet.dateTo || packet.endDate,
+          status: packet.status,
+          limit: packet.limit,
+        });
+        try {
+          ws.send(JSON.stringify({
+            type: 'QUERY_ENTITIES_RESPONSE',
+            action: 'QUERY_ENTITIES_RESPONSE',
+            requestId: packet.requestId || packet.packet_id,
+            entityType: queryResult.entityType,
+            records: queryResult.records,
+            count: queryResult.count,
+            totalMatched: queryResult.totalMatched,
+            truncated: queryResult.truncated,
+            hubTimestamp: Date.now(),
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: Date.now(),
+          }));
+          console.log(`[Termux Hub] 🔎 QUERY_ENTITIES("${queryResult.entityType}") returned ${queryResult.count}/${queryResult.totalMatched} records`);
+        } catch (e) {}
+        return;
+      }
+
+      // =====================================================================
       // 10. DELTA CATCH-UP RESPONSE (NO FIREHOSE - ONLY updatedAt >= sinceTime)
       // =====================================================================
       const isCatchupReq = pType === 'catchup_request' || pType === 'CATCHUP_REQUEST';
@@ -6470,6 +7016,32 @@ wss.on('connection', (ws, req) => {
           return tombTs >= tombstoneWindowStart;
         });
 
+        const missedGenericEnvelopes = [];
+        for (const [gType, bucket] of Object.entries(genericEntitiesStore || {})) {
+          if (!bucket || typeof bucket !== 'object') continue;
+          const isGlobalGen = isHubGlobalBranchEntityType(gType) || isCanonicalT2Type(gType);
+          const isT2Gen = isCanonicalT2Type(gType);
+          for (const [gId, rec] of Object.entries(bucket)) {
+            if (!rec || typeof rec !== 'object') continue;
+            const recTs = Number(rec._updatedAt || getTimestamp(rec)) || 0;
+            if (isT2Gen && isTombstoned(gId, gType, recTs)) continue;
+            if (!isMatch(rec, reqComp, reqBranch, isGlobalGen)) continue;
+            if (recTs >= sinceTime || packet.isForced || isExplicitZero) {
+              missedGenericEnvelopes.push({
+                packetId: `HUB-GEN-${gType}-${gId}-${recTs}`,
+                entityType: gType,
+                entityId: gId,
+                action: 'UPSERT',
+                class: rec._class || (isT2Gen ? 'T2' : 'T1'),
+                updatedAt: recTs || Date.now(),
+                originDeviceId: 'LOCAL_HUB',
+                targetBranchId: isGlobalGen ? 'ALL' : (rec.branch_id || rec.branchId || reqBranch || 'ALL'),
+                data: rec,
+              });
+            }
+          }
+        }
+
         const catchupResponse = {
           type: 'catchup_response',
           action: 'CATCHUP_RESPONSE',
@@ -6511,6 +7083,7 @@ wss.on('connection', (ws, req) => {
             stocktakeSessions: missedStocktakeSessions,
             stocktakeSegments: stocktakeSegmentsStore,
             tombstones: missedTombstones,
+            ...(missedGenericEnvelopes.length > 0 ? { genericEnvelopes: missedGenericEnvelopes } : {}),
             ...(Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && ((permissionsMatrixStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
               ? { permissionsMatrix: permissionsMatrixStore }
               : {}),
@@ -6533,12 +7106,45 @@ wss.on('connection', (ws, req) => {
             `${missedCashLogs.length} cash logs, ${missedSuppliers.length} suppliers, ` +
             `${missedAdminSales.length} admin sales, ${missedCashCounts.length} cash counts, ` +
             `${missedVouchers.length} vouchers, ${missedSalespeople.length} staff, ${missedCustomers.length} customers, ` +
-            `${categoriesStore.length} categories, ${missedTombstones.length} tombstones.`
+            `${categoriesStore.length} categories, ${missedTombstones.length} tombstones, ${missedGenericEnvelopes.length} generic envelopes.`
           );
         } catch (e) {
           console.warn('[Termux Hub] Failed to send catchup response:', e.message);
         }
         return;
+      }
+
+      // =====================================================================
+      // 10.5. SCHEMA-AGNOSTIC GENERIC ENVELOPE CAPTURE (Future-Proof APK Relay)
+      // Persists reconciliation, goods_received, and ANY future entityType automatically
+      // =====================================================================
+      const rawGenericEntityType = packet.entityType || (pType === 'db_mutation' ? packet.sheetName : '');
+      const genericPayloadObj = packet.payload && typeof packet.payload === 'object' ? packet.payload : (packet.data && typeof packet.data === 'object' ? packet.data : null);
+      if (
+        rawGenericEntityType &&
+        genericPayloadObj &&
+        pType !== 'HEARTBEAT' &&
+        pType !== 'PING' &&
+        pType !== 'PONG' &&
+        pType !== 'SYNC_RECEIPT' &&
+        pType !== 'SYNC_ACK'
+      ) {
+        const canonGenType = mapHubEntityToCanonicalType(rawGenericEntityType);
+        const genId = String(packet.entityId || packet.recordId || getHubCanonicalEntityId(genericPayloadObj, canonGenType) || '').trim();
+        if (canonGenType && genId && canonGenType !== 'sheet_mutation' && canonGenType !== 'sync_receipt') {
+          const alreadyCloud = hasIncomingCloudSyncFlag(packet, genericPayloadObj);
+          const storedOk = upsertGenericEntityInHub(canonGenType, genId, genericPayloadObj, {
+            updatedAt: packet.updatedAt || packet.timestamp || Date.now(),
+            class: packet.class,
+            isCloudSynced: alreadyCloud,
+          });
+          if (storedOk) {
+            scheduleSave();
+            if (!alreadyCloud) {
+              pushToCloud(canonGenType, genericEntitiesStore[canonGenType][genId]);
+            }
+          }
+        }
       }
 
       // =====================================================================
@@ -6567,7 +7173,7 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`================================================================`);
-  console.log(`🚀 Saimetric POS - Standalone Local Hub (v3.6.0)`);
+  console.log(`🚀 Saimetric POS - Universal Freeze-Once Local Hub (v4.0.0)`);
   console.log(`📡 WebSocket URL:  ws://0.0.0.0:${PORT}`);
   console.log(`🌐 HTTP Status:    http://0.0.0.0:${PORT}/health`);
   console.log(`🏢 Branch ID:      ${hubBranchId} ("${hubBranchName}")`);
@@ -6649,18 +7255,16 @@ async function syncEdgeToCloudSupabase() {
     return;
   }
 
-  if (adapterCfg.databaseType === 'appscripts') {
+  if (adapterCfg.useUnifiedGateway) {
     if (cloudBackoffUntil > Date.now()) {
       return;
     }
-    const targetUrl = String(
-      adapterCfg.credentials.url ||
-      adapterCfg.credentials.webhookUrl ||
-      adapterCfg.credentials.masterWebhookUrl ||
-      cloudSyncUrl ||
-      ''
-    ).trim();
+    const target = resolveUnifiedGatewayTarget(adapterCfg);
+    const targetUrl = target.url;
     if (!targetUrl) return;
+
+    // Periodically fetch latest runtime policy from Cloud Gateway / Apps Script
+    await fetchCloudGatewayPolicy(targetUrl);
 
     const getTrRankHub = (st) => {
       const u = String(st || '').toUpperCase().trim();
@@ -6713,9 +7317,12 @@ async function syncEdgeToCloudSupabase() {
 
     const ingestCloudEnvelopeIntoHub = (env) => {
       if (!env || !env.entityType || !env.data || typeof env.data !== 'object') return false;
-      const eType = String(env.entityType).trim().toLowerCase();
-      const rec = { ...env.data, isCloudSynced: true };
-      const cId = String(env.entityId || getHubCanonicalEntityId(rec, eType) || '').trim();
+      const eType = mapHubEntityToCanonicalType(env.entityType);
+      const rawNorm = normalizeIncomingCloudRecord(eType, env.data, env.entityId);
+      const rec = { ...rawNorm, isCloudSynced: true };
+      const cId = String(getHubCanonicalEntityId(rec, eType) || env.entityId || '').trim();
+      if (!cId) return false;
+      if (eType === 'inventory_item' && /^USR-/i.test(cId)) return false;
       const cloudTs = parseHubTimestampMs(env.updatedAt || rec.updatedAt || rec.lastUpdated || rec.hubTimestamp) || Date.now();
 
       if (eType === 'tombstone') {
@@ -6814,7 +7421,14 @@ async function syncEdgeToCloudSupabase() {
       };
 
       const targetSpec = storeByType[eType];
-      if (!targetSpec) return false;
+      if (!targetSpec) {
+        // Schema-Agnostic Fallback: store reconciliation, goods_received, and ANY future entityType generically!
+        return upsertGenericEntityInHub(eType, cId, rec, {
+          updatedAt: cloudTs,
+          class: env.class,
+          isCloudSynced: true,
+        });
+      }
 
       if (eType === 'branch' && !isValidBranchRecord(rec)) return false;
       if (eType === 'staff') {
@@ -6907,9 +7521,86 @@ async function syncEdgeToCloudSupabase() {
     };
 
     const newlyPulledEnvelopes = [];
+    const authFields = getHubCloudAuthFields();
+    let pullSucceeded = false;
 
-    // STEP A: Collect & push all unsynced records across all Hub stores via push_envelopes
-    // TOMBSTONE MUST be pushed first so Cloud marks deleted sessions before new sessions arrive!
+    // STEP A (PULL-FIRST): Cursor-based pull_catchup BEFORE pushing so fresh Hubs never miss peer records
+    try {
+      let cursor = 0;
+      let page = 0;
+      let maxSeq = lastAppsScriptServerSeq;
+      const effectiveSinceSeq = lastAppsScriptServerSeq > 0 ? lastAppsScriptServerSeq : 0;
+      const effectiveSinceTs = lastAppsScriptServerSeq > 0 ? lastCloudSyncTimestamp : 0;
+      const MAX_PAGES = Number(hubRuntimePolicy.pullMaxPages) || 12;
+
+      while (cursor !== null && page < MAX_PAGES) {
+        if (cloudBackoffUntil > Date.now()) break;
+        const pullRes = await postAppsScriptJson(targetUrl, {
+          action: 'pull_catchup',
+          company_id: hubTenantId,
+          branch_id: hubBranchId || 'ALL',
+          user_role: 'OWNER',
+          ...authFields,
+          ...target.extraGatewayFields,
+          since_seq: effectiveSinceSeq,
+          since_ts: effectiveSinceTs,
+          limit: 250,
+          cursor,
+        });
+        if (!pullRes.ok || !pullRes.json) break;
+        if (pullRes.json.policy && typeof pullRes.json.policy === 'object') {
+          applyHubRuntimePolicy(pullRes.json.policy);
+        }
+        if (pullRes.json.success === false || pullRes.json.status === 'error' || (typeof pullRes.json.httpStatus === 'number' && pullRes.json.httpStatus >= 400)) {
+          handleHubAppsScriptErrorResponse(pullRes.json);
+          break;
+        }
+        pullSucceeded = true;
+        if (typeof pullRes.json.current_routing_epoch === 'number' && pullRes.json.current_routing_epoch > cloudRoutingEpoch) {
+          cloudRoutingEpoch = pullRes.json.current_routing_epoch;
+        }
+
+        const list = Array.isArray(pullRes.json.envelopes) ? pullRes.json.envelopes : [];
+        list.sort((a, b) => {
+          if (a?.entityType === 'tombstone' && b?.entityType !== 'tombstone') return -1;
+          if (b?.entityType === 'tombstone' && a?.entityType !== 'tombstone') return 1;
+          return (Number(a?.serverSeq || 0) - Number(b?.serverSeq || 0));
+        });
+
+        for (const rawEnv of list) {
+          if (ingestCloudEnvelopeIntoHub(rawEnv)) {
+            newlyPulledEnvelopes.push(rawEnv);
+          }
+          if (typeof rawEnv?.serverSeq === 'number' && rawEnv.serverSeq > maxSeq) {
+            maxSeq = rawEnv.serverSeq;
+          }
+        }
+
+        if (typeof pullRes.json.server_seq === 'number' && pullRes.json.server_seq > maxSeq) {
+          maxSeq = pullRes.json.server_seq;
+        }
+        cursor = pullRes.json.hasMore && pullRes.json.nextCursor !== undefined && pullRes.json.nextCursor !== null
+          ? Number(pullRes.json.nextCursor)
+          : null;
+        page++;
+      }
+
+      if (maxSeq > lastAppsScriptServerSeq) {
+        lastAppsScriptServerSeq = maxSeq;
+      }
+    } catch (pullErr) {
+      console.warn('[Edge-to-Cloud] Cloud pull_catchup notice:', pullErr.message);
+    }
+
+    // STEP B: Collect & push all unsynced records across all dedicated AND generic Hub stores via push_envelopes
+    const canPushToTarget = !(
+      adapterCfg.databaseType === 'appscripts' &&
+      isBlockedMasterSheetWrite(hubTenantId, authFields.spreadsheet_id)
+    );
+    if (!canPushToTarget) {
+      console.warn(`[Edge-to-Cloud] 🛡️ Skipping push_envelopes for non-master tenant ${hubTenantId}: dedicated spreadsheet_id required.`);
+    }
+
     const pushSources = [
       { hubType: 'TOMBSTONE', store: tombstonesStore },
       { hubType: 'SALE', store: salesStore },
@@ -6944,25 +7635,37 @@ async function syncEdgeToCloudSupabase() {
     ];
 
     const pendingPushPairs = [];
-    for (const src of pushSources) {
-      for (const rec of src.store) {
-        if (!rec || typeof rec !== 'object' || rec.isCloudSynced === true) continue;
-        const env = buildHubSyncEnvelope(src.hubType, rec);
-        if (!env.entityId) continue;
-        pendingPushPairs.push({ rec, env, hubType: src.hubType });
+    if (canPushToTarget) {
+      for (const src of pushSources) {
+        for (const rec of src.store) {
+          if (!rec || typeof rec !== 'object' || rec.isCloudSynced === true) continue;
+          const env = buildHubSyncEnvelope(src.hubType, rec);
+          if (!env.entityId) continue;
+          pendingPushPairs.push({ rec, env, hubType: src.hubType });
+        }
+      }
+      // Include all unsynced schema-agnostic generic entities (reconciliation, goods_received, future entities)
+      for (const [gType, bucket] of Object.entries(genericEntitiesStore || {})) {
+        if (!bucket || typeof bucket !== 'object') continue;
+        for (const rec of Object.values(bucket)) {
+          if (!rec || typeof rec !== 'object' || rec.isCloudSynced === true) continue;
+          const env = buildHubSyncEnvelope(gType, rec);
+          if (!env.entityId) continue;
+          pendingPushPairs.push({ rec, env, hubType: gType.toUpperCase() });
+        }
+      }
+      if (Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && permissionsMatrixStore.isCloudSynced !== true) {
+        pendingPushPairs.push({ rec: permissionsMatrixStore, env: buildHubSyncEnvelope('PERMISSIONS_MATRIX', permissionsMatrixStore), hubType: 'PERMISSIONS_MATRIX' });
+      }
+      if (roleConfigsStore.definitions && roleConfigsStore.isCloudSynced !== true) {
+        pendingPushPairs.push({ rec: roleConfigsStore, env: buildHubSyncEnvelope('ROLE_CONFIGS', roleConfigsStore), hubType: 'ROLE_CONFIGS' });
+      }
+      if (multiCurrencyStore.config && multiCurrencyStore.config.isCloudSynced !== true) {
+        pendingPushPairs.push({ rec: multiCurrencyStore.config, env: buildHubSyncEnvelope('MULTI_CURRENCY', multiCurrencyStore.config), hubType: 'MULTI_CURRENCY' });
       }
     }
-    if (Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && permissionsMatrixStore.isCloudSynced !== true) {
-      pendingPushPairs.push({ rec: permissionsMatrixStore, env: buildHubSyncEnvelope('PERMISSIONS_MATRIX', permissionsMatrixStore), hubType: 'PERMISSIONS_MATRIX' });
-    }
-    if (roleConfigsStore.definitions && roleConfigsStore.isCloudSynced !== true) {
-      pendingPushPairs.push({ rec: roleConfigsStore, env: buildHubSyncEnvelope('ROLE_CONFIGS', roleConfigsStore), hubType: 'ROLE_CONFIGS' });
-    }
-    if (multiCurrencyStore.config && multiCurrencyStore.config.isCloudSynced !== true) {
-      pendingPushPairs.push({ rec: multiCurrencyStore.config, env: buildHubSyncEnvelope('MULTI_CURRENCY', multiCurrencyStore.config), hubType: 'MULTI_CURRENCY' });
-    }
 
-    const PUSH_BATCH = 20;
+    const PUSH_BATCH = Number(hubRuntimePolicy.pushBatchSize) || 20;
     for (let i = 0; i < pendingPushPairs.length; i += PUSH_BATCH) {
       if (cloudBackoffUntil > Date.now()) break;
       const chunk = pendingPushPairs.slice(i, i + PUSH_BATCH);
@@ -6974,10 +7677,14 @@ async function syncEdgeToCloudSupabase() {
           user_id: `HUB-${hubBranchId}`,
           user_role: 'OWNER',
           user_branch_id: hubBranchId,
-          ...getHubCloudAuthFields(),
+          ...authFields,
+          ...target.extraGatewayFields,
           envelopes: chunk.map((c) => c.env),
           timestamp: Date.now(),
         });
+        if (pushRes.ok && pushRes.json && pushRes.json.policy && typeof pushRes.json.policy === 'object') {
+          applyHubRuntimePolicy(pushRes.json.policy);
+        }
         if (pushRes.ok && pushRes.json && (pushRes.json.success === false || pushRes.json.status === 'error' || (typeof pushRes.json.httpStatus === 'number' && pushRes.json.httpStatus >= 400))) {
           handleHubAppsScriptErrorResponse(pushRes.json);
           break;
@@ -7041,14 +7748,12 @@ async function syncEdgeToCloudSupabase() {
                 } else {
                   pair.rec.status = 'DRAFT';
                   pair.rec.isLockdownActive = false;
-                  // Mark dirty so the demoted DRAFT syncs safely to Cloud without conflicting
                   pair.rec.isCloudSynced = false;
                 }
                 pair.rec.updatedAt = nowMs;
                 pair.rec.lastUpdated = nowIso;
                 pair.rec.notes = `${pair.rec.notes ? pair.rec.notes + ' | ' : ''}${conflictReason}`;
 
-                // Release local Hub lockdown if it was bound to the rejected session
                 if (branchLockdownsStore && typeof branchLockdownsStore === 'object') {
                   for (const brK of Object.keys(branchLockdownsStore)) {
                     const lk = branchLockdownsStore[brK];
@@ -7069,7 +7774,6 @@ async function syncEdgeToCloudSupabase() {
                   }
                 }
                 scheduleSave();
-                // Notify connected PWA clients so they quarantine the losing session locally
                 try {
                   if (typeof wss !== 'undefined' && wss && wss.clients) {
                     const conflictNotice = JSON.stringify({
@@ -7106,78 +7810,20 @@ async function syncEdgeToCloudSupabase() {
           }
         }
       } catch (pushErr) {
-        console.warn('[Edge-to-Cloud] Apps Script push_envelopes notice:', pushErr.message);
+        console.warn('[Edge-to-Cloud] Cloud push_envelopes notice:', pushErr.message);
         break;
       }
     }
 
-    // STEP B: Cursor-based pull_catchup across all synced entities & sharded monthly tabs
-    try {
-      let cursor = 0;
-      let page = 0;
-      let maxSeq = lastAppsScriptServerSeq;
-      const MAX_PAGES = 4;
-
-      while (cursor !== null && page < MAX_PAGES) {
-        if (cloudBackoffUntil > Date.now()) break;
-        const pullRes = await postAppsScriptJson(targetUrl, {
-          action: 'pull_catchup',
-          company_id: hubTenantId,
-          branch_id: hubBranchId || 'ALL',
-          user_role: 'OWNER',
-          ...getHubCloudAuthFields(),
-          since_seq: lastAppsScriptServerSeq,
-          since_ts: lastCloudSyncTimestamp,
-          limit: 250,
-          cursor,
-        });
-        if (!pullRes.ok || !pullRes.json) break;
-        if (pullRes.json.success === false || pullRes.json.status === 'error' || (typeof pullRes.json.httpStatus === 'number' && pullRes.json.httpStatus >= 400)) {
-          handleHubAppsScriptErrorResponse(pullRes.json);
-          break;
-        }
-        if (typeof pullRes.json.current_routing_epoch === 'number' && pullRes.json.current_routing_epoch > cloudRoutingEpoch) {
-          cloudRoutingEpoch = pullRes.json.current_routing_epoch;
-        }
-
-        const list = Array.isArray(pullRes.json.envelopes) ? pullRes.json.envelopes : [];
-        list.sort((a, b) => {
-          if (a?.entityType === 'tombstone' && b?.entityType !== 'tombstone') return -1;
-          if (b?.entityType === 'tombstone' && a?.entityType !== 'tombstone') return 1;
-          return (Number(a?.serverSeq || 0) - Number(b?.serverSeq || 0));
-        });
-
-        for (const rawEnv of list) {
-          if (ingestCloudEnvelopeIntoHub(rawEnv)) {
-            newlyPulledEnvelopes.push(rawEnv);
-          }
-          if (typeof rawEnv?.serverSeq === 'number' && rawEnv.serverSeq > maxSeq) {
-            maxSeq = rawEnv.serverSeq;
-          }
-        }
-
-        if (typeof pullRes.json.server_seq === 'number' && pullRes.json.server_seq > maxSeq) {
-          maxSeq = pullRes.json.server_seq;
-        }
-        cursor = pullRes.json.hasMore && pullRes.json.nextCursor !== undefined && pullRes.json.nextCursor !== null
-          ? Number(pullRes.json.nextCursor)
-          : null;
-        page++;
-      }
-
-      if (maxSeq > lastAppsScriptServerSeq) {
-        lastAppsScriptServerSeq = maxSeq;
-      }
-    } catch (pullErr) {
-      console.warn('[Edge-to-Cloud] Apps Script pull_catchup notice:', pullErr.message);
+    // Only advance timestamp when pull succeeded so failed initial pulls never clip history
+    if (pullSucceeded) {
+      lastCloudSyncTimestamp = Date.now();
     }
-
-    lastCloudSyncTimestamp = Date.now();
     scheduleSave();
 
     // STEP C: Downstream broadcast canonical envelopes to connected PWAs
     if (newlyPulledEnvelopes.length > 0) {
-      console.log(`[Edge-to-Cloud] 📡 Broadcasting ${newlyPulledEnvelopes.length} Apps Script envelope(s) to connected terminals...`);
+      console.log(`[Edge-to-Cloud] 📡 Broadcasting ${newlyPulledEnvelopes.length} cloud envelope(s) to connected terminals...`);
       const broadcastStr = JSON.stringify({
         type: 'HUB_CLOUD_BROADCAST',
         action: 'HUB_CLOUD_BROADCAST',
@@ -7327,11 +7973,16 @@ async function syncEdgeToCloudSupabase() {
   }
 }
 
-// Edge-to-Cloud Sync: Every 10 minutes (and 10s after startup)
+// Edge-to-Cloud Sync: Cloud-driven dynamic interval (default 5m, 10s after startup)
+function restartCloudSyncTimer() {
+  if (cloudSyncIntervalHandle) clearInterval(cloudSyncIntervalHandle);
+  const intervalMs = Number(hubRuntimePolicy.syncIntervalMs) || 5 * 60 * 1000;
+  cloudSyncIntervalHandle = setInterval(() => {
+    syncEdgeToCloudSupabase();
+  }, intervalMs);
+}
 setTimeout(() => { syncEdgeToCloudSupabase(); }, 10000);
-const CLOUD_SYNC_INTERVAL_MS = 10 * 60 * 1000;
-setInterval(() => {
-  syncEdgeToCloudSupabase();
-}, CLOUD_SYNC_INTERVAL_MS);
+restartCloudSyncTimer();
+
 
 

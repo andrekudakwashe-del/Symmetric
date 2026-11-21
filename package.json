@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
+    "start": "node server.ts",
     "build": "vite build",
     "lint": "tsc --noEmit",
     "preview": "vite preview"
@@ -19,6 +20,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^2.15.1",
+    "ws": "^8.23.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {

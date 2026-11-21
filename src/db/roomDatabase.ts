@@ -160,6 +160,8 @@ import {
   verifyPinHash,
   isSha256Hash,
   sanitizeUserForExport,
+  sha256Hex,
+  timingSafeEqualHex,
 } from '../utils/pinCrypto';
 
 export {
@@ -3418,6 +3420,15 @@ export const verifySalespersonPin = (
       return false;
     }
 
+    // Secure path for unsalted SHA-256 pin_hash synced from Master Sheet signup before local salt migration
+    if (user.pin_hash && !user.pin_salt && isSha256Hash(user.pin_hash)) {
+      const normalizedStored = String(user.pin_hash).trim().toLowerCase();
+      if (timingSafeEqualHex(sha256Hex(cleanInput), normalizedStored)) {
+        return true;
+      }
+      return false;
+    }
+
     // Fallback for unmigrated legacy user with plain pin
     if (user.pin) {
       const cleanExpected = String(user.pin).trim();
@@ -3692,12 +3703,16 @@ export const addCustomer = (
 
   if (!options?.fromSync) {
     enqueueSync('Customers', 'INSERT', {
+      ...created,
+      id: created.customerId,
+      customerId: created.customerId,
       company_id: compId,
       branch_id: brId,
       CustomerID: created.customerId,
       Name: created.name,
-      Phone: created.phone,
-      Address: created.address,
+      CustomerName: created.name,
+      Phone: created.phone || '',
+      Address: created.address || '',
       CreatedDate: created.createdDate,
       CreatedBy: created.createdBy,
     });
@@ -7213,8 +7228,12 @@ export const addCustomerChange = (
 
   if (!options?.fromSync) {
     enqueueSync('CustomerChange', 'INSERT', {
+      ...created,
+      id: created.id,
+      changeId: created.id,
       company_id: compId,
       branch_id: brId,
+      ChangeID: created.id,
       Timestamp: created.timestamp,
       Date: created.date,
       StaffID: created.staffId,
@@ -7482,8 +7501,12 @@ export const saveDailyCustomerChangeSheet = (
     }
 
     enqueueSync('CustomerChange', 'INSERT', {
+      ...newEntry,
+      id: newEntry.id,
+      changeId: newEntry.id,
       company_id: currentCompany,
       branch_id: currentBranch,
+      ChangeID: newEntry.id,
       Timestamp: newEntry.timestamp,
       Date: newEntry.date,
       StaffID: newEntry.staffId,
@@ -7593,6 +7616,9 @@ export const addCreditSale = (
   if (!options?.fromSync && !(entry as any).fromMesh) {
     console.log(`[Row10] Direct enqueue: CreditSales ${created.id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('CreditSales', 'INSERT', {
+      ...created,
+      id: created.id,
+      creditId: created.id,
       company_id: compId,
       branch_id: brId,
       Timestamp: created.timestamp,
@@ -8271,6 +8297,9 @@ export const saveDailyCreditSalesSheet = (
     }
 
     enqueueSync('CreditSales', 'INSERT', {
+      ...newEntry,
+      id: newEntry.id,
+      creditId: newEntry.id,
       company_id: currentCompany,
       branch_id: currentBranch,
       Timestamp: newEntry.timestamp,
@@ -10230,19 +10259,32 @@ export const addSale = (
     }
   }
 
-  // Save to Sheet "Sales"
+  // Save full canonical SaleInvoice to Sheet "Sales" (camelCase + legacy PascalCase aliases)
+  const saleTotalQty = Array.isArray(created.items)
+    ? created.items.reduce((sum, it) => sum + (Number(it.quantity) || 0), 0)
+    : Number((created as any).totalQty || 0);
   enqueueSync('Sales', 'INSERT', {
+    ...created,
+    id: created.id,
     company_id: created.company_id,
     branch_id: created.branch_id,
+    totalQty: saleTotalQty,
+    Date: created.date,
     Timestamp: created.timestamp,
+    Time: (created as any).time || '',
     InvoiceID: created.id,
     CustomerID: created.customerId,
     CustomerName: created.customerName,
     ItemsSummary: created.itemsSummary,
+    TotalQty: saleTotalQty,
     Subtotal: created.subtotal,
     Discount: created.discount,
     Total: created.total,
+    AmountTendered: (created as any).amountTendered ?? created.total,
+    ChangeGiven: (created as any).changeGiven ?? 0,
     PaymentMethod: created.paymentMethod,
+    Currency: created.currency || 'USD',
+    ExchangeRate: created.exchangeRate || 1,
     StaffID: created.staffId,
     StaffName: created.staffName,
     Status: created.status,
@@ -11518,6 +11560,8 @@ export const addExpense = (
   if (!options?.fromSync && !expenseData.fromMesh) {
     console.log(`[Row10] Direct enqueue: Expenses ${created.id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('Expenses', 'INSERT', {
+      ...created,
+      id: created.id,
       company_id: compId,
       branch_id: brId,
       Timestamp: created.timestamp,
@@ -11763,42 +11807,54 @@ export const getReconciliations = (): ShiftReconciliation[] => {
   return getAllReconciliations();
 };
 
-export const saveReconciliation = (recData: Omit<ShiftReconciliation, 'id' | 'synced' | 'timestamp'> & { id?: string }): ShiftReconciliation => {
+export const saveReconciliation = (
+  recData: Omit<ShiftReconciliation, 'id' | 'synced' | 'timestamp'> & { id?: string; timestamp?: string },
+  options?: { fromSync?: boolean }
+): ShiftReconciliation => {
   const list = getRawStoredReconciliations();
   const compId = (recData as any).company_id || (recData as any).companyId || getCurrentCompanyId();
   const brId = (recData as any).branch_id || (recData as any).branchId || getCurrentBranchId();
+  const recId = recData.id || `REC-${Date.now()}`;
   const created: ShiftReconciliation = {
     ...recData,
-    id: recData.id || `REC-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    synced: false,
+    id: recId,
+    timestamp: recData.timestamp || new Date().toISOString(),
+    synced: Boolean(options?.fromSync),
     company_id: compId,
     companyId: compId,
     branch_id: brId,
     branchId: brId,
   } as any;
-  const updated = [created, ...list];
+  const existingIdx = list.findIndex((r) => r.id === recId);
+  const updated = existingIdx >= 0
+    ? list.map((r, idx) => (idx === existingIdx ? { ...r, ...created } : r))
+    : [created, ...list];
   setStored(STORAGE_KEYS.RECONCILIATIONS, updated);
 
-  // Save to Sheet "Reconciliations"
-  enqueueSync('Reconciliations', 'INSERT', {
-    company_id: compId,
-    branch_id: brId,
-    Timestamp: created.timestamp,
-    Date: created.date,
-    StaffID: created.staffId,
-    StaffName: created.staffName,
-    OpeningFloat: created.openingFloat,
-    CashSales: created.cashSales,
-    OtherCashIn: created.otherCashIn,
-    CashExpenses: created.cashExpenses,
-    BankDrops: created.bankDrops,
-    ExpectedCash: created.expectedCash,
-    ActualCashCount: created.actualCashCount,
-    Variance: created.variance,
-    Status: created.status,
-    Notes: created.notes,
-  });
+  // Save to Sheet "Reconciliations" (skip echo when hydrated from cloud/mesh)
+  if (!options?.fromSync) {
+    enqueueSync('Reconciliations', 'INSERT', {
+      ...created,
+      id: created.id,
+      ReconID: created.id,
+      company_id: compId,
+      branch_id: brId,
+      Timestamp: created.timestamp,
+      Date: created.date,
+      StaffID: created.staffId,
+      StaffName: created.staffName,
+      OpeningFloat: created.openingFloat,
+      CashSales: created.cashSales,
+      OtherCashIn: created.otherCashIn,
+      CashExpenses: created.cashExpenses,
+      BankDrops: created.bankDrops,
+      ExpectedCash: created.expectedCash,
+      ActualCashCount: created.actualCashCount,
+      Variance: created.variance,
+      Status: created.status,
+      Notes: created.notes,
+    });
+  }
 
   return created;
 };
@@ -12765,7 +12821,25 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
         target_branch_id,
         branchCode: activeBr?.code || 'HQ-01',
         entityType: resolveEntityType(sheetName as string),
-        recordId: String(payload.id || payload.itemId || payload.grvNumber || payload.invoiceNumber || newItem.id),
+        recordId: String(
+          payload.id ||
+            payload.itemId ||
+            payload.ItemID ||
+            payload.ProductID ||
+            payload.InvoiceID ||
+            payload.ExpenseID ||
+            payload.customerId ||
+            payload.CustomerID ||
+            payload.CreditID ||
+            payload.ChangeID ||
+            payload.GRNID ||
+            payload.grvNumber ||
+            payload.supplierId ||
+            payload.SupplierID ||
+            payload.voucherId ||
+            payload.invoiceNumber ||
+            newItem.id
+        ),
         payload: enhancedPayload,
         timestamp: newItem.timestamp,
         clientRequestId,
@@ -14374,10 +14448,16 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
     console.warn('Sync products error:', e);
   }
 
-  // 1. Enqueue write to Google Sheets for InventoryMaster tab
+  // 1. Enqueue full canonical InventoryItem write to Google Sheets for InventoryMaster tab
   try {
     enqueueSync('InventoryMaster' as SheetName, 'INSERT', {
+      ...normalized,
+      id: normalized.itemId,
+      itemId: normalized.itemId,
+      costPriceUnit: normalized.costPerUnit,
+      costPriceCase: normalized.costPerCase,
       ItemID: normalized.itemId,
+      ProductID: normalized.itemId,
       CompanyID: normalized.company_id,
       BranchID: normalized.branch_id,
       ItemName: normalized.itemName,
@@ -14385,6 +14465,8 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
       CostPerCase: normalized.costPerCase,
       CostPerUnit: normalized.costPerUnit,
       SellingPrice: normalized.sellPriceUnit,
+      SellPriceUnit: normalized.sellPriceUnit,
+      SellPriceCase: normalized.sellPriceCase,
       StockCases: normalized.stockCases,
       StockSingles: normalized.stockSingles,
       TotalUnits: normalized.totalUnits,
@@ -15075,6 +15157,174 @@ export function resolveEntityType(sheetName: string): DatabaseEntityType {
       return 'setting';
     default:
       return 'other';
+  }
+}
+
+/**
+ * Maps any sheet name or legacy entity alias to its exact canonical ENTITY_REGISTRY / Code.gs ENTITY_TO_TAB key.
+ * Prevents offline-queued operational records (InventoryMaster, Expenses, CustomerChange, CreditSales,
+ * Direct_GRV, GoodsReceived, StockMovements, CashLifts, CashAccounts, CashTransfers, etc.) from
+ * falling back to 'audit_log'.
+ */
+export function resolveCanonicalEntityType(sheetOrType: string): string {
+  const raw = String(sheetOrType || '').trim();
+  if (!raw) return 'audit_log';
+  const lower = raw.toLowerCase();
+
+  switch (lower) {
+    case 'sales':
+    case 'sale':
+      return 'sale';
+    case 'inventorymaster':
+    case 'inventory':
+    case 'inventory_item':
+    case 'products':
+      return 'inventory_item';
+    case 'branches':
+    case 'branch':
+      return 'branch';
+    case 'salespeople':
+    case 'users':
+    case 'staff':
+      return 'staff';
+    case 'customers':
+    case 'customer':
+      return 'customer';
+    case 'customerchange':
+    case 'customer_change':
+      return 'customer_change';
+    case 'creditsales':
+    case 'credit_sale':
+      return 'credit_sale';
+    case 'creditgroups':
+    case 'credit_group':
+      return 'credit_group';
+    case 'cashlog':
+    case 'cash_log':
+      return 'cash_log';
+    case 'cashlifts':
+    case 'cash_lift':
+      return 'cash_lift';
+    case 'cashmovements':
+    case 'cash_movement':
+      return 'cash_movement';
+    case 'cashaccounts':
+    case 'cash_account':
+      return 'cash_account';
+    case 'cashtransfers':
+    case 'cash_transfer':
+      return 'cash_transfer';
+    case 'wallets':
+    case 'wallet':
+      return 'wallet';
+    case 'direct_grv':
+    case 'directgrvs':
+    case 'direct_grvs':
+    case 'direct_grv_vouchers':
+      return 'direct_grv';
+    case 'goodsreceived':
+    case 'goods_received':
+    case 'grn':
+      return 'goods_received';
+    case 'stockmovements':
+    case 'stockmovement':
+    case 'stock_movement':
+      return 'stock_movement';
+    case 'expenses':
+    case 'expense':
+      return 'expense';
+    case 'internalconsumption':
+    case 'internal_consumption':
+      return 'internal_consumption';
+    case 'reconciliations':
+    case 'reconciliation':
+    case 'eod':
+      return 'reconciliation';
+    case 'businessdayclosures':
+    case 'business_day_closure':
+    case 'closures':
+    case 'closure':
+      return 'business_day_closure';
+    case 'electronicsettlements':
+    case 'electronic_settlement':
+    case 'settlements':
+    case 'settlement':
+      return 'electronic_settlement';
+    case 'cashcounts':
+    case 'cash_count':
+      return 'cash_count';
+    case 'adminsales':
+    case 'admin_sales':
+      return 'admin_sales';
+    case 'suppliers':
+    case 'supplier':
+      return 'supplier';
+    case 'supplierinvoices':
+    case 'supplier_invoice_voucher':
+    case 'vouchers':
+    case 'voucher':
+      return 'supplier_invoice_voucher';
+    case 'categories':
+    case 'inventory_category':
+    case 'category':
+      return 'inventory_category';
+    case 'stocktakesessions':
+    case 'stocktake_session':
+      return 'stocktake_session';
+    case 'stocktakesegments':
+    case 'stocktake_segment':
+      return 'stocktake_segment';
+    case 'stocktakezoneassignments':
+    case 'stocktake_zone_assignment':
+      return 'stocktake_zone_assignment';
+    case 'stocktakezoneclaims':
+    case 'stocktake_zone_claim':
+      return 'stocktake_zone_claim';
+    case 'stocktakeblindvault':
+    case 'stocktake_count_submission':
+      return 'stocktake_count_submission';
+    case 'stocktakejointproposals':
+    case 'stocktake_joint_proposal':
+      return 'stocktake_joint_proposal';
+    case 'stocktakejointfinalized':
+    case 'stocktake_joint_finalized':
+      return 'stocktake_joint_finalized';
+    case 'stocktakeunlocklog':
+    case 'stocktake_segment_unlock':
+      return 'stocktake_segment_unlock';
+    case 'casualworkers':
+    case 'casual_worker':
+      return 'casual_worker';
+    case 'branchlockdowns':
+    case 'branch_lockdown':
+      return 'branch_lockdown';
+    case 'sheets_config':
+    case 'sheetsconfig':
+      return 'sheets_config';
+    case 'settings':
+    case 'systemsettings':
+    case 'system_settings':
+    case 'setting':
+      return 'system_settings';
+    case 'multicurrency':
+    case 'multi_currency':
+      return 'multi_currency';
+    case 'permissionsmatrix':
+    case 'permissions_matrix':
+      return 'permissions_matrix';
+    case 'roleconfigs':
+    case 'role_configs':
+      return 'role_configs';
+    case 'tombstones':
+    case 'tombstone':
+      return 'tombstone';
+    case 'supervisor_approval':
+      return 'supervisor_approval';
+    case 'audit_log':
+    case 'auditlog':
+      return 'audit_log';
+    default:
+      return lower;
   }
 }
 
@@ -18204,10 +18454,13 @@ export const addGoodsReceived = (
   if (!options?.fromSync && !(entry as any).fromMesh) {
     console.log(`[Row10] Direct enqueue: GoodsReceived ${normalized.grnId || normalized.id} (fromSync=${options?.fromSync ?? false})`);
     enqueueSync('GoodsReceived', 'INSERT', {
+      ...normalized,
+      id: normalized.id || normalized.grnId,
+      grnId: normalized.grnId || normalized.id,
       company_id: compId,
       branch_id: brId,
       Timestamp: normalized.timestamp,
-      GRNID: normalized.grnId,
+      GRNID: normalized.grnId || normalized.id,
       InvoiceNo: normalized.invoiceNo,
       Date: normalized.date,
       Supplier: normalized.supplier,
@@ -23316,19 +23569,35 @@ export const logEmergencyLockdownSale = (params: {
 // ============================================================================
 
 function sanitizeCompanyRecord_(company: Company): Company {
+  const safeCompanyId = String(company?.company_id ?? '').trim();
+  const safeCompanyName = String(company?.company_name ?? '').trim();
+  const safeOwnerEmail = String(company?.owner_email ?? '').trim();
+  const safeOwnerName = String(company?.owner_name ?? '').trim();
+  const safePhone = company?.phone !== undefined && company?.phone !== null ? String(company.phone) : '';
+  const safeCategory =
+    company?.business_category !== undefined && company?.business_category !== null
+      ? String(company.business_category)
+      : '';
+  const safeActivationCode =
+    company?.offline_activation_code !== undefined && company?.offline_activation_code !== null
+      ? String(company.offline_activation_code)
+      : undefined;
+
   const cfg = getStored<Partial<GoogleSheetsConfig>>(STORAGE_KEYS.SHEETS_CONFIG, {});
   const masterId = cfg.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
-  const safeSheetId = sanitizeTenantSheetId(company.company_id, company.sheet_id, masterId);
-  const safeFolderId = isMasterSpreadsheetId(company.sheet_folder_id, masterId)
+  const safeSheetId = sanitizeTenantSheetId(safeCompanyId, company?.sheet_id !== undefined && company?.sheet_id !== null ? String(company.sheet_id) : undefined, masterId);
+  const rawFolderId = company?.sheet_folder_id !== undefined && company?.sheet_folder_id !== null ? String(company.sheet_folder_id) : '';
+  const safeFolderId = isMasterSpreadsheetId(rawFolderId, masterId)
     ? ''
-    : (company.sheet_folder_id || '');
-  const safeWebhookUrl = isDeprecatedLegacyWebhookUrl(company.webhook_url)
+    : rawFolderId;
+  const rawWebhookUrl = company?.webhook_url !== undefined && company?.webhook_url !== null ? String(company.webhook_url) : undefined;
+  const safeWebhookUrl = isDeprecatedLegacyWebhookUrl(rawWebhookUrl)
     ? DEFAULT_MASTER_WEBHOOK_URL
-    : company.webhook_url;
+    : rawWebhookUrl;
   let safeBackendConfig = company.backend_config;
   if (safeBackendConfig && safeBackendConfig.sheets) {
     const safeCfgSheetId = sanitizeTenantSheetId(
-      company.company_id,
+      safeCompanyId,
       safeBackendConfig.sheets.spreadsheetId,
       masterId
     );
@@ -23360,6 +23629,13 @@ function sanitizeCompanyRecord_(company: Company): Company {
     }
   }
   if (
+    safeCompanyId === company.company_id &&
+    safeCompanyName === company.company_name &&
+    safeOwnerEmail === company.owner_email &&
+    safeOwnerName === company.owner_name &&
+    safePhone === company.phone &&
+    safeCategory === company.business_category &&
+    safeActivationCode === company.offline_activation_code &&
     safeSheetId === company.sheet_id &&
     safeFolderId === (company.sheet_folder_id || '') &&
     safeWebhookUrl === company.webhook_url &&
@@ -23369,6 +23645,13 @@ function sanitizeCompanyRecord_(company: Company): Company {
   }
   return {
     ...company,
+    company_id: safeCompanyId,
+    company_name: safeCompanyName,
+    owner_email: safeOwnerEmail,
+    owner_name: safeOwnerName,
+    phone: safePhone,
+    business_category: safeCategory,
+    ...(safeActivationCode !== undefined ? { offline_activation_code: safeActivationCode } : {}),
     sheet_id: safeSheetId,
     sheet_folder_id: safeFolderId,
     ...(safeWebhookUrl !== undefined ? { webhook_url: safeWebhookUrl } : {}),

@@ -195,7 +195,7 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
     const count = branches.length + 1;
     setFormCode(`BR-0${count}`);
     setFormAddress('');
-    setFormSheetId(`POS_${company.company_name.replace(/\s+/g, '_')}_Branch${count}_2026.xlsx`);
+    setFormSheetId(`POS_${String(company.company_name || company.company_id || 'Company').replace(/\s+/g, '_')}_Branch${count}_2026.xlsx`);
     setFormManagerId(staffList[0]?.id || '');
     setFormIsActive(true);
     setFormError('');

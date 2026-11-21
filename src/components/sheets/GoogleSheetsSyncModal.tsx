@@ -1570,15 +1570,29 @@ export const GoogleSheetsSyncModal: React.FC<GoogleSheetsSyncModalProps> = ({
                   </div>
 
                   <div className="flex flex-wrap items-center gap-2">
-                    <a
-                      href="/api/download/code-gs"
-                      download="Code.gs"
-                      className="py-1.5 px-3 rounded-xl bg-indigo-950 hover:bg-indigo-900 border border-indigo-800 text-indigo-200 text-xs font-bold flex items-center space-x-1 transition"
-                      title="Download the full 4,500-line Code.gs file"
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const code =
+                          scriptType === 'tenant-dedicated'
+                            ? generateTenantDedicatedAppsScriptCode(currentComp.company_id)
+                            : generateAppsScriptCode();
+                        const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = 'Code.gs';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                      }}
+                      className="py-1.5 px-3 rounded-xl bg-indigo-950 hover:bg-indigo-900 border border-indigo-800 text-indigo-200 text-xs font-bold flex items-center space-x-1 transition cursor-pointer"
+                      title="Download the complete verified Code.gs file"
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>Download Code.gs</span>
-                    </a>
+                    </button>
                     <div className="flex bg-slate-900 p-0.5 rounded-xl border border-slate-800 text-xs">
                       <button
                         type="button"

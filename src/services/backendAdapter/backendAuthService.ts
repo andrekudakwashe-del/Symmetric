@@ -152,13 +152,21 @@ export class BackendAuthService {
               active: 'Y',
             },
           };
+        } else if ((data.status === 'error' || data.success === false) && data.cloudChecked !== false) {
+          return {
+            status: 'error',
+            success: false,
+            authProvider: 'sheets_appscript',
+            authModeUsed: 'hybrid',
+            message: data.message || 'Invalid email or password. Please verify your credentials.',
+          };
         }
       }
     } catch (e) {
       // Fallback to Apps Script direct
     }
 
-    // Fall back to Google Apps Script owner auth
+    // Fall back to Google Apps Script owner auth (standalone static PWA / Vercel where /api/* is 404)
     try {
       const appsScriptRes = await authenticateOwnerWithAppsScript(cleanEmail, passwordOrPin);
       const resolvedGasCompId = String(

@@ -22,8 +22,8 @@ import {
   UserCheck,
 } from 'lucide-react';
 import {
-  restoreEncryptedBackup,
   restoreDatabaseFromPayload,
+  extractEnvelopesFromBackupPayload,
   RestoreResult,
   BackupPayload,
 } from '../../services/databaseBackupService';
@@ -50,6 +50,8 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
   const [restoreMode, setRestoreMode] = useState<'replace' | 'append' | 'master_only'>(defaultMode);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [isTamperedError, setIsTamperedError] = useState<boolean>(false);
+  const [hmacVerified, setHmacVerified] = useState<boolean>(false);
   const [decryptedPayload, setDecryptedPayload] = useState<BackupPayload | null>(null);
   const [successResult, setSuccessResult] = useState<RestoreResult | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
@@ -69,6 +71,8 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setErrorMsg(null);
+    setIsTamperedError(false);
+    setHmacVerified(false);
     setSuccessResult(null);
     setDecryptedPayload(null);
     setRestoreProgress(null);
@@ -97,14 +101,10 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
       setUploadProgress(100);
       setFileContent(text);
 
-      // Check if file is already an unencrypted JSON backup
+      // Detect unencrypted JSON backup (v3 SyncEnvelope[] payload, raw SyncEnvelope[], or legacy v2)
       try {
         const parsed = JSON.parse(text);
-        if (parsed && parsed.manifest && parsed.tables) {
-          setIsUnencrypted(true);
-        } else {
-          setIsUnencrypted(false);
-        }
+        setIsUnencrypted(backupCryptoService.isUnencryptedBackupObject(parsed));
       } catch {
         setIsUnencrypted(false);
       }
@@ -131,20 +131,35 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
 
     setIsProcessing(true);
     setErrorMsg(null);
+    setIsTamperedError(false);
 
     try {
       const decResult = await backupCryptoService.decryptBackupPayload(fileContent, password || 'default');
       if (!decResult.success || !decResult.data) {
+        setIsTamperedError(Boolean(decResult.tampered));
         setErrorMsg(decResult.error || 'Decryption failed. Please verify your password.');
         setIsProcessing(false);
         return;
       }
 
-      setDecryptedPayload(decResult.data);
-      const manifest = decResult.data.manifest;
+      // Normalize raw SyncEnvelope[] array into a BackupPayload for uniform UI inspection
+      const normalized = Array.isArray(decResult.data)
+        ? (() => {
+            const extracted = extractEnvelopesFromBackupPayload(decResult.data);
+            return {
+              manifest: extracted.manifest,
+              envelopes: extracted.envelopes,
+              metadata: extracted.metadata,
+            } as BackupPayload;
+          })()
+        : (decResult.data as BackupPayload);
+
+      setHmacVerified(Boolean(decResult.hmacVerified));
+      setDecryptedPayload(normalized);
+      const manifest = normalized.manifest;
 
       // Auto-set optimal restore mode
-      if (manifest.backupType === 'ADMIN_MASTER_UPDATE' || manifest.isMasterOnly) {
+      if (manifest.isMasterOnly) {
         setRestoreMode('master_only');
       } else if (manifest.backupType === 'EOD_HANDOVER') {
         setRestoreMode('append');
@@ -226,19 +241,56 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
         {/* Success State */}
         {successResult ? (
           <div className="space-y-4 py-2">
-            <div className="p-4 rounded-2xl bg-emerald-950/80 border border-emerald-600/60 text-emerald-200 text-xs space-y-2">
+            <div className="p-4 rounded-2xl bg-emerald-950/80 border border-emerald-600/60 text-emerald-200 text-xs space-y-2.5">
               <div className="flex items-center gap-2 font-bold text-sm text-emerald-300">
                 <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                <span>Database Restored Successfully!</span>
+                <span>Hexagonal Sync Import Complete!</span>
               </div>
               <p>{successResult.message}</p>
-              <div className="font-mono text-[11px] pt-1 border-t border-emerald-800/60 flex justify-between text-emerald-400">
-                <span>Backup Type: {successResult.backupType}</span>
-                <span>Records: {successResult.recordsProcessed}</span>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 font-mono text-[11px]">
+                <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                  <span className="text-slate-400 block text-[10px]">New T1 Events</span>
+                  <strong className="text-emerald-300">{successResult.t1Accepted ?? 0}</strong>
+                </div>
+                <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                  <span className="text-slate-400 block text-[10px]">Duplicate T1 Skipped</span>
+                  <strong className="text-slate-200">{successResult.t1Deduped ?? 0}</strong>
+                </div>
+                <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                  <span className="text-slate-400 block text-[10px]">T2 Config Updated</span>
+                  <strong className="text-indigo-300">{successResult.t2Accepted ?? 0}</strong>
+                </div>
+                <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                  <span className="text-slate-400 block text-[10px]">Stale T2 Rejected</span>
+                  <strong className="text-amber-300">{successResult.t2StaleRejected ?? 0}</strong>
+                </div>
+                <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                  <span className="text-slate-400 block text-[10px]">Balances Protected</span>
+                  <strong className="text-emerald-300">{successResult.balancesProtected ?? 0}</strong>
+                </div>
+                <div className="bg-slate-900/70 p-2 rounded-xl border border-emerald-800/50">
+                  <span className="text-slate-400 block text-[10px]">Queued for Hub/Cloud</span>
+                  <strong className="text-cyan-300">{successResult.queuedForHubSync ?? 0}</strong>
+                </div>
               </div>
+
+              {(successResult.selfOriginSkipped ?? 0) > 0 && (
+                <div className="text-[10px] text-amber-200 bg-amber-950/60 border border-amber-600/40 p-2 rounded-xl">
+                  Skipped {successResult.selfOriginSkipped} envelope(s) that originated from this same device.
+                </div>
+              )}
+
+              {(hmacVerified || successResult.hmacVerified) && (
+                <div className="text-[10px] text-emerald-300 bg-emerald-900/50 p-2 rounded-xl flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>HMAC-SHA256 Verified Authentic • Routed via SyncCore.ingestBatch()</span>
+                </div>
+              )}
+
               {successResult.protectedTablesPreserved !== undefined && successResult.protectedTablesPreserved > 0 && (
                 <div className="text-[10px] text-emerald-300 bg-emerald-900/60 p-2 rounded-xl mt-1">
-                  🛡️ <strong>Safety Shield Confirmed:</strong> Branch counter sales, till cash logs, and customer debt ledger were 100% protected and remained untouched.
+                  <strong>Safety Shield Confirmed:</strong> Branch counter sales, till cash logs, and customer debt ledger were 100% protected and remained untouched.
                 </div>
               )}
             </div>
@@ -340,6 +392,33 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
               </div>
             )}
 
+            {/* HMAC & Hexagonal Sync Integrity Banner */}
+            <div className="p-3 rounded-2xl bg-slate-950 border border-emerald-500/40 text-xs space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-emerald-300 flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                  <span>{hmacVerified ? 'HMAC-SHA256 Verified (Unmodified)' : 'Legacy Backup Format (Auto-Upgraded to SyncCore)'}</span>
+                </span>
+                <span className="font-mono text-[10px] text-indigo-300">
+                  {manifest.format === 'HEXAGONAL_SYNC_ENVELOPE' ? 'v3 SyncEnvelopes' : 'v2 Legacy'}
+                </span>
+              </div>
+              <div className="font-mono text-[11px] text-slate-400 flex flex-wrap gap-x-3 gap-y-0.5">
+                {manifest.t1Count !== undefined && (
+                  <span>T1 Ledger: <strong className="text-emerald-300">{manifest.t1Count}</strong></span>
+                )}
+                {manifest.t2Count !== undefined && (
+                  <span>T2 Config: <strong className="text-indigo-300">{manifest.t2Count}</strong></span>
+                )}
+                {manifest.dateRange && (
+                  <span>Range: <strong className="text-white">{manifest.dateRange.startDate} → {manifest.dateRange.endDate}</strong></span>
+                )}
+              </div>
+              <p className="text-[10px] text-slate-400 leading-relaxed">
+                Golden Rule Active: Existing stock, customer debt, supplier, cash account, and wallet balances will NOT be overwritten — only metadata updates (5000ms LWW) and new T1 ledger events apply.
+              </p>
+            </div>
+
             {/* General Manifest Details */}
             {!handover && !isMasterOnly && (
               <div className="p-3 bg-slate-950 rounded-2xl border border-slate-800 text-xs space-y-1.5 font-mono">
@@ -352,7 +431,7 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
                   <span className="text-white">{safeDateSlice(manifest.timestamp, 0, 19).replace('T', ' ')}</span>
                 </div>
                 <div className="flex justify-between text-slate-400">
-                  <span>Total Records:</span>
+                  <span>Total Envelopes:</span>
                   <span className="text-white font-bold">{manifest.totalRecords}</span>
                 </div>
               </div>
@@ -482,9 +561,22 @@ export const DatabaseRestoreModal: React.FC<DatabaseRestoreModalProps> = ({
           /* Step 1: Upload & Password Entry Form */
           <div className="space-y-4">
             {errorMsg && (
-              <div className="p-3.5 rounded-xl bg-rose-950/80 border border-rose-600/60 text-rose-200 text-xs flex items-center gap-2.5">
-                <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                <span>{errorMsg}</span>
+              <div
+                className={`p-3.5 rounded-xl border text-xs flex items-start gap-2.5 ${
+                  isTamperedError
+                    ? 'bg-red-950/90 border-red-500 text-red-100 shadow-lg shadow-red-950/40'
+                    : 'bg-rose-950/80 border-rose-600/60 text-rose-200'
+                }`}
+              >
+                <AlertTriangle className={`w-4 h-4 shrink-0 mt-0.5 ${isTamperedError ? 'text-red-400' : 'text-rose-400'}`} />
+                <div className="space-y-1">
+                  {isTamperedError && (
+                    <strong className="block text-red-300 uppercase tracking-wide text-[11px]">
+                      Security Alert — Tampered File Rejected
+                    </strong>
+                  )}
+                  <span>{errorMsg}</span>
+                </div>
               </div>
             )}
 

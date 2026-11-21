@@ -20,7 +20,7 @@ import {
   isOfflineModeForced,
   markRecordsCloudSynced,
   parseTimestampMs,
-  resolveEntityType,
+  resolveCanonicalEntityType,
   resolveConflictingLocalStocktakeSession,
   annotateSaleCloudReceiptMetadata,
   DEFAULT_MASTER_WEBHOOK_URL,
@@ -98,6 +98,83 @@ const ENTITY_TO_SHEET: Record<string, string> = {
   sheets_config: 'SheetsConfig',
   tombstone: 'Tombstones',
 };
+
+function extractCanonicalEntityId(entityType: string, p: Record<string, any>, fallbackId: string): string {
+  const pick = (...vals: any[]): string => {
+    for (const v of vals) {
+      if (v !== undefined && v !== null && String(v).trim() !== '') {
+        return String(v).trim();
+      }
+    }
+    return '';
+  };
+
+  switch (entityType) {
+    case 'inventory_item':
+      return pick(p.itemId, p.ItemID, p.ProductID, p.productId, p.id, fallbackId);
+    case 'sale':
+      return pick(p.InvoiceID, p.invoice_id, p.invoiceId, p.id, fallbackId);
+    case 'customer':
+      return pick(p.customerId, p.CustomerID, p.id, fallbackId);
+    case 'customer_change':
+      return pick(p.changeId, p.ChangeID, p.id, p.Reference, p.reference, fallbackId);
+    case 'credit_sale':
+      return pick(p.creditId, p.CreditID, p.id, fallbackId);
+    case 'credit_group':
+      return pick(p.groupId, p.GroupID, p.id, fallbackId);
+    case 'expense':
+      return pick(p.ExpenseID, p.expenseId, p.id, fallbackId);
+    case 'cash_log':
+      return pick(p.LogID, p.logId, p.id, fallbackId);
+    case 'cash_lift':
+      return pick(p.LiftID, p.liftId, p.id, fallbackId);
+    case 'cash_movement':
+      return pick(p.MovementID, p.movementId, p.id, fallbackId);
+    case 'cash_account':
+      return pick(p.account_id, p.AccountID, p.accountId, p.id, fallbackId);
+    case 'cash_transfer':
+      return pick(p.transfer_id, p.TransferID, p.transferId, p.id, fallbackId);
+    case 'direct_grv':
+      return pick(p.grvNumber, p.GRVNumber, p.GRVID, p.id, fallbackId);
+    case 'goods_received':
+      return pick(p.grnId, p.GRNID, p.id, p.reference, fallbackId);
+    case 'stock_movement':
+      return pick(p.movementId, p.txnId, p.MovementID, p.id, fallbackId);
+    case 'reconciliation':
+      return pick(p.ReconID, p.reconId, p.id, fallbackId);
+    case 'supplier':
+      return pick(p.supplierId, p.SupplierID, p.id, fallbackId);
+    case 'supplier_invoice_voucher':
+      return pick(p.voucherId, p.VoucherID, p.id, fallbackId);
+    case 'staff':
+      return pick(p.id, p.UserID, p.user_id, p.staffId, fallbackId);
+    case 'branch':
+      return pick(p.branchId, p.BranchID, p.branch_id, p.id, fallbackId);
+    case 'stocktake_session':
+      return pick(p.sessionId, p.SessionID, p.id, fallbackId);
+    default:
+      return pick(
+        p.id,
+        p.entityId,
+        p.itemId,
+        p.ItemID,
+        p.ProductID,
+        p.InvoiceID,
+        p.ExpenseID,
+        p.customerId,
+        p.CustomerID,
+        p.CreditID,
+        p.ChangeID,
+        p.GRNID,
+        p.grvNumber,
+        p.supplierId,
+        p.SupplierID,
+        p.voucherId,
+        p.sessionId,
+        fallbackId
+      );
+  }
+}
 
 export class AppScriptsAdapter implements SyncAdapter {
   readonly name = 'AppScriptsAdapter';
@@ -626,10 +703,9 @@ export class AppScriptsAdapter implements SyncAdapter {
     if (typeof resData?.current_routing_epoch === 'number' && resData.current_routing_epoch > getRoutingEpoch(companyId)) {
       setRoutingEpoch(companyId, resData.current_routing_epoch);
     }
-
-    if (typeof resData?.server_seq === 'number' && resData.server_seq > getCloudCatchupSeq(companyId, branchId)) {
-      setCloudCatchupSeq(companyId, branchId, resData.server_seq);
-    }
+    // IMPORTANT: Never advance cloudCatchupSeq from a push response.
+    // Advancing the pull cursor on push causes a fresh device that pushes a local event
+    // before its first catch-up pull to permanently skip all older cloud products/sales.
 
     const resultsByPacket = new Map<string, any>();
     if (Array.isArray(resData?.results)) {
@@ -927,16 +1003,18 @@ export class AppScriptsAdapter implements SyncAdapter {
     const pulledEnvelopes: SyncEnvelope[] = [];
     let maxSeq = getCloudCatchupSeq(creds.companyId, creds.branchId);
     const storedTs = getLastCloudCatchupTimestamp(creds.companyId, creds.branchId);
-    const isForcedReset = sinceTimestamp === 0;
-    const effectiveSinceSeq = isForcedReset ? 0 : maxSeq;
-    const effectiveSinceTs = isForcedReset
+    // If maxSeq === 0 (fresh device or reset cursor), ALWAYS perform a full catch-up from seq 0 / ts 0
+    // so historical catalog items & sales are never clipped by a rolling 1-hour window.
+    const isInitialOrForcedFullSync = sinceTimestamp === 0 || maxSeq === 0;
+    const effectiveSinceSeq = isInitialOrForcedFullSync ? 0 : maxSeq;
+    const effectiveSinceTs = isInitialOrForcedFullSync
       ? 0
       : Math.max(Number(sinceTimestamp || 0), storedTs || 0);
 
     try {
       let cursor: number | null = 0;
       let page = 0;
-      const MAX_PAGES = 4;
+      const MAX_PAGES = 12;
 
       while (cursor !== null && page < MAX_PAGES) {
         if (!this.canRelayToCloud()) break;
@@ -1054,11 +1132,9 @@ export class AppScriptsAdapter implements SyncAdapter {
         const envelopes: SyncEnvelope[] = [];
         for (const item of chunk) {
           const p = item.payload || {};
-          const rawEntity = String(p.entityType || resolveEntityType(item.sheetName) || 'audit_log');
+          const rawEntity = resolveCanonicalEntityType(String(p.entityType || item.sheetName || 'audit_log'));
           const eType = ENTITY_REGISTRY[rawEntity] ? rawEntity : 'audit_log';
-          const eId = String(
-            p.id || p.itemId || p.InvoiceID || p.customerId || p.grvNumber || p.supplierId || p.sessionId || item.id
-          );
+          const eId = extractCanonicalEntityId(eType, p, item.id);
           updateSyncQueueItem(item.id, { status: 'syncing' });
           const lsMut: MutationSource = p.mutationSource === 'SEED' ? 'SEED' : 'USER_EDIT';
           envelopes.push(
@@ -1164,9 +1240,9 @@ export class AppScriptsAdapter implements SyncAdapter {
         const chunk = operationalPending.slice(j, j + BATCH_SIZE);
         const envelopes: SyncEnvelope[] = chunk.map((item) => {
           const p = item.payload || {};
-          const rawEntity = String(p.entityType || resolveEntityType(item.sheetName || '') || 'audit_log');
+          const rawEntity = resolveCanonicalEntityType(String(p.entityType || item.sheetName || 'audit_log'));
           const eType = ENTITY_REGISTRY[rawEntity] ? rawEntity : 'audit_log';
-          const eId = String(p.id || p.itemId || p.InvoiceID || p.grvNumber || p.sessionId || item.clientRequestId || item.id);
+          const eId = extractCanonicalEntityId(eType, p, item.clientRequestId || item.id);
           const idbMut: MutationSource = p.mutationSource === 'SEED' ? 'SEED' : 'USER_EDIT';
           return this.sanitizeEnvelopeForCloud(
             {

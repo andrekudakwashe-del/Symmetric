@@ -3,6 +3,43 @@ import { ENTITY_REGISTRY, EntitySpec } from './EntityRegistry';
 import { SyncAdapter, BroadcastResult } from './SyncAdapter';
 import { BridgeTombstoneRecord, getTombstonesFromBridge } from './syncIngestBridge';
 
+export interface IngestOptions {
+  /** LWW clock-skew tolerance in ms (default: 60000ms for live mesh; 5000ms for WhatsApp file imports) */
+  lwwToleranceMs?: number;
+  /** Allow ingesting envelopes that originated from this same device (e.g. disaster recovery restore) */
+  allowSelfOrigin?: boolean;
+  /** True when envelopes come from an offline WhatsApp/JSON file import */
+  isFileImport?: boolean;
+}
+
+export interface BatchIngestOptions extends IngestOptions {
+  /** Look up the current local record for T1 dedupe & T2 LWW comparison */
+  lookupExisting?: (envelope: SyncEnvelope) => any | Promise<any>;
+  /** Persist an accepted envelope to local storage / RoomDB */
+  onAcceptedPersist?: (envelope: SyncEnvelope, existingRecord?: any) => void | Promise<void>;
+  /** Chunk progress callback */
+  onProgress?: (progress: {
+    processed: number;
+    total: number;
+    accepted: number;
+    rejected: number;
+    currentEntityType?: string;
+  }) => void;
+}
+
+export interface BatchIngestResult {
+  processed: number;
+  accepted: number;
+  rejected: number;
+  t1Accepted: number;
+  t1Deduped: number;
+  t2Accepted: number;
+  t2StaleRejected: number;
+  resurrectionBlocked: number;
+  selfOriginSkipped: number;
+  reasons: Record<string, number>;
+}
+
 const TOMBSTONE_STORAGE_KEY = 'saimetric_room_deleted_records';
 
 export function normalizeTombstoneEntityType(rawType: string): string {
@@ -226,10 +263,13 @@ export class SyncCore {
   async ingest(
     envelope: SyncEnvelope,
     existingRecord?: any,
-    onAcceptedPersist?: (envelope: SyncEnvelope) => void | Promise<void>
+    onAcceptedPersist?: (envelope: SyncEnvelope, existingRecord?: any) => void | Promise<void>,
+    options?: IngestOptions
   ): Promise<{ accepted: boolean; reason?: string }> {
-    // Lesson 4 (No Re-Broadcast): reject packets from self
-    if (envelope.originDeviceId === this.deviceId) {
+    const lwwToleranceMs = options?.lwwToleranceMs ?? 60000;
+
+    // Lesson 4 (No Re-Broadcast): reject packets from self unless explicitly allowed (e.g. fresh-device file restore)
+    if (!options?.allowSelfOrigin && envelope.originDeviceId === this.deviceId) {
       return { accepted: false, reason: 'SELF_ORIGIN' };
     }
 
@@ -307,21 +347,28 @@ export class SyncCore {
             existingPinVer > 0 &&
             (incomingPinVer === 0 || existingPinVer > incomingPinVer);
 
-          // 3. Monotonic logical version comparison takes precedence over wall-clock skew
+          // 3. Monotonic logical version comparison & LWW timestamp check (default 60000ms live; 5000ms file imports)
           if (!incomingHasNewerPin) {
             if (existingVersion > 0 && incomingVersion > 0) {
               if (incomingVersion < existingVersion) {
                 return { accepted: false, reason: 'STALE_T2' };
               }
-              if (incomingVersion === existingVersion && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 60000) {
+              if (
+                incomingVersion === existingVersion &&
+                existingTs > 0 &&
+                incomingTs > 0 &&
+                existingTs - incomingTs > lwwToleranceMs
+              ) {
                 return { accepted: false, reason: 'STALE_T2' };
               }
             } else if (existingVersion > 0 && incomingVersion === 0 && existingSource === 'USER_EDIT') {
-              // An unversioned cloud/legacy row cannot blindly overwrite a versioned USER_EDIT unless strictly newer (> 60s)
-              if (incomingTs <= existingTs + 60000) {
+              // An unversioned cloud/legacy row cannot blindly overwrite a versioned USER_EDIT unless strictly newer
+              if (incomingTs <= existingTs + lwwToleranceMs) {
                 return { accepted: false, reason: 'STALE_T2' };
               }
-            } else if (existingTs - incomingTs > 60000) {
+            } else if (existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > lwwToleranceMs) {
+              return { accepted: false, reason: 'STALE_T2' };
+            } else if (options?.isFileImport && existingTs > 0 && incomingTs > 0 && existingTs - incomingTs > 5000) {
               return { accepted: false, reason: 'STALE_T2' };
             }
           }
@@ -335,7 +382,7 @@ export class SyncCore {
           const isLocalDirty = Boolean(existingRecord.isDirty || existingRecord.dirty || existingRecord.synced === false);
           if (isCloudPull && isLocalDirty && !incomingHasNewerPin) {
             const strictlyNewerVersion = incomingVersion > existingVersion && incomingVersion > 0;
-            const strictlyNewerTs = incomingVersion === existingVersion && incomingTs > existingTs + 60000;
+            const strictlyNewerTs = incomingVersion === existingVersion && incomingTs > existingTs + lwwToleranceMs;
             if (!strictlyNewerVersion && !strictlyNewerTs) {
               return { accepted: false, reason: 'STALE_T2_DIRTY_LOCAL' };
             }
@@ -397,7 +444,7 @@ export class SyncCore {
     }
 
     if (onAcceptedPersist) {
-      await onAcceptedPersist(envelope);
+      await onAcceptedPersist(envelope, existingRecord);
     }
 
     // Lesson 10 (Cross-Device UI Events): dispatch UI event
@@ -410,14 +457,76 @@ export class SyncCore {
 
   /**
    * Lesson 7 (Chunked Ingest): chunks into groups of 50 and yields thread.
+   * Supports full lookupExisting + onAcceptedPersist + configurable LWW tolerance (e.g. 5000ms for WhatsApp file import).
    */
-  async ingestBatch(envelopes: SyncEnvelope[]): Promise<void> {
+  async ingestBatch(
+    envelopes: SyncEnvelope[],
+    options?: BatchIngestOptions
+  ): Promise<BatchIngestResult> {
     const CHUNK_SIZE = 50;
+    const result: BatchIngestResult = {
+      processed: 0,
+      accepted: 0,
+      rejected: 0,
+      t1Accepted: 0,
+      t1Deduped: 0,
+      t2Accepted: 0,
+      t2StaleRejected: 0,
+      resurrectionBlocked: 0,
+      selfOriginSkipped: 0,
+      reasons: {},
+    };
+
+    const ingestOpts: IngestOptions | undefined = options
+      ? {
+          lwwToleranceMs: options.lwwToleranceMs,
+          allowSelfOrigin: options.allowSelfOrigin,
+          isFileImport: options.isFileImport,
+        }
+      : undefined;
+
     for (let i = 0; i < envelopes.length; i += CHUNK_SIZE) {
       const chunk = envelopes.slice(i, i + CHUNK_SIZE);
-      await Promise.all(chunk.map((e) => this.ingest(e)));
+      // Sequential within chunk when persisting to avoid race conditions on shared localStorage arrays
+      for (const e of chunk) {
+        const spec = ENTITY_REGISTRY[e.entityType];
+        const existing = options?.lookupExisting ? await options.lookupExisting(e) : undefined;
+        const outcome = await this.ingest(
+          e,
+          existing,
+          options?.onAcceptedPersist,
+          ingestOpts
+        );
+        result.processed++;
+        if (outcome.accepted) {
+          result.accepted++;
+          if (spec?.class === 'T1') result.t1Accepted++;
+          else if (spec?.class === 'T2') result.t2Accepted++;
+        } else {
+          result.rejected++;
+          const reason = outcome.reason || 'REJECTED';
+          result.reasons[reason] = (result.reasons[reason] || 0) + 1;
+          if (reason === 'DUPLICATE_T1' || reason === 'DUPLICATE_PACKET') result.t1Deduped++;
+          else if (reason === 'STALE_T2' || reason === 'STALE_T2_SEED_BLOCKED' || reason === 'STALE_T2_DIRTY_LOCAL') result.t2StaleRejected++;
+          else if (reason === 'RESURRECTION_BLOCKED') result.resurrectionBlocked++;
+          else if (reason === 'SELF_ORIGIN') result.selfOriginSkipped++;
+        }
+      }
+
+      if (options?.onProgress) {
+        options.onProgress({
+          processed: result.processed,
+          total: envelopes.length,
+          accepted: result.accepted,
+          rejected: result.rejected,
+          currentEntityType: chunk[chunk.length - 1]?.entityType,
+        });
+      }
+
       await new Promise((r) => setTimeout(r, 10));
     }
+
+    return result;
   }
 
   /**

@@ -143,15 +143,25 @@ export const queueAllStoreDataForSync = (): number => {
 
   // 1. Sales
   getSales().forEach((s) => {
+    const totalQty = Array.isArray(s.items)
+      ? s.items.reduce((sum, it) => sum + (Number(it.quantity) || 0), 0)
+      : Number((s as any).totalQty || 0);
     enqueueSync('Sales', 'INSERT', {
+      ...s,
+      id: s.id,
+      totalQty,
+      Date: s.date,
       Timestamp: s.timestamp,
       InvoiceID: s.id,
       CustomerID: s.customerId,
       CustomerName: s.customerName,
       ItemsSummary: s.itemsSummary,
+      TotalQty: totalQty,
       Subtotal: s.subtotal,
       Discount: s.discount,
       Total: s.total,
+      AmountTendered: (s as any).amountTendered ?? s.total,
+      ChangeGiven: (s as any).changeGiven ?? 0,
       PaymentMethod: s.paymentMethod,
       StaffID: s.staffId,
       StaffName: s.staffName,
@@ -168,8 +178,12 @@ export const queueAllStoreDataForSync = (): number => {
   // 2. Customers
   getCustomers().forEach((c) => {
     enqueueSync('Customers', 'INSERT', {
+      ...c,
+      id: c.customerId,
+      customerId: c.customerId,
       CustomerID: c.customerId,
       Name: c.name,
+      CustomerName: c.name,
       Phone: c.phone || '',
       Address: c.address || '',
       CreatedDate: c.createdDate,
@@ -183,6 +197,9 @@ export const queueAllStoreDataForSync = (): number => {
   // 3. Cash Logs
   getCashLogs().forEach((c) => {
     enqueueSync('CashLog', 'INSERT', {
+      ...c,
+      id: c.id,
+      LogID: c.id,
       Timestamp: c.timestamp,
       Date: c.date,
       StaffID: c.staffId,
@@ -191,6 +208,7 @@ export const queueAllStoreDataForSync = (): number => {
       Description: c.description,
       In: c.in,
       Out: c.out,
+      Reference: c.reference || '',
       company_id: c.company_id || compId,
       branch_id: c.branch_id || branchId,
     });
@@ -200,6 +218,8 @@ export const queueAllStoreDataForSync = (): number => {
   // 4. Expenses
   getExpenses().forEach((e) => {
     enqueueSync('Expenses', 'INSERT', {
+      ...e,
+      id: e.id,
       Timestamp: e.timestamp,
       ExpenseID: e.id,
       Date: e.date,
@@ -211,35 +231,84 @@ export const queueAllStoreDataForSync = (): number => {
       StaffName: e.staffName,
       Description: e.description,
       ReceiptRef: e.receiptRef || '',
+      Status: e.status || 'approved',
       company_id: e.company_id || compId,
       branch_id: e.branch_id || branchId,
     });
     count++;
   });
 
-  // 5. Inventory & Products
-  getProducts().forEach((p) => {
-    enqueueSync('InventoryMaster' as SheetName, 'INSERT', {
-      ProductID: p.id,
-      Name: p.name,
-      SKU: p.sku || '',
-      Category: p.category || 'General',
-      SellingPrice: p.price || 0,
-      CostPrice: p.costPrice || 0,
-      StockQuantity: p.stockQuantity ?? p.totalUnits ?? 0,
-      Barcode: p.barcode || '',
-      ReorderLevel: p.reorderLevelUnits || 5,
-      company_id: p.company_id || compId,
-      branch_id: p.branch_id || branchId,
+  // 5. Inventory & Products (use canonical InventoryItems to preserve costPerUnit/costPerCase/unitsPerCase)
+  const invItems = getInventoryItems();
+  if (invItems.length > 0) {
+    invItems.forEach((item) => {
+      enqueueSync('InventoryMaster' as SheetName, 'INSERT', {
+        ...item,
+        id: item.itemId,
+        itemId: item.itemId,
+        costPriceUnit: item.costPerUnit,
+        costPriceCase: item.costPerCase,
+        ItemID: item.itemId,
+        ProductID: item.itemId,
+        ItemName: item.itemName,
+        SKU: item.sku || '',
+        Barcode: item.barcode || '',
+        Category: item.category || 'General',
+        UnitsPerCase: item.unitsPerCase || 1,
+        CostPerCase: item.costPerCase || 0,
+        CostPerUnit: item.costPerUnit || 0,
+        SellingPrice: item.sellPriceUnit || 0,
+        SellPriceUnit: item.sellPriceUnit || 0,
+        SellPriceCase: item.sellPriceCase || 0,
+        StockCases: item.stockCases || 0,
+        StockSingles: item.stockSingles || 0,
+        TotalUnits: item.totalUnits ?? 0,
+        ReorderLevel: item.reorderLevelUnits || 5,
+        company_id: item.company_id || compId,
+        branch_id: item.branch_id || branchId,
+      });
+      count++;
     });
-    count++;
-  });
+  } else {
+    getProducts().forEach((p) => {
+      enqueueSync('InventoryMaster' as SheetName, 'INSERT', {
+        ...p,
+        id: p.id,
+        itemId: p.id,
+        itemName: p.name,
+        sellPriceUnit: p.price || 0,
+        costPerUnit: p.costPrice || 0,
+        costPriceUnit: p.costPrice || 0,
+        totalUnits: p.stockQuantity ?? p.totalUnits ?? 0,
+        ItemID: p.id,
+        ProductID: p.id,
+        ItemName: p.name,
+        Name: p.name,
+        SKU: p.sku || '',
+        Category: p.category || 'General',
+        SellingPrice: p.price || 0,
+        CostPrice: p.costPrice || 0,
+        CostPerUnit: p.costPrice || 0,
+        StockQuantity: p.stockQuantity ?? p.totalUnits ?? 0,
+        TotalUnits: p.stockQuantity ?? p.totalUnits ?? 0,
+        Barcode: p.barcode || '',
+        ReorderLevel: p.reorderLevelUnits || 5,
+        company_id: p.company_id || compId,
+        branch_id: p.branch_id || branchId,
+      });
+      count++;
+    });
+  }
 
   // 6. Suppliers
   getSuppliers().forEach((sup) => {
     enqueueSync('Suppliers', 'INSERT', {
+      ...sup,
+      id: sup.supplierId,
+      supplierId: sup.supplierId,
       SupplierID: sup.supplierId,
       Name: sup.name,
+      SupplierName: sup.name,
       Category: sup.category || '',
       ContactPerson: sup.contactPerson || '',
       Phone: sup.phone || '',
@@ -2556,7 +2625,7 @@ export const authenticateOwnerWithAppsScript = async (
   const targetWebhook = sanitizeMasterWebhookUrl(config.masterWebhookUrl || config.webhookUrl);
   const cleanEmail = email.trim().toLowerCase();
 
-  // 1. Primary: Server Proxy (/api/saas/owner-login) - Fast local in-memory auth, zero CORS, follows redirects
+  // 1. Primary: Server Proxy (/api/saas/owner-login) - Fast local + cloud auth, zero CORS, follows redirects
   try {
     const srvRes = await fetchWithTimeout(
       '/api/saas/owner-login',
@@ -2600,10 +2669,10 @@ export const authenticateOwnerWithAppsScript = async (
       }
     }
   } catch (srvErr) {
-    console.info('Server owner-login request unavailable, checking local device cache:', srvErr);
+    console.info('Server owner-login request unavailable, using direct cloud / local auth:', srvErr);
   }
 
-  // 2. Fallback to local roomDatabase when offline
+  // 2. Super Admin local check
   if (cleanEmail === 'andrekudakwashe@gmail.com') {
     if (rawPassword === 'Pass123' || rawPassword === '1234' || rawPassword === 'admin123') {
       return {
@@ -2616,34 +2685,16 @@ export const authenticateOwnerWithAppsScript = async (
         user_id: 'USR-MASTER-001',
         full_name: 'Andre Kudakwashe',
         email: cleanEmail,
-        message: 'Super Admin authenticated offline',
+        message: 'Super Admin authenticated',
       };
     }
   }
 
   const localCompanies = getCompanies();
-  const matchedComp = localCompanies.find(
-    (c) => c.owner_email && c.owner_email.trim().toLowerCase() === cleanEmail
-  );
+  const localStaff = getAllSalespeople();
+  let directGasErrorMessage = '';
 
-  if (matchedComp) {
-    if (rawPassword === 'Pass123' || rawPassword === '1234') {
-      return {
-        status: 'success',
-        role: 'owner',
-        businessId: matchedComp.company_id,
-        company_id: matchedComp.company_id,
-        company_name: matchedComp.company_name,
-        branch_id: 'BR-MAIN',
-        user_id: `USR-${matchedComp.company_id}-01`,
-        full_name: matchedComp.owner_name || matchedComp.company_name,
-        email: cleanEmail,
-        message: 'Owner authenticated from local storage',
-      };
-    }
-  }
-
-  // 3. Optional Direct Webhook fallback for standalone static PWAs without local server
+  // 3. Direct Apps Script authentication (primary path on standalone static hosts like Vercel)
   if (targetWebhook && targetWebhook.startsWith('http')) {
     try {
       const response = await fetchWithTimeout(
@@ -2685,31 +2736,166 @@ export const authenticateOwnerWithAppsScript = async (
             routing_epoch: typeof data.routing_epoch === 'number' ? data.routing_epoch : undefined,
             message: data.message,
           };
-        } else if (data && data.status === 'error') {
-          return {
-            status: 'error',
-            message: data.message || 'Invalid credentials',
-          };
+        } else if (data && (data.status === 'error' || data.success === false)) {
+          directGasErrorMessage = String(data.message || 'Invalid email or password');
         }
       }
     } catch (gasErr) {
-      console.info('Direct Apps Script fetch skipped or unavailable:', gasErr);
+      console.info('Direct Apps Script login_owner skipped or unavailable:', gasErr);
+    }
+
+    // 3b. Compatibility bridge for deployed Apps Script instances whose `companies.password_hash`
+    //     received a salted user `pin_hash` without `password_salt`: look up the company by email
+    //     and verify cryptographically via `login_staff` (which checks Master `users` pin_hash + pin_salt
+    //     and issues a real signed HS256 JWT).
+    try {
+      let candComp: any = localCompanies.find(
+        (c) => c.owner_email && c.owner_email.trim().toLowerCase() === cleanEmail
+      );
+      if (!candComp) {
+        const sep = targetWebhook.includes('?') ? '&' : '?';
+        const lookupUrl = `${targetWebhook}${sep}action=lookup_company&email=${encodeURIComponent(cleanEmail)}&_t=${Date.now()}`;
+        const lRes = await fetchWithTimeout(lookupUrl, { method: 'GET', redirect: 'follow' }, 15000);
+        if (lRes.ok) {
+          const lParsed = parseGasResponseText(await lRes.text(), lRes.status);
+          if (lParsed.data?.success && lParsed.data?.exists && lParsed.data?.company) {
+            candComp = lParsed.data.company;
+          }
+        }
+      }
+
+      const candStaff = localStaff.find(
+        (s) => s.email && s.email.trim().toLowerCase() === cleanEmail
+      );
+      const candCompId = String(candComp?.company_id || candStaff?.companyId || candStaff?.company_id || '').trim();
+      const candName = String(candStaff?.name || candComp?.owner_name || '').trim();
+      const candUserId = String(candStaff?.id || '').trim();
+
+      if (candCompId && (candUserId || candName)) {
+        const staffLoginRes = await fetchWithTimeout(
+          targetWebhook,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({
+              action: 'login_staff',
+              company_id: candCompId,
+              businessId: candCompId,
+              userId: candUserId || undefined,
+              name: candName || undefined,
+              pin: rawPassword,
+            }),
+            redirect: 'follow',
+          },
+          GAS_TIMEOUTS.AUTH_CLIENT_MS
+        );
+
+        if (staffLoginRes.ok) {
+          const sParsed = parseGasResponseText(await staffLoginRes.text(), staffLoginRes.status);
+          const sData = sParsed.data;
+          if (sData && (sData.status === 'success' || sData.success === true) && sData.user) {
+            const returnedEmail = String(sData.user.email || '').trim().toLowerCase();
+            const returnedRole = String(sData.user.role || 'OWNER').trim().toUpperCase();
+            const emailMatches =
+              (returnedEmail && returnedEmail === cleanEmail) ||
+              (!returnedEmail && returnedRole === 'OWNER' && String(candComp?.owner_email || '').trim().toLowerCase() === cleanEmail);
+
+            if (emailMatches) {
+              const resolvedSheetId = sanitizeTenantSheetId(
+                candCompId,
+                sData.sheet_id || sData.spreadsheet_id || candComp?.sheet_id || '',
+                config.masterSpreadsheetId
+              );
+              const resolvedBranchId = String(sData.user.branch_id || sData.user.branchId || 'BR-MAIN').trim();
+              const resolvedUserId = String(sData.user.user_id || sData.user.id || candUserId || `USR-${candCompId}-01`).trim();
+              const resolvedFullName = String(sData.user.full_name || sData.user.name || candComp?.owner_name || 'Business Owner').trim();
+
+              if (candComp && !localCompanies.some((c) => c.company_id === candCompId)) {
+                try {
+                  saveCompany({
+                    company_id: candCompId,
+                    company_name: String(candComp.company_name || candCompId),
+                    owner_name: String(candComp.owner_name || resolvedFullName),
+                    owner_email: cleanEmail,
+                    phone: String(candComp.phone || ''),
+                    business_category: String(candComp.business_category || 'Wholesale & Retail'),
+                    sheet_folder_id: '',
+                    sheet_id: resolvedSheetId,
+                    trial_start_date: String(candComp.trial_start_date || new Date().toISOString().split('T')[0]),
+                    subscription_status: (candComp.subscription_status || candComp.status || 'TRIAL') as any,
+                    plan: (candComp.plan || 'PROFESSIONAL') as any,
+                    next_billing_date: String(candComp.next_billing_date || candComp.expiry || ''),
+                    offline_activation_code: String(candComp.offline_activation_code || candComp.activation_code || ''),
+                  });
+                } catch {}
+              }
+
+              try {
+                saveSalesperson({
+                  id: resolvedUserId,
+                  name: resolvedFullName,
+                  email: cleanEmail,
+                  phone: String(sData.user.phone || candComp?.phone || ''),
+                  role: returnedRole as any,
+                  active: 'Y',
+                  companyId: candCompId,
+                  company_id: candCompId,
+                  branchId: resolvedBranchId,
+                  branch_id: resolvedBranchId,
+                  branchName: String(sData.user.branchName || 'Main Branch'),
+                  pin_hash: String(sData.user.pin_hash || ''),
+                  pin_salt: String(sData.user.pin_salt || ''),
+                  permissions: (typeof sData.user.permissions === 'object' && sData.user.permissions)
+                    ? sData.user.permissions
+                    : getOwnerDefaultPermissions(),
+                } as any);
+              } catch {}
+
+              return {
+                status: 'success',
+                role: returnedRole,
+                businessId: candCompId,
+                company_id: candCompId,
+                company_name: String(candComp?.company_name || candCompId),
+                branch_id: resolvedBranchId,
+                user_id: resolvedUserId,
+                full_name: resolvedFullName,
+                email: cleanEmail,
+                token: sData.token,
+                sheet_id: resolvedSheetId,
+                spreadsheet_id: resolvedSheetId,
+                routing_epoch: typeof sData.routing_epoch === 'number' ? sData.routing_epoch : undefined,
+                message: 'Owner authenticated via cloud directory',
+              };
+            }
+          }
+        }
+      }
+    } catch (bridgeErr) {
+      console.info('Direct Apps Script staff-verified owner bridge unavailable:', bridgeErr);
+    }
+
+    if (directGasErrorMessage) {
+      return {
+        status: 'error',
+        message: directGasErrorMessage,
+      };
     }
   }
 
-  // Also check if a staff member from any company is registering the device
-  const localStaff = getAllSalespeople();
-  const matchedStaff = localStaff.find(
+  // 4. Offline fallback: verify cryptographically against local synced staff/owner pin_hash (salted or unsalted)
+  const matchingLocalStaff = localStaff.filter(
     (s) => s.email && s.email.trim().toLowerCase() === cleanEmail
   );
 
-  if (matchedStaff) {
-    if (rawPassword === 'Pass123' || rawPassword === '1234' || verifySalespersonPin(matchedStaff, rawPassword)) {
-      const staffCompId = matchedStaff.companyId || matchedStaff.company_id || 'COMP-001';
+  for (const matchedStaff of matchingLocalStaff) {
+    if (verifySalespersonPin(matchedStaff, rawPassword)) {
+      const staffCompId = matchedStaff.companyId || matchedStaff.company_id || '';
+      if (!staffCompId) continue;
       const staffComp = localCompanies.find((c) => c.company_id === staffCompId);
       return {
         status: 'success',
-        role: matchedStaff.role || 'staff',
+        role: matchedStaff.role || 'OWNER',
         businessId: staffCompId,
         company_id: staffCompId,
         company_name: staffComp ? staffComp.company_name : staffCompId,
@@ -2717,14 +2903,16 @@ export const authenticateOwnerWithAppsScript = async (
         user_id: matchedStaff.id,
         full_name: matchedStaff.name,
         email: cleanEmail,
-        message: 'Staff account authenticated for device registration',
+        sheet_id: staffComp?.sheet_id || undefined,
+        spreadsheet_id: staffComp?.sheet_id || undefined,
+        message: 'Account authenticated from verified local credentials',
       };
     }
   }
 
   return {
     status: 'error',
-    message: 'Invalid credentials. Please verify your email and password.',
+    message: 'Invalid email or password. Please verify your credentials.',
   };
 };
 

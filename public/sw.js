@@ -3,7 +3,7 @@
  * Provides 100% offline app loading, clean cache management, and instant updates.
  */
 
-const CACHE_NAME = 'saimetric-v5-offline-v10';
+const CACHE_NAME = 'saimetric-v5-offline-v12';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',

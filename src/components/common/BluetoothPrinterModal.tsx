@@ -78,18 +78,21 @@ export const BluetoothPrinterModal: React.FC<BluetoothPrinterModalProps> = ({
       
       const loaded = getPrinterConfig(currentTenant.company_id);
       // Auto-heal if loaded config still has "chapwanya" or outdated fallback address while tenant is different
+      const tenantCompanyName = String(currentTenant.company_name ?? '');
+      const loadedStoreName = String(loaded.storeName ?? '');
+      const loadedStoreAddress = String(loaded.storeAddress ?? '');
       const isContaminated = Boolean(
-        loaded.storeName &&
-        loaded.storeName.toLowerCase().includes('chapwanya') &&
-        !currentTenant.company_name.toLowerCase().includes('chapwanya')
+        loadedStoreName &&
+        loadedStoreName.toLowerCase().includes('chapwanya') &&
+        !tenantCompanyName.toLowerCase().includes('chapwanya')
       );
 
-      if (isContaminated || !loaded.storeAddress || loaded.storeAddress.toLowerCase().includes('harare commercial hub')) {
+      if (isContaminated || !loadedStoreAddress || loadedStoreAddress.toLowerCase().includes('harare commercial hub')) {
         const sanitized = savePrinterConfig(
           {
-            storeName: isContaminated ? currentTenant.company_name : (loaded.storeName || currentTenant.company_name),
+            storeName: isContaminated ? tenantCompanyName : (loadedStoreName || tenantCompanyName),
             branchName: isContaminated ? activeBranchName : (loaded.branchName || activeBranchName),
-            storeAddress: activeBranchAddress || loaded.storeAddress,
+            storeAddress: activeBranchAddress || loadedStoreAddress,
             storePhone: currentBranch.phone || currentTenant.phone || loaded.storePhone,
           },
           currentTenant.company_id

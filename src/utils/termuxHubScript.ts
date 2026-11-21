@@ -1,7 +1,7 @@
 // Utility for retrieving, downloading, and copying the latest Termux Hub script
 // Provides 100% offline fallback, Blob download generation, and Termux Heredoc formatting
 
-export const TERMUX_HUB_VERSION = 'v3.2';
+export const TERMUX_HUB_VERSION = 'v4.0';
 export const TERMUX_HUB_FILENAME = 'termux-hub.js';
 export const TERMUX_HUB_PORT = 8080;
 

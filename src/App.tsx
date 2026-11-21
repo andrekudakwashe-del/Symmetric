@@ -449,6 +449,7 @@ export default function App() {
       saveSalesperson(updated);
     }
     setDbVersion((v) => v + 1);
+    meshSyncService.triggerCloudSyncNow(true).catch(() => {});
   };
 
   // Lightweight boot config fetch on mount (never blocks LoginScreen typing or saturates mobile 4G)
@@ -474,11 +475,18 @@ export default function App() {
     prefetchAppModules();
     initializeSystemConfigAndSync().catch(() => {});
     persistentSyncEngine.initialize().catch((err) => console.warn('[App] Sync engine init error:', err));
+    // Immediately pull cloud catalog, sales, cash logs, customers & expenses on login (no 2-min wait)
+    const loginSyncTimer = setTimeout(() => {
+      meshSyncService.triggerCloudSyncNow(true).catch(() => {});
+    }, 1200);
 
     const unsubAlerts = persistentSyncEngine.subscribeAlerts((alert) => {
       setTenantAlert(alert);
     });
-    return () => unsubAlerts();
+    return () => {
+      clearTimeout(loginSyncTimer);
+      unsubAlerts();
+    };
   }, [Boolean(currentUser)]);
 
   // Multi-layered clock tampering monitor (boot, focus, online, visibility, and 60s interval)

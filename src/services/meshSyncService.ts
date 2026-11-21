@@ -230,6 +230,7 @@ import { MongoDBAdapter } from './sync/MongoDBAdapter';
 import { getActiveCloudConfig, ActiveDatabaseType } from './sync/cloudConfigResolver';
 import {
   registerSyncCoreIngestBridge,
+  registerSyncCoreIngestBatchBridge,
   registerSyncCoreSaveAndSyncBridge,
   registerTombstoneLookup,
 } from './sync/syncIngestBridge';
@@ -871,6 +872,9 @@ class MeshSyncManager {
 
     registerSyncCoreIngestBridge((envelope, existingRecord, onAcceptedPersist) =>
       this.syncCore.ingest(envelope, existingRecord, onAcceptedPersist)
+    );
+    registerSyncCoreIngestBatchBridge((envelopes, options) =>
+      this.syncCore.ingestBatch(envelopes, options)
     );
     registerSyncCoreSaveAndSyncBridge(async (envelope) => {
       if (this.isIngestingFromHub) {
@@ -1722,6 +1726,8 @@ class MeshSyncManager {
     databaseType: string;
     credentials: Record<string, any>;
     companyId?: string;
+    gatewayUrl?: string;
+    runtimePolicy?: Record<string, any>;
   } | null {
     try {
       const comp: any = getCurrentCompany();
@@ -1729,6 +1735,26 @@ class MeshSyncManager {
       const rawType = String(backendCfg?.backendType || comp?.backend_type || '').toLowerCase().trim();
       const rawSheets = getRawStoredSheetsConfig() as any;
       const alreadyPurged = isCloudConfigPurged();
+      const resolvedGatewayUrl =
+        typeof window !== 'undefined' && window.location?.origin && /^https?:\/\//i.test(window.location.origin)
+          ? `${window.location.origin}/api/sync/gateway`
+          : '';
+      const defaultRuntimePolicy = {
+        protocolVersion: '4.0',
+        pushBatchSize: 20,
+        pullMaxPages: 12,
+        requestTimeoutMs: 45000,
+        syncIntervalMs: 5 * 60 * 1000,
+        clockDriftToleranceMs: 5 * 60 * 1000,
+        blockBackdatedVoidsOnly: true,
+        blockedBackdateActions: ['VOID', 'REFUND'],
+        blockedMasterSheetIds: ['1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE'],
+        t2EntityTypes: [],
+        globalBranchEntityTypes: [],
+        retentionDays: 30,
+        maxStorageMb: 2048,
+        genericBucketMaxItems: 5000,
+      };
 
       // 1. Check MongoDB credentials
       const mongoCfg = backendCfg?.mongodb || {};
@@ -1751,11 +1777,13 @@ class MeshSyncManager {
             databaseType: 'mongodb',
             credentials,
             companyId: comp?.company_id,
+            ...(resolvedGatewayUrl ? { gatewayUrl: resolvedGatewayUrl } : {}),
+            runtimePolicy: defaultRuntimePolicy,
           };
         }
       }
 
-      // 2. Check Supabase credentials
+      // 2. Check Supabase credentials (routed through frozen Cloud Sync Gateway when available)
       const sbCfg = backendCfg?.supabase || {};
       const sbUrl = String(
         sbCfg?.projectUrl ||
@@ -1783,11 +1811,13 @@ class MeshSyncManager {
               ...(sbCfg?.schema ? { schema: String(sbCfg.schema).trim() } : {}),
             },
             companyId: comp?.company_id,
+            ...(resolvedGatewayUrl ? { gatewayUrl: resolvedGatewayUrl } : {}),
+            runtimePolicy: defaultRuntimePolicy,
           };
         }
       }
 
-      // 3. Check Firebase credentials
+      // 3. Check Firebase credentials (routed through frozen Cloud Sync Gateway when available)
       const fbCfg = backendCfg?.firebase || {};
       const fbProjectId = String(fbCfg?.projectId || '').trim();
       const fbApiKey = String(fbCfg?.apiKey || '').trim();
@@ -1806,11 +1836,13 @@ class MeshSyncManager {
               ...(fbCfg?.databaseId ? { databaseId: String(fbCfg.databaseId).trim() } : {}),
             },
             companyId: comp?.company_id,
+            ...(resolvedGatewayUrl ? { gatewayUrl: resolvedGatewayUrl } : {}),
+            runtimePolicy: defaultRuntimePolicy,
           };
         }
       }
 
-      // 4. Check Apps Script / Google Sheets credentials (avoid re-sending empty defaults if already purged)
+      // 4. Check Apps Script / Google Sheets credentials (speaks the same frozen 3-action protocol natively)
       const sheetsCfg = backendCfg?.sheets || {};
       const activeSheetsCfg = alreadyPurged ? null : getSheetsConfig();
       const webhookUrl = String(
@@ -1850,6 +1882,7 @@ class MeshSyncManager {
             isolationMode: sheetsCfg?.isolationMode || comp?.branch_isolation_mode || 'ROW_LEVEL',
           },
           companyId: compIdForTok,
+          runtimePolicy: defaultRuntimePolicy,
         };
       }
     } catch (err) {
@@ -5175,12 +5208,40 @@ class MeshSyncManager {
     return this.localGatewayUrl;
   }
 
+  private localGatewayBackoffUntil: number = 0;
+  private localGatewayFailureCount: number = 0;
+  private sseConsecutiveErrors: number = 0;
+  private sseRetryTimer: number | null = null;
+
   private startLocalGatewayPolling() {
     if (this.localGatewayPollTimer) {
       clearInterval(this.localGatewayPollTimer);
     }
     const gateway = this.localGatewayUrl ? this.localGatewayUrl.replace(/\/+$/, '') : '';
+    const isSameOriginRemote =
+      !gateway &&
+      typeof window !== 'undefined' &&
+      !['localhost', '127.0.0.1'].includes(window.location.hostname) &&
+      !/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(window.location.hostname);
+
+    // Use a gentle interval on remote/hosted previews to avoid tripping proxy rate limits
+    const pollIntervalMs = isSameOriginRemote ? 15000 : 5000;
+
     this.localGatewayPollTimer = window.setInterval(async () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (Date.now() < this.localGatewayBackoffUntil) return;
+
+      const tripBackoff = (status: number) => {
+        this.localGatewayFailureCount = Math.min(this.localGatewayFailureCount + 1, 6);
+        const delayMs =
+          status === 429
+            ? Math.min(300000, 30000 * Math.pow(2, this.localGatewayFailureCount - 1))
+            : status === 404
+            ? 300000
+            : Math.min(120000, 10000 * Math.pow(2, this.localGatewayFailureCount - 1));
+        this.localGatewayBackoffUntil = Date.now() + delayMs;
+      };
+
       try {
         // 1. Heartbeat to local server / LAN gateway (strictly scoped by tenant and branch)
         const res = await fetch(`${gateway}/api/mesh/heartbeat`, {
@@ -5196,7 +5257,13 @@ class MeshSyncManager {
             deviceType: 'terminal',
           }),
         });
-        if (res.ok) {
+        if (res.status === 429 || res.status === 404 || res.status >= 500) {
+          tripBackoff(res.status);
+          return;
+        }
+        const hbType = res.headers.get('content-type') || '';
+        if (res.ok && hbType.includes('application/json')) {
+          this.localGatewayFailureCount = 0;
           const data = await res.json();
           this.isServerRelayConnected = true;
           this.isMqttConnected = true;
@@ -5226,6 +5293,15 @@ class MeshSyncManager {
             }
             this.notifyPeerSubscribers();
           }
+        } else if (res.ok && !hbType.includes('application/json')) {
+          // Static SPA host returned index.html — stop polling /api/mesh/*
+          tripBackoff(404);
+          return;
+        }
+
+        // Skip redundant HTTP polling if the live SSE stream is already connected
+        if (this.serverEventSource && this.serverEventSource.readyState === EventSource.OPEN) {
+          return;
         }
 
         // 2. Poll new packets from central server buffer (scoped by tenant and branch)
@@ -5236,7 +5312,12 @@ class MeshSyncManager {
             this.config.companyId
           )}&since=${this.lastMeshPollTimestamp}&deviceId=${encodeURIComponent(this.config.deviceId)}`
         );
-        if (pollRes.ok) {
+        if (pollRes.status === 429 || pollRes.status === 404 || pollRes.status >= 500) {
+          tripBackoff(pollRes.status);
+          return;
+        }
+        const pollType = pollRes.headers.get('content-type') || '';
+        if (pollRes.ok && pollType.includes('application/json')) {
           const pollData = await pollRes.json();
           if (pollData && pollData.serverTime) {
             this.lastMeshPollTimestamp = pollData.serverTime;
@@ -5247,8 +5328,10 @@ class MeshSyncManager {
             }
           }
         }
-      } catch (e) {}
-    }, 3500);
+      } catch (e) {
+        tripBackoff(0);
+      }
+    }, pollIntervalMs);
   }
 
   // =========================================================================
@@ -5256,6 +5339,10 @@ class MeshSyncManager {
   // =========================================================================
   private initServerStream() {
     if (typeof window === 'undefined' || typeof EventSource === 'undefined') return;
+    if (this.sseRetryTimer) {
+      clearTimeout(this.sseRetryTimer);
+      this.sseRetryTimer = null;
+    }
     if (this.serverEventSource) {
       try {
         this.serverEventSource.close();
@@ -5275,6 +5362,7 @@ class MeshSyncManager {
       this.serverEventSource = es;
 
       es.onopen = () => {
+        this.sseConsecutiveErrors = 0;
         this.isServerRelayConnected = true;
         this.isMqttConnected = true;
         this.brokerName = 'Integrated Realtime Mesh Relay';
@@ -5293,6 +5381,7 @@ class MeshSyncManager {
           if (!event.data) return;
           const parsed = JSON.parse(event.data);
           if (parsed && parsed.type === 'CONNECTED') {
+            this.sseConsecutiveErrors = 0;
             this.isServerRelayConnected = true;
             this.isMqttConnected = true;
             this.evaluateConnectionPriority();
@@ -5306,6 +5395,22 @@ class MeshSyncManager {
       es.onerror = () => {
         this.isServerRelayConnected = false;
         this.evaluateConnectionPriority();
+        this.sseConsecutiveErrors += 1;
+        // Stop native EventSource 3-second reconnect storm on 429/404 hosts
+        if (this.sseConsecutiveErrors >= 2) {
+          try {
+            es.close();
+          } catch {}
+          if (this.serverEventSource === es) {
+            this.serverEventSource = null;
+          }
+          const retryDelayMs = Math.min(300000, 60000 * this.sseConsecutiveErrors);
+          this.sseRetryTimer = window.setTimeout(() => {
+            if (typeof document === 'undefined' || !document.hidden) {
+              this.initServerStream();
+            }
+          }, retryDelayMs);
+        }
       };
     } catch (err) {
       console.warn('[MeshSync] Server stream init error:', err);
@@ -7249,6 +7354,37 @@ class MeshSyncManager {
       }
     }
 
+    // 8.11e Ingest schema-agnostic generic envelopes from Universal Hub (reconciliation, goods_received, future entities)
+    const rawGenericEnvelopes = (delta as any).genericEnvelopes;
+    if (Array.isArray(rawGenericEnvelopes) && rawGenericEnvelopes.length > 0) {
+      for (const gEnv of rawGenericEnvelopes) {
+        if (!gEnv || !gEnv.entityType || !gEnv.entityId || !gEnv.data) continue;
+        try {
+          if (
+            await this.ingestEnvelopeThroughSyncCore(
+              {
+                packetId: gEnv.packetId || `CATCHUP-GEN-${gEnv.entityType}-${gEnv.entityId}`,
+                entityType: String(gEnv.entityType),
+                entityId: String(gEnv.entityId),
+                action: gEnv.action || 'UPSERT',
+                data: gEnv.data,
+                updatedAt: parseTimestampMs(gEnv.updatedAt || gEnv.data?.updatedAt) || Date.now(),
+                originDeviceId: gEnv.originDeviceId || packetOrigin || 'LOCAL_HUB',
+                targetBranchId: gEnv.targetBranchId || this.config.branchId || 'ALL',
+                class: gEnv.class === 'T2' ? 'T2' : 'T1',
+              },
+              originName,
+              { isReconBackfill: true }
+            )
+          ) {
+            overallProcessed += 1;
+          }
+        } catch (genErr) {
+          console.warn('[CatchUp] Notice ingesting generic Hub envelope:', genErr);
+        }
+      }
+    }
+
     // Complete sync progress indicator
     if (totalRecordsToProcess > 0) {
       this.finishSyncProgress(totalRecordsToProcess, 'Sync Complete');
@@ -8511,8 +8647,10 @@ class MeshSyncManager {
       }
       if (typeof navigator !== 'undefined' && navigator.onLine) {
         try {
+          // Pull BEFORE pushing so a fresh device never skips older cloud data,
+          // and pass 0 so AppScriptsAdapter uses its persisted server_seq cursor (or full seq=0 on first pull).
+          await cloudAdapter.requestCatchUp(0);
           await cloudAdapter.drainOfflineQueue();
-          await cloudAdapter.requestCatchUp(Date.now() - 3600 * 1000);
         } catch (e) {}
       }
     }, 120000);
@@ -9054,6 +9192,27 @@ class MeshSyncManager {
     } else {
       const cloudAdapter = this.getOrCreateSingleCloudAdapter();
       await cloudAdapter.drainOfflineQueue();
+    }
+  }
+
+  /**
+   * Immediately performs a pull-first cloud catch-up and queue drain (used on login & branch switch)
+   * so second devices see all catalog items, sales, cash logs, and customers without waiting 2 minutes.
+   */
+  public async triggerCloudSyncNow(forceFullIfFresh: boolean = true): Promise<void> {
+    try {
+      this.syncActiveAdapter();
+      if (this.isLocalHubActive() && !this.isCloudOnlyMode) {
+        void this.requestCatchUpSync('ALL', forceFullIfFresh ? undefined : new Date(Date.now() - 3600 * 1000).toISOString(), false, false).catch(() => {});
+        return;
+      }
+      const cloudAdapter = this.getOrCreateSingleCloudAdapter();
+      if (cloudAdapter.isPaused?.()) return;
+      if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+      await cloudAdapter.requestCatchUp(forceFullIfFresh ? 0 : Date.now() - 3600 * 1000);
+      await cloudAdapter.drainOfflineQueue();
+    } catch (e) {
+      console.warn('[MeshSync] triggerCloudSyncNow warning:', e);
     }
   }
 
