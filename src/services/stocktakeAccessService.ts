@@ -400,6 +400,17 @@ export const isTabAllowedUnderLockdownOrStocktake = (
   // Under FULL_LOCKDOWN:
   if (tab === 'stocktake') return true;
 
+  // Platform Super Admin always retains access to the Super Admin console
+  const normRole = String(user.role || '').trim().toUpperCase().replace(/\s+/g, '_');
+  if (
+    tab === 'super_admin' &&
+    (normRole === 'SUPER_ADMIN' ||
+      normRole === 'SUPER_ADMINISTRATOR' ||
+      String(user.email || '').trim().toLowerCase() === 'andrekudakwashe@gmail.com')
+  ) {
+    return true;
+  }
+
   // Leaders and Designated Auditors retain oversight tools if needed
   if (isStocktakeLeader(user) || isStocktakeAuditor(user, lockdownSess)) {
     return tab === 'stocktake' || tab === 'dashboard' || tab === 'p2p_mesh' || tab === 'staff_access';

@@ -28,6 +28,7 @@ import { historyNavigationService } from './services/historyNavigationService';
 import { OfflineIndicator } from './components/pwa/OfflineIndicator';
 import { SyncProgressIndicator } from './components/common/SyncProgressIndicator';
 import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
+import { SuperAdminDashboard } from './components/admin/SuperAdminDashboard';
 import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield, X } from 'lucide-react';
 import { initializeSystemConfigAndSync, fetchGlobalSystemConfig } from './services/systemConfig';
 import { persistentSyncEngine } from './services/persistentSyncEngine';
@@ -71,7 +72,6 @@ const DataManagementHub = lazyWithRetry(() => import('./components/admin/DataMan
 const UniversalReportBuilder = lazyWithRetry(() => import('./components/reports/UniversalReportBuilder').then(m => ({ default: m.UniversalReportBuilder })), 'UniversalReportBuilder');
 const CustomReportsListView = lazyWithRetry(() => import('./components/reports/CustomReportsListView').then(m => ({ default: m.CustomReportsListView })), 'CustomReportsListView');
 const PermissionsMatrixModal = lazyWithRetry(() => import('./components/admin/PermissionsMatrixModal').then(m => ({ default: m.PermissionsMatrixModal })), 'PermissionsMatrixModal');
-const SuperAdminDashboard = lazyWithRetry(() => import('./components/admin/SuperAdminDashboard').then(m => ({ default: m.SuperAdminDashboard })), 'SuperAdminDashboard');
 const TenantDiagnosticsModal = lazyWithRetry(() => import('./components/admin/TenantDiagnosticsModal').then(m => ({ default: m.TenantDiagnosticsModal })), 'TenantDiagnosticsModal');
 const BranchSetupScreen = lazyWithRetry(() => import('./components/admin/BranchSetupScreen').then(m => ({ default: m.BranchSetupScreen })), 'BranchSetupScreen');
 const SyncDiagnosticsModal = lazyWithRetry(() => import('./components/sync/SyncDiagnosticsModal').then(m => ({ default: m.SyncDiagnosticsModal })), 'SyncDiagnosticsModal');
@@ -84,6 +84,26 @@ const ViewLoadingFallback = () => (
     <span className="text-[11px] font-bold text-slate-400">Opening view...</span>
   </div>
 );
+
+const ModalLoadingFallback = () => (
+  <div className="fixed inset-0 z-[60] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="bg-slate-900 border border-slate-700 rounded-2xl px-6 py-5 flex flex-col items-center space-y-3 shadow-2xl">
+      <div className="w-8 h-8 border-2 border-amber-500/20 border-t-amber-400 rounded-full animate-spin" />
+      <span className="text-xs font-bold text-slate-200">Opening panel...</span>
+    </div>
+  </div>
+);
+
+const isSuperAdminUser = (user: Salesperson | null | undefined): boolean => {
+  if (!user) return false;
+  const normRole = String(user.role || '').trim().toUpperCase().replace(/\s+/g, '_');
+  const normEmail = String(user.email || '').trim().toLowerCase();
+  return (
+    normRole === 'SUPER_ADMIN' ||
+    normRole === 'SUPER_ADMINISTRATOR' ||
+    normEmail === 'andrekudakwashe@gmail.com'
+  );
+};
 
 const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes inactivity timeout
 
@@ -183,8 +203,24 @@ export default function App() {
     return () => window.removeEventListener('saimetric_eod_completed', onEodDone);
   }, []);
 
+  const handleOpenSuperAdmin = () => {
+    setIsHamburgerOpen(false);
+    setIsSuperAdminModalOpen(true);
+  };
+
   const handleNavigateTab = (newTab: ActiveTab) => {
     const activeUser = currentUser || getSessionUser();
+    const rawTab = String(newTab || '');
+    if (rawTab === 'super_admin' || rawTab === 'SuperAdminDashboard') {
+      if (isSuperAdminUser(activeUser)) {
+        handleOpenSuperAdmin();
+        return;
+      }
+      historyNavigationService.pushTab('super_admin');
+      setActiveTab('super_admin');
+      return;
+    }
+
     const userBranch = activeUser?.branchId || activeUser?.branch_id;
     if (activeUser && !isTabAllowedUnderLockdownOrStocktake(activeUser, newTab, userBranch)) {
       showToastNotification(
@@ -523,7 +559,7 @@ export default function App() {
     if (contextCustomer) {
       setSalePreselectedCustomer(contextCustomer);
     }
-    setActiveTab(tab);
+    handleNavigateTab(tab);
   };
 
   const smartUpdateBanner = updateAvailable ? (
@@ -557,9 +593,7 @@ export default function App() {
   // Check SaaS 14-day trial & license status
   const currentCompany = getCurrentCompany();
   const subStatus = getSubscriptionStatus(currentCompany);
-  const isSuperAdmin =
-    currentUser.role === 'SUPER_ADMIN' ||
-    currentUser.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+  const isSuperAdmin = isSuperAdminUser(currentUser);
 
   // If trial has expired and user is not Super Admin, display the TrialExpiredLockScreen
   if (!isSuperAdmin && subStatus.isExpired) {
@@ -628,7 +662,7 @@ export default function App() {
         onOpenSyncModal={() => setIsSyncModalOpen(true)}
         onOpenAdminModal={() => setIsAdminModalOpen(true)}
         onOpenPermissions={() => setIsPermissionsModalOpen(true)}
-        onOpenSuperAdmin={isSuperAdmin ? () => setIsSuperAdminModalOpen(true) : undefined}
+        onOpenSuperAdmin={isSuperAdmin ? handleOpenSuperAdmin : undefined}
         onOpenDiagnostics={() => setIsDiagnosticsModalOpen(true)}
         onOpenTenantDiagnostics={() => setIsTenantDiagnosticsModalOpen(true)}
         onOpenHamburgerMenu={() => setIsHamburgerOpen(true)}
@@ -695,7 +729,7 @@ export default function App() {
           </div>
           <button
             type="button"
-            onClick={() => setIsSuperAdminModalOpen(true)}
+            onClick={handleOpenSuperAdmin}
             className="px-2.5 py-0.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-[10px] shrink-0 cursor-pointer"
           >
             Manage SaaS Tenants &rarr;
@@ -1246,7 +1280,7 @@ export default function App() {
           <StaffAccessManagementScreen
             currentUser={currentUser}
             onNavigateHome={() => setActiveTab('home')}
-            onNavigateTab={(tab) => setActiveTab(tab)}
+            onNavigateTab={(tab) => handleNavigateTab(tab)}
           />
         )}
 
@@ -1255,17 +1289,17 @@ export default function App() {
           <BranchSetupScreen
             currentUser={currentUser}
             onNavigateHome={() => setActiveTab('home')}
-            onNavigateTab={(tab) => setActiveTab(tab)}
+            onNavigateTab={(tab) => handleNavigateTab(tab)}
           />
         )}
 
         {/* SAAS MULTI-TENANT SUPER ADMIN VIEW */}
-        {activeTab === 'super_admin' && (
+        {activeTab === 'super_admin' && !isSuperAdminModalOpen && (
           isSuperAdmin ? (
             <SuperAdminDashboard
               isOpen={true}
               currentUser={currentUser}
-              onClose={() => setActiveTab('home')}
+              onClose={() => setActiveTab('dashboard')}
               onOpenSheetSetup={() => setIsSyncModalOpen(true)}
               onOpenReportBuilder={() => setActiveTab('custom_reports')}
             />
@@ -1454,11 +1488,25 @@ export default function App() {
         }}
         onLogout={handleLogout}
         onOpenPrinterModal={() => setIsPrinterModalOpen(true)}
-        onOpenSuperAdmin={isSuperAdmin ? () => setIsSuperAdminModalOpen(true) : undefined}
+        onOpenSuperAdmin={isSuperAdmin ? handleOpenSuperAdmin : undefined}
       />
 
+      {/* SaaS Multi-Tenant Management Dashboard (statically imported for instant 0ms opening without Suspense blank flash) */}
+      {isSuperAdmin && isSuperAdminModalOpen && (
+        <SuperAdminDashboard
+          isOpen={isSuperAdminModalOpen}
+          currentUser={currentUser}
+          onClose={() => setIsSuperAdminModalOpen(false)}
+          onOpenSheetSetup={() => setIsSyncModalOpen(true)}
+          onOpenReportBuilder={() => {
+            setIsSuperAdminModalOpen(false);
+            setActiveTab('custom_reports');
+          }}
+        />
+      )}
+
       {/* Lazy-loaded Admin and Auxiliary Modals */}
-      <Suspense fallback={null}>
+      <Suspense fallback={<ModalLoadingFallback />}>
         {/* 4. Google Sheets Sync Modal */}
         {isSyncModalOpen && (
           <GoogleSheetsSyncModal
@@ -1482,17 +1530,6 @@ export default function App() {
           <PermissionsMatrixModal
             isOpen={isPermissionsModalOpen}
             onClose={() => setIsPermissionsModalOpen(false)}
-          />
-        )}
-
-        {/* 7. SaaS Multi-Tenant Management Dashboard */}
-        {isSuperAdmin && isSuperAdminModalOpen && (
-          <SuperAdminDashboard
-            isOpen={isSuperAdminModalOpen}
-            currentUser={currentUser}
-            onClose={() => setIsSuperAdminModalOpen(false)}
-            onOpenSheetSetup={() => setIsSyncModalOpen(true)}
-            onOpenReportBuilder={() => setActiveTab('custom_reports')}
           />
         )}
 

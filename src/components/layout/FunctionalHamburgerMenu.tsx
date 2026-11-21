@@ -120,9 +120,11 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
     }
   }, [isOpen]);
 
+  const normalizedRole = String(currentUser?.role || '').trim().toUpperCase().replace(/\s+/g, '_');
   const isSuperAdmin =
-    currentUser?.role === 'SUPER_ADMIN' ||
-    currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+    normalizedRole === 'SUPER_ADMIN' ||
+    normalizedRole === 'SUPER_ADMINISTRATOR' ||
+    String(currentUser?.email || '').trim().toLowerCase() === 'andrekudakwashe@gmail.com';
 
   const roleDef = useMemo(() => getRoleDefinitionForUser(currentUser), [currentUser]);
   const primaryModules = useMemo(() => getUserPrimaryModules(currentUser), [currentUser]);
@@ -315,10 +317,14 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
               <button
                 type="button"
                 id="btn-hamburger-super-admin"
-                onClick={() => {
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (onOpenSuperAdmin) {
+                    onOpenSuperAdmin();
+                  } else {
+                    onSelectTab('super_admin');
+                  }
                   onClose();
-                  if (onOpenSuperAdmin) onOpenSuperAdmin();
-                  else onSelectTab('super_admin');
                 }}
                 className="mt-2.5 w-full py-2 px-3 rounded-xl bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 text-slate-950 text-xs font-black flex items-center justify-center gap-1.5 shadow-md transition cursor-pointer"
               >

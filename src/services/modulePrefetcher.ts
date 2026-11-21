@@ -21,7 +21,6 @@ const MODULE_LOADERS: Array<() => Promise<any>> = [
   () => import('../components/reports/UniversalReportBuilder'),
   () => import('../components/reports/CustomReportsListView'),
   () => import('../components/admin/BranchSetupScreen'),
-  () => import('../components/admin/SuperAdminDashboard'),
   () => import('../components/sheets/GoogleSheetsSyncModal'),
   () => import('../components/admin/PermissionsMatrixModal'),
   () => import('../components/admin/SalespersonManagementModal'),

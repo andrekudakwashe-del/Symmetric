@@ -1437,7 +1437,7 @@ export const BranchSetupScreen: React.FC<BranchSetupScreenProps> = ({
         onUpgrade={() => {
           setLimitModalState((prev) => ({ ...prev, isOpen: false }));
           if (onNavigateTab) {
-            onNavigateTab('SuperAdminDashboard');
+            onNavigateTab('super_admin');
           }
         }}
       />

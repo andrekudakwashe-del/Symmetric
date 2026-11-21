@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
+import { lazyWithRetry } from '../../utils/lazyWithRetry';
 import {
   Crown,
   Building2,
@@ -40,8 +41,14 @@ import {
   Server,
   Trash2,
 } from 'lucide-react';
-import { PackageSetupView } from './PackageSetupView';
-import { BackendAdapterHub } from './BackendAdapterHub';
+const PackageSetupView = lazyWithRetry(
+  () => import('./PackageSetupView').then((m) => ({ default: m.PackageSetupView })),
+  'PackageSetupView'
+);
+const BackendAdapterHub = lazyWithRetry(
+  () => import('./BackendAdapterHub').then((m) => ({ default: m.BackendAdapterHub })),
+  'BackendAdapterHub'
+);
 import { getPackages, assignCompanyPackage } from '../../services/packageService';
 import { fetchWithTimeout, pingGasDeployment } from '../../services/sync/gasTransport';
 import {
@@ -102,9 +109,11 @@ export const SuperAdminDashboard: React.FC<SuperAdminDashboardProps> = ({
   onOpenReportBuilder,
   initialTab = 'tenants',
 }) => {
+  const normalizedRole = String(currentUser?.role || '').trim().toUpperCase().replace(/\s+/g, '_');
   const isSuperAdmin =
-    currentUser?.role === 'SUPER_ADMIN' ||
-    currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+    normalizedRole === 'SUPER_ADMIN' ||
+    normalizedRole === 'SUPER_ADMINISTRATOR' ||
+    String(currentUser?.email || '').trim().toLowerCase() === 'andrekudakwashe@gmail.com';
 
   const [adminTab, setAdminTab] = useState<'tenants' | 'packages' | 'sheets' | 'reports' | 'backends'>(initialTab);
   const [companies, setCompanies] = useState<Company[]>(() => getCompanies());
@@ -547,7 +556,7 @@ function setupMasterSheets() {
 
   if (currentUser && !isSuperAdmin) {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/90 backdrop-blur-md animate-fadeIn">
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-950/90 backdrop-blur-md animate-fadeIn">
         <div className="bg-slate-900 border border-red-500/40 rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl text-center space-y-4">
           <div className="w-16 h-16 rounded-3xl bg-red-500/10 border border-red-500/30 text-red-400 flex items-center justify-center mx-auto text-3xl">
             🛡️
@@ -960,7 +969,7 @@ function setupMasterSheets() {
   });
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/95 sm:backdrop-blur-md flex flex-col p-0 sm:p-3 md:p-4 overflow-hidden">
+    <div className="fixed inset-0 z-[60] bg-slate-950/95 sm:backdrop-blur-md flex flex-col p-0 sm:p-3 md:p-4 overflow-hidden">
       <div className="bg-slate-900 sm:border sm:border-slate-800 sm:rounded-3xl w-full max-w-6xl h-full sm:h-[96vh] mx-auto flex flex-col shadow-2xl overflow-hidden animate-fadeIn">
         {/* Pinned Header - Always Visible on Mobile, PWA & Desktop */}
         <div className="flex items-center justify-between border-b border-slate-800 p-3 sm:p-4 bg-slate-900 shrink-0 z-20 sticky top-0 shadow-md">
@@ -1114,25 +1123,34 @@ function setupMasterSheets() {
           {/* PACKAGE SETUP VIEW TAB */}
           {adminTab === 'packages' && (
             <div className="animate-fadeIn">
-              <PackageSetupView
-                onClose={onClose}
-                onOpenReportBuilder={() => {
-                  if (onOpenReportBuilder) {
-                    onClose();
-                    onOpenReportBuilder();
-                  } else {
-                    setAdminTab('reports');
-                  }
-                }}
-                onOpenSheetSetup={() => {
-                  if (onOpenSheetSetup) {
-                    onClose();
-                    onOpenSheetSetup();
-                  } else {
-                    setAdminTab('sheets');
-                  }
-                }}
-              />
+              <Suspense
+                fallback={
+                  <div className="flex flex-col items-center justify-center p-10 space-y-2.5">
+                    <div className="w-7 h-7 border-2 border-amber-500/20 border-t-amber-400 rounded-full animate-spin" />
+                    <span className="text-xs font-bold text-slate-400">Loading Package Setup...</span>
+                  </div>
+                }
+              >
+                <PackageSetupView
+                  onClose={onClose}
+                  onOpenReportBuilder={() => {
+                    if (onOpenReportBuilder) {
+                      onClose();
+                      onOpenReportBuilder();
+                    } else {
+                      setAdminTab('reports');
+                    }
+                  }}
+                  onOpenSheetSetup={() => {
+                    if (onOpenSheetSetup) {
+                      onClose();
+                      onOpenSheetSetup();
+                    } else {
+                      setAdminTab('sheets');
+                    }
+                  }}
+                />
+              </Suspense>
             </div>
           )}
 
@@ -1341,7 +1359,16 @@ function setupMasterSheets() {
           {/* BACKEND ADAPTERS & TIERS TAB */}
           {adminTab === 'backends' && (
             <div className="animate-fadeIn">
-              <BackendAdapterHub onShowToast={showToast} />
+              <Suspense
+                fallback={
+                  <div className="flex flex-col items-center justify-center p-10 space-y-2.5">
+                    <div className="w-7 h-7 border-2 border-amber-500/20 border-t-amber-400 rounded-full animate-spin" />
+                    <span className="text-xs font-bold text-slate-400">Loading Backend Adapters...</span>
+                  </div>
+                }
+              >
+                <BackendAdapterHub onShowToast={showToast} />
+              </Suspense>
             </div>
           )}
 

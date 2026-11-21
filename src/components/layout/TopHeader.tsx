@@ -92,9 +92,11 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
   });
   const menuRef = useRef<HTMLDivElement>(null);
 
+  const normalizedRole = String(currentUser?.role || '').trim().toUpperCase().replace(/\s+/g, '_');
   const isSuperAdmin =
-    currentUser?.role === 'SUPER_ADMIN' ||
-    currentUser?.email?.toLowerCase() === 'andrekudakwashe@gmail.com';
+    normalizedRole === 'SUPER_ADMIN' ||
+    normalizedRole === 'SUPER_ADMINISTRATOR' ||
+    String(currentUser?.email || '').trim().toLowerCase() === 'andrekudakwashe@gmail.com';
 
   const activeComp = getCurrentCompany();
   const backendConfig = getTenantBackendConfig(activeComp);
@@ -608,7 +610,7 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
                       {isSuperAdmin && onOpenSuperAdmin && (
                         <button
                           type="button"
-                          id="btn-dropdown-super-admin"
+                          id="btn-dropdown-saas-multi-tenant"
                           onClick={() => {
                             setIsProfileOpen(false);
                             onOpenSuperAdmin();

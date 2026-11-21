@@ -1768,7 +1768,7 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
         onUpgrade={() => {
           setLimitModalState((prev) => ({ ...prev, isOpen: false }));
           if (onNavigateTab) {
-            onNavigateTab('SuperAdminDashboard');
+            onNavigateTab('super_admin');
           }
         }}
       />
