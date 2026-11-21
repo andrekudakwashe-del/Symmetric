@@ -3,13 +3,16 @@ import {
   saveSheetsConfig,
   getCompanies,
   saveCompany,
+  saveCompaniesBulk,
   pruneLocalCompaniesToAllowlist,
   deleteLocalCompany,
   getAllBranches,
   saveBranch,
+  saveBranchesBulk,
   getSalespeopleForCompany,
   getAllSalespeople,
   saveSalesperson,
+  flushRoomDatabaseNotifications,
   getOwnerDefaultPermissions,
   parseTimestampMs,
   sanitizeMasterWebhookUrl,
@@ -77,11 +80,10 @@ export async function flushPendingCloudRegistrations(): Promise<number> {
   }
 }
 
-async function ingestBootstrapStaffRecord(su: any): Promise<void> {
-  if (!su) return;
-  console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(su));
+async function ingestBootstrapStaffRecord(su: any): Promise<boolean> {
+  if (!su) return false;
   const uComp = su.company_id || su.companyId;
-  if (!uComp) return;
+  if (!uComp) return false;
 
   const staffId = su.id || su.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
   const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
@@ -143,6 +145,7 @@ async function ingestBootstrapStaffRecord(su: any): Promise<void> {
     ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
   };
 
+  let didSave = false;
   await routeCloudRecordThroughSyncCore(
     {
       packetId: `SERVER-BOOTSTRAP-STAFF-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
@@ -159,17 +162,11 @@ async function ingestBootstrapStaffRecord(su: any): Promise<void> {
     },
     existingStaff,
     () => {
-      const savedStaff = saveSalesperson(staffPayload, { fromSync: true });
-      console.log(
-        '[STAFF TRACE] 7. Saved to DB. New Pin:',
-        savedStaff.pin_hash,
-        'New Branches:',
-        (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
-        'Role:',
-        savedStaff.role
-      );
+      saveSalesperson(staffPayload, { fromSync: true, silent: true, silentBroadcast: true });
+      didSave = true;
     }
   );
+  return didSave;
 }
 
 export interface GlobalSystemConfig {
@@ -509,6 +506,7 @@ export async function initializeSystemConfigAndSync(): Promise<{
 
     // 2. Query companies & users from server
     let authoritativeCloudIds: string[] | null = null;
+    let serverAlreadyCloudSynced = false;
     try {
       const serverRes = await fetchWithTimeout(
         '/api/saas/companies',
@@ -517,38 +515,40 @@ export async function initializeSystemConfigAndSync(): Promise<{
       );
       if (serverRes.ok) {
         const serverData = await serverRes.json();
-        if (serverData && Array.isArray(serverData.companies)) {
-          serverData.companies.forEach((sc: any) => {
-            if (sc && sc.company_id) {
-              saveCompany(sc);
-            }
-          });
-          if (serverData.cloudSynced === true && serverData.companies.length > 0) {
+        if (serverData && Array.isArray(serverData.companies) && serverData.companies.length > 0) {
+          saveCompaniesBulk(serverData.companies);
+          if (serverData.cloudSynced === true) {
+            serverAlreadyCloudSynced = true;
             authoritativeCloudIds = serverData.companies
               .map((sc: any) => String(sc?.company_id || '').trim())
               .filter(Boolean);
           }
         }
-        if (serverData && Array.isArray(serverData.branches)) {
-          serverData.branches.forEach((sb: any) => {
-            const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
-            if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
-              saveBranch(sb, { fromSync: true });
-            }
-          });
+        if (serverData && Array.isArray(serverData.branches) && serverData.branches.length > 0) {
+          saveBranchesBulk(serverData.branches, { fromSync: true });
         }
-        if (serverData && Array.isArray(serverData.users)) {
-          for (const su of serverData.users) {
-            await ingestBootstrapStaffRecord(su);
+        if (serverData && Array.isArray(serverData.users) && serverData.users.length > 0) {
+          let anyStaffSaved = false;
+          for (let i = 0; i < serverData.users.length; i++) {
+            if (i > 0 && i % 40 === 0) {
+              await new Promise((r) => setTimeout(r, 0));
+            }
+            if (await ingestBootstrapStaffRecord(serverData.users[i])) {
+              anyStaffSaved = true;
+            }
           }
+          if (anyStaffSaved) flushRoomDatabaseNotifications();
         }
       }
     } catch {
       // ignore
     }
 
-    // 3. Query Master Google Sheet (if configured)
-    const masterRes = await fetchCompaniesFromMasterSheet().catch(() => null);
+    // 3. Query Master Google Sheet ONLY if Step 2 did NOT already sync live from Master Cloud
+    //    (eliminates double back-to-back get_companies downloads on every page load)
+    const masterRes = serverAlreadyCloudSynced
+      ? null
+      : await fetchCompaniesFromMasterSheet().catch(() => null);
     if (masterRes?.cloudSynced && Array.isArray(masterRes.companies) && masterRes.companies.length > 0) {
       authoritativeCloudIds = masterRes.companies
         .map((mc) => String(mc?.company_id || '').trim())

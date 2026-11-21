@@ -22,9 +22,12 @@ import {
   getCompanies,
   getBranches,
   saveCompany,
+  saveCompaniesBulk,
   pruneLocalCompaniesToAllowlist,
   saveBranch,
+  saveBranchesBulk,
   saveSalesperson,
+  flushRoomDatabaseNotifications,
   getAllSalespeople,
   getSalespeopleForCompany,
   getOwnerDefaultPermissions,
@@ -1656,12 +1659,13 @@ export const fetchCompaniesFromMasterSheet = async (
 
   try {
     if (remoteList.length > 0) {
-      remoteList.forEach((c) => {
-        if (!c || !c.company_id) return;
-        const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+      const masterSheetId = config.masterSpreadsheetId || DEFAULT_MASTER_SPREADSHEET_ID;
+      const normalizedCompanies: Company[] = [];
+      for (const c of remoteList) {
+        if (!c || !c.company_id) continue;
         const safeSheetId = sanitizeTenantSheetId(c.company_id, c.sheet_id, masterSheetId);
         const safeFolderId = isMasterSpreadsheetId(c.sheet_folder_id, masterSheetId) ? '' : (c.sheet_folder_id || '');
-        saveCompany({
+        normalizedCompanies.push({
           company_id: c.company_id,
           company_name: c.company_name || c.company_id,
           owner_name: c.owner_name || 'Business Owner',
@@ -1678,12 +1682,20 @@ export const fetchCompaniesFromMasterSheet = async (
           branch_isolation_mode: c.branch_isolation_mode || 'ROW_LEVEL',
           trial_days_remaining: c.trial_days_remaining,
         });
+      }
+      saveCompaniesBulk(normalizedCompanies);
 
-        const existingStaff = getSalespeopleForCompany(c.company_id);
-        const existingAllCompanyStaff = getAllSalespeople().filter(
-          (s) => String(s.companyId || (s as any).company_id || '').toUpperCase() === String(c.company_id || '').toUpperCase()
-        );
-        if (existingStaff.length === 0 && existingAllCompanyStaff.length === 0 && (c.owner_name || c.owner_email)) {
+      // Seed missing default owner accounts silently (single scan of all salespeople)
+      const allStaffSnapshot = getAllSalespeople();
+      const companiesWithStaff = new Set<string>();
+      for (const s of allStaffSnapshot) {
+        const cid = String(s.companyId || (s as any).company_id || '').trim().toUpperCase();
+        if (cid) companiesWithStaff.add(cid);
+      }
+      let seededOwners = 0;
+      for (const c of normalizedCompanies) {
+        const cidUpper = String(c.company_id || '').trim().toUpperCase();
+        if (!companiesWithStaff.has(cidUpper) && (c.owner_name || c.owner_email)) {
           saveSalesperson(
             {
               id: `USR-${c.company_id}-001`,
@@ -1702,114 +1714,123 @@ export const fetchCompaniesFromMasterSheet = async (
               mutationSource: 'SEED',
               updatedAt: 0,
             },
-            { fromSync: true }
+            { fromSync: true, silent: true, silentBroadcast: true }
           );
+          companiesWithStaff.add(cidUpper);
+          seededOwners++;
         }
-      });
+      }
+      if (seededOwners > 0) flushRoomDatabaseNotifications();
     }
 
     if (remoteBranches.length > 0) {
-      remoteBranches.forEach((sb: any) => {
-        const bComp = sb?.company_id || sb?.companyId || sb?.CompanyID;
-        if (sb && bComp && (sb.branch_id || sb.branchId || sb.BranchID || sb.id)) {
-          saveBranch(sb, { fromSync: true });
-        }
-      });
+      // Single O(N) in-memory dedupe + 1 localStorage write (prevents UI freeze even if sheet has 46k+ rows)
+      saveBranchesBulk(remoteBranches, { fromSync: true });
     }
 
-    // Cross-device user synchronization: route through SyncCore T2 LWW gate and skip when paused
+    // Cross-device user synchronization: deduplicate first, ingest silently in yielded chunks
     if (remoteUsers.length > 0 && !persistentSyncEngine.isSyncPaused() && !isAppScriptsIngestPaused()) {
+      const dedupedUsersMap = new Map<string, any>();
       for (const u of remoteUsers) {
-        const cloudStaff = u;
-        console.log('[STAFF TRACE] 6. AppScripts Ingest. Incoming:', JSON.stringify(cloudStaff));
+        if (!u) continue;
+        const uComp = String(u.company_id || u.companyId || '').trim().toUpperCase();
+        const uId = String(u.id || u.user_id || u.email || '').trim().toUpperCase();
+        if (!uComp || !uId) continue;
+        dedupedUsersMap.set(`${uComp}::${uId}`, u);
+      }
+      const uniqueUsers = Array.from(dedupedUsersMap.values());
+      const existingStaffById = new Map(getAllSalespeople().map((s) => [s.id, s]));
+      let savedUserCount = 0;
+
+      for (let ui = 0; ui < uniqueUsers.length; ui++) {
+        // Yield every 40 records so typing on the Login screen stays 60fps
+        if (ui > 0 && ui % 40 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        const u = uniqueUsers[ui];
         const uComp = u.company_id || u.companyId;
-        if (uComp) {
-          const staffId = u.id || u.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
-          const existingStaff = getAllSalespeople().find((s) => s.id === staffId);
-          const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || 0;
-          const incomingVersion = Number(u.version || 0);
-          const incomingMutationSource =
-            u.mutationSource ||
-            u.mutation_source ||
-            (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : 'MIGRATION');
-          const incomingPinVersion = Number(u.pinVersion || u.pin_version || 0);
-          const incomingPinUpdatedAt = parseTimestampMs(u.pinUpdatedAt || u.pin_updated_at) || incomingTs;
-          const existingPinVersion = Number((existingStaff as any)?.pinVersion || 0);
-          const existingPinUpdatedAt = parseTimestampMs((existingStaff as any)?.pinUpdatedAt || existingStaff?.updatedAt);
-          const existingHasPin = Boolean(existingStaff?.pin_hash || existingStaff?.pin);
-          const shouldKeepExistingPin =
-            existingHasPin &&
-            (
-              !u.pin_hash ||
-              (existingPinVersion > 0 && incomingPinVersion === 0) ||
-              (existingPinVersion > 0 && incomingPinVersion > 0 && existingPinVersion > incomingPinVersion) ||
-              (existingPinUpdatedAt > 0 && incomingPinUpdatedAt > 0 && existingPinUpdatedAt - incomingPinUpdatedAt > 5000) ||
-              incomingTs === 0
-            );
-          const pinHash = shouldKeepExistingPin ? existingStaff?.pin_hash : (u.pin_hash || existingStaff?.pin_hash);
-          const pinSalt = shouldKeepExistingPin ? existingStaff?.pin_salt : (u.pin_salt || existingStaff?.pin_salt);
-          const effectivePinVersion = Math.max(existingPinVersion, incomingPinVersion);
-          const effectivePinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
-          const resolvedBranchId = u.branch_id || u.branchId || existingStaff?.branchId || 'BR-MAIN';
-          const resolvedBranchAssignments = u.branchAssignments || existingStaff?.branchAssignments;
-          const resolvedAssignedBranchIds =
-            u.assignedBranchIds ||
-            (Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
-              ? resolvedBranchAssignments.map((a: any) => a.branchId).filter(Boolean)
-              : (existingStaff as any)?.assignedBranchIds);
-          const staffObj: any = {
-            id: staffId,
-            name: u.full_name || u.name || existingStaff?.name || 'Staff Member',
-            role: (u.role || existingStaff?.role || 'OWNER').toUpperCase() as any,
-            email: u.email || existingStaff?.email || '',
-            ...(pinHash
-              ? { pin_hash: pinHash, ...(pinSalt ? { pin_salt: pinSalt } : {}) }
-              : existingStaff?.pin
-              ? { pin: existingStaff.pin }
-              : { pin: String(u.pin || '1234') }),
-            phone: u.phone || existingStaff?.phone || '',
-            active: u.is_active === false || u.active === 'N' ? 'N' : 'Y',
-            companyId: uComp,
-            company_id: uComp,
-            branchId: resolvedBranchId,
-            branch_id: resolvedBranchId,
-            ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
-            ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
-            permissions: u.permissions || existingStaff?.permissions || getOwnerDefaultPermissions(),
+        if (!uComp) continue;
+        const staffId = u.id || u.user_id || `USR-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+        const existingStaff = existingStaffById.get(staffId);
+        const incomingTs = parseTimestampMs(u.updatedAt || u.updated_at || u.lastUpdated) || 0;
+        const incomingVersion = Number(u.version || 0);
+        const incomingMutationSource =
+          u.mutationSource ||
+          u.mutation_source ||
+          (incomingTs === 0 && incomingVersion === 0 ? 'SEED' : 'MIGRATION');
+        const incomingPinVersion = Number(u.pinVersion || u.pin_version || 0);
+        const incomingPinUpdatedAt = parseTimestampMs(u.pinUpdatedAt || u.pin_updated_at) || incomingTs;
+        const existingPinVersion = Number((existingStaff as any)?.pinVersion || 0);
+        const existingPinUpdatedAt = parseTimestampMs((existingStaff as any)?.pinUpdatedAt || existingStaff?.updatedAt);
+        const existingHasPin = Boolean(existingStaff?.pin_hash || existingStaff?.pin);
+        const shouldKeepExistingPin =
+          existingHasPin &&
+          (
+            !u.pin_hash ||
+            (existingPinVersion > 0 && incomingPinVersion === 0) ||
+            (existingPinVersion > 0 && incomingPinVersion > 0 && existingPinVersion > incomingPinVersion) ||
+            (existingPinUpdatedAt > 0 && incomingPinUpdatedAt > 0 && existingPinUpdatedAt - incomingPinUpdatedAt > 5000) ||
+            incomingTs === 0
+          );
+        const pinHash = shouldKeepExistingPin ? existingStaff?.pin_hash : (u.pin_hash || existingStaff?.pin_hash);
+        const pinSalt = shouldKeepExistingPin ? existingStaff?.pin_salt : (u.pin_salt || existingStaff?.pin_salt);
+        const effectivePinVersion = Math.max(existingPinVersion, incomingPinVersion);
+        const effectivePinUpdatedAt = Math.max(existingPinUpdatedAt, incomingPinUpdatedAt);
+        const resolvedBranchId = u.branch_id || u.branchId || existingStaff?.branchId || 'BR-MAIN';
+        const resolvedBranchAssignments = u.branchAssignments || existingStaff?.branchAssignments;
+        const resolvedAssignedBranchIds =
+          u.assignedBranchIds ||
+          (Array.isArray(resolvedBranchAssignments) && resolvedBranchAssignments.length > 0
+            ? resolvedBranchAssignments.map((a: any) => a.branchId).filter(Boolean)
+            : (existingStaff as any)?.assignedBranchIds);
+        const staffObj: any = {
+          id: staffId,
+          name: u.full_name || u.name || existingStaff?.name || 'Staff Member',
+          role: (u.role || existingStaff?.role || 'OWNER').toUpperCase() as any,
+          email: u.email || existingStaff?.email || '',
+          ...(pinHash
+            ? { pin_hash: pinHash, ...(pinSalt ? { pin_salt: pinSalt } : {}) }
+            : existingStaff?.pin
+            ? { pin: existingStaff.pin }
+            : { pin: String(u.pin || '1234') }),
+          phone: u.phone || existingStaff?.phone || '',
+          active: u.is_active === false || u.active === 'N' ? 'N' : 'Y',
+          companyId: uComp,
+          company_id: uComp,
+          branchId: resolvedBranchId,
+          branch_id: resolvedBranchId,
+          ...(resolvedBranchAssignments ? { branchAssignments: resolvedBranchAssignments } : {}),
+          ...(resolvedAssignedBranchIds ? { assignedBranchIds: resolvedAssignedBranchIds } : {}),
+          permissions: u.permissions || existingStaff?.permissions || getOwnerDefaultPermissions(),
+          version: incomingVersion,
+          mutationSource: incomingMutationSource,
+          ...(effectivePinVersion > 0 ? { pinVersion: effectivePinVersion } : {}),
+          ...(effectivePinUpdatedAt > 0 ? { pinUpdatedAt: effectivePinUpdatedAt } : {}),
+          ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
+        };
+        await routeCloudRecordThroughSyncCore(
+          {
+            packetId: `GAS-MASTER-STAFF-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
+            entityType: 'staff',
+            entityId: String(staffId),
+            action: 'UPSERT',
+            data: staffObj,
+            updatedAt: incomingTs,
             version: incomingVersion,
             mutationSource: incomingMutationSource,
-            ...(effectivePinVersion > 0 ? { pinVersion: effectivePinVersion } : {}),
-            ...(effectivePinUpdatedAt > 0 ? { pinUpdatedAt: effectivePinUpdatedAt } : {}),
-            ...(incomingTs > 0 ? { updatedAt: incomingTs, lastUpdated: new Date(incomingTs).toISOString() } : {}),
-          };
-          await routeCloudRecordThroughSyncCore(
-            {
-              packetId: `CLOUD-MASTER-STAFF-${staffId}-${incomingTs}-${Math.random().toString(36).substring(2, 6)}`,
-              entityType: 'staff',
-              entityId: String(staffId),
-              action: 'UPSERT',
-              data: staffObj,
-              updatedAt: incomingTs,
-              version: incomingVersion,
-              mutationSource: incomingMutationSource,
-              originDeviceId: 'APPS_SCRIPT_CLOUD',
-              targetBranchId: 'ALL',
-              class: 'T2',
-            },
-            existingStaff,
-            () => {
-              const savedStaff = saveSalesperson(staffObj, { fromSync: true });
-              console.log(
-                '[STAFF TRACE] 7. Saved to DB. New Pin:',
-                savedStaff.pin_hash,
-                'New Branches:',
-                (savedStaff as any).assignedBranchIds ?? savedStaff.branchAssignments?.map((b) => b.branchId),
-                'Role:',
-                savedStaff.role
-              );
-            }
-          );
-        }
+            originDeviceId: 'APPS_SCRIPT_CLOUD',
+            targetBranchId: 'ALL',
+            class: 'T2',
+          },
+          existingStaff,
+          () => {
+            saveSalesperson(staffObj, { fromSync: true, silent: true, silentBroadcast: true });
+            savedUserCount++;
+          }
+        );
+      }
+      if (savedUserCount > 0) {
+        flushRoomDatabaseNotifications();
       }
     }
 
@@ -2571,7 +2592,7 @@ export const authenticateOwnerWithAppsScript = async (
           routing_epoch: typeof srvData.routing_epoch === 'number' ? srvData.routing_epoch : undefined,
           message: srvData.message,
         };
-      } else if (srvData && (srvData.status === 'error' || srvData.success === false)) {
+      } else if (srvData && (srvData.status === 'error' || srvData.success === false) && srvData.cloudChecked !== false) {
         return {
           status: 'error',
           message: srvData.message || 'Invalid credentials',

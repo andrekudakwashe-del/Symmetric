@@ -4994,6 +4994,7 @@ function handleGetStock(req, ss, masterSsOpt) {
 
 function handleGetCompanies(req, ss) {
   var cSheet = ss.getSheetByName("companies");
+  var compMap = {};
   var list = [];
   if (cSheet && cSheet.getLastRow() >= 2) {
     var vals = cSheet.getDataRange().getValues();
@@ -5006,11 +5007,19 @@ function handleGetCompanies(req, ss) {
       }
       if (!obj.company_id) continue;
       if (obj.is_deleted === true || String(obj.is_deleted).toUpperCase() === "TRUE") continue;
-      list.push(obj);
+      var cKey = String(obj.company_id).trim().toUpperCase();
+      if (compMap[cKey] !== undefined) {
+        list[compMap[cKey]] = obj;
+      } else {
+        compMap[cKey] = list.length;
+        list.push(obj);
+      }
     }
   }
 
+  // Deduplicate branches in-memory by company_id::branch_id so bloated duplicate rows never bloat payload
   var branches = [];
+  var branchMap = {};
   var bSheet = ss.getSheetByName("branches");
   if (bSheet && bSheet.getLastRow() >= 2) {
     var bVals = bSheet.getDataRange().getValues();
@@ -5025,11 +5034,21 @@ function handleGetCompanies(req, ss) {
       bObj.name = bObj.branch_name || bObj.name || bObj.branch_id;
       bObj.code = bObj.branch_code || bObj.code || bObj.branch_id;
       bObj.location = bObj.location || bObj.address || "";
-      branches.push(bObj);
+      var bCompKey = String(bObj.company_id).trim().toUpperCase();
+      var bIdKey = String(bObj.branch_id).trim().toUpperCase();
+      var bKey = bCompKey + "::" + bIdKey;
+      if (branchMap[bKey] !== undefined) {
+        branches[branchMap[bKey]] = bObj;
+      } else {
+        branchMap[bKey] = branches.length;
+        branches.push(bObj);
+      }
     }
   }
 
+  // Deduplicate users in-memory by company_id::user_id
   var users = [];
+  var userMap = {};
   var uSheet = ss.getSheetByName("users");
   if (uSheet && uSheet.getLastRow() >= 2) {
     var uVals = uSheet.getDataRange().getValues();
@@ -5051,7 +5070,13 @@ function handleGetCompanies(req, ss) {
       uObj.pinUpdatedAt = parseTimestampMsSafe(uObj.pin_updated_at);
       uObj.updatedAt = parseTimestampMsSafe(uObj.client_updated_at) || parseTimestampMsSafe(uObj.updated_at);
       uObj.mutationSource = uObj.mutation_source || "";
-      users.push(uObj);
+      var uKey = String(uObj.company_id).trim().toUpperCase() + "::" + String(uObj.user_id).trim().toUpperCase();
+      if (userMap[uKey] !== undefined) {
+        users[userMap[uKey]] = uObj;
+      } else {
+        userMap[uKey] = users.length;
+        users.push(uObj);
+      }
     }
   }
 

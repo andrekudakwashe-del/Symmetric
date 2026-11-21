@@ -4848,6 +4848,173 @@ export const saveBranch = (
   }
 };
 
+/**
+ * High-performance O(N) bulk branch upsert.
+ * Deduplicates thousands of incoming rows in memory first, performs ONE localStorage write,
+ * and dispatches ONE UI notification — preventing main-thread freezes when remote sheets have duplicate rows.
+ */
+export const saveBranchesBulk = (
+  incomingBranches: any[],
+  options?: { fromSync?: boolean }
+): number => {
+  if (!Array.isArray(incomingBranches) || incomingBranches.length === 0) return 0;
+
+  const currentCompany = getCurrentCompanyId();
+  const now = Date.now();
+
+  // Load deletion filters ONCE
+  let deletedSet: Set<string> | null = null;
+  let tombMap: Map<string, number> | null = null;
+  if (options?.fromSync) {
+    const deletedList = getStored<string[]>(STORAGE_KEYS.DELETED_BRANCH_IDS, []);
+    deletedSet = new Set(deletedList.map((d) => canonicalizeBranchId(d).toUpperCase()));
+    tombMap = new Map<string, number>();
+    for (const t of getTombstones()) {
+      if (normalizeRoomTombstoneType(t.entityType) === 'branch') {
+        const k = canonicalizeBranchId(t.entityId).toUpperCase();
+        const prev = tombMap.get(k) || 0;
+        const delAt = Number(t.deletedAt || 0);
+        if (delAt >= prev) tombMap.set(k, delAt);
+      }
+    }
+  }
+
+  // Pass 1: Collapse incoming duplicates in memory O(N)
+  const dedupedIncoming = new Map<string, any>();
+  for (let i = 0; i < incomingBranches.length; i++) {
+    const raw = incomingBranches[i];
+    if (!raw || typeof raw !== 'object' || !isValidBranchRecord(raw)) continue;
+    const rawComp = raw.company_id || raw.companyId || raw.CompanyID || currentCompany;
+    const compId = normBranchTenant(rawComp);
+    const rawId = String(raw.branchId || raw.id || raw.branch_id || raw.BranchID || 'BR-MAIN').trim();
+    const id = canonicalizeBranchId(rawId);
+    const idUpper = id.toUpperCase();
+    const incomingTs = parseTimestampMs(raw.updatedAt || raw.updated_at || raw.lastUpdated || raw.hubTimestamp);
+
+    if (options?.fromSync && deletedSet && deletedSet.has(idUpper)) {
+      const tombDelAt = tombMap?.get(idUpper) || 0;
+      if (incomingTs === 0 || tombDelAt >= incomingTs) continue;
+    }
+
+    const key = `${compId}::${idUpper}`;
+    const prev = dedupedIncoming.get(key);
+    if (!prev) {
+      dedupedIncoming.set(key, raw);
+    } else {
+      const prevTs = parseTimestampMs(prev.updatedAt || prev.updated_at || prev.lastUpdated || prev.hubTimestamp);
+      const prevName = extractBranchName(prev);
+      const curName = extractBranchName(raw);
+      if (
+        incomingTs > prevTs ||
+        (incomingTs === prevTs && isPlaceholderBranchName(prevName) && !isPlaceholderBranchName(curName))
+      ) {
+        dedupedIncoming.set(key, raw);
+      }
+    }
+  }
+
+  if (dedupedIncoming.size === 0) return 0;
+
+  // Pass 2: Merge into existing branches ONCE
+  const existingList = getAllBranches();
+  const updated = [...existingList];
+  const byCompId = new Map<string, number>();
+  const byCompCode = new Map<string, number>();
+
+  for (let i = 0; i < updated.length; i++) {
+    const b = updated[i];
+    const c = normBranchTenant(b.company_id || b.companyId);
+    const bId = canonicalizeBranchId(b.branchId || b.id || (b as any).branch_id).toUpperCase();
+    byCompId.set(`${c}::${bId}`, i);
+    const bCode = String(b.code || '').trim().toUpperCase();
+    if (bCode && !isPlaceholderBranchCode(bCode, bId)) {
+      byCompCode.set(`${c}::${bCode}`, i);
+    }
+  }
+
+  let applied = 0;
+  dedupedIncoming.forEach((branch) => {
+    const rawComp = branch.company_id || branch.companyId || branch.CompanyID || currentCompany;
+    const compId = normBranchTenant(rawComp);
+    const rawId = String(branch.branchId || branch.id || branch.branch_id || branch.BranchID || 'BR-MAIN').trim();
+    const id = canonicalizeBranchId(rawId);
+    const incomingTs = parseTimestampMs(branch.updatedAt || branch.updated_at || branch.lastUpdated || branch.hubTimestamp);
+    const incomingName = extractBranchName(branch);
+    const incomingCode = extractBranchCode(branch);
+    const incomingLoc = extractBranchLocation(branch);
+
+    let index = byCompId.get(`${compId}::${id.toUpperCase()}`);
+    if (index === undefined && incomingCode && !isPlaceholderBranchCode(incomingCode, id)) {
+      index = byCompCode.get(`${compId}::${incomingCode.toUpperCase()}`);
+    }
+
+    const existing = index !== undefined ? updated[index] : undefined;
+    const seedMatch = findSeedBranch(id, compId);
+    const resolvedId = existing ? canonicalizeBranchId(existing.branchId || id) : id;
+
+    const resolvedName = options?.fromSync
+      ? (!isPlaceholderBranchName(incomingName)
+          ? incomingName
+          : existing && !isPlaceholderBranchName(existing.name)
+          ? existing.name
+          : seedMatch?.name || incomingName || existing?.name || 'Main Branch')
+      : (incomingName || existing?.name || seedMatch?.name || 'Main Branch');
+
+    const resolvedCode = options?.fromSync
+      ? (!isPlaceholderBranchCode(incomingCode, resolvedId)
+          ? incomingCode
+          : existing && !isPlaceholderBranchCode(existing.code, resolvedId)
+          ? existing.code
+          : seedMatch?.code || incomingCode || existing?.code || resolvedId)
+      : (incomingCode || existing?.code || seedMatch?.code || resolvedId);
+
+    const resolvedLoc =
+      incomingLoc || existing?.location || existing?.address || seedMatch?.location || '4th Street Commercial Center, Harare';
+
+    const existingTs = existing ? parseTimestampMs(existing.updatedAt || existing.lastUpdated) : 0;
+    const effectiveTs = options?.fromSync ? (incomingTs || existingTs || 0) : now;
+
+    const normalized: Branch = {
+      ...(existing || {}),
+      ...branch,
+      branchId: resolvedId,
+      id: resolvedId,
+      branch_id: resolvedId,
+      name: resolvedName,
+      code: resolvedCode,
+      location: resolvedLoc,
+      address: resolvedLoc,
+      company_id: compId,
+      companyId: compId,
+      ...(effectiveTs > 0
+        ? {
+            updatedAt: effectiveTs,
+            lastUpdated: new Date(effectiveTs).toISOString(),
+          }
+        : {}),
+    };
+
+    if (index !== undefined) {
+      updated[index] = normalized;
+    } else {
+      const nextIdx = updated.length;
+      updated.push(normalized);
+      byCompId.set(`${compId}::${resolvedId.toUpperCase()}`, nextIdx);
+      if (resolvedCode && !isPlaceholderBranchCode(resolvedCode, resolvedId)) {
+        byCompCode.set(`${compId}::${resolvedCode.toUpperCase()}`, nextIdx);
+      }
+    }
+    applied++;
+  });
+
+  setStored(STORAGE_KEYS.BRANCHES, updated);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_branches_updated', { detail: { bulk: true, count: applied } }));
+  }
+  notifyListeners();
+  return applied;
+};
+
 export const deleteBranch = (branchId: string, options?: { fromSync?: boolean }): boolean => {
   const cleanId = canonicalizeBranchId(branchId);
   const cleanUpper = cleanId.toUpperCase();
@@ -23239,6 +23406,62 @@ export function saveCompany(company: Company): void {
     window.dispatchEvent(new CustomEvent('saas_company_updated', { detail: cleanCompany }));
     window.dispatchEvent(new CustomEvent('saas_packages_updated', { detail: cleanCompany }));
   }
+}
+
+/**
+ * High-performance bulk company upsert: merges all incoming companies in memory,
+ * writes localStorage ONCE, and emits ONE UI notification.
+ */
+export function saveCompaniesBulk(incomingCompanies: Company[]): number {
+  if (!Array.isArray(incomingCompanies) || incomingCompanies.length === 0) return 0;
+  const list = getCompanies();
+  const byId = new Map<string, number>();
+  for (let i = 0; i < list.length; i++) {
+    if (list[i]?.company_id) {
+      byId.set(String(list[i].company_id).trim().toUpperCase(), i);
+    }
+  }
+
+  let applied = 0;
+  for (let i = 0; i < incomingCompanies.length; i++) {
+    const raw = incomingCompanies[i];
+    if (!raw || !raw.company_id) continue;
+    const cleanCompany = sanitizeCompanyRecord_({ ...raw });
+    if (cleanCompany.plan) {
+      if (
+        !cleanCompany.package_id ||
+        cleanCompany.package_id === 'pkg_starter' ||
+        cleanCompany.package_id === 'pkg_professional' ||
+        cleanCompany.package_id === 'pkg_enterprise'
+      ) {
+        if (cleanCompany.plan === 'ENTERPRISE') cleanCompany.package_id = 'pkg_enterprise';
+        else if (cleanCompany.plan === 'PROFESSIONAL') cleanCompany.package_id = 'pkg_professional';
+        else if (cleanCompany.plan === 'STARTER') cleanCompany.package_id = 'pkg_starter';
+      }
+    }
+    const key = String(cleanCompany.company_id).trim().toUpperCase();
+    const exIdx = byId.get(key);
+    if (exIdx !== undefined) {
+      list[exIdx] = { ...list[exIdx], ...cleanCompany };
+    } else {
+      byId.set(key, list.length);
+      list.push(cleanCompany);
+    }
+    applied++;
+  }
+
+  if (applied > 0) {
+    setStored(STORAGE_KEYS.COMPANIES, list);
+    notifyListeners();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saas_company_updated', { detail: { bulk: true, count: applied } }));
+    }
+  }
+  return applied;
+}
+
+export function flushRoomDatabaseNotifications(): void {
+  notifyListeners();
 }
 
 const PROTECTED_LOCAL_COMPANY_IDS = new Set(['COMP-001', 'COMP-MASTER']);

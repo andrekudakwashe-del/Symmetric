@@ -3,7 +3,7 @@
  * Provides 100% offline app loading, clean cache management, and instant updates.
  */
 
-const CACHE_NAME = 'saimetric-v5-offline-v8';
+const CACHE_NAME = 'saimetric-v5-offline-v9';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',
@@ -11,7 +11,7 @@ const PRECACHE_ASSETS = [
   '/icon.svg',
 ];
 
-// Install: precache the core shell resiliently
+// Install: precache the core shell resiliently and activate immediately so stale bundles never linger
 self.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
@@ -29,8 +29,7 @@ self.addEventListener('install', (event) => {
           } catch (e) {}
         })
       );
-      // Notice: Do NOT call self.skipWaiting() here automatically.
-      // The update is applied when the user taps the 'Update' banner in the app.
+      await self.skipWaiting();
     })()
   );
 });

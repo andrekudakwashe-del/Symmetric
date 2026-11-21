@@ -29,7 +29,7 @@ import { OfflineIndicator } from './components/pwa/OfflineIndicator';
 import { SyncProgressIndicator } from './components/common/SyncProgressIndicator';
 import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
 import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield, X } from 'lucide-react';
-import { initializeSystemConfigAndSync } from './services/systemConfig';
+import { initializeSystemConfigAndSync, fetchGlobalSystemConfig } from './services/systemConfig';
 import { persistentSyncEngine } from './services/persistentSyncEngine';
 import { meshSyncService } from './services/meshSyncService';
 import { FunctionalHamburgerMenu } from './components/layout/FunctionalHamburgerMenu';
@@ -415,8 +415,26 @@ export default function App() {
     setDbVersion((v) => v + 1);
   };
 
-  // Sync global system config, tenants, and persistent sync engine on boot
+  // Lightweight boot config fetch on mount (never blocks LoginScreen typing or saturates mobile 4G)
   useEffect(() => {
+    fetchGlobalSystemConfig().catch(() => {});
+
+    // Only run full tenant list background sync before login if device is already bound to a store
+    let isBound = false;
+    try {
+      isBound = localStorage.getItem('saimetric_device_registered') === 'true';
+    } catch {}
+    if (isBound) {
+      const timer = setTimeout(() => {
+        initializeSystemConfigAndSync().catch(() => {});
+      }, 1500);
+      return () => clearTimeout(timer);
+    }
+  }, []);
+
+  // Post-login heavy engines: prefetch lazy modules, sync tenants, and start persistent sync engine ONLY after authentication
+  useEffect(() => {
+    if (!currentUser) return;
     prefetchAppModules();
     initializeSystemConfigAndSync().catch(() => {});
     persistentSyncEngine.initialize().catch((err) => console.warn('[App] Sync engine init error:', err));
@@ -425,7 +443,7 @@ export default function App() {
       setTenantAlert(alert);
     });
     return () => unsubAlerts();
-  }, []);
+  }, [Boolean(currentUser)]);
 
   // Multi-layered clock tampering monitor (boot, focus, online, visibility, and 60s interval)
   useEffect(() => {
