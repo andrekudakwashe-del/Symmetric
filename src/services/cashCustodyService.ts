@@ -1363,8 +1363,8 @@ function finalizeTransferLedger(transfer: CashTransfer, actor?: Salesperson, was
 
       if (targetStaff) {
         const todayStr = nowIso.split('T')[0];
-        const sId = getShiftId(targetStaff.id, todayStr);
-        const moves = getMovements();
+        const sId = getShiftId(targetStaff.id, todayStr, transfer.branch_id);
+        const moves = getMovements(undefined, transfer.branch_id);
         const hasInitialFloat = moves.some(
           (m) =>
             (m.shiftId === sId || (m.staffId === targetStaff.id && m.date === todayStr)) &&

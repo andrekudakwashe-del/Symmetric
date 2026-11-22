@@ -693,7 +693,7 @@ export function finalizeAndPostTripManifest(
     if (freightAmount <= 0) continue;
 
     if (lc.paymentMethod === 'cash_till') {
-      const shiftId = getShiftId(staffId, shiftDate);
+      const shiftId = getShiftId(staffId, shiftDate, trip.branchId);
       const movement = addMovement({
         shiftId,
         staffId,
@@ -721,7 +721,7 @@ export function finalizeAndPostTripManifest(
       });
       lc.payableId = payableId;
     } else if (lc.paymentMethod === 'petty_cash') {
-      const shiftId = getShiftId(staffId, shiftDate);
+      const shiftId = getShiftId(staffId, shiftDate, trip.branchId);
       const movement = addMovement({
         shiftId,
         staffId,

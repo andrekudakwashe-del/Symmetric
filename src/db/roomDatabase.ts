@@ -3973,6 +3973,7 @@ export const addSupplier = (
     } catch (e) {
       console.warn('[addSupplier] enqueueSync error:', e);
     }
+    notifySupplierChanged(created);
   }
 
   notifyListeners();
@@ -3991,10 +3992,22 @@ export const updateSupplier = (
   const all = getRawStoredSuppliers();
   const idx = all.findIndex((s) => s.supplierId === supplierId);
   if (idx === -1) return null;
-  const updated = { ...all[idx], ...updates };
+  const now = Date.now();
+  const updated = {
+    ...all[idx],
+    ...updates,
+    updatedAt: now,
+    lastUpdated: new Date(now).toISOString(),
+  };
   all[idx] = updated;
   setStored(STORAGE_KEYS.SUPPLIERS, all);
   enqueueSync('Suppliers', 'UPDATE', updated);
+  notifySupplierChanged(updated);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('saimetric_suppliers_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_suppliers_updated', { detail: updated }));
+  }
   return updated;
 };
 
@@ -4017,6 +4030,7 @@ export const deleteSupplier = (supplierId: string, options?: { fromSync?: boolea
   }
   notifyListeners();
   if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_suppliers_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_supplier_updated'));
   }
   return removed;
@@ -5805,17 +5819,20 @@ export const saveParkedSale = (data: {
 };
 
 export const deleteParkedSale = (id: string): void => {
-  const list = getAllParkedSales();
+  const list = getRawStoredParkedSales();
   const updated = list.filter((p) => p.id !== id);
   setStored(STORAGE_KEYS.PARKED_SALES, updated);
 };
 
 export const clearParkedSales = (): void => {
   const currentCompany = getCurrentCompanyId();
-  const list = getAllParkedSales();
+  const currentBranch = getCurrentBranchId();
+  const branches = getBranches();
+  const list = getRawStoredParkedSales();
   const updated = list.filter((p) => {
     const compId = p.company_id || p.companyId;
-    return compId && compId !== currentCompany;
+    const brId = p.branch_id || p.branchId;
+    return !isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId);
   });
   setStored(STORAGE_KEYS.PARKED_SALES, updated);
 };
@@ -6753,12 +6770,12 @@ export const addCashLift = (data: {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
 
-  const allLifts = getAllCashLifts();
+  const allLifts = getRawStoredCashLifts();
   const liftId = `LIFT-${Date.now().toString().slice(-6)}`;
 
   // Validate supervisor lift against drawer balance, with configurable overage tolerance
-  const shiftId = getShiftId(data.cashierId, dateStr);
-  const currentBal = computeDrawerBalance(shiftId, 'USD');
+  const shiftId = getShiftId(data.cashierId, dateStr, currentBranch);
+  const currentBal = computeDrawerBalance(shiftId, 'USD', currentBranch);
   const govConfig = getCashGovernanceConfig();
   let overageAmount = 0;
 
@@ -6832,7 +6849,7 @@ export const addCashLift = (data: {
 
   // Write supervisor_lift movement to cashMovements (Out from cashier drawer)
   addMovement({
-    shiftId: getShiftId(data.cashierId, dateStr),
+    shiftId: getShiftId(data.cashierId, dateStr, currentBranch),
     staffId: data.cashierId,
     date: dateStr,
     timestamp: newLift.timestamp,
@@ -6855,7 +6872,7 @@ export const addCashLift = (data: {
   // Also record supervisor custody intake movement (In to supervisor expected handover cash)
   if (data.supervisorId) {
     addMovement({
-      shiftId: getShiftId(data.supervisorId, dateStr),
+      shiftId: getShiftId(data.supervisorId, dateStr, currentBranch),
       staffId: data.supervisorId,
       date: dateStr,
       timestamp: newLift.timestamp,
@@ -6940,7 +6957,7 @@ export const addCashLift = (data: {
 };
 
 export const deleteCashLift = (liftId: string): boolean => {
-  const allLifts = getAllCashLifts();
+  const allLifts = getRawStoredCashLifts();
   const target = allLifts.find((l) => l.id === liftId);
   if (!target) return false;
 
@@ -7069,7 +7086,7 @@ export const saveFinalCashCount = (
   }
 
   // Clean up any legacy "Final Cash Out" rows in CASH_LOGS for this staff, date, and branch
-  const allLogs = getAllCashLogs();
+  const allLogs = getRawStoredCashLogs();
   const cleanedLogs = allLogs.filter(
     (l) => {
       const compId = (l as any).company_id || (l as any).companyId || 'COMP-001';
@@ -7374,11 +7391,13 @@ export const saveDailyCustomerChangeSheet = (
 ): CustomerChangeEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const all = getAllCustomerChanges();
-  // Keep records for other companies or other staff/dates in this company
+  const branches = getBranches();
+  const all = getRawStoredCustomerChanges();
+  // Keep records for other companies, other branches, or other staff/dates in this branch
   const otherChanges = all.filter((c) => {
     const compId = c.company_id || c.companyId || 'COMP-001';
-    if (compId !== currentCompany) return true;
+    const brId = (c as any).branch_id || (c as any).branchId;
+    if (!isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) return true;
     return !(c.staffId === staffId && c.date === date);
   });
   const valid = entries.filter((e) => e.customerName.trim() !== '' && (e.in > 0 || e.out > 0));
@@ -7388,7 +7407,7 @@ export const saveDailyCustomerChangeSheet = (
   }
 
   // Clean up existing sourceModule: 'form3' movements for this shift
-  const shiftId = getShiftId(staffId, date);
+  const shiftId = getShiftId(staffId, date, currentBranch);
   const currentMovements = getMovements();
   const toDelete = currentMovements.filter(
     (m) => matchesShift(m, shiftId) && m.sourceModule === 'form3' && (m.type === 'change_received' || m.type === 'change_paid')
@@ -7847,7 +7866,7 @@ export const saveCreditPolicy = (policy: StoreCreditPolicy): void => {
 
 export const DEFAULT_BRANCH_SHARING_SETTINGS: CompanyBranchSharingSettings = {
   shareCustomersAcrossBranches: false,
-  shareSuppliersAcrossBranches: false,
+  shareSuppliersAcrossBranches: true,
   form4AuditPassword: '',
   eodVerificationMode: 'SINGLE',
 };
@@ -8092,7 +8111,7 @@ export const approveCreditSale = (
   id: string,
   supervisor: Salesperson
 ): boolean => {
-  const all = getAllCreditSales();
+  const all = getRawStoredCreditSales();
   let found = false;
   const updated = all.map((c) => {
     if (c.id === id) {
@@ -8119,7 +8138,7 @@ export const flagCreditSale = (
   supervisor: Salesperson,
   reason: string
 ): boolean => {
-  const all = getAllCreditSales();
+  const all = getRawStoredCreditSales();
   let found = false;
   const updated = all.map((c) => {
     if (c.id === id) {
@@ -8159,11 +8178,13 @@ export const saveDailyCreditSalesSheet = (
 ): CreditSaleEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const all = getAllCreditSales();
-  // Keep records for other companies or other staff/dates in this company
+  const branches = getBranches();
+  const all = getRawStoredCreditSales();
+  // Keep records for other companies, other branches, or other staff/dates in this branch
   const otherCredits = all.filter((c) => {
     const compId = c.company_id || c.companyId || 'COMP-001';
-    if (compId !== currentCompany) return true;
+    const brId = (c as any).branch_id || (c as any).branchId;
+    if (!isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) return true;
     return !(c.staffId === staffId && c.date === date);
   });
   const valid = entries.filter(
@@ -8177,7 +8198,7 @@ export const saveDailyCreditSalesSheet = (
   }
 
   // Clean up existing sourceModule: 'form3' credit movements for this shift
-  const shiftId = getShiftId(staffId, date);
+  const shiftId = getShiftId(staffId, date, currentBranch);
   const currentMovements = getMovements();
   const toDelete = currentMovements.filter(
     (m) => matchesShift(m, shiftId) && m.sourceModule === 'form3' && m.type === 'credit_cash_payment'
@@ -8582,6 +8603,24 @@ export const notifyCustomerChanged = (customer: any) => {
       fn(customer);
     } catch (e) {
       console.error('customerChangeListener error:', e);
+    }
+  });
+};
+
+export type SupplierChangeListener = (supplier: Supplier) => void;
+const supplierChangeListeners: Set<SupplierChangeListener> = new Set();
+export const onSupplierChanged = (listener: SupplierChangeListener) => {
+  supplierChangeListeners.add(listener);
+  return () => {
+    supplierChangeListeners.delete(listener);
+  };
+};
+export const notifySupplierChanged = (supplier: Supplier) => {
+  supplierChangeListeners.forEach((fn) => {
+    try {
+      fn(supplier);
+    } catch (e) {
+      console.error('supplierChangeListener error:', e);
     }
   });
 };
@@ -9307,7 +9346,7 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
         }
         // Drawer cash adjustment for exchange net difference
         if (ex.netDifference && ex.paymentMethod === 'Cash') {
-          const shiftId = getShiftId(ex.cashierId || sale.staffId, ex.date || sale.date);
+          const shiftId = getShiftId(ex.cashierId || sale.staffId, ex.date || sale.date, sale.branch_id || sale.branchId);
           if (ex.netDifference > 0) {
             addMovement({
               shiftId,
@@ -11055,9 +11094,9 @@ export const exchangeSaleItems = (params: {
   }
 
   // 2. Financial Ledger Movements (Cash Drawer & Form 2):
-  const shiftId = getShiftId(params.cashier.id, dateStr);
   const compId = invoice.company_id || invoice.companyId;
   const brId = invoice.branch_id || invoice.branchId;
+  const shiftId = getShiftId(params.cashier.id, dateStr, brId);
 
   if (netDifference > 0) {
     // Customer pays extra difference
@@ -11694,7 +11733,7 @@ export const rejectExpense = (
 
     // 2. Compensatory cash movement into the cashier's drawer
     addMovement({
-      shiftId: getShiftId(targetStaffId, shiftDate),
+      shiftId: getShiftId(targetStaffId, shiftDate, exp.branch_id || (exp as any).branchId),
       staffId: targetStaffId,
       date: shiftDate,
       timestamp: now,
@@ -11901,15 +11940,17 @@ export const saveAdminSalesEntry = (
   notes?: string,
   options?: { fromSync?: boolean; id?: string; timestamp?: string; company_id?: string; branch_id?: string }
 ): AdminSalesEntry => {
-  const all = getAllAdminSales();
+  const all = getRawStoredAdminSales();
   const currentCompany = options?.company_id || getCurrentCompanyId();
   const currentBranch = options?.branch_id || getCurrentBranchId();
+  const branches = getBranches();
   const id = options?.id || `AS-${date}-${staffId}`;
   const now = options?.timestamp || new Date().toISOString();
   const existingIdx = all.findIndex((s) => {
     if (s.id && s.id === id) return true;
     const compId = (s as any).company_id || (s as any).companyId || 'COMP-001';
-    return compId === currentCompany && s.staffId === staffId && s.date === date;
+    const brId = (s as any).branch_id || (s as any).branchId;
+    return isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId) && s.staffId === staffId && s.date === date;
   });
 
   const entry: AdminSalesEntry = {
@@ -11963,13 +12004,16 @@ export const saveAllAdminSalesEntries = (
     notes?: string;
   }>
 ): AdminSalesEntry[] => {
-  const all = getAllAdminSales();
+  const all = getRawStoredAdminSales();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  // Filter out any entries for this specific date and company that we are updating
+  const branches = getBranches();
+  // Filter out any entries for this specific date, company, and branch that we are updating
   const otherEntries = all.filter((s) => {
     const compId = (s as any).company_id || (s as any).companyId || 'COMP-001';
-    return compId !== currentCompany || s.date !== date;
+    const brId = (s as any).branch_id || (s as any).branchId;
+    if (!isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) return true;
+    return s.date !== date;
   });
   const now = new Date().toISOString();
 
@@ -15561,21 +15605,17 @@ export const ingestMeshSupervisorApproval = (entry: AuditLogEntry): boolean => {
   if (!entry) return false;
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const currentBranchCode = getCurrentBranch()?.code;
+  const branches = getBranches();
 
   const compId = (entry.company_id || entry.companyId || currentCompany).trim().toUpperCase();
   if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
 
   const brId = (entry.branch_id || entry.branchId || currentBranch).trim().toUpperCase();
-  if (
-    brId &&
-    brId !== currentBranch.trim().toUpperCase() &&
-    brId !== (currentBranchCode || '').trim().toUpperCase()
-  ) {
+  if (brId && !isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) {
     return false;
   }
 
-  const all = getAuditLogs();
+  const all = getRawStoredAuditLogs();
   const exists = all.some(
     (l) =>
       (entry.id && l.id === entry.id) ||
@@ -15597,7 +15637,7 @@ export const ingestMeshSupervisorApproval = (entry: AuditLogEntry): boolean => {
 
   // If this was an approved GRV or EOD, update corresponding record
   if (((entry.action as string) === 'APPROVE_DIRECT_GRV' || (entry.action as string) === 'DIRECT_GRV_APPROVE') && entry.referenceId) {
-    const grvs = getDirectGrvs();
+    const grvs = getRawStoredDirectGrvs();
     const grv = grvs.find((g) => g.grvNumber === entry.referenceId || g.id === entry.referenceId);
     if (grv && grv.status !== 'APPROVED') {
       grv.status = 'APPROVED';
@@ -15624,17 +15664,13 @@ export const ingestMeshCashLog = (entry: CashLogEntry): boolean => {
   const normEntry = normalizeCashLogRecord(entry);
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const currentBranchCode = getCurrentBranch()?.code;
+  const branches = getBranches();
 
   const compId = (normEntry.company_id || normEntry.companyId || currentCompany).trim().toUpperCase();
   if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
 
   const brId = (normEntry.branch_id || normEntry.branchId || currentBranch).trim().toUpperCase();
-  if (
-    brId &&
-    brId !== currentBranch.trim().toUpperCase() &&
-    brId !== (currentBranchCode || '').trim().toUpperCase()
-  ) {
+  if (brId && !isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) {
     return false;
   }
 
@@ -15705,21 +15741,17 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
   if (!grv || !grv.grvNumber) return false;
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const currentBranchCode = getCurrentBranch()?.code;
+  const branches = getBranches();
 
   const compId = (grv.companyId || grv.company_id || currentCompany).trim().toUpperCase();
   if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
 
   const brId = (grv.branchId || grv.branch_id || currentBranch).trim().toUpperCase();
-  if (
-    brId &&
-    brId !== currentBranch.trim().toUpperCase() &&
-    brId !== (currentBranchCode || '').trim().toUpperCase()
-  ) {
+  if (brId && !isRecordInBranchScope(brId, currentBranch, branches, currentCompany, compId)) {
     return false;
   }
 
-  const all = getAllDirectGrvs();
+  const all = getRawStoredDirectGrvs();
   const idx = all.findIndex((g) => g.grvNumber === grv.grvNumber || g.id === grv.id);
   const incomingTime = extractRecordTimestamp(grv);
   const now = Date.now();
@@ -15775,7 +15807,7 @@ export const ingestMeshCustomer = (
   const compId = (customer.company_id || customer.companyId || currentCompany).trim().toUpperCase();
   if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
 
-  const all = getCustomers();
+  const all = getRawStoredCustomers();
   const id = customer.id || customer.customerId;
   const idx = all.findIndex(
     (c) =>
@@ -15930,7 +15962,7 @@ export const ingestMeshStockMovement = (entry: any): boolean => {
 
 export const ingestMeshCashLift = (entry: any): boolean => {
   if (!entry || !entry.id) return false;
-  const all = getAllCashLifts();
+  const all = getRawStoredCashLifts();
   if (all.some((c) => c.id === entry.id)) return false;
   setStored(STORAGE_KEYS.CASH_LIFTS, [entry, ...all]);
   notifyListeners();
@@ -15943,7 +15975,7 @@ export const ingestMeshCashLift = (entry: any): boolean => {
 
 export const ingestMeshGoodsReceived = (entry: any): boolean => {
   if (!entry || (!entry.id && !entry.reference)) return false;
-  const all = getAllGoodsReceived();
+  const all = getRawStoredGoodsReceived();
   const id = entry.id || entry.reference;
   const idx = all.findIndex((g: any) => (g.id || g.reference) === id);
   const incomingTime = extractRecordTimestamp(entry);
@@ -16124,15 +16156,16 @@ export const getTransactionsDigest = (
   else if (norm === 'direct_grvs' || norm === 'direct_grv' || norm === 'grv') {
     const rawGrvs = getDirectGrvs();
     for (const g of rawGrvs) {
-      const id = g.id || g.grvId || g.reference;
+      const id = g.id || g.grvNumber || (g as any).grvId || (g as any).reference;
       if (!id) continue;
-      const t = parseTimestampMs(g.timestamp || g.date);
+      const t = parseTimestampMs((g as any).timestamp || g.createdAt || g.date);
       if (inRange(t)) {
-        const amt = Number(g.totalAmount || g.total) || 0;
+        const amt = Number(g.totalCost || (g as any).totalAmount || (g as any).total) || 0;
         totalSum += amt;
         items.push({
           id,
           total: amt,
+          status: g.status,
           timestamp: t,
         });
       }
@@ -16218,6 +16251,20 @@ export const getTransactionsDigest = (
     }
   }
 
+  // 12. Suppliers (T2)
+  else if (norm === 'suppliers' || norm === 'supplier') {
+    const tenantSuppliers = getSuppliers();
+    for (const s of tenantSuppliers) {
+      const id = s.supplierId || (s as any).id;
+      if (!id) continue;
+      const up = parseTimestampMs((s as any).updatedAt || (s as any).lastUpdated || s.createdDate);
+      items.push({
+        id,
+        updatedAt: up,
+      });
+    }
+  }
+
   return {
     entityType: norm,
     startDate,
@@ -16246,7 +16293,9 @@ export const getDeltaRecordsSince = (sinceIsoTimestamp: string) => {
     sales: filterByTime(getAllSales()),
     cashLogs: filterByTime(getCashLogs()),
     cashLifts: filterByTime(getAllCashLifts()),
+    cashCounts: filterByTime(getCashCounts()),
     cashMovements: filterByTime(getMovements()),
+    adminSales: filterByTime(getAdminSales()),
     customerChanges: filterByTime(getCustomerChanges()),
     creditSales: filterByTime(getCreditSales()),
     stockMovements: filterByTime(getStockMovements()),
@@ -16255,6 +16304,8 @@ export const getDeltaRecordsSince = (sinceIsoTimestamp: string) => {
     goodsReceivedNotes: filterByTime(getAllGoodsReceived()),
     internalConsumptions: filterByTime(getStored<any[]>('saimetric_internal_consumption', [])),
     inventoryItems: getAllInventoryItems(),
+    suppliers: getSuppliers(),
+    customers: getCustomers(),
   };
 };
 
@@ -16283,7 +16334,7 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   }
 
   // 2. Update Sales syncStatus, synced, and syncedToHub flag
-  const sales = getAllSales();
+  const sales = getRawStoredSales();
   let salesChanged = false;
   const updatedSales = sales.map((sale) => {
     const saleReqId = (sale as any).clientRequestId || sale.id;
@@ -16299,7 +16350,7 @@ export const markSyncItemsAsSynced = (clientRequestIds: string[] = [], itemIds: 
   }
 
   // 3. Update CashLogs synced status
-  const cashLogs = getAllCashLogs();
+  const cashLogs = getRawStoredCashLogs();
   let cashLogsChanged = false;
   const updatedCashLogs = cashLogs.map((log) => {
     const logReqId = (log as any).clientRequestId || log.id;
@@ -24952,10 +25003,16 @@ export const saveDirectGrv = (
   grv: DirectGrv,
   options?: { fromSync?: boolean }
 ): DirectGrv => {
-  const list = getAllDirectGrvs();
+  const list = getRawStoredDirectGrvs();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const compId = (grv as any).company_id || (grv as any).companyId || currentCompany || 'COMP-001';
+  const incomingComp = (grv as any).company_id || (grv as any).companyId;
+  const isLocalWrite = !options?.fromSync && !(grv as any).fromMesh;
+  // Never allow a hardcoded 'COMP-001' placeholder on a local write to override an active non-demo tenant
+  const compId =
+    isLocalWrite && currentCompany && currentCompany !== 'COMP-001' && currentCompany !== 'COMP-MASTER'
+      ? (incomingComp && incomingComp !== 'COMP-001' ? incomingComp : currentCompany)
+      : (incomingComp || currentCompany || 'COMP-001');
   const brId = (grv as any).branch_id || (grv as any).branchId || currentBranch || 'BR-MAIN';
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
@@ -25054,7 +25111,7 @@ export const approveDirectGrv = (
   approverId: string,
   approverName: string
 ): { success: boolean; message: string; grv?: DirectGrv } => {
-  const list = getAllDirectGrvs();
+  const list = getRawStoredDirectGrvs();
   const grv = list.find((g) => g.id === id || g.grvNumber === id);
   if (!grv) {
     return { success: false, message: 'GRV voucher not found.' };
@@ -25329,7 +25386,7 @@ export const rejectDirectGrv = (
   rejectorName: string,
   reason: string
 ): { success: boolean; message: string; grv?: DirectGrv } => {
-  const list = getAllDirectGrvs();
+  const list = getRawStoredDirectGrvs();
   const grv = list.find((g) => g.id === id || g.grvNumber === id);
   if (!grv) {
     return { success: false, message: 'GRV voucher not found.' };
@@ -25375,12 +25432,13 @@ export const rejectDirectGrv = (
   });
 
   // 3. Add an audit reversal movement for tracking the return of funds
+  const grvBranchId = (grv as any).branch_id || (grv as any).branchId || getCurrentBranchId();
   if (grv.payments && grv.payments.length > 0) {
     grv.payments.forEach((p) => {
       const amt = Number(p.amount) || 0;
       if (amt > 0 && p.userId) {
         addMovement({
-          shiftId: getShiftId(p.userId, shiftDate),
+          shiftId: getShiftId(p.userId, shiftDate, grvBranchId),
           staffId: p.userId,
           terminalId: p.drawerId || 'Till 1',
           date: shiftDate,
@@ -25785,7 +25843,7 @@ export const ingestMeshCashTransfer = (transfer: CashTransfer): boolean => {
       const targetGrv = String(merged.linked_grv_id).trim();
       const paidAtIso = merged.received_at || merged.approved_at || merged.lastUpdated || new Date().toISOString();
 
-      const directGrvs = getAllDirectGrvs();
+      const directGrvs = getRawStoredDirectGrvs();
       let directGrvChanged = false;
       const updatedDirectGrvs = directGrvs.map((g) => {
         if (g.grvNumber === targetGrv || g.id === targetGrv) {
@@ -25996,10 +26054,12 @@ export const getRawStoredBusinessDayClosures = (): BusinessDayClosure[] => {
 export const getBusinessDayClosures = (branchId?: string): BusinessDayClosure[] => {
   const all = getRawStoredBusinessDayClosures();
   const currentBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
   if (!currentBranch || currentBranch === 'ALL') {
     return all;
   }
-  return all.filter((c) => c.branchId === currentBranch);
+  const branches = getBranches();
+  return all.filter((c) => isRecordInBranchScope(c.branchId, currentBranch, branches, currentCompany, c.companyId));
 };
 
 export const getBusinessDayClosureByDate = (date: string, branchId?: string): BusinessDayClosure | null => {

@@ -81,7 +81,7 @@ export const Form2ExpenseModal: React.FC<Form2ExpenseModalProps> = ({
 
       // Also record petty cash movement in shift cash ledger
       addMovement({
-        shiftId: getShiftId(selectedStaff.id, sheetDate),
+        shiftId: getShiftId(selectedStaff.id, sheetDate, newExp.branch_id),
         staffId: selectedStaff.id,
         date: sheetDate,
         timestamp: now.toISOString(),
@@ -96,6 +96,7 @@ export const Form2ExpenseModal: React.FC<Form2ExpenseModalProps> = ({
         approvedBy: isSupervisor ? currentUser.id : undefined,
         approvedByName: isSupervisor ? currentUser.name : undefined,
         approvedAt: isSupervisor ? now.toISOString() : undefined,
+        branch_id: newExp.branch_id,
       });
 
       if (onExpenseAdded) {

@@ -115,7 +115,7 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
       const pAmount = Number(p.amount) || 0;
       if (pAmount <= 0 || !p.userId) return;
 
-      const staffShiftId = getShiftId(p.userId, shiftDate);
+      const staffShiftId = getShiftId(p.userId, shiftDate, brId);
       const staffVoucherKey = `${grn.grnNumber}-${p.userId}`;
       const indexedVoucherKey = payments.length > 1 ? `${grn.grnNumber}-P${pIdx + 1}` : grn.grnNumber;
 

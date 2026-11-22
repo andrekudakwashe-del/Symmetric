@@ -52,6 +52,7 @@ import {
   addSupplier,
   getBranches,
   getCurrentBranch,
+  getCurrentCompanyId,
   getDirectGrvs,
   saveDirectGrv,
   approveDirectGrv,
@@ -304,6 +305,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setLastDirectDraftSavedAt(null);
     setSupplierName('');
     setSupplierId('');
+    setSupplierFilterTerm('');
     setInvoiceNo('');
     setPurchaseOrderNo('');
     setRows([
@@ -335,7 +337,16 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
   useEffect(() => {
     const unsub = subscribeRoomDatabase(refreshData);
-    return unsub;
+    const handleExternalUpdate = () => refreshData();
+    window.addEventListener('saimetric_direct_grvs_updated', handleExternalUpdate);
+    window.addEventListener('saimetric_suppliers_updated', handleExternalUpdate);
+    window.addEventListener('saimetric_supplier_updated', handleExternalUpdate);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_direct_grvs_updated', handleExternalUpdate);
+      window.removeEventListener('saimetric_suppliers_updated', handleExternalUpdate);
+      window.removeEventListener('saimetric_supplier_updated', handleExternalUpdate);
+    };
   }, []);
 
   // Row Calculation Helper (Identical to Goods Received Voucher)
@@ -654,7 +665,22 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       effectiveSupplierName = matchedSupplier.name;
     }
 
-    const invalidItems = rows.filter((r) => !r.productName.trim() || !r.productId);
+    // Ignore completely blank auto-appended trailing rows while still rejecting partially filled uncatalogued rows
+    const activeRows = rows.filter(
+      (r) =>
+        Boolean(r.productId) ||
+        r.productName.trim() !== '' ||
+        (Number(r.quantityCases) || 0) > 0 ||
+        (Number(r.quantitySingles) || 0) > 0 ||
+        (Number(r.pricePerCase) || 0) > 0
+    );
+
+    if (activeRows.length === 0) {
+      showToast('error', 'Please add at least one delivered product line item.');
+      return;
+    }
+
+    const invalidItems = activeRows.filter((r) => !r.productName.trim() || !r.productId);
     if (invalidItems.length > 0) {
       showToast(
         'error',
@@ -700,8 +726,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
     const targetBranch = branches.find((b) => b.branchId === selectedBranchId) || currentBranch;
 
-    // Convert rows to DirectGrvItem
-    const grvItems: DirectGrvItem[] = rows.map((r) => {
+    // Convert active populated rows to DirectGrvItem
+    const grvItems: DirectGrvItem[] = activeRows.map((r) => {
       const calc = getRowCalculations(r);
       return {
         productId: r.productId,
@@ -756,13 +782,18 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       ? Math.round(Math.max(0, voucherTotals.totalCost - tillPaidTotal) * 100) / 100
       : voucherTotals.totalCost;
 
+    const activeCompanyId = getCurrentCompanyId();
+
     const newDirectGrv: DirectGrv = {
       id: grvNumber,
       grvNumber,
       type: 'DIRECT',
-      status: isSupervisorOrAbove ? 'APPROVED' : 'PENDING_APPROVAL',
-      companyId: 'COMP-001',
+      // Always start as PENDING_APPROVAL so approveDirectGrv runs inventory posting & FIFO batches cleanly for supervisors/owners
+      status: 'PENDING_APPROVAL',
+      companyId: activeCompanyId,
+      company_id: activeCompanyId,
       branchId: targetBranch.branchId,
+      branch_id: targetBranch.branchId,
       branchName: targetBranch.name,
       supplierId: effectiveSupplierId || 'SUP-001',
       supplierName: effectiveSupplierName,
@@ -780,22 +811,23 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       payments: formattedPayments,
       receivedByStaffId: currentUser?.id || 'USR-003',
       receivedByStaffName: currentUser?.name || 'Cashier',
-      approvedByStaffId: isSupervisorOrAbove ? currentUser?.id : undefined,
-      approvedByStaffName: isSupervisorOrAbove ? currentUser?.name : undefined,
-      approvedAt: isSupervisorOrAbove ? new Date().toISOString() : undefined,
       createdAt: new Date().toISOString(),
       synced: false,
     };
 
     if (isSupervisorOrAbove) {
       saveDirectGrv(newDirectGrv);
-      approveDirectGrv(newDirectGrv.id, currentUser?.id || 'USR-001', currentUser?.name || 'Supervisor');
-      showToast(
-        'success',
-        payFromTill
-          ? `Direct Delivery ${grvNumber} created & APPROVED! Stock posted to inventory and till payout recorded in Form 2.`
-          : `Direct Delivery ${grvNumber} created & APPROVED! Stock posted to inventory (Supplier invoice on account - no till cash payout).`
-      );
+      const approveRes = approveDirectGrv(newDirectGrv.id, currentUser?.id || 'USR-001', currentUser?.name || 'Supervisor');
+      if (approveRes.success) {
+        showToast(
+          'success',
+          payFromTill
+            ? `Direct Delivery ${grvNumber} created & APPROVED! Stock posted to inventory and till payout recorded in Form 2.`
+            : `Direct Delivery ${grvNumber} created & APPROVED! Stock posted to inventory (Supplier invoice on account - no till cash payout).`
+        );
+      } else {
+        showToast('error', `Direct Delivery ${grvNumber} was saved, but auto-approval failed: ${approveRes.message}`);
+      }
     } else {
       saveDirectGrv(newDirectGrv);
       showToast(
@@ -827,6 +859,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setVoucherDate(getTodayDateString());
     setSupplierName('');
     setSupplierId('');
+    setSupplierFilterTerm('');
     setInvoiceNo('');
     setPurchaseOrderNo('');
     setPaymentRows([
@@ -1212,7 +1245,13 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                       const exact = suppliers.find((s) => s.name && s.name.trim().toLowerCase() === val.trim().toLowerCase());
                       setSupplierId(exact ? (exact.supplierId || exact.id || '') : '');
                     }}
-                    onFocus={() => setIsSupplierDropdownOpen(true)}
+                    onFocus={() => {
+                      if (supplierId) {
+                        setSupplierFilterTerm('');
+                      }
+                      setSuppliers(getSuppliers());
+                      setIsSupplierDropdownOpen(true);
+                    }}
                     placeholder="Search or select supplier..."
                     className={`w-full bg-slate-800 border text-white rounded-xl pl-3.5 pr-8 py-2.5 text-sm focus:outline-none font-medium ${
                       supplierName.trim().length > 0 && !suppliers.some((s) => (supplierId && (s.supplierId === supplierId || s.id === supplierId)) || (s.name && s.name.trim().toLowerCase() === supplierName.trim().toLowerCase()))
@@ -1263,25 +1302,34 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
                 {/* Dropdown menu */}
                 {isSupplierDropdownOpen && (
-                  <div className="absolute left-0 right-0 top-full mt-1 bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl z-30 max-h-48 overflow-y-auto">
-                    {filteredSuppliers.map((s, idx) => {
-                      const supKey = s.supplierId || s.id || s.name;
-                      return (
-                        <button
-                          key={`${supKey}-${idx}`}
-                          type="button"
-                          onClick={() => {
-                            setSupplierName(s.name);
-                            setSupplierId(supKey);
-                            setIsSupplierDropdownOpen(false);
-                          }}
-                          className="w-full text-left px-3.5 py-2 hover:bg-slate-700 text-xs text-slate-200 flex items-center justify-between border-b border-slate-700/50"
-                        >
-                          <span className="font-bold text-white">{s.name}</span>
-                          <span className="text-[10px] text-slate-400 font-mono">{s.code || s.supplierId}</span>
-                        </button>
-                      );
-                    })}
+                  <div className="absolute left-0 right-0 top-full mt-1 bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl z-30 max-h-56 overflow-y-auto">
+                    {filteredSuppliers.length === 0 ? (
+                      <div className="px-3.5 py-3 text-xs text-slate-400 text-center">
+                        {suppliers.length === 0
+                          ? 'No registered suppliers found for this branch/company yet. Ask a Supervisor or Manager to register suppliers in the Supplier Directory.'
+                          : `No registered supplier matches "${supplierFilterTerm}".`}
+                      </div>
+                    ) : (
+                      filteredSuppliers.map((s, idx) => {
+                        const supKey = s.supplierId || s.id || s.name;
+                        return (
+                          <button
+                            key={`${supKey}-${idx}`}
+                            type="button"
+                            onClick={() => {
+                              setSupplierName(s.name);
+                              setSupplierId(supKey);
+                              setSupplierFilterTerm('');
+                              setIsSupplierDropdownOpen(false);
+                            }}
+                            className="w-full text-left px-3.5 py-2 hover:bg-slate-700 text-xs text-slate-200 flex items-center justify-between border-b border-slate-700/50"
+                          >
+                            <span className="font-bold text-white">{s.name}</span>
+                            <span className="text-[10px] text-slate-400 font-mono">{s.code || s.supplierId}</span>
+                          </button>
+                        );
+                      })
+                    )}
                     <button
                       type="button"
                       onClick={() => setIsSupplierDropdownOpen(false)}

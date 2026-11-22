@@ -146,6 +146,7 @@ import {
   onSaleUpdated,
   onStaffChanged,
   onCustomerChanged,
+  onSupplierChanged,
   onBranchChanged,
   onCashAccountChanged,
   onCashTransferChanged,
@@ -1147,6 +1148,11 @@ class MeshSyncManager {
     // Auto-hook into Customer creation & edits: broadcast to Local Hub & mesh
     onCustomerChanged((cust: any) => {
       this.broadcastCustomer(cust);
+    });
+
+    // Auto-hook into Supplier creation & edits: broadcast to Local Hub & mesh
+    onSupplierChanged((supp: any) => {
+      this.broadcastSupplier(supp);
     });
 
     // Auto-hook into Branch creation & edits: broadcast to Local Hub & mesh
@@ -4453,6 +4459,7 @@ class MeshSyncManager {
           'expenses',
           'inventory',
           'customers',
+          'suppliers',
           'staff',
           'branches',
         ],
@@ -4477,7 +4484,7 @@ class MeshSyncManager {
     const sweepId = packet.sweepId || `sweep-${Date.now()}`;
     const targetEntities: string[] = Array.isArray(packet.targetEntities)
       ? packet.targetEntities
-      : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'staff', 'branches'];
+      : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'suppliers', 'staff', 'branches'];
 
     if (isPosActiveCheckout()) {
       console.log(`[Recon Sweep] 🛒 POS terminal is active in checkout. Deferring sweep (${sweepId}) by 60s.`);
@@ -4939,6 +4946,21 @@ class MeshSyncManager {
           delete cleanRec.fromSync;
           if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
           this.broadcastCustomer(cleanRec, { isReconPush: true });
+          pushedCount++;
+        }
+      } else if (entityType === 'suppliers' || entityType === 'supplier') {
+        const rec = getRawStoredSuppliers().find((s) =>
+          [s.supplierId, (s as any).id].some(
+            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+          )
+        );
+        if (rec) {
+          this.reconPushedTimestamps.set(dedupeKey, Date.now());
+          const cleanRec: any = { ...rec };
+          delete cleanRec.fromMesh;
+          delete cleanRec.fromSync;
+          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+          this.broadcastSupplier(cleanRec, { isReconPush: true });
           pushedCount++;
         }
       } else if (entityType === 'staff' || entityType === 'salespeople' || entityType === 'users') {
@@ -7782,6 +7804,32 @@ class MeshSyncManager {
       meta: { isReconPush },
     });
     this.addLog('BROADCAST', `Customer account ${customer.name} (${custId}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast a supplier creation or update to peers & Hub so cashiers across devices can select them
+   */
+  public broadcastSupplier(supplier: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!supplier) return;
+    if (!isReconPush && (supplier.fromMesh || (supplier as any).fromSync)) return;
+
+    supplier.updatedAt = supplier.updatedAt || Date.now();
+    supplier.lastUpdated = supplier.lastUpdated || new Date().toISOString();
+
+    const suppId = supplier.supplierId || supplier.id || 'SUP_NEW';
+    const packetId = `SUPP-PKT-${suppId}-${Date.now()}`;
+
+    void this.dispatchEnvelope('supplier', suppId, supplier, {
+      action: 'UPSERT',
+      updatedAt: supplier.updatedAt,
+      topicSuffix: 'supplier',
+      packetId,
+      meta: { isReconPush },
+    });
+    this.addLog('BROADCAST', `Supplier ${supplier.name} (${suppId}) broadcasted to WiFi mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 

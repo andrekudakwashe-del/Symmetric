@@ -26,6 +26,7 @@ import {
   approveDirectGrv,
   rejectDirectGrv,
   verifySalespersonPin,
+  getCurrentBranchId,
 } from '../../db/roomDatabase';
 import {
   issueTillFloat,
@@ -318,12 +319,12 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   }, [selectedStaff, currentUser, salespeople, ledgerRefreshKey, cashLogs]);
 
   const currentShiftId = useMemo(() => {
-    return getShiftId(selectedStaffId, sheetDate);
+    return getShiftId(selectedStaffId, sheetDate, getCurrentBranchId());
   }, [selectedStaffId, sheetDate]);
 
   // Float Requirement: On Form 2 open, if no opening_float exists for the shift, auto-create it with configured default float and deduct from Safe/Clerk
   useEffect(() => {
-    const sId = getShiftId(selectedStaffId, sheetDate);
+    const sId = getShiftId(selectedStaffId, sheetDate, getCurrentBranchId());
     const moves = getMovements();
     const hasOpeningFloat = moves.some(
       (m) => (m.shiftId === sId || (m.staffId === selectedStaffId && m.date === sheetDate)) && m.type === 'opening_float'
@@ -369,7 +370,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
   // Compute shift movements live from cashMovements
   const shiftMovements = useMemo(() => {
-    const sId = getShiftId(selectedStaffId, sheetDate);
+    const sId = getShiftId(selectedStaffId, sheetDate, getCurrentBranchId());
     return getMovements().filter((m) => {
       if (m.shiftId === sId) return true;
       if (m.date === sheetDate && isStaffMatch(m.staffId, m.staffName)) return true;
@@ -1831,6 +1832,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     }
 
     const now = new Date();
+    const targetStaffId = selectedStaff?.id || selectedStaffId || currentUser.id;
+    const targetStaffName = selectedStaff?.name || currentUser.name;
+    const activeBranchId = getCurrentBranchId();
     let created: CashLogEntry;
 
     if (currentQuickItem.id === 'expenses') {
@@ -1842,8 +1846,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         vendorOrCustomer: singleCustomDesc.trim() || 'General Store Expense',
         amount: numAmt,
         paymentMethod: 'Cash',
-        staffId: currentUser.id,
-        staffName: currentUser.name,
+        staffId: targetStaffId,
+        staffName: targetStaffName,
         description: singleCustomDesc.trim() || 'Petty Cash Expense',
         receiptRef: singleRef.trim() || undefined,
         recordCashLog: true,
@@ -1854,8 +1858,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       });
 
       addMovement({
-        shiftId: getShiftId(currentUser.id, sheetDate),
-        staffId: currentUser.id,
+        shiftId: getShiftId(targetStaffId, sheetDate, activeBranchId),
+        staffId: targetStaffId,
         date: sheetDate,
         timestamp: now.toISOString(),
         type: 'petty_cash',
@@ -1869,6 +1873,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         approvedBy: isSuper ? currentUser.id : undefined,
         approvedByName: isSuper ? currentUser.name : undefined,
         approvedAt: isSuper ? now.toISOString() : undefined,
+        branch_id: activeBranchId,
       });
 
       const allLogs = getCashLogs();
@@ -1876,8 +1881,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
         id: `LOG-EXP-${Date.now()}`,
         timestamp: now.toISOString(),
         date: sheetDate,
-        staffId: currentUser.id,
-        staffName: currentUser.name,
+        staffId: targetStaffId,
+        staffName: targetStaffName,
         line: 'Expenses',
         description: `Expense #${newExp.id} - ${finalDesc}`,
         in: 0,
@@ -1886,18 +1891,41 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       };
       loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
     } else {
+      const refValue = singleRef.trim() || undefined;
       created = addCashLog({
         timestamp: now.toISOString(),
         date: sheetDate,
-        staffId: currentUser.id,
-        staffName: currentUser.name,
+        staffId: targetStaffId,
+        staffName: targetStaffName,
         line: currentQuickItem.group,
         description: finalDesc,
         in: singleType === 'IN' ? numAmt : 0,
         out: singleType === 'OUT' ? numAmt : 0,
         category: currentQuickItem.group,
-        reference: singleRef.trim() || undefined,
+        reference: refValue,
       });
+
+      // Mirror Quick-Add Direct Procurement into cashMovements so Live Drawer Balance and Form 4 deduct it immediately
+      if (currentQuickItem.id === 'direct_procurement' && singleType === 'OUT') {
+        addMovement({
+          shiftId: getShiftId(targetStaffId, sheetDate, activeBranchId),
+          staffId: targetStaffId,
+          date: sheetDate,
+          timestamp: now.toISOString(),
+          type: 'supplier_payment',
+          amount: numAmt,
+          currency: 'USD',
+          direction: 'out',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form2',
+          sourceRef: refValue || created.id,
+          notes: finalDesc,
+          branch_id: activeBranchId,
+        });
+      }
+      loadSheetDataForStaffAndDate(sheetDate, selectedStaffId);
+      setLedgerRefreshKey((k) => k + 1);
     }
 
     confetti({

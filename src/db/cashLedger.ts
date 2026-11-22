@@ -67,6 +67,64 @@ export const getShiftId = (staffId: string, date: string, branchId?: string): st
   return `${cleanStaff}_${cleanDate}_${cleanBranch}`;
 };
 
+const normLedgerTenant = (compId?: string | null): string => {
+  const c = String(compId || '').trim().toUpperCase();
+  if (!c || c === 'COMP-001' || c === 'COMP-MASTER') return 'COMP-001';
+  return c;
+};
+
+const isCashCompanyInScope = (recordCompanyId?: string | null, targetCompanyId?: string | null): boolean => {
+  if (!recordCompanyId || !targetCompanyId) return true;
+  const tgt = String(targetCompanyId).trim().toUpperCase();
+  if (tgt === 'COMP-MASTER') return true;
+  return normLedgerTenant(recordCompanyId) === normLedgerTenant(targetCompanyId);
+};
+
+const MAIN_BRANCH_ALIASES = new Set(['1', 'br-main', 'br001', 'hq-01', 'sai-01']);
+
+const getBranchAliasesForTarget = (targetBranch: string): Set<string> => {
+  const cleanTarget = String(targetBranch || '').trim().toLowerCase();
+  const aliases = new Set<string>([cleanTarget]);
+  if (MAIN_BRANCH_ALIASES.has(cleanTarget)) {
+    MAIN_BRANCH_ALIASES.forEach((a) => aliases.add(a));
+  }
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const raw = window.localStorage.getItem('saimetric_room_branches');
+      if (raw) {
+        const branches = JSON.parse(raw);
+        if (Array.isArray(branches)) {
+          const matched = branches.find((b: any) =>
+            [b?.branchId, b?.id, b?.code, b?.branch_id].some(
+              (v) => v && String(v).trim().toLowerCase() === cleanTarget
+            )
+          );
+          if (matched) {
+            [matched.branchId, matched.id, matched.code, matched.branch_id].forEach((v) => {
+              if (v) aliases.add(String(v).trim().toLowerCase());
+            });
+            if (matched.isMain) {
+              MAIN_BRANCH_ALIASES.forEach((a) => aliases.add(a));
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore storage parse fallback
+    }
+  }
+  return aliases;
+};
+
+const isCashBranchInScope = (recordBranchId?: string | null, targetBranchId?: string | null): boolean => {
+  const cleanTarget = String(targetBranchId || '').trim().toLowerCase();
+  if (!cleanTarget || cleanTarget === 'all') return true;
+  const cleanRecord = String(recordBranchId || '').trim().toLowerCase();
+  if (!cleanRecord || cleanRecord === 'all') return true;
+  if (cleanRecord === cleanTarget) return true;
+  return getBranchAliasesForTarget(cleanTarget).has(cleanRecord);
+};
+
 /**
  * Initialize IndexedDB with required object store and indexes
  */
@@ -315,12 +373,15 @@ export const getMovements = (
 ): CashMovement[] => {
   const all = getAllMovements();
   const targetBranch = branchId || getActiveBranchId();
+  const targetCompany = getActiveCompanyId();
 
-  // Strict branch isolation
+  // Tenant & alias-aware branch isolation
   const branchFiltered = all.filter((m) => {
+    const movComp = m.company_id || (m as any).companyId;
+    if (!isCashCompanyInScope(movComp, targetCompany)) return false;
     if (branchId === 'ALL') return true;
     const movBranch = m.branch_id || (m as any).branchId || 'BR-MAIN';
-    return movBranch === targetBranch;
+    return isCashBranchInScope(movBranch, targetBranch);
   });
 
   if (!filter) return branchFiltered;
@@ -338,17 +399,23 @@ export const getMovements = (
 
 /**
  * Helper to test if a movement belongs to a given shiftId.
- * Supports exact match, or matching by staffId_date and branchId.
+ * Supports exact match, or matching by staffId_date and branchId (with canonical branch aliases).
  */
 export const matchesShift = (m: CashMovement, shiftId: string, branchId?: string): boolean => {
   const parts = shiftId.split('_');
   const targetStaff = parts[0] || '';
   const targetDate = parts[1] || '';
   const targetBranch = parts[2] || branchId || getActiveBranchId();
+  const targetCompany = getActiveCompanyId();
 
-  // Strict branch isolation: movement branch must match targetBranch
+  const movComp = m.company_id || (m as any).companyId;
+  if (!isCashCompanyInScope(movComp, targetCompany)) {
+    return false;
+  }
+
+  // Alias-aware branch isolation: movement branch must match targetBranch
   const movBranch = m.branch_id || (m as any).branchId || 'BR-MAIN';
-  if (targetBranch && movBranch !== targetBranch) {
+  if (targetBranch && !isCashBranchInScope(movBranch, targetBranch)) {
     return false;
   }
 
@@ -357,7 +424,7 @@ export const matchesShift = (m: CashMovement, shiftId: string, branchId?: string
   if (m.shiftId === `${targetStaff}_${targetDate}_${targetBranch}`) return true;
   if (m.shiftId === `${targetStaff}_${targetDate}`) {
     // Legacy movement without branch in shiftId
-    if (movBranch === targetBranch) return true;
+    if (isCashBranchInScope(movBranch, targetBranch)) return true;
   }
 
   // Normalized ID match (e.g. '001_2026-09-22' vs '1_2026-09-22')
@@ -365,7 +432,7 @@ export const matchesShift = (m: CashMovement, shiftId: string, branchId?: string
     const normM = String(m.staffId || '').replace(/^usr-|^staff-|^0+/, '').toLowerCase();
     const normT = String(targetStaff).replace(/^usr-|^staff-|^0+/, '').toLowerCase();
     if (normM && normT && normM === normT) {
-      if (movBranch === targetBranch) return true;
+      if (isCashBranchInScope(movBranch, targetBranch)) return true;
     }
   }
   return false;
@@ -435,8 +502,11 @@ const computeMissingDirectGrvPayouts = (
         return;
       }
 
+      const gComp = g.companyId || g.company_id;
+      if (!isCashCompanyInScope(gComp, getActiveCompanyId())) return;
+
       const gBranch = g.branchId || g.branch_id;
-      if (shiftBranch && gBranch && gBranch !== shiftBranch) return;
+      if (shiftBranch && gBranch && !isCashBranchInScope(gBranch, shiftBranch)) return;
 
       const gDate = String(g.date || g.createdAt || '').slice(0, 10);
       if (targetDate && gDate && gDate !== targetDate) return;
@@ -515,10 +585,13 @@ const sortMovementsChronologicallyAsc = (movs: CashMovement[]): CashMovement[] =
 
 export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', branchId?: string): number => {
   const targetBranch = branchId || shiftId.split('_')[2] || getActiveBranchId();
+  const targetCompany = getActiveCompanyId();
   const all = sortMovementsChronologicallyAsc(
     getAllMovements().filter((m) => {
+      const movComp = m.company_id || (m as any).companyId;
+      if (!isCashCompanyInScope(movComp, targetCompany)) return false;
       const movBranch = m.branch_id || (m as any).branchId || 'BR-MAIN';
-      return movBranch === targetBranch;
+      return isCashBranchInScope(movBranch, targetBranch);
     })
   );
   const validStatuses: CashMovementStatus[] = ['approved', 'pending-POS-auto'];

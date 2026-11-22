@@ -2777,6 +2777,11 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                             <span className="text-[9px] text-slate-400 font-mono-num block">
                               In: ${(row.cashInTotal ?? 0).toFixed(0)} / Out: ${(row.cashOutTotal ?? 0).toFixed(0)}
                             </span>
+                            {(row.directProcurements ?? 0) > 0 && (
+                              <span className="text-[9px] text-amber-400 font-mono-num font-bold block">
+                                Direct Proc: -${row.directProcurements.toFixed(2)}
+                              </span>
+                            )}
                           </td>
 
                           {/* 3. Physical Count Column */}
