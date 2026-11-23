@@ -424,10 +424,26 @@ export default function App() {
     };
   }, [currentUser]);
 
-  // Subscribe to Room DB changes & sync active session user branch
+  // Subscribe to Room DB changes ONLY when App-shell fields (pending badge, company/subscription, or user branch) actually change.
+  // Prevents full-App re-render storms during background Local Hub / Internet sync bursts.
+  const appShellSignatureRef = useRef<string>('');
   useEffect(() => {
+    const computeShellSignature = () => {
+      const comp = getCurrentCompany();
+      const sub = getSubscriptionStatus(comp);
+      const q = getSyncQueue(comp.company_id);
+      const pending = q.filter((i) => i.status === 'pending' || i.status === 'failed').length;
+      return `${comp.company_id}|${comp.company_name}|${sub.isExpired}|${sub.isTrial}|${sub.daysRemaining}|${pending}`;
+    };
+
+    appShellSignatureRef.current = computeShellSignature();
+
     const unsubscribe = subscribeToDatabase(() => {
-      setDbVersion((v) => v + 1);
+      const nextSig = computeShellSignature();
+      if (nextSig !== appShellSignatureRef.current) {
+        appShellSignatureRef.current = nextSig;
+        setDbVersion((v) => v + 1);
+      }
       const sess = getSessionUser();
       if (sess && currentUser && (sess.branchId !== currentUser.branchId || sess.branch_id !== currentUser.branch_id)) {
         setLoggedInUser(sess);
@@ -469,21 +485,30 @@ export default function App() {
     }
   }, []);
 
-  // Post-login heavy engines: prefetch lazy modules, sync tenants, and start persistent sync engine ONLY after authentication
+  // Post-login background engines: staggered after authentication so the landing screen & first taps are 100% instant offline-first
   useEffect(() => {
     if (!currentUser) return;
     prefetchAppModules();
-    initializeSystemConfigAndSync().catch(() => {});
-    persistentSyncEngine.initialize().catch((err) => console.warn('[App] Sync engine init error:', err));
-    // Immediately pull cloud catalog, sales, cash logs, customers & expenses on login (no 2-min wait)
+
+    const configSyncTimer = setTimeout(() => {
+      initializeSystemConfigAndSync().catch(() => {});
+    }, 1800);
+
+    const engineInitTimer = setTimeout(() => {
+      persistentSyncEngine.initialize().catch((err) => console.warn('[App] Sync engine init error:', err));
+    }, 2400);
+
+    // Pull cloud catalog, sales, cash logs, customers & expenses shortly after landing screen has painted
     const loginSyncTimer = setTimeout(() => {
       meshSyncService.triggerCloudSyncNow(true).catch(() => {});
-    }, 1200);
+    }, 3600);
 
     const unsubAlerts = persistentSyncEngine.subscribeAlerts((alert) => {
       setTenantAlert(alert);
     });
     return () => {
+      clearTimeout(configSyncTimer);
+      clearTimeout(engineInitTimer);
       clearTimeout(loginSyncTimer);
       unsubAlerts();
     };

@@ -447,23 +447,41 @@ export class SyncCore {
       await onAcceptedPersist(envelope, existingRecord);
     }
 
-    // Lesson 10 (Cross-Device UI Events): dispatch UI event
+    // Lesson 10 (Cross-Device UI Events): dispatch coalesced UI event so bursts never freeze React
     if (spec.uiEventName && typeof window !== 'undefined') {
-      window.dispatchEvent(new Event(spec.uiEventName));
+      this.scheduleCoalescedUiEvent(spec.uiEventName);
     }
 
     return { accepted: true };
   }
 
+  private pendingUiEvents: Set<string> = new Set();
+  private uiEventFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private scheduleCoalescedUiEvent(eventName: string): void {
+    this.pendingUiEvents.add(eventName);
+    if (this.uiEventFlushTimer !== null) return;
+    this.uiEventFlushTimer = setTimeout(() => {
+      this.uiEventFlushTimer = null;
+      const toDispatch = Array.from(this.pendingUiEvents);
+      this.pendingUiEvents.clear();
+      if (typeof window !== 'undefined') {
+        for (const evt of toDispatch) {
+          window.dispatchEvent(new Event(evt));
+        }
+      }
+    }, 100);
+  }
+
   /**
-   * Lesson 7 (Chunked Ingest): chunks into groups of 50 and yields thread.
+   * Lesson 7 (Chunked Ingest): chunks into groups of 20 and yields thread to keep UI 60fps responsive.
    * Supports full lookupExisting + onAcceptedPersist + configurable LWW tolerance (e.g. 5000ms for WhatsApp file import).
    */
   async ingestBatch(
     envelopes: SyncEnvelope[],
     options?: BatchIngestOptions
   ): Promise<BatchIngestResult> {
-    const CHUNK_SIZE = 50;
+    const CHUNK_SIZE = 20;
     const result: BatchIngestResult = {
       processed: 0,
       accepted: 0,
@@ -523,7 +541,7 @@ export class SyncCore {
         });
       }
 
-      await new Promise((r) => setTimeout(r, 10));
+      await new Promise((r) => setTimeout(r, 16));
     }
 
     return result;

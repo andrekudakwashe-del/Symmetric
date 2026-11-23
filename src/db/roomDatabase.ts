@@ -530,39 +530,168 @@ export const subscribeRoomDatabase = subscribeToDatabase;
 
 let notifyScheduled = false;
 let notifyTimer: any = null;
+let batchDepth = 0;
+let batchDirty = false;
+let lastNotifyExecutedAt = 0;
+const NOTIFY_COALESCE_WINDOW_MS = 140;
 
-// Throttled listener notification to coalesce rapid bulk writes into a single render tick
+const executeNotifyListeners = () => {
+  notifyScheduled = false;
+  notifyTimer = null;
+  lastNotifyExecutedAt = Date.now();
+  listeners.forEach((fn) => {
+    try {
+      fn();
+    } catch (e) {
+      console.error('Listener error:', e);
+    }
+  });
+};
+
+/**
+ * Begin a bulk database mutation window (e.g. Hub catchup or Cloud pull batch).
+ * Suppresses intermediate React listener storms and flushes once cleanly on endBatchUpdate().
+ */
+export const beginBatchUpdate = (): void => {
+  batchDepth++;
+};
+
+/**
+ * End a bulk database mutation window. Fires a single coalesced UI notification if any writes occurred.
+ */
+export const endBatchUpdate = (): void => {
+  if (batchDepth > 0) batchDepth--;
+  if (batchDepth === 0 && batchDirty) {
+    batchDirty = false;
+    notifyListeners();
+  }
+};
+
+// Leading + trailing coalesced listener notification:
+// - Single local user actions notify on the very next animation frame (0ms lag)
+// - Rapid sync bursts coalesce into ~1 render every 140ms instead of 60fps render storms
 export const notifyListeners = () => {
+  if (batchDepth > 0) {
+    batchDirty = true;
+    return;
+  }
   if (notifyScheduled) return;
   notifyScheduled = true;
-  if (typeof requestAnimationFrame !== 'undefined') {
-    requestAnimationFrame(() => {
-      notifyScheduled = false;
-      listeners.forEach((fn) => {
-        try {
-          fn();
-        } catch (e) {
-          console.error('Listener error:', e);
-        }
-      });
-    });
+
+  const elapsed = Date.now() - lastNotifyExecutedAt;
+  if (elapsed >= NOTIFY_COALESCE_WINDOW_MS) {
+    if (typeof requestAnimationFrame !== 'undefined') {
+      requestAnimationFrame(executeNotifyListeners);
+    } else {
+      if (notifyTimer) clearTimeout(notifyTimer);
+      notifyTimer = setTimeout(executeNotifyListeners, 16);
+    }
   } else {
+    const remaining = Math.max(16, NOTIFY_COALESCE_WINDOW_MS - elapsed);
     if (notifyTimer) clearTimeout(notifyTimer);
-    notifyTimer = setTimeout(() => {
-      notifyScheduled = false;
-      listeners.forEach((fn) => {
-        try {
-          fn();
-        } catch (e) {
-          console.error('Listener error:', e);
-        }
-      });
-    }, 16);
+    notifyTimer = setTimeout(executeNotifyListeners, remaining);
   }
 };
 
 // High-performance in-memory layer: Prevents synchronous localStorage I/O freezes on UI thread
 const memoryCache = new Map<string, any>();
+
+// Coalesced disk persistence queue: eliminates repeated synchronous JSON.stringify + localStorage.setItem
+// freezes during Hub/Internet sync while guaranteeing 100% durability via pagehide/beforeunload/visibilitychange flush.
+interface PendingStorageWrite {
+  value: any;
+  skipIdbOverwriteIfExisting?: boolean;
+}
+const pendingStorageWrites = new Map<string, PendingStorageWrite>();
+let storageFlushTimer: any = null;
+let storageMaxWaitTimer: any = null;
+const STORAGE_FLUSH_DEBOUNCE_MS = 120;
+const STORAGE_FLUSH_MAX_WAIT_MS = 400;
+
+const IMMEDIATE_PERSIST_KEYS = new Set<string>([
+  STORAGE_KEYS.SESSION_USER,
+  STORAGE_KEYS.CURRENT_COMPANY_ID,
+  STORAGE_KEYS.CURRENT_BRANCH_ID,
+  STORAGE_KEYS.OFFLINE_MODE,
+]);
+
+const persistSingleKeyNow = (key: string, value: any, skipIdbOverwriteIfExisting?: boolean): void => {
+  // Persist to localStorage safely with quota recovery
+  if (typeof localStorage !== 'undefined') {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (err) {
+      console.warn(`[Storage] localStorage write for ${key} failed, attempting quota recovery:`, err);
+      try {
+        cleanupLocalStorageQuota();
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch (retryErr) {
+        console.warn(`[Storage] LocalStorage quota still exceeded for ${key}. Preserving in IndexedDB & Memory:`, retryErr);
+        try {
+          if (Array.isArray(value)) {
+            localStorage.setItem(key, JSON.stringify(value.slice(-60)));
+          } else {
+            localStorage.setItem(key, JSON.stringify({ __overflow_idb: true, count: 1 }));
+          }
+        } catch {
+          try { localStorage.removeItem(key); } catch {}
+        }
+      }
+    }
+  }
+
+  // Persist asynchronously to IndexedDB meta store for bulletproof persistence across browser reloads
+  if (typeof window !== 'undefined' && window.indexedDB) {
+    if (skipIdbOverwriteIfExisting) {
+      getMeta(`room_${key}`)
+        .then((existing) => {
+          if (existing === null || existing === undefined) {
+            setMeta(`room_${key}`, value).catch(() => {});
+          }
+        })
+        .catch(() => {
+          setMeta(`room_${key}`, value).catch(() => {});
+        });
+    } else {
+      setMeta(`room_${key}`, value).catch(() => {});
+    }
+  }
+};
+
+export function flushPendingStorageWrites(): void {
+  if (storageFlushTimer) {
+    clearTimeout(storageFlushTimer);
+    storageFlushTimer = null;
+  }
+  if (storageMaxWaitTimer) {
+    clearTimeout(storageMaxWaitTimer);
+    storageMaxWaitTimer = null;
+  }
+  if (pendingStorageWrites.size === 0) return;
+
+  const entries = Array.from(pendingStorageWrites.entries());
+  pendingStorageWrites.clear();
+  for (const [key, entry] of entries) {
+    try {
+      persistSingleKeyNow(key, entry.value, entry.skipIdbOverwriteIfExisting);
+    } catch (err) {
+      console.error(`[Storage] Error flushing ${key}:`, err);
+    }
+  }
+}
+
+const scheduleStorageFlush = (): void => {
+  if (storageFlushTimer) clearTimeout(storageFlushTimer);
+  storageFlushTimer = setTimeout(() => {
+    flushPendingStorageWrites();
+  }, STORAGE_FLUSH_DEBOUNCE_MS);
+
+  if (!storageMaxWaitTimer) {
+    storageMaxWaitTimer = setTimeout(() => {
+      flushPendingStorageWrites();
+    }, STORAGE_FLUSH_MAX_WAIT_MS);
+  }
+};
 
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
@@ -571,6 +700,20 @@ if (typeof window !== 'undefined') {
       notifyListeners();
     }
   });
+  // Guarantee zero data loss on tab close, refresh, or mobile app switch
+  window.addEventListener('pagehide', () => {
+    flushPendingStorageWrites();
+  });
+  window.addEventListener('beforeunload', () => {
+    flushPendingStorageWrites();
+  });
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingStorageWrites();
+      }
+    });
+  }
 }
 
 export function cleanupLocalStorageQuota(): void {
@@ -784,53 +927,29 @@ export function getStored<T>(key: string, fallback: T): T {
   }
 }
 
-export function setStored<T>(key: string, value: T, options?: { skipIdbOverwriteIfExisting?: boolean }): void {
+export function setStored<T>(
+  key: string,
+  value: T,
+  options?: { skipIdbOverwriteIfExisting?: boolean; immediate?: boolean }
+): void {
   try {
-    // 1. Update in-memory cache instantly (0ms UI latency)
+    // 1. Update in-memory cache instantly (0ms UI latency & immediately consistent reads)
     memoryCache.set(key, value);
 
-    // 2. Persist to localStorage safely with quota recovery
-    if (typeof localStorage !== 'undefined') {
-      try {
-        localStorage.setItem(key, JSON.stringify(value));
-      } catch (err) {
-        console.warn(`[Storage] localStorage write for ${key} failed, attempting quota recovery:`, err);
-        try {
-          cleanupLocalStorageQuota();
-          localStorage.setItem(key, JSON.stringify(value));
-        } catch (retryErr) {
-          console.warn(`[Storage] LocalStorage quota still exceeded for ${key}. Preserving in IndexedDB & Memory:`, retryErr);
-          try {
-            if (Array.isArray(value)) {
-              localStorage.setItem(key, JSON.stringify(value.slice(-60)));
-            } else {
-              localStorage.setItem(key, JSON.stringify({ __overflow_idb: true, count: 1 }));
-            }
-          } catch {
-            try { localStorage.removeItem(key); } catch {}
-          }
-        }
-      }
+    // 2. Persist immediately for critical auth/context keys or when explicitly requested;
+    //    otherwise coalesce rapid disk writes (120ms debounce / 400ms max-wait, auto-flushed on pagehide/unload)
+    if (options?.immediate || IMMEDIATE_PERSIST_KEYS.has(key) || typeof window === 'undefined') {
+      pendingStorageWrites.delete(key);
+      persistSingleKeyNow(key, value, options?.skipIdbOverwriteIfExisting);
+    } else {
+      pendingStorageWrites.set(key, {
+        value,
+        skipIdbOverwriteIfExisting: options?.skipIdbOverwriteIfExisting,
+      });
+      scheduleStorageFlush();
     }
 
-    // 3. Persist asynchronously to IndexedDB meta store for bulletproof persistence across browser reloads
-    if (typeof window !== 'undefined' && window.indexedDB) {
-      if (options?.skipIdbOverwriteIfExisting) {
-        getMeta(`room_${key}`)
-          .then((existing) => {
-            if (existing === null || existing === undefined) {
-              setMeta(`room_${key}`, value).catch(() => {});
-            }
-          })
-          .catch(() => {
-            setMeta(`room_${key}`, value).catch(() => {});
-          });
-      } else {
-        setMeta(`room_${key}`, value).catch(() => {});
-      }
-    }
-
-    // 4. Notify subscribers via throttled frame
+    // 3. Notify subscribers via batch-aware coalesced frame
     notifyListeners();
   } catch (err) {
     console.error(`Error in setStored for ${key}:`, err);

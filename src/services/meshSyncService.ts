@@ -39,6 +39,9 @@ import {
   STORAGE_KEYS,
   mergeT1Records,
   isPosActiveCheckout,
+  beginBatchUpdate,
+  endBatchUpdate,
+  isOfflineModeForced,
   getTransactionsDigest,
   applyTombstone,
   recordTombstone,
@@ -843,14 +846,43 @@ class MeshSyncManager {
     return result;
   }
 
+  private pendingHubUiEvents: Map<string, any> = new Map();
+
+  private dispatchHubCoalescedEvent(eventName: string, detail?: any) {
+    if (typeof window === 'undefined') return;
+    if (this.isIngestingFromHub) {
+      this.pendingHubUiEvents.set(eventName, detail);
+      this.scheduleBatchUiUpdate();
+      return;
+    }
+    window.dispatchEvent(
+      detail !== undefined ? new CustomEvent(eventName, { detail }) : new CustomEvent(eventName)
+    );
+  }
+
   private scheduleBatchUiUpdate() {
     if (this.batchUiTimer) return;
     this.batchUiTimer = window.setTimeout(() => {
       this.batchUiTimer = null;
       if (typeof window !== 'undefined') {
-        window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
-        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
-        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        const queued = Array.from(this.pendingHubUiEvents.entries());
+        this.pendingHubUiEvents.clear();
+        const dispatched = new Set<string>();
+        for (const [evtName, detail] of queued) {
+          dispatched.add(evtName);
+          window.dispatchEvent(
+            detail !== undefined ? new CustomEvent(evtName, { detail }) : new CustomEvent(evtName)
+          );
+        }
+        if (!dispatched.has('saimetric_sales_updated')) {
+          window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+        }
+        if (!dispatched.has('saimetric_cash_updated')) {
+          window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+        }
+        if (!dispatched.has('saimetric_inventory_updated')) {
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        }
       }
     }, 150);
   }
@@ -2071,9 +2103,11 @@ class MeshSyncManager {
     const batch = this.hubIngestQueue.splice(0, BATCH_SIZE);
 
     // ABSOLUTE STRICT INGEST:
-    // Inside this execution window, outbound broadcasts are strictly prohibited.
+    // Inside this execution window, outbound broadcasts are strictly prohibited,
+    // and RoomDatabase notifications are batched so 10 packets trigger 1 clean UI update instead of 10.
     this.isIngestingFromHub = true;
     this.syncLocalHubContext();
+    beginBatchUpdate();
     try {
       for (const item of batch) {
         this.processSingleLocalHubPacket(item);
@@ -2081,12 +2115,13 @@ class MeshSyncManager {
     } catch (err) {
       console.warn('[MeshSync] Error processing hub ingest batch:', err);
     } finally {
+      endBatchUpdate();
       this.isIngestingFromHub = false;
       this.syncLocalHubContext();
     }
 
     if (this.hubIngestQueue.length > 0) {
-      // 50ms pause between batches yields the event loop to the browser network thread, preventing socket drops
+      // 50ms pause between batches yields the event loop to the browser UI & network threads
       this.hubProcessingTimer = window.setTimeout(() => {
         this.processHubQueueBatch();
       }, 50);
@@ -2466,11 +2501,9 @@ class MeshSyncManager {
         }
 
         if ((ingested || attachedLogs.length > 0) && !isSilent) {
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
-            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
-            window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
-          }
+          this.dispatchHubCoalescedEvent('saimetric_sales_updated');
+          this.dispatchHubCoalescedEvent('saimetric_cash_updated');
+          this.dispatchHubCoalescedEvent('saimetric_inventory_updated');
           this.scheduleBatchUiUpdate();
           this.addLog(
             'EPIDEMIC_HOP',
@@ -2502,14 +2535,9 @@ class MeshSyncManager {
           fromMesh: true,
         });
         if (ingested && !isSilent) {
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('saimetric_inventory_updated', { detail: d }));
-            window.dispatchEvent(new Event('saimetric_products_updated'));
-            window.dispatchEvent(new CustomEvent('saimetric_products_updated', { detail: d }));
-            window.dispatchEvent(
-              new CustomEvent('mesh-inventory-received', { detail: { item: d, originName } })
-            );
-          }
+          this.dispatchHubCoalescedEvent('saimetric_inventory_updated', d);
+          this.dispatchHubCoalescedEvent('saimetric_products_updated', d);
+          this.dispatchHubCoalescedEvent('mesh-inventory-received', { item: d, originName });
           this.scheduleBatchUiUpdate();
           this.notifyPeerSubscribers();
           this.addLog(
@@ -2528,8 +2556,8 @@ class MeshSyncManager {
         if (d) {
           const ingested = ingestMeshCashLog({ ...d, fromMesh: true } as any);
           if (ingested && !isSilent && typeof window !== 'undefined') {
-            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
-            window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+            this.dispatchHubCoalescedEvent('saimetric_cash_updated');
+            this.dispatchHubCoalescedEvent('saimetric_cash_movements_updated');
             this.addLog(
               'EPIDEMIC_HOP',
               `Cash Drawer movement synced from ${originName}: In $${d.in || 0} / Out $${d.out || 0} (${d.description || ''}).`,
@@ -2543,10 +2571,10 @@ class MeshSyncManager {
       case 'customer_change':
         if (d) {
           if (ingestMeshCustomerChange(d) && !isSilent && typeof window !== 'undefined') {
-            playChime();
-            window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: d }));
-            window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
-            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+            if (!this.isIngestingFromHub) playChime();
+            this.dispatchHubCoalescedEvent('saimetric_customer_changes_updated', d);
+            this.dispatchHubCoalescedEvent('saimetric_customers_updated');
+            this.dispatchHubCoalescedEvent('saimetric_cash_updated');
             this.addLog(
               'EPIDEMIC_HOP',
               `Customer Change voucher synced from ${originName}: ${d.customerName || ''} ($${d.amount || d.in || d.out || 0})`,
@@ -2560,10 +2588,10 @@ class MeshSyncManager {
       case 'credit_sale':
         if (d) {
           if (ingestMeshCreditSale(d) && !isSilent && typeof window !== 'undefined') {
-            playChime();
-            window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: d }));
-            window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
-            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+            if (!this.isIngestingFromHub) playChime();
+            this.dispatchHubCoalescedEvent('saimetric_credit_sales_updated', d);
+            this.dispatchHubCoalescedEvent('saimetric_customers_updated');
+            this.dispatchHubCoalescedEvent('saimetric_cash_updated');
             this.addLog(
               'EPIDEMIC_HOP',
               `Credit Sale synced from ${originName}: ${d.customerName || ''} ($${d.amount || 0})`,
@@ -5256,6 +5284,10 @@ class MeshSyncManager {
     this.localGatewayPollTimer = window.setInterval(async () => {
       if (typeof document !== 'undefined' && document.hidden) return;
       if (Date.now() < this.localGatewayBackoffUntil) return;
+      // Offline-First & Local Hub Priority: never waste HTTP connections polling /api/mesh/*
+      // when connected directly to the Termux Local Hub or when offline.
+      if (this.isLocalHubConnected && !this.isCloudOnlyMode) return;
+      if (isOfflineModeForced() || (typeof navigator !== 'undefined' && !navigator.onLine)) return;
 
       const tripBackoff = (status: number) => {
         this.localGatewayFailureCount = Math.min(this.localGatewayFailureCount + 1, 6);
@@ -8502,7 +8534,38 @@ class MeshSyncManager {
     return result;
   }
 
+  private peerNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  private logNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+
   private notifyPeerSubscribers(force: boolean = false) {
+    if (!force && this.isIngestingFromHub) {
+      if (!this.peerNotifyTimer) {
+        this.peerNotifyTimer = setTimeout(() => {
+          this.peerNotifyTimer = null;
+          this.notifyPeerSubscribers(false);
+        }, 450);
+      }
+      return;
+    }
+
+    if (!force) {
+      if (this.peerNotifyTimer) return;
+      this.peerNotifyTimer = setTimeout(() => {
+        this.peerNotifyTimer = null;
+        this.flushPeerSubscribers(false);
+      }, 300);
+      return;
+    }
+
+    if (this.peerNotifyTimer) {
+      clearTimeout(this.peerNotifyTimer);
+      this.peerNotifyTimer = null;
+    }
+    this.flushPeerSubscribers(true);
+  }
+
+  private flushPeerSubscribers(force: boolean = false) {
+    if (this.peerListeners.length === 0) return;
     let count: number;
     let peersList: P2PMeshPeer[];
 
@@ -8575,11 +8638,19 @@ class MeshSyncManager {
     this.logs.unshift(log);
     if (this.logs.length > 300) this.logs.pop();
 
-    this.logListeners.forEach((fn) => {
-      try {
-        fn([...this.logs]);
-      } catch (e) {}
-    });
+    if (this.logListeners.length === 0) return;
+    if (!this.logNotifyTimer) {
+      this.logNotifyTimer = setTimeout(() => {
+        this.logNotifyTimer = null;
+        if (this.logListeners.length === 0) return;
+        const snapshot = [...this.logs];
+        this.logListeners.forEach((fn) => {
+          try {
+            fn(snapshot);
+          } catch (e) {}
+        });
+      }, 250);
+    }
   }
 
   // =========================================================================

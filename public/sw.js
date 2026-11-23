@@ -3,7 +3,7 @@
  * Provides 100% offline app loading, clean cache management, and instant updates.
  */
 
-const CACHE_NAME = 'saimetric-v5-offline-v12';
+const CACHE_NAME = 'saimetric-v5-offline-v13';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',
@@ -80,31 +80,11 @@ self.addEventListener('fetch', (event) => {
   }
 
   // Handle SPA Navigation requests (HTML document)
-  // Network-First when online to ensure fresh version is served; fallback to cache when offline
+  // True Offline-First (Stale-While-Revalidate): serve cached shell in 0ms immediately,
+  // then silently refresh from network in the background when online so flaky WiFi / LAN Hub never stalls startup.
   if (event.request.mode === 'navigate') {
     event.respondWith(
       (async () => {
-        if (navigator.onLine) {
-          try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 3500);
-            const networkResponse = await fetch(event.request, { signal: controller.signal });
-            clearTimeout(timeoutId);
-
-            if (networkResponse && networkResponse.status === 200) {
-              const copy = networkResponse.clone();
-              const cache = await caches.open(CACHE_NAME);
-              cache.put(event.request, copy.clone());
-              cache.put('/', copy.clone());
-              cache.put('/index.html', copy.clone());
-              return networkResponse;
-            }
-          } catch (err) {
-            console.warn('[SW] Online navigation fetch timed out or failed, falling back to cache');
-          }
-        }
-
-        // Offline fallback: serve from current cache
         const cache = await caches.open(CACHE_NAME);
         const cached =
           (await cache.match(event.request)) ||
@@ -112,8 +92,37 @@ self.addEventListener('fetch', (event) => {
           (await cache.match('/index.html')) ||
           (await cache.match('/'));
 
+        const revalidateInBackground = async () => {
+          if (!navigator.onLine) return null;
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 2500);
+            const networkResponse = await fetch(event.request, { signal: controller.signal });
+            clearTimeout(timeoutId);
+
+            if (networkResponse && networkResponse.status === 200) {
+              const copy = networkResponse.clone();
+              await cache.put(event.request, copy.clone());
+              await cache.put('/', copy.clone());
+              await cache.put('/index.html', copy.clone());
+              return networkResponse;
+            }
+          } catch {
+            // Silent offline fallback
+          }
+          return null;
+        };
+
         if (cached) {
+          // Instant 0ms offline-first load; refresh cache silently in background
+          event.waitUntil(revalidateInBackground());
           return cached;
+        }
+
+        // Cold first visit (no cached shell yet): fetch from network
+        const networkFresh = await revalidateInBackground();
+        if (networkFresh) {
+          return networkFresh;
         }
 
         return new Response(

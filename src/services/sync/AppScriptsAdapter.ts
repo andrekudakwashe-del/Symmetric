@@ -25,6 +25,8 @@ import {
   annotateSaleCloudReceiptMetadata,
   DEFAULT_MASTER_WEBHOOK_URL,
   isMasterCompanyId,
+  beginBatchUpdate,
+  endBatchUpdate,
 } from '../../db/roomDatabase';
 import {
   fetchWithTimeout,
@@ -1046,40 +1048,53 @@ export class AppScriptsAdapter implements SyncAdapter {
           return (Number(a?.serverSeq || 0) - Number(b?.serverSeq || 0));
         });
 
-        for (const rawEnv of rawList) {
-          if (!rawEnv || !rawEnv.entityType) continue;
-          const eType = String(rawEnv.entityType).trim().toLowerCase();
-          const spec = ENTITY_REGISTRY[eType];
-          const rawMut = String(rawEnv.mutationSource || '').toUpperCase();
-          const envMutSource: MutationSource = rawMut === 'SEED' ? 'SEED' : rawMut === 'USER_EDIT' ? 'USER_EDIT' : 'MIGRATION';
-          const env: SyncEnvelope = {
-            packetId: String(rawEnv.packetId || `GAS-PULL-${eType}-${rawEnv.entityId}-${Date.now()}`),
-            entityType: eType,
-            entityId: String(rawEnv.entityId || ''),
-            action: rawEnv.action === 'DELETE' ? 'DELETE' : 'UPSERT',
-            data: rawEnv.data,
-            updatedAt: parseTimestampMs(rawEnv.updatedAt) || Date.now(),
-            version: Number(rawEnv.version || 1),
-            mutationSource: envMutSource,
-            originDeviceId: rawEnv.originDeviceId || 'APPS_SCRIPT_CLOUD',
-            targetBranchId: rawEnv.targetBranchId || creds.branchId || 'ALL',
-            class: spec ? spec.class : (rawEnv.class === 'T2' ? 'T2' : 'T1'),
-            isCloudSynced: true,
-          };
+        beginBatchUpdate();
+        try {
+          for (let idx = 0; idx < rawList.length; idx++) {
+            const rawEnv = rawList[idx];
+            if (!rawEnv || !rawEnv.entityType) continue;
+            const eType = String(rawEnv.entityType).trim().toLowerCase();
+            const spec = ENTITY_REGISTRY[eType];
+            const rawMut = String(rawEnv.mutationSource || '').toUpperCase();
+            const envMutSource: MutationSource = rawMut === 'SEED' ? 'SEED' : rawMut === 'USER_EDIT' ? 'USER_EDIT' : 'MIGRATION';
+            const env: SyncEnvelope = {
+              packetId: String(rawEnv.packetId || `GAS-PULL-${eType}-${rawEnv.entityId}-${Date.now()}`),
+              entityType: eType,
+              entityId: String(rawEnv.entityId || ''),
+              action: rawEnv.action === 'DELETE' ? 'DELETE' : 'UPSERT',
+              data: rawEnv.data,
+              updatedAt: parseTimestampMs(rawEnv.updatedAt) || Date.now(),
+              version: Number(rawEnv.version || 1),
+              mutationSource: envMutSource,
+              originDeviceId: rawEnv.originDeviceId || 'APPS_SCRIPT_CLOUD',
+              targetBranchId: rawEnv.targetBranchId || creds.branchId || 'ALL',
+              class: spec ? spec.class : (rawEnv.class === 'T2' ? 'T2' : 'T1'),
+              isCloudSynced: true,
+            };
 
-          const existing = lookupLocalRecordForCloudEnvelope(env);
-          const ingestRes = await routeCloudRecordThroughSyncCore(env, existing, () => {
-            applyCloudEnvelopeToRoomDb(env, 'APPS_SCRIPT_CLOUD');
-          });
+            const existing = lookupLocalRecordForCloudEnvelope(env);
+            const ingestRes = await routeCloudRecordThroughSyncCore(env, existing, () => {
+              applyCloudEnvelopeToRoomDb(env, 'APPS_SCRIPT_CLOUD');
+            });
 
-          if (ingestRes.accepted) {
-            this.emitReceivedEnvelope(env);
-            pulledEnvelopes.push(env);
+            if (ingestRes.accepted) {
+              this.emitReceivedEnvelope(env);
+              pulledEnvelopes.push(env);
+            }
+
+            if (typeof rawEnv.serverSeq === 'number' && rawEnv.serverSeq > maxSeq) {
+              maxSeq = rawEnv.serverSeq;
+            }
+
+            // Yield to the main UI thread every 15 records so opening views/files stays 60fps instant
+            if ((idx + 1) % 15 === 0) {
+              endBatchUpdate();
+              await sleepMs(16);
+              beginBatchUpdate();
+            }
           }
-
-          if (typeof rawEnv.serverSeq === 'number' && rawEnv.serverSeq > maxSeq) {
-            maxSeq = rawEnv.serverSeq;
-          }
+        } finally {
+          endBatchUpdate();
         }
 
         if (typeof resData?.server_seq === 'number' && resData.server_seq > maxSeq) {
@@ -1130,32 +1145,37 @@ export class AppScriptsAdapter implements SyncAdapter {
         if (!this.canRelayToCloud()) break;
         const chunk = lsQueue.slice(i, i + BATCH_SIZE);
         const envelopes: SyncEnvelope[] = [];
-        for (const item of chunk) {
-          const p = item.payload || {};
-          const rawEntity = resolveCanonicalEntityType(String(p.entityType || item.sheetName || 'audit_log'));
-          const eType = ENTITY_REGISTRY[rawEntity] ? rawEntity : 'audit_log';
-          const eId = extractCanonicalEntityId(eType, p, item.id);
-          updateSyncQueueItem(item.id, { status: 'syncing' });
-          const lsMut: MutationSource = p.mutationSource === 'SEED' ? 'SEED' : 'USER_EDIT';
-          envelopes.push(
-            this.sanitizeEnvelopeForCloud(
-              {
-                packetId: p.clientRequestId || item.id,
-                entityType: eType,
-                entityId: eId,
-                action: item.action === 'DELETE' ? 'DELETE' : 'UPSERT',
-                data: p,
-                updatedAt: parseTimestampMs(p.updatedAt) || item.timestamp || Date.now(),
-                version: Number(p.version || 1),
-                mutationSource: lsMut,
-                originDeviceId: 'PWA_OFFLINE_QUEUE',
-                targetBranchId: p.branch_id || creds.branchId || 'ALL',
-                class: ENTITY_REGISTRY[eType]?.class || 'T1',
-              },
-              creds.companyId,
-              creds.branchId
-            )
-          );
+        beginBatchUpdate();
+        try {
+          for (const item of chunk) {
+            const p = item.payload || {};
+            const rawEntity = resolveCanonicalEntityType(String(p.entityType || item.sheetName || 'audit_log'));
+            const eType = ENTITY_REGISTRY[rawEntity] ? rawEntity : 'audit_log';
+            const eId = extractCanonicalEntityId(eType, p, item.id);
+            updateSyncQueueItem(item.id, { status: 'syncing' });
+            const lsMut: MutationSource = p.mutationSource === 'SEED' ? 'SEED' : 'USER_EDIT';
+            envelopes.push(
+              this.sanitizeEnvelopeForCloud(
+                {
+                  packetId: p.clientRequestId || item.id,
+                  entityType: eType,
+                  entityId: eId,
+                  action: item.action === 'DELETE' ? 'DELETE' : 'UPSERT',
+                  data: p,
+                  updatedAt: parseTimestampMs(p.updatedAt) || item.timestamp || Date.now(),
+                  version: Number(p.version || 1),
+                  mutationSource: lsMut,
+                  originDeviceId: 'PWA_OFFLINE_QUEUE',
+                  targetBranchId: p.branch_id || creds.branchId || 'ALL',
+                  class: ENTITY_REGISTRY[eType]?.class || 'T1',
+                },
+                creds.companyId,
+                creds.branchId
+              )
+            );
+          }
+        } finally {
+          endBatchUpdate();
         }
 
         try {
