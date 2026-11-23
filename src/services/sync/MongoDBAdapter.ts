@@ -110,7 +110,7 @@ export class MongoDBAdapter implements SyncAdapter {
     const compId = d.company_id || d.companyId || getCurrentCompany()?.company_id || 'COMP-001';
     const branchId = d.branch_id || d.branchId || envelope.targetBranchId || getCurrentBranchId() || 'ALL';
     const collection = mapEntityTypeToCloudTable(envelope.entityType);
-    const idVal = String(d.id || d.itemId || d.customerId || d.grvNumber || envelope.entityId);
+    const idVal = String(d.id || d.account_id || d.transfer_id || d.settlementId || d.itemId || d.customerId || d.grvNumber || envelope.entityId);
 
     let response: Response;
     try {

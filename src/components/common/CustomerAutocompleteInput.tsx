@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Customer } from '../../types';
 import { getCustomers, getCustomerChanges, getCreditSales } from '../../db/roomDatabase';
+import { formatDisplayId } from '../../utils/idFormatters';
 import {
   User,
   Check,
@@ -264,9 +265,12 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
         {/* Status indicator / Customer ID badge inside input */}
         <div className="absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center space-x-1.5 pointer-events-none">
           {exactMatch ? (
-            <span className="text-[10px] bg-emerald-500/20 text-emerald-300 font-mono-num font-bold px-1.5 py-0.5 rounded flex items-center space-x-1">
+            <span
+              title={exactMatch.customerId}
+              className="text-[10px] bg-emerald-500/20 text-emerald-300 font-mono-num font-bold px-1.5 py-0.5 rounded flex items-center space-x-1"
+            >
               <Check className="w-3 h-3 text-emerald-400" />
-              <span>{exactMatch.customerId}</span>
+              <span>{formatDisplayId(exactMatch.customerId, 'customer')}</span>
             </span>
           ) : query && !disabled ? (
             <span className="text-[10px] bg-purple-500/20 text-purple-300 font-semibold px-1.5 py-0.5 rounded flex items-center space-x-1">
@@ -318,8 +322,11 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
                         <span className="font-bold text-white truncate">
                           {renderHighlightedName(cust.name, query)}
                         </span>
-                        <span className="font-mono-num text-[10px] text-purple-300 bg-purple-950 border border-purple-800/60 px-1.5 py-0.2 rounded shrink-0 font-bold">
-                          {cust.customerId}
+                        <span
+                          title={cust.customerId}
+                          className="font-mono-num text-[10px] text-purple-300 bg-purple-950 border border-purple-800/60 px-1.5 py-0.2 rounded shrink-0 font-bold"
+                        >
+                          {formatDisplayId(cust.customerId, 'customer')}
                         </span>
                       </div>
 

@@ -83,6 +83,7 @@ import { ProcurementTripManifestView } from './ProcurementTripManifestView';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
 import { safeDateSlice } from '../../utils/dateUtils';
+import { formatDisplayId } from '../../utils/idFormatters';
 
 interface GoodsReceivedViewProps {
   currentUser: Salesperson | null;
@@ -1654,8 +1655,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                             }`}
                           >
                             <span className="block font-semibold">{s.name}</span>
-                            <span className="text-[10px] text-slate-500 font-mono">
-                              {s.supplierId} • {s.category}
+                            <span title={s.supplierId} className="text-[10px] text-slate-500 font-mono">
+                              {formatDisplayId(s.supplierId, 'supplier')} • {s.category}
                             </span>
                           </button>
                         ))}

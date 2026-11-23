@@ -135,7 +135,7 @@ export class SupabaseAdapter implements SyncAdapter {
 
     const basePayload: Record<string, any> = {
       ...d,
-      id: d.id || d.itemId || d.customerId || d.grvNumber || envelope.entityId,
+      id: d.id || d.account_id || d.transfer_id || d.settlementId || d.itemId || d.customerId || d.grvNumber || envelope.entityId,
       company_id: compId,
       branch_id: branchId,
       updated_at: new Date(outboundTs).toISOString(),

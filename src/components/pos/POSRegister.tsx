@@ -32,6 +32,7 @@ import {
   getCurrentBranch,
   getTodayDateString,
 } from '../../db/roomDatabase';
+import { formatDisplayId } from '../../utils/idFormatters';
 import { syncService } from '../../services/syncService';
 import { meshSyncService } from '../../services/meshSyncService';
 import { ManagerPinModal } from '../common/ManagerPinModal';
@@ -1059,8 +1060,11 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
                     {activeCustomer?.name || 'Walk-in Customer'}
                   </span>
                   {isRegisteredCustomer ? (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold border border-emerald-500/30">
-                      Registered (#{activeCustomer?.customerId})
+                    <span
+                      title={activeCustomer?.customerId}
+                      className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold border border-emerald-500/30"
+                    >
+                      Registered (#{formatDisplayId(activeCustomer?.customerId, 'customer')})
                     </span>
                   ) : (
                     <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-semibold border border-amber-500/30">

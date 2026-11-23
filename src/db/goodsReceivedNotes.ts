@@ -20,10 +20,35 @@ export const IDB_GENERAL_STORE = 'generalGRVs';
 
 let memoryGrns: GoodsReceivedNote[] = [];
 
+const normGrnTenant = (comp?: string | null): string => {
+  const clean = String(comp || '').trim().toUpperCase();
+  if (!clean || clean === 'COMP-001' || clean === 'COMP-MASTER' || clean === 'DEFAULT') {
+    return 'COMP-001';
+  }
+  return clean;
+};
+
+const getActiveGrnCompanyId = (): string => {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const sessionRaw = window.localStorage.getItem('saimetric_room_session_user');
+      if (sessionRaw) {
+        const u = JSON.parse(sessionRaw);
+        if (u?.companyId || u?.company_id) return String(u.companyId || u.company_id).trim();
+      }
+      const storedComp = window.localStorage.getItem('saimetric_room_current_company_id');
+      if (storedComp && storedComp.trim()) return storedComp.trim();
+    } catch {
+      // Fallback below
+    }
+  }
+  return 'COMP-001';
+};
+
 /**
- * Read all unified Goods Received Notes from storage (in-memory / localStorage)
+ * Read ALL raw unified Goods Received Notes across all companies (internal persistence & migrations only)
  */
-export const getAllGoodsReceivedNotes = (): GoodsReceivedNote[] => {
+export const getRawStoredGoodsReceivedNotes = (): GoodsReceivedNote[] => {
   if (typeof window === 'undefined' || !window.localStorage) {
     return memoryGrns;
   }
@@ -40,6 +65,15 @@ export const getAllGoodsReceivedNotes = (): GoodsReceivedNote[] => {
     console.error('[GRN Store] Error reading goodsReceivedNotes:', err);
     return memoryGrns;
   }
+};
+
+/**
+ * Read tenant-scoped unified Goods Received Notes for the currently active company
+ */
+export const getAllGoodsReceivedNotes = (companyId?: string): GoodsReceivedNote[] => {
+  const all = getRawStoredGoodsReceivedNotes();
+  const targetComp = normGrnTenant(companyId || getActiveGrnCompanyId());
+  return all.filter((g) => normGrnTenant(g.company_id || g.companyId) === targetComp);
 };
 
 /**
@@ -83,17 +117,23 @@ export const saveAllGoodsReceivedNotes = (grns: GoodsReceivedNote[]) => {
  * Save or update a single Goods Received Note
  */
 export const saveGoodsReceivedNote = (grn: GoodsReceivedNote): GoodsReceivedNote => {
-  const all = getAllGoodsReceivedNotes();
-  const idx = all.findIndex((g) => g.id === grn.id || g.grnNumber === grn.grnNumber);
+  const all = getRawStoredGoodsReceivedNotes();
+  const activeComp = grn.company_id || grn.companyId || getActiveGrnCompanyId();
+  const stamped: GoodsReceivedNote = {
+    ...grn,
+    company_id: activeComp,
+    companyId: activeComp,
+  };
+  const idx = all.findIndex((g) => g.id === stamped.id || g.grnNumber === stamped.grnNumber);
   let updated: GoodsReceivedNote[];
   if (idx >= 0) {
     updated = [...all];
-    updated[idx] = grn;
+    updated[idx] = stamped;
   } else {
-    updated = [grn, ...all];
+    updated = [stamped, ...all];
   }
   saveAllGoodsReceivedNotes(updated);
-  return grn;
+  return stamped;
 };
 
 // ==================== TYPE CONVERTERS ====================
@@ -489,7 +529,7 @@ export interface GrnMigrationReport {
  * Can be run repeatedly without duplicating records.
  */
 export async function runGrnMigration(): Promise<GrnMigrationReport> {
-  const existingGrns = getAllGoodsReceivedNotes();
+  const existingGrns = getRawStoredGoodsReceivedNotes();
   const existingMap = new Map<string, GoodsReceivedNote>();
 
   for (const g of existingGrns) {

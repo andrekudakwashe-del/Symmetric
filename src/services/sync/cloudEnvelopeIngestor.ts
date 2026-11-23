@@ -182,9 +182,12 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
         return ts > 0 ? { ...found, updatedAt: ts } : undefined;
       }
       case 'cash_account': {
-        const found = getRawStoredCashAccounts().find(
-          (a: any) => String(a.account_id || a.id || '').trim().toUpperCase() === cleanUpper
-        );
+        const envComp = String(d?.company_id || d?.companyId || envelope.meta?.companyId || '').trim().toUpperCase();
+        const found = getRawStoredCashAccounts().find((a: any) => {
+          if (String(a.account_id || a.id || '').trim().toUpperCase() !== cleanUpper) return false;
+          const accComp = String(a.company_id || a.companyId || '').trim().toUpperCase();
+          return !envComp || !accComp || accComp === envComp;
+        });
         if (!found) return undefined;
         const ts = extractRecordTimestamp(found);
         return ts > 0 ? { ...found, updatedAt: ts } : undefined;
@@ -337,7 +340,14 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
         (g: any) => String(g.id || g.grvNumber || '').trim().toUpperCase() === cleanUpper
       );
       if (!existing) return undefined;
-      const statusChanged = (d?.status && d.status !== existing.status) || envelope.action === 'UPSERT';
+      const paymentChanged =
+        (d?.paymentStatus && d.paymentStatus !== (existing as any).paymentStatus) ||
+        (d?.unpaidBalance !== undefined && Number(d.unpaidBalance) !== Number((existing as any).unpaidBalance)) ||
+        (Boolean(d?.paidVoucherId) && d.paidVoucherId !== (existing as any).paidVoucherId);
+      const statusChanged =
+        (d?.status && d.status !== existing.status) ||
+        paymentChanged ||
+        envelope.action === 'UPSERT';
       return statusChanged ? undefined : existing;
     }
     case 'internal_consumption': {
@@ -401,9 +411,13 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
         (v: any) => String(v.voucherId || v.id || '').trim().toUpperCase() === cleanUpper
       );
       if (!existing) return undefined;
-      const prevPaid = Number((existing as any).paidAmount || 0);
-      const nextPaid = Number(d?.paidAmount || 0);
-      if (nextPaid > prevPaid || (d?.status === 'PAID' && (existing as any).status !== 'PAID')) {
+      const prevPaid = Math.max(Number((existing as any).paidAmount || 0), Number((existing as any).custodyPaidAmount || 0));
+      const nextPaid = Math.max(Number(d?.paidAmount || 0), Number(d?.custodyPaidAmount || 0));
+      const markedPaid =
+        (d?.status === 'PAID' && (existing as any).status !== 'PAID') ||
+        (d?.paymentStatus === 'PAID' && (existing as any).paymentStatus !== 'PAID') ||
+        (Boolean(d?.paidVoucherId) && !(existing as any).paidVoucherId);
+      if (nextPaid > prevPaid || markedPaid || envelope.action === 'UPSERT') {
         return undefined;
       }
       return existing;
@@ -1123,15 +1137,19 @@ export function applyCloudEnvelopeToRoomDb(
     case 'cash_account':
       if (d && (d.account_id || d.id)) {
         const accId = String(d.account_id || d.id).trim();
-        const existingAcc: any = getRawStoredCashAccounts().find(
-          (a: any) => String(a.account_id || a.id || '').trim().toUpperCase() === accId.toUpperCase()
-        );
+        const incComp = String(d.company_id || d.companyId || envelope.meta?.companyId || '').trim().toUpperCase();
+        const existingAcc: any = getRawStoredCashAccounts().find((a: any) => {
+          if (String(a.account_id || a.id || '').trim().toUpperCase() !== accId.toUpperCase()) return false;
+          const aComp = String(a.company_id || a.companyId || '').trim().toUpperCase();
+          return !incComp || !aComp || aComp === incComp;
+        });
         const accTime = extractRecordTimestamp(d) || envelope.updatedAt || 0;
         const accPayload: any = { ...d, isCloudSynced: markCloudSynced, fromMesh: true };
         if (protectBalances && existingAcc) {
-          // GOLDEN RULE: Preserve live local CashAccount balance; update account metadata only
+          // GOLDEN RULE: Preserve live local CashAccount balance (base USD & native mobile money); update metadata only
           accPayload.current_balance = existingAcc.current_balance;
           if (existingAcc.balance !== undefined) accPayload.balance = existingAcc.balance;
+          if (existingAcc.native_balance !== undefined) accPayload.native_balance = existingAcc.native_balance;
           options?.onBalanceProtected?.('cash_account', accId);
         }
         saveCashAccount(accPayload, { fromSync: true });
@@ -1233,7 +1251,7 @@ export function applyCloudEnvelopeToRoomDb(
     case 'supplier_payable': {
       const pId = String(d.id || envelope.entityId || '').trim();
       if (d && pId) {
-        const allPayables = payablesLedger.getAllPayables();
+        const allPayables = payablesLedger.getRawStoredPayables();
         const idx = allPayables.findIndex((p) => String(p.id).toUpperCase() === pId.toUpperCase());
         if (idx >= 0) {
           const existing = allPayables[idx];
@@ -1376,8 +1394,13 @@ export function applyCloudEnvelopeToRoomDb(
 
     case 'electronic_settlement':
       if (d && (d.id || d.date)) {
+        const resolvedComp = d.company_id || d.companyId || (envelope as any).companyId || undefined;
         saveElectronicSettlement(
-          { ...d, id: d.id || `SETTLE-${d.date}-${branchId}` },
+          {
+            ...d,
+            id: d.id || `SETTLE-${d.date}-${branchId}`,
+            ...(resolvedComp ? { companyId: resolvedComp, company_id: resolvedComp } : {}),
+          },
           { fromSync: true }
         );
         if (typeof window !== 'undefined') {

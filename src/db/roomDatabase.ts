@@ -116,6 +116,16 @@ import {
   reportTrustedTimeSample,
 } from '../utils/clockSecurity';
 import {
+  getOrCreatePersistentDeviceId,
+  getDeviceShortCode,
+  getBranchInitials,
+  getUserInvoiceInitials,
+  peekSequentialEntityId,
+  allocateSequentialEntityId,
+  recordUsedSequentialId,
+  extractInvoiceRef,
+} from '../utils/idFormatters';
+import {
   INITIAL_SALESPEOPLE,
   INITIAL_CUSTOMERS,
   INITIAL_SUPPLIERS,
@@ -1820,7 +1830,7 @@ export const cleanupDuplicateChangeMovements = (): void => {
     // Pass 1: find all POS credit upfront deposits
     all.forEach((m) => {
       if (m.type === 'credit_upfront_deposit') {
-        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
         if (invMatch) {
           const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
           posCreditDepositInvoices.add(`${shiftPart}_${invMatch}`);
@@ -1833,7 +1843,7 @@ export const cleanupDuplicateChangeMovements = (): void => {
       if (m.type === 'change_received') {
         const isManualRef = Boolean(m.notes?.includes('[Manual Change]') || m.sourceRef?.startsWith('MAN-CHG-'));
         if (!isManualRef && (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #'))) {
-          const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+          const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
           if (invMatch) {
             const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
             const key = `chg_${shiftPart}_${invMatch}`;
@@ -1847,7 +1857,7 @@ export const cleanupDuplicateChangeMovements = (): void => {
       }
 
       if (m.type === 'credit_cash_payment') {
-        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
         const isPosDepositPayment = m.notes?.includes('deposit paid') || m.notes?.includes('POS Credit Sale Invoice');
         if (invMatch && isPosDepositPayment) {
           const shiftPart = m.shiftId || `${m.staffId}_${m.date}`;
@@ -2233,7 +2243,7 @@ export const getAllAuditLogs = (branchId?: string): AuditLogEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredAuditLogs();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((a) => isCompanyInTenantScope(a.company_id || a.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((a) => {
@@ -3632,8 +3642,26 @@ export const getCustomers = (): Customer[] => {
   });
 };
 
-export const getNextCustomerId = (): string => {
-  return generateUUID();
+const resolveBranchCodeForSequentialId = (branchId?: string): string => {
+  const targetBrId = branchId || getCurrentBranchId();
+  const branch = getBranchById(targetBrId) || getCurrentBranch();
+  return getBranchInitials(branch, targetBrId);
+};
+
+export const peekNextCustomerId = (branchId?: string): string => {
+  const companyId = getCurrentCompanyId();
+  const branchCode = resolveBranchCodeForSequentialId(branchId);
+  const dev4 = getDeviceShortCode(getDeviceId());
+  const existingIds = getRawStoredCustomers().map((c) => c.customerId || (c as any).id || '');
+  return peekSequentialEntityId({ companyId, entity: 'customer', branchCode, dev4, existingIds });
+};
+
+export const getNextCustomerId = (branchId?: string): string => {
+  const companyId = getCurrentCompanyId();
+  const branchCode = resolveBranchCodeForSequentialId(branchId);
+  const dev4 = getDeviceShortCode(getDeviceId());
+  const existingIds = getRawStoredCustomers().map((c) => c.customerId || (c as any).id || '');
+  return allocateSequentialEntityId({ companyId, entity: 'customer', branchCode, dev4, existingIds });
 };
 
 export const addCustomer = (
@@ -3652,9 +3680,10 @@ export const addCustomer = (
   const all = getRawStoredCustomers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const nextId = customerData.customerId || generateUUID();
   const compId = customerData.company_id || customerData.companyId || currentCompany;
   const brId = customerData.branch_id || customerData.branchId || currentBranch;
+  const nextId = customerData.customerId || getNextCustomerId(brId);
+  recordUsedSequentialId(compId, 'customer', nextId);
   
   // Default credit option is strictly OFF (creditAllowed: false, creditLimit: 0)
   const isCreditAllowed = customerData.creditAllowed === true;
@@ -3887,8 +3916,20 @@ export const getSupplierById = (supplierId: string): Supplier | undefined => {
   );
 };
 
-export const getNextSupplierId = (): string => {
-  return generateUUID();
+export const peekNextSupplierId = (branchId?: string): string => {
+  const companyId = getCurrentCompanyId();
+  const branchCode = resolveBranchCodeForSequentialId(branchId);
+  const dev4 = getDeviceShortCode(getDeviceId());
+  const existingIds = getRawStoredSuppliers().map((s) => s.supplierId || (s as any).id || '');
+  return peekSequentialEntityId({ companyId, entity: 'supplier', branchCode, dev4, existingIds });
+};
+
+export const getNextSupplierId = (branchId?: string): string => {
+  const companyId = getCurrentCompanyId();
+  const branchCode = resolveBranchCodeForSequentialId(branchId);
+  const dev4 = getDeviceShortCode(getDeviceId());
+  const existingIds = getRawStoredSuppliers().map((s) => s.supplierId || (s as any).id || '');
+  return allocateSequentialEntityId({ companyId, entity: 'supplier', branchCode, dev4, existingIds });
 };
 
 export const addSupplier = (
@@ -3907,9 +3948,10 @@ export const addSupplier = (
   const all = getRawStoredSuppliers();
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
-  const nextId = supplierData.supplierId || supplierData.id || generateUUID();
   const compId = supplierData.company_id || supplierData.companyId || currentCompany;
   const brId = supplierData.branch_id || supplierData.branchId || currentBranch;
+  const nextId = supplierData.supplierId || supplierData.id || getNextSupplierId(brId);
+  recordUsedSequentialId(compId, 'supplier', nextId);
   const created: Supplier = {
     supplierId: nextId,
     name: (supplierData.name || '').trim(),
@@ -4344,6 +4386,18 @@ const normBranchTenant = (comp?: string): string => {
   return clean;
 };
 
+/**
+ * Canonical Company/Tenant Isolation Matcher:
+ * Legacy untagged records belong to COMP-001 (master default) and NEVER leak into new companies.
+ */
+export const isCompanyInTenantScope = (
+  recordCompanyId?: string | null,
+  targetCompanyId?: string | null
+): boolean => {
+  if (!targetCompanyId) return true;
+  return normBranchTenant(recordCompanyId || undefined) === normBranchTenant(targetCompanyId || undefined);
+};
+
 const isPlaceholderBranchName = (name?: string): boolean => {
   const clean = String(name || '').trim().toLowerCase();
   return !clean || clean === 'branch' || clean === 'main branch' || clean === 'unnamed branch';
@@ -4663,23 +4717,24 @@ export const getBranchById = (branchId: string): Branch | undefined => {
  * 3. Handles all canonical aliases ('1', 'BR-MAIN', 'BR001', 'HQ-01', 'SAI-01', lowercase, whitespace trimmed).
  * 4. Unassigned legacy records match the main/HQ branch.
  */
-export const isRecordInBranchScope = (
+export function isRecordInBranchScope(
   recordBranchId: string | undefined | null,
   targetBranchId: string,
   branchesList?: Branch[],
   targetCompanyId?: string,
   recordCompanyId?: string
-): boolean => {
-  if (!targetBranchId || targetBranchId === 'ALL') return true;
-
-  // Strict company isolation: if both companies are present and neither is COMP-MASTER, they must match
-  if (recordCompanyId && targetCompanyId) {
-    const cleanRecComp = normBranchTenant(recordCompanyId);
-    const cleanTgtComp = normBranchTenant(targetCompanyId);
-    if (cleanRecComp !== cleanTgtComp) {
+): boolean {
+  // Strict company isolation FIRST whenever the caller passes the record's company argument
+  // (even when that property is undefined on a legacy COMP-001 record, or when targetBranchId === 'ALL'!).
+  // Callers passing fewer than 5 arguments are performing pure same-company branch-ID matching.
+  if (arguments.length >= 5) {
+    const effectiveTargetCompany = targetCompanyId || getCurrentCompanyId();
+    if (effectiveTargetCompany && !isCompanyInTenantScope(recordCompanyId, effectiveTargetCompany)) {
       return false;
     }
   }
+
+  if (!targetBranchId || targetBranchId === 'ALL') return true;
 
   const cleanTarget = (targetBranchId || '').toLowerCase().trim();
   const cleanRecord = (recordBranchId || '').toLowerCase().trim();
@@ -5482,10 +5537,24 @@ export const getProductById = (id: string): Product | undefined => {
   return inventoryItemToProduct(item);
 };
 
-export const getNextProductId = (): string => {
-  const time = Date.now().toString(36).slice(-4).toUpperCase();
-  const rand = Math.random().toString(36).substring(2, 6).toUpperCase();
-  return `ITM-${time}-${rand}`;
+export const peekNextInventoryItemId = (branchId?: string): string => {
+  const companyId = getCurrentCompanyId();
+  const branchCode = resolveBranchCodeForSequentialId(branchId);
+  const dev4 = getDeviceShortCode(getDeviceId());
+  const existingIds = getRawStoredInventoryItems().map((i) => i.itemId || (i as any).id || '');
+  return peekSequentialEntityId({ companyId, entity: 'inventory', branchCode, dev4, existingIds });
+};
+
+export const getNextInventoryItemId = (branchId?: string): string => {
+  const companyId = getCurrentCompanyId();
+  const branchCode = resolveBranchCodeForSequentialId(branchId);
+  const dev4 = getDeviceShortCode(getDeviceId());
+  const existingIds = getRawStoredInventoryItems().map((i) => i.itemId || (i as any).id || '');
+  return allocateSequentialEntityId({ companyId, entity: 'inventory', branchCode, dev4, existingIds });
+};
+
+export const getNextProductId = (branchId?: string): string => {
+  return getNextInventoryItemId(branchId);
 };
 
 export const saveProduct = (productData: Omit<Product, 'id'> & { id?: string }): Product => {
@@ -5765,7 +5834,7 @@ export const getAllParkedSales = (branchId?: string): ParkedSale[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredParkedSales();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((p) => isCompanyInTenantScope(p.company_id || p.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((p) => {
@@ -6080,7 +6149,7 @@ export const getAllCashLogs = (branchId?: string): CashLogEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredCashLogs();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((l) => isCompanyInTenantScope(l.company_id || l.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((l) => {
@@ -6713,7 +6782,7 @@ export const getAllCashLifts = (branchId?: string): CashLiftRecord[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredCashLifts();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((c) => isCompanyInTenantScope((c as any).company_id || (c as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((c) => {
@@ -6893,57 +6962,98 @@ export const addCashLift = (data: {
     });
   }
 
-  // Credit destination CashAccount (Branch Safe or Accounts Clerk)
+  // Credit destination CashAccount (Branch Safe or Accounts Clerk) strictly within active tenant company
   try {
     const rawAccounts = getStored<CashAccount[]>(STORAGE_KEYS.CASH_ACCOUNTS, []);
-    const destAccId = data.destinationAccountId || `ACC-BR-SAFE-${currentBranch}`;
+    const companyAccounts = rawAccounts.filter((a) => isCompanyInTenantScope(a.company_id, currentCompany));
+    const compPrefix = currentCompany.slice(0, 6);
+    const destAccId = data.destinationAccountId || `ACC-BR-SAFE-${compPrefix}-${currentBranch}`;
     const isClerkDest = destAccId.includes('CLERK') || destAccId.includes('FLOAT');
+    const targetType = isClerkDest ? 'CLERK_FLOAT' : 'SAFE';
+    const branchObj = getBranches().find((b) => b.id === currentBranch || b.branchCode === currentBranch);
 
-    let targetAcc = rawAccounts.find((a) => a.account_id === destAccId);
+    let targetAcc = companyAccounts.find((a) => a.account_id === destAccId);
     if (!targetAcc) {
-      if (isClerkDest) {
-        targetAcc = rawAccounts.find((a) => a.account_type === 'CLERK_FLOAT' && isCashBranchMatch(a.branch_id, currentBranch));
-      } else {
-        targetAcc = rawAccounts.find((a) => a.account_type === 'SAFE' && isCashBranchMatch(a.branch_id, currentBranch));
+      targetAcc = companyAccounts.find(
+        (a) => a.account_type === targetType && isCashBranchMatch(a.branch_id, currentBranch)
+      );
+    }
+    if (!targetAcc) {
+      const sameTypeInCompany = companyAccounts.filter((a) => a.account_type === targetType);
+      if (sameTypeInCompany.length === 1) {
+        targetAcc = sameTypeInCompany[0];
       }
     }
 
+    const nowMs = now.getTime();
+    const nowIso = now.toISOString();
+    let creditedAcc: CashAccount;
+
     if (targetAcc) {
-      saveCashAccount({
+      creditedAcc = saveCashAccount({
         ...targetAcc,
-        current_balance: Math.round(((targetAcc.current_balance || 0) + data.totalAmount) * 100) / 100,
-        updated_at: now.toISOString(),
+        company_id: targetAcc.company_id || currentCompany,
+        current_balance: Math.round(((Number(targetAcc.current_balance) || 0) + data.totalAmount) * 100) / 100,
+        updated_at: nowIso,
+        updatedAt: nowMs,
+        lastUpdated: nowIso,
+      });
+    } else {
+      const newAccId = isClerkDest
+        ? `ACC-CLERK-${compPrefix}-${currentBranch}`
+        : `ACC-BR-SAFE-${compPrefix}-${currentBranch}`;
+      creditedAcc = saveCashAccount({
+        account_id: newAccId,
+        company_id: currentCompany,
+        branch_id: currentBranch,
+        account_type: targetType,
+        account_name: isClerkDest ? 'Accounts Clerk Petty Float' : 'Branch Safe',
+        current_balance: Math.round(data.totalAmount * 100) / 100,
+        currency: 'USD',
+        status: 'OPEN',
+        created_at: nowIso,
+        updated_at: nowIso,
+        updatedAt: nowMs,
+        lastUpdated: nowIso,
       });
     }
 
-    // Also record completed CashTransfer voucher in transfer ledger
+    const companyTillAcc = companyAccounts.find(
+      (a) => a.account_type === 'TILL' && isCashBranchMatch(a.branch_id, currentBranch)
+    );
+    const fromTillId = companyTillAcc?.account_id || `ACC-TILL-1-${compPrefix}-${currentBranch}`;
+
+    // Also record completed CashTransfer voucher in transfer ledger via saveCashTransfer so it broadcasts over Mesh & syncs to Google Sheets
     const transferId = `TRF-LIFT-${newLift.id}`;
-    const allTransfers = getStored<CashTransfer[]>(STORAGE_KEYS.CASH_TRANSFERS, []);
     const liftTransfer: CashTransfer = {
       transfer_id: transferId,
       company_id: currentCompany,
       branch_id: currentBranch,
+      branch_name: branchObj?.name || currentBranch,
+      target_branch_id: 'ALL',
       type: 'TILL_COLLECTION',
-      from_account_id: `ACC-TILL-1-${currentBranch}`,
-      to_account_id: targetAcc?.account_id || destAccId,
+      from_account_id: fromTillId,
+      to_account_id: creditedAcc.account_id,
       amount: data.totalAmount,
       currency: 'USD',
       status: 'COMPLETED',
       created_by_user_id: data.supervisorId,
       created_by_user_name: data.supervisorName,
-      created_at: now.toISOString(),
+      created_at: nowIso,
       recipient_name: data.cashierName,
-      notes: `Supervisor Cash Lift: $${data.totalAmount.toFixed(2)} lifted from Cashier ${data.cashierName} into ${targetAcc?.account_name || (isClerkDest ? 'Accounts Clerk Float' : 'Branch Safe')}.${data.reason ? ` Reason: ${data.reason}` : ''}`,
+      denominations: data.denominations,
+      notes: `Supervisor Cash Lift: $${data.totalAmount.toFixed(2)} lifted from Cashier ${data.cashierName} into ${creditedAcc.account_name}.${data.reason ? ` Reason: ${data.reason}` : ''}`,
       approved_by_user_id: data.supervisorId,
       approved_by_user_name: data.supervisorName,
-      approved_at: now.toISOString(),
+      approved_at: nowIso,
+      received_by_user_id: data.supervisorId,
+      received_by_user_name: data.supervisorName,
+      received_at: nowIso,
       is_owner_override: false,
+      updatedAt: nowMs,
+      lastUpdated: nowIso,
     };
-    setStored(STORAGE_KEYS.CASH_TRANSFERS, [liftTransfer, ...allTransfers]);
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated'));
-    }
+    saveCashTransfer(liftTransfer);
   } catch (err) {
     console.warn('Failed to auto-credit destination account on cash lift:', err);
   }
@@ -6996,7 +7106,7 @@ export const getAllCashCounts = (branchId?: string): CashCountRecord[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredCashCounts();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((c) => isCompanyInTenantScope((c as any).company_id || (c as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((c) => {
@@ -7166,7 +7276,7 @@ export const getAllCustomerChanges = (branchId?: string): CustomerChangeEntry[] 
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredCustomerChanges();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((c) => isCompanyInTenantScope(c.company_id || c.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((c) => {
@@ -7280,7 +7390,7 @@ export const addCustomerChange = (
 
   // Ensure cashMovements has change_received (In) or change_paid (Out) if affectsDrawer !== false
   const shiftId = getShiftId(created.staffId, created.date, brId);
-  const invRef = created.reference || (created.notes?.match(/INV-[A-Za-z0-9-]+/i)?.[0]);
+  const invRef = created.reference || extractInvoiceRef(undefined, created.notes);
   const shouldAffectDrawer = (entry as any).affectsDrawer !== false && !options?.skipCashMovement;
   const existingMovements = getMovements(undefined, brId);
 
@@ -7553,7 +7663,7 @@ export const getAllCreditSales = (branchId?: string): CreditSaleEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredCreditSales();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((c) => isCompanyInTenantScope(c.company_id || c.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((c) => {
@@ -8366,7 +8476,7 @@ export const getAllSales = (branchId?: string): SaleInvoice[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredSales();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((s) => isCompanyInTenantScope(s.company_id || s.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((s) => {
@@ -8464,25 +8574,43 @@ export const getUserPrefix = (staffId?: any, staffName?: string): string => {
 };
 
 /**
- * Standard Invoice Number Generator: [user_prefix]-[YYMMDD]-[HHMMSS]-[Random3Digits]
- * Example: KM5-261024-143022-892
- * Eliminates legacy 'INV-' prefix and collision renaming ('r001')
+ * Standard Invoice Number Generator: [BR]-[USR]-[DEV4]-[SEQ]
+ * Example: HQ-KM-X9K4-0001 -> HQ-KM-X9K4-9999 -> HQ-KM-X9K4-10000
+ * - Includes staff initials (USR) on invoices only
+ * - Continuous, unlimited sequence per branch + device (zero rollover, zero offline collisions)
  */
-export const generateInvoiceNumber = (staffId?: any, staffName?: string): string => {
-  let prefix = getUserPrefix(staffId, staffName);
-  if (!prefix || prefix.toUpperCase().startsWith('INV')) {
-    prefix = 'KM5';
-  }
-  const now = new Date();
-  const yy = String(now.getFullYear()).slice(-2);
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  const dd = String(now.getDate()).padStart(2, '0');
-  const hh = String(now.getHours()).padStart(2, '0');
-  const min = String(now.getMinutes()).padStart(2, '0');
-  const ss = String(now.getSeconds()).padStart(2, '0');
-  const rand = String(Math.floor(100 + Math.random() * 900));
+export const generateInvoiceNumber = (staffId?: any, staffName?: string, branchId?: string): string => {
+  const sessionUser = getSessionUser();
+  let resolvedName = staffName;
+  let resolvedId = '';
+  let explicitPrefix = '';
 
-  return `${prefix}-${yy}${mm}${dd}-${hh}${min}${ss}-${rand}`;
+  if (typeof staffId === 'object' && staffId !== null) {
+    explicitPrefix = String(staffId.user_prefix || staffId.userPrefix || staffId.prefix || '').trim();
+    resolvedId = String(staffId.id || '').trim();
+    resolvedName = resolvedName || String(staffId.name || staffId.username || '').trim();
+  } else {
+    resolvedId = String(staffId || sessionUser?.id || '').trim();
+    if (!resolvedName && (!staffId || staffId === sessionUser?.id)) {
+      resolvedName = String(sessionUser?.name || sessionUser?.username || '').trim();
+      explicitPrefix = String((sessionUser as any)?.user_prefix || (sessionUser as any)?.userPrefix || (sessionUser as any)?.prefix || '').trim();
+    }
+  }
+
+  const userCode = getUserInvoiceInitials(resolvedName, explicitPrefix, resolvedId || getUserPrefix(staffId, staffName));
+  const companyId = getCurrentCompanyId();
+  const branchCode = resolveBranchCodeForSequentialId(branchId);
+  const dev4 = getDeviceShortCode(getDeviceId());
+  const existingIds = getRawStoredSales().map((s) => s.id || '');
+
+  return allocateSequentialEntityId({
+    companyId,
+    entity: 'invoice',
+    branchCode,
+    dev4,
+    userCode,
+    existingIds,
+  });
 };
 
 export const getNextInvoiceId = generateInvoiceNumber;
@@ -8675,6 +8803,24 @@ export const notifyCashTransferChanged = (transfer: CashTransfer) => {
       fn(transfer);
     } catch (e) {
       console.error('cashTransferChangeListener error:', e);
+    }
+  });
+};
+
+export type ElectronicSettlementChangeListener = (settlement: ElectronicSettlementRecord) => void;
+const electronicSettlementChangeListeners: Set<ElectronicSettlementChangeListener> = new Set();
+export const onElectronicSettlementChanged = (listener: ElectronicSettlementChangeListener) => {
+  electronicSettlementChangeListeners.add(listener);
+  return () => {
+    electronicSettlementChangeListeners.delete(listener);
+  };
+};
+export const notifyElectronicSettlementChanged = (settlement: ElectronicSettlementRecord) => {
+  electronicSettlementChangeListeners.forEach((fn) => {
+    try {
+      fn(settlement);
+    } catch (e) {
+      console.error('electronicSettlementChangeListener error:', e);
     }
   });
 };
@@ -9867,7 +10013,8 @@ export const addSale = (
   const currentBranch = getCurrentBranchId();
   const compId = saleData.company_id || saleData.companyId || currentCompany;
   const brId = saleData.branch_id || saleData.branchId || currentBranch;
-  const invId = saleData.id || getNextInvoiceId(saleData.staffId, saleData.staffName);
+  const invId = saleData.id || getNextInvoiceId(saleData.staffId, saleData.staffName, brId);
+  recordUsedSequentialId(compId, 'invoice', invId);
   const companiesList = getCompanies();
   const matchedComp = companiesList.find((c) => c.company_id === compId);
   const branchesList = getBranches();
@@ -11398,7 +11545,7 @@ export const getAllExpenses = (branchId?: string): ExpenseEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredExpenses();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((e) => isCompanyInTenantScope(e.company_id || e.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((e) => {
@@ -11832,7 +11979,7 @@ export const getAllReconciliations = (branchId?: string): ShiftReconciliation[] 
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredReconciliations();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((r) => isCompanyInTenantScope((r as any).company_id || (r as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((r) => {
@@ -11908,7 +12055,7 @@ export const getAllAdminSales = (branchId?: string): AdminSalesEntry[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredAdminSales();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((s) => isCompanyInTenantScope((s as any).company_id || (s as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((s) => {
@@ -12867,6 +13014,9 @@ export const enqueueSync = (sheetName: SheetName, action: 'INSERT' | 'UPDATE' | 
         entityType: resolveEntityType(sheetName as string),
         recordId: String(
           payload.id ||
+            payload.transfer_id ||
+            payload.account_id ||
+            payload.settlementId ||
             payload.itemId ||
             payload.ItemID ||
             payload.ProductID ||
@@ -14161,13 +14311,12 @@ export const getAllInventoryItems = (branchId?: string): InventoryItem[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredInventoryItems();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((item) => isCompanyInTenantScope(item.company_id || (item as any).companyId, currentCompany));
   }
-  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
   const branches = getBranches();
   return raw.filter((item) => {
     const compId = item.company_id || (item as any).companyId;
-    if (compId && currentCompany && normTenant(compId) !== normTenant(currentCompany)) {
+    if (!isCompanyInTenantScope(compId, currentCompany)) {
       return false;
     }
     // 1. Branch catalog assignment (e.g. Grocery store vs Hardware store)
@@ -14311,7 +14460,8 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
   const brId = item.branch_id || (item as any).branchId || currentBranch || 'BR-MAIN';
 
   const rawItemId = (item.itemId || (item as any).id || '').trim();
-  const resolvedItemId = rawItemId || generateUUID();
+  const resolvedItemId = rawItemId || getNextInventoryItemId(brId);
+  recordUsedSequentialId(compId, 'inventory', resolvedItemId);
   item.itemId = resolvedItemId;
   (item as any).id = resolvedItemId;
 
@@ -15774,24 +15924,67 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
       console.log(`[ingestMeshGRV] 🛡️ Protected finalized GRV ${grv.grvNumber} (${exStatus}) from stale ${incStatus} update.`);
       return false;
     }
-    if (!isIncomingRecordNewer(normalized, existing) && exStatus === incStatus) {
+
+    // Track payment settlement progression (e.g. PARTIALLY_PAID_TILL -> PAID or lower unpaidBalance)
+    const payRank = (s?: string) => {
+      const u = String(s || '').trim().toUpperCase();
+      if (u === 'PAID') return 3;
+      if (u === 'PARTIALLY_PAID_TILL' || u === 'PARTIAL') return 2;
+      if (u === 'AWAITING_SAFE_PAYMENT' || u === 'INVOICE_CREDIT' || u === 'UNPAID') return 1;
+      return 0;
+    };
+    const exPayRank = payRank(existing.paymentStatus);
+    const incPayRank = payRank(normalized.paymentStatus);
+    const exUnpaid = existing.unpaidBalance !== undefined ? Number(existing.unpaidBalance) : undefined;
+    const incUnpaid = normalized.unpaidBalance !== undefined ? Number(normalized.unpaidBalance) : undefined;
+    const paymentProgressed =
+      incPayRank > exPayRank ||
+      (exUnpaid !== undefined && incUnpaid !== undefined && incUnpaid < exUnpaid - 0.009) ||
+      (Boolean(normalized.paidVoucherId) && !existing.paidVoucherId);
+
+    if (!paymentProgressed && !isIncomingRecordNewer(normalized, existing) && exStatus === incStatus) {
       console.log(`[ingestMeshGRV] 🛡️ Stale GRV update ignored for ${grv.grvNumber}. Existing timestamp is newer.`);
       return false;
     }
-    all[idx] = { ...all[idx], ...normalized };
+
+    // Monotonic payment protection: never downgrade a PAID Direct GRV or increase its unpaidBalance from a stale packet
+    const merged: DirectGrv = { ...existing, ...normalized };
+    if (exPayRank > incPayRank) {
+      merged.paymentStatus = existing.paymentStatus;
+    }
+    if (existing.paidVoucherId && !merged.paidVoucherId) {
+      merged.paidVoucherId = existing.paidVoucherId;
+    }
+    if (exUnpaid !== undefined && incUnpaid !== undefined && incUnpaid > exUnpaid) {
+      merged.unpaidBalance = exUnpaid;
+    }
+    if (merged.paymentStatus === 'PAID') {
+      merged.unpaidBalance = 0;
+    }
+
+    all[idx] = merged;
   } else {
     all.unshift(normalized);
   }
+  const savedGrv = idx >= 0 ? all[idx] : normalized;
   setStored(STORAGE_KEYS.DIRECT_GRVS, all);
 
+  // Keep unified goodsReceivedNotes mirror synchronized with incoming Direct GRV payment/approval state
+  try {
+    postDirectDelivery(savedGrv);
+  } catch (err) {
+    console.warn('[ingestMeshGRV] postDirectDelivery mirror sync warning:', err);
+  }
+
   // If paid from till, record till payout movement and CashLog for cashier Form 2
-  if (normalized.status !== 'REJECTED') {
-    recordDirectGrvTillPayouts(normalized);
+  if (savedGrv.status !== 'REJECTED') {
+    recordDirectGrvTillPayouts(savedGrv);
   }
 
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
+    window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
   }
@@ -16783,7 +16976,7 @@ export async function pullTenantSales(companyId?: string): Promise<number> {
 }
 
 export const getDeviceId = (): string => {
-  return (typeof localStorage !== 'undefined' && localStorage.getItem('saimetric_mesh_device_id')) || 'terminal-local';
+  return getOrCreatePersistentDeviceId();
 };
 
 export const addQuickProduct = (params: {
@@ -16797,10 +16990,8 @@ export const addQuickProduct = (params: {
   unit?: string;
 }): Product => {
   const cleanName = params.name.trim();
-  const slug = cleanName.replace(/[^a-zA-Z0-9]/g, '').slice(0, 6).toUpperCase() || 'ITEM';
-  const timestamp = Date.now();
-  const id = `ITM-${slug}-${timestamp.toString().slice(-4)}`;
-  const sku = params.sku?.trim() || `SKU-${slug}-${timestamp.toString().slice(-4)}`;
+  const id = getNextInventoryItemId();
+  const sku = params.sku?.trim() || `SKU-${id}`;
   const price = Math.max(0.01, Number(params.price) || 1.0);
   const costPrice = params.costPrice !== undefined ? Math.max(0, Number(params.costPrice)) : Math.round(price * 0.7 * 100) / 100;
   const stockQty = params.stockQuantity !== undefined ? Number(params.stockQuantity) : 50;
@@ -16868,7 +17059,7 @@ export const getAllStockBatches = (branchId?: string): StockBatch[] => {
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredStockBatches();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((b) => isCompanyInTenantScope(b.company_id || b.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((b) => {
@@ -16993,7 +17184,7 @@ export const getAllNegativeBalances = (branchId?: string): NegativeBalanceEntry[
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredNegativeBalances();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((n) => isCompanyInTenantScope((n as any).company_id || (n as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((n) => {
@@ -17580,7 +17771,7 @@ export const getAllSupplierInvoiceVouchers = (branchId?: string): SupplierInvoic
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredSupplierInvoiceVouchers();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((v) => isCompanyInTenantScope(v.company_id || v.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((v) => {
@@ -18469,7 +18660,7 @@ export const getAllGoodsReceived = (branchId?: string): GoodsReceivedEntry[] => 
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredGoodsReceived();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((g) => isCompanyInTenantScope(g.company_id || g.companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((g) => {
@@ -18629,7 +18820,7 @@ export const getAllStockMovements = (branchId?: string): StockMovementEntry[] =>
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredStockMovements();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((m) => isCompanyInTenantScope((m as any).company_id || (m as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((m) => {
@@ -19403,7 +19594,7 @@ export const getAllStocktakeSessions = (branchId?: string): StocktakeSession[] =
   const currentCompany = getCurrentCompanyId();
   const raw = getRawStoredStocktakeSessions();
   if (!currentBranch || currentBranch === 'ALL') {
-    return raw;
+    return raw.filter((s) => isCompanyInTenantScope((s as any).company_id || (s as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return raw.filter((s) => {
@@ -24731,7 +24922,7 @@ export const getAllDirectGrvs = (branchId?: string): DirectGrv[] => {
   const currentCompany = getCurrentCompanyId();
   const all = getRawStoredDirectGrvs();
   if (!currentBranch || currentBranch === 'ALL') {
-    return all;
+    return all.filter((g) => isCompanyInTenantScope((g as any).company_id || (g as any).companyId, currentCompany));
   }
   const branches = getBranches();
   return all.filter((g) => {
@@ -25145,7 +25336,7 @@ export const approveDirectGrv = (
 
     if (!invItem) {
       // Auto-register item in inventory catalog if not found
-      const fallbackId = cleanId || `ITM-${Date.now().toString().slice(-4)}`;
+      const fallbackId = cleanId || getNextInventoryItemId(grv.branchId || grv.branch_id);
       invItem = {
         itemId: fallbackId,
         itemName: item.productName || 'Direct Delivery Item',
@@ -25528,7 +25719,9 @@ export const getDirectGrvsForCurrentBranch = (): DirectGrv[] => {
   const grvs = getDirectGrvs();
   const branches = getBranches();
   const currentCompany = getCurrentCompanyId();
-  return grvs.filter((g) => isRecordInBranchScope(g.branchId || (g as any).branch_id, branchId, branches, currentCompany));
+  return grvs.filter((g) =>
+    isRecordInBranchScope(g.branchId || (g as any).branch_id, branchId, branches, currentCompany, (g as any).company_id || (g as any).companyId)
+  );
 };
 
 export const getCashLogsForCurrentBranch = (): CashLogEntry[] => {
@@ -25556,7 +25749,7 @@ export const getAllCashAccounts = (branchId?: string): CashAccount[] => {
     // HQ Safe and Commercial Bank accounts are global to company
     if (acc.account_type === 'HQ_SAFE' || acc.account_type === 'BANK_ACCOUNT') return true;
     if (targetBranch === 'ALL') return true;
-    return isRecordInBranchScope(acc.branch_id, targetBranch, branches, currentCompany);
+    return isRecordInBranchScope(acc.branch_id, targetBranch, branches, currentCompany, acc.company_id);
   });
 };
 
@@ -25568,10 +25761,7 @@ const isCashBranchMatch = (b1?: string, b2?: string): boolean => {
 };
 
 const isCashCompanyMatch = (c1?: string, c2?: string): boolean => {
-  if (!c1 || !c2) return true;
-  if (c1 === c2) return true;
-  if ((c1 === 'COMP-001' || c1 === 'COMP-MASTER') && (c2 === 'COMP-001' || c2 === 'COMP-MASTER')) return true;
-  return false;
+  return isCompanyInTenantScope(c1, c2);
 };
 
 export const getCashAccounts = (branchId?: string): CashAccount[] => {
@@ -25592,13 +25782,18 @@ export const saveCashAccount = (
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
 
-  // Find index by exact account_id OR by matching type + branch alias (to prevent duplicate accounts)
-  let index = all.findIndex((a) => a.account_id === account.account_id);
-  if (index < 0) {
+  // Find index by exact account_id WITHIN the same tenant company; for non-BANK accounts, also match by type + branch alias (to prevent duplicate safes)
+  // BANK_ACCOUNTs (EcoCash, ZiG, CBZ, Stanbic, etc.) MUST always be keyed strictly by account_id!
+  const targetCompanyId = account.company_id || currentCompany;
+  let index = all.findIndex(
+    (a) => a.account_id === account.account_id && isCashCompanyMatch(a.company_id, targetCompanyId)
+  );
+  if (index < 0 && account.account_type !== 'BANK_ACCOUNT') {
     index = all.findIndex(
       (a) =>
+        isCashCompanyMatch(a.company_id, targetCompanyId) &&
         a.account_type === account.account_type &&
-        (account.account_type === 'HQ_SAFE' || account.account_type === 'BANK_ACCOUNT' || isCashBranchMatch(a.branch_id, account.branch_id))
+        (account.account_type === 'HQ_SAFE' || isCashBranchMatch(a.branch_id, account.branch_id))
     );
   }
 
@@ -25635,21 +25830,24 @@ export const saveCashAccount = (
 
     updated = [...all];
     updated[index] = toSave;
-    // Also synchronize any other duplicate/alias accounts of the same type and branch so balances never diverge
-    updated = updated.map((a, i) => {
-      if (i !== index &&
-          a.account_type === toSave.account_type &&
-          (toSave.account_type === 'HQ_SAFE' || toSave.account_type === 'BANK_ACCOUNT' || isCashBranchMatch(a.branch_id, toSave.branch_id))) {
-        return {
-          ...a,
-          current_balance: toSave.current_balance,
-          updated_at: effectiveLastUpdated,
-          updatedAt: effectiveUpdatedAt,
-          lastUpdated: effectiveLastUpdated,
-        };
-      }
-      return a;
-    });
+    // Synchronize duplicate/alias accounts of the same type and branch ONLY for non-BANK accounts
+    if (toSave.account_type !== 'BANK_ACCOUNT') {
+      updated = updated.map((a, i) => {
+        if (i !== index &&
+            isCashCompanyMatch(a.company_id, toSave.company_id) &&
+            a.account_type === toSave.account_type &&
+            (toSave.account_type === 'HQ_SAFE' || isCashBranchMatch(a.branch_id, toSave.branch_id))) {
+          return {
+            ...a,
+            current_balance: toSave.current_balance,
+            updated_at: effectiveLastUpdated,
+            updatedAt: effectiveUpdatedAt,
+            lastUpdated: effectiveLastUpdated,
+          };
+        }
+        return a;
+      });
+    }
   } else {
     updated = [...all, toSave];
   }
@@ -25684,6 +25882,7 @@ const isCompanyLevelCashTransfer = (t?: Partial<CashTransfer> | null): boolean =
     type === 'BRANCH_TO_HQ' ||
     type === 'BANK_DEPOSIT' ||
     type === 'BANK_WITHDRAWAL' ||
+    type === 'ELECTRONIC_SETTLEMENT' ||
     type === 'CAPITAL_INFUSION' ||
     type === 'SUPPLIER_PAYMENT' ||
     type === 'THIRD_PARTY_PAYOUT'
@@ -25712,7 +25911,7 @@ export const getAllCashTransfers = (branchId?: string): CashTransfer[] => {
     if (targetBranch === 'ALL') return true;
     // Company/HQ-level transfers (HQ_TO_BRANCH, BRANCH_TO_HQ, BANK_DEPOSIT, etc.) are global across devices/branches
     if (isCompanyLevelCashTransfer(t)) return true;
-    return isRecordInBranchScope(t.branch_id, targetBranch, branches, currentCompany);
+    return isRecordInBranchScope(t.branch_id, targetBranch, branches, currentCompany, t.company_id);
   });
 };
 
@@ -26027,15 +26226,23 @@ export interface BusinessDayClosure {
 
 export interface ElectronicSettlementRecord {
   id: string;
+  companyId?: string;
+  company_id?: string;
   date: string;
   branchId: string;
+  branch_id?: string;
+  branchName?: string;
   ecocashBatchRef: string;
   ecocashAmountSettled: number;
   ecocashSystemTotal: number;
+  ecocashNativeAmount?: number;
+  ecocashRate?: number;
   ecocashVerified: boolean;
   zigBatchRef: string;
   zigAmountSettled: number;
   zigSystemTotal: number;
+  zigNativeAmount?: number;
+  zigRate?: number;
   zigVerified: boolean;
   targetBankAccountId: string;
   targetBankAccountName: string;
@@ -26044,6 +26251,8 @@ export interface ElectronicSettlementRecord {
   verifiedByStaffName?: string;
   verifiedAt?: string;
   notes?: string;
+  updatedAt?: number;
+  lastUpdated?: string;
 }
 
 export const getRawStoredBusinessDayClosures = (): BusinessDayClosure[] => {
@@ -26056,7 +26265,7 @@ export const getBusinessDayClosures = (branchId?: string): BusinessDayClosure[] 
   const currentBranch = branchId || getCurrentBranchId();
   const currentCompany = getCurrentCompanyId();
   if (!currentBranch || currentBranch === 'ALL') {
-    return all;
+    return all.filter((c) => isCompanyInTenantScope((c as any).company_id || c.companyId, currentCompany));
   }
   const branches = getBranches();
   return all.filter((c) => isRecordInBranchScope(c.branchId, currentBranch, branches, currentCompany, c.companyId));
@@ -26110,12 +26319,27 @@ export const saveBusinessDayClosure = (
   };
 };
 
-export const getElectronicSettlementForDate = (date: string, branchId?: string): ElectronicSettlementRecord | null => {
+export const getRawStoredElectronicSettlements = (): ElectronicSettlementRecord[] => {
   const settlements = getStored<ElectronicSettlementRecord[]>(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, []);
-  const targetBranch = branchId || getCurrentBranchId();
-  const found = (Array.isArray(settlements) ? settlements : []).find(
-    (s) => s.date === date && (!targetBranch || targetBranch === 'ALL' || s.branchId === targetBranch)
+  return Array.isArray(settlements) ? settlements : [];
+};
+
+export const getElectronicSettlements = (branchId?: string): ElectronicSettlementRecord[] => {
+  const all = getRawStoredElectronicSettlements();
+  const currentBranch = branchId || getCurrentBranchId();
+  const currentCompany = getCurrentCompanyId();
+  if (!currentBranch || currentBranch === 'ALL') {
+    return all.filter((s) => isCompanyInTenantScope(s.company_id || s.companyId, currentCompany));
+  }
+  const branches = getBranches();
+  return all.filter((s) =>
+    isRecordInBranchScope(s.branch_id || s.branchId, currentBranch, branches, currentCompany, s.company_id || s.companyId)
   );
+};
+
+export const getElectronicSettlementForDate = (date: string, branchId?: string): ElectronicSettlementRecord | null => {
+  const scoped = getElectronicSettlements(branchId);
+  const found = scoped.find((s) => s.date === date);
   return found || null;
 };
 
@@ -26123,21 +26347,43 @@ export const saveElectronicSettlement = (
   record: ElectronicSettlementRecord,
   options?: { fromSync?: boolean }
 ): void => {
-  const settlements = getStored<ElectronicSettlementRecord[]>(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, []);
-  const list = Array.isArray(settlements) ? settlements : [];
-  const idx = list.findIndex((s) => s.id === record.id || (s.date === record.date && s.branchId === record.branchId));
+  const list = getRawStoredElectronicSettlements();
+  const currentCompany = getCurrentCompanyId();
+  const resolvedCompany = record.company_id || record.companyId || currentCompany;
+  const resolvedBranch = record.branch_id || record.branchId || getCurrentBranchId() || 'BR-MAIN';
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  const toSave: ElectronicSettlementRecord = {
+    ...record,
+    companyId: resolvedCompany,
+    company_id: resolvedCompany,
+    branchId: resolvedBranch,
+    branch_id: resolvedBranch,
+    updatedAt: options?.fromSync ? (record.updatedAt || nowMs) : nowMs,
+    lastUpdated: options?.fromSync ? (record.lastUpdated || nowIso) : nowIso,
+  };
+
+  const idx = list.findIndex(
+    (s) =>
+      s.id === toSave.id ||
+      (s.date === toSave.date &&
+        (s.branch_id || s.branchId) === resolvedBranch &&
+        isCompanyInTenantScope(s.company_id || s.companyId, resolvedCompany))
+  );
   let updated: ElectronicSettlementRecord[];
   if (idx >= 0) {
     updated = [...list];
-    updated[idx] = record;
+    updated[idx] = { ...list[idx], ...toSave };
   } else {
-    updated = [record, ...list];
+    updated = [toSave, ...list];
   }
   setStored(STORAGE_KEYS.ELECTRONIC_SETTLEMENTS, updated);
 
   if (!options?.fromSync) {
     try {
-      enqueueSync('ElectronicSettlements' as any, idx >= 0 ? 'UPDATE' : 'INSERT', record);
+      enqueueSync('ElectronicSettlements' as any, idx >= 0 ? 'UPDATE' : 'INSERT', toSave);
+      notifyElectronicSettlementChanged(toSave);
     } catch (e) {
       console.warn('[saveElectronicSettlement] enqueueSync error:', e);
     }
@@ -26146,8 +26392,8 @@ export const saveElectronicSettlement = (
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event('saimetric_settlements_updated'));
-    window.dispatchEvent(new CustomEvent('saimetric_settlements_updated', { detail: record }));
-    window.dispatchEvent(new CustomEvent('saimetric_electronic_settlement_updated', { detail: record }));
+    window.dispatchEvent(new CustomEvent('saimetric_settlements_updated', { detail: toSave }));
+    window.dispatchEvent(new CustomEvent('saimetric_electronic_settlement_updated', { detail: toSave }));
   }
 };
 

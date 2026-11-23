@@ -3,6 +3,7 @@ import { Customer, Salesperson } from '../../types';
 import { getCustomers } from '../../db/roomDatabase';
 import { CustomerRegistrationModal } from '../customers/CustomerRegistrationModal';
 import { Search, UserPlus, Phone, MapPin, User, X, Check, Building2, ChevronRight } from 'lucide-react';
+import { formatDisplayId } from '../../utils/idFormatters';
 
 interface CustomerSearchModalProps {
   isOpen: boolean;
@@ -201,19 +202,30 @@ export const CustomerSearchModal: React.FC<CustomerSearchModalProps> = ({
                         : 'bg-slate-950/60 border-slate-800/80 hover:bg-slate-800/50 hover:border-slate-700'
                     }`}
                   >
-                    <div className="flex items-start space-x-3">
+                    <div className="flex items-start space-x-3 min-w-0 flex-1">
                       <div
-                        className={`w-10 h-10 rounded-2xl flex items-center justify-center font-mono-num font-bold text-xs shrink-0 mt-0.5 ${
+                        className={`w-10 h-10 rounded-2xl flex items-center justify-center font-bold text-xs shrink-0 mt-0.5 uppercase ${
                           isSelected
                             ? 'bg-gradient-to-tr from-[#6A4DFF] to-[#FF8A00] text-white shadow-md'
                             : 'bg-slate-800 text-slate-300 border border-slate-700'
                         }`}
                       >
-                        {customer.customerId}
+                        {(customer.name || 'CU')
+                          .split(/\s+/)
+                          .filter(Boolean)
+                          .slice(0, 2)
+                          .map((w) => w[0])
+                          .join('') || 'CU'}
                       </div>
-                      <div className="min-w-0">
-                        <div className="text-sm font-bold text-white truncate flex items-center gap-1.5">
-                          <span>{customer.name}</span>
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-bold text-white flex flex-wrap items-center gap-1.5">
+                          <span className="truncate">{customer.name}</span>
+                          <span
+                            title={customer.customerId}
+                            className="font-mono-num text-[10px] text-purple-300 bg-purple-950/80 border border-purple-800/60 px-1.5 py-0.5 rounded font-bold shrink-0"
+                          >
+                            {formatDisplayId(customer.customerId, 'customer')}
+                          </span>
                           {isSelected && (
                             <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-1.5 py-0.2 rounded-full font-bold">
                               Selected

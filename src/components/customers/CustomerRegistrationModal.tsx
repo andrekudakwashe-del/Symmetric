@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Customer, Salesperson } from '../../types';
 import {
-  getNextCustomerId,
+  peekNextCustomerId,
   addCustomer,
   isSupervisorOrAbove,
   getCreditGroups,
@@ -23,7 +23,7 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
   currentUser,
   onCustomerCreated,
 }) => {
-  const nextId = getNextCustomerId();
+  const nextId = peekNextCustomerId();
   const isAuthorizedToSetCredit = isSupervisorOrAbove(currentUser.role) || Boolean(currentUser.permissions?.canGrantCredit);
   const standardGroupLimit = getStandardGroupLimit(); // Default $5.00
   const creditGroups = getCreditGroups();

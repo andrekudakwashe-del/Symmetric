@@ -47,6 +47,7 @@ import {
   getInventoryItems,
   getSessionUser,
   saveInventoryItem,
+  peekNextInventoryItemId,
   deleteInventoryItem,
   breakCase,
   receiveStock,
@@ -572,7 +573,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
               onClick={() => {
                 setEditingItem(null);
                 setFormData({
-                  itemId: `ITM${Math.floor(100 + Math.random() * 900)}`,
+                  itemId: peekNextInventoryItemId(),
                   itemName: '',
                   category: 'Dry Grocery & Staples',
                   canSellAsCase: false,
@@ -909,7 +910,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
               onClick={() => {
                 setEditingItem(null);
                 setFormData({
-                  itemId: `ITM${Math.floor(100 + Math.random() * 900)}`,
+                  itemId: peekNextInventoryItemId(),
                   itemName: '',
                   category: 'Dry Grocery & Staples',
                   canSellAsCase: false, // Default false
@@ -971,7 +972,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                       onClick={() => {
                         setEditingItem(null);
                         setFormData({
-                          itemId: `ITM${Math.floor(100 + Math.random() * 900)}`,
+                          itemId: peekNextInventoryItemId(),
                           itemName: searchQuery || '',
                           category: selectedCategory !== 'ALL' ? selectedCategory : 'Dry Grocery & Staples',
                           canSellAsCase: false,

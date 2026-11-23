@@ -5164,11 +5164,27 @@ wss.on('connection', (ws, req) => {
               } catch (e) {}
               return;
             }
-            directGrvsStore[exIdx] = {
+            const mergedGrv = {
               ...directGrvsStore[exIdx],
               ...grv,
               ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
             };
+            // Monotonic payment protection: never downgrade a PAID Direct GRV or raise unpaidBalance from a stale packet
+            if (prevGrv.paymentStatus === 'PAID' && mergedGrv.paymentStatus !== 'PAID') {
+              mergedGrv.paymentStatus = 'PAID';
+              mergedGrv.unpaidBalance = 0;
+            }
+            if (prevGrv.paidVoucherId && !mergedGrv.paidVoucherId) {
+              mergedGrv.paidVoucherId = prevGrv.paidVoucherId;
+            }
+            if (
+              prevGrv.unpaidBalance !== undefined &&
+              mergedGrv.unpaidBalance !== undefined &&
+              Number(mergedGrv.unpaidBalance) > Number(prevGrv.unpaidBalance)
+            ) {
+              mergedGrv.unpaidBalance = prevGrv.unpaidBalance;
+            }
+            directGrvsStore[exIdx] = mergedGrv;
           } else {
             // Append-Only: Accept unique offline GRVs regardless of timestamp!
             directGrvsStore.unshift({
@@ -5707,6 +5723,7 @@ wss.on('connection', (ws, req) => {
             trTypeUpper === 'BRANCH_TO_HQ' ||
             trTypeUpper === 'BANK_DEPOSIT' ||
             trTypeUpper === 'BANK_WITHDRAWAL' ||
+            trTypeUpper === 'ELECTRONIC_SETTLEMENT' ||
             trTypeUpper === 'CAPITAL_INFUSION' ||
             trTypeUpper === 'SUPPLIER_PAYMENT' ||
             trTypeUpper === 'THIRD_PARTY_PAYOUT';
@@ -5905,21 +5922,92 @@ wss.on('connection', (ws, req) => {
         }
       }
 
-      const isSettlement = pType === 'SETTLEMENT_SYNC' || pType === 'SETTLEMENT' || pType === 'settlement' || sheetName === 'ElectronicSettlements' || sheetName === 'Settlements';
-      if (isSettlement && payload) {
-        const sId = payload.id || `SETTLE-${payload.date}-${payload.branchId || 'BR-MAIN'}`;
+      const isSettlement =
+        pType === 'SETTLEMENT_SYNC' ||
+        pType === 'SETTLEMENT' ||
+        pType === 'settlement' ||
+        pType === 'ELECTRONIC_SETTLEMENT' ||
+        pType === 'ELECTRONIC_SETTLEMENT_SYNC' ||
+        entityType === 'electronic_settlement' ||
+        sheetName === 'ElectronicSettlements' ||
+        sheetName === 'Settlements' ||
+        Boolean(packet.settlement);
+      const settleObj = packet.settlement || payload;
+      if (isSettlement && settleObj) {
+        const sBranch = settleObj.branchId || settleObj.branch_id || packet.branchId || 'BR-MAIN';
+        const sComp = settleObj.company_id || settleObj.companyId || packet.companyId || packet.company_id || 'COMP-001';
+        const sId = settleObj.id || `SETTLE-${settleObj.date}-${sBranch}`;
         if (sId) {
-          const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
-          const exIdx = electronicSettlementsStore.findIndex((s) => s.id === sId || (s.date === payload.date && s.branchId === payload.branchId));
-          const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && electronicSettlementsStore[exIdx].isCloudSynced === true);
+          const hubNow = Date.now();
+          const hubIso = new Date(hubNow).toISOString();
+          const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, settleObj);
+          const normSComp = (v) => {
+            const u = String(v || 'COMP-001').trim().toUpperCase();
+            return (!u || u === 'DEFAULT' || u === 'COMP-001' || u === 'COMP-MASTER') ? 'COMP-001' : u;
+          };
+          const exIdx = electronicSettlementsStore.findIndex(
+            (s) =>
+              s.id === sId ||
+              (s.date === settleObj.date &&
+                (s.branchId || s.branch_id) === sBranch &&
+                normSComp(s.company_id || s.companyId) === normSComp(sComp))
+          );
+          const prevSt = exIdx >= 0 ? electronicSettlementsStore[exIdx] : null;
+          const resolvedCloudSynced = incomingCloudSynced || (prevSt && prevSt.isCloudSynced === true);
+          const stampedSettlement = {
+            ...(prevSt || {}),
+            ...settleObj,
+            id: sId,
+            companyId: sComp,
+            company_id: sComp,
+            branchId: sBranch,
+            branch_id: sBranch,
+            target_branch_id: 'ALL',
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
+            ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+          };
           if (exIdx >= 0) {
-            electronicSettlementsStore[exIdx] = { ...electronicSettlementsStore[exIdx], ...payload, id: sId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+            electronicSettlementsStore[exIdx] = stampedSettlement;
+            console.log(`[Termux Hub] 🔄 Updated Electronic Settlement [${sId}] (${stampedSettlement.date})`);
           } else {
-            electronicSettlementsStore.unshift({ ...payload, id: sId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) });
-            console.log(`[Termux Hub] 📥 Accepted Electronic Settlement [${sId}] (Append-Only)`);
+            electronicSettlementsStore.unshift(stampedSettlement);
+            console.log(`[Termux Hub] 📥 Accepted Electronic Settlement [${sId}] (${stampedSettlement.date})`);
           }
           scheduleSave();
-          if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'SETTLEMENT', sId);
+
+          try {
+            ws.send(JSON.stringify({
+              type: 'SYNC_ACK',
+              action: 'SYNC_ACK',
+              entityType: 'ELECTRONIC_SETTLEMENT',
+              id: sId,
+              updatedAt: hubNow,
+              hubTimestamp: hubNow,
+              lastUpdated: hubIso,
+            }));
+          } catch (e) {}
+
+          if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'ELECTRONIC_SETTLEMENT', sId);
+
+          const stBroadcastStr = JSON.stringify({
+            type: 'SETTLEMENT_SYNC',
+            action: 'SETTLEMENT_SYNC',
+            target_branch_id: 'ALL',
+            companyId: sComp,
+            branchId: sBranch,
+            settlement: stampedSettlement,
+            payload: stampedSettlement,
+            origin_device_id: 'LOCAL_HUB',
+            origin_device_name: 'Termux Local Hub',
+            timestamp: hubNow,
+          });
+          wss.clients.forEach((client) => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+              try { client.send(stBroadcastStr); } catch (e) {}
+            }
+          });
         }
       }
 
@@ -6563,7 +6651,12 @@ wss.on('connection', (ws, req) => {
           }
           return;
         }
-        const aIdx = cashAccountsStore.findIndex((a) => (a.account_id || a.id) === accId);
+        const incAccComp = String(rawCashAccObj.company_id || rawCashAccObj.companyId || packet.company_id || packet.companyId || '').trim().toUpperCase();
+        const aIdx = cashAccountsStore.findIndex((a) => {
+          if ((a.account_id || a.id) !== accId) return false;
+          const exComp = String(a.company_id || a.companyId || '').trim().toUpperCase();
+          return !incAccComp || !exComp || exComp === incAccComp;
+        });
         let accepted = true;
 
         if (aIdx >= 0) {
@@ -6965,7 +7058,7 @@ wss.on('connection', (ws, req) => {
           const tb = String(tr?.target_branch_id || '').toUpperCase().trim();
           return b === 'HQ' || b === 'ALL' || tb === 'ALL' ||
             t === 'HQ_TO_BRANCH' || t === 'BRANCH_TO_HQ' || t === 'BANK_DEPOSIT' ||
-            t === 'BANK_WITHDRAWAL' || t === 'CAPITAL_INFUSION' || t === 'SUPPLIER_PAYMENT' || t === 'THIRD_PARTY_PAYOUT';
+            t === 'BANK_WITHDRAWAL' || t === 'ELECTRONIC_SETTLEMENT' || t === 'CAPITAL_INFUSION' || t === 'SUPPLIER_PAYMENT' || t === 'THIRD_PARTY_PAYOUT';
         };
         const missedCashTransfers = cashTransfersStore.filter((tr) => isMatch(tr, reqComp, isGlobalCashTransferRec(tr) ? 'ALL' : reqBranch) && (getTimestamp(tr) >= sinceTime || packet.isForced || isExplicitZero));
         const missedSuppliers = suppliersStore
@@ -7002,10 +7095,26 @@ wss.on('connection', (ws, req) => {
         const missedCashAccounts = cashAccountsStore
           .filter((item) => !isTombstoned(item.account_id || item.id, 'cash_account', getTimestamp(item)))
           .filter((a) => isMatch(a, reqComp, isGlobalCashAccRec(a) ? 'ALL' : reqBranch) && (getTimestamp(a) >= sinceTime || packet.isForced || isExplicitZero));
-        const missedCasualWorkers = casualWorkersStore.filter((item) => !isTombstoned(item.id || item.pin_hash, 'casual_worker', getTimestamp(item)));
-        const missedCategories = categoriesStore.filter((item) => !isTombstoned(item.categoryId || item.id || item.categoryName, 'inventory_category', getTimestamp(item)));
-        const missedCreditGroups = creditGroupsStore.filter((item) => !isTombstoned(item.groupId || item.id, 'credit_group', getTimestamp(item)));
-        const missedStocktakeSessions = stocktakeSessionsStore.filter((item) => !isTombstoned(item.sessionId || item.id, 'stocktake_session', getTimestamp(item)));
+        const missedCasualWorkers = casualWorkersStore
+          .filter((item) => !isTombstoned(item.id || item.pin_hash, 'casual_worker', getTimestamp(item)))
+          .filter((item) => isMatch(item, reqComp, 'ALL'));
+        const missedCategories = categoriesStore
+          .filter((item) => !isTombstoned(item.categoryId || item.id || item.categoryName, 'inventory_category', getTimestamp(item)))
+          .filter((item) => isMatch(item, reqComp, 'ALL'));
+        const missedCreditGroups = creditGroupsStore
+          .filter((item) => !isTombstoned(item.groupId || item.id, 'credit_group', getTimestamp(item)))
+          .filter((item) => isMatch(item, reqComp, 'ALL'));
+        const missedStocktakeSessions = stocktakeSessionsStore
+          .filter((item) => !isTombstoned(item.sessionId || item.id, 'stocktake_session', getTimestamp(item)))
+          .filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedZoneAssignments = zoneAssignmentsStore.filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedBranchLockdowns = branchLockdownsStore.filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedBusinessDayClosures = businessDayClosuresStore.filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedElectronicSettlements = electronicSettlementsStore.filter(
+          (item) => isMatch(item, reqComp, 'ALL') && (getTimestamp(item) >= sinceTime || packet.isForced || isExplicitZero)
+        );
+        const missedStocktakeSegments = stocktakeSegmentsStore.filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedSecurityAlerts = securityAlertsStore.filter((item) => isMatch(item, reqComp, 'ALL')).slice(0, 50);
         const tombstoneWindowStart = Math.max(0, sinceTime - 5 * 60 * 1000);
         const missedTombstones = tombstonesStore.filter((t) => {
           if (!t || !t.entityId) return false;
@@ -7070,18 +7179,18 @@ wss.on('connection', (ws, req) => {
             cashCounts: missedCashCounts,
             vouchers: missedVouchers,
             casualWorkers: missedCasualWorkers,
-            zoneAssignments: zoneAssignmentsStore,
-            branchLockdowns: branchLockdownsStore,
+            zoneAssignments: missedZoneAssignments,
+            branchLockdowns: missedBranchLockdowns,
             salespeople: missedSalespeople,
             customers: missedCustomers,
             branches: missedBranches,
             cashAccounts: missedCashAccounts,
-            businessDayClosures: businessDayClosuresStore,
-            electronicSettlements: electronicSettlementsStore,
+            businessDayClosures: missedBusinessDayClosures,
+            electronicSettlements: missedElectronicSettlements,
             categories: missedCategories,
             creditGroups: missedCreditGroups,
             stocktakeSessions: missedStocktakeSessions,
-            stocktakeSegments: stocktakeSegmentsStore,
+            stocktakeSegments: missedStocktakeSegments,
             tombstones: missedTombstones,
             ...(missedGenericEnvelopes.length > 0 ? { genericEnvelopes: missedGenericEnvelopes } : {}),
             ...(Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && ((permissionsMatrixStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
@@ -7093,7 +7202,7 @@ wss.on('connection', (ws, req) => {
             ...(multiCurrencyStore.config && ((multiCurrencyStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
               ? { multiCurrencyConfig: multiCurrencyStore.config }
               : {}),
-            securityAlerts: securityAlertsStore.slice(0, 50),
+            securityAlerts: missedSecurityAlerts,
           },
         };
 
@@ -7465,6 +7574,11 @@ async function syncEdgeToCloudSupabase() {
           }
         } else if (eType === 'credit_sale' || eType === 'expense' || eType === 'internal_consumption' || eType === 'direct_grv') {
           if (cloudTs > getRecordTimestamp(ex) && rec.status !== ex.status) {
+            targetSpec.arr[idx] = { ...ex, ...rec, isCloudSynced: true };
+            return true;
+          }
+        } else if (eType === 'electronic_settlement') {
+          if (cloudTs > getRecordTimestamp(ex)) {
             targetSpec.arr[idx] = { ...ex, ...rec, isCloudSynced: true };
             return true;
           }

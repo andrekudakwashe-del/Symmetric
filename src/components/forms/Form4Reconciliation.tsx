@@ -53,11 +53,14 @@ import {
   getMobileMoneySaleKind,
   getDuplicateSameNameStaffGroups,
   deduplicateSameNameStaffProfiles,
+  getCurrencyRate,
+  getBranches,
 } from '../../db/roomDatabase';
 import {
   handoverTillToSafe,
   getCashierRetainedFloat,
   saveCashierRetainedFloat,
+  recordElectronicSettlementToCustody,
 } from '../../services/cashCustodyService';
 import { ManagerPinModal } from '../common/ManagerPinModal';
 import { getAllMovements, getShiftId, matchesShift, CashMovement } from '../../db/cashLedger';
@@ -265,14 +268,51 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     });
   }, [salesList, date, refreshKey]);
 
-  // Electronic Settlements & Sweep State
+  // Electronic Settlements & Sweep State (Dual Currency: Base USD + Original Mobile Money)
   const [showElectronicModal, setShowElectronicModal] = useState(false);
   const [ecocashBatchInput, setEcocashBatchInput] = useState('');
   const [ecocashSettledAmount, setEcocashSettledAmount] = useState('');
+  const [ecocashNativeInput, setEcocashNativeInput] = useState('');
   const [zigBatchInput, setZigBatchInput] = useState('');
   const [zigSettledAmount, setZigSettledAmount] = useState('');
-  const [targetBankInput, setTargetBankInput] = useState('CABS');
+  const [zigNativeInput, setZigNativeInput] = useState('');
+  const [targetBankInput, setTargetBankInput] = useState('EcoCash & ZiG Dual Custody Accounts');
   const [isElectronicSettled, setIsElectronicSettled] = useState(false);
+
+  // Live FX rates for EcoCash and ZiG (units per 1 USD)
+  const ecocashFxRate = useMemo(() => {
+    const r = getCurrencyRate('EcoCash');
+    return r > 0 ? r : 1;
+  }, [refreshKey, showElectronicModal]);
+
+  const zigFxRate = useMemo(() => {
+    const r = getCurrencyRate('ZiG');
+    return r > 0 ? r : 1;
+  }, [refreshKey, showElectronicModal]);
+
+  // Compute day's actual native EcoCash & ZiG sales totals from POS invoices (fallback to USD * rate)
+  const dayNativeElectronicTotals = useMemo(() => {
+    let ecoNativeFromSales = 0;
+    let zigNativeFromSales = 0;
+    salesList.forEach((s) => {
+      if (!s || (s as any).isDeleted || s.status === 'Voided' || s.status === 'Refunded') return;
+      if (!isSameDaySafe(s.date, s.timestamp, date)) return;
+      const kind = getMobileMoneySaleKind(s);
+      if (kind === 'EcoCash') {
+        const nativeAmt = Number((s as any).amountInCurrency ?? (s as any).tenderedAmount ?? 0);
+        const usdAmt = Number(s.totalAmount || 0);
+        ecoNativeFromSales += nativeAmt > 0 ? nativeAmt : Math.round(usdAmt * ecocashFxRate * 100) / 100;
+      } else if (kind === 'ZiG') {
+        const nativeAmt = Number((s as any).amountInCurrency ?? (s as any).tenderedAmount ?? 0);
+        const usdAmt = Number(s.totalAmount || 0);
+        zigNativeFromSales += nativeAmt > 0 ? nativeAmt : Math.round(usdAmt * zigFxRate * 100) / 100;
+      }
+    });
+    return {
+      ecocashNative: Math.round(ecoNativeFromSales * 100) / 100,
+      zigNative: Math.round(zigNativeFromSales * 100) / 100,
+    };
+  }, [salesList, date, ecocashFxRate, zigFxRate]);
 
   // EOD Wizard State
   const [showEodWizardModal, setShowEodWizardModal] = useState(false);
@@ -294,16 +334,32 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     if (existing) {
       setEcocashBatchInput(existing.ecocashBatchRef || '');
       setEcocashSettledAmount(existing.ecocashAmountSettled ? String(existing.ecocashAmountSettled) : '');
+      setEcocashNativeInput(
+        existing.ecocashNativeAmount !== undefined
+          ? String(existing.ecocashNativeAmount)
+          : existing.ecocashAmountSettled
+          ? String(Math.round(existing.ecocashAmountSettled * (existing.ecocashRate || ecocashFxRate) * 100) / 100)
+          : ''
+      );
       setZigBatchInput(existing.zigBatchRef || '');
       setZigSettledAmount(existing.zigAmountSettled ? String(existing.zigAmountSettled) : '');
-      setTargetBankInput(existing.targetBankAccountName || 'CABS');
+      setZigNativeInput(
+        existing.zigNativeAmount !== undefined
+          ? String(existing.zigNativeAmount)
+          : existing.zigAmountSettled
+          ? String(Math.round(existing.zigAmountSettled * (existing.zigRate || zigFxRate) * 100) / 100)
+          : ''
+      );
+      setTargetBankInput(existing.targetBankAccountName || 'EcoCash & ZiG Dual Custody Accounts');
       setIsElectronicSettled(existing.ecocashVerified && existing.zigVerified);
     } else {
       setEcocashBatchInput('');
       setEcocashSettledAmount('');
+      setEcocashNativeInput('');
       setZigBatchInput('');
       setZigSettledAmount('');
-      setTargetBankInput('CABS');
+      setZigNativeInput('');
+      setTargetBankInput('EcoCash & ZiG Dual Custody Accounts');
       setIsElectronicSettled(false);
     }
   }, [date, currentUser?.branchId, refreshKey]);
@@ -775,7 +831,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         const res = handoverTillToSafe({
           cashierId: row.staffId,
           cashierName: row.staffName,
-          totalCountedCash: alreadySurrendered + net + retained,
+          totalCountedCash: net + retained,
           retainedFloat: retained,
           supervisor: currentUser,
           destinationTarget,
@@ -996,24 +1052,52 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     }
   };
 
-  // Confirm Electronic Settlement (EcoCash & ZiG Swipe)
+  // Confirm Electronic Settlement (EcoCash & ZiG Swipe) -> feeds Dual Custody directly (USD + Native)
   const handleSaveElectronicSettlement = () => {
     try {
       const branchId = currentUser?.branchId || 'BR-MAIN';
-      const ecoAmt = parseFloat(ecocashSettledAmount) || summaryTotals.totalEcocashSales;
-      const zigAmt = parseFloat(zigSettledAmount) || summaryTotals.totalZigSales;
+      const branchObj = getBranches().find((b) => b.id === branchId || b.branchCode === branchId);
+      const ecoUsd =
+        ecocashSettledAmount.trim() !== ''
+          ? Math.max(0, parseFloat(ecocashSettledAmount) || 0)
+          : summaryTotals.totalEcocashSales;
+      const defaultEcoNative =
+        dayNativeElectronicTotals.ecocashNative > 0 && ecocashSettledAmount.trim() === ''
+          ? dayNativeElectronicTotals.ecocashNative
+          : Math.round(ecoUsd * ecocashFxRate * 100) / 100;
+      const ecoNative =
+        ecocashNativeInput.trim() !== ''
+          ? Math.max(0, parseFloat(ecocashNativeInput) || 0)
+          : defaultEcoNative;
+
+      const zigUsd =
+        zigSettledAmount.trim() !== ''
+          ? Math.max(0, parseFloat(zigSettledAmount) || 0)
+          : summaryTotals.totalZigSales;
+      const defaultZigNative =
+        dayNativeElectronicTotals.zigNative > 0 && zigSettledAmount.trim() === ''
+          ? dayNativeElectronicTotals.zigNative
+          : Math.round(zigUsd * zigFxRate * 100) / 100;
+      const zigNative =
+        zigNativeInput.trim() !== ''
+          ? Math.max(0, parseFloat(zigNativeInput) || 0)
+          : defaultZigNative;
 
       saveElectronicSettlement({
         id: `ESET-${date}-${branchId}`,
         date,
         branchId,
         ecocashBatchRef: ecocashBatchInput.trim(),
-        ecocashAmountSettled: ecoAmt,
+        ecocashAmountSettled: ecoUsd,
         ecocashSystemTotal: summaryTotals.totalEcocashSales,
+        ecocashNativeAmount: ecoNative,
+        ecocashRate: ecocashFxRate,
         ecocashVerified: true,
         zigBatchRef: zigBatchInput.trim(),
-        zigAmountSettled: zigAmt,
+        zigAmountSettled: zigUsd,
         zigSystemTotal: summaryTotals.totalZigSales,
+        zigNativeAmount: zigNative,
+        zigRate: zigFxRate,
         zigVerified: true,
         targetBankAccountId: targetBankInput,
         targetBankAccountName: targetBankInput,
@@ -1023,9 +1107,27 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         verifiedAt: new Date().toISOString(),
       });
 
+      // Feed directly into Dual Custody EcoCash Merchant Account & ZiG Bank / Swipe Account (idempotent delta-safe)
+      recordElectronicSettlementToCustody({
+        date,
+        branchId,
+        branchName: branchObj?.name || branchId,
+        ecocashUsd: ecoUsd,
+        ecocashNative: ecoNative,
+        ecocashRate: ecocashFxRate,
+        ecocashBatchRef: ecocashBatchInput.trim() || undefined,
+        zigUsd,
+        zigNative,
+        zigRate: zigFxRate,
+        zigBatchRef: zigBatchInput.trim() || undefined,
+        verifiedBy: currentUser,
+      });
+
       setIsElectronicSettled(true);
       setShowElectronicModal(false);
-      setSaveSuccessBanner(`Electronic settlement verified! Funds confirmed and earmarked for sweep to ${targetBankInput}.`);
+      setSaveSuccessBanner(
+        `Electronic settlement confirmed & synced to Dual Custody! EcoCash: $${ecoUsd.toFixed(2)} (${ecoNative.toLocaleString('en-US', { maximumFractionDigits: 2 })} EcoCash) · ZiG: $${zigUsd.toFixed(2)} (${zigNative.toLocaleString('en-US', { maximumFractionDigits: 2 })} ZiG).`
+      );
       setRefreshKey((k) => k + 1);
     } catch (e: any) {
       alert(e?.message || 'Failed to save electronic settlement');
@@ -1115,19 +1217,44 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
         console.warn('[EOD] Automatic backup file generation notice:', backupErr);
       }
 
-      // 4. Save Electronic Settlement Record if entered
-      if (ecocashBatchInput || zigBatchInput || isElectronicSettled) {
+      // 4. Save Electronic Settlement Record & feed Dual Custody idempotently
+      const finalEcoUsd =
+        ecocashSettledAmount.trim() !== ''
+          ? Math.max(0, parseFloat(ecocashSettledAmount) || 0)
+          : summaryTotals.totalEcocashSales;
+      const finalEcoNative =
+        ecocashNativeInput.trim() !== ''
+          ? Math.max(0, parseFloat(ecocashNativeInput) || 0)
+          : dayNativeElectronicTotals.ecocashNative > 0 && ecocashSettledAmount.trim() === ''
+          ? dayNativeElectronicTotals.ecocashNative
+          : Math.round(finalEcoUsd * ecocashFxRate * 100) / 100;
+      const finalZigUsd =
+        zigSettledAmount.trim() !== ''
+          ? Math.max(0, parseFloat(zigSettledAmount) || 0)
+          : summaryTotals.totalZigSales;
+      const finalZigNative =
+        zigNativeInput.trim() !== ''
+          ? Math.max(0, parseFloat(zigNativeInput) || 0)
+          : dayNativeElectronicTotals.zigNative > 0 && zigSettledAmount.trim() === ''
+          ? dayNativeElectronicTotals.zigNative
+          : Math.round(finalZigUsd * zigFxRate * 100) / 100;
+
+      if (ecocashBatchInput || zigBatchInput || isElectronicSettled || finalEcoUsd > 0 || finalZigUsd > 0) {
         saveElectronicSettlement({
           id: `ESET-${date}-${branchId}`,
           date,
           branchId,
           ecocashBatchRef: ecocashBatchInput,
-          ecocashAmountSettled: parseFloat(ecocashSettledAmount) || summaryTotals.totalEcocashSales,
+          ecocashAmountSettled: finalEcoUsd,
           ecocashSystemTotal: summaryTotals.totalEcocashSales,
+          ecocashNativeAmount: finalEcoNative,
+          ecocashRate: ecocashFxRate,
           ecocashVerified: true,
           zigBatchRef: zigBatchInput,
-          zigAmountSettled: parseFloat(zigSettledAmount) || summaryTotals.totalZigSales,
+          zigAmountSettled: finalZigUsd,
           zigSystemTotal: summaryTotals.totalZigSales,
+          zigNativeAmount: finalZigNative,
+          zigRate: zigFxRate,
           zigVerified: true,
           targetBankAccountId: targetBankInput,
           targetBankAccountName: targetBankInput,
@@ -1135,6 +1262,20 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
           verifiedByStaffId: currentUser.id,
           verifiedByStaffName: currentUser.name,
           verifiedAt: new Date().toISOString(),
+        });
+        recordElectronicSettlementToCustody({
+          date,
+          branchId,
+          branchName,
+          ecocashUsd: finalEcoUsd,
+          ecocashNative: finalEcoNative,
+          ecocashRate: ecocashFxRate,
+          ecocashBatchRef: ecocashBatchInput.trim() || undefined,
+          zigUsd: finalZigUsd,
+          zigNative: finalZigNative,
+          zigRate: zigFxRate,
+          zigBatchRef: zigBatchInput.trim() || undefined,
+          verifiedBy: currentUser,
         });
       }
 
@@ -3441,20 +3582,67 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
             </div>
 
             <div className="space-y-4 text-xs">
-              {/* EcoCash Verification Box */}
-              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2.5">
-                <div className="flex items-center justify-between">
+              {/* EcoCash Verification Box (Dual Currency: Base USD + Original EcoCash) */}
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-blue-500/30 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
                   <div className="flex items-center space-x-2">
                     <span className="w-2.5 h-2.5 rounded-full bg-blue-500" />
                     <span className="font-bold text-white text-xs">EcoCash Merchant Account</span>
                   </div>
-                  <span className="text-slate-400 font-mono text-[11px]">
-                    System Total: <strong className="text-blue-400">${summaryTotals.totalEcocashSales.toFixed(2)}</strong>
-                  </span>
+                  <div className="text-right font-mono text-[11px]">
+                    <span className="text-slate-400">System: </span>
+                    <strong className="text-blue-400">${summaryTotals.totalEcocashSales.toFixed(2)}</strong>
+                    <span className="text-slate-500"> · </span>
+                    <strong className="text-blue-300">
+                      {(dayNativeElectronicTotals.ecocashNative || Math.round(summaryTotals.totalEcocashSales * ecocashFxRate * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 })} EcoCash
+                    </strong>
+                  </div>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">Merchant Reference / Statement Ref</label>
+                    <label className="block text-[11px] text-slate-400 mb-1">Base USD ($)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={ecocashSettledAmount}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setEcocashSettledAmount(val);
+                        const num = parseFloat(val);
+                        if (!isNaN(num)) {
+                          setEcocashNativeInput(String(Math.round(num * ecocashFxRate * 100) / 100));
+                        } else if (val === '') {
+                          setEcocashNativeInput('');
+                        }
+                      }}
+                      placeholder={summaryTotals.totalEcocashSales.toFixed(2)}
+                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono-num font-bold focus:ring-1 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-blue-300 mb-1">
+                      Original EcoCash {ecocashFxRate !== 1 ? `(1 USD = ${ecocashFxRate})` : ''}
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={ecocashNativeInput}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setEcocashNativeInput(val);
+                        const num = parseFloat(val);
+                        if (!isNaN(num) && ecocashFxRate > 0) {
+                          setEcocashSettledAmount(String(Math.round((num / ecocashFxRate) * 100) / 100));
+                        } else if (val === '') {
+                          setEcocashSettledAmount('');
+                        }
+                      }}
+                      placeholder={String(dayNativeElectronicTotals.ecocashNative || Math.round(summaryTotals.totalEcocashSales * ecocashFxRate * 100) / 100)}
+                      className="w-full px-3 py-1.5 bg-slate-900 border border-blue-500/40 rounded-xl text-blue-200 font-mono-num font-bold focus:ring-1 focus:ring-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">Merchant Batch Ref</label>
                     <input
                       type="text"
                       value={ecocashBatchInput}
@@ -3463,34 +3651,70 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                       className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono focus:ring-1 focus:ring-blue-500"
                     />
                   </div>
-                  <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">Settled / Confirmed Amount ($)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={ecocashSettledAmount}
-                      onChange={(e) => setEcocashSettledAmount(e.target.value)}
-                      placeholder={summaryTotals.totalEcocashSales.toFixed(2)}
-                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono-num font-bold focus:ring-1 focus:ring-blue-500"
-                    />
-                  </div>
                 </div>
               </div>
 
-              {/* ZiG Swipe Verification Box */}
-              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2.5">
-                <div className="flex items-center justify-between">
+              {/* ZiG Swipe Verification Box (Dual Currency: Base USD + Original ZiG) */}
+              <div className="p-3.5 rounded-2xl bg-slate-950 border border-amber-500/30 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-1.5">
                   <div className="flex items-center space-x-2">
                     <span className="w-2.5 h-2.5 rounded-full bg-amber-500" />
-                    <span className="font-bold text-white text-xs">ZiG POS Swipe Settlement</span>
+                    <span className="font-bold text-white text-xs">ZiG Bank / POS Swipe Settlement</span>
                   </div>
-                  <span className="text-slate-400 font-mono text-[11px]">
-                    System Total: <strong className="text-amber-400">${summaryTotals.totalZigSales.toFixed(2)}</strong>
-                  </span>
+                  <div className="text-right font-mono text-[11px]">
+                    <span className="text-slate-400">System: </span>
+                    <strong className="text-amber-400">${summaryTotals.totalZigSales.toFixed(2)}</strong>
+                    <span className="text-slate-500"> · </span>
+                    <strong className="text-amber-300">
+                      {(dayNativeElectronicTotals.zigNative || Math.round(summaryTotals.totalZigSales * zigFxRate * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 })} ZiG
+                    </strong>
+                  </div>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">POS Terminal Batch / Audit Ref</label>
+                    <label className="block text-[11px] text-slate-400 mb-1">Base USD ($)</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={zigSettledAmount}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setZigSettledAmount(val);
+                        const num = parseFloat(val);
+                        if (!isNaN(num)) {
+                          setZigNativeInput(String(Math.round(num * zigFxRate * 100) / 100));
+                        } else if (val === '') {
+                          setZigNativeInput('');
+                        }
+                      }}
+                      placeholder={summaryTotals.totalZigSales.toFixed(2)}
+                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono-num font-bold focus:ring-1 focus:ring-amber-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-amber-300 mb-1">
+                      Original ZiG {zigFxRate !== 1 ? `(1 USD = ${zigFxRate})` : ''}
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={zigNativeInput}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setZigNativeInput(val);
+                        const num = parseFloat(val);
+                        if (!isNaN(num) && zigFxRate > 0) {
+                          setZigSettledAmount(String(Math.round((num / zigFxRate) * 100) / 100));
+                        } else if (val === '') {
+                          setZigSettledAmount('');
+                        }
+                      }}
+                      placeholder={String(dayNativeElectronicTotals.zigNative || Math.round(summaryTotals.totalZigSales * zigFxRate * 100) / 100)}
+                      className="w-full px-3 py-1.5 bg-slate-900 border border-amber-500/40 rounded-xl text-amber-200 font-mono-num font-bold focus:ring-1 focus:ring-amber-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] text-slate-400 mb-1">POS Batch / Audit Ref</label>
                     <input
                       type="text"
                       value={zigBatchInput}
@@ -3499,41 +3723,18 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                       className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono focus:ring-1 focus:ring-amber-500"
                     />
                   </div>
-                  <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">Settled / Confirmed Amount ($)</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={zigSettledAmount}
-                      onChange={(e) => setZigSettledAmount(e.target.value)}
-                      placeholder={summaryTotals.totalZigSales.toFixed(2)}
-                      className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-xl text-white font-mono-num font-bold focus:ring-1 focus:ring-amber-500"
-                    />
-                  </div>
                 </div>
               </div>
 
-              {/* Destination Operating Bank Account for Dual-Custody Sweep */}
-              <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-2">
-                <div className="flex items-center space-x-2">
-                  <Building2 className="w-4 h-4 text-emerald-400" />
-                  <label className="font-bold text-white text-xs">Target Bank Operating Account</label>
+              {/* Dual-Custody Auto-Credit Notice */}
+              <div className="p-3 rounded-2xl bg-emerald-950/30 border border-emerald-500/30 flex items-start space-x-2.5">
+                <Building2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <div className="font-bold text-emerald-300 text-xs">Direct Dual-Custody Settlement Feed</div>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    Confirming here immediately credits your <strong>EcoCash Merchant Account</strong> and <strong>ZiG Bank / Swipe Account</strong> in Dual Custody (Branch Safe &amp; HQ Safe) in both Base USD and native mobile money, and syncs across devices.
+                  </p>
                 </div>
-                <select
-                  value={targetBankInput}
-                  onChange={(e) => setTargetBankInput(e.target.value)}
-                  className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-xl text-white text-xs focus:ring-2 focus:ring-emerald-500 cursor-pointer"
-                >
-                  <option value="CABS Operating Account - 100293847">CABS Operating Account • 100293847</option>
-                  <option value="Steward Bank Main - 0293847190">Steward Bank Main • 0293847190</option>
-                  <option value="Stanbic Store Account - 9023847102">Stanbic Store Account • 9023847102</option>
-                  <option value="CBZ Commercial Account - 110293845">CBZ Commercial Account • 110293845</option>
-                  <option value="Ecobank Operating - 8820192301">Ecobank Operating • 8820192301</option>
-                  <option value="Nedbank Store Float - 44029102">Nedbank Store Float • 44029102</option>
-                </select>
-                <p className="text-[10px] text-slate-400">
-                  Electronic receipts verified here will be batched into the End-of-Day dual-custody bank sweep.
-                </p>
               </div>
             </div>
 
@@ -3551,7 +3752,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                 className="px-4 py-2 rounded-xl bg-gradient-to-r from-indigo-600 to-emerald-600 hover:opacity-95 text-white text-xs font-bold shadow-md flex items-center space-x-1.5"
               >
                 <CheckCircle2 className="w-3.5 h-3.5" />
-                <span>Confirm Settlement & Sweep</span>
+                <span>Confirm &amp; Credit Dual Custody</span>
               </button>
             </div>
           </div>
@@ -3670,8 +3871,8 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                         <CreditCard className="w-5 h-5 text-indigo-400 shrink-0" />
                         <div>
                           <div className="font-bold text-white text-xs">Mobile Money & Electronic Settlement</div>
-                          <div className="text-[11px] text-slate-300">
-                            EcoCash: ${summaryTotals.totalEcocashSales.toFixed(2)} | ZiG Swipe: ${summaryTotals.totalZigSales.toFixed(2)}
+                          <div className="text-[11px] text-slate-300 font-mono">
+                            EcoCash: ${summaryTotals.totalEcocashSales.toFixed(2)} ({(dayNativeElectronicTotals.ecocashNative || Math.round(summaryTotals.totalEcocashSales * ecocashFxRate * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 })} EcoCash) · ZiG: ${summaryTotals.totalZigSales.toFixed(2)} ({(dayNativeElectronicTotals.zigNative || Math.round(summaryTotals.totalZigSales * zigFxRate * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 })} ZiG)
                           </div>
                         </div>
                       </div>
@@ -3730,10 +3931,16 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                       <div className="p-2 rounded-xl bg-slate-900 border border-slate-800">
                         <div className="text-[10px] text-slate-400">EcoCash Sales</div>
                         <div className="text-sm font-black text-blue-400 font-mono-num">${summaryTotals.totalEcocashSales.toFixed(2)}</div>
+                        <div className="text-[10px] font-mono text-blue-300/80">
+                          {(dayNativeElectronicTotals.ecocashNative || Math.round(summaryTotals.totalEcocashSales * ecocashFxRate * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 })} EcoCash
+                        </div>
                       </div>
                       <div className="p-2 rounded-xl bg-slate-900 border border-slate-800">
                         <div className="text-[10px] text-slate-400">ZiG Swipe Sales</div>
                         <div className="text-sm font-black text-amber-400 font-mono-num">${summaryTotals.totalZigSales.toFixed(2)}</div>
+                        <div className="text-[10px] font-mono text-amber-300/80">
+                          {(dayNativeElectronicTotals.zigNative || Math.round(summaryTotals.totalZigSales * zigFxRate * 100) / 100).toLocaleString('en-US', { maximumFractionDigits: 2 })} ZiG
+                        </div>
                       </div>
                     </div>
 

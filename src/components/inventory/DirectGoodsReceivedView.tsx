@@ -65,6 +65,7 @@ import {
 import { cleanNumberInput } from './GoodsReceivedView';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
+import { formatDisplayId } from '../../utils/idFormatters';
 
 interface DirectGoodsReceivedViewProps {
   currentUser: Salesperson | null;
@@ -1324,8 +1325,10 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                             }}
                             className="w-full text-left px-3.5 py-2 hover:bg-slate-700 text-xs text-slate-200 flex items-center justify-between border-b border-slate-700/50"
                           >
-                            <span className="font-bold text-white">{s.name}</span>
-                            <span className="text-[10px] text-slate-400 font-mono">{s.code || s.supplierId}</span>
+                            <span className="font-bold text-white truncate pr-2">{s.name}</span>
+                            <span title={s.supplierId} className="text-[10px] text-slate-400 font-mono shrink-0">
+                              {formatDisplayId(s.code || s.supplierId, 'supplier')}
+                            </span>
                           </button>
                         );
                       })

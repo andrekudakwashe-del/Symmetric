@@ -19,16 +19,16 @@ import {
 import { costingService } from './costingService';
 import { payablesLedger } from './payablesLedger';
 import { addMovement, getShiftId } from '../db/cashLedger';
-import { getCurrentBranchId, getCurrentCompanyId } from '../db/roomDatabase';
+import { getCurrentBranchId, getCurrentCompanyId, isCompanyInTenantScope } from '../db/roomDatabase';
 
 export const TRIP_MANIFEST_STORAGE_KEY = 'saimetric_room_procurement_trips';
 
 let memoryTrips: ProcurementTripManifest[] = [];
 
 /**
- * Retrieve all procurement trip manifests
+ * Retrieve ALL raw procurement trip manifests across all tenants (internal persistence only)
  */
-export function getAllTripManifests(): ProcurementTripManifest[] {
+export function getRawStoredTripManifests(): ProcurementTripManifest[] {
   if (typeof window === 'undefined' || !window.localStorage) {
     return memoryTrips;
   }
@@ -61,6 +61,16 @@ export function getAllTripManifests(): ProcurementTripManifest[] {
 }
 
 /**
+ * Retrieve tenant-scoped procurement trip manifests for the active company
+ */
+export function getAllTripManifests(): ProcurementTripManifest[] {
+  const currentCompany = getCurrentCompanyId();
+  return getRawStoredTripManifests().filter((t: any) =>
+    isCompanyInTenantScope(t.company_id || t.companyId, currentCompany)
+  );
+}
+
+/**
  * Persist trip manifests to storage
  */
 export function saveAllTripManifests(trips: ProcurementTripManifest[]): void {
@@ -85,17 +95,23 @@ export function saveAllTripManifests(trips: ProcurementTripManifest[]): void {
  * Save or update a single procurement trip manifest
  */
 export function saveTripManifest(trip: ProcurementTripManifest): ProcurementTripManifest {
-  const all = getAllTripManifests();
-  const idx = all.findIndex((t) => t.id === trip.id || t.tripNumber === trip.tripNumber);
+  const all = getRawStoredTripManifests();
+  const activeComp = (trip as any).company_id || (trip as any).companyId || getCurrentCompanyId();
+  const stamped: ProcurementTripManifest = {
+    ...trip,
+    companyId: activeComp,
+    company_id: activeComp,
+  } as ProcurementTripManifest;
+  const idx = all.findIndex((t) => t.id === stamped.id || t.tripNumber === stamped.tripNumber);
   let updated: ProcurementTripManifest[];
   if (idx >= 0) {
     updated = [...all];
-    updated[idx] = trip;
+    updated[idx] = stamped;
   } else {
-    updated = [trip, ...all];
+    updated = [stamped, ...all];
   }
   saveAllTripManifests(updated);
-  return trip;
+  return stamped;
 }
 
 /**

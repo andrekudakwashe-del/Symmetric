@@ -211,9 +211,9 @@ var BASE_TAB_COLUMNS = {
   "CashLog": ["LogID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "AccountID", "Category", "Description", "In", "Out", "Currency", "PaymentMethod", "Reference", "Status", "SyncedAt"],
   "CashLifts": ["LiftID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "Amount", "Currency", "DestinationAccount", "AuthorizedBy", "Notes", "Status", "SyncedAt"],
   "CashMovements": ["MovementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "ShiftID", "AccountID", "Type", "Direction", "Amount", "Currency", "StaffID", "StaffName", "Description", "Reference", "SyncedAt"],
-  "CashAccounts": ["AccountID", "CompanyID", "BranchID", "BranchName", "Name", "Type", "Currency", "CurrentBalance", "ExpectedBalance", "IsActive", "UpdatedAt"],
-  "CashTransfers": ["TransferID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "FromAccountID", "ToAccountID", "Amount", "Currency", "Status", "Rank", "LinkedCashLogIDs", "StaffID", "StaffName", "Notes", "UpdatedAt"],
-  "DirectGRVs": ["GRVID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "GRVNumber", "SupplierName", "InvoiceNumber", "ItemsCount", "TotalCost", "CashPaid", "PaymentMethod", "AccountID", "Status", "RecordedBy", "ApprovedBy", "Notes", "SyncedAt"],
+  "CashAccounts": ["AccountID", "CompanyID", "BranchID", "BranchName", "Name", "Type", "Subtype", "Currency", "CurrentBalance", "NativeCurrency", "NativeBalance", "ExpectedBalance", "IsActive", "UpdatedAt"],
+  "CashTransfers": ["TransferID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "Type", "FromAccountID", "ToAccountID", "Amount", "Currency", "NativeCurrency", "NativeAmount", "ExchangeRate", "BatchRef", "RecipientName", "LinkedGrvID", "BankName", "Status", "Rank", "LinkedCashLogIDs", "StaffID", "StaffName", "ApprovedBy", "ReceivedBy", "Notes", "UpdatedAt"],
+  "DirectGRVs": ["GRVID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "GRVNumber", "SupplierName", "InvoiceNumber", "ItemsCount", "TotalCost", "CashPaid", "UnpaidBalance", "PaymentMethod", "PaymentStatus", "PaidVoucherID", "AccountID", "Status", "RecordedBy", "ApprovedBy", "Notes", "SyncedAt"],
   "GoodsReceived": ["GRNID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "SupplierID", "SupplierName", "InvoiceRef", "TotalAmount", "ItemsCount", "Status", "ReceivedBy", "Notes", "SyncedAt"],
   "GoodsReceivedItems": ["GRNItemID", "CompanyID", "BranchID", "GRNID", "ProductID", "ProductName", "QtyReceived", "UnitCost", "LineTotal", "BatchNo", "ExpiryDate"],
   "StockMovements": ["MovementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "ProductID", "ProductName", "MovementType", "QtyChange", "BalanceBefore", "BalanceAfter", "ReferenceID", "StaffID", "StaffName", "Notes", "SyncedAt"],
@@ -222,7 +222,7 @@ var BASE_TAB_COLUMNS = {
   "InternalConsumption": ["ConsumptionID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "Department", "Reason", "TotalCost", "ItemsCount", "Status", "ApprovedBy", "Notes"],
   "Reconciliations": ["ReconID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "OpeningFloat", "CashSales", "OtherCashIn", "CashExpenses", "BankDrops", "ExpectedCash", "ActualCashCount", "Variance", "Status", "Notes", "ApprovedBy", "SyncedAt"],
   "BusinessDayClosures": ["ClosureID", "CompanyID", "BranchID", "BranchName", "Date", "ClosedAt", "ClosedBy", "ClosedByName", "TotalSales", "TotalExpenses", "NetCash", "Variance", "Status", "Notes"],
-  "ElectronicSettlements": ["SettlementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "Provider", "Currency", "ExpectedAmount", "SettledAmount", "Variance", "Reference", "StaffID", "Status", "Notes"],
+  "ElectronicSettlements": ["SettlementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "EcocashBatchRef", "EcocashUsdSettled", "EcocashNativeAmount", "EcocashRate", "EcocashVerified", "ZigBatchRef", "ZigUsdSettled", "ZigNativeAmount", "ZigRate", "ZigVerified", "TargetBankAccountID", "TargetBankName", "SweptToBank", "VerifiedBy", "Notes", "UpdatedAt"],
   "CashCounts": ["CountID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "DenominationsJSON", "FinalCashOutTotal", "Notes", "Status"],
   "AdminSales": ["AdminSaleID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "SalesAmount", "Notes", "Status"],
   "Suppliers": ["SupplierID", "CompanyID", "BranchID", "BranchName", "SupplierName", "Category", "ContactPerson", "Phone", "Email", "Address", "City", "PaymentTerms", "TaxNumber", "Balance", "Status", "UpdatedAt", "SyncedAt"],
@@ -2227,20 +2227,34 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
       obj.SyncedAt = isoServerNow;
       break;
     case "direct_grv":
+      var grvTillPaidSum = 0;
+      if (Array.isArray(d.payments)) {
+        for (var pi = 0; pi < d.payments.length; pi++) {
+          grvTillPaidSum += Number((d.payments[pi] && d.payments[pi].amount) || 0);
+        }
+      }
+      var grvCashPaid = Math.max(
+        grvTillPaidSum,
+        Number(d.paidFromDrawerAmount || 0),
+        Number(d.cashPaid !== undefined ? d.cashPaid : (d.CashPaid || 0))
+      );
       obj.GRVID = entityId;
       obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
-      obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
+      obj.Timestamp = d.timestamp || d.createdAt || d.Timestamp || isoClientUpdated;
       obj.GRVNumber = d.grvNumber || d.GRVNumber || entityId;
       obj.SupplierName = d.supplierName || d.SupplierName || d.supplier || "";
-      obj.InvoiceNumber = d.invoiceNumber || d.InvoiceNumber || "";
+      obj.InvoiceNumber = d.invoiceNo || d.invoiceNumber || d.InvoiceNumber || "";
       obj.ItemsCount = Array.isArray(d.items) ? d.items.length : Number(d.itemsCount || d.ItemsCount || 0);
       obj.TotalCost = Number(d.totalCost !== undefined ? d.totalCost : (d.TotalCost || 0));
-      obj.CashPaid = Number(d.cashPaid !== undefined ? d.cashPaid : (d.CashPaid || 0));
-      obj.PaymentMethod = d.paymentMethod || d.PaymentMethod || "Cash";
-      obj.AccountID = d.accountId || d.AccountID || "";
+      obj.CashPaid = Math.round(grvCashPaid * 100) / 100;
+      obj.UnpaidBalance = d.unpaidBalance !== undefined ? Number(d.unpaidBalance) : Math.max(0, Math.round((obj.TotalCost - obj.CashPaid) * 100) / 100);
+      obj.PaymentMethod = d.paymentMethod || d.PaymentMethod || (d.payFromTill ? "TILL" : "INVOICE_ON_ACCOUNT");
+      obj.PaymentStatus = d.paymentStatus || d.PaymentStatus || (obj.UnpaidBalance <= 0 ? "PAID" : "AWAITING_SAFE_PAYMENT");
+      obj.PaidVoucherID = d.paidVoucherId || d.PaidVoucherID || "";
+      obj.AccountID = d.allocatedSafeId || d.accountId || d.AccountID || "";
       obj.Status = d.status || d.Status || "APPROVED";
-      obj.RecordedBy = d.recordedByName || d.recordedBy || d.staffName || d.RecordedBy || "";
-      obj.ApprovedBy = d.approvedByName || d.approvedBy || d.ApprovedBy || "";
+      obj.RecordedBy = d.receivedByStaffName || d.recordedByName || d.recordedBy || d.staffName || d.RecordedBy || "";
+      obj.ApprovedBy = d.approvedByStaffName || d.approvedByName || d.approvedBy || d.ApprovedBy || "";
       obj.Notes = d.notes || d.Notes || "";
       obj.SyncedAt = isoServerNow;
       break;
@@ -2297,13 +2311,13 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
       obj.LiftID = entityId;
       obj.Date = d.date || d.Date || isoServerNow.split("T")[0];
       obj.Timestamp = d.timestamp || d.Timestamp || isoClientUpdated;
-      obj.StaffID = d.staffId || d.StaffID || "";
-      obj.StaffName = d.staffName || d.StaffName || "";
-      obj.Amount = Number(d.amount !== undefined ? d.amount : (d.Amount || 0));
+      obj.StaffID = d.cashierId || d.staffId || d.StaffID || "";
+      obj.StaffName = d.cashierName || d.staffName || d.StaffName || "";
+      obj.Amount = Number(d.totalAmount !== undefined ? d.totalAmount : (d.amount !== undefined ? d.amount : (d.Amount || 0)));
       obj.Currency = d.currency || d.Currency || "USD";
-      obj.DestinationAccount = d.destinationAccount || d.DestinationAccount || "";
-      obj.AuthorizedBy = d.authorizedBy || d.supervisorName || d.AuthorizedBy || "";
-      obj.Notes = d.notes || d.Notes || "";
+      obj.DestinationAccount = d.destinationAccountId || d.destinationAccount || d.DestinationAccount || "";
+      obj.AuthorizedBy = d.supervisorName || d.authorizedBy || d.AuthorizedBy || "";
+      obj.Notes = d.notes || d.reason || d.Notes || "";
       obj.Status = d.status || d.Status || "Completed";
       obj.SyncedAt = isoServerNow;
       break;
@@ -2323,19 +2337,66 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
       obj.IPOrDevice = d.deviceId || d.IPOrDevice || envelope.originDeviceId || "";
       obj.Status = d.severity || d.status || d.Status || "INFO";
       break;
+    case "cash_account":
+      obj.AccountID = d.account_id || d.id || entityId;
+      obj.BranchName = d.branch_name || d.branchName || "";
+      obj.Name = d.account_name || d.name || entityId;
+      obj.Type = d.account_type || d.type || "BRANCH_SAFE";
+      obj.Subtype = d.account_subtype || d.subtype || "";
+      obj.Currency = d.currency || "USD";
+      obj.CurrentBalance = Number(d.current_balance !== undefined ? d.current_balance : (d.balance || 0));
+      obj.NativeCurrency = d.native_currency || d.nativeCurrency || "";
+      obj.NativeBalance = d.native_balance !== undefined ? Number(d.native_balance) : "";
+      obj.ExpectedBalance = d.expected_balance !== undefined ? Number(d.expected_balance) : "";
+      obj.IsActive = d.is_active !== false;
+      obj.UpdatedAt = isoClientUpdated;
+      break;
     case "cash_transfer":
-      obj.TransferID = entityId;
-      obj.Date = d.date || isoServerNow.split("T")[0];
-      obj.Timestamp = d.timestamp || isoClientUpdated;
+      obj.TransferID = d.transfer_id || d.id || entityId;
+      obj.BranchName = d.branch_name || d.branchName || "";
+      obj.Date = d.date || (d.created_at ? String(d.created_at).split("T")[0] : isoServerNow.split("T")[0]);
+      obj.Timestamp = d.created_at || d.timestamp || isoClientUpdated;
+      obj.Type = d.type || "BRANCH_TO_HQ";
       obj.FromAccountID = d.from_account_id || d.fromAccountId || "";
       obj.ToAccountID = d.to_account_id || d.toAccountId || "";
-      obj.Amount = d.amount || 0;
+      obj.Amount = Number(d.amount || 0);
       obj.Currency = d.currency || "USD";
+      obj.NativeCurrency = d.native_currency || d.nativeCurrency || "";
+      obj.NativeAmount = d.native_amount !== undefined ? Number(d.native_amount) : "";
+      obj.ExchangeRate = d.exchange_rate !== undefined ? Number(d.exchange_rate) : "";
+      obj.BatchRef = d.settlement_batch_ref || d.batchRef || d.bank_slip_reference || "";
+      obj.RecipientName = d.recipient_name || d.recipientName || "";
+      obj.LinkedGrvID = d.linked_grv_id || d.linkedGrvId || "";
+      obj.BankName = d.bank_name || d.bankName || "";
       obj.Status = d.status || "PENDING";
       obj.Rank = d.rank !== undefined ? d.rank : 0;
       obj.LinkedCashLogIDs = JSON.stringify(d.linked_cash_log_ids || []);
-      obj.StaffID = d.staffId || d.createdBy || "";
-      obj.StaffName = d.staffName || d.createdByName || "";
+      obj.StaffID = d.created_by_user_id || d.staffId || d.createdBy || "";
+      obj.StaffName = d.created_by_user_name || d.staffName || d.createdByName || "";
+      obj.ApprovedBy = d.approved_by_user_name || d.approved_by_user_id || d.approvedBy || "";
+      obj.ReceivedBy = d.received_by_user_name || d.received_by_user_id || d.receivedBy || "";
+      obj.Notes = d.notes || "";
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "electronic_settlement":
+      obj.SettlementID = d.id || entityId;
+      obj.BranchName = d.branchName || d.branch_name || "";
+      obj.Date = d.date || isoServerNow.split("T")[0];
+      obj.Timestamp = d.verifiedAt || d.timestamp || isoClientUpdated;
+      obj.EcocashBatchRef = d.ecocashBatchRef || "";
+      obj.EcocashUsdSettled = Number(d.ecocashAmountSettled || 0);
+      obj.EcocashNativeAmount = d.ecocashNativeAmount !== undefined ? Number(d.ecocashNativeAmount) : "";
+      obj.EcocashRate = d.ecocashRate !== undefined ? Number(d.ecocashRate) : "";
+      obj.EcocashVerified = Boolean(d.ecocashVerified);
+      obj.ZigBatchRef = d.zigBatchRef || "";
+      obj.ZigUsdSettled = Number(d.zigAmountSettled || 0);
+      obj.ZigNativeAmount = d.zigNativeAmount !== undefined ? Number(d.zigNativeAmount) : "";
+      obj.ZigRate = d.zigRate !== undefined ? Number(d.zigRate) : "";
+      obj.ZigVerified = Boolean(d.zigVerified);
+      obj.TargetBankAccountID = d.targetBankAccountId || "";
+      obj.TargetBankName = d.targetBankAccountName || "";
+      obj.SweptToBank = Boolean(d.sweptToBank);
+      obj.VerifiedBy = d.verifiedByStaffName || d.verifiedByStaffId || "";
       obj.Notes = d.notes || "";
       obj.UpdatedAt = isoClientUpdated;
       break;

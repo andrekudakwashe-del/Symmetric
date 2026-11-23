@@ -360,6 +360,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
             supervisor: currentUser,
             shiftDate: sheetDate,
             notes: `Auto-issued initial shift opening float ($${defaultFloat.toFixed(2)})`,
+            autoAccept: true,
+            skipDrawerMovement: true,
           });
         } catch (_) {}
 
@@ -1503,8 +1505,8 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       const tillAccId = `ACC-TILL-1-${sourceAcc.branch_id}`;
 
       if (numAmt > 0) {
-        // Cash moved from Safe/Clerk into Till
-        const voucher = createCashTransferVoucher({
+        // Cash moved from Safe/Clerk into Till — already posted to Form 2 above, settle custody ledger directly
+        createCashTransferVoucher({
           type: 'FLOAT_ISSUE',
           from_account_id: sourceAcc.account_id,
           to_account_id: tillAccId,
@@ -1512,10 +1514,9 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
           initiator: supervisor,
           recipient_name: selectedStaff?.name || 'Cashier',
           notes: `Float Top-Up by ${supervisor.name}: ${floatAdjReason.trim() || 'Drawer float addition'}`,
+          auto_accept: true,
+          skip_drawer_movement: true,
         });
-        try {
-          acceptTillFloat(voucher.transfer_id, (selectedStaff || currentUser) as any, trimmedPin);
-        } catch (_) {}
       } else {
         // Cash skimmed from Till back into Safe/Clerk
         createCashTransferVoucher({

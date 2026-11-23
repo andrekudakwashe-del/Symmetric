@@ -4,21 +4,57 @@ export const CUSTOMER_LEDGER_STORAGE_KEY = 'saimetric_room_customer_ledger';
 
 let memoryCustomerLedger: CustomerLedgerEntry[] = [];
 
+const normCustomerLedgerTenant = (comp?: string | null): string => {
+  const clean = String(comp || '').trim().toUpperCase();
+  if (!clean || clean === 'COMP-001' || clean === 'COMP-MASTER' || clean === 'DEFAULT') {
+    return 'COMP-001';
+  }
+  return clean;
+};
+
+const getActiveCustomerLedgerCompanyId = (): string => {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const sessionRaw = window.localStorage.getItem('saimetric_room_session_user');
+      if (sessionRaw) {
+        const u = JSON.parse(sessionRaw);
+        if (u?.companyId || u?.company_id) return String(u.companyId || u.company_id).trim();
+      }
+      const storedComp = window.localStorage.getItem('saimetric_room_current_company_id');
+      if (storedComp && storedComp.trim()) return storedComp.trim();
+    } catch {
+      // Fallback below
+    }
+  }
+  return 'COMP-001';
+};
+
 /**
- * Read all entries from customer ledger
+ * Read ALL raw entries across all companies (internal persistence only)
  */
-export const getAllCustomerLedgerEntries = (): CustomerLedgerEntry[] => {
+export const getRawStoredCustomerLedgerEntries = (): CustomerLedgerEntry[] => {
   if (typeof window === 'undefined' || !window.localStorage) {
     return memoryCustomerLedger;
   }
   try {
     const raw = window.localStorage.getItem(CUSTOMER_LEDGER_STORAGE_KEY);
     if (!raw) return memoryCustomerLedger;
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : memoryCustomerLedger;
   } catch (err) {
     console.error('Error reading customerLedger:', err);
     return memoryCustomerLedger;
   }
+};
+
+/**
+ * Read tenant-scoped entries from customer ledger for the active company
+ */
+export const getAllCustomerLedgerEntries = (): CustomerLedgerEntry[] => {
+  const activeComp = normCustomerLedgerTenant(getActiveCustomerLedgerCompanyId());
+  return getRawStoredCustomerLedgerEntries().filter((e: any) =>
+    normCustomerLedgerTenant(e.company_id || e.companyId) === activeComp
+  );
 };
 
 /**
@@ -53,15 +89,18 @@ export const addCustomerLedgerEntry = (
 ): CustomerLedgerEntry => {
   const now = new Date().toISOString();
   const id = entry.id || `CLED-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  const activeComp = (entry as any).company_id || (entry as any).companyId || getActiveCustomerLedgerCompanyId();
   const fullEntry: CustomerLedgerEntry = {
     ...entry,
+    companyId: activeComp,
+    company_id: activeComp,
     id,
     amount: Number(entry.amount) || 0,
     createdAt: now,
     updatedAt: now,
-  };
+  } as CustomerLedgerEntry;
 
-  const current = getAllCustomerLedgerEntries();
+  const current = getRawStoredCustomerLedgerEntries();
   const updated = [fullEntry, ...current];
   saveAllCustomerLedgerEntries(updated);
   return fullEntry;
@@ -74,7 +113,7 @@ export const updateCustomerLedgerEntry = (
   id: string,
   patch: Partial<CustomerLedgerEntry>
 ): CustomerLedgerEntry | null => {
-  const current = getAllCustomerLedgerEntries();
+  const current = getRawStoredCustomerLedgerEntries();
   const index = current.findIndex((e) => e.id === id);
   if (index === -1) return null;
 
@@ -95,7 +134,7 @@ export const updateCustomerLedgerEntry = (
  * Delete a customer ledger entry
  */
 export const deleteCustomerLedgerEntry = (id: string): boolean => {
-  const current = getAllCustomerLedgerEntries();
+  const current = getRawStoredCustomerLedgerEntries();
   const filtered = current.filter((e) => e.id !== id);
   if (filtered.length === current.length) return false;
   saveAllCustomerLedgerEntries(filtered);

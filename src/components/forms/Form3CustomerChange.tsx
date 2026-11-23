@@ -62,6 +62,7 @@ import { FormStepNavigation } from '../common/FormStepNavigation';
 import { CustomerAutocompleteInput } from '../common/CustomerAutocompleteInput';
 import { CustomerChangeReport } from '../reports/CustomerChangeReport';
 import { CustomerCreditReport } from '../reports/CustomerCreditReport';
+import { formatDisplayId } from '../../utils/idFormatters';
 
 interface Form3CustomerChangeProps {
   currentUser: Salesperson;
@@ -1327,12 +1328,15 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                             {idx + 1}
                           </td>
                           <td className="py-3 px-3">
-                            <div className="font-bold text-white flex items-center gap-1.5">
+                            <div className="font-bold text-white flex flex-wrap items-center gap-1.5">
                               <User className="w-3.5 h-3.5 text-purple-400 shrink-0" />
                               <span>{row.customerName}</span>
                               {row.customerId && (
-                                <span className="text-[10px] font-mono text-purple-300 bg-purple-950/60 px-1.5 py-0.5 rounded border border-purple-800/60">
-                                  {row.customerId}
+                                <span
+                                  title={row.customerId}
+                                  className="text-[10px] font-mono text-purple-300 bg-purple-950/60 px-1.5 py-0.5 rounded border border-purple-800/60 shrink-0"
+                                >
+                                  {formatDisplayId(row.customerId, 'customer')}
                                 </span>
                               )}
                             </div>
@@ -1476,12 +1480,15 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                             {idx + 1}
                           </td>
                           <td className="py-3 px-3">
-                            <div className="font-bold text-white flex items-center gap-1.5">
+                            <div className="font-bold text-white flex flex-wrap items-center gap-1.5">
                               <User className="w-3.5 h-3.5 text-orange-400 shrink-0" />
                               <span>{row.customerName}</span>
                               {row.customerId && (
-                                <span className="text-[10px] font-mono text-orange-300 bg-orange-950/60 px-1.5 py-0.5 rounded border border-orange-800/60">
-                                  {row.customerId}
+                                <span
+                                  title={row.customerId}
+                                  className="text-[10px] font-mono text-orange-300 bg-orange-950/60 px-1.5 py-0.5 rounded border border-orange-800/60 shrink-0"
+                                >
+                                  {formatDisplayId(row.customerId, 'customer')}
                                 </span>
                               )}
                             </div>
@@ -1965,8 +1972,8 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                         <td className="py-2 px-3 font-semibold text-white">
                           {log.customerName}{' '}
                           {log.customerId && (
-                            <span className="text-[10px] text-purple-300 font-mono-num">
-                              [{log.customerId}]
+                            <span title={log.customerId} className="text-[10px] text-purple-300 font-mono-num">
+                              [{formatDisplayId(log.customerId, 'customer')}]
                             </span>
                           )}
                         </td>
@@ -2067,8 +2074,8 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
                         <td className="py-2 px-3 font-semibold text-white">
                           {cr.customerName}{' '}
                           {cr.customerId && (
-                            <span className="text-[10px] text-orange-300 font-mono-num">
-                              [{cr.customerId}]
+                            <span title={cr.customerId} className="text-[10px] text-orange-300 font-mono-num">
+                              [{formatDisplayId(cr.customerId, 'customer')}]
                             </span>
                           )}
                         </td>
@@ -2330,7 +2337,7 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
               {voucherData.customerId && (
                 <div className="flex justify-between">
                   <span className="text-slate-600">Customer ID:</span>
-                  <span>{voucherData.customerId}</span>
+                  <span title={voucherData.customerId}>{formatDisplayId(voucherData.customerId, 'customer')}</span>
                 </div>
               )}
             </div>

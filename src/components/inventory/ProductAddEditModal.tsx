@@ -26,6 +26,7 @@ import {
   getSuppliers,
   getSessionUser,
   saveInventoryItem,
+  peekNextInventoryItemId,
   createPackagingVariant,
   recalculateItemPackagingRatio,
   recordPriceCostChangeAudit,
@@ -182,10 +183,8 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       setShelfLifeDays(initialItem.shelfLifeDays !== undefined ? initialItem.shelfLifeDays : '');
       setError('');
     } else {
-      // Auto-generate a sequential item ID
-      const allItems = getInventoryItems();
-      const nextNum = allItems.length + 1;
-      const genId = `PRD${String(nextNum).padStart(3, '0')}`;
+      // Auto-generate a collision-free continuous sequential item ID (I-BR-DEV4-SEQ)
+      const genId = peekNextInventoryItemId();
 
       setItemId(genId);
       setItemName(prefillName || '');

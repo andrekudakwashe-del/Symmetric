@@ -19,15 +19,17 @@ import {
   getOwnerOverrideAlerts,
   approveCashTransfer,
   receiveHqSafeTransfer,
-  getHqSafeAccount,
-  getBranchSafeAccount,
-  getClerkFloatAccount,
   getUnpaidGrvsForSafePayment,
   createCashTransferVoucher,
   DEFAULT_SUPPLIER_APPROVAL_THRESHOLD,
   MAX_CUSTODY_TRANSACTION_AMOUNT,
   UnpaidGrvRecord,
+  GrvLineItemDetail,
+  ensureDefaultCashAccounts,
 } from '../../services/cashCustodyService';
+import { BranchGrvPicker } from './BranchGrvPicker';
+import { AccountStatementModal, formatNativeAmount } from './AccountStatementModal';
+import { CommercialBanksModal } from './CommercialBanksModal';
 import {
   Building2,
   ShieldAlert,
@@ -73,7 +75,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
   const [accounts, setAccounts] = useState<CashAccount[]>([]);
   const [transfers, setTransfers] = useState<CashTransfer[]>([]);
   const [overrideAlerts, setOverrideAlerts] = useState<CashTransfer[]>([]);
-  const [summary, setSummary] = useState(getCustodyBalancesSummary());
+  const [summary, setSummary] = useState(() => getCustodyBalancesSummary('ALL'));
   const [unpaidGrvs, setUnpaidGrvs] = useState<UnpaidGrvRecord[]>([]);
   const [salespeople, setSalespeople] = useState<Salesperson[]>([]);
 
@@ -83,8 +85,9 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
   const [enteredPin, setEnteredPin] = useState('');
   const [notification, setNotification] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
-  // Commercial Bank Breakdown Modal
+  // Commercial Bank Breakdown Modal & Account Statement Modal (HQ Safe, Branch Safe, Clerk Float, Banks)
   const [isBankDetailsModalOpen, setIsBankDetailsModalOpen] = useState(false);
+  const [selectedLedgerAccountId, setSelectedLedgerAccountId] = useState<string | null>(null);
 
   // HQ Voucher Creation Modal
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -93,26 +96,28 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
   const [fromAccountId, setFromAccountId] = useState<string>('');
   const [toAccountId, setToAccountId] = useState<string>('');
   const [linkedGrvId, setLinkedGrvId] = useState<string>('');
+  const [linkedGrvItems, setLinkedGrvItems] = useState<GrvLineItemDetail[]>([]);
   const [recipientName, setRecipientName] = useState<string>('');
   const [selectedCashierId, setSelectedCashierId] = useState<string>('');
   const [bagSealNumber, setBagSealNumber] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
-  const [bankName, setBankName] = useState<string>('CBZ Bank Zimbabwe');
+  const [bankName, setBankName] = useState<string>('EcoCash Merchant Account');
   const [bankAccountNumber, setBankAccountNumber] = useState<string>('');
   const [grvSearchQuery, setGrvSearchQuery] = useState('');
 
   const govConfig = useMemo(() => getCashGovernanceConfig(), []);
 
   const reloadData = () => {
-    setAccounts(getCashAccounts());
-    setTransfers(getCashTransfers());
+    setAccounts(getCashAccounts('ALL'));
+    setTransfers(getCashTransfers('ALL'));
     setOverrideAlerts(getOwnerOverrideAlerts(7));
-    setSummary(getCustodyBalancesSummary());
+    setSummary(getCustodyBalancesSummary('ALL'));
     setUnpaidGrvs(getUnpaidGrvsForSafePayment());
     setSalespeople(getSalespeople());
   };
 
   useEffect(() => {
+    ensureDefaultCashAccounts();
     reloadData();
     const handleUpdate = () => reloadData();
     const unsub = subscribeToDatabase(handleUpdate);
@@ -153,10 +158,63 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
   }, [transfers]);
 
   const bankAccounts = useMemo(() => accounts.filter((a) => a.account_type === 'BANK_ACCOUNT'), [accounts]);
+  const mobileMoneyAccounts = useMemo(() => bankAccounts.filter((b) => Boolean(b.native_currency)), [bankAccounts]);
   const tillAccounts = useMemo(() => accounts.filter((a) => a.account_type === 'TILL'), [accounts]);
-  const hqSafe = useMemo(() => getHqSafeAccount(), [accounts]);
-  const branchSafe = useMemo(() => getBranchSafeAccount(), [accounts]);
-  const clerkFloat = useMemo(() => getClerkFloatAccount(), [accounts]);
+  const hqSafe = useMemo<CashAccount>(() => {
+    const match = accounts.find((a) => a.account_type === 'HQ_SAFE');
+    if (match) return match;
+    const comp = getCurrentCompanyId();
+    const nowIso = new Date().toISOString();
+    return {
+      account_id: `ACC-HQ-SAFE-${comp.slice(0, 6)}`,
+      company_id: comp,
+      branch_id: 'HQ',
+      target_branch_id: 'ALL',
+      account_type: 'HQ_SAFE',
+      account_name: 'HQ Central Vault Safe',
+      current_balance: 0,
+      currency: 'USD',
+      status: 'OPEN',
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+  }, [accounts]);
+
+  const branchSafe = useMemo<CashAccount>(() => {
+    const match = accounts.find((a) => a.account_type === 'SAFE');
+    if (match) return match;
+    const nowIso = new Date().toISOString();
+    return {
+      account_id: 'ACC-BR-SAFE-BR-MAIN',
+      company_id: getCurrentCompanyId(),
+      branch_id: 'BR-MAIN',
+      account_type: 'SAFE',
+      account_name: 'Branch Safe',
+      current_balance: 0,
+      currency: 'USD',
+      status: 'OPEN',
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+  }, [accounts]);
+
+  const clerkFloat = useMemo<CashAccount>(() => {
+    const match = accounts.find((a) => a.account_type === 'CLERK_FLOAT');
+    if (match) return match;
+    const nowIso = new Date().toISOString();
+    return {
+      account_id: 'ACC-CLERK-BR-MAIN',
+      company_id: getCurrentCompanyId(),
+      branch_id: 'BR-MAIN',
+      account_type: 'CLERK_FLOAT',
+      account_name: 'Accounts Clerk Petty Float',
+      current_balance: 0,
+      currency: 'USD',
+      status: 'OPEN',
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+  }, [accounts]);
 
   const getTillDisplayName = (tillAcc: CashAccount): string => {
     const matchCashier = salespeople.find(
@@ -215,12 +273,14 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
     setModalType(type);
     setAmount('');
     setLinkedGrvId('');
+    setLinkedGrvItems([]);
     setRecipientName('');
     setSelectedCashierId('');
     setBagSealNumber('');
     setNotes('');
     setGrvSearchQuery('');
-    setBankName(govConfig.bankList[0] || 'CBZ Bank Zimbabwe');
+    const defaultBank = bankAccounts[0];
+    setBankName(defaultBank?.account_name || govConfig.bankList[0] || 'EcoCash Merchant Account');
     setBankAccountNumber('');
 
     if (type === 'HQ_TO_BRANCH') {
@@ -282,13 +342,23 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
 
     try {
       const isBankTxn = modalType === 'BANK_DEPOSIT' || modalType === 'BANK_WITHDRAWAL';
+      const matchedBankAcc = isBankTxn
+        ? bankAccounts.find((b) => b.account_name === bankName)
+        : undefined;
       const created = createCashTransferVoucher({
         type: modalType,
-        from_account_id: fromAccountId || hqSafe.account_id,
-        to_account_id: toAccountId || undefined,
+        from_account_id:
+          modalType === 'BANK_WITHDRAWAL'
+            ? matchedBankAcc?.account_id || fromAccountId || hqSafe.account_id
+            : fromAccountId || hqSafe.account_id,
+        to_account_id:
+          modalType === 'BANK_DEPOSIT'
+            ? matchedBankAcc?.account_id || toAccountId || undefined
+            : toAccountId || undefined,
         amount: numAmount,
         initiator: currentUser,
         linked_grv_id: linkedGrvId || undefined,
+        linked_grv_items: linkedGrvItems.length > 0 ? linkedGrvItems : undefined,
         recipient_name: recipientName || undefined,
         bag_seal_number: bagSealNumber || undefined,
         notes: notes || undefined,
@@ -389,57 +459,91 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
           </div>
         </div>
 
-        {/* 5 Pillars of Cash Custody Breakdown */}
+        {/* 5 Pillars of Cash Custody Breakdown (Clickable Account Statements for HQ Safe, Branch Safe, Clerk Float & Banks) */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mt-5 pt-4 border-t border-indigo-500/20">
-          <div className="bg-slate-950/80 border border-indigo-500/30 rounded-2xl p-4 shadow-inner">
+          <div
+            onClick={() => setSelectedLedgerAccountId(hqSafe?.account_id || null)}
+            className="bg-slate-950/80 border border-indigo-500/30 hover:border-indigo-400/70 rounded-2xl p-4 shadow-inner cursor-pointer transition group active:scale-[0.99]"
+            title="Click to open HQ Central Vault Statement & Movements"
+          >
             <div className="flex items-center justify-between text-indigo-400 text-xs font-semibold">
               <span>HQ Central Vault</span>
-              <Building2 className="w-4 h-4" />
+              <Building2 className="w-4 h-4 group-hover:scale-110 transition" />
             </div>
             <div className="text-2xl font-black text-white font-mono tabular-nums mt-1.5">
-              ${summary.totalHqSafe.toFixed(2)}
+              ${summary.totalHqSafe.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </div>
-            <div className="text-[11px] text-slate-400 mt-1">Physical Master Safe</div>
+            <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
+              <span>Physical Master Safe</span>
+              <span className="text-indigo-400 group-hover:underline text-[10px] font-semibold">Ledger →</span>
+            </div>
           </div>
 
-          <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-4 shadow-inner">
+          <div
+            onClick={() => setSelectedLedgerAccountId(branchSafe?.account_id || null)}
+            className="bg-slate-950/80 border border-slate-800 hover:border-emerald-500/60 rounded-2xl p-4 shadow-inner cursor-pointer transition group active:scale-[0.99]"
+            title="Click to open Branch Safe Statement & Movements"
+          >
             <div className="flex items-center justify-between text-slate-400 text-xs font-semibold">
               <span>Branch Safes</span>
-              <Layers className="w-4 h-4" />
+              <Layers className="w-4 h-4 group-hover:scale-110 transition text-emerald-400" />
             </div>
             <div className="text-2xl font-black text-white font-mono tabular-nums mt-1.5">
-              ${summary.totalBranchSafes.toFixed(2)}
+              ${summary.totalBranchSafes.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </div>
-            <div className="text-[11px] text-slate-400 mt-1">Across branch locations</div>
+            <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
+              <span>Across branches</span>
+              <span className="text-emerald-400 group-hover:underline text-[10px] font-semibold">Ledger →</span>
+            </div>
           </div>
 
-          <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-4 shadow-inner">
+          <div
+            onClick={() => setSelectedLedgerAccountId(clerkFloat?.account_id || null)}
+            className="bg-slate-950/80 border border-slate-800 hover:border-emerald-500/60 rounded-2xl p-4 shadow-inner cursor-pointer transition group active:scale-[0.99]"
+            title="Click to open Clerk Float Statement & Movements"
+          >
             <div className="flex items-center justify-between text-emerald-400 text-xs font-semibold">
               <span>Clerk Floats</span>
-              <DollarSign className="w-4 h-4" />
+              <DollarSign className="w-4 h-4 group-hover:scale-110 transition" />
             </div>
             <div className="text-2xl font-black text-emerald-400 font-mono tabular-nums mt-1.5">
-              ${summary.totalClerkFloats.toFixed(2)}
+              ${summary.totalClerkFloats.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </div>
-            <div className="text-[11px] text-slate-400 mt-1">Petty cash in hand</div>
+            <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
+              <span>Petty cash in hand</span>
+              <span className="text-emerald-400 group-hover:underline text-[10px] font-semibold">Ledger →</span>
+            </div>
           </div>
 
           <div
             onClick={() => setIsBankDetailsModalOpen(true)}
-            className="bg-slate-950/80 border border-cyan-500/30 hover:border-cyan-500/60 rounded-2xl p-4 shadow-inner cursor-pointer transition group"
-            title="Click to view Commercial Bank balances & corporate accounts"
+            className="bg-slate-950/80 border border-cyan-500/30 hover:border-cyan-500/60 rounded-2xl p-4 shadow-inner cursor-pointer transition group active:scale-[0.99]"
+            title="Click to view Commercial Banks, EcoCash & ZiG balances and statements"
           >
             <div className="flex items-center justify-between text-cyan-400 text-xs font-semibold">
-              <span>Commercial Bank</span>
+              <span>Commercial Banks</span>
               <Landmark className="w-4 h-4 group-hover:scale-110 transition" />
             </div>
             <div className="text-2xl font-black text-cyan-300 font-mono tabular-nums mt-1.5">
-              ${summary.totalBankBalances.toFixed(2)}
+              ${summary.totalBankBalances.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </div>
-            <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
-              <span>{summary.bankBreakdown.length} Corporate Accounts</span>
-              <span className="text-cyan-400 underline text-[10px] font-semibold">View</span>
-            </div>
+            {mobileMoneyAccounts.length > 0 ? (
+              <div className="text-[10px] font-mono text-slate-300 mt-1 truncate" title={mobileMoneyAccounts.map((m) => formatNativeAmount(m.native_balance || 0, m.native_currency)).join(' · ')}>
+                {mobileMoneyAccounts.map((m, idx) => (
+                  <span key={m.account_id}>
+                    {idx > 0 ? ' · ' : ''}
+                    <span className={m.account_subtype === 'ECOCASH' || m.account_id.includes('ECOCASH') ? 'text-blue-300' : 'text-amber-300'}>
+                      {formatNativeAmount(m.native_balance || 0, m.native_currency)}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[11px] text-slate-400 mt-1 flex items-center justify-between">
+                <span>{summary.bankBreakdown.length} Accounts</span>
+                <span className="text-cyan-400 underline text-[10px] font-semibold">View</span>
+              </div>
+            )}
           </div>
 
           <div className="bg-slate-950/80 border border-purple-500/30 rounded-2xl p-4 shadow-inner">
@@ -448,7 +552,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
               <TrendingUp className="w-4 h-4" />
             </div>
             <div className="text-2xl font-black text-purple-400 font-mono tabular-nums mt-1.5">
-              ${summary.totalCashInTransit.toFixed(2)}
+              ${summary.totalCashInTransit.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </div>
             <div className="text-[11px] text-slate-400 mt-1">Sealed transit / courier</div>
           </div>
@@ -765,8 +869,8 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
 
       {/* HQ Voucher Creation Modal */}
       {isCreateModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
-          <div className="bg-slate-900 border border-indigo-500/40 rounded-3xl w-full max-w-lg p-5 sm:p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-sm animate-fadeIn">
+          <div className="bg-slate-900 border border-indigo-500/40 rounded-3xl w-full max-w-lg p-4 sm:p-6 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto overflow-x-hidden">
             <div className="flex items-center justify-between pb-3 border-b border-slate-800">
               <div className="flex items-center space-x-2.5">
                 <div className="w-10 h-10 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center border border-amber-500/40">
@@ -805,7 +909,7 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
                   placeholder="0.00"
                   className="w-full min-h-[44px] px-3.5 text-base font-mono font-bold bg-slate-950 border border-slate-800 rounded-xl text-white placeholder-slate-600 focus:outline-none focus:border-amber-500"
                 />
-                <div className="flex items-center gap-1.5 mt-2">
+                <div className="flex flex-wrap items-center gap-1.5 mt-2">
                   {[50, 100, 250, 500, 1000, 1500].map((val) => (
                     <button
                       key={val}
@@ -915,114 +1019,31 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
                 </div>
               )}
 
-              {/* Searchable GRVs for Supplier Payment */}
+              {/* Branch-Organized, Expandable GRVs for Supplier Payment */}
               {modalType === 'SUPPLIER_PAYMENT' && (
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <label className="block text-xs font-semibold text-slate-300">
-                      Linked Goods Received Voucher (GRV)
-                    </label>
-                    <span className="text-[10px] text-emerald-400 font-mono">
-                      {unpaidGrvs.length} Pending
-                    </span>
-                  </div>
-
-                  <div className="relative">
-                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                    <input
-                      type="text"
-                      value={grvSearchQuery}
-                      onChange={(e) => setGrvSearchQuery(e.target.value)}
-                      placeholder="🔍 Search GRV #, supplier name, invoice..."
-                      className="w-full pl-9 pr-3 py-2 text-xs bg-slate-950 border border-slate-800 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-amber-500 font-medium"
-                    />
-                  </div>
-
-                  {linkedGrvId && (
-                    <div className="p-2.5 bg-emerald-950/70 border border-emerald-500/50 rounded-xl flex items-center justify-between text-xs">
-                      <div>
-                        <span className="font-mono font-bold text-emerald-300">{linkedGrvId}</span>
-                        <span className="text-white ml-2">{recipientName}</span>
-                        <span className="text-emerald-400 font-mono font-bold ml-2">${amount}</span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setLinkedGrvId('');
-                          setAmount('');
-                          setRecipientName('');
-                        }}
-                        className="text-xs text-rose-400 hover:text-rose-300 underline"
-                      >
-                        Change GRV
-                      </button>
-                    </div>
-                  )}
-
-                  <div className="max-h-56 overflow-y-auto space-y-1.5 p-1 bg-slate-950/60 rounded-xl border border-slate-800">
-                    {(() => {
-                      const filteredModalGrvs = unpaidGrvs.filter((g) => {
-                        if (!grvSearchQuery.trim()) return true;
-                        const q = grvSearchQuery.toLowerCase().trim();
-                        return (
-                          g.grvNumber.toLowerCase().includes(q) ||
-                          (g.supplierName || '').toLowerCase().includes(q) ||
-                          (g.invoiceNo || '').toLowerCase().includes(q) ||
-                          (g.id || '').toLowerCase().includes(q) ||
-                          g.totalCost.toFixed(2).includes(q) ||
-                          g.totalCost.toString().includes(q)
-                        );
-                      });
-
-                      if (unpaidGrvs.length === 0) {
-                        return (
-                          <div className="p-3 text-center text-xs text-slate-500">
-                            No pending unpaid GRVs found (all deliveries settled).
-                          </div>
-                        );
-                      }
-
-                      if (filteredModalGrvs.length === 0) {
-                        return (
-                          <div className="p-3 text-center text-xs text-amber-300 bg-amber-950/30 rounded-lg border border-amber-800/40">
-                            No pending GRVs match "{grvSearchQuery}". ({unpaidGrvs.length} other pending delivery voucher{unpaidGrvs.length !== 1 ? 's' : ''} available).
-                          </div>
-                        );
-                      }
-
-                      return filteredModalGrvs.map((g, idx) => (
-                        <div
-                          key={`${g.id || g.grvNumber}-${idx}`}
-                          onClick={() => {
-                            setLinkedGrvId(g.grvNumber);
-                            setAmount(g.totalCost.toString());
-                            if (g.supplierName) setRecipientName(g.supplierName);
-                            setNotes(`HQ direct payment for GRV ${g.grvNumber} (Invoice: ${g.invoiceNo || 'Direct'}) - ${g.supplierName}`);
-                          }}
-                          className={`p-2 rounded-xl border text-left cursor-pointer transition flex items-center justify-between ${
-                            linkedGrvId === g.grvNumber
-                              ? 'bg-emerald-900/40 border-emerald-500 text-white'
-                              : 'bg-slate-900/80 border-slate-800/80 hover:bg-slate-800/80 text-slate-300'
-                          }`}
-                        >
-                          <div>
-                            <div className="flex items-center space-x-2">
-                              <span className="font-mono font-bold text-emerald-400 text-xs">{g.grvNumber}</span>
-                              <span className="text-xs text-white font-semibold">{g.supplierName}</span>
-                            </div>
-                            <div className="text-[10px] text-slate-400 mt-0.5">
-                              {g.invoiceNo ? `Inv: ${g.invoiceNo}` : 'Direct delivery'} · {g.date}
-                            </div>
-                          </div>
-                          <div className="text-right">
-                            <div className="font-mono font-bold text-white text-xs">${g.totalCost.toFixed(2)}</div>
-                            <span className="text-[10px] text-emerald-400 font-medium underline">Select</span>
-                          </div>
-                        </div>
-                      ));
-                    })()}
-                  </div>
-                </div>
+                <BranchGrvPicker
+                  unpaidGrvs={unpaidGrvs}
+                  selectedGrvId={linkedGrvId}
+                  selectedSupplierName={recipientName}
+                  selectedAmount={amount}
+                  defaultShowAllBranches={true}
+                  accentColor="amber"
+                  onSelectGrv={(g) => {
+                    setLinkedGrvId(g.grvNumber);
+                    setLinkedGrvItems(g.items || []);
+                    setAmount(g.totalCost.toString());
+                    if (g.supplierName) setRecipientName(g.supplierName);
+                    setNotes(
+                      `HQ direct payment for ${g.grvNumber} (${g.invoiceNo ? `Invoice: ${g.invoiceNo}` : 'Direct'} · ${g.branchName}) - ${g.supplierName}`
+                    );
+                  }}
+                  onClearSelection={() => {
+                    setLinkedGrvId('');
+                    setLinkedGrvItems([]);
+                    setAmount('');
+                    setRecipientName('');
+                  }}
+                />
               )}
 
               {/* Commercial Bank selection */}
@@ -1109,112 +1130,28 @@ export const OwnerHqCommandCenter: React.FC<OwnerHqCommandCenterProps> = ({
         </div>
       )}
 
-      {/* 🏦 Commercial Bank Accounts & Corporate Balances Modal */}
-      {isBankDetailsModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn">
-          <div className="bg-slate-900 border border-cyan-500/40 rounded-3xl w-full max-w-lg p-5 sm:p-6 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-              <div className="flex items-center space-x-2.5">
-                <div className="w-10 h-10 rounded-2xl bg-cyan-600/20 text-cyan-400 flex items-center justify-center border border-cyan-500/40">
-                  <Landmark className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-white">Commercial Bank Accounts & Live Balances</h3>
-                  <p className="text-[11px] text-slate-400">HQ corporate banking balances & settlement tracking</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setIsBankDetailsModalOpen(false)}
-                className="p-1.5 hover:bg-slate-800 rounded-xl text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+      {/* 🏦 Commercial Banks & Electronic Settlement Accounts Modal (Shared with Branch Safe) */}
+      <CommercialBanksModal
+        isOpen={isBankDetailsModalOpen}
+        bankAccounts={bankAccounts}
+        totalBankBalance={summary.totalBankBalances}
+        title="HQ Commercial Banks & Electronic Settlement Accounts"
+        subtitle="Combined USD base balances with EcoCash & ZiG native totals"
+        onClose={() => setIsBankDetailsModalOpen(false)}
+        onOpenStatement={(accId) => setSelectedLedgerAccountId(accId)}
+        onDeposit={() => openHqActionModal('BANK_DEPOSIT')}
+        onWithdraw={() => openHqActionModal('BANK_WITHDRAWAL')}
+        onBankCreated={reloadData}
+      />
 
-            {/* Total Corporate Bank Balance */}
-            <div className="bg-slate-950/80 border border-cyan-500/30 rounded-2xl p-4 text-center">
-              <div className="text-[11px] uppercase tracking-wider text-cyan-400 font-bold font-mono">
-                Total Live Commercial Bank Balance
-              </div>
-              <div className="text-3xl font-black text-white font-mono tabular-nums mt-1">
-                ${summary.totalBankBalances.toFixed(2)}
-              </div>
-              <div className="text-[10px] text-slate-400 mt-1">
-                Synchronized across all corporate bank accounts and USD Bank wallet
-              </div>
-            </div>
-
-            {/* Accounts Breakdown List */}
-            <div className="space-y-2.5">
-              <div className="text-xs font-semibold text-slate-300">Registered Commercial Accounts</div>
-              {bankAccounts.length === 0 ? (
-                <div className="p-4 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-2xl">
-                  No bank accounts configured.
-                </div>
-              ) : (
-                bankAccounts.map((b) => (
-                  <div
-                    key={b.account_id}
-                    className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-3"
-                  >
-                    <div>
-                      <div className="text-xs font-bold text-white flex items-center space-x-1.5">
-                        <Landmark className="w-3.5 h-3.5 text-cyan-400" />
-                        <span>{b.account_name}</span>
-                      </div>
-                      <div className="text-[10px] text-slate-500 font-mono mt-0.5">
-                        Account ID: {b.account_id} · Currency: {b.currency}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-base font-bold font-mono text-cyan-400">
-                        ${(b.current_balance || 0).toFixed(2)}
-                      </div>
-                      <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-800/40 font-mono">
-                        Active Account
-                      </span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-
-            {/* Explanation of Cash Movements */}
-            <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 text-[11px] text-slate-400 space-y-1">
-              <div className="font-semibold text-slate-300">💡 Where does the money go?</div>
-              <div>• <strong>Bank Deposit:</strong> Physical cash moves from HQ Central Vault / Branch Safe ➔ Commercial Bank. Safe decreases, Bank Balance increases.</div>
-              <div>• <strong>Bank Withdrawal:</strong> Funds move from Commercial Bank ➔ Vault to replenish physical cash on hand. Bank Balance decreases, Safe increases.</div>
-            </div>
-
-            {/* Action buttons */}
-            <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-800">
-              <button
-                type="button"
-                onClick={() => {
-                  setIsBankDetailsModalOpen(false);
-                  openHqActionModal('BANK_DEPOSIT');
-                }}
-                className="flex-1 py-2.5 px-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition flex items-center justify-center space-x-1.5 shadow-md"
-              >
-                <PlusCircle className="w-3.5 h-3.5" />
-                <span>Deposit Cash to Bank</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setIsBankDetailsModalOpen(false);
-                  openHqActionModal('BANK_WITHDRAWAL');
-                }}
-                className="flex-1 py-2.5 px-3 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition flex items-center justify-center space-x-1.5 shadow-md"
-              >
-                <Landmark className="w-3.5 h-3.5" />
-                <span>Withdraw to HQ Vault</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* 📜 Unified Account Statement & Detailed Movements Modal (HQ Safe, Branch Safe, Clerk Float, EcoCash, ZiG, Banks) */}
+      <AccountStatementModal
+        accountId={selectedLedgerAccountId}
+        accounts={accounts}
+        branchId="ALL"
+        onSelectAccount={(id) => setSelectedLedgerAccountId(id)}
+        onClose={() => setSelectedLedgerAccountId(null)}
+      />
 
       {/* Owner PIN Verification Modal */}
       {selectedTransfer && (

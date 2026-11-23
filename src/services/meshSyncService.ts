@@ -125,6 +125,7 @@ import {
   getAllCashTransfers,
   generateInvoiceNumber,
   getNextInvoiceId,
+  getDeviceId,
   markSaleAsSynced,
   markRecordsCloudSynced,
   syncCasualWorkersFromHub,
@@ -150,6 +151,8 @@ import {
   onBranchChanged,
   onCashAccountChanged,
   onCashTransferChanged,
+  onElectronicSettlementChanged,
+  getElectronicSettlements,
   onExpenseChanged,
   onDirectGrvChanged,
   getPermissionsList,
@@ -1170,6 +1173,11 @@ class MeshSyncManager {
       this.broadcastCashTransfer(transfer);
     });
 
+    // Auto-hook into Electronic Settlements (EcoCash & ZiG confirmations): broadcast via SyncCore to Local Hub, Cloud & mesh
+    onElectronicSettlementChanged((settlement: any) => {
+      this.broadcastElectronicSettlement(settlement);
+    });
+
     // Auto-hook into Cash Drawer Movements: broadcast in real-time so cash balances across devices
     onCashMovementCreated((movement: CashMovement) => {
       this.broadcastCashMovement(movement);
@@ -1304,11 +1312,7 @@ class MeshSyncManager {
       localStorage.setItem(PREFS_DEVICE_KEY, deviceName);
     }
 
-    let deviceId = localStorage.getItem(PREFS_DEVICE_ID_KEY);
-    if (!deviceId) {
-      deviceId = 'DEV-' + Math.random().toString(36).substring(2, 8).toUpperCase();
-      localStorage.setItem(PREFS_DEVICE_ID_KEY, deviceId);
-    }
+    const deviceId = getDeviceId();
 
     return {
       branchCode,
@@ -6579,6 +6583,7 @@ class MeshSyncManager {
     const deltaExpenses = filterSince(getAllExpenses());
     const deltaCashAccounts = filterSince(getAllCashAccounts());
     const deltaCashTransfers = filterSince(getAllCashTransfers());
+    const deltaElectronicSettlements = filterSince(getElectronicSettlements('ALL'));
     const localMc = getMultiCurrencyConfig();
     const localMcTime = getMultiCurrencyUpdatedAt(localMc);
     const includeMc = localMcTime > 0 && (localMcTime >= sinceTime || sinceTime <= 0);
@@ -6588,6 +6593,7 @@ class MeshSyncManager {
       expenses: deltaExpenses,
       cashAccounts: deltaCashAccounts,
       cashTransfers: deltaCashTransfers,
+      electronicSettlements: deltaElectronicSettlements,
       ...(includeMc ? { multiCurrencyConfig: localMc } : {}),
     };
 
@@ -6605,6 +6611,7 @@ class MeshSyncManager {
       deltaExpenses.length +
       deltaCashAccounts.length +
       deltaCashTransfers.length +
+      deltaElectronicSettlements.length +
       (delta.internalConsumptions?.length || 0);
 
     const responsePacketId = `CRS-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
@@ -8045,6 +8052,7 @@ class MeshSyncManager {
       typeUpper === 'BRANCH_TO_HQ' ||
       typeUpper === 'BANK_DEPOSIT' ||
       typeUpper === 'BANK_WITHDRAWAL' ||
+      typeUpper === 'ELECTRONIC_SETTLEMENT' ||
       typeUpper === 'CAPITAL_INFUSION' ||
       typeUpper === 'SUPPLIER_PAYMENT' ||
       typeUpper === 'THIRD_PARTY_PAYOUT';
@@ -8072,6 +8080,51 @@ class MeshSyncManager {
       },
     });
     this.addLog('BROADCAST', `Cash Transfer ${tId} (${cleanTransfer.status || 'NEW'}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  /**
+   * Broadcast an Electronic Settlement (EcoCash / ZiG Form 4 confirmation) via SyncCore
+   * to Local Hub, active Cloud backend (GAS / Supabase / MongoDB), and mesh peers.
+   */
+  public broadcastElectronicSettlement(settlement: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!settlement) return;
+    if (!isReconPush && (settlement.fromMesh || settlement.fromSync)) return;
+
+    const sId = String(settlement.id || `SETTLE-${settlement.date}-${settlement.branchId || this.config.branchId || 'BR-MAIN'}`).trim();
+    if (!sId) return;
+
+    const updatedAt = settlement.updatedAt || Date.now();
+    const lastUpdated = settlement.lastUpdated || new Date(updatedAt).toISOString();
+    const cleanSettlement: any = {
+      ...settlement,
+      id: sId,
+      companyId: settlement.companyId || settlement.company_id || this.config.companyId,
+      company_id: settlement.company_id || settlement.companyId || this.config.companyId,
+      branchId: settlement.branchId || settlement.branch_id || this.config.branchId || 'BR-MAIN',
+      branch_id: settlement.branch_id || settlement.branchId || this.config.branchId || 'BR-MAIN',
+      target_branch_id: 'ALL',
+      updatedAt,
+      lastUpdated,
+    };
+    delete cleanSettlement.fromMesh;
+    delete cleanSettlement.fromSync;
+
+    const packetId = `STL-PKT-${sId}-${updatedAt}`;
+    void this.dispatchEnvelope('electronic_settlement', sId, cleanSettlement, {
+      action: 'UPSERT',
+      targetBranchId: 'ALL',
+      updatedAt,
+      topicSuffix: 'electronic_settlement',
+      packetId,
+      meta: {
+        wireAction: 'SETTLEMENT_SYNC',
+        isReconPush,
+      },
+    });
+    this.addLog('BROADCAST', `Electronic Settlement ${sId} (${cleanSettlement.date}) broadcasted to SyncCore & mesh`, this.config.deviceName);
     this.notifyPeerSubscribers();
   }
 

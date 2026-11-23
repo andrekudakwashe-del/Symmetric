@@ -5,6 +5,7 @@ import {
   CashMovementStatus,
   CashMovementSource,
 } from '../types';
+import { extractInvoiceRef } from '../utils/idFormatters';
 
 export type { CashMovement };
 
@@ -69,14 +70,12 @@ export const getShiftId = (staffId: string, date: string, branchId?: string): st
 
 const normLedgerTenant = (compId?: string | null): string => {
   const c = String(compId || '').trim().toUpperCase();
-  if (!c || c === 'COMP-001' || c === 'COMP-MASTER') return 'COMP-001';
+  if (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT') return 'COMP-001';
   return c;
 };
 
 const isCashCompanyInScope = (recordCompanyId?: string | null, targetCompanyId?: string | null): boolean => {
-  if (!recordCompanyId || !targetCompanyId) return true;
-  const tgt = String(targetCompanyId).trim().toUpperCase();
-  if (tgt === 'COMP-MASTER') return true;
+  if (!targetCompanyId) return true;
   return normLedgerTenant(recordCompanyId) === normLedgerTenant(targetCompanyId);
 };
 
@@ -605,7 +604,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
 
   all.forEach((m) => {
     if (m.type === 'credit_upfront_deposit' && matchesShift(m, shiftId, targetBranch)) {
-      const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+      const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
       if (invMatch) seenCreditDepositInvoices.add(invMatch);
     }
   });
@@ -636,7 +635,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
     if (m.type === 'change_received') {
       const isManualRef = Boolean(m.notes?.includes('[Manual Change]') || m.sourceRef?.startsWith('MAN-CHG-'));
       if (!isManualRef && (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #'))) {
-        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
         if (invMatch) {
           if (seenChangeReceivedInvoices.has(invMatch)) return;
           seenChangeReceivedInvoices.add(invMatch);
@@ -646,7 +645,7 @@ export const computeDrawerBalance = (shiftId: string, currency: string = 'USD', 
 
     // Prevent double-counting credit upfront deposit if logged in both POS and Form 3
     if (m.type === 'credit_cash_payment') {
-      const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+      const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
       const isPosDepositPayment = m.notes?.includes('deposit paid') || m.notes?.includes('POS Credit Sale Invoice');
       if (invMatch && isPosDepositPayment && seenCreditDepositInvoices.has(invMatch)) {
         return;
@@ -867,7 +866,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
 
   all.forEach((m) => {
     if (m.type === 'credit_upfront_deposit' && matchesShift(m, shiftId)) {
-      const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+      const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
       if (invMatch) seenCreditDepositInvoices.add(invMatch);
     }
   });
@@ -926,7 +925,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
     if (m.type === 'change_received') {
       const isManualRef = Boolean(m.notes?.includes('[Manual Change]') || m.sourceRef?.startsWith('MAN-CHG-'));
       if (!isManualRef && (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #'))) {
-        const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+        const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
         if (invMatch) {
           if (seenChangeReceivedInvoices.has(invMatch)) return;
           seenChangeReceivedInvoices.add(invMatch);
@@ -936,7 +935,7 @@ export const getShiftLedgerBreakdown = (shiftId: string, currency: string = 'USD
 
     // Prevent double-counting credit upfront deposit if logged in both POS and Form 3
     if (m.type === 'credit_cash_payment') {
-      const invMatch = (m.sourceRef?.match(/INV-[A-Za-z0-9-]+/i) || m.notes?.match(/INV-[A-Za-z0-9-]+/i))?.[0]?.toUpperCase();
+      const invMatch = extractInvoiceRef(m.sourceRef, m.notes);
       const isPosDepositPayment = m.notes?.includes('deposit paid') || m.notes?.includes('POS Credit Sale Invoice');
       if (invMatch && isPosDepositPayment && seenCreditDepositInvoices.has(invMatch)) {
         return;

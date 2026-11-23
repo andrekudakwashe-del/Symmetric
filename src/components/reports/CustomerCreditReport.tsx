@@ -9,6 +9,7 @@ import {
   getTodayDateString,
   subscribeToDatabase,
 } from '../../db/roomDatabase';
+import { formatDisplayId } from '../../utils/idFormatters';
 import {
   CreditCard,
   Search,
@@ -673,13 +674,18 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                         isOwing ? 'bg-amber-950/5' : ''
                       }`}
                     >
-                      {/* 1. Customer ID & Name */}
+                      {/* 1. Customer Name & ID */}
                       <td className="py-3 px-3">
-                        <div className="flex items-center space-x-2">
-                          <span className="font-mono-num text-[11px] text-amber-300 bg-amber-950 border border-amber-800/60 px-2 py-0.5 rounded-lg font-bold shadow-sm shrink-0">
-                            {item.customerId}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-bold text-white text-xs sm:text-sm leading-tight">
+                            {item.customerName}
                           </span>
-                          <span className="font-bold text-white text-xs">{item.customerName}</span>
+                          <span
+                            title={item.customerId}
+                            className="font-mono-num text-[10px] text-amber-300 bg-amber-950 border border-amber-800/60 px-1.5 py-0.5 rounded-md font-bold shadow-sm shrink-0"
+                          >
+                            {formatDisplayId(item.customerId, 'customer')}
+                          </span>
                         </div>
                         <div className="text-[11px] text-slate-400 mt-1 flex items-center space-x-2 flex-wrap">
                           {item.phone && (
@@ -859,10 +865,13 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
             <form onSubmit={handleConfirmPayment} className="space-y-4">
               <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 space-y-1.5">
                 <div className="text-xs text-slate-400 font-medium">Customer:</div>
-                <div className="text-sm font-bold text-white flex items-center justify-between">
-                  <span>{paymentModalItem.customerName}</span>
-                  <span className="font-mono-num text-xs bg-amber-950 text-amber-300 px-2 py-0.5 rounded font-bold">
-                    {paymentModalItem.customerId}
+                <div className="text-sm font-bold text-white flex items-center justify-between gap-2">
+                  <span className="truncate">{paymentModalItem.customerName}</span>
+                  <span
+                    title={paymentModalItem.customerId}
+                    className="font-mono-num text-xs bg-amber-950 text-amber-300 px-2 py-0.5 rounded font-bold shrink-0"
+                  >
+                    {formatDisplayId(paymentModalItem.customerId, 'customer')}
                   </span>
                 </div>
                 <div className="text-xs text-slate-400 pt-1 flex items-center justify-between">
@@ -981,12 +990,15 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
           <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 sm:p-6 w-full max-w-2xl max-h-[85vh] overflow-y-auto shadow-2xl space-y-4">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div>
-                <div className="flex items-center space-x-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <h3 className="font-bold text-white text-base">
                     Credit Ledger: {selectedItemForHistory.customerName}
                   </h3>
-                  <span className="font-mono-num text-xs bg-amber-950 text-amber-300 px-2 py-0.5 rounded font-bold">
-                    {selectedItemForHistory.customerId}
+                  <span
+                    title={selectedItemForHistory.customerId}
+                    className="font-mono-num text-xs bg-amber-950 text-amber-300 px-2 py-0.5 rounded font-bold shrink-0"
+                  >
+                    {formatDisplayId(selectedItemForHistory.customerId, 'customer')}
                   </span>
                 </div>
                 <p className="text-xs text-slate-400 mt-0.5">

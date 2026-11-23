@@ -705,10 +705,14 @@ export interface CashAccount {
   branch_id?: string;            // undefined or 'HQ' for company-wide safe
   account_type: CashAccountType;
   account_name: string;          // e.g. "Main Vault Safe", "Till #1 (Alice)"
+  account_subtype?: 'ECOCASH' | 'ZIG' | 'COMMERCIAL_BANK';
+  bank_account_number?: string;
   holder_user_id?: string;       // ID of staff currently in physical custody
   holder_user_name?: string;     // Denormalized for display
   current_balance: number;       // Base USD currency
   currency: string;              // 'USD'
+  native_currency?: string;      // e.g. 'EcoCash', 'ZiG', 'ZAR'
+  native_balance?: number;       // Native mobile money / local currency balance
   status: CashAccountStatus;
   last_reconciled_at?: string;
   created_at: string;
@@ -727,6 +731,7 @@ export type CashTransferType =
   | 'SUPPLIER_PAYMENT'      // Safe / HQ Safe -> Supplier
   | 'BANK_DEPOSIT'          // Safe -> In Transit -> Bank Account
   | 'BANK_WITHDRAWAL'       // Bank Account -> In Transit -> Safe (Safe cash replenishment)
+  | 'ELECTRONIC_SETTLEMENT' // Form 4 Confirmed EcoCash / ZiG Settlement -> Custody Account
   | 'THIRD_PARTY_PAYOUT'    // Clerk Float -> In Transit -> Expense
   | 'CAPITAL_INFUSION';     // Owner / HQ Injection -> Branch Safe (Branch opening float)
 
@@ -746,12 +751,17 @@ export interface CashTransfer {
   transfer_id: string;            // e.g. "TRF-20261016-0042"
   company_id: string;
   branch_id: string;
+  branch_name?: string;           // Human-readable branch name for cross-branch statements
   target_branch_id?: string;      // 'ALL' for company-wide / HQ / inter-branch transfers
   type: CashTransferType;
   from_account_id: string;
   to_account_id?: string;        // Optional for supplier or bank deposits
-  amount: number;
-  currency: string;
+  amount: number;                 // Base USD currency amount
+  currency: string;               // 'USD'
+  native_currency?: string;       // e.g. 'EcoCash', 'ZiG'
+  native_amount?: number;         // Original mobile money / local currency amount
+  exchange_rate?: number;         // Rate used at confirmation time (native per 1 base USD)
+  batch_ref?: string;             // EcoCash merchant batch / ZiG POS terminal batch ref
   status: CashTransferStatus;
   updatedAt?: number;
   lastUpdated?: string;
@@ -777,13 +787,21 @@ export interface CashTransfer {
   
   // Links & Metadata
   linked_grv_id?: string;         // If paying a supplier
+  linked_grv_items?: Array<{
+    productName: string;
+    qty: number;
+    unit?: string;
+    unitCost: number;
+    lineTotal: number;
+  }>;
+  denominations?: Record<string, number>;
   recipient_name?: string;        // e.g. "Gardener Joe"
   receipt_image_url?: string;     // Proof upload (bank deposit slip, receipt)
   bag_seal_number?: string;       // For branch-to-HQ transit
   notes?: string;
 
   // Bank details (for deposits and withdrawals)
-  bank_name?: string;             // e.g. "CBZ Bank", "Stanbic Bank", "Ecobank", "CABS"
+  bank_name?: string;             // e.g. "EcoCash Merchant Account", "ZiG Bank / Swipe Account", "CBZ Bank"
   bank_account_number?: string;
   
   // Aborted / Returned Transit handling

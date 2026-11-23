@@ -910,6 +910,7 @@ export class LocalHubAdapter implements SyncAdapter {
           typeUpper === 'BRANCH_TO_HQ' ||
           typeUpper === 'BANK_DEPOSIT' ||
           typeUpper === 'BANK_WITHDRAWAL' ||
+          typeUpper === 'ELECTRONIC_SETTLEMENT' ||
           typeUpper === 'CAPITAL_INFUSION' ||
           typeUpper === 'SUPPLIER_PAYMENT' ||
           typeUpper === 'THIRD_PARTY_PAYOUT';
@@ -922,6 +923,16 @@ export class LocalHubAdapter implements SyncAdapter {
           payload: d,
         };
       }
+
+      case 'electronic_settlement':
+        return {
+          ...base,
+          type: 'SETTLEMENT_SYNC',
+          action: 'SETTLEMENT_SYNC',
+          target_branch_id: 'ALL',
+          settlement: d,
+          payload: d,
+        };
 
       case 'cash_movement':
         return {

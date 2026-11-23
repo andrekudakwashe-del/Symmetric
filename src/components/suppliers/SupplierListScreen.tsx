@@ -21,6 +21,7 @@ import {
   Upload,
 } from 'lucide-react';
 import { Supplier, SupplierInvoiceVoucher, Salesperson } from '../../types';
+import { formatDisplayId } from '../../utils/idFormatters';
 import {
   getSuppliers,
   getSupplierStats,
@@ -313,8 +314,8 @@ export const SupplierListScreen: React.FC<SupplierListScreenProps> = ({
                             {supplier.name}
                           </h3>
                         </div>
-                        <span className="text-[10px] font-mono text-slate-400 block mt-0.5">
-                          {supplier.supplierId} • {supplier.category}
+                        <span title={supplier.supplierId} className="text-[10px] font-mono text-slate-400 block mt-0.5">
+                          {formatDisplayId(supplier.supplierId, 'supplier')} • {supplier.category}
                         </span>
                       </div>
                       <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-300 border border-slate-700">

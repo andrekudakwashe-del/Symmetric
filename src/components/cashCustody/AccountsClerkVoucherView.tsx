@@ -29,8 +29,6 @@ import {
   DEFAULT_SUPPLIER_APPROVAL_THRESHOLD,
   MAX_CUSTODY_TRANSACTION_AMOUNT,
   isSettledTransferStatus,
-  getClerkFloatAccount,
-  getBranchSafeAccount,
   getUnpaidGrvsForSafePayment,
   UnpaidGrvRecord,
   returnTransitToSafe,
@@ -38,9 +36,11 @@ import {
   getInTransitTotal,
   consolidateClerkFloatToSafe,
   recordCustodialExpense,
-  getAccountTransactionLedger,
-  AccountLedgerEntry,
+  GrvLineItemDetail,
 } from '../../services/cashCustodyService';
+import { BranchGrvPicker } from './BranchGrvPicker';
+import { AccountStatementModal, formatNativeAmount } from './AccountStatementModal';
+import { CommercialBanksModal } from './CommercialBanksModal';
 import { toTimeStringSafe } from '../../utils/dateUtils';
 import {
   PlusCircle,
@@ -113,12 +113,13 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
   const [fromAccountId, setFromAccountId] = useState<string>('');
   const [toAccountId, setToAccountId] = useState<string>('');
   const [linkedGrvId, setLinkedGrvId] = useState<string>('');
+  const [linkedGrvItems, setLinkedGrvItems] = useState<GrvLineItemDetail[]>([]);
   const [recipientName, setRecipientName] = useState<string>('');
   const [selectedCashierId, setSelectedCashierId] = useState<string>('');
   const [bagSealNumber, setBagSealNumber] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
   const [receiptImage, setReceiptImage] = useState<string>('');
-  const [bankName, setBankName] = useState<string>('CBZ Bank Zimbabwe');
+  const [bankName, setBankName] = useState<string>('EcoCash Merchant Account');
   const [bankAccountNumber, setBankAccountNumber] = useState<string>('');
 
   // PIN verification dialog
@@ -129,8 +130,6 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
 
   // Account Statement & Ledger Modal
   const [selectedLedgerAccountId, setSelectedLedgerAccountId] = useState<string | null>(null);
-  const [ledgerDateFilter, setLedgerDateFilter] = useState<'all' | 'today' | '7days' | '30days'>('all');
-  const [ledgerSearchQuery, setLedgerSearchQuery] = useState('');
 
   // Custodial Expense Modal (Safe Vault / Clerk Float)
   const [isCustodialExpenseModalOpen, setIsCustodialExpenseModalOpen] = useState(false);
@@ -150,7 +149,6 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
     (currentUser.role as string) === 'super_admin';
 
   const reloadData = () => {
-    ensureDefaultCashAccounts();
     setAccounts(getCashAccounts());
     setTransfers(getCashTransfers());
     setGrvs(getDirectGrvs());
@@ -160,6 +158,7 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
   };
 
   useEffect(() => {
+    ensureDefaultCashAccounts();
     reloadData();
     const handleUpdate = () => {
       reloadData();
@@ -209,9 +208,49 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
     setTimeout(() => setFeedbackMessage(null), 4000);
   };
 
-  // Safe, Clerk, and Transit balances
-  const branchSafe = useMemo(() => getBranchSafeAccount(), [accounts]);
-  const clerkFloat = useMemo(() => getClerkFloatAccount(), [accounts]);
+  // Safe, Clerk, and Transit balances (pure derivation from state — never write to DB during render!)
+  const branchSafe = useMemo<CashAccount>(() => {
+    const targetBranch = getCurrentBranchId();
+    const match =
+      accounts.find((a) => a.account_type === 'SAFE' && (a.branch_id === targetBranch || targetBranch === 'ALL')) ||
+      accounts.find((a) => a.account_type === 'SAFE');
+    if (match) return match;
+    const nowIso = new Date().toISOString();
+    return {
+      account_id: `ACC-BR-SAFE-${targetBranch || 'BR-MAIN'}`,
+      company_id: getCurrentCompanyId(),
+      branch_id: targetBranch || 'BR-MAIN',
+      account_type: 'SAFE',
+      account_name: 'Branch Safe',
+      current_balance: 0,
+      currency: 'USD',
+      status: 'OPEN',
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+  }, [accounts]);
+
+  const clerkFloat = useMemo<CashAccount>(() => {
+    const targetBranch = getCurrentBranchId();
+    const match =
+      accounts.find((a) => a.account_type === 'CLERK_FLOAT' && (a.branch_id === targetBranch || targetBranch === 'ALL')) ||
+      accounts.find((a) => a.account_type === 'CLERK_FLOAT');
+    if (match) return match;
+    const nowIso = new Date().toISOString();
+    return {
+      account_id: `ACC-CLERK-${targetBranch || 'BR-MAIN'}`,
+      company_id: getCurrentCompanyId(),
+      branch_id: targetBranch || 'BR-MAIN',
+      account_type: 'CLERK_FLOAT',
+      account_name: 'Accounts Clerk Petty Float',
+      current_balance: 0,
+      currency: 'USD',
+      status: 'OPEN',
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+  }, [accounts]);
+
   const inTransitTotal = useMemo(() => getInTransitTotal(), [transfers]);
 
   // Bank & Till Accounts breakdown
@@ -222,76 +261,10 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
     [bankAccounts]
   );
 
-  // Computed Account Statement & Ledger for Safe, Clerk Float, Bank, etc.
-  const ledgerData = useMemo(() => {
-    if (!selectedLedgerAccountId) return null;
-    const raw = getAccountTransactionLedger(selectedLedgerAccountId, currentUser?.branchId);
-    const now = new Date();
-    const todayStr = now.toISOString().slice(0, 10);
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 86400000).toISOString().slice(0, 10);
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 86400000).toISOString().slice(0, 10);
-
-    let list = raw.entries;
-    if (ledgerDateFilter === 'today') {
-      list = raw.entries.filter((e) => e.date === todayStr);
-    } else if (ledgerDateFilter === '7days') {
-      list = raw.entries.filter((e) => e.date >= sevenDaysAgo);
-    } else if (ledgerDateFilter === '30days') {
-      list = raw.entries.filter((e) => e.date >= thirtyDaysAgo);
-    }
-
-    if (ledgerSearchQuery.trim()) {
-      const q = ledgerSearchQuery.toLowerCase().trim();
-      list = list.filter(
-        (e) =>
-          e.transferId.toLowerCase().includes(q) ||
-          e.description.toLowerCase().includes(q) ||
-          e.recipientOrSource.toLowerCase().includes(q) ||
-          e.authorizedBy.toLowerCase().includes(q) ||
-          e.reference.toLowerCase().includes(q)
-      );
-    }
-
-    const periodIn = list.reduce((s, e) => s + e.inAmount, 0);
-    const periodOut = list.reduce((s, e) => s + e.outAmount, 0);
-
-    return {
-      ...raw,
-      filteredEntries: list,
-      periodIn: Math.round(periodIn * 100) / 100,
-      periodOut: Math.round(periodOut * 100) / 100,
-    };
-  }, [selectedLedgerAccountId, transfers, accounts, ledgerDateFilter, ledgerSearchQuery, currentUser?.branchId]);
-
-  // Export Account Statement to CSV
-  const handleExportLedgerCsv = () => {
-    if (!ledgerData || !ledgerData.account) return;
-    const acc = ledgerData.account;
-    const rows = ledgerData.filteredEntries.map((e) => [
-      `"${e.date} ${toTimeStringSafe(e.timestamp)}"`,
-      `"${e.transferId}"`,
-      `"${(e.description || '').replace(/"/g, '""')}"`,
-      `"${(e.recipientOrSource || '').replace(/"/g, '""')}"`,
-      e.inAmount > 0 ? e.inAmount.toFixed(2) : '',
-      e.outAmount > 0 ? e.outAmount.toFixed(2) : '',
-      e.runningBalance.toFixed(2),
-      `"${e.authorizedBy || ''}"`,
-      `"${e.status || ''}"`,
-    ]);
-
-    const header = ['Date & Time', 'Transfer ID', 'Description', 'Counterparty / Payee', 'In (+)', 'Out (-)', 'Running Balance', 'Authorized By', 'Status'];
-    const csvContent = [header.join(','), ...rows.map((r) => r.join(','))].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', `${acc.account_name.replace(/\s+/g, '_')}_Statement_${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-    showToast(`Exported statement for ${acc.account_name}`);
-  };
+  const mobileMoneyAccounts = useMemo(
+    () => bankAccounts.filter((b) => Boolean(b.native_currency)),
+    [bankAccounts]
+  );
 
   // Submit Custodial Expense (Safe / Clerk Float)
   const handleRecordCustodialExpenseSubmit = (e: React.FormEvent) => {
@@ -387,9 +360,10 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
     setModalType('SUPPLIER_PAYMENT');
     setAmount(grv.totalCost.toString());
     setLinkedGrvId(grv.grvNumber);
+    setLinkedGrvItems(grv.items || []);
     setRecipientName(grv.supplierName);
     setBagSealNumber('');
-    setNotes(`Direct safe cash payment for delivery invoice ${grv.invoiceNo || grv.grvNumber}`);
+    setNotes(`Direct safe cash payment for ${grv.grvNumber} (${grv.supplierName}${grv.branchName ? ` · ${grv.branchName}` : ''})`);
     setReceiptImage('');
     setFromAccountId(grv.allocatedSafeId || branchSafe.account_id);
     setToAccountId('');
@@ -400,13 +374,15 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
     setModalType(type);
     setAmount('');
     setLinkedGrvId('');
+    setLinkedGrvItems([]);
     setRecipientName('');
     setSelectedCashierId('');
     setBagSealNumber('');
     setNotes('');
     setReceiptImage('');
     setGrvSearchQuery('');
-    setBankName(govConfig.bankList[0] || 'CBZ Bank Zimbabwe');
+    const defaultBank = bankAccounts[0];
+    setBankName(defaultBank?.account_name || govConfig.bankList[0] || 'EcoCash Merchant Account');
     setBankAccountNumber('');
 
     if (type === 'FLOAT_ISSUE') {
@@ -467,13 +443,23 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
 
     try {
       const isBankTxn = modalType === 'BANK_DEPOSIT' || modalType === 'BANK_WITHDRAWAL';
+      const matchedBankAcc = isBankTxn
+        ? bankAccounts.find((b) => b.account_name === bankName)
+        : undefined;
       const created = createCashTransferVoucher({
         type: modalType,
-        from_account_id: fromAccountId || branchSafe.account_id,
-        to_account_id: toAccountId || undefined,
+        from_account_id:
+          modalType === 'BANK_WITHDRAWAL'
+            ? matchedBankAcc?.account_id || fromAccountId || branchSafe.account_id
+            : fromAccountId || branchSafe.account_id,
+        to_account_id:
+          modalType === 'BANK_DEPOSIT'
+            ? matchedBankAcc?.account_id || toAccountId || undefined
+            : toAccountId || undefined,
         amount: numAmount,
         initiator: currentUser,
         linked_grv_id: linkedGrvId || undefined,
+        linked_grv_items: linkedGrvItems.length > 0 ? linkedGrvItems : undefined,
         recipient_name: recipientName || undefined,
         bag_seal_number: bagSealNumber || undefined,
         receipt_image_url: receiptImage || undefined,
@@ -730,27 +716,34 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
           </div>
 
           <div
-            onClick={() => {
-              if (bankAccounts.length > 0) {
-                setSelectedLedgerAccountId(bankAccounts[0].account_id);
-              } else {
-                setIsBankDetailsModalOpen(true);
-              }
-            }}
+            onClick={() => setIsBankDetailsModalOpen(true)}
             className="bg-slate-950/60 border border-cyan-500/30 hover:border-cyan-500/60 rounded-2xl p-3 cursor-pointer transition group shadow-sm active:scale-[0.99]"
-            title="Click to view Commercial Bank statement & corporate accounts"
+            title="Click to view Commercial Banks, EcoCash & ZiG balances and statements"
           >
             <div className="flex items-center justify-between text-[11px] text-cyan-400 font-medium">
-              <span>Commercial Bank</span>
+              <span>Commercial Banks</span>
               <Landmark className="w-3.5 h-3.5 group-hover:scale-110 transition" />
             </div>
             <div className="text-lg font-bold text-cyan-300 font-mono tabular-nums mt-0.5">
-              ${totalBankBalance.toFixed(2)}
+              ${totalBankBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
             </div>
-            <div className="text-[10px] text-slate-400 mt-0.5 flex items-center justify-between">
-              <span>{bankAccounts.length} Corporate Accounts</span>
-              <span className="text-cyan-400 underline text-[9px] font-semibold">Statement →</span>
-            </div>
+            {mobileMoneyAccounts.length > 0 ? (
+              <div className="text-[10px] font-mono text-slate-300 mt-0.5 truncate" title={mobileMoneyAccounts.map((m) => formatNativeAmount(m.native_balance || 0, m.native_currency)).join(' · ')}>
+                {mobileMoneyAccounts.map((m, idx) => (
+                  <span key={m.account_id}>
+                    {idx > 0 ? ' · ' : ''}
+                    <span className={m.account_subtype === 'ECOCASH' || m.account_id.includes('ECOCASH') ? 'text-blue-300' : 'text-amber-300'}>
+                      {formatNativeAmount(m.native_balance || 0, m.native_currency)}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <div className="text-[10px] text-slate-400 mt-0.5 flex items-center justify-between">
+                <span>{bankAccounts.length} Accounts</span>
+                <span className="text-cyan-400 underline text-[9px] font-semibold">View →</span>
+              </div>
+            )}
           </div>
 
           <div className="bg-slate-950/60 border border-slate-800/80 rounded-2xl p-3">
@@ -1352,117 +1345,34 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
                 </div>
               )}
 
-              {/* Supplier Payment: Searchable Linked GRV */}
+              {/* Supplier Payment: Branch-Organized, Expandable Linked GRV Picker */}
               {modalType === 'SUPPLIER_PAYMENT' && (
                 <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <label className="block text-xs font-semibold text-slate-300">
-                      Linked Goods Received Voucher (GRV) *
-                    </label>
-                    <span className="text-[10px] text-emerald-400 font-mono">
-                      {unpaidGrvs.length} available delivery voucher{unpaidGrvs.length !== 1 ? 's' : ''}
-                    </span>
-                  </div>
-
-                  {/* Real-time GRV Search Input */}
-                  <div className="relative">
-                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                    <input
-                      type="text"
-                      value={grvSearchQuery}
-                      onChange={(e) => setGrvSearchQuery(e.target.value)}
-                      placeholder="🔍 Search GRV #, supplier name, invoice, amount..."
-                      className="w-full pl-9 pr-3 py-2 text-xs bg-slate-950 border border-slate-800 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-medium"
-                    />
-                  </div>
-
-                  {/* Selected GRV Chip */}
-                  {linkedGrvId && (
-                    <div className="p-2.5 bg-emerald-950/70 border border-emerald-500/50 rounded-xl flex items-center justify-between text-xs animate-fadeIn">
-                      <div>
-                        <span className="font-mono font-bold text-emerald-300">{linkedGrvId}</span>
-                        <span className="text-white ml-2 font-medium">{recipientName}</span>
-                        <span className="text-emerald-400 font-mono font-bold ml-2">${amount}</span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setLinkedGrvId('');
-                          setAmount('');
-                          setRecipientName('');
-                        }}
-                        className="text-xs text-rose-400 hover:text-rose-300 font-medium underline"
-                      >
-                        Change GRV
-                      </button>
-                    </div>
-                  )}
-
-                  {/* Searchable GRVs List */}
-                  <div className="max-h-56 overflow-y-auto space-y-1.5 p-1 bg-slate-950/60 rounded-xl border border-slate-800">
-                    {(() => {
-                      const filteredModalGrvs = unpaidGrvs.filter((g) => {
-                        if (!grvSearchQuery.trim()) return true;
-                        const q = grvSearchQuery.toLowerCase().trim();
-                        return (
-                          g.grvNumber.toLowerCase().includes(q) ||
-                          (g.supplierName || '').toLowerCase().includes(q) ||
-                          (g.invoiceNo || '').toLowerCase().includes(q) ||
-                          (g.id || '').toLowerCase().includes(q) ||
-                          g.totalCost.toFixed(2).includes(q) ||
-                          g.totalCost.toString().includes(q)
-                        );
-                      });
-
-                      if (unpaidGrvs.length === 0) {
-                        return (
-                          <div className="p-3 text-center text-xs text-slate-500">
-                            No pending unpaid GRVs found (all deliveries settled).
-                          </div>
-                        );
-                      }
-
-                      if (filteredModalGrvs.length === 0) {
-                        return (
-                          <div className="p-3 text-center text-xs text-amber-300 bg-amber-950/30 rounded-lg border border-amber-800/40">
-                            No pending GRVs match "{grvSearchQuery}". ({unpaidGrvs.length} other pending delivery voucher{unpaidGrvs.length !== 1 ? 's' : ''} available).
-                          </div>
-                        );
-                      }
-
-                      return filteredModalGrvs.map((g, idx) => (
-                        <div
-                          key={`${g.id || g.grvNumber}-${idx}`}
-                          onClick={() => {
-                            setLinkedGrvId(g.grvNumber);
-                            setAmount(g.totalCost.toString());
-                            if (g.supplierName) setRecipientName(g.supplierName);
-                            if (g.allocatedSafeId) setFromAccountId(g.allocatedSafeId);
-                            setNotes(`Direct safe cash payment for delivery invoice ${g.invoiceNo || g.grvNumber} (${g.supplierName})`);
-                          }}
-                          className={`p-2.5 rounded-xl border text-left cursor-pointer transition flex items-center justify-between ${
-                            linkedGrvId === g.grvNumber
-                              ? 'bg-emerald-900/40 border-emerald-500 text-white shadow-md'
-                              : 'bg-slate-900/80 border-slate-800/80 hover:bg-slate-800/80 text-slate-300'
-                          }`}
-                        >
-                          <div>
-                            <div className="flex items-center space-x-2">
-                              <span className="font-mono font-bold text-emerald-400 text-xs">{g.grvNumber}</span>
-                              <span className="text-xs text-white font-semibold">{g.supplierName}</span>
-                            </div>
-                            <div className="text-[10px] text-slate-400 mt-0.5">
-                              {g.invoiceNo ? `Inv: ${g.invoiceNo}` : 'Direct delivery'} · {g.date}
-                            </div>
-                          </div>
-                          <div className="text-right">
-                            <div className="font-mono font-bold text-white text-xs">${g.totalCost.toFixed(2)}</div>
-                            <span className="text-[10px] text-emerald-400 font-medium underline">Select</span>
-                          </div>
-                        </div>
-                      ));
-                    })()}
-                  </div>
+                  <BranchGrvPicker
+                    unpaidGrvs={unpaidGrvs}
+                    selectedGrvId={linkedGrvId}
+                    selectedSupplierName={recipientName}
+                    selectedAmount={amount}
+                    defaultBranchId={getCurrentBranchId()}
+                    defaultShowAllBranches={false}
+                    accentColor="emerald"
+                    onSelectGrv={(g) => {
+                      setLinkedGrvId(g.grvNumber);
+                      setLinkedGrvItems(g.items || []);
+                      setAmount(g.totalCost.toString());
+                      if (g.supplierName) setRecipientName(g.supplierName);
+                      if (g.allocatedSafeId) setFromAccountId(g.allocatedSafeId);
+                      setNotes(
+                        `Direct safe cash payment for ${g.invoiceNo ? `invoice ${g.invoiceNo}` : g.grvNumber} (${g.supplierName} · ${g.branchName})`
+                      );
+                    }}
+                    onClearSelection={() => {
+                      setLinkedGrvId('');
+                      setLinkedGrvItems([]);
+                      setAmount('');
+                      setRecipientName('');
+                    }}
+                  />
 
                   {parseFloat(amount) > DEFAULT_SUPPLIER_APPROVAL_THRESHOLD && (
                     <p className="text-[11px] text-amber-400 mt-1 flex items-center space-x-1">
@@ -1497,7 +1407,8 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
                       {bankAccounts.length > 0
                         ? bankAccounts.map((b) => (
                             <option key={b.account_id} value={b.account_name}>
-                              {b.account_name} — Balance: ${(b.current_balance || 0).toFixed(2)}
+                              {b.account_name} — ${(b.current_balance || 0).toFixed(2)}
+                              {b.native_currency ? ` (${formatNativeAmount(b.native_balance || 0, b.native_currency)})` : ''}
                             </option>
                           ))
                         : govConfig.bankList.map((b) => (
@@ -1950,372 +1861,42 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
         </div>
       )}
 
-      {/* 🏦 Commercial Bank Accounts & Corporate Balances Modal */}
-      {isBankDetailsModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fadeIn">
-          <div className="bg-slate-900 border border-cyan-500/40 rounded-3xl w-full max-w-lg p-5 sm:p-6 shadow-2xl space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-              <div className="flex items-center space-x-2.5">
-                <div className="w-10 h-10 rounded-2xl bg-cyan-600/20 text-cyan-400 flex items-center justify-center border border-cyan-500/40">
-                  <Landmark className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-white">Commercial Bank Accounts & Live Balances</h3>
-                  <p className="text-[11px] text-slate-400">Company corporate banking accounts & settlement tracking</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setIsBankDetailsModalOpen(false)}
-                className="p-1.5 hover:bg-slate-800 rounded-xl text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+      {/* 🏦 Commercial Bank, EcoCash & ZiG Accounts Modal */}
+      <CommercialBanksModal
+        isOpen={isBankDetailsModalOpen}
+        bankAccounts={bankAccounts}
+        totalBankBalance={totalBankBalance}
+        onClose={() => setIsBankDetailsModalOpen(false)}
+        onOpenStatement={(accId) => {
+          setIsBankDetailsModalOpen(false);
+          setSelectedLedgerAccountId(accId);
+        }}
+        onDeposit={() => {
+          setIsBankDetailsModalOpen(false);
+          openNewVoucherModal('BANK_DEPOSIT');
+        }}
+        onWithdraw={() => {
+          setIsBankDetailsModalOpen(false);
+          openNewVoucherModal('BANK_WITHDRAWAL');
+        }}
+        onBankCreated={() => {
+          reloadData();
+          showToast('Commercial bank account added and ready for deposits & settlements.');
+        }}
+      />
 
-            {/* Total Corporate Bank Balance */}
-            <div className="bg-slate-950/80 border border-cyan-500/30 rounded-2xl p-4 text-center">
-              <div className="text-[11px] uppercase tracking-wider text-cyan-400 font-bold font-mono">
-                Total Live Commercial Bank Balance
-              </div>
-              <div className="text-3xl font-black text-white font-mono tabular-nums mt-1">
-                ${totalBankBalance.toFixed(2)}
-              </div>
-              <div className="text-[10px] text-slate-400 mt-1">
-                Synchronized across all corporate bank accounts and USD Bank wallet
-              </div>
-            </div>
-
-            {/* Accounts Breakdown List */}
-            <div className="space-y-2.5">
-              <div className="text-xs font-semibold text-slate-300">Registered Commercial Accounts</div>
-              {bankAccounts.length === 0 ? (
-                <div className="p-4 text-center text-xs text-slate-500 border border-dashed border-slate-800 rounded-2xl">
-                  No bank accounts configured.
-                </div>
-              ) : (
-                bankAccounts.map((b) => (
-                  <div
-                    key={b.account_id}
-                    className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-3"
-                  >
-                    <div>
-                      <div className="text-xs font-bold text-white flex items-center space-x-1.5">
-                        <Landmark className="w-3.5 h-3.5 text-cyan-400" />
-                        <span>{b.account_name}</span>
-                      </div>
-                      <div className="text-[10px] text-slate-500 font-mono mt-0.5">
-                        Account ID: {b.account_id} · Currency: {b.currency}
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className="text-base font-bold font-mono text-cyan-400">
-                        ${(b.current_balance || 0).toFixed(2)}
-                      </div>
-                      <span className="text-[9px] uppercase px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300 border border-cyan-800/40 font-mono">
-                        Active Account
-                      </span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-
-            {/* Explanation of Cash Movements */}
-            <div className="p-3 rounded-2xl bg-slate-950/60 border border-slate-800 text-[11px] text-slate-400 space-y-1">
-              <div className="font-semibold text-slate-300">💡 How Bank Deposits & Withdrawals Work:</div>
-              <div>• <strong>Bank Deposit:</strong> Physical cash moves from Branch Safe / Vault ➔ Commercial Bank. Safe decreases, Bank Balance increases.</div>
-              <div>• <strong>Bank Withdrawal:</strong> Funds move from Commercial Bank ➔ Branch Safe to replenish physical cash on hand. Bank Balance decreases, Safe increases.</div>
-            </div>
-
-            {/* Action buttons */}
-            <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-800">
-              <button
-                type="button"
-                onClick={() => {
-                  setIsBankDetailsModalOpen(false);
-                  openNewVoucherModal('BANK_DEPOSIT');
-                }}
-                className="flex-1 py-2.5 px-3 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition flex items-center justify-center space-x-1.5 shadow-md"
-              >
-                <PlusCircle className="w-3.5 h-3.5" />
-                <span>Make Bank Deposit</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  setIsBankDetailsModalOpen(false);
-                  openNewVoucherModal('BANK_WITHDRAWAL');
-                }}
-                className="flex-1 py-2.5 px-3 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition flex items-center justify-center space-x-1.5 shadow-md"
-              >
-                <Landmark className="w-3.5 h-3.5" />
-                <span>Withdraw to Safe</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
       {/* 📜 Dual-Custody Account Statement & Double-Entry Ledger Modal */}
-      {selectedLedgerAccountId && ledgerData && ledgerData.account && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/80 backdrop-blur-md animate-fadeIn">
-          <div className="bg-slate-900 border border-slate-700/80 rounded-3xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden">
-            {/* Modal Header */}
-            <div className="p-4 sm:p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/70">
-              <div className="flex items-center space-x-3">
-                <div className={`w-10 h-10 rounded-2xl flex items-center justify-center border ${
-                  ledgerData.account.account_type === 'SAFE'
-                    ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
-                    : ledgerData.account.account_type === 'CLERK_FLOAT'
-                    ? 'bg-indigo-500/20 text-indigo-400 border-indigo-500/40'
-                    : 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40'
-                }`}>
-                  {ledgerData.account.account_type === 'SAFE' ? (
-                    <Coins className="w-5 h-5" />
-                  ) : ledgerData.account.account_type === 'CLERK_FLOAT' ? (
-                    <Banknote className="w-5 h-5" />
-                  ) : (
-                    <Landmark className="w-5 h-5" />
-                  )}
-                </div>
-                <div>
-                  <div className="flex items-center space-x-2">
-                    <h3 className="text-sm sm:text-base font-bold text-white">
-                      {ledgerData.account.account_name} Statement
-                    </h3>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-slate-800 text-slate-300 border border-slate-700">
-                      {ledgerData.account.account_id}
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-slate-400">
-                    Custodian: <strong>{ledgerData.account.holder_user_name || 'Branch Custodian'}</strong> • Double-entry custodial transaction ledger
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex items-center space-x-2">
-                <button
-                  type="button"
-                  onClick={handleExportLedgerCsv}
-                  className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center space-x-1.5 transition border border-slate-700"
-                  title="Export this account ledger to CSV"
-                >
-                  <Download className="w-3.5 h-3.5 text-cyan-400" />
-                  <span className="hidden sm:inline">Export CSV</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setSelectedLedgerAccountId(null)}
-                  className="p-1.5 hover:bg-slate-800 rounded-xl text-slate-400 hover:text-white transition"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            {/* Account Switcher Bar */}
-            <div className="px-4 sm:px-5 py-2.5 bg-slate-950/40 border-b border-slate-800/80 flex items-center justify-between gap-2 overflow-x-auto">
-              <div className="flex items-center space-x-1.5 text-xs">
-                <span className="text-[11px] text-slate-400 font-medium mr-1">Switch Account:</span>
-                {branchSafe && (
-                  <button
-                    type="button"
-                    onClick={() => setSelectedLedgerAccountId(branchSafe.account_id)}
-                    className={`px-2.5 py-1 rounded-xl text-[11px] font-bold transition ${
-                      selectedLedgerAccountId === branchSafe.account_id
-                        ? 'bg-emerald-600 text-white shadow-sm'
-                        : 'bg-slate-800/70 hover:bg-slate-700 text-slate-300'
-                    }`}
-                  >
-                    Branch Safe (${branchSafe.current_balance.toFixed(2)})
-                  </button>
-                )}
-                {clerkFloat && (
-                  <button
-                    type="button"
-                    onClick={() => setSelectedLedgerAccountId(clerkFloat.account_id)}
-                    className={`px-2.5 py-1 rounded-xl text-[11px] font-bold transition ${
-                      selectedLedgerAccountId === clerkFloat.account_id
-                        ? 'bg-indigo-600 text-white shadow-sm'
-                        : 'bg-slate-800/70 hover:bg-slate-700 text-slate-300'
-                    }`}
-                  >
-                    Clerk Float (${clerkFloat.current_balance.toFixed(2)})
-                  </button>
-                )}
-                {bankAccounts.map((b) => (
-                  <button
-                    key={b.account_id}
-                    type="button"
-                    onClick={() => setSelectedLedgerAccountId(b.account_id)}
-                    className={`px-2.5 py-1 rounded-xl text-[11px] font-bold transition ${
-                      selectedLedgerAccountId === b.account_id
-                        ? 'bg-cyan-600 text-white shadow-sm'
-                        : 'bg-slate-800/70 hover:bg-slate-700 text-slate-300'
-                    }`}
-                  >
-                    {b.account_name} (${(b.current_balance || 0).toFixed(2)})
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Summary Metrics Cards */}
-            <div className="p-4 sm:p-5 grid grid-cols-2 sm:grid-cols-4 gap-2.5 bg-slate-950/20 border-b border-slate-800/60">
-              <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800">
-                <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Current Balance</div>
-                <div className="text-xl font-black font-mono text-cyan-300 mt-1">
-                  ${ledgerData.currentBalance.toFixed(2)}
-                </div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Physical funds on hand</div>
-              </div>
-
-              <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800">
-                <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Period Inflows</div>
-                <div className="text-xl font-black font-mono text-emerald-400 mt-1">
-                  +${ledgerData.periodIn.toFixed(2)}
-                </div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Collections &amp; deposits</div>
-              </div>
-
-              <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800">
-                <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Period Outflows</div>
-                <div className="text-xl font-black font-mono text-rose-400 mt-1">
-                  -${ledgerData.periodOut.toFixed(2)}
-                </div>
-                <div className="text-[10px] text-slate-500 mt-0.5">Disbursements &amp; floats</div>
-              </div>
-
-              <div className="p-3 rounded-2xl bg-slate-950/70 border border-slate-800">
-                <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Net Movement</div>
-                <div className={`text-xl font-black font-mono mt-1 ${
-                  ledgerData.periodIn >= ledgerData.periodOut ? 'text-emerald-400' : 'text-rose-400'
-                }`}>
-                  {ledgerData.periodIn >= ledgerData.periodOut ? '+' : ''}${(ledgerData.periodIn - ledgerData.periodOut).toFixed(2)}
-                </div>
-                <div className="text-[10px] text-slate-500 mt-0.5">{ledgerData.filteredEntries.length} transactions</div>
-              </div>
-            </div>
-
-            {/* Filter and Search Bar */}
-            <div className="px-4 sm:px-5 py-3 border-b border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-2.5">
-              <div className="inline-flex rounded-xl p-1 bg-slate-950 border border-slate-800 text-xs">
-                {(['all', 'today', '7days', '30days'] as const).map((period) => (
-                  <button
-                    key={period}
-                    type="button"
-                    onClick={() => setLedgerDateFilter(period)}
-                    className={`px-3 py-1 rounded-lg font-bold transition ${
-                      ledgerDateFilter === period
-                        ? 'bg-slate-800 text-white shadow-sm'
-                        : 'text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {period === 'all' ? 'All Time' : period === 'today' ? 'Today' : period === '7days' ? 'Last 7 Days' : 'Last 30 Days'}
-                  </button>
-                ))}
-              </div>
-
-              <div className="relative w-full sm:w-64">
-                <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                <input
-                  type="text"
-                  value={ledgerSearchQuery}
-                  onChange={(e) => setLedgerSearchQuery(e.target.value)}
-                  placeholder="Filter ref, reason, payee..."
-                  className="w-full pl-9 pr-3 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
-                />
-              </div>
-            </div>
-
-            {/* Scrollable Transaction Ledger Table */}
-            <div className="flex-1 overflow-y-auto p-4 sm:p-5">
-              {ledgerData.filteredEntries.length === 0 ? (
-                <div className="py-12 text-center text-slate-500 space-y-2">
-                  <FileText className="w-8 h-8 mx-auto text-slate-600 opacity-60" />
-                  <p className="text-sm font-semibold text-slate-400">No transactions recorded for this period</p>
-                  <p className="text-xs text-slate-500">Try changing the date filter or searching for a different keyword.</p>
-                </div>
-              ) : (
-                <div className="border border-slate-800 rounded-2xl overflow-hidden shadow-sm">
-                  <table className="w-full text-left text-xs text-slate-300">
-                    <thead className="bg-slate-950 text-slate-400 font-bold uppercase tracking-wider text-[10px] border-b border-slate-800">
-                      <tr>
-                        <th className="py-2.5 px-3">Date &amp; Time</th>
-                        <th className="py-2.5 px-3">Voucher Ref</th>
-                        <th className="py-2.5 px-3">Description &amp; Counterparty</th>
-                        <th className="py-2.5 px-3 text-right text-emerald-400">In (+)</th>
-                        <th className="py-2.5 px-3 text-right text-rose-400">Out (-)</th>
-                        <th className="py-2.5 px-3 text-right text-white">Running Balance</th>
-                        <th className="py-2.5 px-3 text-center">Authorized By</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/60 font-sans">
-                      {ledgerData.filteredEntries.map((e, idx) => (
-                        <tr key={`${e.id}-${idx}`} className="hover:bg-slate-800/40 transition">
-                          <td className="py-2.5 px-3 font-mono text-[11px] text-slate-400 whitespace-nowrap">
-                            <div>{e.date}</div>
-                            <div className="text-[9px] text-slate-500">{toTimeStringSafe(e.timestamp)}</div>
-                          </td>
-
-                          <td className="py-2.5 px-3 font-mono text-[11px] whitespace-nowrap">
-                            <span className="font-bold text-slate-200">{e.transferId}</span>
-                            <div className="text-[9px] text-indigo-400">{e.type}</div>
-                          </td>
-
-                          <td className="py-2.5 px-3">
-                            <div className="text-white font-medium max-w-xs truncate" title={e.description}>
-                              {e.description}
-                            </div>
-                            <div className="text-[10px] text-slate-400 flex items-center space-x-1.5">
-                              <span>Party: {e.recipientOrSource}</span>
-                              {e.reference && e.reference !== e.transferId && (
-                                <span className="font-mono text-slate-500">· Ref: {e.reference}</span>
-                              )}
-                            </div>
-                          </td>
-
-                          <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400 whitespace-nowrap">
-                            {e.inAmount > 0 ? `+$${e.inAmount.toFixed(2)}` : '—'}
-                          </td>
-
-                          <td className="py-2.5 px-3 text-right font-mono font-bold text-rose-400 whitespace-nowrap">
-                            {e.outAmount > 0 ? `-$${e.outAmount.toFixed(2)}` : '—'}
-                          </td>
-
-                          <td className="py-2.5 px-3 text-right font-mono font-extrabold text-white whitespace-nowrap">
-                            ${e.runningBalance.toFixed(2)}
-                          </td>
-
-                          <td className="py-2.5 px-3 text-center text-[10px] text-slate-400 whitespace-nowrap">
-                            <span className="px-2 py-0.5 rounded bg-slate-950 text-slate-300 border border-slate-800">
-                              {e.authorizedBy}
-                            </span>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-
-            {/* Footer */}
-            <div className="p-3.5 bg-slate-950 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
-              <div>
-                Showing <strong>{ledgerData.filteredEntries.length}</strong> movements · Verified against SAIMETRIC double-entry cash ledger
-              </div>
-              <button
-                type="button"
-                onClick={() => setSelectedLedgerAccountId(null)}
-                className="px-4 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs transition"
-              >
-                Close Statement
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <AccountStatementModal
+        accountId={selectedLedgerAccountId}
+        accounts={[
+          ...(branchSafe ? [branchSafe] : []),
+          ...(clerkFloat ? [clerkFloat] : []),
+          ...bankAccounts,
+        ]}
+        branchId={getCurrentBranchId()}
+        onSelectAccount={(accId) => setSelectedLedgerAccountId(accId)}
+        onClose={() => setSelectedLedgerAccountId(null)}
+      />
 
       {/* ⚡ Record Safe Vault / Clerk Float Operating Expense Modal */}
       {isCustodialExpenseModalOpen && (

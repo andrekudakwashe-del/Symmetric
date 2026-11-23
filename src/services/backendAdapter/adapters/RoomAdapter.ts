@@ -26,6 +26,8 @@ import {
   getCashTransfers,
   getAllCashAccounts,
   getAllCashTransfers,
+  getRawStoredCashAccounts,
+  getRawStoredCashTransfers,
 } from '../../../db/roomDatabase';
 
 export class RoomBackendAdapter implements IBackendAdapter {
@@ -162,7 +164,7 @@ export class RoomBackendAdapter implements IBackendAdapter {
 
       // 4. Cash Accounts
       if (Array.isArray(snapshot.data.cashAccounts)) {
-        const existingAccs = getAllCashAccounts();
+        const existingAccs = getRawStoredCashAccounts();
         const nonTenantAccs = existingAccs.filter((a: any) => a.company_id && a.company_id !== companyId);
         const mappedAccs = snapshot.data.cashAccounts.map((a) => ({
           ...a,
@@ -174,7 +176,7 @@ export class RoomBackendAdapter implements IBackendAdapter {
 
       // 5. Cash Transfers
       if (Array.isArray(snapshot.data.cashTransfers)) {
-        const existingTrfs = getAllCashTransfers();
+        const existingTrfs = getRawStoredCashTransfers();
         const nonTenantTrfs = existingTrfs.filter((t: any) => t.company_id && t.company_id !== companyId);
         const mappedTrfs = snapshot.data.cashTransfers.map((t) => ({
           ...t,
