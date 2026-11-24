@@ -91,6 +91,8 @@ const ENTITY_TO_SHEET: Record<string, string> = {
   stocktake_joint_proposal: 'StocktakeJointProposals',
   stocktake_joint_finalized: 'StocktakeJointFinalized',
   stocktake_segment_unlock: 'StocktakeUnlockLog',
+  daily_blind_config: 'DailyBlindConfigs',
+  daily_blind_count: 'DailyBlindCounts',
   casual_worker: 'CasualWorkers',
   branch_lockdown: 'BranchLockdowns',
   system_settings: 'SystemSettings',
@@ -154,6 +156,10 @@ function extractCanonicalEntityId(entityType: string, p: Record<string, any>, fa
       return pick(p.branchId, p.BranchID, p.branch_id, p.id, fallbackId);
     case 'stocktake_session':
       return pick(p.sessionId, p.SessionID, p.id, fallbackId);
+    case 'daily_blind_config':
+      return pick(p.id, p.configId, p.ConfigID, fallbackId);
+    case 'daily_blind_count':
+      return pick(p.id, p.countId, p.CountID, fallbackId);
     default:
       return pick(
         p.id,

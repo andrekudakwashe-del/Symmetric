@@ -362,21 +362,28 @@ export const ingestMeshInternalConsumption = (incoming: InternalConsumption): bo
     return !u || u === 'PENDING' || u === 'PENDING_APPROVAL';
   };
 
+  const cleanIncoming: any = { ...incoming };
+  delete cleanIncoming.fromMesh;
+  delete cleanIncoming.fromSync;
+
   if (existing) {
-    if (isFinal(existing.status) && isPending(incoming.status)) {
+    if (isFinal(existing.status) && isPending(cleanIncoming.status)) {
       return false;
     }
     const existingTime = Number(existing.updatedAt) || new Date(existing.approvedAt || existing.requestedAt || 0).getTime() || 0;
-    const incomingTime = Number(incoming.updatedAt) || new Date(incoming.approvedAt || incoming.requestedAt || 0).getTime() || 0;
-    if (existing.status === incoming.status && incomingTime <= existingTime) {
+    const incomingTime = Number(cleanIncoming.updatedAt) || new Date(cleanIncoming.approvedAt || cleanIncoming.requestedAt || 0).getTime() || 0;
+    if (existing.status === cleanIncoming.status && incomingTime <= existingTime) {
       return false;
     }
-    list[idx] = { ...existing, ...incoming };
+    const merged: any = { ...existing, ...cleanIncoming };
+    delete merged.fromMesh;
+    delete merged.fromSync;
+    list[idx] = merged;
     saveInternalConsumptions(list);
     return true;
   }
 
-  saveInternalConsumptions([incoming, ...list]);
+  saveInternalConsumptions([cleanIncoming, ...list]);
   return true;
 };
 
@@ -507,6 +514,8 @@ export const approveInternalConsumption = (
   req.approvedAt = nowIso;
   req.updatedAt = nowMs;
   req.lastUpdated = nowIso;
+  delete (req as any).fromMesh;
+  delete (req as any).fromSync;
 
   saveInternalConsumptions(list);
   enqueueSync('InternalConsumption' as any, 'UPDATE', req);
@@ -532,6 +541,8 @@ export const rejectInternalConsumption = (
   req.rejectionReason = reason;
   req.updatedAt = nowMs;
   req.lastUpdated = nowIso;
+  delete (req as any).fromMesh;
+  delete (req as any).fromSync;
 
   saveInternalConsumptions(list);
   enqueueSync('InternalConsumption' as any, 'UPDATE', req);

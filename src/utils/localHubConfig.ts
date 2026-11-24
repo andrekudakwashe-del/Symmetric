@@ -10,7 +10,23 @@ export const STORAGE_KEY_HUB_BRANCH_ID = 'saimetric_hub_branch_id';
 export const STORAGE_KEY_HUB_BRANCH_NAME = 'saimetric_hub_branch_name';
 export const STORAGE_KEY_HUB_TENANT_ID = 'saimetric_hub_tenant_id';
 export const STORAGE_KEY_CLOUD_ONLY_MODE = 'saimetric_cloud_only_mode';
+export const STORAGE_KEY_PAIRED_HUBS = 'saimetric_paired_hubs_v1';
 export const DEFAULT_LOCAL_HUB_URL = 'ws://192.168.43.1:8080';
+
+export interface PairedHubProfile {
+  hubId: string;
+  wsUrl: string;
+  branchId: string;
+  branchName: string;
+  tenantId: string;
+  deviceId: string;
+  deviceSecret: string;
+  hubPubKey?: string;
+  hubVersion?: string;
+  hubRuntime?: 'ANDROID_APK' | 'TERMUX' | 'UNKNOWN';
+  pairedAt: number;
+  lastConnectedAt?: number;
+}
 
 export interface LocalHubTestResult {
   success: boolean;
@@ -245,6 +261,127 @@ export class LocalHubConfig {
         console.warn('[LocalHubConfig] Failed to set cloud only mode:', e);
       }
     }
+  }
+
+  // ==================== BRANCH-KEYED PAIRED HUB PROFILES ====================
+
+  public static getPairedHubs(): PairedHubProfile[] {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_PAIRED_HUBS);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter((p) => p && typeof p.hubId === 'string' && typeof p.deviceSecret === 'string');
+    } catch {
+      return [];
+    }
+  }
+
+  private static writePairedHubs(profiles: PairedHubProfile[]): void {
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(STORAGE_KEY_PAIRED_HUBS, JSON.stringify(profiles));
+      this.dispatchConfigChange();
+    } catch (e) {
+      console.warn('[LocalHubConfig] Failed to persist paired hub profiles:', e);
+    }
+  }
+
+  public static savePairedHubProfile(profile: PairedHubProfile): void {
+    const cleanUrl = normalizeHubUrl(profile.wsUrl);
+    const normBranch = String(profile.branchId || '').trim().toUpperCase();
+    const normHub = String(profile.hubId || '').trim().toUpperCase();
+    const normalized: PairedHubProfile = {
+      ...profile,
+      wsUrl: cleanUrl,
+      pairedAt: profile.pairedAt || Date.now(),
+      lastConnectedAt: profile.lastConnectedAt || Date.now(),
+    };
+    const existing = this.getPairedHubs().filter((p) => {
+      const sameHub = String(p.hubId || '').trim().toUpperCase() === normHub;
+      const sameBranch = normBranch && normBranch !== 'UNASSIGNED' && String(p.branchId || '').trim().toUpperCase() === normBranch;
+      const sameUrl = normalizeHubUrl(p.wsUrl) === cleanUrl;
+      return !(sameHub || sameBranch || sameUrl);
+    });
+    this.writePairedHubs([normalized, ...existing]);
+  }
+
+  public static removePairedHubProfile(hubIdOrBranchOrUrl: string): void {
+    const target = String(hubIdOrBranchOrUrl || '').trim().toUpperCase();
+    if (!target) return;
+    const targetUrl = normalizeHubUrl(hubIdOrBranchOrUrl);
+    const filtered = this.getPairedHubs().filter((p) => {
+      const sameHub = String(p.hubId || '').trim().toUpperCase() === target;
+      const sameBranch = String(p.branchId || '').trim().toUpperCase() === target;
+      const sameUrl = normalizeHubUrl(p.wsUrl) === targetUrl;
+      return !(sameHub || sameBranch || sameUrl);
+    });
+    this.writePairedHubs(filtered);
+  }
+
+  public static getPairedHubById(hubId: string): PairedHubProfile | null {
+    const target = String(hubId || '').trim().toUpperCase();
+    if (!target) return null;
+    return this.getPairedHubs().find((p) => String(p.hubId || '').trim().toUpperCase() === target) || null;
+  }
+
+  public static getPairedHubForBranch(branchId: string): PairedHubProfile | null {
+    const target = String(branchId || '').trim().toUpperCase();
+    if (!target) return null;
+    return this.getPairedHubs().find((p) => String(p.branchId || '').trim().toUpperCase() === target) || null;
+  }
+
+  public static getPairedHubForUrl(rawUrl: string): PairedHubProfile | null {
+    if (!rawUrl) return null;
+    const cleanUrl = normalizeHubUrl(rawUrl);
+    return this.getPairedHubs().find((p) => normalizeHubUrl(p.wsUrl) === cleanUrl) || null;
+  }
+
+  /**
+   * Returns true if the target URL is already paired to a secure Hub profile,
+   * preventing silent downgrade to an unauthenticated spoofed Hub on the same LAN IP.
+   */
+  public static isStrictAuthRequiredForUrl(rawUrl: string): boolean {
+    return this.getPairedHubForUrl(rawUrl) !== null;
+  }
+
+  /**
+   * Updates lastConnectedAt / metadata on a paired Hub profile (e.g. after IP change or OTA update).
+   */
+  public static touchPairedHubProfile(
+    hubId: string,
+    patch: Partial<Pick<PairedHubProfile, 'wsUrl' | 'branchId' | 'branchName' | 'tenantId' | 'hubVersion' | 'hubRuntime' | 'lastConnectedAt'>>
+  ): void {
+    const profiles = this.getPairedHubs();
+    const target = String(hubId || '').trim().toUpperCase();
+    let changed = false;
+    const next = profiles.map((p) => {
+      if (String(p.hubId || '').trim().toUpperCase() !== target) return p;
+      changed = true;
+      return {
+        ...p,
+        ...patch,
+        wsUrl: patch.wsUrl ? normalizeHubUrl(patch.wsUrl) : p.wsUrl,
+        lastConnectedAt: patch.lastConnectedAt || Date.now(),
+      };
+    });
+    if (changed) {
+      this.writePairedHubs(next);
+    }
+  }
+
+  /**
+   * For roaming Managers/Owners: if the newly selected branch already has a paired Hub,
+   * switches the active Local Hub URL automatically without overwriting other branches' credentials.
+   */
+  public static switchToPairedBranchHub(branchId: string): PairedHubProfile | null {
+    const profile = this.getPairedHubForBranch(branchId);
+    if (!profile) return null;
+    if (this.getLocalHubUrl() !== profile.wsUrl) {
+      this.setLocalHubUrl(profile.wsUrl);
+    }
+    return profile;
   }
 
   /**

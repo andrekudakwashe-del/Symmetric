@@ -82,6 +82,10 @@ import {
   setStored,
   STORAGE_KEYS,
   updateProductStock,
+  getRawStoredDailyBlindConfigs,
+  getRawStoredDailyBlindCounts,
+  ingestMeshDailyBlindConfig,
+  ingestMeshDailyBlindCount,
 } from '../../db/roomDatabase';
 import { getMovements, addMovement } from '../../db/cashLedger';
 import {
@@ -239,6 +243,22 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
       case 'stocktake_session': {
         const found = getRawStoredStocktakeSessions().find(
           (s: any) => String(s.sessionId || s.id || '').trim().toUpperCase() === cleanUpper
+        );
+        if (!found) return undefined;
+        const ts = extractRecordTimestamp(found);
+        return ts > 0 ? { ...found, updatedAt: ts } : undefined;
+      }
+      case 'daily_blind_config': {
+        const found = getRawStoredDailyBlindConfigs().find(
+          (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
+        );
+        if (!found) return undefined;
+        const ts = extractRecordTimestamp(found);
+        return ts > 0 ? { ...found, updatedAt: ts } : undefined;
+      }
+      case 'daily_blind_count': {
+        const found = getRawStoredDailyBlindCounts().find(
+          (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
         );
         if (!found) return undefined;
         const ts = extractRecordTimestamp(found);
@@ -404,8 +424,32 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
       return getRawStoredReconciliations().find((r: any) => String(r.id || '').trim().toUpperCase() === cleanUpper);
     case 'admin_sales':
       return getRawStoredAdminSales().find((a: any) => String(a.id || '').trim().toUpperCase() === cleanUpper);
-    case 'cash_count':
-      return getRawStoredCashCounts().find((c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper);
+    case 'cash_count': {
+      const existing = getRawStoredCashCounts().find(
+        (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (!existing) return undefined;
+      const existingTs = Math.max(
+        Number((existing as any).updatedAt || 0),
+        Date.parse(String((existing as any).lastUpdated || existing.timestamp || '')) || 0
+      );
+      const incomingTs = Math.max(
+        Number(envelope.updatedAt || 0),
+        Number(d?.updatedAt || 0),
+        Date.parse(String(d?.lastUpdated || d?.timestamp || '')) || 0
+      );
+      const totalChanged =
+        d?.finalCashOutTotal !== undefined &&
+        Math.abs(Number(d.finalCashOutTotal) - Number(existing.finalCashOutTotal || 0)) > 0.005;
+      const notesChanged = d?.notes !== undefined && String(d.notes || '') !== String(existing.notes || '');
+      const denomChanged =
+        d?.denominations &&
+        JSON.stringify(d.denominations) !== JSON.stringify(existing.denominations || {});
+      if (incomingTs > existingTs || totalChanged || notesChanged || denomChanged || envelope.action === 'UPSERT') {
+        return incomingTs < existingTs ? existing : undefined;
+      }
+      return existing;
+    }
     case 'supplier_invoice_voucher': {
       const existing = getRawStoredSupplierInvoiceVouchers().find(
         (v: any) => String(v.voucherId || v.id || '').trim().toUpperCase() === cleanUpper
@@ -1665,6 +1709,38 @@ export function applyCloudEnvelopeToRoomDb(
         if (envelope.updatedAt) {
           setLastStocktakeSessionSync(Math.max(getLastStocktakeSessionSync(), envelope.updatedAt));
         }
+      }
+      break;
+    }
+
+    case 'daily_blind_config': {
+      if (d) {
+        ingestMeshDailyBlindConfig({
+          ...d,
+          id: d.id || envelope.entityId,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+        });
+      }
+      break;
+    }
+
+    case 'daily_blind_count': {
+      if (d) {
+        const recId = d.id || envelope.entityId;
+        if (protectBalances) {
+          const existing = getRawStoredDailyBlindCounts().find(
+            (r: any) => String(r.id || '').toUpperCase() === String(recId).toUpperCase()
+          );
+          if (existing && existing.status === 'ARCHIVED' && d.status !== 'ARCHIVED') {
+            options?.onBalanceProtected?.('daily_blind_count', String(recId));
+            break;
+          }
+        }
+        ingestMeshDailyBlindCount({
+          ...d,
+          id: recId,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+        });
       }
       break;
     }

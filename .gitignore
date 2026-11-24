@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.local
+.hub-ota-private.pem
+.hub-config.key
+hub-cloud-config.enc
+hub-security.json
+termux-hub-data.json
+server-config.json
+server-saas-data.json

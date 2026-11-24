@@ -3,7 +3,7 @@
  * Provides 100% offline app loading, clean cache management, and instant updates.
  */
 
-const CACHE_NAME = 'saimetric-v5-offline-v13';
+const CACHE_NAME = 'saimetric-v5-offline-v14';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',
@@ -63,9 +63,10 @@ self.addEventListener('message', (event) => {
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
-  // Skip non-GET requests and WebSocket connections
+  // Skip non-GET requests, API routes, Hub OTA releases, and WebSocket connections
   if (event.request.method !== 'GET') return;
   if (url.pathname.startsWith('/api/')) return;
+  if (url.pathname.startsWith('/hub-ota/')) return;
   if (url.protocol === 'ws:' || url.protocol === 'wss:') return;
   // Never intercept dev server internals, vite modules, or browser extension requests
   if (

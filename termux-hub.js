@@ -64,6 +64,19 @@ let hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1]
   ? process.argv[tenantIdArgIdx + 1]
   : (process.env.HUB_TENANT_ID || 'COMP-001');
 
+// Runtime & Mutual-Auth Security Mode
+// - Termux backup defaults to HUB_REQUIRE_AUTH = false for zero-friction continuity
+// - Android Hub APK (HUB_RUNTIME=ANDROID_APK) or --require-auth enforces strict mutual HMAC auth
+const HUB_VERSION = '4.1.0';
+const HUB_RUNTIME = String(process.env.HUB_RUNTIME || 'TERMUX').toUpperCase() === 'ANDROID_APK'
+  ? 'ANDROID_APK'
+  : 'TERMUX';
+const HUB_OTA_SLOT = String(process.env.HUB_OTA_SLOT || (HUB_RUNTIME === 'ANDROID_APK' ? 'A' : 'TERMUX'));
+const HUB_REQUIRE_AUTH =
+  process.argv.includes('--require-auth') ||
+  String(process.env.HUB_REQUIRE_AUTH || '').toLowerCase() === 'true' ||
+  (HUB_RUNTIME === 'ANDROID_APK' && String(process.env.HUB_REQUIRE_AUTH || '').toLowerCase() !== 'false');
+
 // Edge Gateway Cloud Bridge configuration (App Scripts / Supabase forwarding)
 const cloudUrlArgIdx = process.argv.indexOf('--cloud-url');
 let cloudSyncUrl = cloudUrlArgIdx !== -1 && process.argv[cloudUrlArgIdx + 1]
@@ -659,6 +672,8 @@ const T2_CANONICAL_TYPES = new Set([
   'stocktake_joint_proposal',
   'stocktake_joint_finalized',
   'stocktake_segment_unlock',
+  'daily_blind_config',
+  'daily_blind_count',
   'permissions_matrix',
   'role_configs',
   'multi_currency',
@@ -725,6 +740,8 @@ function mapHubEntityToCanonicalType(entityType) {
   if (t === 'STOCKTAKE_SEGMENT' || t === 'STOCKTAKE_SEGMENTS') return 'stocktake_segment';
   if (t === 'STOCKTAKE_ZONE_ASSIGNMENT' || t === 'STOCKTAKE_ZONE_ASSIGNMENTS') return 'stocktake_zone_assignment';
   if (t === 'STOCKTAKE_BLIND_COUNT' || t === 'STOCKTAKE_COUNT_SUBMISSION') return 'stocktake_count_submission';
+  if (t === 'DAILY_BLIND_CONFIG' || t === 'DAILY_BLIND_CONFIGS' || t === 'DAILY_BLIND_CONFIG_SYNC') return 'daily_blind_config';
+  if (t === 'DAILY_BLIND_COUNT' || t === 'DAILY_BLIND_COUNTS' || t === 'DAILY_BLIND_COUNT_SYNC') return 'daily_blind_count';
   if (t === 'TOMBSTONE' || t === 'TOMBSTONES') return 'tombstone';
   if (t === 'PERMISSIONS_MATRIX') return 'permissions_matrix';
   if (t === 'ROLE_CONFIGS') return 'role_configs';
@@ -756,6 +773,8 @@ function getHubCanonicalEntityId(record, canonicalType) {
   if (canonicalType === 'stocktake_session') return String(record.sessionId || record.id || '').trim();
   if (canonicalType === 'stocktake_segment') return String(record.segmentId || record.id || '').trim();
   if (canonicalType === 'stocktake_zone_assignment') return String(record.id || `${record.sessionId || ''}::${record.zoneId || ''}`).trim();
+  if (canonicalType === 'daily_blind_config') return String(record.id || record.configId || '').trim();
+  if (canonicalType === 'daily_blind_count') return String(record.id || record.countId || '').trim();
   if (canonicalType === 'permissions_matrix') return 'PERMISSIONS_MATRIX';
   if (canonicalType === 'role_configs') return 'ROLE_CONFIGS';
   if (canonicalType === 'multi_currency') return 'MULTI_CURRENCY_CONFIG';
@@ -1296,6 +1315,8 @@ let zoneAssignmentsStore = [];
 let branchLockdownsStore = {};
 let stocktakeSessionsStore = [];
 let stocktakeSegmentsStore = [];
+let dailyBlindConfigsStore = [];
+let dailyBlindCountsStore = [];
 
 // Staff & Customer Master Stores (Synced across multi-device Wi-Fi)
 let salespeopleStore = [];
@@ -1581,22 +1602,32 @@ function isMatch(rec, reqComp, reqBranch, isCatalog = false) {
   return true;
 }
 
-// Helper: Extract timestamp in milliseconds
+// Helper: Extract timestamp in milliseconds (considers refund/void timestamps so CatchUp never omits them)
 function getTimestamp(rec) {
   if (!rec) return 0;
-  const t =
-    rec.updatedAt ??
-    rec.hubTimestamp ??
-    rec.lastUpdated ??
-    rec.updated_at ??
-    rec.timestamp ??
-    rec.createdAt ??
-    rec.created_at ??
-    rec.date;
-  if (t === undefined || t === null) return 0;
-  if (typeof t === 'number') return t;
-  const tm = new Date(t).getTime();
-  return isNaN(tm) ? 0 : tm;
+  const parseTs = (v) => {
+    if (v === undefined || v === null || v === '') return 0;
+    if (typeof v === 'number') return isNaN(v) ? 0 : v;
+    const tm = new Date(v).getTime();
+    return isNaN(tm) ? 0 : tm;
+  };
+  const candidates = [
+    rec.updatedAt,
+    rec.hubTimestamp,
+    rec.lastUpdated,
+    rec.updated_at,
+    rec.refundedAt,
+    rec.voidedAt,
+    rec.mobileVerifiedAt,
+  ];
+  let best = 0;
+  for (let i = 0; i < candidates.length; i++) {
+    const val = parseTs(candidates[i]);
+    if (val > best) best = val;
+  }
+  if (best > 0) return best;
+  const fallback = rec.timestamp ?? rec.createdAt ?? rec.created_at ?? rec.date;
+  return parseTs(fallback);
 }
 
 // Cloud-Controlled Disk Rotation (default 30 days) & Storage Safety Trim (default 2GB)
@@ -1711,6 +1742,8 @@ function loadData() {
       }
       if (Array.isArray(parsed.stocktakeSessions)) stocktakeSessionsStore = parsed.stocktakeSessions;
       if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
+      if (Array.isArray(parsed.dailyBlindConfigs)) dailyBlindConfigsStore = parsed.dailyBlindConfigs;
+      if (Array.isArray(parsed.dailyBlindCounts)) dailyBlindCountsStore = parsed.dailyBlindCounts;
       if (Array.isArray(parsed.tombstones)) tombstonesStore = parsed.tombstones;
       if (Array.isArray(parsed.securityAlerts)) securityAlertsStore = parsed.securityAlerts;
       if (parsed.permissionsMatrix && Array.isArray(parsed.permissionsMatrix.rules)) {
@@ -1803,6 +1836,8 @@ function saveData() {
       electronicSettlements: electronicSettlementsStore,
       branchLockdowns: branchLockdownsStore,
       stocktakeSessions: stocktakeSessionsStore,
+      dailyBlindConfigs: dailyBlindConfigsStore,
+      dailyBlindCounts: dailyBlindCountsStore,
       stocktakeSegments: stocktakeSegmentsStore,
       tombstones: tombstonesStore,
       securityAlerts: securityAlertsStore,
@@ -1848,8 +1883,181 @@ function saveData() {
 loadData();
 loadBlindVault();
 
-// HTTP server for health checks & ping
-const server = http.createServer((req, res) => {
+// =====================================================================
+// MUTUAL HMAC-SHA256 AUTH & ZERO-CAMERA PAIRING ENGINE (v4.1.0)
+// Compatible with both Android Hub APK (strict auth) & Termux Backup
+// =====================================================================
+const SECURITY_FILE = path.join(process.cwd(), 'hub-security.json');
+let hubSecurityState = {
+  hubId: `HUB-${hubBranchId}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`,
+  pairedDevices: {},
+  activePairCode: null,
+  pairCodeExpiresAt: 0,
+};
+const pendingPairRequests = new Map(); // deviceId -> { ws, deviceId, deviceName, branchId, tenantId, confirmCode, createdAt }
+const pairRateLimitMap = new Map(); // ip -> { count, windowStart }
+
+function loadHubSecurityState() {
+  try {
+    if (fs.existsSync(SECURITY_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(SECURITY_FILE, 'utf8'));
+      if (parsed && typeof parsed === 'object') {
+        hubSecurityState = {
+          hubId: String(parsed.hubId || hubSecurityState.hubId),
+          pairedDevices: parsed.pairedDevices && typeof parsed.pairedDevices === 'object' ? parsed.pairedDevices : {},
+          activePairCode: parsed.activePairCode || null,
+          pairCodeExpiresAt: Number(parsed.pairCodeExpiresAt || 0),
+        };
+      }
+    } else {
+      saveHubSecurityState();
+    }
+  } catch (err) {
+    console.warn('[Termux Hub] Failed to load hub-security.json:', err.message);
+  }
+}
+
+function saveHubSecurityState() {
+  try {
+    fs.writeFileSync(SECURITY_FILE, JSON.stringify(hubSecurityState, null, 2), { encoding: 'utf8', mode: 0o600 });
+  } catch (err) {
+    console.warn('[Termux Hub] Failed to save hub-security.json:', err.message);
+  }
+}
+
+function hubHmacSha256Hex(secret, message) {
+  return crypto.createHmac('sha256', String(secret)).update(String(message), 'utf8').digest('hex');
+}
+
+function hubConstantTimeEqual(a, b) {
+  const sa = String(a || '');
+  const sb = String(b || '');
+  if (!sa || !sb || sa.length !== sb.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sa, 'utf8'), Buffer.from(sb, 'utf8'));
+  } catch {
+    return false;
+  }
+}
+
+function computeHubVisualConfirmCode(hubId, deviceId, clientNonce) {
+  const hashHex = crypto
+    .createHash('sha256')
+    .update(`PAIR:${hubId}:${deviceId}:${clientNonce}`, 'utf8')
+    .digest('hex');
+  const num = parseInt(hashHex.slice(0, 8), 16) % 1000000;
+  const padded = String(num).padStart(6, '0');
+  return `${padded.slice(0, 3)}-${padded.slice(3, 6)}`;
+}
+
+function issueNewPairCode(ttlMs = 120000) {
+  const code = String(crypto.randomInt(100000, 1000000));
+  hubSecurityState.activePairCode = code;
+  hubSecurityState.pairCodeExpiresAt = Date.now() + ttlMs;
+  saveHubSecurityState();
+  return { pairCode: code, expiresAt: hubSecurityState.pairCodeExpiresAt };
+}
+
+function isPairRateLimited(remoteIp) {
+  const key = String(remoteIp || 'unknown');
+  const now = Date.now();
+  const entry = pairRateLimitMap.get(key);
+  if (!entry || now - entry.windowStart > 60000) {
+    pairRateLimitMap.set(key, { count: 0, windowStart: now });
+    return false;
+  }
+  return entry.count >= 5;
+}
+
+function recordPairFailure(remoteIp) {
+  const key = String(remoteIp || 'unknown');
+  const now = Date.now();
+  const entry = pairRateLimitMap.get(key);
+  if (!entry || now - entry.windowStart > 60000) {
+    pairRateLimitMap.set(key, { count: 1, windowStart: now });
+  } else {
+    entry.count += 1;
+  }
+}
+
+function emitHubIpcEvent(eventObj) {
+  try {
+    console.log(`[HUB_IPC] ${JSON.stringify(eventObj)}`);
+  } catch {}
+}
+
+function approveDevicePairing(ws, deviceInfo) {
+  const deviceId = String(deviceInfo.deviceId || '').trim();
+  if (!deviceId) return null;
+  const deviceSecret = crypto.randomBytes(32).toString('hex');
+  hubSecurityState.pairedDevices[deviceId] = {
+    deviceId,
+    deviceName: String(deviceInfo.deviceName || 'POS Terminal'),
+    branchId: String(deviceInfo.branchId || hubBranchId),
+    tenantId: String(deviceInfo.tenantId || hubTenantId),
+    deviceSecret,
+    pairedAt: Date.now(),
+    lastSeenAt: Date.now(),
+    revoked: false,
+  };
+  saveHubSecurityState();
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.isAuthenticated = true;
+    ws.pairedDeviceId = deviceId;
+    ws.pairedDeviceSecret = deviceSecret;
+    ws.authNonce = '';
+    try {
+      ws.send(JSON.stringify({
+        type: 'PAIR_APPROVED',
+        action: 'PAIR_APPROVED',
+        hubId: hubSecurityState.hubId,
+        hub_id: hubSecurityState.hubId,
+        branchId: hubBranchId,
+        branch_id: hubBranchId,
+        branchName: hubBranchName,
+        branch_name: hubBranchName,
+        tenantId: hubTenantId,
+        tenant_id: hubTenantId,
+        deviceSecret,
+        version: HUB_VERSION,
+        hub_runtime: HUB_RUNTIME,
+        ota_slot: HUB_OTA_SLOT,
+        serverTime: Date.now(),
+      }));
+    } catch {}
+  }
+  pendingPairRequests.delete(deviceId);
+  console.log(`[Termux Hub] 🔐 Paired device "${deviceInfo.deviceName || deviceId}" (${deviceId}) cleanly.`);
+  return hubSecurityState.pairedDevices[deviceId];
+}
+
+function isLocalhostRequest(req) {
+  const addr = String(req.socket?.remoteAddress || '');
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      if (body.length < 65536) body += chunk.toString();
+    });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch {
+        resolve({});
+      }
+    });
+    req.on('error', () => resolve({}));
+  });
+}
+
+loadHubSecurityState();
+
+// HTTP server for health checks, ping, and localhost-only Native Shell admin bridge
+const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -1865,7 +2073,12 @@ const server = http.createServer((req, res) => {
       JSON.stringify({
         status: 'ok',
         hub: 'Termux-Local-Hub-Saimetric',
-        version: '3.4.0',
+        hubId: hubSecurityState.hubId,
+        version: HUB_VERSION,
+        hubRuntime: HUB_RUNTIME,
+        otaSlot: HUB_OTA_SLOT,
+        authRequired: HUB_REQUIRE_AUTH,
+        pairedDevicesCount: Object.values(hubSecurityState.pairedDevices).filter((d) => d && !d.revoked).length,
         branchId: hubBranchId,
         branchName: hubBranchName,
         tenantId: hubTenantId,
@@ -1890,8 +2103,11 @@ const server = http.createServer((req, res) => {
         branch_id: hubBranchId,
         branch_name: hubBranchName,
         tenant_id: hubTenantId,
-        hub_id: `HUB-${hubBranchId}`,
-        version: '3.4.0',
+        hub_id: hubSecurityState.hubId,
+        version: HUB_VERSION,
+        hub_runtime: HUB_RUNTIME,
+        ota_slot: HUB_OTA_SLOT,
+        auth_required: HUB_REQUIRE_AUTH,
         totalRecords: salesStore.length + directGrvsStore.length,
         casualWorkersCount: casualWorkersStore.length,
         branchesCount: branchesStore.length,
@@ -1899,6 +2115,124 @@ const server = http.createServer((req, res) => {
         timestamp: Date.now(),
       })
     );
+  }
+
+  // Localhost-only Native Shell Admin API (127.0.0.1 only — unreachable from LAN Wi-Fi)
+  if (req.url && req.url.startsWith('/local-admin/')) {
+    if (!isLocalhostRequest(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'Localhost access only' }));
+    }
+
+    if (req.method === 'GET' && req.url === '/local-admin/security-state') {
+      const now = Date.now();
+      const safeDevices = Object.values(hubSecurityState.pairedDevices).map((d) => ({
+        deviceId: d.deviceId,
+        deviceName: d.deviceName,
+        branchId: d.branchId,
+        pairedAt: d.pairedAt,
+        lastSeenAt: d.lastSeenAt,
+        revoked: Boolean(d.revoked),
+      }));
+      const pending = Array.from(pendingPairRequests.values())
+        .filter((p) => now - p.createdAt < 120000)
+        .map((p) => ({
+          deviceId: p.deviceId,
+          deviceName: p.deviceName,
+          branchId: p.branchId,
+          confirmCode: p.confirmCode,
+          createdAt: p.createdAt,
+        }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        hubId: hubSecurityState.hubId,
+        branchId: hubBranchId,
+        branchName: hubBranchName,
+        tenantId: hubTenantId,
+        version: HUB_VERSION,
+        hubRuntime: HUB_RUNTIME,
+        otaSlot: HUB_OTA_SLOT,
+        authRequired: HUB_REQUIRE_AUTH,
+        activePairCode: hubSecurityState.pairCodeExpiresAt > now ? hubSecurityState.activePairCode : null,
+        pairCodeExpiresAt: hubSecurityState.pairCodeExpiresAt > now ? hubSecurityState.pairCodeExpiresAt : 0,
+        pairedDevices: safeDevices,
+        pendingApprovals: pending,
+      }));
+    }
+
+    if (req.method === 'POST' && req.url === '/local-admin/pair-code') {
+      const issued = issueNewPairCode(120000);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ hubId: hubSecurityState.hubId, ...issued }));
+    }
+
+    if (req.method === 'POST' && req.url === '/local-admin/approve-pair') {
+      const body = await readJsonBody(req);
+      const pending = pendingPairRequests.get(String(body.deviceId || ''));
+      if (!pending) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'Pending pairing request not found or expired' }));
+      }
+      approveDevicePairing(pending.ws, pending);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: true, deviceId: pending.deviceId }));
+    }
+
+    if (req.method === 'POST' && req.url === '/local-admin/reject-pair') {
+      const body = await readJsonBody(req);
+      const pending = pendingPairRequests.get(String(body.deviceId || ''));
+      if (pending) {
+        try {
+          if (pending.ws && pending.ws.readyState === WebSocket.OPEN) {
+            pending.ws.send(JSON.stringify({
+              type: 'PAIR_REJECTED',
+              action: 'PAIR_REJECTED',
+              reason: String(body.reason || 'Pairing rejected on Local Hub.'),
+            }));
+          }
+        } catch {}
+        pendingPairRequests.delete(pending.deviceId);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: true }));
+    }
+
+    if (req.method === 'POST' && req.url === '/local-admin/revoke-device') {
+      const body = await readJsonBody(req);
+      const targetId = String(body.deviceId || '').trim();
+      if (targetId && hubSecurityState.pairedDevices[targetId]) {
+        hubSecurityState.pairedDevices[targetId].revoked = true;
+        saveHubSecurityState();
+        wss.clients.forEach((client) => {
+          if (client.pairedDeviceId === targetId && client.readyState === WebSocket.OPEN) {
+            try {
+              client.send(JSON.stringify({ type: 'AUTH_FAILED', reason: 'Device pairing was revoked on the Local Hub.' }));
+              client.close(4003, 'Device revoked');
+            } catch {}
+          }
+        });
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: true, revokedDeviceId: targetId }));
+    }
+
+    if (req.method === 'POST' && req.url === '/local-admin/broadcast-updating') {
+      const body = await readJsonBody(req);
+      const notice = JSON.stringify({
+        type: 'HUB_UPDATING',
+        action: 'HUB_UPDATING',
+        targetVersion: String(body.targetVersion || ''),
+        etaSeconds: Number(body.etaSeconds || 6),
+        timestamp: Date.now(),
+      });
+      wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+          try { client.send(notice); } catch {}
+        }
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ success: true }));
+    }
   }
 
   res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -2497,7 +2831,7 @@ function getRecordTotal(rec, norm) {
       return (Number(rec.in) || 0) - (Number(rec.out) || 0);
     case 'credit_sales':
     case 'credit_sale':
-      return Number(rec.amount || rec.out) || 0;
+      return (Number(rec.out ?? rec.amount) || 0) - (Number(rec.in) || 0);
     case 'cash_logs':
     case 'cash_log':
       return (Number(rec.in) || 0) - (Number(rec.out) || 0);
@@ -2755,6 +3089,26 @@ function computeDigestDiff(clientDigest, entityType) {
       if (rec.status && clientItem.status && rec.status !== clientItem.status) {
         missingOrOutdated.push(rec);
       }
+    } else if (norm === 'customer_changes' || norm === 'customer_change' || norm === 'credit_sales' || norm === 'credit_sale') {
+      // T1 check: colliding sequential ID with different amount (e.g. CHG-002 $56 vs $89)
+      const hubTotal = getRecordTotal(rec, norm);
+      const clientTotal = Number(clientItem.total) || 0;
+      if (Math.abs(hubTotal - clientTotal) > 0.005) {
+        missingOrOutdated.push(rec);
+      }
+    } else if (
+      norm === 'expenses' ||
+      norm === 'expense' ||
+      norm === 'direct_grvs' ||
+      norm === 'direct_grv' ||
+      norm === 'grv' ||
+      norm === 'internal_consumptions' ||
+      norm === 'internal_consumption'
+    ) {
+      // T1 approval status discrepancy (e.g. APPROVED/REJECTED on Hub vs PENDING on client)
+      if (rec.status && clientItem.status && String(rec.status).toLowerCase() !== String(clientItem.status).toLowerCase()) {
+        missingOrOutdated.push(rec);
+      }
     }
   }
 
@@ -2791,6 +3145,30 @@ function computeClientMissingOnHub(clientDigest, entityType) {
       const hubUpdated = getRecordTimestamp(hubRec);
       const clientUpdated = clientTs;
       if (clientUpdated - hubUpdated > 60000) {
+        missingOnHubIds.push(cleanId);
+      }
+    } else if (norm === 'sales' || norm === 'sale') {
+      // Request push if client has Refunded/Voided while Hub still has Completed
+      if (item.status && hubRec.status && item.status !== hubRec.status) {
+        missingOnHubIds.push(cleanId);
+      }
+    } else if (norm === 'customer_changes' || norm === 'customer_change' || norm === 'credit_sales' || norm === 'credit_sale') {
+      // Request push if client has colliding ID with different amount
+      const hubTotal = getRecordTotal(hubRec, norm);
+      const clientTotal = Number(item.total) || 0;
+      if (Math.abs(hubTotal - clientTotal) > 0.005) {
+        missingOnHubIds.push(cleanId);
+      }
+    } else if (
+      norm === 'expenses' ||
+      norm === 'expense' ||
+      norm === 'direct_grvs' ||
+      norm === 'direct_grv' ||
+      norm === 'grv' ||
+      norm === 'internal_consumptions' ||
+      norm === 'internal_consumption'
+    ) {
+      if (item.status && hubRec.status && String(item.status).toLowerCase() !== String(hubRec.status).toLowerCase()) {
         missingOnHubIds.push(cleanId);
       }
     }
@@ -2932,34 +3310,128 @@ const terminalLastActivity = new Map();
 // WebSocket Server
 const wss = new WebSocketServer({ server });
 
+// Active 20s server-side keepalive to prevent silent Wi-Fi zombie sockets on Android
+// Active 20s server-side keepalive + unauthenticated idle reaper
+const UNAUTH_ALLOWED_OUTBOUND = new Set([
+  'AUTH_CHALLENGE',
+  'AUTH_OK',
+  'AUTH_FAILED',
+  'PAIR_PENDING',
+  'PAIR_APPROVED',
+  'PAIR_REJECTED',
+  'HUB_INFO',
+  'PING',
+  'PONG',
+  'HUB_UPDATING',
+  'HUB_UPDATE_STATUS',
+]);
+
+setInterval(() => {
+  const now = Date.now();
+  wss.clients.forEach((client) => {
+    if (client.readyState !== WebSocket.OPEN) return;
+    // Drop unauthenticated sockets that stall (30s normal, 120s if actively waiting for Hub UI pairing approval)
+    if (HUB_REQUIRE_AUTH && !client.isAuthenticated) {
+      const limitMs = client.hasPendingPair ? 120000 : 30000;
+      if (client.connectedAt && now - client.connectedAt > limitMs) {
+        try {
+          client.send(JSON.stringify({ type: 'AUTH_FAILED', reason: 'Authentication/pairing timeout.' }));
+          client.close(4002, 'Auth timeout');
+        } catch {}
+        return;
+      }
+    }
+    if (client.lastActivityAt && now - client.lastActivityAt > 50000) {
+      try {
+        client.terminate();
+      } catch {}
+      return;
+    }
+    try {
+      client.send(JSON.stringify({ type: 'PING', ts: now }));
+    } catch {}
+  });
+}, 20000);
+
 wss.on('connection', (ws, req) => {
   const remoteIp = req.socket.remoteAddress;
-  console.log(`[Termux Hub] 🟢 POS Terminal connected from ${remoteIp}`);
+  console.log(`[Termux Hub] 🟢 POS Terminal connected from ${remoteIp} (AuthRequired=${HUB_REQUIRE_AUTH})`);
 
   let terminalDeviceId = null;
+  ws.isAuthenticated = !HUB_REQUIRE_AUTH;
+  ws.authNonce = crypto.randomBytes(32).toString('hex');
+  ws.connectedAt = Date.now();
+  ws.lastActivityAt = Date.now();
+  ws.hasPendingPair = false;
+  ws.pairedDeviceId = null;
+  ws.pairedDeviceSecret = null;
 
-  // Send immediate greeting with branch identity
-  try {
-    const greeting = {
-      type: 'HUB_GREETING',
-      action: 'HUB_INFO',
-      hub_id: `HUB-${hubBranchId}`,
-      branch_id: hubBranchId,
-      branch_name: hubBranchName,
-      tenant_id: hubTenantId,
-      version: '3.7.0',
-      totalSales: salesStore.length,
-      totalInventory: inventoryStore.length,
-      lastCloudSyncTimestamp,
-      message: `Connected to Saimetric Local Hub (${hubBranchName})`,
-      timestamp: Date.now(),
+  // Socket-level egress quarantine: prevents any broadcast loop from leaking business data before auth
+  if (HUB_REQUIRE_AUTH) {
+    const rawWsSend = ws.send.bind(ws);
+    ws.send = (data, ...rest) => {
+      if (!ws.isAuthenticated) {
+        try {
+          const parsed = typeof data === 'string' ? JSON.parse(data) : null;
+          const outType = String(parsed?.type || parsed?.action || '').toUpperCase();
+          if (!UNAUTH_ALLOWED_OUTBOUND.has(outType)) {
+            return;
+          }
+        } catch {
+          return;
+        }
+      }
+      return rawWsSend(data, ...rest);
     };
-    ws.send(JSON.stringify(greeting));
+  }
+
+  // Always send AUTH_CHALLENGE so paired clients authenticate mutually & Termux backup clients auto-detect optional mode
+  try {
+    ws.send(JSON.stringify({
+      type: 'AUTH_CHALLENGE',
+      action: 'AUTH_CHALLENGE',
+      hubId: hubSecurityState.hubId,
+      hub_id: hubSecurityState.hubId,
+      branchId: hubBranchId,
+      branch_id: hubBranchId,
+      tenantId: hubTenantId,
+      tenant_id: hubTenantId,
+      nonce: ws.authNonce,
+      timestamp: Date.now(),
+      auth_required: HUB_REQUIRE_AUTH,
+      version: HUB_VERSION,
+      hub_runtime: HUB_RUNTIME,
+      ota_slot: HUB_OTA_SLOT,
+    }));
   } catch (e) {}
 
-  // 3.5s delayed automatic background reconciliation sweep trigger upon connection
+  // In open Termux backup mode, also send immediate HUB_GREETING for legacy compatibility
+  if (!HUB_REQUIRE_AUTH) {
+    try {
+      const greeting = {
+        type: 'HUB_GREETING',
+        action: 'HUB_INFO',
+        hub_id: hubSecurityState.hubId,
+        branch_id: hubBranchId,
+        branch_name: hubBranchName,
+        tenant_id: hubTenantId,
+        version: HUB_VERSION,
+        hub_runtime: HUB_RUNTIME,
+        ota_slot: HUB_OTA_SLOT,
+        auth_required: HUB_REQUIRE_AUTH,
+        totalSales: salesStore.length,
+        totalInventory: inventoryStore.length,
+        lastCloudSyncTimestamp,
+        message: `Connected to Saimetric Local Hub (${hubBranchName})`,
+        timestamp: Date.now(),
+      };
+      ws.send(JSON.stringify(greeting));
+    } catch (e) {}
+  }
+
+  // 3.5s delayed automatic background reconciliation sweep trigger upon authenticated connection
   setTimeout(() => {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws.readyState === WebSocket.OPEN && ws.isAuthenticated) {
       if (terminalDeviceId) {
         const lastSeen = terminalLastActivity.get(terminalDeviceId) || 0;
         const gapMs = Date.now() - lastSeen;
@@ -2975,6 +3447,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('message', (message) => {
     try {
+      ws.lastActivityAt = Date.now();
       const dataStr = message.toString();
       let packet;
       try {
@@ -2989,6 +3462,233 @@ wss.on('connection', (ws, req) => {
       const payload = packet.payload || packet.data || packet.item;
       const sheetName = packet.sheetName || packet.sheet;
       const entityType = packet.entityType || packet.entity;
+
+      // =====================================================================
+      // KEEPALIVE PING / PONG
+      // =====================================================================
+      if (pType === 'PING' || pType === 'HEARTBEAT') {
+        try {
+          ws.send(JSON.stringify({ type: 'PONG', ts: packet.ts || Date.now() }));
+        } catch {}
+        return;
+      }
+      if (pType === 'PONG') {
+        return;
+      }
+
+      // =====================================================================
+      // ZERO-CAMERA PAIRING & MUTUAL HMAC AUTH HANDLERS
+      // =====================================================================
+      if (pType === 'PAIR_REQUEST') {
+        if (isPairRateLimited(remoteIp)) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'PAIR_REJECTED',
+              reason: 'Too many failed pairing attempts. Please wait 60 seconds and try again.',
+            }));
+          } catch {}
+          return;
+        }
+
+        const reqDeviceId = String(packet.deviceId || '').trim();
+        const reqDeviceName = String(packet.deviceName || 'POS Terminal').trim();
+        const reqBranchId = String(packet.branchId || hubBranchId).trim();
+        const reqTenantId = String(packet.tenantId || hubTenantId).trim();
+        const reqPairCode = String(packet.pairCode || '').replace(/[^0-9A-Za-z]/g, '').trim();
+        const reqClientNonce = String(packet.clientNonce || '').trim();
+
+        if (!reqDeviceId) {
+          try {
+            ws.send(JSON.stringify({ type: 'PAIR_REJECTED', reason: 'Missing deviceId in PAIR_REQUEST.' }));
+          } catch {}
+          return;
+        }
+
+        // Path A: 6-digit single-use pairing code verification
+        if (reqPairCode) {
+          const now = Date.now();
+          const hasValidCode =
+            Boolean(hubSecurityState.activePairCode) &&
+            hubSecurityState.pairCodeExpiresAt > now &&
+            hubConstantTimeEqual(reqPairCode, hubSecurityState.activePairCode);
+
+          if (!hasValidCode) {
+            recordPairFailure(remoteIp);
+            try {
+              ws.send(JSON.stringify({
+                type: 'PAIR_REJECTED',
+                reason: 'Invalid or expired 6-digit pairing code. Generate a fresh code on the Hub.',
+              }));
+            } catch {}
+            return;
+          }
+
+          // Consume single-use code immediately
+          hubSecurityState.activePairCode = null;
+          hubSecurityState.pairCodeExpiresAt = 0;
+          approveDevicePairing(ws, {
+            deviceId: reqDeviceId,
+            deviceName: reqDeviceName,
+            branchId: reqBranchId,
+            tenantId: reqTenantId,
+          });
+          return;
+        }
+
+        // Path B: TV-Style / Desktop 1-Tap Approval on Hub UI (no camera or code needed)
+        const confirmCode = computeHubVisualConfirmCode(hubSecurityState.hubId, reqDeviceId, reqClientNonce);
+        pendingPairRequests.set(reqDeviceId, {
+          ws,
+          deviceId: reqDeviceId,
+          deviceName: reqDeviceName,
+          branchId: reqBranchId,
+          tenantId: reqTenantId,
+          confirmCode,
+          createdAt: Date.now(),
+        });
+
+        emitHubIpcEvent({
+          event: 'PAIR_APPROVAL_NEEDED',
+          hubId: hubSecurityState.hubId,
+          deviceId: reqDeviceId,
+          deviceName: reqDeviceName,
+          branchId: reqBranchId,
+          confirmCode,
+        });
+        ws.hasPendingPair = true;
+        console.log(`[Termux Hub] 🔐 PAIRING REQUEST from "${reqDeviceName}" (${reqDeviceId}) — Confirm Code: ${confirmCode}`);
+
+        try {
+          ws.send(JSON.stringify({
+            type: 'PAIR_PENDING',
+            action: 'PAIR_PENDING',
+            hubId: hubSecurityState.hubId,
+            hub_id: hubSecurityState.hubId,
+            branchId: hubBranchId,
+            branchName: hubBranchName,
+            confirmCode,
+            timestamp: Date.now(),
+          }));
+        } catch {}
+        return;
+      }
+
+      if (pType === 'AUTH_RESPONSE') {
+        const reqDeviceId = String(packet.deviceId || '').trim();
+        const reqNonce = String(packet.nonce || '').trim();
+        const reqClientNonce = String(packet.clientNonce || '').trim();
+        const reqTs = Number(packet.timestamp || 0);
+        const reqClientProof = String(packet.clientProof || '').trim();
+        const deviceRec = hubSecurityState.pairedDevices[reqDeviceId];
+
+        if (!deviceRec || deviceRec.revoked) {
+          try {
+            ws.send(JSON.stringify({
+              type: 'AUTH_FAILED',
+              reason: deviceRec?.revoked ? 'This device was revoked on the Local Hub.' : 'Unrecognized device. Pair this device first.',
+            }));
+            ws.close(4001, 'Unauthorized device');
+          } catch {}
+          return;
+        }
+
+        if (!ws.authNonce || !hubConstantTimeEqual(reqNonce, ws.authNonce)) {
+          try {
+            ws.send(JSON.stringify({ type: 'AUTH_FAILED', reason: 'Invalid or replayed auth nonce.' }));
+            ws.close(4001, 'Invalid nonce');
+          } catch {}
+          return;
+        }
+
+        if (!Number.isFinite(reqTs) || Math.abs(Date.now() - reqTs) > 120000) {
+          try {
+            ws.send(JSON.stringify({ type: 'AUTH_FAILED', reason: 'Auth timestamp expired or clock drift exceeds 2 minutes.' }));
+            ws.close(4001, 'Timestamp drift');
+          } catch {}
+          return;
+        }
+
+        const expectedClientProof = hubHmacSha256Hex(
+          deviceRec.deviceSecret,
+          `CLIENT:${reqNonce}:${hubSecurityState.hubId}:${reqDeviceId}:${reqTs}`
+        );
+
+        if (!hubConstantTimeEqual(reqClientProof, expectedClientProof)) {
+          try {
+            ws.send(JSON.stringify({ type: 'AUTH_FAILED', reason: 'Cryptographic client proof verification failed.' }));
+            ws.close(4001, 'Invalid clientProof');
+          } catch {}
+          return;
+        }
+
+        // Mutual Proof: Hub proves its own identity over clientNonce so PWA rejects spoofed Hubs!
+        const serverTime = Date.now();
+        const hubProof = hubHmacSha256Hex(
+          deviceRec.deviceSecret,
+          `HUB:${reqClientNonce}:${hubSecurityState.hubId}:${hubBranchId}:${serverTime}`
+        );
+
+        ws.isAuthenticated = true;
+        ws.pairedDeviceId = reqDeviceId;
+        ws.pairedDeviceSecret = deviceRec.deviceSecret;
+        ws.authNonce = ''; // Single-use nonce consumed
+        deviceRec.lastSeenAt = serverTime;
+        saveHubSecurityState();
+
+        try {
+          ws.send(JSON.stringify({
+            type: 'AUTH_OK',
+            action: 'AUTH_OK',
+            hubId: hubSecurityState.hubId,
+            hub_id: hubSecurityState.hubId,
+            branchId: hubBranchId,
+            branch_id: hubBranchId,
+            branchName: hubBranchName,
+            branch_name: hubBranchName,
+            tenantId: hubTenantId,
+            tenant_id: hubTenantId,
+            version: HUB_VERSION,
+            hub_runtime: HUB_RUNTIME,
+            ota_slot: HUB_OTA_SLOT,
+            serverTime,
+            hubProof,
+          }));
+        } catch {}
+        console.log(`[Termux Hub] ✅ Mutually authenticated terminal "${deviceRec.deviceName}" (${reqDeviceId})`);
+        return;
+      }
+
+      // Quarantine guard: block all business packets until authenticated when HUB_REQUIRE_AUTH is active
+      if (HUB_REQUIRE_AUTH && !ws.isAuthenticated && pType !== 'PING_HUB' && pType !== 'PING_IDENTITY') {
+        try {
+          ws.send(JSON.stringify({
+            type: 'AUTH_FAILED',
+            reason: 'Authentication required. Complete mutual handshake or pair this terminal first.',
+          }));
+        } catch {}
+        return;
+      }
+
+      // Cloud OTA check hook (forwarded to Android Native Shell via IPC)
+      if (pType === 'CHECK_HUB_UPDATE') {
+        emitHubIpcEvent({
+          event: 'CHECK_HUB_UPDATE',
+          requestedBy: packet.deviceId || ws.pairedDeviceId || 'UNKNOWN',
+          timestamp: Date.now(),
+        });
+        if (HUB_RUNTIME !== 'ANDROID_APK') {
+          try {
+            ws.send(JSON.stringify({
+              type: 'HUB_UPDATE_STATUS',
+              action: 'HUB_UPDATE_STATUS',
+              status: 'TERMUX_MANUAL',
+              message: `Running Termux Backup Hub v${HUB_VERSION}. Signed Cloud OTA applies to the Android Hub APK.`,
+              timestamp: Date.now(),
+            }));
+          } catch {}
+        }
+        return;
+      }
 
       if (packet.cloudSyncUrl || packet.cloudUrl) {
         cloudSyncUrl = packet.cloudSyncUrl || packet.cloudUrl;
@@ -3216,8 +3916,11 @@ wss.on('connection', (ws, req) => {
           branch_id: hubBranchId,
           branch_name: hubBranchName,
           tenant_id: hubTenantId,
-          hub_id: `HUB-${hubBranchId}`,
-          version: '3.7.0',
+          hub_id: hubSecurityState.hubId,
+          version: HUB_VERSION,
+          hub_runtime: HUB_RUNTIME,
+          ota_slot: HUB_OTA_SLOT,
+          auth_required: HUB_REQUIRE_AUTH,
           routing_epoch: cloudRoutingEpoch,
           totalRecords: salesStore.length + directGrvsStore.length,
           casualWorkersCount: casualWorkersStore.length,
@@ -3236,6 +3939,25 @@ wss.on('connection', (ws, req) => {
       // 0.1 RESET HUB IDENTITY & REPURPOSE HARDWARE
       // =====================================================================
       if (pType === 'RESET_BRANCH') {
+        if (HUB_REQUIRE_AUTH) {
+          const authTs = Number(packet.authTs || 0);
+          const authSig = String(packet.authSig || '');
+          const recordId = String(packet.packet_id || packet.entityId || packet.recordId || 'GLOBAL');
+          const validTs = Number.isFinite(authTs) && Math.abs(Date.now() - authTs) <= 60000;
+          const expectedSig = ws.pairedDeviceSecret
+            ? hubHmacSha256Hex(ws.pairedDeviceSecret, `CMD:RESET_BRANCH:${recordId}:${authTs}`)
+            : '';
+          if (!ws.isAuthenticated || !validTs || !hubConstantTimeEqual(authSig, expectedSig)) {
+            console.warn('[Termux Hub] 🛑 Blocked unsigned/invalid RESET_BRANCH command.');
+            try {
+              ws.send(JSON.stringify({
+                type: 'AUTH_FAILED',
+                reason: 'RESET_BRANCH requires a valid signed command from an authenticated paired terminal.',
+              }));
+            } catch {}
+            return;
+          }
+        }
         console.warn(`[Termux Hub] ⚠️ RESET_BRANCH received! Wiping memory and resetting branch identity...`);
         salesStore = [];
         inventoryStore = [];
@@ -4877,9 +5599,16 @@ wss.on('connection', (ws, req) => {
 
       if (isSale && saleId) {
         const senderDeviceId = packet.origin_device_id || packet.originDeviceId || packet.deviceId || 'UNKNOWN-DEVICE';
-        const saleClockCheck = validatePacketClock(ws, packet, saleObj, senderDeviceId, pType === 'SALE_UPDATE' ? 'SALE_UPDATE' : 'SALE');
-        if (!saleClockCheck.accepted) {
-          return;
+        const isSaleMutation =
+          pType === 'SALE_UPDATE' ||
+          saleObj?.status === 'Refunded' ||
+          saleObj?.status === 'Voided' ||
+          Boolean(saleObj?.mobileVerificationStatus);
+        if (!isSaleMutation) {
+          const saleClockCheck = validatePacketClock(ws, packet, saleObj, senderDeviceId, 'SALE');
+          if (!saleClockCheck.accepted) {
+            return;
+          }
         }
         const isLegacyInv = String(saleId).toUpperCase().startsWith('INV-');
         const existingIdx = salesStore.findIndex((s) => s.id === saleId);
@@ -4943,10 +5672,22 @@ wss.on('connection', (ws, req) => {
           }
 
           // Otherwise update existing record (e.g. cashier issuing refund/void, exchange, or mobile money verification)
+          const nowHubMs = Date.now();
+          const statusOrVerifyChanged =
+            (cleanSaleObj?.status && cleanSaleObj.status !== prevSale?.status) ||
+            (cleanSaleObj?.mobileVerificationStatus && cleanSaleObj.mobileVerificationStatus !== prevSale?.mobileVerificationStatus) ||
+            Boolean(cleanSaleObj?.hasExchanges && !prevSale?.hasExchanges);
           const mergedSale = {
             ...salesStore[existingIdx],
             ...(cleanSaleObj || packet),
             ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+            ...(statusOrVerifyChanged
+              ? {
+                  updatedAt: Math.max(nowHubMs, Number(cleanSaleObj?.updatedAt) || 0),
+                  hubTimestamp: nowHubMs,
+                  lastUpdated: new Date(nowHubMs).toISOString(),
+                }
+              : {}),
           };
           if (isExistingMobFinal && isIncomingMobPending) {
             mergedSale.mobileVerificationStatus = prevSale.mobileVerificationStatus;
@@ -5501,19 +6242,63 @@ wss.on('connection', (ws, req) => {
         packet.entityType === 'customer_change';
       const changeId = payload ? (payload.changeId || payload.id) : null;
 
+      const extractHubPosInvRef = (rec, prefix) => {
+        if (!rec || typeof rec !== 'object') return '';
+        const explicitRef = String(rec.reference || rec.invoiceId || rec.saleId || '').trim();
+        if (explicitRef) return explicitRef.toUpperCase();
+        const rawId = String(rec.id || rec.changeId || rec.creditId || '').trim();
+        if (rawId.toUpperCase().startsWith(prefix + '-') && rawId.length > prefix.length + 4) {
+          const rest = rawId.slice(prefix.length + 1);
+          if (!/^\d{1,4}$/.test(rest) && !/^[A-Z0-9]{4}-[A-Z0-9]+-[A-Z0-9]{3}$/i.test(rest)) {
+            return rest.toUpperCase();
+          }
+        }
+        const desc = String(rec.description || rec.notes || '');
+        const m = desc.match(/Inv(?:oice)?\s*#?\s*([A-Z0-9][A-Z0-9_-]{3,})/i);
+        return m && m[1] ? m[1].trim().toUpperCase() : '';
+      };
+
       if (isCustomerChangePacket && payload && changeId) {
         const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
-        const exIdx = customerChangesStore.findIndex((c) => c.changeId === changeId || c.id === changeId);
-        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && customerChangesStore[exIdx].isCloudSynced === true);
-        const normChange = { ...payload, id: changeId, changeId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+        const incomingInvRef = extractHubPosInvRef(payload, 'CHG');
+        const canonicalChangeId = incomingInvRef ? `CHG-${incomingInvRef}` : changeId;
+        let exIdx = customerChangesStore.findIndex((c) => c.changeId === canonicalChangeId || c.id === canonicalChangeId || c.changeId === changeId || c.id === changeId);
+        if (exIdx < 0 && incomingInvRef) {
+          exIdx = customerChangesStore.findIndex((c) => {
+            const ref = extractHubPosInvRef(c, 'CHG');
+            return ref && ref === incomingInvRef && String(c.customerId || '').trim().toUpperCase() === String(payload.customerId || '').trim().toUpperCase();
+          });
+        }
+        // Collision guard: if same sequential ID belongs to a DIFFERENT customer or amount, preserve both with a deterministic suffix
+        let finalChangeId = canonicalChangeId;
         if (exIdx >= 0) {
-          customerChangesStore[exIdx] = { ...customerChangesStore[exIdx], ...normChange };
+          const existing = customerChangesStore[exIdx];
+          const sameCust = !payload.customerId || !existing.customerId || String(payload.customerId).trim().toUpperCase() === String(existing.customerId).trim().toUpperCase();
+          const sameAmt = Math.abs((Number(payload.in) || 0) - (Number(existing.in) || 0)) < 0.005 && Math.abs((Number(payload.out) || 0) - (Number(existing.out) || 0)) < 0.005;
+          if (!sameCust || !sameAmt) {
+            const sig = `${payload.customerId || ''}|${payload.in || 0}|${payload.out || 0}|${payload.date || ''}|${payload.timestamp || ''}`;
+            let h = 2166136261;
+            for (let hi = 0; hi < sig.length; hi++) { h ^= sig.charCodeAt(hi); h = Math.imul(h, 16777619); }
+            finalChangeId = `${changeId}-C${(h >>> 0).toString(36).toUpperCase().slice(0, 6)}`;
+            exIdx = customerChangesStore.findIndex((c) => c.id === finalChangeId || c.changeId === finalChangeId);
+          }
+        }
+        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && customerChangesStore[exIdx].isCloudSynced === true);
+        const normChange = {
+          ...payload,
+          id: finalChangeId,
+          changeId: finalChangeId,
+          ...(incomingInvRef && !payload.reference ? { reference: incomingInvRef } : {}),
+          ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+        };
+        if (exIdx >= 0) {
+          customerChangesStore[exIdx] = { ...customerChangesStore[exIdx], ...normChange, id: finalChangeId, changeId: finalChangeId };
         } else {
           customerChangesStore.unshift(normChange);
-          console.log(`[Termux Hub] 📥 Accepted Customer Change [${changeId}] (Append-Only)`);
+          console.log(`[Termux Hub] 📥 Accepted Customer Change [${finalChangeId}] (Append-Only)`);
         }
         scheduleSave();
-        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CUSTOMER_CHANGE', changeId);
+        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CUSTOMER_CHANGE', finalChangeId);
       }
 
       const isCreditSalePacket =
@@ -5526,17 +6311,44 @@ wss.on('connection', (ws, req) => {
 
       if (isCreditSalePacket && payload && creditId) {
         const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
-        const exIdx = creditSalesStore.findIndex((c) => c.creditId === creditId || c.id === creditId);
-        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && creditSalesStore[exIdx].isCloudSynced === true);
-        const normCredit = { ...payload, id: creditId, creditId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+        const incomingInvRef = extractHubPosInvRef(payload, 'CR');
+        const canonicalCreditId = incomingInvRef ? `CR-${incomingInvRef}` : creditId;
+        let exIdx = creditSalesStore.findIndex((c) => c.creditId === canonicalCreditId || c.id === canonicalCreditId || c.creditId === creditId || c.id === creditId);
+        if (exIdx < 0 && incomingInvRef) {
+          exIdx = creditSalesStore.findIndex((c) => {
+            const ref = extractHubPosInvRef(c, 'CR');
+            return ref && ref === incomingInvRef && String(c.customerId || '').trim().toUpperCase() === String(payload.customerId || '').trim().toUpperCase();
+          });
+        }
+        let finalCreditId = canonicalCreditId;
         if (exIdx >= 0) {
-          creditSalesStore[exIdx] = { ...creditSalesStore[exIdx], ...normCredit };
+          const existing = creditSalesStore[exIdx];
+          const sameCust = !payload.customerId || !existing.customerId || String(payload.customerId).trim().toUpperCase() === String(existing.customerId).trim().toUpperCase();
+          const sameAmt = Math.abs((Number(payload.out ?? payload.amount) || 0) - (Number(existing.out ?? existing.amount) || 0)) < 0.005 && Math.abs((Number(payload.in) || 0) - (Number(existing.in) || 0)) < 0.005;
+          if (!sameCust || !sameAmt) {
+            const sig = `${payload.customerId || ''}|${payload.out ?? payload.amount ?? 0}|${payload.in || 0}|${payload.date || ''}|${payload.timestamp || ''}`;
+            let h = 2166136261;
+            for (let hi = 0; hi < sig.length; hi++) { h ^= sig.charCodeAt(hi); h = Math.imul(h, 16777619); }
+            finalCreditId = `${creditId}-C${(h >>> 0).toString(36).toUpperCase().slice(0, 6)}`;
+            exIdx = creditSalesStore.findIndex((c) => c.id === finalCreditId || c.creditId === finalCreditId);
+          }
+        }
+        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && creditSalesStore[exIdx].isCloudSynced === true);
+        const normCredit = {
+          ...payload,
+          id: finalCreditId,
+          creditId: finalCreditId,
+          ...(incomingInvRef && !payload.reference ? { reference: incomingInvRef } : {}),
+          ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+        };
+        if (exIdx >= 0) {
+          creditSalesStore[exIdx] = { ...creditSalesStore[exIdx], ...normCredit, id: finalCreditId, creditId: finalCreditId };
         } else {
           creditSalesStore.unshift(normCredit);
-          console.log(`[Termux Hub] 📥 Accepted Credit Sale [${creditId}] (Append-Only)`);
+          console.log(`[Termux Hub] 📥 Accepted Credit Sale [${finalCreditId}] (Append-Only)`);
         }
         scheduleSave();
-        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CREDIT_SALE', creditId);
+        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CREDIT_SALE', finalCreditId);
       }
 
       // =====================================================================
@@ -5571,6 +6383,76 @@ wss.on('connection', (ws, req) => {
           scheduleSave();
           if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CREDIT_GROUP', groupId);
         }
+      }
+
+      // =====================================================================
+      // 7.2 DAILY BLIND COUNT CONFIGS & ARCHIVED REPORTS (T2 - LWW)
+      // =====================================================================
+      const isDailyBlindConfigPacket =
+        pType === 'DAILY_BLIND_CONFIG' ||
+        pType === 'DAILY_BLIND_CONFIG_SYNC' ||
+        pType === 'daily_blind_config' ||
+        sheetName === 'DailyBlindConfigs' ||
+        packet.entityType === 'daily_blind_config';
+      const dbcId = payload ? (payload.id || payload.configId) : (packet.id || packet.entityId);
+
+      if (isDailyBlindConfigPacket && payload && dbcId) {
+        const incomingTime = getTimestamp(payload) || getTimestamp(packet) || Date.now();
+        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
+        const exIdx = dailyBlindConfigsStore.findIndex((c) => c && String(c.id).toUpperCase() === String(dbcId).toUpperCase());
+        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && dailyBlindConfigsStore[exIdx].isCloudSynced === true);
+        if (exIdx >= 0) {
+          const existingTime = getTimestamp(dailyBlindConfigsStore[exIdx]) || 0;
+          if (incomingTime >= existingTime - 60000) {
+            dailyBlindConfigsStore[exIdx] = { ...dailyBlindConfigsStore[exIdx], ...payload, id: dbcId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+          }
+        } else {
+          dailyBlindConfigsStore.push({ ...payload, id: dbcId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) });
+        }
+        scheduleSave();
+        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'DAILY_BLIND_CONFIG', dbcId);
+      }
+
+      const isDailyBlindCountPacket =
+        pType === 'DAILY_BLIND_COUNT' ||
+        pType === 'DAILY_BLIND_COUNT_SYNC' ||
+        pType === 'daily_blind_count' ||
+        sheetName === 'DailyBlindCounts' ||
+        packet.entityType === 'daily_blind_count';
+      const dbcntId = payload ? (payload.id || payload.countId) : (packet.id || packet.entityId);
+
+      if (isDailyBlindCountPacket && payload && dbcntId) {
+        const statusRank = { SUBMITTED: 1, EXPLANATION_REQUESTED: 2, EXPLANATION_SUBMITTED: 3, ARCHIVED: 4 };
+        const incomingTime = getTimestamp(payload) || getTimestamp(packet) || Date.now();
+        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
+        const exIdx = dailyBlindCountsStore.findIndex((r) => r && String(r.id).toUpperCase() === String(dbcntId).toUpperCase());
+        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && dailyBlindCountsStore[exIdx].isCloudSynced === true);
+        if (exIdx >= 0) {
+          const existingRec = dailyBlindCountsStore[exIdx];
+          const exRank = statusRank[existingRec.status] || 1;
+          const incRank = statusRank[payload.status] || 1;
+          const existingTime = getTimestamp(existingRec) || 0;
+          if (existingRec.status !== 'ARCHIVED' || payload.status === 'ARCHIVED') {
+            if (incRank > exRank || (incRank === exRank && incomingTime >= existingTime - 60000)) {
+              dailyBlindCountsStore[exIdx] = {
+                ...existingRec,
+                ...payload,
+                id: dbcntId,
+                reportOnly: true,
+                ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+              };
+            }
+          }
+        } else {
+          dailyBlindCountsStore.push({
+            ...payload,
+            id: dbcntId,
+            reportOnly: true,
+            ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+          });
+        }
+        scheduleSave();
+        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'DAILY_BLIND_COUNT', dbcntId);
       }
 
       // =====================================================================
@@ -5636,12 +6518,39 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 9. TRANSACTIONAL DATA: EXPENSES & CASH TRANSFERS (APPEND-ONLY)
       // =====================================================================
-      if ((pType === 'EXPENSE' || sheetName === 'Expenses') && payload && payload.id) {
+      if ((pType === 'EXPENSE' || pType === 'expense' || sheetName === 'Expenses' || packet.entityType === 'expense') && payload && payload.id) {
         const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
         const exIdx = expensesStore.findIndex((e) => e.id === payload.id);
         const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && expensesStore[exIdx].isCloudSynced === true);
         if (exIdx >= 0) {
-          expensesStore[exIdx] = { ...expensesStore[exIdx], ...payload, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+          const prevExp = expensesStore[exIdx];
+          const prevSt = String(prevExp.status || '').toLowerCase();
+          const incSt = String(payload.status || '').toLowerCase();
+          const prevFinal = prevSt === 'approved' || prevSt === 'rejected';
+          const incPending = !incSt || incSt === 'pending' || incSt === 'pending_supervisor';
+          if (prevFinal && incPending) {
+            try {
+              ws.send(JSON.stringify({
+                type: 'EXPENSE',
+                action: 'EXPENSE',
+                expense: prevExp,
+                payload: prevExp,
+                origin_device_id: 'LOCAL_HUB',
+                origin_device_name: 'Termux Local Hub',
+                timestamp: Date.now(),
+              }));
+            } catch (e) {}
+            return;
+          }
+          const nowExpMs = Date.now();
+          expensesStore[exIdx] = {
+            ...prevExp,
+            ...payload,
+            updatedAt: Math.max(nowExpMs, Number(payload.updatedAt) || 0),
+            hubTimestamp: nowExpMs,
+            lastUpdated: new Date(nowExpMs).toISOString(),
+            ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+          };
         } else {
           expensesStore.unshift({ ...payload, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) });
           console.log(`[Termux Hub] 📥 Accepted Expense [${payload.id}] (Append-Only)`);
@@ -5865,21 +6774,86 @@ wss.on('connection', (ws, req) => {
         }
       }
 
-      const isCashCount = pType === 'CASH_COUNT' || pType === 'CASH_COUNT_SYNC' || pType === 'cash_count' || sheetName === 'CashCounts';
-      if (isCashCount && payload) {
-        const ccId = payload.id;
-        if (ccId) {
-          const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
-          const exIdx = cashCountsStore.findIndex((c) => c.id === ccId);
-          const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && cashCountsStore[exIdx].isCloudSynced === true);
-          if (exIdx >= 0) {
-            cashCountsStore[exIdx] = { ...cashCountsStore[exIdx], ...payload, id: ccId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+      const isCashCount =
+        pType === 'CASH_COUNT' ||
+        pType === 'CASH_COUNT_SYNC' ||
+        pType === 'CASH_COUNT_RECORD' ||
+        pType === 'cash_count' ||
+        sheetName === 'CashCounts' ||
+        packet.entityType === 'cash_count' ||
+        Boolean(packet.cashCount);
+      const ccPayload = (packet.cashCount && typeof packet.cashCount === 'object') ? packet.cashCount : payload;
+      if (isCashCount && ccPayload) {
+        const ccId = String(ccPayload.id || packet.recordId || packet.entityId || '').trim();
+        if (ccId || (ccPayload.staffId && ccPayload.date)) {
+          const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, ccPayload);
+          const normComp = String(ccPayload.company_id || ccPayload.companyId || packet.companyId || 'COMP-001').trim().toUpperCase();
+          const normBr = String(ccPayload.branch_id || ccPayload.branchId || packet.branchId || 'BR-MAIN').trim().toUpperCase();
+          const normStaff = String(ccPayload.staffId || '').trim().toUpperCase();
+          const normDate = String(ccPayload.date || '').trim();
+
+          const exIdx = cashCountsStore.findIndex((c) => {
+            if (ccId && c.id === ccId) return true;
+            if (!normStaff || !normDate) return false;
+            const cComp = String(c.company_id || c.companyId || 'COMP-001').trim().toUpperCase();
+            const cBr = String(c.branch_id || c.branchId || 'BR-MAIN').trim().toUpperCase();
+            const cStaff = String(c.staffId || '').trim().toUpperCase();
+            return cComp === normComp && cBr === normBr && cStaff === normStaff && String(c.date || '').trim() === normDate;
+          });
+
+          const hubNow = Date.now();
+          const incomingTs = Math.max(
+            Number(ccPayload.updatedAt || 0),
+            Number(packet.updatedAt || 0),
+            getTimestamp(ccPayload) || 0
+          ) || hubNow;
+          const existingTs = exIdx >= 0 ? getTimestamp(cashCountsStore[exIdx]) : 0;
+
+          if (exIdx >= 0 && existingTs > 0 && incomingTs < existingTs) {
+            // Strictly older replay: keep newer record in Hub, still preserve cloud sync flag if incoming confirmed cloud
+            if (incomingCloudSynced && cashCountsStore[exIdx].isCloudSynced !== true) {
+              cashCountsStore[exIdx].isCloudSynced = true;
+              scheduleSave();
+            }
           } else {
-            cashCountsStore.unshift({ ...payload, id: ccId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) });
-            console.log(`[Termux Hub] 📥 Accepted Cash Count [${ccId}] (Append-Only)`);
+            const finalId = ccId || (exIdx >= 0 ? cashCountsStore[exIdx].id : `CNT-${hubNow}`);
+            const isNewerLocalEdit =
+              exIdx >= 0 &&
+              !incomingCloudSynced &&
+              (incomingTs > existingTs ||
+                Math.abs(Number(ccPayload.finalCashOutTotal || 0) - Number(cashCountsStore[exIdx].finalCashOutTotal || 0)) > 0.005 ||
+                String(ccPayload.notes || '') !== String(cashCountsStore[exIdx].notes || ''));
+            const resolvedCloudSynced = incomingCloudSynced
+              ? true
+              : isNewerLocalEdit
+              ? false
+              : (exIdx >= 0 && cashCountsStore[exIdx].isCloudSynced === true);
+            const mergedCc = {
+              ...(exIdx >= 0 ? cashCountsStore[exIdx] : {}),
+              ...ccPayload,
+              id: finalId,
+              company_id: ccPayload.company_id || ccPayload.companyId || normComp,
+              companyId: ccPayload.companyId || ccPayload.company_id || normComp,
+              branch_id: ccPayload.branch_id || ccPayload.branchId || normBr,
+              branchId: ccPayload.branchId || ccPayload.branch_id || normBr,
+              updatedAt: Math.max(incomingTs, hubNow),
+              hubTimestamp: hubNow,
+              lastUpdated: new Date(Math.max(incomingTs, hubNow)).toISOString(),
+              isCloudSynced: resolvedCloudSynced,
+            };
+            delete mergedCc.fromMesh;
+            delete mergedCc.fromSync;
+
+            if (exIdx >= 0) {
+              cashCountsStore[exIdx] = mergedCc;
+              console.log(`[Termux Hub] 🔄 Updated Cash Count [${finalId}] ($${Number(mergedCc.finalCashOutTotal || 0).toFixed(2)})`);
+            } else {
+              cashCountsStore.unshift(mergedCc);
+              console.log(`[Termux Hub] 📥 Accepted Cash Count [${finalId}] ($${Number(mergedCc.finalCashOutTotal || 0).toFixed(2)})`);
+            }
+            scheduleSave();
+            if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CASH_COUNT', finalId);
           }
-          scheduleSave();
-          if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CASH_COUNT', ccId);
         }
       }
 
@@ -6375,10 +7349,31 @@ wss.on('connection', (ws, req) => {
       // =====================================================================
       // 9.2 CONFIGURATION DATA: CUSTOMERS & CREDIT LIMITS (STRICT LWW)
       // =====================================================================
-      const custObj = packet.customer || (payload && (payload.customerId || payload.creditLimit !== undefined) ? payload : null);
-      const isCust = pType === 'CUSTOMER' || pType === 'CUSTOMER_SYNC' || pType === 'CUSTOMER_RECORD' || sheetName === 'Customers' || !!custObj;
-      if (isCust && custObj && (custObj.customerId || custObj.id)) {
+      // CRITICAL: Only match explicit CUSTOMER packets! Never hijack SALE, CUSTOMER_CHANGE,
+      // or CREDIT_SALE packets that happen to carry payload.customerId.
+      const isExplicitCustType =
+        pType === 'CUSTOMER' ||
+        pType === 'CUSTOMER_SYNC' ||
+        pType === 'CUSTOMER_RECORD' ||
+        pType === 'customer' ||
+        sheetName === 'Customers' ||
+        packet.entityType === 'customer' ||
+        Boolean(packet.customer);
+      const rawCustCandidate = packet.customer || (isExplicitCustType ? payload : null);
+      const isNonCustomerTransactionBlob =
+        !rawCustCandidate ||
+        typeof rawCustCandidate !== 'object' ||
+        'changeId' in rawCustCandidate ||
+        'creditId' in rawCustCandidate ||
+        'creditSaleId' in rawCustCandidate ||
+        'invoiceNumber' in rawCustCandidate ||
+        Array.isArray(rawCustCandidate.items) ||
+        ('in' in rawCustCandidate && 'out' in rawCustCandidate);
+      const custObj = isExplicitCustType && !isNonCustomerTransactionBlob ? rawCustCandidate : null;
+
+      if (custObj && (custObj.customerId || custObj.id)) {
         const cId = custObj.customerId || custObj.id;
+        const incomingName = String(custObj.name || custObj.CustomerName || custObj.customerName || '').trim();
         const hubNow = Date.now();
         const hubIso = new Date().toISOString();
         const incomingTime = getTimestamp(custObj) || getTimestamp(packet);
@@ -6393,6 +7388,11 @@ wss.on('connection', (ws, req) => {
           return;
         }
         const cIdx = customersStore.findIndex((c) => (c.customerId || c.id) === cId);
+        // Never create a ghost blank-name customer record
+        if (cIdx < 0 && !incomingName) {
+          console.log(`[Termux Hub] 🛡️ Ignored blank-name customer payload for ${cId}`);
+          return;
+        }
         let accepted = true;
 
         if (cIdx >= 0) {
@@ -6423,18 +7423,27 @@ wss.on('connection', (ws, req) => {
         if (accepted) {
           const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, custObj);
           const resolvedCloudSynced = incomingCloudSynced || (cIdx >= 0 && customersStore[cIdx].isCloudSynced === true);
-          custObj.updatedAt = hubNow;
-          custObj.hubTimestamp = hubNow;
-          custObj.lastUpdated = hubIso;
-          if (resolvedCloudSynced) custObj.isCloudSynced = true;
+          const existingCust = cIdx >= 0 ? customersStore[cIdx] : null;
+          const preservedName = incomingName || String(existingCust?.name || existingCust?.CustomerName || '').trim();
+          const savedCust = {
+            ...(existingCust || {}),
+            ...custObj,
+            customerId: cId,
+            id: cId,
+            name: preservedName,
+            updatedAt: hubNow,
+            hubTimestamp: hubNow,
+            lastUpdated: hubIso,
+            ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+          };
 
           if (cIdx >= 0) {
-            customersStore[cIdx] = { ...customersStore[cIdx], ...custObj };
+            customersStore[cIdx] = savedCust;
           } else {
-            customersStore.unshift(custObj);
+            customersStore.unshift(savedCust);
           }
           scheduleSave();
-          console.log(`[Termux Hub] 👥 Synced Customer account: ${custObj.name} (${cId}) stamped at ${hubIso}`);
+          console.log(`[Termux Hub] 👥 Synced Customer account: ${savedCust.name} (${cId}) stamped at ${hubIso}`);
 
           // Send SYNC_ACK
           try {
@@ -6449,12 +7458,12 @@ wss.on('connection', (ws, req) => {
             }));
           } catch (e) {}
 
-          // Broadcast updated customer to other peers
+          // Broadcast merged authoritative customer to other peers
           const custBroadcastStr = JSON.stringify({
             type: 'CUSTOMER',
             action: 'CUSTOMER_SYNC',
-            customer: custObj,
-            payload: custObj,
+            customer: savedCust,
+            payload: savedCust,
             origin_device_id: 'LOCAL_HUB',
             origin_device_name: 'Termux Local Hub',
             timestamp: hubNow,
@@ -6470,7 +7479,7 @@ wss.on('connection', (ws, req) => {
             console.log(`[Termux Hub] ⏭️ Dual-Writer Skip: CUSTOMER #${cId} already cloud-synced by PWA. Broadcasting T1_CLOUD_SYNC_ACK.`);
             broadcastCloudSyncAck(ws, 'CUSTOMER', cId);
           } else {
-            pushToCloud('CUSTOMER', custObj);
+            pushToCloud('CUSTOMER', savedCust);
           }
         }
       }
@@ -7114,6 +8123,10 @@ wss.on('connection', (ws, req) => {
           (item) => isMatch(item, reqComp, 'ALL') && (getTimestamp(item) >= sinceTime || packet.isForced || isExplicitZero)
         );
         const missedStocktakeSegments = stocktakeSegmentsStore.filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedDailyBlindConfigs = dailyBlindConfigsStore.filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedDailyBlindCounts = dailyBlindCountsStore.filter(
+          (item) => isMatch(item, reqComp, reqBranch) && (getTimestamp(item) >= sinceTime || packet.isForced || isExplicitZero)
+        );
         const missedSecurityAlerts = securityAlertsStore.filter((item) => isMatch(item, reqComp, 'ALL')).slice(0, 50);
         const tombstoneWindowStart = Math.max(0, sinceTime - 5 * 60 * 1000);
         const missedTombstones = tombstonesStore.filter((t) => {
@@ -7191,6 +8204,8 @@ wss.on('connection', (ws, req) => {
             creditGroups: missedCreditGroups,
             stocktakeSessions: missedStocktakeSessions,
             stocktakeSegments: missedStocktakeSegments,
+            dailyBlindConfigs: missedDailyBlindConfigs,
+            dailyBlindCounts: missedDailyBlindCounts,
             tombstones: missedTombstones,
             ...(missedGenericEnvelopes.length > 0 ? { genericEnvelopes: missedGenericEnvelopes } : {}),
             ...(Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && ((permissionsMatrixStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
@@ -7227,7 +8242,7 @@ wss.on('connection', (ws, req) => {
       // 10.5. SCHEMA-AGNOSTIC GENERIC ENVELOPE CAPTURE (Future-Proof APK Relay)
       // Persists reconciliation, goods_received, and ANY future entityType automatically
       // =====================================================================
-      const rawGenericEntityType = packet.entityType || (pType === 'db_mutation' ? packet.sheetName : '');
+      const rawGenericEntityType = packet.entityType || (pType === 'DB_MUTATION' ? packet.sheetName : '');
       const genericPayloadObj = packet.payload && typeof packet.payload === 'object' ? packet.payload : (packet.data && typeof packet.data === 'object' ? packet.data : null);
       if (
         rawGenericEntityType &&
@@ -7257,10 +8272,10 @@ wss.on('connection', (ws, req) => {
       }
 
       // =====================================================================
-      // 11. GENERAL BROADCAST TO OTHER PEERS (DO NOT ECHO BACK TO SENDER)
+      // 11. GENERAL BROADCAST TO OTHER AUTHENTICATED PEERS (NO ECHO / NO LEAK)
       // =====================================================================
       wss.clients.forEach((client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
+        if (client !== ws && client.readyState === WebSocket.OPEN && client.isAuthenticated !== false) {
           try {
             client.send(dataStr);
           } catch (e) {}
@@ -7272,6 +8287,11 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    for (const [devId, pending] of pendingPairRequests.entries()) {
+      if (pending.ws === ws) {
+        pendingPairRequests.delete(devId);
+      }
+    }
     console.log(`[Termux Hub] 🔴 POS Terminal disconnected`);
   });
 
@@ -7282,9 +8302,11 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`================================================================`);
-  console.log(`🚀 Saimetric POS - Universal Freeze-Once Local Hub (v4.0.0)`);
+  console.log(`🚀 Saimetric POS - Universal Freeze-Once Local Hub (v${HUB_VERSION})`);
   console.log(`📡 WebSocket URL:  ws://0.0.0.0:${PORT}`);
   console.log(`🌐 HTTP Status:    http://0.0.0.0:${PORT}/health`);
+  console.log(`🆔 Hub ID:         ${hubSecurityState.hubId} (${HUB_RUNTIME} / Slot ${HUB_OTA_SLOT})`);
+  console.log(`🔐 Mutual Auth:    ${HUB_REQUIRE_AUTH ? 'STRICT (Paired Devices Only)' : 'OPTIONAL (Termux Backup Mode — pass --require-auth to enforce)'}`);
   console.log(`🏢 Branch ID:      ${hubBranchId} ("${hubBranchName}")`);
   console.log(`🏢 Tenant ID:      ${hubTenantId}`);
   console.log(`💾 Data File:      ${DATA_FILE}`);
@@ -7527,6 +8549,8 @@ async function syncEdgeToCloudSupabase() {
         stocktake_session: { arr: stocktakeSessionsStore, keyFn: (r) => r.sessionId || r.id },
         stocktake_segment: { arr: stocktakeSegmentsStore, keyFn: (r) => r.segmentId || r.id },
         stocktake_zone_assignment: { arr: zoneAssignmentsStore, keyFn: (r) => r.id || `${r.sessionId || ''}::${r.zoneId || ''}` },
+        daily_blind_config: { arr: dailyBlindConfigsStore, keyFn: (r) => r.id || r.configId },
+        daily_blind_count: { arr: dailyBlindCountsStore, keyFn: (r) => r.id || r.countId },
       };
 
       const targetSpec = storeByType[eType];
@@ -7741,6 +8765,8 @@ async function syncEdgeToCloudSupabase() {
       { hubType: 'STOCKTAKE_SESSION', store: stocktakeSessionsStore },
       { hubType: 'STOCKTAKE_SEGMENT', store: stocktakeSegmentsStore },
       { hubType: 'STOCKTAKE_ZONE_ASSIGNMENT', store: zoneAssignmentsStore },
+      { hubType: 'DAILY_BLIND_CONFIG', store: dailyBlindConfigsStore },
+      { hubType: 'DAILY_BLIND_COUNT', store: dailyBlindCountsStore },
       { hubType: 'INVENTORY', store: inventoryStore },
       { hubType: 'CUSTOMER', store: customersStore },
       { hubType: 'STAFF', store: salespeopleStore },

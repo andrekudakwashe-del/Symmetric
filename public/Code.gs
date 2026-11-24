@@ -245,6 +245,8 @@ var BASE_TAB_COLUMNS = {
   "StocktakeJointProposals": ["ProposalID", "CompanyID", "BranchID", "SessionID", "ZoneID", "ProposedBySlot", "ProposedByName", "RecountLinesJSON", "Timestamp"],
   "StocktakeJointFinalized": ["FinalID", "CompanyID", "BranchID", "SessionID", "ZoneID", "SignedByA", "SignedByB", "ResolvedByName", "ResolvedLinesJSON", "FinalizedAt"],
   "StocktakeUnlockLog": ["UnlockID", "CompanyID", "BranchID", "SessionID", "SegmentID", "TargetSlot", "ActorID", "ActorName", "Reason", "UnlockedAt"],
+  "DailyBlindConfigs": ["ConfigID", "CompanyID", "BranchID", "SelectedItemIdsJSON", "DesignatedAuditorID", "DesignatedAuditorName", "UpdatedBy", "UpdatedAt"],
+  "DailyBlindCounts": ["CountID", "CompanyID", "BranchID", "BranchName", "Date", "ListSource", "CountedByID", "CountedByName", "SubmittedAt", "Status", "TotalItemsCounted", "MatchedCount", "VarianceItemCount", "NetVarianceUnits", "NetVarianceCostValue", "AbsVarianceCostValue", "ReviewedByName", "ReviewedAt", "ArchivedAt", "AuditorSummaryNote", "LinesJSON", "UpdatedAt"],
   "CasualWorkers": ["CasualID", "CompanyID", "BranchID", "SessionID", "Name", "Phone", "HomeBranchID", "WorkerType", "PassCodeHash", "AssignedZones", "ExpiresAt", "IsActive", "UpdatedAt"],
   "BranchLockdowns": ["BranchID", "CompanyID", "IsLocked", "SessionID", "LockedBy", "LockedByName", "LockedAt", "Reason", "UpdatedAt"],
 
@@ -321,6 +323,8 @@ var ENTITY_TO_TAB = {
   "stocktake_joint_proposal": "StocktakeJointProposals",
   "stocktake_joint_finalized": "StocktakeJointFinalized",
   "stocktake_segment_unlock": "StocktakeUnlockLog",
+  "daily_blind_config": "DailyBlindConfigs",
+  "daily_blind_count": "DailyBlindCounts",
   "casual_worker": "CasualWorkers",
   "branch_lockdown": "BranchLockdowns",
   "system_settings": "SystemSettings",
@@ -345,6 +349,8 @@ var T2_ENTITY_TYPES = {
   "stocktake_session": true,
   "stocktake_segment": true,
   "stocktake_zone_assignment": true,
+  "daily_blind_config": true,
+  "daily_blind_count": true,
   "casual_worker": true,
   "branch_lockdown": true,
   "sheets_config": true,
@@ -2673,6 +2679,8 @@ function getIdColumnsForEntityType(entityType) {
     case "stocktake_joint_proposal": return ["ProposalID", "ZoneID"];
     case "stocktake_joint_finalized": return ["FinalID", "ZoneID"];
     case "stocktake_segment_unlock": return ["UnlockID", "id"];
+    case "daily_blind_config": return ["ConfigID", "id"];
+    case "daily_blind_count": return ["CountID", "id"];
     case "casual_worker": return ["CasualID", "id"];
     case "branch_lockdown": return ["BranchID", "branchId"];
     case "tombstone": return ["TombstoneKey", "TargetEntityID"];
@@ -3818,6 +3826,8 @@ function handleLegacyActionAsEnvelope(actionNorm, req, masterSsOpt, targetSs, co
     "branches": "branch",
     "stocktake_sessions": "stocktake_session",
     "stocktake_segments": "stocktake_segment",
+    "daily_blind_configs": "daily_blind_config",
+    "daily_blind_counts": "daily_blind_count",
     "casual_workers": "casual_worker",
     "tombstones": "tombstone"
   };

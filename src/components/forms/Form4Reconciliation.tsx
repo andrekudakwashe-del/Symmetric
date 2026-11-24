@@ -376,6 +376,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
     const unsub = subscribeToDatabase(handleUpdate);
     window.addEventListener('saimetric_sales_updated', handleUpdate);
     window.addEventListener('saimetric_cash_updated', handleUpdate);
+    window.addEventListener('saimetric_cash_counts_updated', handleUpdate);
     window.addEventListener('saimetric_cash_movements_updated', handleUpdate);
     window.addEventListener('saimetric_customer_changes_updated', handleUpdate);
     window.addEventListener('saimetric_credit_sales_updated', handleUpdate);
@@ -390,6 +391,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       unsub();
       window.removeEventListener('saimetric_sales_updated', handleUpdate);
       window.removeEventListener('saimetric_cash_updated', handleUpdate);
+      window.removeEventListener('saimetric_cash_counts_updated', handleUpdate);
       window.removeEventListener('saimetric_cash_movements_updated', handleUpdate);
       window.removeEventListener('saimetric_customer_changes_updated', handleUpdate);
       window.removeEventListener('saimetric_credit_sales_updated', handleUpdate);

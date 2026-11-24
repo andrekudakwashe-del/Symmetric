@@ -397,6 +397,7 @@ export const DEFAULT_ROLE_DEFINITIONS: Record<string, RoleDefinition> = {
       'direct_grv',
       'procurement_reorder',
       'sales',
+      'stocktake',
     ],
     defaultLandingModule: 'pos',
     isSystem: true,

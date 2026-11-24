@@ -68,6 +68,10 @@ import {
   StocktakeZoneAssignment,
   StocktakeVarianceItem,
   HubBlindSubmission,
+  DailyBlindBranchConfig,
+  DailyBlindCountLine,
+  DailyBlindCountRecord,
+  DailyBlindCountStatus,
 } from '../types';
 import {
   addMovement,
@@ -239,6 +243,8 @@ export const STORAGE_KEYS = {
   ELECTRONIC_SETTLEMENTS: 'saimetric_room_electronic_settlements',
   WALLET_RECOVERY_QUEUE: 'saimetric_room_wallet_recovery_queue',
   DELETED_RECORDS: 'saimetric_deleted_records',
+  DAILY_BLIND_CONFIGS: 'saimetric_room_daily_blind_configs',
+  DAILY_BLIND_COUNTS: 'saimetric_room_daily_blind_counts',
 };
 
 /**
@@ -816,6 +822,8 @@ export async function rehydrateFromIndexedDB(): Promise<void> {
       { key: STORAGE_KEYS.CASH_LIFTS, idField: (c) => c.id },
       { key: STORAGE_KEYS.PARKED_SALES, idField: (p) => p.id },
       { key: STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, idField: (g) => g.id },
+      { key: STORAGE_KEYS.DAILY_BLIND_CONFIGS, idField: (c) => c.id },
+      { key: STORAGE_KEYS.DAILY_BLIND_COUNTS, idField: (c) => c.id },
     ];
 
     const criticalScalarKeys = [
@@ -957,6 +965,368 @@ export function setStored<T>(
 }
 
 /**
+ * Extract canonical POS invoice reference from a CustomerChange or CreditSale entry.
+ * Used to prevent parent-child double booking across Device A, Android Hub APK, and Device B.
+ */
+export const extractPosInvoiceRefFromLedger = (rec: any): string => {
+  if (!rec || typeof rec !== 'object') return '';
+  const directRef = String(rec.reference || '').trim();
+  if (directRef && !/^CHG-|^CR-|^CRD-/i.test(directRef)) {
+    return directRef.toUpperCase();
+  }
+  const rawId = String(rec.id || rec.changeId || rec.creditId || '').trim();
+  // Hub & canonical POS child IDs use CHG-<invoiceId> or CR-<invoiceId>
+  // Exclude sequential IDs (CHG-001), collision-free manual IDs (CHG-XXXX-TS36-RRR), and re-keyed suffixes (-CXXXXXX)
+  const isManualRandomId = /^(?:CHG|CR)-[A-Z0-9]{4}-[A-Z0-9]{6,10}-[A-Z0-9]{3}$/i.test(rawId);
+  const isRekeyedId = /-C[A-Z0-9]{4,6}$/i.test(rawId);
+  if (!isManualRandomId && !isRekeyedId) {
+    const idMatch = rawId.match(/^(?:CHG|CR)-([A-Z0-9]+-[A-Z0-9-]+)$/i);
+    if (idMatch && idMatch[1] && !/^\d+$/.test(idMatch[1])) {
+      return idMatch[1].trim().toUpperCase();
+    }
+  }
+  const text = `${rec.notes || ''} ${rec.description || ''}`;
+  const noteMatch =
+    text.match(/POS\s+(?:Credit\s+Sale\s+)?(?:Invoice|Sale)\s*#?\s*([A-Z0-9][A-Z0-9_-]{3,})/i) ||
+    text.match(/(?:from\s+Sale|Inv(?:oice)?)\s*#\s*([A-Z0-9][A-Z0-9_-]{3,})/i);
+  if (noteMatch && noteMatch[1]) {
+    return noteMatch[1].trim().toUpperCase();
+  }
+  return '';
+};
+
+const isCanonicalPosLedgerId = (id: string, prefix: 'CHG' | 'CR', invRef: string): boolean => {
+  if (!id || !invRef) return false;
+  return String(id).trim().toUpperCase() === `${prefix}-${invRef.toUpperCase()}`;
+};
+
+const computeDeterministicLedgerHash = (parts: Array<string | number | undefined>): string => {
+  const raw = parts.map((p) => String(p ?? '').trim().toUpperCase()).join('|');
+  let h = 2166136261;
+  for (let i = 0; i < raw.length; i++) {
+    h ^= raw.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36).toUpperCase().slice(0, 6);
+};
+
+export const deduplicateCustomerChangeEntries = (entries: CustomerChangeEntry[]): CustomerChangeEntry[] => {
+  if (!Array.isArray(entries) || entries.length <= 1) return Array.isArray(entries) ? [...entries] : [];
+  const byId = new Map<string, CustomerChangeEntry>();
+  const byPosSig = new Map<string, CustomerChangeEntry>();
+  const ordered: CustomerChangeEntry[] = [];
+
+  for (const raw of entries) {
+    if (!raw || typeof raw !== 'object') continue;
+    const clean: any = { ...raw };
+    delete clean.fromMesh;
+    delete clean.fromSync;
+    const id = String(clean.id || clean.changeId || '').trim();
+    if (!id) continue;
+    clean.id = id;
+    clean.changeId = id;
+
+    const invRef = extractPosInvoiceRefFromLedger(clean);
+    const inAmt = Math.round((Number(clean.in) || 0) * 100) / 100;
+    const outAmt = Math.round((Number(clean.out) || 0) * 100) / 100;
+    const custKey = String(clean.customerId || clean.customerName || '').trim().toUpperCase();
+    const posSig = invRef ? `${invRef}|${custKey}|${inAmt.toFixed(2)}|${outAmt.toFixed(2)}` : '';
+
+    if (posSig && byPosSig.has(posSig)) {
+      const prev = byPosSig.get(posSig)!;
+      const incomingIsCanonical = isCanonicalPosLedgerId(id, 'CHG', invRef);
+      const prevIsCanonical = isCanonicalPosLedgerId(prev.id, 'CHG', invRef);
+      const merged: CustomerChangeEntry = {
+        ...prev,
+        ...clean,
+        id: incomingIsCanonical ? id : prevIsCanonical ? prev.id : prev.id,
+        changeId: incomingIsCanonical ? id : prevIsCanonical ? prev.id : prev.id,
+        customerName: clean.customerName || prev.customerName,
+        reference: clean.reference || prev.reference || invRef,
+        notes: clean.notes || prev.notes,
+      } as any;
+      byPosSig.set(posSig, merged);
+      byId.delete(prev.id);
+      byId.set(merged.id, merged);
+      const idx = ordered.findIndex((x) => x.id === prev.id);
+      if (idx >= 0) ordered[idx] = merged;
+      continue;
+    }
+
+    if (byId.has(id)) {
+      const prev = byId.get(id)!;
+      const prevIn = Math.round((Number(prev.in) || 0) * 100) / 100;
+      const prevOut = Math.round((Number(prev.out) || 0) * 100) / 100;
+      const prevCust = String(prev.customerId || prev.customerName || '').trim().toUpperCase();
+      const samePayload = prevCust === custKey && Math.abs(prevIn - inAmt) < 0.005 && Math.abs(prevOut - outAmt) < 0.005;
+      if (samePayload) {
+        const merged = { ...prev, ...clean, customerName: clean.customerName || prev.customerName };
+        byId.set(id, merged);
+        const idx = ordered.findIndex((x) => x.id === id);
+        if (idx >= 0) ordered[idx] = merged;
+        continue;
+      }
+      // Sequential ID collision between two distinct transactions — preserve both deterministically
+      const suffix = computeDeterministicLedgerHash([custKey, clean.date, inAmt, outAmt, invRef || clean.notes]);
+      const resolvedId = `${id}-C${suffix}`;
+      if (!byId.has(resolvedId)) {
+        const rekeyed = { ...clean, id: resolvedId, changeId: resolvedId };
+        byId.set(resolvedId, rekeyed);
+        if (posSig) byPosSig.set(posSig, rekeyed);
+        ordered.push(rekeyed);
+      }
+      continue;
+    }
+
+    byId.set(id, clean);
+    if (posSig) byPosSig.set(posSig, clean);
+    ordered.push(clean);
+  }
+  return ordered;
+};
+
+export const deduplicateCreditSaleEntries = (entries: CreditSaleEntry[]): CreditSaleEntry[] => {
+  if (!Array.isArray(entries) || entries.length <= 1) return Array.isArray(entries) ? [...entries] : [];
+  const byId = new Map<string, CreditSaleEntry>();
+  const byPosSig = new Map<string, CreditSaleEntry>();
+  const ordered: CreditSaleEntry[] = [];
+
+  for (const raw of entries) {
+    if (!raw || typeof raw !== 'object') continue;
+    const clean: any = { ...raw };
+    delete clean.fromMesh;
+    delete clean.fromSync;
+    const id = String(clean.id || clean.creditId || clean.creditSaleId || '').trim();
+    if (!id) continue;
+    clean.id = id;
+    clean.creditId = id;
+
+    const invRef = extractPosInvoiceRefFromLedger(clean);
+    const outAmt = Math.round((Number(clean.out ?? clean.amount) || 0) * 100) / 100;
+    const inAmt = Math.round((Number(clean.in) || 0) * 100) / 100;
+    const custKey = String(clean.customerId || clean.customerName || '').trim().toUpperCase();
+    // Only collapse POS credit purchase entries (outAmt > 0) sharing the exact same invoice ref + customer + amounts
+    const posSig = invRef && outAmt > 0 ? `${invRef}|${custKey}|${outAmt.toFixed(2)}|${inAmt.toFixed(2)}` : '';
+
+    if (posSig && byPosSig.has(posSig)) {
+      const prev = byPosSig.get(posSig)!;
+      const incomingIsCanonical = isCanonicalPosLedgerId(id, 'CR', invRef);
+      const prevIsCanonical = isCanonicalPosLedgerId(prev.id, 'CR', invRef);
+      const merged: CreditSaleEntry = {
+        ...prev,
+        ...clean,
+        id: incomingIsCanonical ? id : prevIsCanonical ? prev.id : prev.id,
+        creditId: incomingIsCanonical ? id : prevIsCanonical ? prev.id : prev.id,
+        customerName: clean.customerName || prev.customerName,
+        reference: clean.reference || (prev as any).reference || invRef,
+        notes: clean.notes || prev.notes,
+      } as any;
+      byPosSig.set(posSig, merged);
+      byId.delete(prev.id);
+      byId.set(merged.id, merged);
+      const idx = ordered.findIndex((x) => x.id === prev.id);
+      if (idx >= 0) ordered[idx] = merged;
+      continue;
+    }
+
+    if (byId.has(id)) {
+      const prev = byId.get(id)!;
+      const prevOut = Math.round((Number(prev.out ?? prev.amount) || 0) * 100) / 100;
+      const prevIn = Math.round((Number(prev.in) || 0) * 100) / 100;
+      const prevCust = String(prev.customerId || prev.customerName || '').trim().toUpperCase();
+      const samePayload = prevCust === custKey && Math.abs(prevOut - outAmt) < 0.005 && Math.abs(prevIn - inAmt) < 0.005;
+      if (samePayload) {
+        const merged = { ...prev, ...clean, customerName: clean.customerName || prev.customerName };
+        byId.set(id, merged);
+        const idx = ordered.findIndex((x) => x.id === id);
+        if (idx >= 0) ordered[idx] = merged;
+        continue;
+      }
+      // Sequential ID collision between two distinct transactions — preserve both deterministically
+      const suffix = computeDeterministicLedgerHash([custKey, clean.date, outAmt, inAmt, invRef || clean.notes]);
+      const resolvedId = `${id}-C${suffix}`;
+      if (!byId.has(resolvedId)) {
+        const rekeyed = { ...clean, id: resolvedId, creditId: resolvedId };
+        byId.set(resolvedId, rekeyed);
+        if (posSig) byPosSig.set(posSig, rekeyed);
+        ordered.push(rekeyed);
+      }
+      continue;
+    }
+
+    byId.set(id, clean);
+    if (posSig) byPosSig.set(posSig, clean);
+    ordered.push(clean);
+  }
+  return ordered;
+};
+
+/**
+ * Non-destructive local self-healer for:
+ * 1) Customer records whose `name` was blanked/polluted by Hub Section 9.2 misclassifying Change/Credit packets
+ * 2) Historical duplicate POS Customer Change / Credit Sale entries (e.g. CHG-001 + CHG-INV-100 for the same sale)
+ */
+export const healCustomerNamesAndChangeCreditLedgers = (): {
+  customersHealed: number;
+  changesCollapsed: number;
+  creditsCollapsed: number;
+} => {
+  let customersHealed = 0;
+  let changesCollapsed = 0;
+  let creditsCollapsed = 0;
+  try {
+    const rawChanges = getStored<CustomerChangeEntry[]>(STORAGE_KEYS.CUSTOMER_CHANGES, []);
+    const rawCredits = getStored<CreditSaleEntry[]>(STORAGE_KEYS.CREDIT_SALES, []);
+    const rawSales = getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, []);
+    const rawCustomers = getStored<any[]>(STORAGE_KEYS.CUSTOMERS, []);
+
+    // Build authoritative customerId -> name lookup from all local ledgers
+    const knownNames = new Map<string, string>();
+    const registerName = (cid?: string, name?: string) => {
+      const k = String(cid || '').trim().toUpperCase();
+      const n = String(name || '').trim();
+      if (!k || !n || n.toUpperCase() === k || n.toLowerCase() === 'walk-in customer') return;
+      if (!knownNames.has(k)) knownNames.set(k, n);
+    };
+
+    for (const c of rawCustomers) {
+      if (!c) continue;
+      registerName(c.customerId || c.id, c.name || c.CustomerName || c.customerName || c.FullName);
+    }
+    for (const ch of rawChanges) {
+      if (ch) registerName(ch.customerId, ch.customerName);
+    }
+    for (const cr of rawCredits) {
+      if (cr) registerName(cr.customerId, cr.customerName);
+    }
+    for (const s of rawSales) {
+      if (s) registerName(s.customerId, s.customerName);
+    }
+
+    // 1. Heal corrupted customer records without deleting any valid customer
+    if (Array.isArray(rawCustomers) && rawCustomers.length > 0) {
+      const mergedCustMap = new Map<string, any>();
+      const cleanedCustomers: any[] = [];
+      let custChanged = false;
+
+      for (const c of rawCustomers) {
+        if (!c || typeof c !== 'object') {
+          custChanged = true;
+          continue;
+        }
+        const isTransactionBlob = Boolean(
+          c.changeId || c.creditId || c.creditSaleId || c.invoiceNumber || Array.isArray(c.items)
+        );
+        const cid = String(c.customerId || (!isTransactionBlob ? c.id : '') || '').trim();
+        const cidUpper = cid.toUpperCase();
+        const resolvedName = String(
+          c.name || c.CustomerName || c.customerName || c.FullName || knownNames.get(cidUpper) || ''
+        ).trim();
+
+        // If this entry was purely a transaction blob with no customerId and no name, drop only the bogus blob
+        if (isTransactionBlob && !cid && !resolvedName) {
+          custChanged = true;
+          customersHealed++;
+          continue;
+        }
+
+        const sanitized: any = { ...c };
+        if (isTransactionBlob) {
+          delete sanitized.changeId;
+          delete sanitized.creditId;
+          delete sanitized.creditSaleId;
+          delete sanitized.in;
+          delete sanitized.out;
+          delete sanitized.reference;
+          delete sanitized.amount;
+          delete sanitized.items;
+          delete sanitized.invoiceNumber;
+          if (/^(?:CHG|CR|CRD)-/i.test(String(sanitized.id || ''))) {
+            sanitized.id = cid || sanitized.customerId;
+          }
+          custChanged = true;
+          customersHealed++;
+        }
+        if (cid && !sanitized.customerId) {
+          sanitized.customerId = cid;
+          custChanged = true;
+        }
+        if (resolvedName && (!sanitized.name || String(sanitized.name).trim() === '')) {
+          sanitized.name = resolvedName;
+          custChanged = true;
+          customersHealed++;
+        }
+        delete sanitized.fromMesh;
+        delete sanitized.fromSync;
+
+        if (cidUpper) {
+          const prev = mergedCustMap.get(cidUpper);
+          if (prev) {
+            // Merge duplicate customerId entries, always keeping non-empty name/phone/address/creditLimit
+            const combined = {
+              ...prev,
+              ...sanitized,
+              customerId: prev.customerId || sanitized.customerId,
+              name: prev.name || sanitized.name || resolvedName,
+              phone: sanitized.phone || prev.phone,
+              address: sanitized.address || prev.address,
+              creditLimit: sanitized.creditLimit ?? prev.creditLimit,
+            };
+            mergedCustMap.set(cidUpper, combined);
+            const idx = cleanedCustomers.findIndex((x) => String(x.customerId || x.id || '').trim().toUpperCase() === cidUpper);
+            if (idx >= 0) cleanedCustomers[idx] = combined;
+            custChanged = true;
+            customersHealed++;
+          } else {
+            mergedCustMap.set(cidUpper, sanitized);
+            cleanedCustomers.push(sanitized);
+          }
+        } else {
+          cleanedCustomers.push(sanitized);
+        }
+      }
+
+      if (custChanged) {
+        setStored(STORAGE_KEYS.CUSTOMERS, cleanedCustomers);
+      }
+    }
+
+    // 2. Deduplicate historical POS Customer Change entries
+    if (Array.isArray(rawChanges) && rawChanges.length > 0) {
+      const dedupedChanges = deduplicateCustomerChangeEntries(rawChanges);
+      if (dedupedChanges.length !== rawChanges.length) {
+        changesCollapsed = rawChanges.length - dedupedChanges.length;
+        setStored(STORAGE_KEYS.CUSTOMER_CHANGES, dedupedChanges);
+      }
+    }
+
+    // 3. Deduplicate historical POS Credit Sale entries
+    if (Array.isArray(rawCredits) && rawCredits.length > 0) {
+      const dedupedCredits = deduplicateCreditSaleEntries(rawCredits);
+      if (dedupedCredits.length !== rawCredits.length) {
+        creditsCollapsed = rawCredits.length - dedupedCredits.length;
+        setStored(STORAGE_KEYS.CREDIT_SALES, dedupedCredits);
+      }
+    }
+
+    if (customersHealed > 0 || changesCollapsed > 0 || creditsCollapsed > 0) {
+      notifyListeners();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_customers_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated'));
+      }
+      console.log(
+        `[healCustomerNamesAndChangeCreditLedgers] 🧹 Healed ${customersHealed} customer record(s), collapsed ${changesCollapsed} duplicate change(s), ${creditsCollapsed} duplicate credit(s).`
+      );
+    }
+  } catch (err) {
+    console.warn('[healCustomerNamesAndChangeCreditLedgers] Healing skipped:', err);
+  }
+  return { customersHealed, changesCollapsed, creditsCollapsed };
+};
+
+/**
  * Generic T1 Merge Helper (Append-Only / Upsert by ID)
  * Prevents catchup arrays or empty deltas from wiping or overwriting local T1 records.
  * If incomingRecords is empty (length === 0), it does absolutely nothing and avoids touching local storage.
@@ -1030,8 +1400,11 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
     return u === 'VERIFIED' || u === 'FLAGGED';
   };
 
-  incomingRecords.forEach((item) => {
-    if (!item) return;
+  incomingRecords.forEach((rawItem) => {
+    if (!rawItem) return;
+    const item = { ...rawItem };
+    delete item.fromMesh;
+    delete item.fromSync;
     const key = getRecordId(item);
     if (key) {
       const prev = map.get(key);
@@ -1039,6 +1412,48 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
         map.set(key, item);
         return;
       }
+
+      // Preserve distinct Change/Credit transactions that collided on an old sequential ID (e.g. CHG-002)
+      if (storageKey === STORAGE_KEYS.CUSTOMER_CHANGES) {
+        const prevCust = String(prev.customerId || prev.customerName || '').trim().toUpperCase();
+        const incCust = String(item.customerId || item.customerName || '').trim().toUpperCase();
+        const prevIn = Math.round((Number(prev.in) || 0) * 100) / 100;
+        const incIn = Math.round((Number(item.in) || 0) * 100) / 100;
+        const prevOut = Math.round((Number(prev.out) || 0) * 100) / 100;
+        const incOut = Math.round((Number(item.out) || 0) * 100) / 100;
+        const isDifferentTxn =
+          (prevCust && incCust && prevCust !== incCust) ||
+          Math.abs(prevIn - incIn) > 0.005 ||
+          Math.abs(prevOut - incOut) > 0.005;
+        if (isDifferentTxn) {
+          const suffix = computeDeterministicLedgerHash([incCust, item.date, incIn, incOut, item.reference || item.notes]);
+          const resolvedId = `${key}-C${suffix}`;
+          if (!map.has(resolvedId)) {
+            map.set(resolvedId, { ...item, id: resolvedId, changeId: resolvedId });
+          }
+          return;
+        }
+      } else if (storageKey === STORAGE_KEYS.CREDIT_SALES) {
+        const prevCust = String(prev.customerId || prev.customerName || '').trim().toUpperCase();
+        const incCust = String(item.customerId || item.customerName || '').trim().toUpperCase();
+        const prevOut = Math.round((Number(prev.out ?? prev.amount) || 0) * 100) / 100;
+        const incOut = Math.round((Number(item.out ?? item.amount) || 0) * 100) / 100;
+        const prevIn = Math.round((Number(prev.in) || 0) * 100) / 100;
+        const incIn = Math.round((Number(item.in) || 0) * 100) / 100;
+        const isDifferentTxn =
+          (prevCust && incCust && prevCust !== incCust) ||
+          Math.abs(prevOut - incOut) > 0.005 ||
+          Math.abs(prevIn - incIn) > 0.005;
+        if (isDifferentTxn) {
+          const suffix = computeDeterministicLedgerHash([incCust, item.date, incOut, incIn, item.reference || item.notes]);
+          const resolvedId = `${key}-C${suffix}`;
+          if (!map.has(resolvedId)) {
+            map.set(resolvedId, { ...item, id: resolvedId, creditId: resolvedId });
+          }
+          return;
+        }
+      }
+
       const mergedItem = { ...prev, ...item };
       // Protect finalized approval/void/custody statuses from being downgraded by stale pending/in-transit records
       if (isFinalApprovalStatus(prev.status) && (!item.status || isPendingApprovalStatus(item.status))) {
@@ -1081,10 +1496,58 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
     }
   });
 
+  const deduplicateCashCountEntries = (records: any[]): any[] => {
+    const getCountTs = (rec: any): number => {
+      if (!rec) return 0;
+      const candidates = [rec.updatedAt, rec.hubTimestamp, rec.lastUpdated, rec.timestamp, rec.date];
+      let maxTs = 0;
+      for (const c of candidates) {
+        if (typeof c === 'number' && Number.isFinite(c) && c > maxTs) {
+          maxTs = c;
+        } else if (typeof c === 'string' && c.trim()) {
+          const parsed = Date.parse(c);
+          if (Number.isFinite(parsed) && parsed > maxTs) maxTs = parsed;
+        }
+      }
+      return maxTs;
+    };
+    const bySlot = new Map<string, any>();
+    for (const raw of records) {
+      if (!raw || typeof raw !== 'object') continue;
+      const rec = { ...raw };
+      delete rec.fromMesh;
+      delete rec.fromSync;
+      const comp = String(rec.company_id || rec.companyId || 'COMP-001').trim().toUpperCase();
+      const br = String(rec.branch_id || rec.branchId || 'BR-MAIN').trim().toUpperCase();
+      const staff = String(rec.staffId || '').trim().toUpperCase();
+      const dt = String(rec.date || '').trim();
+      const slotKey = staff && dt ? `${comp}|${br}|${staff}|${dt}` : `ID|${String(rec.id || Math.random())}`;
+      const prev = bySlot.get(slotKey);
+      if (!prev) {
+        bySlot.set(slotKey, rec);
+        continue;
+      }
+      const prevTs = getCountTs(prev);
+      const nextTs = getCountTs(rec);
+      const winner = nextTs >= prevTs ? { ...prev, ...rec } : { ...rec, ...prev };
+      if (prev.isCloudSynced === true || rec.isCloudSynced === true) {
+        winner.isCloudSynced = nextTs > prevTs ? Boolean(rec.isCloudSynced) : true;
+      }
+      bySlot.set(slotKey, winner);
+    }
+    return Array.from(bySlot.values()).sort((a, b) => getCountTs(b) - getCountTs(a));
+  };
+
   const mergedRaw = Array.from(map.values());
   const merged =
     storageKey === STORAGE_KEYS.CASH_LOGS
       ? deduplicateCashLogs(mergedRaw.map((r) => normalizeCashLogRecord(r)))
+      : storageKey === STORAGE_KEYS.CUSTOMER_CHANGES
+      ? deduplicateCustomerChangeEntries(mergedRaw)
+      : storageKey === STORAGE_KEYS.CREDIT_SALES
+      ? deduplicateCreditSaleEntries(mergedRaw)
+      : storageKey === STORAGE_KEYS.CASH_COUNTS
+      ? deduplicateCashCountEntries(mergedRaw)
       : mergedRaw;
   setStored(storageKey, merged);
   notifyListeners();
@@ -2320,6 +2783,7 @@ export const healMultiCurrencySalesAndMovements = (): void => {
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
       }
     }
+    healCustomerNamesAndChangeCreditLedgers();
   } catch (err) {
     console.warn('[healMultiCurrencySalesAndMovements] Healing skipped:', err);
   }
@@ -6500,8 +6964,21 @@ export const getTodayDateString = (): string => {
 };
 
 export const getCashCountForStaffAndDate = (staffId: string, date: string): CashCountRecord | undefined => {
-  const counts = getCashCounts();
-  return counts.find((c) => c.staffId === staffId && c.date === date);
+  const counts = getCashCounts().filter((c) => c.staffId === staffId && c.date === date);
+  if (counts.length <= 1) return counts[0];
+  const getTs = (c: any): number => {
+    const vals = [c?.updatedAt, c?.hubTimestamp, c?.lastUpdated, c?.timestamp];
+    let best = 0;
+    for (const v of vals) {
+      if (typeof v === 'number' && Number.isFinite(v) && v > best) best = v;
+      else if (typeof v === 'string' && v.trim()) {
+        const ms = Date.parse(v);
+        if (Number.isFinite(ms) && ms > best) best = ms;
+      }
+    }
+    return best;
+  };
+  return counts.reduce((latest, cur) => (getTs(cur) >= getTs(latest) ? cur : latest), counts[0]);
 };
 
 export const getCashLogsForStaffAndDate = (staffId: string, date: string): CashLogEntry[] => {
@@ -7243,6 +7720,8 @@ export const saveFinalCashCount = (
   data: {
     id?: string;
     timestamp?: string;
+    updatedAt?: number;
+    lastUpdated?: string;
     staffId: string;
     staffName: string;
     denominations: Record<string, number>;
@@ -7253,52 +7732,108 @@ export const saveFinalCashCount = (
     branch_id?: string;
     companyId?: string;
     company_id?: string;
+    isCloudSynced?: boolean;
   },
   options?: { fromSync?: boolean }
 ): { countRecord: CashCountRecord; cashLogRecord: CashLogEntry | null } => {
   const now = data.timestamp ? new Date(data.timestamp) : new Date();
+  const parsedNowMs = Number.isFinite(now.getTime()) ? now.getTime() : Date.now();
+  const effectiveUpdatedAt = options?.fromSync
+    ? Math.max(Number(data.updatedAt) || 0, parsedNowMs)
+    : Date.now();
+  const effectiveIso = new Date(effectiveUpdatedAt).toISOString();
   const dateStr = data.date || getTodayDateString();
   const currentCounts = getRawStoredCashCounts();
   const currentCompany = data.companyId || data.company_id || getCurrentCompanyId();
   const currentBranch = data.branchId || data.branch_id || getCurrentBranchId();
 
+  const getCountTs = (c: any): number => {
+    if (!c) return 0;
+    const vals = [c.updatedAt, c.hubTimestamp, c.lastUpdated, c.timestamp];
+    let best = 0;
+    for (const v of vals) {
+      if (typeof v === 'number' && Number.isFinite(v) && v > best) best = v;
+      else if (typeof v === 'string' && v.trim()) {
+        const ms = Date.parse(v);
+        if (Number.isFinite(ms) && ms > best) best = ms;
+      }
+    }
+    return best;
+  };
+
+  const normComp = String(currentCompany || 'COMP-001').trim().toUpperCase();
+  const normBr = String(currentBranch || 'BR-MAIN').trim().toUpperCase();
+  const normStaff = String(data.staffId || '').trim().toUpperCase();
+
   const existingCountIndex = currentCounts.findIndex(
     (c) => {
       if (data.id && c.id === data.id) return true;
-      const compId = (c as any).company_id || (c as any).companyId || 'COMP-001';
-      const brId = (c as any).branch_id || (c as any).branchId || 'BR-MAIN';
-      return compId === currentCompany && brId === currentBranch && c.staffId === data.staffId && c.date === dateStr;
+      const compId = String((c as any).company_id || (c as any).companyId || 'COMP-001').trim().toUpperCase();
+      const brId = String((c as any).branch_id || (c as any).branchId || 'BR-MAIN').trim().toUpperCase();
+      const cStaff = String(c.staffId || '').trim().toUpperCase();
+      return compId === normComp && brId === normBr && cStaff === normStaff && c.date === dateStr;
     }
   );
+
+  // Protect newer local cash counts from being overwritten by strictly older sync/catchup packets
+  if (options?.fromSync && existingCountIndex >= 0) {
+    const existing = currentCounts[existingCountIndex];
+    const existingTs = getCountTs(existing);
+    if (existingTs > 0 && effectiveUpdatedAt > 0 && effectiveUpdatedAt < existingTs) {
+      return { countRecord: existing, cashLogRecord: null };
+    }
+  }
 
   let countRecord: CashCountRecord;
 
   if (existingCountIndex >= 0) {
     // Update existing count record in place for this salesperson, date, and branch
-    const existing = currentCounts[existingCountIndex];
+    const existing: any = { ...currentCounts[existingCountIndex] };
+    delete existing.fromMesh;
+    delete existing.fromSync;
     countRecord = {
       ...existing,
       id: data.id || existing.id,
-      timestamp: now.toISOString(),
-      staffName: data.staffName,
+      timestamp: options?.fromSync ? (data.timestamp || effectiveIso) : effectiveIso,
+      updatedAt: effectiveUpdatedAt,
+      lastUpdated: data.lastUpdated || effectiveIso,
+      staffName: data.staffName || existing.staffName,
       denominations: data.denominations,
       finalCashOutTotal: data.finalCashOutTotal,
       notes: data.notes !== undefined ? data.notes : existing.notes,
-      company_id: (existing as any).company_id || currentCompany,
-      companyId: (existing as any).companyId || currentCompany,
+      company_id: existing.company_id || currentCompany,
+      companyId: existing.companyId || currentCompany,
       branch_id: currentBranch,
       branchId: currentBranch,
-      synced: false,
-    };
-    const updatedCounts = [...currentCounts];
-    updatedCounts[existingCountIndex] = countRecord;
+      synced: options?.fromSync ? Boolean(existing.synced) : false,
+      ...(options?.fromSync && data.isCloudSynced !== undefined
+        ? { isCloudSynced: data.isCloudSynced }
+        : !options?.fromSync
+        ? { isCloudSynced: false }
+        : {}),
+    } as any;
+    const updatedCounts = currentCounts.filter((c, idx) => {
+      if (idx === existingCountIndex) return true;
+      const compId = String((c as any).company_id || (c as any).companyId || 'COMP-001').trim().toUpperCase();
+      const brId = String((c as any).branch_id || (c as any).branchId || 'BR-MAIN').trim().toUpperCase();
+      const cStaff = String(c.staffId || '').trim().toUpperCase();
+      return !(compId === normComp && brId === normBr && cStaff === normStaff && c.date === dateStr);
+    });
+    const targetIdx = updatedCounts.findIndex((c) => c.id === existing.id || c.id === countRecord.id);
+    if (targetIdx >= 0) {
+      updatedCounts[targetIdx] = countRecord;
+    } else {
+      updatedCounts.unshift(countRecord);
+    }
     setStored(STORAGE_KEYS.CASH_COUNTS, updatedCounts);
   } else {
     // New cash count record partitioned by branch
     const countId = data.id || `CNT-${Date.now()}`;
     countRecord = {
       id: countId,
-      timestamp: now.toISOString(),
+      timestamp: options?.fromSync ? (data.timestamp || effectiveIso) : effectiveIso,
+      updatedAt: effectiveUpdatedAt,
+      lastUpdated: data.lastUpdated || effectiveIso,
       date: dateStr,
       staffId: data.staffId,
       staffName: data.staffName,
@@ -7310,6 +7845,7 @@ export const saveFinalCashCount = (
       branch_id: currentBranch,
       branchId: currentBranch,
       synced: false,
+      ...(data.isCloudSynced !== undefined ? { isCloudSynced: data.isCloudSynced } : {}),
     } as any;
     setStored(STORAGE_KEYS.CASH_COUNTS, [countRecord, ...currentCounts]);
   }
@@ -7345,7 +7881,7 @@ export const saveFinalCashCount = (
   if (existingSnapshot) {
     updateMovement(existingSnapshot.id, {
       amount: data.finalCashOutTotal,
-      timestamp: now.toISOString(),
+      timestamp: countRecord.timestamp || effectiveIso,
       sourceRef: countRecord.id,
       notes: data.notes || '',
     });
@@ -7354,7 +7890,7 @@ export const saveFinalCashCount = (
       shiftId,
       staffId: data.staffId,
       date: dateStr,
-      timestamp: now.toISOString(),
+      timestamp: countRecord.timestamp || effectiveIso,
       type: 'physical_count',
       amount: data.finalCashOutTotal,
       currency: 'USD',
@@ -7381,6 +7917,8 @@ export const saveFinalCashCount = (
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event('saimetric_cash_counts_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_cash_counts_updated', { detail: countRecord }));
+    window.dispatchEvent(new Event('saimetric_cash_movements_updated'));
+    window.dispatchEvent(new Event('saimetric_cash_updated'));
   }
 
   return { countRecord, cashLogRecord: null };
@@ -7410,18 +7948,14 @@ export const getCustomerChanges = (): CustomerChangeEntry[] => {
 };
 
 export const getNextCustomerChangeId = (): string => {
-  const list = getAllCustomerChanges();
-  const numbers = (Array.isArray(list) ? list : [])
-    .map((c) => {
-      if (!c) return null;
-      const rawId = c.id || (c as any).changeId || '';
-      const match = String(rawId).match(/^CHG-(\d+)$/i);
-      return match ? parseInt(match[1], 10) : null;
-    })
-    .filter((n): n is number => n !== null);
-  const max = numbers.length > 0 ? Math.max(...numbers) : 0;
-  const next = max + 1;
-  return `CHG-${String(next).padStart(3, '0')}`;
+  const rawDev =
+    (typeof localStorage !== 'undefined' &&
+      (localStorage.getItem('saimetric_mesh_device_id') || localStorage.getItem('saimetric_device_id'))) ||
+    'DEV';
+  const devShort = rawDev.replace(/[^A-Za-z0-9]/g, '').slice(-4).toUpperCase() || 'POS1';
+  const tsPart = Date.now().toString(36).toUpperCase();
+  const randPart = Math.random().toString(36).substring(2, 5).toUpperCase();
+  return `CHG-${devShort}-${tsPart}-${randPart}`;
 };
 
 export const addCustomerChange = (
@@ -7460,15 +7994,40 @@ export const addCustomerChange = (
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
   const brId = entry.branch_id || entry.branchId || currentBranch;
+  const posInvRef = extractPosInvoiceRefFromLedger(entry);
+  const inAmt = Math.round((Number(entry.in) || 0) * 100) / 100;
+  const outAmt = Math.round((Number(entry.out) || 0) * 100) / 100;
+
+  // Idempotent guard: prevent duplicate POS change entries for the exact same invoice + amounts
+  if (!isManualEntry && posInvRef) {
+    const existingDup = all.find((c) => {
+      if (entry.id && (c.id === entry.id || (c as any).changeId === entry.id)) return true;
+      const cInv = extractPosInvoiceRefFromLedger(c);
+      if (!cInv || cInv !== posInvRef) return false;
+      return (
+        Math.abs((Number(c.in) || 0) - inAmt) < 0.005 &&
+        Math.abs((Number(c.out) || 0) - outAmt) < 0.005
+      );
+    });
+    if (existingDup) {
+      return existingDup;
+    }
+  }
+
+  const cleanEntry: any = { ...entry };
+  delete cleanEntry.fromMesh;
+  delete cleanEntry.fromSync;
+
   const created: CustomerChangeEntry = {
-    ...entry,
-    id: entry.id || getNextCustomerChangeId(),
+    ...cleanEntry,
+    id: entry.id || (posInvRef && !isManualEntry ? `CHG-${posInvRef}` : getNextCustomerChangeId()),
     synced: false,
     company_id: compId,
     companyId: compId,
     branch_id: brId,
     branchId: brId,
   };
+  (created as any).changeId = created.id;
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.CUSTOMER_CHANGES, updated);
 
@@ -7499,7 +8058,7 @@ export const addCustomerChange = (
       companyId: compId,
       branchId: brId,
       branchCode: getCurrentBranch()?.code || brId,
-      entityType: 'customer',
+      entityType: 'customer_change',
       recordId: created.id,
       payload: created,
       fromSync: false,
@@ -7797,23 +8356,20 @@ export const getCreditSales = (): CreditSaleEntry[] => {
 };
 
 export const getNextCreditSaleId = (): string => {
-  const list = getAllCreditSales();
-  const numbers = (Array.isArray(list) ? list : [])
-    .map((c) => {
-      if (!c) return null;
-      const rawId = c.id || (c as any).creditSaleId || '';
-      const match = String(rawId).match(/^CR-(\d+)$/i);
-      return match ? parseInt(match[1], 10) : null;
-    })
-    .filter((n): n is number => n !== null);
-  const max = numbers.length > 0 ? Math.max(...numbers) : 0;
-  const next = max + 1;
-  return `CR-${String(next).padStart(3, '0')}`;
+  const rawDev =
+    (typeof localStorage !== 'undefined' &&
+      (localStorage.getItem('saimetric_mesh_device_id') || localStorage.getItem('saimetric_device_id'))) ||
+    'DEV';
+  const devShort = rawDev.replace(/[^A-Za-z0-9]/g, '').slice(-4).toUpperCase() || 'POS1';
+  const tsPart = Date.now().toString(36).toUpperCase();
+  const randPart = Math.random().toString(36).substring(2, 5).toUpperCase();
+  return `CR-${devShort}-${tsPart}-${randPart}`;
 };
 
 export const addCreditSale = (
   entry: Omit<CreditSaleEntry, 'id' | 'synced'> & {
     id?: string;
+    reference?: string;
     company_id?: string;
     companyId?: string;
     branch_id?: string;
@@ -7849,15 +8405,43 @@ export const addCreditSale = (
   const currentBranch = getCurrentBranchId();
   const compId = entry.company_id || entry.companyId || currentCompany;
   const brId = entry.branch_id || entry.branchId || currentBranch;
+  const invRef = extractPosInvoiceRefFromLedger(entry);
+  const outAmt = Math.round((Number(entry.out ?? entry.amount) || 0) * 100) / 100;
+  const inAmt = Math.round((Number(entry.in) || 0) * 100) / 100;
+
+  // Idempotent guard: prevent duplicate POS credit purchase entries for the exact same invoice
+  if (!entry.isManual && invRef && outAmt > 0) {
+    const existingDup = all.find((c) => {
+      if (entry.id && (c.id === entry.id || (c as any).creditId === entry.id)) return true;
+      const cInv = extractPosInvoiceRefFromLedger(c);
+      if (!cInv || cInv !== invRef) return false;
+      return (
+        Math.abs((Number(c.out ?? c.amount) || 0) - outAmt) < 0.005 &&
+        Math.abs((Number(c.in) || 0) - inAmt) < 0.005
+      );
+    });
+    if (existingDup) {
+      return existingDup;
+    }
+  }
+
+  const cleanEntry: any = { ...entry };
+  delete cleanEntry.fromMesh;
+  delete cleanEntry.fromSync;
+
   const created: CreditSaleEntry = {
-    ...entry,
-    id: entry.id || getNextCreditSaleId(),
+    ...cleanEntry,
+    id: entry.id || (invRef && !entry.isManual && outAmt > 0 ? `CR-${invRef}` : getNextCreditSaleId()),
     synced: false,
     company_id: compId,
     companyId: compId,
     branch_id: brId,
     branchId: brId,
   };
+  (created as any).creditId = created.id;
+  if (invRef && !(created as any).reference) {
+    (created as any).reference = invRef;
+  }
   const updated = [created, ...all];
   setStored(STORAGE_KEYS.CREDIT_SALES, updated);
 
@@ -7891,7 +8475,7 @@ export const addCreditSale = (
       companyId: compId,
       branchId: brId,
       branchCode: getCurrentBranch()?.code || brId,
-      entityType: 'customer',
+      entityType: 'credit_sale',
       recordId: created.id,
       payload: created,
       fromSync: false,
@@ -9897,12 +10481,19 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
       : (normalized.changeDue || 0);
 
   if (normalized.changeLeftBehind && amountToLeaveBehind > 0) {
-    const existingChange = getAllCustomerChanges().find(
-      (c) => c.reference === normalized.id || (c.notes && c.notes.includes(normalized.id))
+    const canonicalChangeId = `CHG-${normalized.id}`;
+    const existingChange = getRawStoredCustomerChanges().find(
+      (c) =>
+        c.id === canonicalChangeId ||
+        (c as any).changeId === canonicalChangeId ||
+        c.reference === normalized.id ||
+        extractPosInvoiceRefFromLedger(c) === String(normalized.id).trim().toUpperCase() ||
+        (c.notes && c.notes.includes(normalized.id))
     );
     if (!existingChange) {
       addCustomerChange(
         {
+          id: canonicalChangeId,
           timestamp: normalized.timestamp,
           date: normalized.date,
           staffId: normalized.staffId,
@@ -9939,8 +10530,14 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
 
   // 3. Credit sale child ledger extraction
   if (normalized.paymentMethod === 'Credit' || (normalized.creditAmount && Number(normalized.creditAmount) > 0)) {
-    const existingCredit = getAllCreditSales().find(
-      (c) => c.notes?.includes(normalized.id) || (c as any).reference === normalized.id
+    const canonicalCreditId = `CR-${normalized.id}`;
+    const existingCredit = getRawStoredCreditSales().find(
+      (c) =>
+        c.id === canonicalCreditId ||
+        (c as any).creditId === canonicalCreditId ||
+        (c as any).reference === normalized.id ||
+        extractPosInvoiceRefFromLedger(c) === String(normalized.id).trim().toUpperCase() ||
+        c.notes?.includes(normalized.id)
     );
     if (!existingCredit) {
       const deposit = Number(normalized.creditDeposit) || 0;
@@ -9957,6 +10554,8 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
 
       addCreditSale(
         {
+          id: canonicalCreditId,
+          reference: normalized.id,
           timestamp: normalized.timestamp,
           date: normalized.date,
           staffId: normalized.staffId,
@@ -10295,6 +10894,7 @@ export const addSale = (
 
     if (created.changeLeftBehind && amountToLeaveBehind > 0 && saleData.recordChangeEntry !== false) {
       addCustomerChange({
+        id: `CHG-${created.id}`,
         timestamp: created.timestamp,
         date: created.date,
         staffId: created.staffId,
@@ -10346,6 +10946,8 @@ export const addSale = (
         : 'Pending';
 
     addCreditSale({
+      id: `CR-${created.id}`,
+      reference: created.id,
       timestamp: created.timestamp,
       date: created.date,
       staffId: created.staffId,
@@ -10776,13 +11378,23 @@ export const refundSaleInvoice = (params: {
   }
 
   const now = new Date();
+  const nowMs = now.getTime();
+  const nowIso = now.toISOString();
+  const wasVerifiedMobile = invoice.mobileVerificationStatus === 'VERIFIED' && Boolean(getMobileMoneySaleKind(invoice));
   invoice.status = 'Refunded';
   invoice.refundReason = params.reason;
-  invoice.refundedAt = now.toISOString();
+  invoice.refundedAt = nowIso;
   invoice.refundApprovedBy = params.manager.name;
   invoice.refundApprovedById = params.manager.id;
+  (invoice as any).updatedAt = nowMs;
+  (invoice as any).lastUpdated = nowIso;
+  delete (invoice as any).fromMesh;
+  delete (invoice as any).fromSync;
 
   setStored(STORAGE_KEYS.SALES, allSales);
+  if (wasVerifiedMobile) {
+    syncVerifiedMobileSaleToDualCustody(invoice, params.manager);
+  }
 
   // Restore inventory stock for refunded items
   if (Array.isArray(invoice.items)) {
@@ -10945,13 +11557,23 @@ export const voidSaleInvoice = (params: {
   }
 
   const now = new Date();
+  const nowMs = now.getTime();
+  const nowIso = now.toISOString();
+  const wasVerifiedMobile = invoice.mobileVerificationStatus === 'VERIFIED' && Boolean(getMobileMoneySaleKind(invoice));
   invoice.status = 'Voided';
   invoice.voidReason = params.reason;
-  invoice.voidedAt = now.toISOString();
+  invoice.voidedAt = nowIso;
   invoice.voidApprovedBy = params.manager.name;
   invoice.voidApprovedById = params.manager.id;
+  (invoice as any).updatedAt = nowMs;
+  (invoice as any).lastUpdated = nowIso;
+  delete (invoice as any).fromMesh;
+  delete (invoice as any).fromSync;
 
   setStored(STORAGE_KEYS.SALES, allSales);
+  if (wasVerifiedMobile) {
+    syncVerifiedMobileSaleToDualCustody(invoice, params.manager);
+  }
 
   const targetCashierId = params.cashier?.id || invoice.staffId || params.manager.id;
   const targetCashierName = params.cashier?.name || invoice.staffName || params.manager.name;
@@ -11084,6 +11706,181 @@ export const voidSaleInvoice = (params: {
   return { success: true, message: `Invoice #${invoice.id} voided successfully.`, invoice };
 };
 
+/**
+ * Immediately & idempotently syncs confirmed EcoCash / ZiG transactions into Dual Custody
+ * Commercial Bank accounts (EcoCash Merchant Account & ZiG Bank / Swipe Account).
+ * Uses the exact same deterministic daily voucher ID (TRF-ECO-<date>-<branchId> / TRF-ZIG-<date>-<branchId>)
+ * as EOD recordElectronicSettlementToCustody so both workflows share a single delta-safe ledger with zero double-counting.
+ */
+export const syncVerifiedMobileSaleToDualCustody = (
+  sale: SaleInvoice,
+  supervisor?: Salesperson
+): CashTransfer | undefined => {
+  try {
+    const curKind = getMobileMoneySaleKind(sale);
+    if (!curKind) return undefined;
+    const channel: 'ECOCASH' | 'ZIG' = curKind === 'ZiG' ? 'ZIG' : 'ECOCASH';
+    const label = channel === 'ECOCASH' ? 'EcoCash' : 'ZiG';
+    const currentCompany = (sale.company_id || sale.companyId || getCurrentCompanyId()).trim();
+    const compPrefix = currentCompany.slice(0, 6);
+    const branchId = (sale.branch_id || sale.branchId || getCurrentBranchId()).trim();
+    const shiftDate = toDateStringSafe(sale.date || sale.timestamp) || getTodayDateString();
+    const branchObj = getBranches().find((b) => b.id === branchId || b.branchCode === branchId);
+    const branchName = branchObj?.name || branchId;
+
+    const mcConfig = getMultiCurrencyConfig();
+    const defaultRate =
+      channel === 'ZIG'
+        ? (mcConfig.rates['ZiG']?.rateToUsd || 26.5)
+        : (mcConfig.rates['EcoCash']?.rateToUsd || 1.05);
+
+    // Aggregate all VERIFIED (non-Voided, non-Refunded) sales for this date + branch + channel
+    const allSales = getRawStoredSales();
+    let totalVerifiedUsd = 0;
+    let totalVerifiedNative = 0;
+    const verifiedRefs: string[] = [];
+
+    for (const s of allSales) {
+      if (!s || s.status === 'Voided' || s.status === 'Refunded') continue;
+      if (s.mobileVerificationStatus !== 'VERIFIED') continue;
+      const sKind = getMobileMoneySaleKind(s);
+      if ((channel === 'ZIG' && sKind !== 'ZiG') || (channel === 'ECOCASH' && sKind !== 'EcoCash')) continue;
+      const sBranch = (s.branch_id || s.branchId || branchId).trim();
+      if (sBranch.toUpperCase() !== branchId.toUpperCase()) continue;
+      const sDate = toDateStringSafe(s.date || s.timestamp) || '';
+      if (sDate !== shiftDate) continue;
+
+      const sRate = Number(s.exchangeRate) > 0 ? Number(s.exchangeRate) : defaultRate;
+      const grossUsd = (Number(s.total) || 0) + (Number(s.cashWithdrawalAmount) || 0);
+      const shortfallUsd = Number(s.mobileShortfallUsd) || 0;
+      const verifiedUsd = Math.max(0, Math.round((grossUsd - shortfallUsd) * 100) / 100);
+      const verifiedNative =
+        s.mobileVerifiedAmountInCurrency !== undefined && Number.isFinite(Number(s.mobileVerifiedAmountInCurrency))
+          ? Math.max(0, Math.round(Number(s.mobileVerifiedAmountInCurrency) * 100) / 100)
+          : Math.round(verifiedUsd * sRate * 100) / 100;
+
+      totalVerifiedUsd = Math.round((totalVerifiedUsd + verifiedUsd) * 100) / 100;
+      totalVerifiedNative = Math.round((totalVerifiedNative + verifiedNative) * 100) / 100;
+      const refCode = String(s.mobileVerifiedRef || s.proofOfPaymentRef || s.id).trim();
+      if (refCode) verifiedRefs.push(refCode);
+    }
+
+    const transferId = `TRF-${channel === 'ECOCASH' ? 'ECO' : 'ZIG'}-${shiftDate}-${branchId}`;
+    const existingTransfers = getAllCashTransfers('ALL');
+    const existing = existingTransfers.find((t) => t.transfer_id === transferId);
+
+    if (totalVerifiedUsd <= 0 && totalVerifiedNative <= 0 && !existing) {
+      return undefined;
+    }
+
+    // Locate or auto-provision the EcoCash Merchant / ZiG Bank Account
+    const accounts = getCashAccounts();
+    let account = accounts.find(
+      (a) =>
+        a.account_type === 'BANK_ACCOUNT' &&
+        (a.account_subtype === channel ||
+          a.account_id.includes(channel) ||
+          a.account_name.toLowerCase().includes(channel.toLowerCase()))
+    );
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+
+    if (!account) {
+      account = saveCashAccount({
+        account_id: `ACC-BANK-${channel}-${compPrefix}`,
+        company_id: currentCompany,
+        branch_id: 'HQ',
+        target_branch_id: 'ALL',
+        account_type: 'BANK_ACCOUNT',
+        account_subtype: channel,
+        account_name: channel === 'ECOCASH' ? 'EcoCash Merchant Account' : 'ZiG Bank / Swipe Account',
+        current_balance: 0,
+        currency: 'USD',
+        native_currency: label,
+        native_balance: 0,
+        status: 'OPEN',
+        created_at: nowIso,
+        updated_at: nowIso,
+        updatedAt: nowMs,
+        lastUpdated: nowIso,
+      });
+    }
+
+    const prevUsd = existing ? Math.round((Number(existing.amount) || 0) * 100) / 100 : 0;
+    const prevNative = existing ? Math.round((Number(existing.native_amount ?? prevUsd) || 0) * 100) / 100 : 0;
+    const deltaUsd = Math.round((totalVerifiedUsd - prevUsd) * 100) / 100;
+    const deltaNative = Math.round((totalVerifiedNative - prevNative) * 100) / 100;
+
+    if (Math.abs(deltaUsd) > 0.001 || Math.abs(deltaNative) > 0.001) {
+      const nextUsdBal = Math.max(0, Math.round(((Number(account.current_balance) || 0) + deltaUsd) * 100) / 100);
+      const nextNativeBal = Math.max(0, Math.round(((Number(account.native_balance) || 0) + deltaNative) * 100) / 100);
+      account = saveCashAccount({
+        ...account,
+        account_subtype: channel,
+        native_currency: label,
+        current_balance: nextUsdBal,
+        native_balance: nextNativeBal,
+        updated_at: nowIso,
+        updatedAt: nowMs,
+        lastUpdated: nowIso,
+      });
+    }
+
+    const actorId = supervisor?.id || sale.mobileVerifiedBy || 'SUPERVISOR';
+    const actorName = supervisor?.name || sale.mobileVerifiedByName || 'Supervisor';
+    const effectiveRate = totalVerifiedUsd > 0 ? Math.round((totalVerifiedNative / totalVerifiedUsd) * 100) / 100 : defaultRate;
+    const batchRefSummary = verifiedRefs.slice(-5).join(', ');
+    const nativeFormatted = totalVerifiedNative.toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    });
+
+    const voucher: CashTransfer = {
+      transfer_id: transferId,
+      company_id: currentCompany,
+      branch_id: branchId,
+      branch_name: branchName,
+      target_branch_id: 'ALL',
+      type: 'ELECTRONIC_SETTLEMENT',
+      from_account_id: `POS-ELECTRONIC-${branchId}`,
+      to_account_id: account.account_id,
+      amount: totalVerifiedUsd,
+      currency: 'USD',
+      native_currency: label,
+      native_amount: totalVerifiedNative,
+      exchange_rate: effectiveRate,
+      batch_ref: batchRefSummary || existing?.batch_ref,
+      bank_name: account.account_name,
+      status: 'COMPLETED',
+      created_by_user_id: existing?.created_by_user_id || actorId,
+      created_by_user_name: existing?.created_by_user_name || actorName,
+      created_at: existing?.created_at || nowIso,
+      approved_by_user_id: actorId,
+      approved_by_user_name: actorName,
+      approved_at: nowIso,
+      received_by_user_id: actorId,
+      received_by_user_name: actorName,
+      received_at: nowIso,
+      recipient_name: `${branchName} · Form 4 Verified ${label}`,
+      receipt_image_url: batchRefSummary || existing?.receipt_image_url,
+      notes: `Form 4 Confirmed ${label} Transactions (${shiftDate}, ${branchName}, ${verifiedRefs.length} txns): $${totalVerifiedUsd.toFixed(2)} USD (${label} ${nativeFormatted} @ ${effectiveRate}x)${batchRefSummary ? ` · Refs: ${batchRefSummary}` : ''}`,
+      is_owner_override: false,
+      updatedAt: nowMs,
+      lastUpdated: nowIso,
+    };
+
+    const saved = saveCashTransfer(voucher);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_cash_transfers_updated', { detail: saved }));
+    }
+    return saved;
+  } catch (err) {
+    console.warn('[syncVerifiedMobileSaleToDualCustody] Failed:', err);
+    return undefined;
+  }
+};
+
 export const verifyMobileMoneySale = (params: {
   saleId: string;
   supervisor: Salesperson;
@@ -11137,11 +11934,14 @@ export const verifyMobileMoneySale = (params: {
     updatedAt: nowMs,
     lastUpdated: nowIso,
   };
+  delete (updatedSale as any).fromMesh;
+  delete (updatedSale as any).fromSync;
 
   allSales[idx] = updatedSale;
   setStored(STORAGE_KEYS.SALES, allSales);
 
   applyMobileMoneyVerificationLedgerEffects(updatedSale);
+  syncVerifiedMobileSaleToDualCustody(updatedSale, params.supervisor);
 
   addAuditLog({
     action: shortfallUsd > 0 ? 'MOBILE_MONEY_SHORT_PAID' : 'MOBILE_MONEY_VERIFIED',
@@ -11227,11 +12027,14 @@ export const flagFakeMobileMoneySale = (params: {
     updatedAt: nowMs,
     lastUpdated: nowIso,
   };
+  delete (updatedSale as any).fromMesh;
+  delete (updatedSale as any).fromSync;
 
   allSales[idx] = updatedSale;
   setStored(STORAGE_KEYS.SALES, allSales);
 
   applyMobileMoneyVerificationLedgerEffects(updatedSale);
+  syncVerifiedMobileSaleToDualCustody(updatedSale, params.supervisor);
 
   addAuditLog({
     action: 'MOBILE_MONEY_FLAGGED_FAKE',
@@ -11740,6 +12543,8 @@ export const addExpense = (
       updatedAt: expenseData.updatedAt || nowMs,
       lastUpdated: expenseData.lastUpdated || nowIso,
     };
+    delete (merged as any).fromMesh;
+    delete (merged as any).fromSync;
     rawAll[existingIdx] = merged;
     setStored(STORAGE_KEYS.EXPENSES, rawAll);
 
@@ -11830,6 +12635,8 @@ export const addExpense = (
     updatedAt: expenseData.updatedAt || nowMs,
     lastUpdated: expenseData.lastUpdated || nowIso,
   };
+  delete (created as any).fromMesh;
+  delete (created as any).fromSync;
   const updated = [created, ...rawAll];
   setStored(STORAGE_KEYS.EXPENSES, updated);
 
@@ -11924,7 +12731,7 @@ export const approveExpense = (expenseId: string, supervisor: Salesperson): bool
   if (idx === -1) return false;
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
-  all[idx] = {
+  const nextExp: any = {
     ...all[idx],
     status: 'approved',
     approvedBy: supervisor.id,
@@ -11933,6 +12740,9 @@ export const approveExpense = (expenseId: string, supervisor: Salesperson): bool
     updatedAt: nowMs,
     lastUpdated: nowIso,
   };
+  delete nextExp.fromMesh;
+  delete nextExp.fromSync;
+  all[idx] = nextExp;
   setStored(STORAGE_KEYS.EXPENSES, all);
   const exp = all[idx];
   enqueueSync('Expenses', 'UPDATE', {
@@ -11963,7 +12773,7 @@ export const rejectExpense = (
 
   const nowMs = Date.now();
   const now = new Date(nowMs).toISOString();
-  all[idx] = {
+  const nextExp: any = {
     ...exp,
     status: 'rejected',
     approvedBy: supervisor.id,
@@ -11973,6 +12783,9 @@ export const rejectExpense = (
     lastUpdated: now,
     notes: `${exp.notes ? exp.notes + ' • ' : ''}Rejected by ${supervisor.name}: ${reason}`,
   };
+  delete nextExp.fromMesh;
+  delete nextExp.fromSync;
+  all[idx] = nextExp;
   setStored(STORAGE_KEYS.EXPENSES, all);
 
   // If cash expense, return the money to the cashier's drawer so it can be re-entered
@@ -12052,7 +12865,7 @@ export const approveAllExpensesForStaffAndDate = (staffId: string, date: string,
 
     if (isDateMatch && isStaffMatch && e.status !== 'approved' && e.status !== 'rejected') {
       count++;
-      const next = {
+      const next: any = {
         ...e,
         status: 'approved',
         approvedBy: supervisor.id,
@@ -12061,6 +12874,8 @@ export const approveAllExpensesForStaffAndDate = (staffId: string, date: string,
         updatedAt: nowMs,
         lastUpdated: now,
       };
+      delete next.fromMesh;
+      delete next.fromSync;
       newlyApproved.push(next);
       return next;
     }
@@ -12120,10 +12935,17 @@ export const saveReconciliation = (
   const compId = (recData as any).company_id || (recData as any).companyId || getCurrentCompanyId();
   const brId = (recData as any).branch_id || (recData as any).branchId || getCurrentBranchId();
   const recId = recData.id || `REC-${Date.now()}`;
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const cleanRec: any = { ...recData };
+  delete cleanRec.fromMesh;
+  delete cleanRec.fromSync;
   const created: ShiftReconciliation = {
-    ...recData,
+    ...cleanRec,
     id: recId,
-    timestamp: recData.timestamp || new Date().toISOString(),
+    timestamp: recData.timestamp || nowIso,
+    updatedAt: (recData as any).updatedAt || nowMs,
+    lastUpdated: (recData as any).lastUpdated || nowIso,
     synced: Boolean(options?.fromSync),
     company_id: compId,
     companyId: compId,
@@ -12136,9 +12958,10 @@ export const saveReconciliation = (
     : [created, ...list];
   setStored(STORAGE_KEYS.RECONCILIATIONS, updated);
 
-  // Save to Sheet "Reconciliations" (skip echo when hydrated from cloud/mesh)
+  // Save to Sheet "Reconciliations" & broadcast over Local Hub (skip echo when hydrated from cloud/mesh)
   if (!options?.fromSync) {
-    enqueueSync('Reconciliations', 'INSERT', {
+    const syncAction = existingIdx >= 0 ? 'UPDATE' : 'INSERT';
+    enqueueSync('Reconciliations', syncAction, {
       ...created,
       id: created.id,
       ReconID: created.id,
@@ -12158,6 +12981,19 @@ export const saveReconciliation = (
       Variance: created.variance,
       Status: created.status,
       Notes: created.notes,
+    });
+    notifyDatabaseMutation({
+      mutationId: `MUT-REC-${created.id}-${nowMs}`,
+      sheetName: 'Reconciliations',
+      action: syncAction,
+      companyId: compId,
+      branchId: brId,
+      branchCode: getCurrentBranch()?.code || brId,
+      entityType: 'reconciliation',
+      recordId: created.id,
+      payload: created,
+      fromSync: false,
+      timestamp: nowMs,
     });
   }
 
@@ -13726,9 +14562,14 @@ export const getCustomerChangeReport = (): {
 
   // First initialize from known customers in DB
   allCustomers.forEach((cust) => {
-    customerMap.set(cust.customerId, {
-      customerId: cust.customerId,
-      customerName: cust.name,
+    const cid = cust.customerId || (cust as any).id;
+    if (!cid) return;
+    const resolvedName = String(
+      cust.name || (cust as any).customerName || (cust as any).CustomerName || ''
+    ).trim();
+    customerMap.set(cid, {
+      customerId: cid,
+      customerName: resolvedName,
       phone: cust.phone,
       address: cust.address,
       entries: [],
@@ -13749,9 +14590,17 @@ export const getCustomerChangeReport = (): {
     if (!customerMap.has(key)) {
       customerMap.set(key, {
         customerId: entry.customerId || 'C-NEW',
-        customerName: entry.customerName || 'Walk-in Customer',
+        customerName: (entry.customerName || '').trim() || 'Walk-in Customer',
         entries: [],
       });
+    } else {
+      const bucket = customerMap.get(key)!;
+      if (
+        (!bucket.customerName || bucket.customerName === bucket.customerId || bucket.customerName === 'Walk-in Customer') &&
+        (entry.customerName || '').trim()
+      ) {
+        bucket.customerName = String(entry.customerName).trim();
+      }
     }
 
     customerMap.get(key)!.entries.push(entry);
@@ -13909,9 +14758,14 @@ export const getCustomerCreditReport = (): {
   }>();
 
   allCustomers.forEach((cust) => {
-    customerMap.set(cust.customerId, {
-      customerId: cust.customerId,
-      customerName: cust.name,
+    const cid = cust.customerId || (cust as any).id;
+    if (!cid) return;
+    const resolvedName = String(
+      cust.name || (cust as any).customerName || (cust as any).CustomerName || ''
+    ).trim();
+    customerMap.set(cid, {
+      customerId: cid,
+      customerName: resolvedName,
       phone: cust.phone,
       address: cust.address,
       entries: [],
@@ -13931,9 +14785,17 @@ export const getCustomerCreditReport = (): {
     if (!customerMap.has(key)) {
       customerMap.set(key, {
         customerId: entry.customerId || 'C-NEW',
-        customerName: entry.customerName || 'Walk-in Customer',
+        customerName: (entry.customerName || '').trim() || 'Walk-in Customer',
         entries: [],
       });
+    } else {
+      const bucket = customerMap.get(key)!;
+      if (
+        (!bucket.customerName || bucket.customerName === bucket.customerId || bucket.customerName === 'Walk-in Customer') &&
+        (entry.customerName || '').trim()
+      ) {
+        bucket.customerName = String(entry.customerName).trim();
+      }
     }
 
     customerMap.get(key)!.entries.push(entry);
@@ -15390,6 +16252,8 @@ export type DatabaseEntityType =
   | 'supervisor_approval'
   | 'cash_log'
   | 'customer'
+  | 'customer_change'
+  | 'credit_sale'
   | 'grv'
   | 'reconciliation'
   | 'supplier'
@@ -15435,9 +16299,11 @@ export function resolveEntityType(sheetName: string): DatabaseEntityType {
     case 'CashLog':
       return 'cash_log';
     case 'Customers':
-    case 'CustomerChange':
-    case 'CreditSales':
       return 'customer';
+    case 'CustomerChange':
+      return 'customer_change';
+    case 'CreditSales':
+      return 'credit_sale';
     case 'CreditGroups':
       return 'credit_group';
     case 'Direct_GRV':
@@ -16033,6 +16899,8 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
     updatedAt: incomingTime || now,
     lastUpdated: (grv as any).lastUpdated || new Date(incomingTime || now).toISOString(),
   };
+  delete (normalized as any).fromMesh;
+  delete (normalized as any).fromSync;
   if (idx >= 0) {
     const existing = all[idx];
     const exStatus = String(existing.status || '').trim().toUpperCase();
@@ -16114,25 +16982,68 @@ export const ingestMeshCustomer = (
   customer: any,
   options?: { fromSync?: boolean }
 ): boolean => {
-  if (!customer) return false;
+  if (!customer || typeof customer !== 'object') return false;
+  // Reject misclassified transaction payloads (e.g. Hub Section 9.2 re-broadcasting Change/Credit/Sale as CUSTOMER)
+  const isNonCustomerTransaction = Boolean(
+    customer.changeId ||
+      customer.creditId ||
+      customer.creditSaleId ||
+      customer.invoiceNumber ||
+      Array.isArray(customer.items) ||
+      customer.in !== undefined ||
+      customer.out !== undefined ||
+      /^(?:CHG|CR|CRD|INV|HQ-)-/i.test(String(customer.id || ''))
+  );
+  if (isNonCustomerTransaction) {
+    // Still allow opportunistic name backfill if we already have this customer with a missing name
+    const cidFromTxn = String(customer.customerId || '').trim();
+    const nameFromTxn = String(customer.customerName || customer.CustomerName || customer.name || '').trim();
+    if (cidFromTxn && nameFromTxn) {
+      const existingAll = getRawStoredCustomers();
+      const targetIdx = existingAll.findIndex(
+        (c) => String(c.customerId || (c as any).id || '').trim().toUpperCase() === cidFromTxn.toUpperCase()
+      );
+      if (targetIdx >= 0 && (!existingAll[targetIdx].name || String(existingAll[targetIdx].name).trim() === '')) {
+        existingAll[targetIdx] = { ...existingAll[targetIdx], name: nameFromTxn };
+        setStored(STORAGE_KEYS.CUSTOMERS, existingAll);
+        notifyListeners();
+      }
+    }
+    return false;
+  }
+
   const currentCompany = getCurrentCompanyId();
   const compId = (customer.company_id || customer.companyId || currentCompany).trim().toUpperCase();
   if (compId && compId !== currentCompany.trim().toUpperCase()) return false;
 
   const all = getRawStoredCustomers();
-  const id = customer.id || customer.customerId;
+  const id = String(customer.customerId || customer.id || '').trim();
+  const resolvedIncomingName = String(
+    customer.name || customer.CustomerName || customer.customerName || customer.FullName || ''
+  ).trim();
+
   const idx = all.findIndex(
     (c) =>
       (id && ((c as any).id === id || c.customerId === id)) ||
-      (customer.name && c.name && c.name.toLowerCase() === customer.name.toLowerCase())
+      (resolvedIncomingName && c.name && c.name.toLowerCase() === resolvedIncomingName.toLowerCase())
   );
+
+  // Never create a ghost customer record with a blank name
+  if (idx < 0 && !resolvedIncomingName) {
+    return false;
+  }
+
   const incomingTime = extractRecordTimestamp(customer);
   const now = Date.now();
-  const normalized = {
+  const normalized: any = {
     ...customer,
+    customerId: id || (idx >= 0 ? all[idx].customerId : undefined),
+    name: resolvedIncomingName || (idx >= 0 ? all[idx].name : ''),
     updatedAt: incomingTime || now,
     lastUpdated: customer.lastUpdated || new Date(incomingTime || now).toISOString(),
   };
+  delete normalized.fromMesh;
+  delete normalized.fromSync;
 
   if (idx >= 0) {
     const existing = all[idx];
@@ -16140,16 +17051,20 @@ export const ingestMeshCustomer = (
     const existingTime = parseTimestampMs(existing.updatedAt || existing.lastUpdated || (existing as any).hubTimestamp);
     if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
       console.warn(
-        `[LWW Client] 🛡️ Rejected stale customer update for ${customer.name || id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+        `[LWW Client] 🛡️ Rejected stale customer update for ${normalized.name || id} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
       );
       return false;
     }
 
     if (!isIncomingRecordNewer(customer, existing)) {
-      console.log(`[ingestMeshCustomer] 🛡️ Stale customer update ignored for ${customer.name || id}. Existing timestamp is newer.`);
+      console.log(`[ingestMeshCustomer] 🛡️ Stale customer update ignored for ${normalized.name || id}. Existing timestamp is newer.`);
       return false;
     }
-    all[idx] = { ...all[idx], ...normalized };
+    all[idx] = {
+      ...all[idx],
+      ...normalized,
+      name: resolvedIncomingName || existing.name,
+    };
   } else {
     all.unshift(normalized);
   }
@@ -16188,17 +17103,84 @@ export const ingestMeshSettings = (settingsPayload: any): boolean => {
 };
 
 export const ingestMeshCustomerChange = (entry: any): boolean => {
-  if (!entry) return false;
-  const id = entry.id || entry.changeId;
-  if (!id) return false;
+  if (!entry || typeof entry !== 'object') return false;
+  const rawId = String(entry.id || entry.changeId || '').trim();
+  if (!rawId) return false;
   const all = getRawStoredCustomerChanges();
-  if (all.some((c) => c.id === id || (entry.changeId && c.id === entry.changeId))) return false;
-  const normalized = { ...entry, id, changeId: id };
-  setStored(STORAGE_KEYS.CUSTOMER_CHANGES, [normalized, ...all]);
+  const clean: any = { ...entry, id: rawId, changeId: rawId };
+  delete clean.fromMesh;
+  delete clean.fromSync;
+
+  const invRef = extractPosInvoiceRefFromLedger(clean);
+  const inAmt = Math.round((Number(clean.in) || 0) * 100) / 100;
+  const outAmt = Math.round((Number(clean.out) || 0) * 100) / 100;
+  const custKey = String(clean.customerId || clean.customerName || '').trim().toUpperCase();
+
+  // 1. Invoice-reference dedupe (prevents $3 -> $6 double-booking from CHG-001 + CHG-INV-100)
+  if (invRef) {
+    const posDupIdx = all.findIndex((c) => {
+      const cInv = extractPosInvoiceRefFromLedger(c);
+      if (!cInv || cInv !== invRef) return false;
+      return (
+        Math.abs((Number(c.in) || 0) - inAmt) < 0.005 &&
+        Math.abs((Number(c.out) || 0) - outAmt) < 0.005
+      );
+    });
+    if (posDupIdx >= 0) {
+      const prev = all[posDupIdx];
+      const incomingIsCanonical = isCanonicalPosLedgerId(rawId, 'CHG', invRef);
+      const prevIsCanonical = isCanonicalPosLedgerId(prev.id, 'CHG', invRef);
+      if (incomingIsCanonical && !prevIsCanonical) {
+        all[posDupIdx] = {
+          ...prev,
+          ...clean,
+          id: rawId,
+          changeId: rawId,
+          customerName: clean.customerName || prev.customerName,
+          reference: clean.reference || prev.reference || invRef,
+        };
+        setStored(STORAGE_KEYS.CUSTOMER_CHANGES, all);
+        notifyListeners();
+      }
+      return false;
+    }
+  }
+
+  // 2. Exact ID match check — handle historic sequential ID collisions without silently dropping records!
+  const idMatchIdx = all.findIndex((c) => c.id === rawId || (c as any).changeId === rawId);
+  if (idMatchIdx >= 0) {
+    const prev = all[idMatchIdx];
+    const prevCust = String(prev.customerId || prev.customerName || '').trim().toUpperCase();
+    const prevIn = Math.round((Number(prev.in) || 0) * 100) / 100;
+    const prevOut = Math.round((Number(prev.out) || 0) * 100) / 100;
+    const isSameTxn =
+      (!prevCust || !custKey || prevCust === custKey) &&
+      Math.abs(prevIn - inAmt) < 0.005 &&
+      Math.abs(prevOut - outAmt) < 0.005;
+    if (isSameTxn) {
+      // Backfill customerName if previously missing
+      if (!prev.customerName && clean.customerName) {
+        all[idMatchIdx] = { ...prev, customerName: clean.customerName };
+        setStored(STORAGE_KEYS.CUSTOMER_CHANGES, all);
+        notifyListeners();
+      }
+      return false;
+    }
+    // Distinct transaction colliding on an old sequential ID -> preserve BOTH deterministically
+    const suffix = computeDeterministicLedgerHash([custKey, clean.date, inAmt, outAmt, invRef || clean.notes]);
+    const resolvedId = `${rawId}-C${suffix}`;
+    if (all.some((c) => c.id === resolvedId || (c as any).changeId === resolvedId)) {
+      return false;
+    }
+    clean.id = resolvedId;
+    clean.changeId = resolvedId;
+  }
+
+  setStored(STORAGE_KEYS.CUSTOMER_CHANGES, [clean, ...all]);
   notifyListeners();
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: normalized }));
-    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_customer_changes_updated', { detail: clean }));
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: clean }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
   }
@@ -16206,17 +17188,82 @@ export const ingestMeshCustomerChange = (entry: any): boolean => {
 };
 
 export const ingestMeshCreditSale = (entry: any): boolean => {
-  if (!entry) return false;
-  const id = entry.id || entry.creditId;
-  if (!id) return false;
+  if (!entry || typeof entry !== 'object') return false;
+  const rawId = String(entry.id || entry.creditId || entry.creditSaleId || '').trim();
+  if (!rawId) return false;
   const all = getRawStoredCreditSales();
-  if (all.some((c) => c.id === id || (entry.creditId && c.id === entry.creditId))) return false;
-  const normalized = { ...entry, id, creditId: id };
-  setStored(STORAGE_KEYS.CREDIT_SALES, [normalized, ...all]);
+  const clean: any = { ...entry, id: rawId, creditId: rawId };
+  delete clean.fromMesh;
+  delete clean.fromSync;
+
+  const invRef = extractPosInvoiceRefFromLedger(clean);
+  const outAmt = Math.round((Number(clean.out ?? clean.amount) || 0) * 100) / 100;
+  const inAmt = Math.round((Number(clean.in) || 0) * 100) / 100;
+  const custKey = String(clean.customerId || clean.customerName || '').trim().toUpperCase();
+
+  // 1. Invoice-reference dedupe (prevents $10 -> $20 double-booking from CR-001 + CR-INV-100)
+  if (invRef && outAmt > 0) {
+    const posDupIdx = all.findIndex((c) => {
+      const cInv = extractPosInvoiceRefFromLedger(c);
+      if (!cInv || cInv !== invRef) return false;
+      return (
+        Math.abs((Number(c.out ?? c.amount) || 0) - outAmt) < 0.005 &&
+        Math.abs((Number(c.in) || 0) - inAmt) < 0.005
+      );
+    });
+    if (posDupIdx >= 0) {
+      const prev = all[posDupIdx];
+      const incomingIsCanonical = isCanonicalPosLedgerId(rawId, 'CR', invRef);
+      const prevIsCanonical = isCanonicalPosLedgerId(prev.id, 'CR', invRef);
+      if (incomingIsCanonical && !prevIsCanonical) {
+        all[posDupIdx] = {
+          ...prev,
+          ...clean,
+          id: rawId,
+          creditId: rawId,
+          customerName: clean.customerName || prev.customerName,
+          reference: clean.reference || (prev as any).reference || invRef,
+        };
+        setStored(STORAGE_KEYS.CREDIT_SALES, all);
+        notifyListeners();
+      }
+      return false;
+    }
+  }
+
+  // 2. Exact ID match check — handle historic sequential ID collisions without silently dropping records!
+  const idMatchIdx = all.findIndex((c) => c.id === rawId || (c as any).creditId === rawId);
+  if (idMatchIdx >= 0) {
+    const prev = all[idMatchIdx];
+    const prevCust = String(prev.customerId || prev.customerName || '').trim().toUpperCase();
+    const prevOut = Math.round((Number(prev.out ?? prev.amount) || 0) * 100) / 100;
+    const prevIn = Math.round((Number(prev.in) || 0) * 100) / 100;
+    const isSameTxn =
+      (!prevCust || !custKey || prevCust === custKey) &&
+      Math.abs(prevOut - outAmt) < 0.005 &&
+      Math.abs(prevIn - inAmt) < 0.005;
+    if (isSameTxn) {
+      if (!prev.customerName && clean.customerName) {
+        all[idMatchIdx] = { ...prev, customerName: clean.customerName };
+        setStored(STORAGE_KEYS.CREDIT_SALES, all);
+        notifyListeners();
+      }
+      return false;
+    }
+    const suffix = computeDeterministicLedgerHash([custKey, clean.date, outAmt, inAmt, invRef || clean.notes]);
+    const resolvedId = `${rawId}-C${suffix}`;
+    if (all.some((c) => c.id === resolvedId || (c as any).creditId === resolvedId)) {
+      return false;
+    }
+    clean.id = resolvedId;
+    clean.creditId = resolvedId;
+  }
+
+  setStored(STORAGE_KEYS.CREDIT_SALES, [clean, ...all]);
   notifyListeners();
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: normalized }));
-    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: normalized }));
+    window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: clean }));
+    window.dispatchEvent(new CustomEvent('saimetric_customers_updated', { detail: clean }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
     window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
   }
@@ -16406,19 +17453,19 @@ export const getTransactionsDigest = (
     }
   }
 
-  // 3. Credit Sales (T1)
+  // 3. Credit Sales (T1) — net of credit issued (out/amount) minus repayments (in)
   else if (norm === 'credit_sales' || norm === 'credit_sale') {
     const rawCredits = getAllCreditSales();
     for (const c of rawCredits) {
-      const id = c.id || c.creditId;
+      const id = c.id || (c as any).creditId;
       if (!id) continue;
       const t = parseTimestampMs(c.timestamp || c.date);
       if (inRange(t)) {
-        const amt = Number(c.amount || c.out) || 0;
-        totalSum += amt;
+        const net = (Number(c.out ?? c.amount) || 0) - (Number(c.in) || 0);
+        totalSum += net;
         items.push({
           id,
-          total: amt,
+          total: net,
           status: c.status || 'Pending',
           timestamp: t,
         });
@@ -16497,6 +17544,25 @@ export const getTransactionsDigest = (
           id: e.id,
           total: amt,
           timestamp: t,
+        });
+      }
+    }
+  }
+
+  // 7b. Form 1 Cash Counts (T1 Upsertable)
+  else if (norm === 'cash_counts' || norm === 'cash_count') {
+    const rawCounts = getAllCashCounts();
+    for (const c of rawCounts) {
+      if (!c || !c.id) continue;
+      const t = parseTimestampMs((c as any).updatedAt || c.timestamp || c.date);
+      if (inRange(t)) {
+        const amt = Number(c.finalCashOutTotal) || 0;
+        totalSum += amt;
+        items.push({
+          id: c.id,
+          total: amt,
+          timestamp: t,
+          updatedAt: t,
         });
       }
     }
@@ -25438,6 +26504,8 @@ export const approveDirectGrv = (
   grv.approvedAt = now;
   (grv as any).updatedAt = nowMs;
   (grv as any).lastUpdated = now;
+  delete (grv as any).fromMesh;
+  delete (grv as any).fromSync;
 
   // 1. Increment inventory for each item with FIFO batches & audit movement logs
   const allInventory = getAllInventoryItems();
@@ -25664,15 +26732,16 @@ export const approveDirectGrv = (
   }
 
   // 4. Audit Log
+  const safeGrvTotal = Number(grv.totalCost ?? (grv as any).totalAmount ?? (grv as any).total ?? 0);
   addAuditLog({
     action: 'DIRECT_GRV_APPROVE',
     severity: 'SECURITY',
     staffId: approverId,
     staffName: approverName,
     staffRole: 'SUPERVISOR',
-    details: `Approved Direct GRV ${grv.grvNumber} for ${grv.supplierName}. Total Cost: $${grv.totalCost.toFixed(2)}. Till Payout: $${grv.payFromTill ? grv.totalCost.toFixed(2) : '0.00'}. Stock updated.`,
+    details: `Approved Direct GRV ${grv.grvNumber} for ${grv.supplierName}. Total Cost: $${safeGrvTotal.toFixed(2)}. Till Payout: $${grv.payFromTill ? safeGrvTotal.toFixed(2) : '0.00'}. Stock updated.`,
     referenceId: grv.grvNumber,
-    amount: grv.totalCost,
+    amount: safeGrvTotal,
   });
 
   enqueueSync('Direct_GRV', 'UPDATE', grv);
@@ -25714,6 +26783,8 @@ export const rejectDirectGrv = (
   (grv as any).approvedAt = now;
   (grv as any).updatedAt = nowMs;
   (grv as any).lastUpdated = now;
+  delete (grv as any).fromMesh;
+  delete (grv as any).fromSync;
   setStored(STORAGE_KEYS.DIRECT_GRVS, list);
 
   // 1. Update associated supplier_payment cashMovements to rejected status & affectsDrawer: false
@@ -26631,6 +27702,780 @@ export const checkPreviousBusinessDayStatus = (
   }
 
   return { requiresEod: false };
+};
+
+// ============================================================================
+// DAILY BLIND COUNTS (REPORT-ONLY, EXACT-MOMENT SOH FREEZE, ARCHIVED HISTORY)
+// ============================================================================
+
+const DAILY_BLIND_STATUS_RANK: Record<DailyBlindCountStatus, number> = {
+  SUBMITTED: 1,
+  EXPLANATION_REQUESTED: 2,
+  EXPLANATION_SUBMITTED: 3,
+  ARCHIVED: 4,
+};
+
+const normDailyBlindId = (val?: string | null): string =>
+  String(val || '').trim().toUpperCase();
+
+export const buildDailyBlindConfigId = (companyId: string, branchId: string): string => {
+  const c = String(companyId || getCurrentCompanyId() || 'COMP-001').trim();
+  const b = String(branchId || getCurrentBranchId() || 'BR-MAIN').trim();
+  return `DBC-${c}-${b}`;
+};
+
+export const getRawStoredDailyBlindConfigs = (): DailyBlindBranchConfig[] => {
+  const list = getStored<DailyBlindBranchConfig[]>(STORAGE_KEYS.DAILY_BLIND_CONFIGS, []);
+  return Array.isArray(list) ? list : [];
+};
+
+export const getDailyBlindBranchConfig = (
+  branchId?: string,
+  companyId?: string
+): DailyBlindBranchConfig | null => {
+  const targetCompany = companyId || getCurrentCompanyId();
+  const targetBranch = branchId || getCurrentBranchId();
+  const branches = getAllBranches();
+  const all = getRawStoredDailyBlindConfigs();
+
+  return (
+    all.find((cfg) => {
+      if (!cfg) return false;
+      const cComp = cfg.company_id || (cfg as any).companyId;
+      if (targetCompany && cComp && normDailyBlindId(cComp) !== normDailyBlindId(targetCompany)) {
+        return false;
+      }
+      if (!targetBranch || targetBranch === 'ALL') return true;
+      return isRecordInBranchScope(cfg.branch_id || (cfg as any).branchId, targetBranch, branches, targetCompany, cComp);
+    }) || null
+  );
+};
+
+export const saveDailyBlindBranchConfig = (
+  config: Partial<DailyBlindBranchConfig> & { selectedItemIds: string[] },
+  options?: { fromSync?: boolean }
+): DailyBlindBranchConfig => {
+  const now = Date.now();
+  const companyId = config.company_id || getCurrentCompanyId() || 'COMP-001';
+  const branchId = config.branch_id || getCurrentBranchId() || 'BR-MAIN';
+  const id = config.id || buildDailyBlindConfigId(companyId, branchId);
+  const all = getRawStoredDailyBlindConfigs();
+  const existingIdx = all.findIndex(
+    (c) =>
+      c &&
+      (normDailyBlindId(c.id) === normDailyBlindId(id) ||
+        (normDailyBlindId(c.company_id) === normDailyBlindId(companyId) &&
+          normDailyBlindId(c.branch_id) === normDailyBlindId(branchId)))
+  );
+  const existing = existingIdx >= 0 ? all[existingIdx] : undefined;
+
+  const dedupedIds = Array.from(
+    new Set((Array.isArray(config.selectedItemIds) ? config.selectedItemIds : []).map((s) => String(s || '').trim()).filter(Boolean))
+  );
+
+  const normalized: DailyBlindBranchConfig = {
+    id: existing?.id || id,
+    company_id: companyId,
+    branch_id: branchId,
+    selectedItemIds: dedupedIds,
+    designatedAuditorId:
+      config.designatedAuditorId !== undefined
+        ? String(config.designatedAuditorId || '').trim() || undefined
+        : existing?.designatedAuditorId,
+    designatedAuditorName:
+      config.designatedAuditorName !== undefined
+        ? String(config.designatedAuditorName || '').trim() || undefined
+        : existing?.designatedAuditorName,
+    updatedBy: config.updatedBy || existing?.updatedBy,
+    updatedByName: config.updatedByName || existing?.updatedByName,
+    updatedAt: options?.fromSync && config.updatedAt ? Number(config.updatedAt) : now,
+    version: (existing?.version || 0) + 1,
+    mutationSource: options?.fromSync ? config.mutationSource || 'SYNC' : 'LOCAL_UI',
+    isCloudSynced: options?.fromSync ? Boolean(config.isCloudSynced ?? true) : false,
+  };
+
+  const next =
+    existingIdx >= 0
+      ? all.map((c, idx) => (idx === existingIdx ? normalized : c))
+      : [...all, normalized];
+
+  setStored(STORAGE_KEYS.DAILY_BLIND_CONFIGS, next);
+  notifyListeners();
+
+  if (!options?.fromSync) {
+    const branchObj = getAllBranches().find(
+      (b) => normDailyBlindId(b.branchId || b.id) === normDailyBlindId(branchId)
+    );
+    const envelope: SyncEnvelope<DailyBlindBranchConfig> = {
+      packetId: `daily_blind_config-${normalized.id}-${now}-${Math.random().toString(36).substring(2, 6)}`,
+      entityType: 'daily_blind_config',
+      entityId: normalized.id,
+      action: 'UPSERT',
+      data: normalized,
+      updatedAt: now,
+      version: normalized.version || 1,
+      mutationSource: 'USER_EDIT',
+      originDeviceId: typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_device_id') || 'LOCAL' : 'LOCAL',
+      targetBranchId: branchId,
+      class: 'T2',
+      meta: {
+        companyId,
+        sheetName: 'DailyBlindConfigs',
+        branchCode: branchObj?.code || branchId,
+      },
+    };
+    void saveAndSyncThroughBridge(envelope).catch((err) => {
+      console.warn('[saveDailyBlindBranchConfig] Bridge sync warning:', err);
+    });
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_daily_blind_updated', { detail: { type: 'config', record: normalized } }));
+  }
+
+  return normalized;
+};
+
+export const ingestMeshDailyBlindConfig = (incoming: DailyBlindBranchConfig): boolean => {
+  if (!incoming) return false;
+  const companyId = incoming.company_id || (incoming as any).companyId || getCurrentCompanyId();
+  const branchId = incoming.branch_id || (incoming as any).branchId || getCurrentBranchId();
+  const id = incoming.id || buildDailyBlindConfigId(companyId, branchId);
+  const existing = getRawStoredDailyBlindConfigs().find(
+    (c) =>
+      c &&
+      (normDailyBlindId(c.id) === normDailyBlindId(id) ||
+        (normDailyBlindId(c.company_id) === normDailyBlindId(companyId) &&
+          normDailyBlindId(c.branch_id) === normDailyBlindId(branchId)))
+  );
+
+  const incomingTime = Number(incoming.updatedAt || extractRecordTimestamp(incoming) || Date.now());
+  const existingTime = existing ? Number(existing.updatedAt || extractRecordTimestamp(existing) || 0) : 0;
+
+  if (existing && existingTime > incomingTime + 60000) {
+    return false;
+  }
+
+  saveDailyBlindBranchConfig(
+    {
+      ...incoming,
+      id: existing?.id || id,
+      company_id: companyId,
+      branch_id: branchId,
+      selectedItemIds: Array.isArray(incoming.selectedItemIds) ? incoming.selectedItemIds : [],
+      updatedAt: incomingTime,
+    },
+    { fromSync: true }
+  );
+  return true;
+};
+
+/**
+ * Captures the EXACT live SOH for a single inventory item at the exact millisecond
+ * a staff member confirms their count on the shop floor.
+ */
+export const captureDailyBlindItemFreeze = (
+  itemId: string,
+  branchId?: string,
+  _companyId?: string
+): {
+  frozenSystemCases: number;
+  frozenSystemSingles: number;
+  frozenSystemUnits: number;
+  unitsPerCase: number;
+  unitCost: number;
+  frozenTimestamp: string;
+} | null => {
+  const items = getInventoryItems();
+  const target = items.find(
+    (it) => it && normDailyBlindId(it.itemId || (it as any).id) === normDailyBlindId(itemId)
+  );
+  if (!target) return null;
+
+  const unitsPerCase = Math.max(1, Number(target.unitsPerCase || 1));
+  const rawCases = Number(target.stockCases || 0);
+  const rawSingles = Number(target.stockSingles || 0);
+  const totalUnits =
+    target.totalUnits !== undefined && target.totalUnits !== null && !isNaN(Number(target.totalUnits))
+      ? Number(target.totalUnits)
+      : rawCases * unitsPerCase + rawSingles;
+
+  const normCases = Math.trunc(totalUnits / unitsPerCase);
+  const normSingles = totalUnits - normCases * unitsPerCase;
+  const unitCost =
+    Number(target.costPriceUnit || 0) > 0
+      ? Number(target.costPriceUnit)
+      : Number(target.costPriceCase || 0) > 0
+      ? Number(target.costPriceCase) / unitsPerCase
+      : 0;
+
+  return {
+    frozenSystemCases: normCases,
+    frozenSystemSingles: normSingles,
+    frozenSystemUnits: totalUnits,
+    unitsPerCase,
+    unitCost: Number(unitCost.toFixed(4)),
+    frozenTimestamp: new Date().toISOString(),
+  };
+};
+
+/**
+ * Resolves the exact list of products for a branch's Daily Blind Count:
+ * - If the Manager / Designated Auditor curated a product list (non-empty), return those items.
+ * - If no manager list exists (or all selected SKUs were deleted), automatically pick the
+ *   Top 10 fastest-moving products in that branch over the last 30 days of non-voided Sales,
+ *   topping up with highest-stock active items if fewer than 10 SKUs have sales yet.
+ * Strictly isolated to the current tenant & branch Inventory Master (zero demo SKUs).
+ */
+export const resolveDailyBlindTargetItems = (
+  branchId?: string,
+  companyId?: string
+): {
+  source: 'MANAGER_LIST' | 'AUTO_TOP_10';
+  items: InventoryItem[];
+  velocityMap: Record<string, number>;
+  config: DailyBlindBranchConfig | null;
+} => {
+  const targetBranch = branchId || getCurrentBranchId();
+  const targetCompany = companyId || getCurrentCompanyId();
+  const branchItems = getInventoryItems().filter((it) => it && !it.isDeleted && it.itemId);
+  const itemById = new Map<string, InventoryItem>();
+  branchItems.forEach((it) => itemById.set(normDailyBlindId(it.itemId), it));
+
+  // Compute 30-day sales velocity (units sold) for this branch
+  const cutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const sales = getAllSales(targetBranch);
+  const velocityMap: Record<string, number> = {};
+
+  for (const sale of sales) {
+    if (!sale || (sale as any).isDeleted) continue;
+    const statusNorm = String(sale.status || '').trim().toUpperCase();
+    if (statusNorm === 'VOIDED' || statusNorm === 'REFUNDED' || statusNorm === 'CANCELLED') continue;
+    const saleMs = sale.timestamp
+      ? new Date(sale.timestamp).getTime()
+      : sale.date
+      ? new Date(`${sale.date}T12:00:00`).getTime()
+      : 0;
+    if (saleMs > 0 && saleMs < cutoffMs) continue;
+
+    const cartItems = Array.isArray(sale.items) ? sale.items : [];
+    for (const line of cartItems) {
+      const rawId = line?.productId || (line as any)?.itemId || (line as any)?.id;
+      if (!rawId) continue;
+      const key = normDailyBlindId(rawId);
+      const inv = itemById.get(key);
+      if (!inv) continue;
+      const qty = Math.abs(Number(line.quantity || 0));
+      const upc = Math.max(1, Number(inv.unitsPerCase || 1));
+      const unitsSold = String(line.unitType || '').toUpperCase() === 'CASE' ? qty * upc : qty;
+      velocityMap[inv.itemId] = (velocityMap[inv.itemId] || 0) + unitsSold;
+    }
+  }
+
+  const config = getDailyBlindBranchConfig(targetBranch, targetCompany);
+  const curatedIds = Array.isArray(config?.selectedItemIds) ? config!.selectedItemIds : [];
+
+  if (curatedIds.length > 0) {
+    const resolvedCurated: InventoryItem[] = [];
+    const seen = new Set<string>();
+    for (const rawId of curatedIds) {
+      const key = normDailyBlindId(rawId);
+      if (seen.has(key)) continue;
+      const inv = itemById.get(key);
+      if (inv) {
+        seen.add(key);
+        resolvedCurated.push(inv);
+      }
+    }
+    if (resolvedCurated.length > 0) {
+      return {
+        source: 'MANAGER_LIST',
+        items: resolvedCurated,
+        velocityMap,
+        config,
+      };
+    }
+  }
+
+  // Fallback: Top 10 fastest-moving items by 30-day unit velocity, topped up by active stock
+  const ranked = [...branchItems].sort((a, b) => {
+    const velDiff = (velocityMap[b.itemId] || 0) - (velocityMap[a.itemId] || 0);
+    if (velDiff !== 0) return velDiff;
+    const stockA = Number(a.totalUnits ?? Number(a.stockCases || 0) * Math.max(1, Number(a.unitsPerCase || 1)) + Number(a.stockSingles || 0));
+    const stockB = Number(b.totalUnits ?? Number(b.stockCases || 0) * Math.max(1, Number(b.unitsPerCase || 1)) + Number(b.stockSingles || 0));
+    if (stockB !== stockA) return stockB - stockA;
+    return String(a.itemName || '').localeCompare(String(b.itemName || ''));
+  });
+
+  return {
+    source: 'AUTO_TOP_10',
+    items: ranked.slice(0, 10),
+    velocityMap,
+    config,
+  };
+};
+
+export const getRawStoredDailyBlindCounts = (): DailyBlindCountRecord[] => {
+  const list = getStored<DailyBlindCountRecord[]>(STORAGE_KEYS.DAILY_BLIND_COUNTS, []);
+  return Array.isArray(list) ? list : [];
+};
+
+export const getDailyBlindCounts = (
+  branchId?: string,
+  companyId?: string
+): DailyBlindCountRecord[] => {
+  const targetCompany = companyId || getCurrentCompanyId();
+  const targetBranch = branchId || getCurrentBranchId();
+  const branches = getAllBranches();
+  const all = getRawStoredDailyBlindCounts();
+
+  return all
+    .filter((rec) => {
+      if (!rec || !rec.id) return false;
+      const rComp = rec.company_id || (rec as any).companyId;
+      if (targetCompany && rComp && normDailyBlindId(rComp) !== normDailyBlindId(targetCompany)) {
+        return false;
+      }
+      if (!targetBranch || targetBranch === 'ALL') return true;
+      return isRecordInBranchScope(rec.branch_id || (rec as any).branchId, targetBranch, branches, targetCompany, rComp);
+    })
+    .sort((a, b) => {
+      const tA = new Date(a.submittedAt || 0).getTime() || Number(a.updatedAt || 0);
+      const tB = new Date(b.submittedAt || 0).getTime() || Number(b.updatedAt || 0);
+      return tB - tA;
+    });
+};
+
+export const getDailyBlindCountById = (id: string): DailyBlindCountRecord | null => {
+  if (!id) return null;
+  const key = normDailyBlindId(id);
+  return getRawStoredDailyBlindCounts().find((r) => r && normDailyBlindId(r.id) === key) || null;
+};
+
+const computeDailyBlindTotals = (lines: DailyBlindCountLine[]) => {
+  let matchedCount = 0;
+  let varianceItemCount = 0;
+  let netVarianceUnits = 0;
+  let netVarianceCostValue = 0;
+  let absVarianceCostValue = 0;
+
+  for (const line of lines) {
+    const vUnits = Number(line.varianceUnits || 0);
+    const vCost = Number(line.varianceCostValue || 0);
+    if (vUnits === 0) {
+      matchedCount += 1;
+    } else {
+      varianceItemCount += 1;
+    }
+    netVarianceUnits += vUnits;
+    netVarianceCostValue += vCost;
+    absVarianceCostValue += Math.abs(vCost);
+  }
+
+  return {
+    totalItemsCounted: lines.length,
+    matchedCount,
+    varianceItemCount,
+    netVarianceUnits,
+    netVarianceCostValue: Number(netVarianceCostValue.toFixed(2)),
+    absVarianceCostValue: Number(absVarianceCostValue.toFixed(2)),
+  };
+};
+
+export const saveDailyBlindCount = (
+  record: DailyBlindCountRecord,
+  options?: { fromSync?: boolean }
+): DailyBlindCountRecord => {
+  const now = Date.now();
+  const companyId = record.company_id || getCurrentCompanyId() || 'COMP-001';
+  const branchId = record.branch_id || getCurrentBranchId() || 'BR-MAIN';
+  const all = getRawStoredDailyBlindCounts();
+  const existingIdx = all.findIndex((r) => r && normDailyBlindId(r.id) === normDailyBlindId(record.id));
+  const existing = existingIdx >= 0 ? all[existingIdx] : undefined;
+
+  const cleanLines = Array.isArray(record.lines) ? record.lines : [];
+  const totals = computeDailyBlindTotals(cleanLines);
+
+  const normalized: DailyBlindCountRecord = {
+    ...record,
+    company_id: companyId,
+    branch_id: branchId,
+    lines: cleanLines,
+    ...totals,
+    reportOnly: true,
+    updatedAt: options?.fromSync && record.updatedAt ? Number(record.updatedAt) : now,
+    version: Math.max((existing?.version || 0) + 1, Number(record.version || 1)),
+    mutationSource: options?.fromSync ? record.mutationSource || 'SYNC' : 'LOCAL_UI',
+    isCloudSynced: options?.fromSync ? Boolean(record.isCloudSynced ?? true) : false,
+  };
+
+  const next =
+    existingIdx >= 0
+      ? all.map((r, idx) => (idx === existingIdx ? normalized : r))
+      : [normalized, ...all];
+
+  setStored(STORAGE_KEYS.DAILY_BLIND_COUNTS, next);
+  notifyListeners();
+
+  if (!options?.fromSync) {
+    const branchObj = getAllBranches().find(
+      (b) => normDailyBlindId(b.branchId || b.id) === normDailyBlindId(branchId)
+    );
+    const envelope: SyncEnvelope<DailyBlindCountRecord> = {
+      packetId: `daily_blind_count-${normalized.id}-${now}-${Math.random().toString(36).substring(2, 6)}`,
+      entityType: 'daily_blind_count',
+      entityId: normalized.id,
+      action: 'UPSERT',
+      data: normalized,
+      updatedAt: now,
+      version: normalized.version || 1,
+      mutationSource: 'USER_EDIT',
+      originDeviceId: typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_device_id') || 'LOCAL' : 'LOCAL',
+      targetBranchId: branchId,
+      class: 'T2',
+      meta: {
+        companyId,
+        sheetName: 'DailyBlindCounts',
+        branchCode: branchObj?.code || branchId,
+      },
+    };
+    void saveAndSyncThroughBridge(envelope).catch((err) => {
+      console.warn('[saveDailyBlindCount] Bridge sync warning:', err);
+    });
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_daily_blind_updated', { detail: { type: 'count', record: normalized } }));
+  }
+
+  return normalized;
+};
+
+/**
+ * Ingests a remote DailyBlindCountRecord safely with monotonic workflow status protection
+ * (SUBMITTED < EXPLANATION_REQUESTED < EXPLANATION_SUBMITTED < ARCHIVED) and LWW merging,
+ * ensuring frozen SOH snapshots from count-time are preserved immutably.
+ */
+export const ingestMeshDailyBlindCount = (incoming: DailyBlindCountRecord): boolean => {
+  if (!incoming || !incoming.id) return false;
+  const existing = getDailyBlindCountById(incoming.id);
+  const incomingTime = Number(incoming.updatedAt || extractRecordTimestamp(incoming) || Date.now());
+
+  if (!existing) {
+    saveDailyBlindCount(
+      {
+        ...incoming,
+        reportOnly: true,
+        updatedAt: incomingTime,
+      },
+      { fromSync: true }
+    );
+    return true;
+  }
+
+  const existingTime = Number(existing.updatedAt || extractRecordTimestamp(existing) || 0);
+  const existingRank = DAILY_BLIND_STATUS_RANK[existing.status] || 1;
+  const incomingRank = DAILY_BLIND_STATUS_RANK[incoming.status] || 1;
+
+  // Never downgrade an already-archived record unless incoming is strictly newer AND also archived
+  if (existing.status === 'ARCHIVED' && incoming.status !== 'ARCHIVED') {
+    return false;
+  }
+
+  // Drop clearly stale packets unless they advance the workflow state
+  if (incomingRank < existingRank && incomingTime <= existingTime + 60000) {
+    return false;
+  }
+  if (incomingRank === existingRank && incomingTime < existingTime - 60000) {
+    return false;
+  }
+
+  // Merge line-level optional explanation fields without losing either auditor requests or staff replies
+  const existingLineMap = new Map<string, DailyBlindCountLine>();
+  (existing.lines || []).forEach((l) => existingLineMap.set(normDailyBlindId(l.itemId), l));
+
+  const mergedLines: DailyBlindCountLine[] = (incoming.lines || existing.lines || []).map((incLine) => {
+    const exLine = existingLineMap.get(normDailyBlindId(incLine.itemId));
+    if (!exLine) return incLine;
+    return {
+      ...exLine,
+      ...incLine,
+      // Always preserve the original exact-moment frozen SOH snapshot
+      frozenSystemCases: exLine.frozenTimestamp ? exLine.frozenSystemCases : incLine.frozenSystemCases,
+      frozenSystemSingles: exLine.frozenTimestamp ? exLine.frozenSystemSingles : incLine.frozenSystemSingles,
+      frozenSystemUnits: exLine.frozenTimestamp ? exLine.frozenSystemUnits : incLine.frozenSystemUnits,
+      frozenTimestamp: exLine.frozenTimestamp || incLine.frozenTimestamp,
+      varianceUnits: exLine.frozenTimestamp ? exLine.varianceUnits : incLine.varianceUnits,
+      varianceCostValue: exLine.frozenTimestamp ? exLine.varianceCostValue : incLine.varianceCostValue,
+      explanationRequested: Boolean(incLine.explanationRequested || exLine.explanationRequested),
+      auditorPrompt: incLine.auditorPrompt || exLine.auditorPrompt,
+      reasonCode: incLine.reasonCode || exLine.reasonCode,
+      staffExplanation: incLine.staffExplanation || exLine.staffExplanation,
+      explainedAt: incLine.explainedAt || exLine.explainedAt,
+      explainedById: incLine.explainedById || exLine.explainedById,
+      explainedByName: incLine.explainedByName || exLine.explainedByName,
+      auditorAckStatus:
+        incLine.auditorAckStatus === 'ACKNOWLEDGED' || exLine.auditorAckStatus === 'ACKNOWLEDGED'
+          ? 'ACKNOWLEDGED'
+          : incLine.auditorAckStatus || exLine.auditorAckStatus,
+      auditorNote: incLine.auditorNote || exLine.auditorNote,
+    };
+  });
+
+  const finalStatus: DailyBlindCountStatus =
+    incomingRank >= existingRank ? incoming.status : existing.status;
+
+  saveDailyBlindCount(
+    {
+      ...existing,
+      ...incoming,
+      status: finalStatus,
+      lines: mergedLines,
+      reportOnly: true,
+      updatedAt: Math.max(incomingTime, existingTime),
+    },
+    { fromSync: true }
+  );
+  return true;
+};
+
+/**
+ * Submits a new Daily Blind Count (strictly Report-Only — ZERO stock mutations).
+ * Any line already frozen when the staff confirmed that product retains its exact-moment
+ * frozen SOH & timestamp; any remaining line freezes at the exact moment of submission.
+ */
+export const submitDailyBlindCount = (params: {
+  entries: Array<{
+    item: InventoryItem;
+    countedCases: number;
+    countedSingles: number;
+    frozenSnapshot?: {
+      frozenSystemCases: number;
+      frozenSystemSingles: number;
+      frozenSystemUnits: number;
+      unitCost: number;
+      frozenTimestamp: string;
+    };
+  }>;
+  listSource: 'MANAGER_LIST' | 'AUTO_TOP_10';
+  counter: { id: string; name: string; role?: string };
+  branchId?: string;
+  companyId?: string;
+}): DailyBlindCountRecord => {
+  const companyId = params.companyId || getCurrentCompanyId() || 'COMP-001';
+  const branchId = params.branchId || getCurrentBranchId() || 'BR-MAIN';
+  const branchObj = getAllBranches().find(
+    (b) => normDailyBlindId(b.branchId || b.id) === normDailyBlindId(branchId)
+  );
+  const nowIso = new Date().toISOString();
+  const dateStr = nowIso.split('T')[0];
+
+  const lines: DailyBlindCountLine[] = params.entries.map(({ item, countedCases, countedSingles, frozenSnapshot }) => {
+    const upc = Math.max(1, Number(item.unitsPerCase || 1));
+    const cCases = Math.max(0, Math.floor(Number(countedCases || 0)));
+    const cSingles = Math.max(0, Math.floor(Number(countedSingles || 0)));
+    const countedTotalUnits = cCases * upc + cSingles;
+
+    // Use the exact-moment freeze captured when the counter confirmed the item,
+    // or capture the live branch SOH right now at submission
+    const freeze = frozenSnapshot || captureDailyBlindItemFreeze(item.itemId, branchId, companyId) || {
+      frozenSystemCases: Number(item.stockCases || 0),
+      frozenSystemSingles: Number(item.stockSingles || 0),
+      frozenSystemUnits:
+        item.totalUnits !== undefined && item.totalUnits !== null
+          ? Number(item.totalUnits)
+          : Number(item.stockCases || 0) * upc + Number(item.stockSingles || 0),
+      unitCost:
+        Number(item.costPriceUnit || 0) > 0
+          ? Number(item.costPriceUnit)
+          : Number(item.costPriceCase || 0) > 0
+          ? Number(item.costPriceCase) / upc
+          : 0,
+      frozenTimestamp: nowIso,
+    };
+
+    const varianceUnits = countedTotalUnits - freeze.frozenSystemUnits;
+    const varianceCostValue = Number((varianceUnits * freeze.unitCost).toFixed(2));
+
+    return {
+      itemId: item.itemId,
+      sku: item.sku,
+      barcode: item.barcode,
+      itemName: item.itemName,
+      category: item.category,
+      unitsPerCase: upc,
+      countedCases: cCases,
+      countedSingles: cSingles,
+      countedTotalUnits,
+      frozenSystemCases: freeze.frozenSystemCases,
+      frozenSystemSingles: freeze.frozenSystemSingles,
+      frozenSystemUnits: freeze.frozenSystemUnits,
+      frozenTimestamp: freeze.frozenTimestamp,
+      varianceUnits,
+      unitCost: Number(freeze.unitCost.toFixed(4)),
+      varianceCostValue,
+    };
+  });
+
+  const totals = computeDailyBlindTotals(lines);
+  const id = `DBC-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`;
+
+  const record: DailyBlindCountRecord = {
+    id,
+    company_id: companyId,
+    branch_id: branchId,
+    branchName: branchObj?.name || branchId,
+    date: dateStr,
+    listSource: params.listSource,
+    countedById: params.counter.id,
+    countedByName: params.counter.name,
+    countedByRole: params.counter.role,
+    submittedAt: nowIso,
+    status: 'SUBMITTED',
+    lines,
+    ...totals,
+    reportOnly: true,
+    updatedAt: Date.now(),
+    version: 1,
+    mutationSource: 'LOCAL_UI',
+    isCloudSynced: false,
+  };
+
+  return saveDailyBlindCount(record, { fromSync: false });
+};
+
+/**
+ * Optional Manager/Auditor-initiated request asking the counter who submitted the count
+ * to explain one or more specific variance items. Never mandatory to archive.
+ */
+export const requestDailyBlindExplanations = (
+  recordId: string,
+  requests: Array<{ itemId: string; prompt?: string }>,
+  auditor: { id: string; name: string }
+): DailyBlindCountRecord | null => {
+  const existing = getDailyBlindCountById(recordId);
+  if (!existing || existing.status === 'ARCHIVED') return null;
+
+  const reqMap = new Map<string, string>();
+  requests.forEach((r) => {
+    if (r?.itemId) reqMap.set(normDailyBlindId(r.itemId), String(r.prompt || '').trim());
+  });
+  if (reqMap.size === 0) return existing;
+
+  const nowIso = new Date().toISOString();
+  const nextLines = existing.lines.map((line) => {
+    const key = normDailyBlindId(line.itemId);
+    if (!reqMap.has(key)) return line;
+    return {
+      ...line,
+      explanationRequested: true,
+      auditorPrompt: reqMap.get(key) || line.auditorPrompt || 'Please explain this variance.',
+      explanationRequestedAt: nowIso,
+      explanationRequestedById: auditor.id,
+      explanationRequestedByName: auditor.name,
+      auditorAckStatus: line.auditorAckStatus || 'PENDING',
+    };
+  });
+
+  return saveDailyBlindCount(
+    {
+      ...existing,
+      status: 'EXPLANATION_REQUESTED',
+      lines: nextLines,
+    },
+    { fromSync: false }
+  );
+};
+
+/**
+ * Staff submits optional explanations ONLY for the specific SKU(s) flagged by the Auditor.
+ */
+export const submitDailyBlindStaffExplanations = (
+  recordId: string,
+  answers: Array<{
+    itemId: string;
+    reasonCode: StocktakeVarianceReasonCode;
+    staffExplanation: string;
+  }>,
+  staff: { id: string; name: string }
+): DailyBlindCountRecord | null => {
+  const existing = getDailyBlindCountById(recordId);
+  if (!existing || existing.status === 'ARCHIVED') return null;
+
+  const ansMap = new Map<string, { reasonCode: StocktakeVarianceReasonCode; staffExplanation: string }>();
+  answers.forEach((a) => {
+    if (a?.itemId) {
+      ansMap.set(normDailyBlindId(a.itemId), {
+        reasonCode: a.reasonCode,
+        staffExplanation: String(a.staffExplanation || '').trim(),
+      });
+    }
+  });
+  if (ansMap.size === 0) return existing;
+
+  const nowIso = new Date().toISOString();
+  const nextLines = existing.lines.map((line) => {
+    const ans = ansMap.get(normDailyBlindId(line.itemId));
+    if (!ans) return line;
+    return {
+      ...line,
+      reasonCode: ans.reasonCode,
+      staffExplanation: ans.staffExplanation,
+      explainedAt: nowIso,
+      explainedById: staff.id,
+      explainedByName: staff.name,
+      auditorAckStatus: 'PENDING' as const,
+    };
+  });
+
+  const stillPending = nextLines.some((l) => l.explanationRequested && !l.explainedAt);
+
+  return saveDailyBlindCount(
+    {
+      ...existing,
+      status: stillPending ? 'EXPLANATION_REQUESTED' : 'EXPLANATION_SUBMITTED',
+      lines: nextLines,
+    },
+    { fromSync: false }
+  );
+};
+
+/**
+ * Permanently archives a Daily Blind Count report so results can be reviewed at any later date.
+ * Strictly report-only — NEVER mutates Inventory Master or posts stock adjustments.
+ */
+export const archiveDailyBlindCount = (
+  recordId: string,
+  auditor: { id: string; name: string },
+  auditorSummaryNote?: string
+): DailyBlindCountRecord | null => {
+  const existing = getDailyBlindCountById(recordId);
+  if (!existing) return null;
+
+  const nowIso = new Date().toISOString();
+  const nextLines = existing.lines.map((line) =>
+    line.explanationRequested && line.explainedAt
+      ? { ...line, auditorAckStatus: 'ACKNOWLEDGED' as const }
+      : line
+  );
+
+  return saveDailyBlindCount(
+    {
+      ...existing,
+      status: 'ARCHIVED',
+      lines: nextLines,
+      reviewedById: auditor.id,
+      reviewedByName: auditor.name,
+      reviewedAt: existing.reviewedAt || nowIso,
+      archivedAt: nowIso,
+      auditorSummaryNote:
+        auditorSummaryNote !== undefined
+          ? String(auditorSummaryNote || '').trim() || undefined
+          : existing.auditorSummaryNote,
+      reportOnly: true,
+    },
+    { fromSync: false }
+  );
 };
 
 

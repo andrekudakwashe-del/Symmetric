@@ -305,49 +305,50 @@ export const hasActiveGuestPass = (staffId: string, branchId?: string): Stocktak
 };
 
 /**
- * Dynamic Stocktake Module Visibility (Phase 3):
- * - Cashiers do NOT hold 'stocktake' in their idle role config.
- * - They automatically unlock 'stocktake' when:
- *   (a) Their branch has an active stocktake session, OR
- *   (b) They hold an active StocktakeGuestPass for this branch, OR
- *   (c) They have permissions.canPerformDailyBlindCount (or active DAILY_BLIND session).
+ * Daily Blind Count — Designated Auditor Check:
+ * Only the Designated Auditor (Owner / Admin, explicitly pinned branch auditor,
+ * or Branch Manager / Supervisor / Stocktake Auditor when no single person is pinned)
+ * can open Daily Blind Count Results, Archive, and Product List Configuration.
+ * Low-level staff (Cashiers, Stock Clerks, Casuals) can count blindly and submit,
+ * and can ONLY view specific line items flagged for their own optional explanation.
+ */
+export const isDailyBlindDesignatedAuditor = (
+  user: Salesperson | null,
+  branchConfig?: { designatedAuditorId?: string } | null
+): boolean => {
+  if (!user) return false;
+  if (user.isCasual || user.isVisitingCounter) return false;
+  if (isStocktakeLeader(user)) return true;
+
+  const cleanUserId = String(user.id || '').trim().toUpperCase();
+  const pinnedAuditorId = String(branchConfig?.designatedAuditorId || '').trim().toUpperCase();
+  if (pinnedAuditorId) {
+    return cleanUserId !== '' && cleanUserId === pinnedAuditorId;
+  }
+
+  if (isStocktakeAuditor(user)) return true;
+
+  const role = String(user.role || '').toUpperCase().trim();
+  return (
+    role === 'MANAGER' ||
+    role === 'BRANCH_MANAGER' ||
+    role === 'SUPERVISOR'
+  );
+};
+
+/**
+ * Dynamic Stocktake Module Visibility:
+ * - All active authenticated staff can access the Stocktake module so anyone
+ *   on the floor (including Cashiers and Clerks) can perform Daily Blind Counts.
+ * - Formal stocktake creation, SOH visibility, and Daily Blind Count results
+ *   remain strictly role-gated inside the module.
  */
 export const canAccessStocktakeModule = (
   user: Salesperson | null,
-  branchId?: string
+  _branchId?: string
 ): boolean => {
   if (!user) return false;
-  if (user.isCasual || user.isVisitingCounter) return true;
-  if (isStocktakeLeader(user) || isStocktakeAuditor(user)) return true;
-
-  const role = String(user.role || '').toUpperCase().trim();
-  if (
-    role === 'MANAGER' ||
-    role === 'BRANCH_MANAGER' ||
-    role === 'SUPERVISOR' ||
-    role === 'STOCK_CLERK' ||
-    role === 'STOCK_CONTROLLER' ||
-    role === 'CLERK'
-  ) {
-    return true;
-  }
-
-  const effectiveBranch = branchId || user.branchId || user.branch_id || getCurrentBranchId();
-
-  if (user.permissions?.canPerformDailyBlindCount) {
-    return true;
-  }
-
-  if (hasActiveGuestPass(user.id, effectiveBranch)) {
-    return true;
-  }
-
-  if (isBranchInLockdown(effectiveBranch)) {
-    return true;
-  }
-
-  const activeSessions = getActiveBranchStocktakeSessions(effectiveBranch);
-  return activeSessions.length > 0;
+  return true;
 };
 
 /**

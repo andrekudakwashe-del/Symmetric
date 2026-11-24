@@ -565,6 +565,26 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     uiEventName: 'saimetric_stocktake_updated',
     description: 'Zone claim slot assignment and vault status envelope',
   },
+  daily_blind_config: {
+    entityType: 'daily_blind_config',
+    class: 'T2',
+    appendOnly: false,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: true,
+    uiEventName: 'saimetric_daily_blind_updated',
+    description: 'Per-branch curated Daily Blind Count product list and designated auditor configuration',
+  },
+  daily_blind_count: {
+    entityType: 'daily_blind_count',
+    class: 'T2',
+    appendOnly: false,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: true,
+    uiEventName: 'saimetric_daily_blind_updated',
+    description: 'Report-only Daily Blind Count submission with exact-moment frozen SOH, optional explanations, and archive state',
+  },
   // AUDIT-NOTE: Row 3 (Hub LWW L5)
   casual_worker: {
     entityType: 'casual_worker',

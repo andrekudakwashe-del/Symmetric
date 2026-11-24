@@ -34,6 +34,7 @@ import {
   Pause,
   Archive,
   FileEdit,
+  ClipboardCheck,
 } from 'lucide-react';
 import { StocktakeSession, StocktakeCountType, Salesperson, TemporaryCasualAccount } from '../../types';
 import {
@@ -56,10 +57,13 @@ import {
   addTemporaryCasual,
   getTemporaryCasuals,
   isStaffAssignedToBranch,
+  getDailyBlindCounts,
+  getDailyBlindBranchConfig,
 } from '../../db/roomDatabase';
 import {
   isStocktakeLeader,
   isStocktakeAuditor,
+  isDailyBlindDesignatedAuditor,
   canUserCreateStocktakeSession,
   getAllowedCreateCountTypes,
   getActiveLockdownSession,
@@ -76,6 +80,7 @@ import {
 import { meshSyncService } from '../../services/meshSyncService';
 import { StocktakeSessionDetailScreen, DetailTab } from './StocktakeSessionDetailScreen';
 import { BranchSegmentsModal } from './BranchSegmentsModal';
+import { DailyBlindCountView } from './DailyBlindCountView';
 
 interface StocktakeHubScreenProps {
   currentUser: Salesperson | null;
@@ -106,10 +111,20 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
   const [hubError, setHubError] = useState<string | null>(null);
   const [showBranchSegmentsModal, setShowBranchSegmentsModal] = useState(false);
   const [archiveExpanded, setArchiveExpanded] = useState(false);
+  const [dailyBlindTick, setDailyBlindTick] = useState(0);
 
   // New Session Modal
   const allowedCreateTypes = useMemo(() => getAllowedCreateCountTypes(currentUser), [currentUser]);
   const canCreateSession = canUserCreateStocktakeSession(currentUser);
+  const [hubMode, setHubMode] = useState<'DAILY_BLIND' | 'FORMAL_STOCKTAKE'>(() => {
+    const isCasualOrVisiting = Boolean(currentUser?.isCasual || currentUser?.isVisitingCounter);
+    if (isCasualOrVisiting) return 'FORMAL_STOCKTAKE';
+    const hasLiveFormal = hasActiveBranchStocktakeSession(activeBranchId);
+    if (!canCreateSession && !isStocktakeLeader(currentUser) && !isStocktakeAuditor(currentUser) && !hasLiveFormal) {
+      return 'DAILY_BLIND';
+    }
+    return 'FORMAL_STOCKTAKE';
+  });
   const allBranches = useMemo(() => getBranches(), []);
   const allActiveStaff = useMemo(
     () => getSalespeople().filter((s) => s.active !== 'N'),
@@ -197,15 +212,18 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
       }
       loadSessions();
     };
+    const handleDailyBlindUpdate = () => setDailyBlindTick((t) => t + 1);
     window.addEventListener('saimetric_stocktake_updated', handleUpdate);
     window.addEventListener('saimetric_stocktake_zone_updated', handleUpdate);
     window.addEventListener('saimetric_stocktake_lockdown_updated', handleUpdate);
     window.addEventListener('saimetric_stocktake_rejected', handleRejected);
+    window.addEventListener('saimetric_daily_blind_updated', handleDailyBlindUpdate);
     return () => {
       window.removeEventListener('saimetric_stocktake_updated', handleUpdate);
       window.removeEventListener('saimetric_stocktake_zone_updated', handleUpdate);
       window.removeEventListener('saimetric_stocktake_lockdown_updated', handleUpdate);
       window.removeEventListener('saimetric_stocktake_rejected', handleRejected);
+      window.removeEventListener('saimetric_daily_blind_updated', handleDailyBlindUpdate);
     };
   }, []);
 
@@ -626,6 +644,22 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
       } as Salesperson)
     : currentUser;
 
+  const dailyBlindBadgeCount = useMemo(() => {
+    if (!effectiveUser || effectiveUser.isCasual || effectiveUser.isVisitingCounter) return 0;
+    const counts = getDailyBlindCounts(activeBranchId);
+    const cfg = getDailyBlindBranchConfig(activeBranchId);
+    if (isDailyBlindDesignatedAuditor(effectiveUser, cfg)) {
+      return counts.filter((c) => c.status !== 'ARCHIVED').length;
+    }
+    const myId = String(effectiveUser.id || '').trim().toUpperCase();
+    return counts.filter(
+      (c) =>
+        c.status !== 'ARCHIVED' &&
+        String(c.countedById || '').trim().toUpperCase() === myId &&
+        (c.lines || []).some((l) => l.explanationRequested && !l.explainedAt)
+    ).length;
+  }, [effectiveUser, activeBranchId, dailyBlindTick]);
+
   const handleCasualPinSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setCasualAuthError(null);
@@ -797,6 +831,51 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
         </div>
       )}
 
+      {/* Workspace Mode Switcher: Daily Blind Counts (All Staff, Report-Only) vs Formal Stocktakes */}
+      {!effectiveUser?.isCasual && !effectiveUser?.isVisitingCounter && (
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center gap-2 bg-slate-900/90 border border-slate-800 p-1.5 rounded-2xl">
+          <button
+            type="button"
+            onClick={() => setHubMode('DAILY_BLIND')}
+            className={`flex-1 min-w-[200px] px-4 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition ${
+              hubMode === 'DAILY_BLIND'
+                ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-950/40'
+                : 'text-slate-300 hover:bg-slate-800'
+            }`}
+          >
+            <ClipboardCheck className="w-4 h-4" />
+            Daily Blind Counts (Report-Only)
+            {dailyBlindBadgeCount > 0 && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-950/60 text-emerald-200 border border-emerald-400/30">
+                {dailyBlindBadgeCount}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setHubMode('FORMAL_STOCKTAKE')}
+            className={`flex-1 min-w-[200px] px-4 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition ${
+              hubMode === 'FORMAL_STOCKTAKE'
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-950/40'
+                : 'text-slate-300 hover:bg-slate-800'
+            }`}
+          >
+            <Layers className="w-4 h-4" />
+            Formal Stocktakes
+            {hasActiveSession && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-950/60 text-blue-200 border border-blue-400/30">
+                Live
+              </span>
+            )}
+          </button>
+        </div>
+      )}
+
+      {hubMode === 'DAILY_BLIND' && !effectiveUser?.isCasual && !effectiveUser?.isVisitingCounter ? (
+        <DailyBlindCountView currentUser={effectiveUser} branchId={activeBranchId} />
+      ) : (
+        <>
       {/* SECTION 1: LIVE BRANCH FLOOR STOCKTAKE (MAX 1 LIVE SESSION RULE) */}
       <section className="max-w-7xl mx-auto space-y-3">
         <div className="flex items-center justify-between">
@@ -1521,6 +1600,8 @@ export const StocktakeHubScreen: React.FC<StocktakeHubScreenProps> = ({ currentU
           </div>
         )}
       </section>
+        </>
+      )}
 
       {/* New Session Modal */}
       {showNewModal && (

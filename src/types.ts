@@ -258,6 +258,93 @@ export type StocktakeVarianceReviewStatus =
   | 'COMMENTS_SUBMITTED'
   | 'CLOSED';
 
+export type DailyBlindCountStatus =
+  | 'SUBMITTED'
+  | 'EXPLANATION_REQUESTED'
+  | 'EXPLANATION_SUBMITTED'
+  | 'ARCHIVED';
+
+export interface DailyBlindCountLine {
+  itemId: string;
+  sku?: string;
+  barcode?: string;
+  itemName: string;
+  category?: string;
+  unitsPerCase: number;
+  countedCases: number;
+  countedSingles: number;
+  countedTotalUnits: number;
+  /** Live branch SOH captured & frozen at the exact moment this product was counted */
+  frozenSystemCases: number;
+  frozenSystemSingles: number;
+  frozenSystemUnits: number;
+  frozenTimestamp: string;
+  /** Immutable variance locked at count freeze time (never recomputed against later live stock) */
+  varianceUnits: number;
+  unitCost: number;
+  varianceCostValue: number;
+  /** Optional manager-initiated variance commentary (never mandatory to archive) */
+  explanationRequested?: boolean;
+  auditorPrompt?: string;
+  explanationRequestedAt?: string;
+  explanationRequestedById?: string;
+  explanationRequestedByName?: string;
+  reasonCode?: StocktakeVarianceReasonCode;
+  staffExplanation?: string;
+  explainedAt?: string;
+  explainedById?: string;
+  explainedByName?: string;
+  auditorAckStatus?: 'PENDING' | 'ACKNOWLEDGED';
+  auditorNote?: string;
+}
+
+export interface DailyBlindCountRecord {
+  id: string;
+  company_id: string;
+  branch_id: string;
+  branchName: string;
+  date: string; // YYYY-MM-DD
+  listSource: 'MANAGER_LIST' | 'AUTO_TOP_10';
+  countedById: string;
+  countedByName: string;
+  countedByRole?: string;
+  submittedAt: string;
+  status: DailyBlindCountStatus;
+  lines: DailyBlindCountLine[];
+  totalItemsCounted: number;
+  matchedCount: number;
+  varianceItemCount: number;
+  netVarianceUnits: number;
+  netVarianceCostValue: number;
+  absVarianceCostValue: number;
+  reviewedById?: string;
+  reviewedByName?: string;
+  reviewedAt?: string;
+  archivedAt?: string;
+  auditorSummaryNote?: string;
+  /** Strictly report-only marker: Daily Blind Counts never directly adjust Inventory Master */
+  reportOnly: true;
+  updatedAt: number;
+  version?: number;
+  mutationSource?: string;
+  isCloudSynced?: boolean;
+}
+
+export interface DailyBlindBranchConfig {
+  id: string; // e.g. `dbc_${companyId}_${branchId}`
+  company_id: string;
+  branch_id: string;
+  selectedItemIds: string[];
+  designatedAuditorId?: string;
+  designatedAuditorName?: string;
+  updatedBy?: string;
+  updatedByName?: string;
+  updatedAt: number;
+  version?: number;
+  mutationSource?: string;
+  isCloudSynced?: boolean;
+}
+
 export interface StocktakeGuestPass {
   id: string;
   sessionId: string;

@@ -2,8 +2,19 @@ import { SyncAdapter, BroadcastResult, CatchUpResult } from './SyncAdapter';
 import { SyncEnvelope, SyncAction } from './SyncEnvelope';
 import { ENTITY_REGISTRY } from './EntityRegistry';
 import { LocalHubConfig, normalizeHubUrl } from '../../utils/localHubConfig';
+import { computeCommandSignature } from '../../utils/hubAuthCrypto';
 
 const PENDING_QUEUE_STORAGE_KEY = 'saimetric_pending_local_hub_queue';
+
+export type HubAuthState =
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'HANDSHAKING'
+  | 'PAIRING_PENDING'
+  | 'AUTHENTICATED'
+  | 'LEGACY_BACKUP'
+  | 'AUTH_FAILED'
+  | 'UPDATING';
 
 export interface LocalHubContext {
   companyId: string;
@@ -31,12 +42,34 @@ const CONTROL_PACKET_TYPES = new Set([
   'RECON_BACKFILL_PAYLOAD',
   'RECON_PUSH_BACKFILL_REQUEST',
   'HUB_CLOUD_BROADCAST',
+  'SYNC_CLOUD_CONFIG_ACK',
+  'HUB_ROUTING_EPOCH_UPDATED',
+  'CLOUD_AUTH_REFRESH_REQUIRED',
+  'AUTH_CHALLENGE',
+  'AUTH_OK',
+  'AUTH_FAILED',
+  'PAIR_PENDING',
+  'PAIR_APPROVED',
+  'PAIR_REJECTED',
+  'HUB_UPDATING',
+  'HUB_UPDATE_STATUS',
   'CATCHUP_REQUEST',
   'CATCHUP_RESPONSE',
   'PING',
   'HEARTBEAT',
   'PONG',
   'SECURITY_ALERT',
+]);
+
+const SENSITIVE_SIGNED_ACTIONS = new Set([
+  'RESET_BRANCH',
+  'STAFF_SYNC',
+  'PERMISSIONS_MATRIX_SYNC',
+  'ROLE_CONFIGS_SYNC',
+  'CASH_TRANSFER',
+  'CASH_TRANSFER_SYNC',
+  'RECONCILIATION',
+  'RECONCILIATION_SYNC',
 ]);
 
 export class LocalHubAdapter implements SyncAdapter {
@@ -57,6 +90,13 @@ export class LocalHubAdapter implements SyncAdapter {
   private pendingQueue: any[] = [];
   private receiveHandlers: Set<(envelope: SyncEnvelope) => void> = new Set();
 
+  // Mutual auth + keepalive watchdog state
+  private authState: HubAuthState = 'DISCONNECTED';
+  private activeHubUrl: string = '';
+  private activeDeviceSecret: string | null = null;
+  private keepaliveIntervalId: ReturnType<typeof setInterval> | null = null;
+  private lastInboundActivityAt: number = 0;
+
   // Lifecycle callbacks consumed by MeshSyncManager
   public onOpenCallback: ((url: string) => void) | null = null;
   public onCloseCallback: ((reason: string) => void) | null = null;
@@ -74,6 +114,38 @@ export class LocalHubAdapter implements SyncAdapter {
 
   public getContext(): LocalHubContext {
     return this.context;
+  }
+
+  public getAuthState(): HubAuthState {
+    return this.authState;
+  }
+
+  public getActiveHubUrl(): string {
+    return this.activeHubUrl;
+  }
+
+  public setAuthState(next: HubAuthState, deviceSecret?: string | null): void {
+    this.authState = next;
+    if (deviceSecret !== undefined) {
+      this.activeDeviceSecret = deviceSecret;
+    }
+    if (next === 'AUTHENTICATED' || next === 'LEGACY_BACKUP') {
+      this.lastInboundActivityAt = Date.now();
+      this.startKeepaliveWatchdog();
+    } else if (next === 'DISCONNECTED' || next === 'AUTH_FAILED' || next === 'UPDATING') {
+      this.stopKeepaliveWatchdog();
+    }
+  }
+
+  /**
+   * Returns true only when WebSocket is open AND either mutually authenticated
+   * or explicitly accepted in legacy Termux backup mode.
+   */
+  public isReadyForSync(): boolean {
+    return (
+      this.isConnected() &&
+      (this.authState === 'AUTHENTICATED' || this.authState === 'LEGACY_BACKUP')
+    );
   }
 
   // ==================== WEBSOCKET TRANSPORT (EXCLUSIVE OWNER) ====================
@@ -103,17 +175,24 @@ export class LocalHubAdapter implements SyncAdapter {
     const hubUrl = customUrl ? normalizeHubUrl(customUrl) : LocalHubConfig.getLocalHubUrl();
     if (!hubUrl) return;
 
+    this.activeHubUrl = hubUrl;
+    this.activeDeviceSecret = null;
+    this.authState = 'CONNECTING';
+
     try {
       const ws = new WebSocket(hubUrl);
       this.ws = ws;
 
       ws.onopen = () => {
         if (this.ws !== ws) return;
+        this.lastInboundActivityAt = Date.now();
+        this.authState = 'HANDSHAKING';
         this.onOpenCallback?.(hubUrl);
       };
 
       ws.onmessage = async (event) => {
         if (this.ws !== ws) return;
+        this.lastInboundActivityAt = Date.now();
         try {
           if (!event.data) return;
           let rawData: any = event.data;
@@ -127,10 +206,39 @@ export class LocalHubAdapter implements SyncAdapter {
           const parsed = JSON.parse(rawData);
           if (!parsed) return;
 
-          // Single control-packet intercept (HUB_INFO, RESET_CONFIRMED, SYNC_ACK, RECON_*, etc.)
+          // Single control-packet intercept (AUTH_*, PAIR_*, HUB_INFO, PING/PONG, HUB_UPDATING, RECON_*, etc.)
           if (!Array.isArray(parsed) && typeof parsed === 'object') {
             const pType = String(parsed.type || parsed.action || '').toUpperCase();
+
+            // Immediately reply to server-side keepalive PING so Android Hub APK never drops an idle PWA
+            if (pType === 'PING' || pType === 'HEARTBEAT') {
+              try {
+                if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: 'PONG',
+                    action: 'PONG',
+                    ts: Date.now(),
+                    deviceId: this.context.deviceId,
+                  }));
+                }
+              } catch {}
+              return;
+            }
+
+            if (pType === 'PONG') {
+              this.onControlPacketCallback?.(pType, parsed);
+              return;
+            }
+
             if (
+              pType === 'AUTH_CHALLENGE' ||
+              pType === 'AUTH_OK' ||
+              pType === 'AUTH_FAILED' ||
+              pType === 'PAIR_PENDING' ||
+              pType === 'PAIR_APPROVED' ||
+              pType === 'PAIR_REJECTED' ||
+              pType === 'HUB_UPDATING' ||
+              pType === 'HUB_UPDATE_STATUS' ||
               pType === 'HUB_INFO' ||
               pType === 'RESET_CONFIRMED' ||
               pType === 'DRAIN_COMPLETE_ACK' ||
@@ -142,11 +250,18 @@ export class LocalHubAdapter implements SyncAdapter {
               pType === 'RECON_PUSH_BACKFILL_REQUEST' ||
               pType === 'HUB_CLOUD_BROADCAST' ||
               pType === 'SYNC_CLOUD_CONFIG_ACK' ||
+              pType === 'HUB_ROUTING_EPOCH_UPDATED' ||
+              pType === 'CLOUD_AUTH_REFRESH_REQUIRED' ||
               pType === 'SECURITY_ALERT'
             ) {
               this.onControlPacketCallback?.(pType, parsed);
               return;
             }
+          }
+
+          // Quarantine guard: never ingest business sync packets while socket is unauthenticated
+          if (this.authState !== 'AUTHENTICATED' && this.authState !== 'LEGACY_BACKUP') {
+            return;
           }
 
           let batch: any[] = [];
@@ -192,10 +307,20 @@ export class LocalHubAdapter implements SyncAdapter {
         }
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         if (this.ws !== ws) return;
+        const wasUpdating = this.authState === 'UPDATING';
+        const wasAuthFailed = this.authState === 'AUTH_FAILED';
         this.cleanupSocket(false);
-        this.onCloseCallback?.('Local Hub WebSocket closed');
+        if (wasUpdating) {
+          this.authState = 'UPDATING';
+          this.onCloseCallback?.('Local Hub restarting for OTA update');
+        } else if (wasAuthFailed || ev?.code === 4001 || ev?.code === 4003) {
+          this.authState = 'AUTH_FAILED';
+          this.onCloseCallback?.(`Local Hub rejected authentication (${ev?.code || 4001})`);
+        } else {
+          this.onCloseCallback?.('Local Hub WebSocket closed');
+        }
       };
     } catch (err: any) {
       this.cleanupSocket(false);
@@ -210,7 +335,53 @@ export class LocalHubAdapter implements SyncAdapter {
     }
   }
 
+  private startKeepaliveWatchdog(): void {
+    this.stopKeepaliveWatchdog();
+    if (typeof window === 'undefined') return;
+    this.keepaliveIntervalId = setInterval(() => {
+      if (!this.isConnected() || !this.ws) {
+        this.stopKeepaliveWatchdog();
+        return;
+      }
+      const idleMs = Date.now() - this.lastInboundActivityAt;
+      // If socket has had zero inbound frames for >45s (missed 2 keepalive windows), tear down half-open socket
+      if (idleMs > 45000) {
+        console.warn('[LocalHubAdapter] Keepalive timeout (>45s silence). Closing half-open socket to force reconnect.');
+        const staleWs = this.ws;
+        this.cleanupSocket(false);
+        try {
+          staleWs.close(4000, 'Keepalive timeout');
+        } catch {}
+        this.onCloseCallback?.('Local Hub keepalive timeout');
+        return;
+      }
+      try {
+        this.ws.send(JSON.stringify({
+          type: 'PING',
+          action: 'PING',
+          ts: Date.now(),
+          deviceId: this.context.deviceId,
+        }));
+      } catch {
+        this.cleanupSocket(false);
+        this.onCloseCallback?.('Local Hub keepalive send failed');
+      }
+    }, 20000);
+  }
+
+  private stopKeepaliveWatchdog(): void {
+    if (this.keepaliveIntervalId !== null) {
+      clearInterval(this.keepaliveIntervalId);
+      this.keepaliveIntervalId = null;
+    }
+  }
+
   private cleanupSocket(nullifyHandlers: boolean): void {
+    this.stopKeepaliveWatchdog();
+    this.activeDeviceSecret = null;
+    if (this.authState !== 'UPDATING' && this.authState !== 'AUTH_FAILED') {
+      this.authState = 'DISCONNECTED';
+    }
     if (!this.ws) return;
     try {
       if (nullifyHandlers) {
@@ -230,11 +401,44 @@ export class LocalHubAdapter implements SyncAdapter {
 
   /**
    * Sends non-entity control/handshake/recon frames directly over the WebSocket.
+   * Automatically attaches an HMAC-SHA256 command signature on sensitive actions when authenticated.
    */
   public sendControlPacket(packet: any): boolean {
     if (!this.isConnected() || !this.ws) {
       return false;
     }
+    const pType = String(packet?.type || packet?.action || '').toUpperCase();
+    const isAuthFrame =
+      pType === 'AUTH_RESPONSE' ||
+      pType === 'PAIR_REQUEST' ||
+      pType === 'PING_HUB' ||
+      pType === 'PING_IDENTITY' ||
+      pType === 'PING' ||
+      pType === 'PONG';
+
+    if (!isAuthFrame && !this.isReadyForSync()) {
+      return false;
+    }
+
+    if (this.activeDeviceSecret && SENSITIVE_SIGNED_ACTIONS.has(pType)) {
+      const wsRef = this.ws;
+      const authTs = Date.now();
+      const recordId = String(packet.recordId || packet.entityId || packet.new_branch_id || packet.id || pType);
+      void computeCommandSignature(this.activeDeviceSecret, pType, recordId, authTs)
+        .then((authSig) => {
+          if (this.ws === wsRef && wsRef.readyState === WebSocket.OPEN) {
+            wsRef.send(JSON.stringify({
+              ...packet,
+              authTs,
+              authDeviceId: this.context.deviceId,
+              authSig,
+            }));
+          }
+        })
+        .catch(() => {});
+      return true;
+    }
+
     try {
       this.ws.send(JSON.stringify(packet));
       return true;
@@ -245,11 +449,35 @@ export class LocalHubAdapter implements SyncAdapter {
   }
 
   /**
-   * Sends a wire packet or queues it locally for replay when Hub reconnects.
+   * Sends a wire packet or queues it locally for replay when Hub reconnects & authenticates.
    */
   public sendRawWirePacket(wirePacket: any, queueIfOffline: boolean = true): boolean {
     if (!wirePacket) return false;
-    if (this.isConnected() && this.ws) {
+    if (this.isReadyForSync() && this.ws) {
+      const pAction = String(wirePacket.action || wirePacket.type || '').toUpperCase();
+      if (this.activeDeviceSecret && SENSITIVE_SIGNED_ACTIONS.has(pAction)) {
+        const wsRef = this.ws;
+        const authTs = Date.now();
+        const recordId = String(wirePacket.recordId || wirePacket.entityId || wirePacket.id || wirePacket.payload?.id || pAction);
+        void computeCommandSignature(this.activeDeviceSecret, pAction, recordId, authTs)
+          .then((authSig) => {
+            if (this.ws === wsRef && wsRef.readyState === WebSocket.OPEN) {
+              wsRef.send(JSON.stringify({
+                ...wirePacket,
+                authTs,
+                authDeviceId: this.context.deviceId,
+                authSig,
+              }));
+            } else if (queueIfOffline) {
+              this.queueOutgoingPacket(wirePacket);
+            }
+          })
+          .catch(() => {
+            if (queueIfOffline) this.queueOutgoingPacket(wirePacket);
+          });
+        return true;
+      }
+
       try {
         this.ws.send(JSON.stringify(wirePacket));
         return true;
@@ -1002,6 +1230,34 @@ export class LocalHubAdapter implements SyncAdapter {
           lastUpdated: d.lastUpdated || new Date(d.updatedAt || envelope.updatedAt || Date.now()).toISOString(),
         };
 
+      case 'daily_blind_config':
+        return {
+          ...base,
+          ...d,
+          type: 'DAILY_BLIND_CONFIG',
+          action: 'DAILY_BLIND_CONFIG_SYNC',
+          id: d.id || envelope.entityId,
+          company_id: d.company_id || ctx.companyId,
+          companyId: d.company_id || ctx.companyId,
+          branch_id: d.branch_id || ctx.branchId,
+          branchId: d.branch_id || ctx.branchId,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+        };
+
+      case 'daily_blind_count':
+        return {
+          ...base,
+          ...d,
+          type: 'DAILY_BLIND_COUNT',
+          action: 'DAILY_BLIND_COUNT_SYNC',
+          id: d.id || envelope.entityId,
+          company_id: d.company_id || ctx.companyId,
+          companyId: d.company_id || ctx.companyId,
+          branch_id: d.branch_id || ctx.branchId,
+          branchId: d.branch_id || ctx.branchId,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+        };
+
       case 'stocktake_session':
         return {
           ...base,
@@ -1147,6 +1403,18 @@ export class LocalHubAdapter implements SyncAdapter {
           unlockedAt: d.unlockedAt || new Date().toISOString(),
         };
 
+      case 'cash_count':
+        return {
+          ...base,
+          type: 'CASH_COUNT',
+          action: 'CASH_COUNT_SYNC',
+          entityType: 'cash_count',
+          sheetName: 'CashCounts',
+          recordId: envelope.entityId,
+          cashCount: d,
+          payload: d,
+        };
+
       case 'sheet_mutation':
         return {
           ...base,
@@ -1261,6 +1529,8 @@ export class LocalHubAdapter implements SyncAdapter {
       const spec = ENTITY_REGISTRY[resolved];
       if (unwrapped.action === 'DELETE' || pTypeLower === 'db_deletion') {
         action = 'DELETE';
+      } else if (resolved === 'cash_count' || resolved === 'reconciliation') {
+        action = 'UPSERT';
       } else {
         action = spec?.appendOnly && unwrapped.action !== 'UPSERT' ? 'APPEND' : 'UPSERT';
       }
@@ -1413,8 +1683,8 @@ export class LocalHubAdapter implements SyncAdapter {
     } else if (pTypeLower === 'cash_count' || pTypeUpper === 'CASH_COUNT' || pTypeUpper === 'CASH_COUNT_SYNC' || pTypeUpper === 'CASH_COUNT_RECORD') {
       entityType = 'cash_count';
       data = unwrapped.cashCount || unwrapped.payload || unwrapped.item || unwrapped;
-      entityId = String(data?.id || data?.staffId || '');
-      action = 'APPEND';
+      entityId = String(data?.id || unwrapped.recordId || unwrapped.entityId || data?.staffId || '');
+      action = 'UPSERT';
     } else if (pTypeLower === 'voucher' || pTypeUpper === 'VOUCHER' || pTypeUpper === 'VOUCHER_SYNC' || pTypeUpper === 'VOUCHER_RECORD' || pTypeLower === 'supplier_invoice' || pTypeUpper === 'SUPPLIER_INVOICE') {
       entityType = 'supplier_invoice_voucher';
       data = unwrapped.voucher || unwrapped.payload || unwrapped.item || unwrapped;
@@ -1488,6 +1758,22 @@ export class LocalHubAdapter implements SyncAdapter {
         ? { ...unwrapped, ...unwrapped.session }
         : unwrapped;
       entityId = String(data.sessionId || unwrapped.sessionId || unwrapped.id || '');
+    } else if (
+      pTypeUpper === 'DAILY_BLIND_CONFIG' ||
+      pTypeUpper === 'DAILY_BLIND_CONFIG_SYNC' ||
+      pTypeLower === 'daily_blind_config'
+    ) {
+      entityType = 'daily_blind_config';
+      data = unwrapped.config && typeof unwrapped.config === 'object' ? { ...unwrapped, ...unwrapped.config } : unwrapped;
+      entityId = String(data.id || unwrapped.id || unwrapped.entityId || '');
+    } else if (
+      pTypeUpper === 'DAILY_BLIND_COUNT' ||
+      pTypeUpper === 'DAILY_BLIND_COUNT_SYNC' ||
+      pTypeLower === 'daily_blind_count'
+    ) {
+      entityType = 'daily_blind_count';
+      data = unwrapped.record && typeof unwrapped.record === 'object' ? { ...unwrapped, ...unwrapped.record } : unwrapped;
+      entityId = String(data.id || unwrapped.id || unwrapped.entityId || '');
     } else if (ENTITY_REGISTRY[pTypeLower]) {
       entityType = pTypeLower;
       entityId = String(unwrapped.entityId || unwrapped.id || data?.id || 'UNKNOWN');
@@ -1584,6 +1870,8 @@ export class LocalHubAdapter implements SyncAdapter {
     if (sheet === 'Settlements' || sheet === 'ElectronicSettlements' || raw === 'settlement' || raw === 'electronic_settlement') return 'electronic_settlement';
     if (sheet === 'Categories' || raw === 'category' || raw === 'inventory_category') return 'inventory_category';
     if (sheet === 'StocktakeSessions' || raw === 'stocktake_session') return 'stocktake_session';
+    if (sheet === 'DailyBlindConfigs' || raw === 'daily_blind_config') return 'daily_blind_config';
+    if (sheet === 'DailyBlindCounts' || raw === 'daily_blind_count') return 'daily_blind_count';
     if (payload?.invoiceNumber) return 'sale';
     if (payload?.staffId && (payload?.in !== undefined || payload?.out !== undefined)) return 'cash_log';
     if (payload?.movementType) return 'stock_movement';

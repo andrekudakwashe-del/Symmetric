@@ -27,10 +27,25 @@ import {
   Search,
   Sparkles,
   Calendar,
+  ShieldCheck,
+  ShieldAlert,
+  KeyRound,
+  Trash2,
+  ChevronDown,
+  ChevronUp,
+  Building2,
+  CloudDownload,
+  Lock,
 } from 'lucide-react';
 import { Html5Qrcode } from 'html5-qrcode';
-import { LocalHubConfig, normalizeHubUrl, LocalHubTestResult } from '../../utils/localHubConfig';
+import {
+  LocalHubConfig,
+  normalizeHubUrl,
+  LocalHubTestResult,
+  PairedHubProfile,
+} from '../../utils/localHubConfig';
 import { meshSyncService, MeshConnectionMode } from '../../services/meshSyncService';
+import { parsePairDeepLink } from '../../utils/hubAuthCrypto';
 import { OfflineQRCode } from '../common/OfflineQRCode';
 import {
   getTermuxHubCode,
@@ -88,6 +103,13 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
   const [showResetConfirmModal, setShowResetConfirmModal] = useState<boolean>(false);
   const [isResettingHub, setIsResettingHub] = useState<boolean>(false);
 
+  // Zero-Camera Mutual Auth & Multi-Branch Pairing State
+  const [pairCodeInput, setPairCodeInput] = useState<string>('');
+  const [showQrFallback, setShowQrFallback] = useState<boolean>(false);
+  const [hubSecurity, setHubSecurity] = useState(() => meshSyncService.getHubSecurityStatus());
+  const [pairedHubs, setPairedHubs] = useState<PairedHubProfile[]>(() => LocalHubConfig.getPairedHubs());
+  const [isCheckingOta, setIsCheckingOta] = useState<boolean>(false);
+
   useEffect(() => {
     if (!isOpen) {
       stopCamera();
@@ -100,12 +122,16 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     setConnMode(meshSyncService.getConnectionMode());
     setHubBranchId(LocalHubConfig.getHubBranchId());
     setHubBranchName(LocalHubConfig.getHubBranchName());
+    setHubSecurity(meshSyncService.getHubSecurityStatus());
+    setPairedHubs(LocalHubConfig.getPairedHubs());
 
-    const unsubMode = meshSyncService.subscribeConnectionMode((mode, details) => {
+    const unsubMode = meshSyncService.subscribeConnectionMode((mode) => {
       setConnMode(mode);
       setConnStatus(meshSyncService.getConnectionStatus());
       setHubBranchId(LocalHubConfig.getHubBranchId());
       setHubBranchName(LocalHubConfig.getHubBranchName());
+      setHubSecurity(meshSyncService.getHubSecurityStatus());
+      setPairedHubs(LocalHubConfig.getPairedHubs());
     });
 
     const unsubConfig = LocalHubConfig.subscribe(() => {
@@ -113,7 +139,17 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
       setForceLocalHub(LocalHubConfig.getForceLocalHub());
       setHubBranchId(LocalHubConfig.getHubBranchId());
       setHubBranchName(LocalHubConfig.getHubBranchName());
+      setPairedHubs(LocalHubConfig.getPairedHubs());
+      setHubSecurity(meshSyncService.getHubSecurityStatus());
     });
+
+    const handleSecurityUpdate = () => {
+      setHubSecurity(meshSyncService.getHubSecurityStatus());
+      setPairedHubs(LocalHubConfig.getPairedHubs());
+      setConnStatus(meshSyncService.getConnectionStatus());
+      setConnMode(meshSyncService.getConnectionMode());
+    };
+    window.addEventListener('saimetric_hub_security_updated', handleSecurityUpdate);
 
     getTermuxHubHeredocCode().then((code) => {
       if (code) setScriptCode(code);
@@ -122,6 +158,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     return () => {
       unsubMode();
       unsubConfig();
+      window.removeEventListener('saimetric_hub_security_updated', handleSecurityUpdate);
       stopCamera();
     };
   }, [isOpen]);
@@ -171,7 +208,21 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
         { fps: 10, qrbox: { width: 220, height: 220 } },
         async (decodedText) => {
           await stopCamera();
-          const cleanUrl = normalizeHubUrl(decodedText);
+          const trimmed = String(decodedText || '').trim();
+          // Support deep-link QR codes (?pairHost=...&pairCode=...) from the Android Hub APK
+          const queryIdx = trimmed.indexOf('?');
+          if (queryIdx !== -1) {
+            const parsedLink = parsePairDeepLink(trimmed.slice(queryIdx));
+            if (parsedLink) {
+              setHubUrlInput(parsedLink.wsUrl);
+              setPairCodeInput(parsedLink.pairCode || '');
+              meshSyncService.startHubPairing(parsedLink.wsUrl, parsedLink.pairCode);
+              setSaveSuccessNotice(`Pairing securely with scanned Hub: ${parsedLink.wsUrl}`);
+              setTimeout(() => setSaveSuccessNotice(null), 5000);
+              return;
+            }
+          }
+          const cleanUrl = normalizeHubUrl(trimmed);
           setHubUrlInput(cleanUrl);
           LocalHubConfig.setLocalHubUrl(cleanUrl);
           meshSyncService.connectLocalHub(cleanUrl);
@@ -182,7 +233,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
       );
     } catch (err: any) {
       setIsScanning(false);
-      setCameraError('Camera access unavailable. Please type or paste the Hub WebSocket URL below.');
+      setCameraError('Camera access unavailable. Use the Zero-Camera 6-Digit Code or Approve on Hub option above.');
     }
   };
 
@@ -191,8 +242,42 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     const clean = LocalHubConfig.setLocalHubUrl(target);
     setHubUrlInput(clean);
     meshSyncService.connectLocalHub(clean);
-    setSaveSuccessNotice(`Hub URL updated to: ${clean}`);
-    setTimeout(() => setSaveSuccessNotice(null), 3000);
+    setSaveSuccessNotice(`Connecting to Hub: ${clean}`);
+    setTimeout(() => setSaveSuccessNotice(null), 3500);
+  };
+
+  const handleStartSecurePairing = () => {
+    const clean = normalizeHubUrl(hubUrlInput);
+    setHubUrlInput(clean);
+    const code = pairCodeInput.replace(/[^0-9A-Za-z]/g, '').trim();
+    meshSyncService.startHubPairing(clean, code || undefined);
+    setSaveSuccessNotice(
+      code
+        ? `Verifying 6-digit pairing code with ${clean}...`
+        : `Pairing request sent to ${clean}. Tap Approve on the Hub screen.`
+    );
+    setTimeout(() => setSaveSuccessNotice(null), 5000);
+  };
+
+  const handleUnpairHub = (hubIdOrUrl?: string) => {
+    meshSyncService.unpairLocalHub(hubIdOrUrl);
+    setPairCodeInput('');
+    setSaveSuccessNotice('Hub unpaired. You can now pair a new Hub or connect to a Termux backup.');
+    setTimeout(() => setSaveSuccessNotice(null), 4000);
+  };
+
+  const handleCheckHubUpdate = () => {
+    setIsCheckingOta(true);
+    const sent = meshSyncService.requestHubUpdateCheck();
+    setSaveSuccessNotice(
+      sent
+        ? 'Requested Local Hub to check for signed cloud updates...'
+        : 'Connect to a Local Hub first to check for updates.'
+    );
+    setTimeout(() => {
+      setIsCheckingOta(false);
+      setSaveSuccessNotice(null);
+    }, 4000);
   };
 
   const handleToggleForceLocalHub = () => {
@@ -445,97 +530,232 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               </div>
             )}
 
-            {/* QR Scanner Section */}
-            <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
-                    <Camera className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Scan Host QR Code</span>
-                  </h3>
-                  <p className="text-[11px] text-slate-400">
-                    Point camera at host phone or manager display to pair instantly
-                  </p>
+            {/* Live Security / Auth / OTA Banner */}
+            {hubSecurity.authState === 'AUTHENTICATED' && (
+              <div className="p-3.5 rounded-2xl bg-emerald-950/40 border border-emerald-500/35 space-y-2.5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
+                      <ShieldCheck className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-xs font-black uppercase tracking-wider text-emerald-300">
+                          Mutually Authenticated
+                        </span>
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/30 font-bold">
+                          {hubSecurity.hubRuntime === 'ANDROID_APK' ? 'Android Hub APK' : 'Termux Secured'}
+                        </span>
+                        {hubSecurity.hubVersion && (
+                          <span className="text-[10px] font-mono text-emerald-300/80">
+                            v{hubSecurity.hubVersion}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-emerald-200/80 font-mono truncate">
+                        {hubSecurity.hubId || 'Paired Hub'}
+                        {hubSecurity.otaSlot ? ` • Slot ${hubSecurity.otaSlot}` : ''}
+                        {' • Anti-Spoof Verified'}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleCheckHubUpdate}
+                      disabled={isCheckingOta}
+                      className="text-[11px] font-bold px-2.5 py-1.5 rounded-xl bg-emerald-600/25 hover:bg-emerald-600/40 text-emerald-200 border border-emerald-500/30 transition flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                      title="Ask the Local Hub to check for signed cloud updates"
+                    >
+                      <CloudDownload className={`w-3.5 h-3.5 ${isCheckingOta ? 'animate-bounce' : ''}`} />
+                      <span>Check Update</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleUnpairHub(hubSecurity.hubId || hubSecurity.hubUrl)}
+                      className="text-[11px] font-bold px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-rose-900/60 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-700/50 transition cursor-pointer"
+                    >
+                      Unpair
+                    </button>
+                  </div>
                 </div>
-                {!isScanning ? (
-                  <button
-                    type="button"
-                    onClick={startCamera}
-                    className="text-xs font-bold px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white shadow transition flex items-center gap-1.5 active:scale-95 cursor-pointer"
-                  >
-                    <Camera className="w-3.5 h-3.5" />
-                    <span>Open Camera</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={stopCamera}
-                    className="text-xs font-bold px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white shadow transition flex items-center gap-1.5 active:scale-95 cursor-pointer"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                    <span>Stop Camera</span>
-                  </button>
+                {hubSecurity.otaStatus && (
+                  <div className="text-[11px] text-emerald-200/90 bg-slate-950/60 rounded-xl px-3 py-2 border border-emerald-500/20">
+                    OTA Status: <strong>{hubSecurity.otaStatus.status}</strong>
+                    {hubSecurity.otaStatus.message ? ` — ${hubSecurity.otaStatus.message}` : ''}
+                  </div>
                 )}
               </div>
+            )}
 
-              {cameraError && (
-                <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-                  <span>{cameraError}</span>
+            {hubSecurity.authState === 'LEGACY_BACKUP' && (
+              <div className="p-3.5 rounded-2xl bg-amber-950/30 border border-amber-500/30 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-start gap-2.5">
+                  <Terminal className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-wider text-amber-300">
+                      Termux Backup Mode (Open LAN)
+                    </p>
+                    <p className="text-[11px] text-amber-200/80">
+                      Running smoothly with your Termux backup hub. Pair below anytime when switching to the Android Hub APK.
+                    </p>
+                  </div>
                 </div>
-              )}
+              </div>
+            )}
 
-              {isScanning && (
-                <div className="relative overflow-hidden rounded-2xl border-2 border-dashed border-indigo-500/50 bg-black flex flex-col items-center justify-center p-2 min-h-[220px]">
-                  <div id={scannerRegionId} className="w-full max-w-[280px]" />
-                  <p className="text-[11px] text-slate-400 mt-2 font-medium animate-pulse">
-                    Scanning for Local Hub QR code...
+            {hubSecurity.authState === 'UPDATING' && (
+              <div className="p-3.5 rounded-2xl bg-indigo-950/50 border border-indigo-500/40 flex items-center gap-3">
+                <RefreshCw className="w-5 h-5 text-indigo-400 animate-spin shrink-0" />
+                <div>
+                  <p className="text-xs font-black uppercase tracking-wider text-indigo-200">
+                    Local Hub Updating...
+                  </p>
+                  <p className="text-[11px] text-indigo-300/90">
+                    {hubSecurity.otaStatus?.message || 'Applying signed cloud update. Sales are safely queued and will auto-sync on reconnect.'}
                   </p>
                 </div>
-              )}
-            </div>
+              </div>
+            )}
 
-            {/* Manual Hub URL & Test Connection */}
-            <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
-              <label htmlFor="hub-url-input" className="block text-xs font-black uppercase tracking-wider text-slate-300">
-                Hub WebSocket URL or IP
-              </label>
-              <div className="flex flex-col sm:flex-row gap-2">
-                <input
-                  id="hub-url-input"
-                  type="text"
-                  value={hubUrlInput}
-                  onChange={(e) => setHubUrlInput(e.target.value)}
-                  placeholder="ws://192.168.43.1:8080"
-                  className="flex-1 bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                />
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleApplyUrl()}
-                    className="flex-1 sm:flex-none text-xs font-bold px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition active:scale-95 shadow cursor-pointer"
-                  >
-                    Save &amp; Connect
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleTestConnection}
-                    disabled={isTesting}
-                    className="flex-1 sm:flex-none text-xs font-bold px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition active:scale-95 disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    {isTesting ? (
-                      <>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                        <span>Testing...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Activity className="w-3.5 h-3.5 text-indigo-400" />
-                        <span>Test Connection</span>
-                      </>
-                    )}
-                  </button>
+            {hubSecurity.authError && (
+              <div className="p-3.5 rounded-2xl bg-rose-950/50 border border-rose-500/40 space-y-2">
+                <div className="flex items-start gap-2.5">
+                  <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-black uppercase tracking-wider text-rose-300">
+                      Security Verification Blocked Connection
+                    </p>
+                    <p className="text-[11px] text-rose-200/90 mt-0.5">
+                      {hubSecurity.authError}
+                    </p>
+                  </div>
                 </div>
+                {hubSecurity.pairedProfile && (
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => handleUnpairHub(hubSecurity.pairedProfile?.hubId || hubSecurity.hubUrl)}
+                      className="text-[11px] font-bold px-3 py-1.5 rounded-xl bg-rose-600/30 hover:bg-rose-600/50 text-rose-100 border border-rose-500/40 transition cursor-pointer"
+                    >
+                      Unpair Old Hub Key (Allow Re-Pair or Termux Backup)
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Live TV-Style Visual Confirmation Banner during PAIRING_PENDING */}
+            {hubSecurity.pendingPair && (
+              <div className="p-4 rounded-2xl bg-indigo-950/60 border-2 border-indigo-500/50 space-y-3 text-center">
+                <div className="flex items-center justify-center gap-2 text-indigo-300 text-xs font-black uppercase tracking-wider">
+                  <Lock className="w-4 h-4 animate-pulse" />
+                  <span>Waiting for Hub Approval</span>
+                </div>
+                {hubSecurity.pendingPair.visualCode ? (
+                  <>
+                    <div className="text-3xl font-mono font-black tracking-[0.25em] text-white bg-slate-950/80 border border-indigo-500/40 rounded-2xl py-3 px-4 inline-block">
+                      {hubSecurity.pendingPair.visualCode}
+                    </div>
+                    <p className="text-xs text-indigo-200/90">
+                      Verify this code matches the popup on <strong>{hubSecurity.pendingPair.branchName || 'your Local Hub'}</strong> and tap <strong>Approve</strong> on the Hub screen.
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-xs text-indigo-200/90">
+                    Contacting <code>{hubSecurity.pendingPair.wsUrl}</code> to establish encrypted pairing...
+                  </p>
+                )}
+                <button
+                  type="button"
+                  onClick={() => meshSyncService.cancelHubPairing()}
+                  className="text-xs font-bold px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition cursor-pointer"
+                >
+                  Cancel Pairing
+                </button>
+              </div>
+            )}
+
+            {/* PRIMARY CARD: Zero-Camera Hub Connection & Secure Pairing (Works on Desktop & Mobile) */}
+            <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
+                    <KeyRound className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Connect or Pair Local Hub (No Camera Needed)</span>
+                  </h3>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Works on Desktop PCs &amp; Mobile. Enter Hub IP + 6-digit code, or leave code blank to approve on the Hub screen.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <div className="sm:col-span-2">
+                  <label htmlFor="hub-url-input" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                    Hub IP or WebSocket URL
+                  </label>
+                  <input
+                    id="hub-url-input"
+                    type="text"
+                    value={hubUrlInput}
+                    onChange={(e) => setHubUrlInput(e.target.value)}
+                    placeholder="ws://192.168.43.1:8080"
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="hub-pair-code-input" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                    6-Digit Code (Optional)
+                  </label>
+                  <input
+                    id="hub-pair-code-input"
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={8}
+                    value={pairCodeInput}
+                    onChange={(e) => setPairCodeInput(e.target.value.replace(/[^0-9A-Za-z-]/g, ''))}
+                    placeholder="e.g. 482917"
+                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs font-mono tracking-widest text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={handleStartSecurePairing}
+                  className="flex-1 sm:flex-none text-xs font-black px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white transition active:scale-95 shadow flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>{pairCodeInput.trim() ? 'Pair with Code' : 'Pair & Approve on Hub'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleApplyUrl()}
+                  className="flex-1 sm:flex-none text-xs font-bold px-3.5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition active:scale-95 shadow cursor-pointer"
+                  title="Connect directly (uses saved key if paired, or open Termux backup mode)"
+                >
+                  Connect / Termux Backup
+                </button>
+                <button
+                  type="button"
+                  onClick={handleTestConnection}
+                  disabled={isTesting}
+                  className="text-xs font-bold px-3 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition active:scale-95 disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  {isTesting ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                      <span>Testing...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Activity className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Test</span>
+                    </>
+                  )}
+                </button>
               </div>
 
               {/* Quick Preset Buttons */}
@@ -589,6 +809,143 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                         : testResult.error}
                     </p>
                   </div>
+                </div>
+              )}
+            </div>
+
+            {/* Saved Branch Hubs (Multi-Branch Roaming Manager) */}
+            {pairedHubs.length > 0 && (
+              <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                    <Building2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Paired Branch Hubs ({pairedHubs.length})</span>
+                  </h3>
+                  <span className="text-[10px] text-slate-500">Auto-authenticates when roaming</span>
+                </div>
+                <div className="space-y-2">
+                  {pairedHubs.map((hub) => {
+                    const isCurrent =
+                      hubSecurity.hubId === hub.hubId ||
+                      normalizeHubUrl(hub.wsUrl) === normalizeHubUrl(hubUrlInput);
+                    return (
+                      <div
+                        key={hub.hubId}
+                        className={`p-2.5 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+                          isCurrent
+                            ? 'bg-emerald-950/25 border-emerald-500/35'
+                            : 'bg-slate-900/70 border-slate-800'
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="text-xs font-bold text-white truncate">
+                              {hub.branchName || hub.branchId}
+                            </span>
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
+                              {hub.branchId}
+                            </span>
+                            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">
+                              {hub.hubRuntime === 'ANDROID_APK' ? 'APK' : hub.hubRuntime === 'TERMUX' ? 'TERMUX' : 'HUB'}
+                            </span>
+                          </div>
+                          <p className="text-[10px] font-mono text-slate-400 truncate mt-0.5">
+                            {hub.wsUrl} • {hub.hubId}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHubUrlInput(hub.wsUrl);
+                              handleApplyUrl(hub.wsUrl);
+                            }}
+                            className="text-[11px] font-bold px-2.5 py-1 rounded-lg bg-indigo-600/80 hover:bg-indigo-500 text-white transition cursor-pointer"
+                          >
+                            {isCurrent ? 'Reconnect' : 'Connect'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleUnpairHub(hub.hubId)}
+                            className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-900/60 text-slate-400 hover:text-rose-200 transition cursor-pointer"
+                            title="Forget paired Hub key"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Optional Fallback: Camera QR Scanner (Collapsed by default so Desktops stay clean) */}
+            <div className="p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !showQrFallback;
+                  setShowQrFallback(next);
+                  if (!next) stopCamera();
+                }}
+                className="w-full flex items-center justify-between text-left cursor-pointer"
+              >
+                <div className="flex items-center gap-2">
+                  <Camera className="w-3.5 h-3.5 text-slate-400" />
+                  <span className="text-xs font-bold text-slate-300">
+                    Optional: Scan Hub QR Code (Mobile Camera)
+                  </span>
+                </div>
+                {showQrFallback ? (
+                  <ChevronUp className="w-4 h-4 text-slate-400" />
+                ) : (
+                  <ChevronDown className="w-4 h-4 text-slate-400" />
+                )}
+              </button>
+
+              {showQrFallback && (
+                <div className="space-y-3 pt-1 border-t border-slate-800/80">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] text-slate-400">
+                      Tip: You can also scan the Hub QR using your phone&apos;s built-in camera app to auto-pair without browser camera permissions.
+                    </p>
+                    {!isScanning ? (
+                      <button
+                        type="button"
+                        onClick={startCamera}
+                        className="text-xs font-bold px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white shadow transition flex items-center gap-1.5 shrink-0 active:scale-95 cursor-pointer"
+                      >
+                        <Camera className="w-3.5 h-3.5" />
+                        <span>Open Camera</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={stopCamera}
+                        className="text-xs font-bold px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white shadow transition flex items-center gap-1.5 shrink-0 active:scale-95 cursor-pointer"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Stop Camera</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {cameraError && (
+                    <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                      <span>{cameraError}</span>
+                    </div>
+                  )}
+
+                  {isScanning && (
+                    <div className="relative overflow-hidden rounded-2xl border-2 border-dashed border-indigo-500/50 bg-black flex flex-col items-center justify-center p-2 min-h-[220px]">
+                      <div id={scannerRegionId} className="w-full max-w-[280px]" />
+                      <p className="text-[11px] text-slate-400 mt-2 font-medium animate-pulse">
+                        Scanning for Local Hub QR code...
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

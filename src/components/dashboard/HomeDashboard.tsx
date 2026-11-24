@@ -80,12 +80,14 @@ export const HomeDashboard: React.FC<HomeDashboardProps> = ({
     window.addEventListener('saimetric_customer_changes_updated', handleSyncUpdate);
     window.addEventListener('saimetric_credit_sales_updated', handleSyncUpdate);
     window.addEventListener('saimetric_sales_updated', handleSyncUpdate);
+    window.addEventListener('saimetric_cash_counts_updated', handleSyncUpdate);
     window.addEventListener('mesh-catchup-completed', handleSyncUpdate);
     return () => {
       unsubDb();
       window.removeEventListener('saimetric_customer_changes_updated', handleSyncUpdate);
       window.removeEventListener('saimetric_credit_sales_updated', handleSyncUpdate);
       window.removeEventListener('saimetric_sales_updated', handleSyncUpdate);
+      window.removeEventListener('saimetric_cash_counts_updated', handleSyncUpdate);
       window.removeEventListener('mesh-catchup-completed', handleSyncUpdate);
     };
   }, []);

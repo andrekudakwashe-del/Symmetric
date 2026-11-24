@@ -79,13 +79,15 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [existingRecordId, setExistingRecordId] = useState<string | null>(null);
+  const [hasUnsavedLocalEdit, setHasUnsavedLocalEdit] = useState(false);
+  const [, setDbRefreshTick] = useState(0);
 
   const isToday = date === today;
   const isAdmin = currentUser.role === 'Admin' || isSupervisorOrAdmin;
   const isEditable = isAdmin || isToday; // Staff can only edit today; Admins can edit any day
 
   // Load saved cash count for selected staff & date whenever date or staff changes
-  const loadSavedCountForDate = (targetDate: string, targetStaffId: string) => {
+  const loadSavedCountForDate = (targetDate: string, targetStaffId: string, preserveSuccessBanner = false) => {
     const saved = getCashCountForStaffAndDate(targetStaffId, targetDate);
     if (saved) {
       const loadedQty: Record<number, number> = {};
@@ -105,7 +107,10 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
       setNotes('');
       setExistingRecordId(null);
     }
-    setSavedSuccess(null);
+    setHasUnsavedLocalEdit(false);
+    if (!preserveSuccessBanner) {
+      setSavedSuccess(null);
+    }
   };
 
   useEffect(() => {
@@ -113,11 +118,21 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
   }, [date, selectedStaffId]);
 
   useEffect(() => {
-    const unsub = subscribeToDatabase(() => {
-      // If active record in DB changed, sync if needed
-    });
-    return () => unsub();
-  }, []);
+    const handleRemoteSync = () => {
+      setDbRefreshTick((t) => t + 1);
+      if (!hasUnsavedLocalEdit) {
+        loadSavedCountForDate(date, selectedStaffId, true);
+      }
+    };
+    const unsub = subscribeToDatabase(handleRemoteSync);
+    window.addEventListener('saimetric_cash_counts_updated', handleRemoteSync);
+    window.addEventListener('mesh-catchup-completed', handleRemoteSync);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_cash_counts_updated', handleRemoteSync);
+      window.removeEventListener('mesh-catchup-completed', handleRemoteSync);
+    };
+  }, [date, selectedStaffId, hasUnsavedLocalEdit]);
 
   const pastCounts = getCashCounts();
 
@@ -145,6 +160,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
       ...prev,
       [note]: isNaN(parsed) || parsed < 0 ? 0 : parsed,
     }));
+    setHasUnsavedLocalEdit(true);
     setSavedSuccess(null);
   };
 
@@ -155,6 +171,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
       const next = Math.max(0, current + delta);
       return { ...prev, [note]: next };
     });
+    setHasUnsavedLocalEdit(true);
     setSavedSuccess(null);
   };
 
@@ -166,6 +183,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
     });
     setQuantities(reset);
     setNotes('');
+    setHasUnsavedLocalEdit(true);
     setSavedSuccess(null);
   };
 
@@ -199,6 +217,7 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
       });
 
       setExistingRecordId(countRecord.id);
+      setHasUnsavedLocalEdit(false);
       setSavedSuccess(countRecord);
       confetti({
         particleCount: 50,
@@ -534,7 +553,11 @@ export const Form1CashCount: React.FC<Form1CashCountProps> = ({
                 type="text"
                 value={notes}
                 disabled={!isEditable}
-                onChange={(e) => setNotes(e.target.value)}
+                onChange={(e) => {
+                  setNotes(e.target.value);
+                  setHasUnsavedLocalEdit(true);
+                  setSavedSuccess(null);
+                }}
                 placeholder="e.g. Verified by Sarah, safe deposit box sealed..."
                 className="w-full py-2 px-3 bg-slate-950/80 border border-slate-800 focus:border-[#6A4DFF] rounded-2xl text-xs text-white placeholder-slate-500 outline-none disabled:opacity-60 disabled:cursor-not-allowed"
               />
