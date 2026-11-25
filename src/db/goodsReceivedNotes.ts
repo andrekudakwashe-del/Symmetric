@@ -12,6 +12,7 @@ import {
   executeTx,
 } from './indexedDBService';
 import { toDateStringSafe } from '../utils/dateUtils';
+import { getStored, setStored } from './roomStorageEngine';
 
 export const GRN_STORAGE_KEY = 'saimetric_room_goods_received_notes';
 export const IDB_GRN_STORE = 'goodsReceivedNotes';
@@ -46,24 +47,21 @@ const getActiveGrnCompanyId = (): string => {
 };
 
 /**
- * Read ALL raw unified Goods Received Notes across all companies (internal persistence & migrations only)
+ * Read ALL raw unified Goods Received Notes across all companies safely via roomStorageEngine
  */
 export const getRawStoredGoodsReceivedNotes = (): GoodsReceivedNote[] => {
-  if (typeof window === 'undefined' || !window.localStorage) {
-    return memoryGrns;
-  }
   try {
-    const raw = window.localStorage.getItem(GRN_STORAGE_KEY);
-    if (!raw) return memoryGrns;
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      memoryGrns = parsed;
-      return parsed;
+    const stored = getStored<GoodsReceivedNote[]>(GRN_STORAGE_KEY, []);
+    if (Array.isArray(stored)) {
+      if (stored.length > 0 || memoryGrns.length === 0) {
+        memoryGrns = stored;
+      }
+      return stored.length > 0 ? stored : memoryGrns;
     }
-    return memoryGrns;
+    return Array.isArray(memoryGrns) ? memoryGrns : [];
   } catch (err) {
     console.error('[GRN Store] Error reading goodsReceivedNotes:', err);
-    return memoryGrns;
+    return Array.isArray(memoryGrns) ? memoryGrns : [];
   }
 };
 
@@ -77,32 +75,31 @@ export const getAllGoodsReceivedNotes = (companyId?: string): GoodsReceivedNote[
 };
 
 /**
- * Save unified Goods Received Notes to localStorage and asynchronously to IndexedDB
+ * Save unified Goods Received Notes via roomStorageEngine and asynchronously to IndexedDB store
  */
 export const saveAllGoodsReceivedNotes = (grns: GoodsReceivedNote[]) => {
-  memoryGrns = grns;
-  if (typeof window !== 'undefined' && window.localStorage) {
-    try {
-      window.localStorage.setItem(GRN_STORAGE_KEY, JSON.stringify(grns));
-      if (typeof window.dispatchEvent === 'function') {
-        window.dispatchEvent(
-          new CustomEvent('saimetric_grn_updated', {
-            detail: { count: grns.length },
-          })
-        );
-      }
-    } catch (err) {
-      console.error('[GRN Store] Error saving goodsReceivedNotes to localStorage:', err);
+  const safeGrns = Array.isArray(grns) ? grns : [];
+  memoryGrns = safeGrns;
+  try {
+    setStored(GRN_STORAGE_KEY, safeGrns);
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('saimetric_grn_updated', {
+          detail: { count: safeGrns.length },
+        })
+      );
     }
+  } catch (err) {
+    console.error('[GRN Store] Error saving goodsReceivedNotes:', err);
   }
 
-  // Asynchronously persist to IndexedDB
+  // Asynchronously persist to dedicated IndexedDB store
   if (typeof window !== 'undefined' && window.indexedDB) {
     initIndexedDB().then((db) => {
       if (!db) return;
       try {
         executeTx(IDB_GRN_STORE, 'readwrite', (store) => {
-          grns.forEach((g) => store.put(g));
+          safeGrns.forEach((g) => store.put(g));
         }).catch((err) => {
           console.warn('[GRN Store] Async IDB sync error:', err);
         });
@@ -566,17 +563,12 @@ export async function runGrnMigration(): Promise<GrnMigrationReport> {
     directRecords.push(...idbDirect);
   } catch (e) {}
 
-  if (typeof window !== 'undefined' && window.localStorage) {
-    try {
-      const raw = window.localStorage.getItem('saimetric_room_direct_grvs');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          directRecords.push(...parsed);
-        }
-      }
-    } catch (e) {}
-  }
+  try {
+    const parsed = getStored<DirectGrv[]>('saimetric_room_direct_grvs', []);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      directRecords.push(...parsed);
+    }
+  } catch (e) {}
 
   // Deduplicate direct records by id / grvNumber
   const directSeen = new Set<string>();
@@ -617,17 +609,12 @@ export async function runGrnMigration(): Promise<GrnMigrationReport> {
     generalRecords.push(...idbGeneral);
   } catch (e) {}
 
-  if (typeof window !== 'undefined' && window.localStorage) {
-    try {
-      const raw = window.localStorage.getItem('saimetric_room_supplier_invoices');
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          generalRecords.push(...parsed);
-        }
-      }
-    } catch (e) {}
-  }
+  try {
+    const parsed = getStored<SupplierInvoiceVoucher[]>('saimetric_room_supplier_invoices', []);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      generalRecords.push(...parsed);
+    }
+  } catch (e) {}
 
   // Deduplicate general records by voucherId / invoiceNo
   const generalSeen = new Set<string>();

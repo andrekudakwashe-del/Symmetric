@@ -1,4 +1,5 @@
 import { CustomerLedgerEntry, CustomerLedgerType } from '../types';
+import { getStored, setStored } from './roomStorageEngine';
 
 export const CUSTOMER_LEDGER_STORAGE_KEY = 'saimetric_room_customer_ledger';
 
@@ -30,20 +31,21 @@ const getActiveCustomerLedgerCompanyId = (): string => {
 };
 
 /**
- * Read ALL raw entries across all companies (internal persistence only)
+ * Read ALL raw entries across all companies safely via roomStorageEngine
  */
 export const getRawStoredCustomerLedgerEntries = (): CustomerLedgerEntry[] => {
-  if (typeof window === 'undefined' || !window.localStorage) {
-    return memoryCustomerLedger;
-  }
   try {
-    const raw = window.localStorage.getItem(CUSTOMER_LEDGER_STORAGE_KEY);
-    if (!raw) return memoryCustomerLedger;
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : memoryCustomerLedger;
+    const stored = getStored<CustomerLedgerEntry[]>(CUSTOMER_LEDGER_STORAGE_KEY, []);
+    if (Array.isArray(stored)) {
+      if (stored.length > 0 || memoryCustomerLedger.length === 0) {
+        memoryCustomerLedger = stored;
+      }
+      return stored.length > 0 ? stored : memoryCustomerLedger;
+    }
+    return Array.isArray(memoryCustomerLedger) ? memoryCustomerLedger : [];
   } catch (err) {
     console.error('Error reading customerLedger:', err);
-    return memoryCustomerLedger;
+    return Array.isArray(memoryCustomerLedger) ? memoryCustomerLedger : [];
   }
 };
 
@@ -58,26 +60,22 @@ export const getAllCustomerLedgerEntries = (): CustomerLedgerEntry[] => {
 };
 
 /**
- * Save all entries to localStorage
+ * Save all entries via roomStorageEngine (handles IndexedDB overflow safely)
  */
 const saveAllCustomerLedgerEntries = (entries: CustomerLedgerEntry[]) => {
-  memoryCustomerLedger = entries;
-  if (typeof window !== 'undefined' && window.localStorage) {
-    try {
-      window.localStorage.setItem(CUSTOMER_LEDGER_STORAGE_KEY, JSON.stringify(entries));
+  const safeEntries = Array.isArray(entries) ? entries : [];
+  memoryCustomerLedger = safeEntries;
+  try {
+    setStored(CUSTOMER_LEDGER_STORAGE_KEY, safeEntries);
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
       window.dispatchEvent(
         new CustomEvent('saimetric_customer_ledger_updated', {
-          detail: { count: entries.length },
+          detail: { count: safeEntries.length },
         })
       );
-      try {
-        window.dispatchEvent(new Event('storage'));
-      } catch {
-        // Safe fallback
-      }
-    } catch (err) {
-      console.error('Error saving customerLedger:', err);
     }
+  } catch (err) {
+    console.error('Error saving customerLedger:', err);
   }
 };
 

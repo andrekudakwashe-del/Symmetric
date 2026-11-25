@@ -1,3 +1,4 @@
+import { getStored, setStored } from '../db/roomStorageEngine';
 import {
   getSyncQueue,
   updateSyncQueueItem,
@@ -843,9 +844,9 @@ export const retrySyncInvoice = async (
       }
       return s;
     });
-    // Write to Room DB storage
+    // Write to Room DB storage safely via roomStorageEngine
     try {
-      localStorage.setItem('saimetric_room_sales', JSON.stringify(updatedSales));
+      setStored('saimetric_room_sales', updatedSales);
       window.dispatchEvent(new Event('room_database_mutation'));
     } catch {}
 
@@ -857,8 +858,7 @@ export const retrySyncInvoice = async (
 
   if (invoiceType === 'supplier_invoice') {
     try {
-      const stored = localStorage.getItem('saimetric_room_supplier_invoices');
-      const invoices = stored ? JSON.parse(stored) : [];
+      const invoices = getStored<any[]>('saimetric_room_supplier_invoices', []);
       const invoice = invoices.find((inv: any) => inv.id === invoiceId || inv.invoiceNumber === invoiceId);
       if (invoice) {
         await persistentSyncEngine.enqueueSyncItem({
@@ -874,7 +874,7 @@ export const retrySyncInvoice = async (
         await persistentSyncEngine.drainSyncQueue(compId);
         invoice.synced = true;
         invoice.syncStatus = 'synced';
-        localStorage.setItem('saimetric_room_supplier_invoices', JSON.stringify(invoices));
+        setStored('saimetric_room_supplier_invoices', invoices);
         window.dispatchEvent(new Event('room_database_mutation'));
         return { success: true, message: `Supplier Invoice #${invoiceId} synced!` };
       }
@@ -885,8 +885,8 @@ export const retrySyncInvoice = async (
 
   if (invoiceType === 'grv' || invoiceType === 'direct_grv') {
     try {
-      const stored = localStorage.getItem(invoiceType === 'direct_grv' ? 'saimetric_room_direct_grvs' : 'saimetric_room_goods_received_notes');
-      const vouchers = stored ? JSON.parse(stored) : [];
+      const key = invoiceType === 'direct_grv' ? 'saimetric_room_direct_grvs' : 'saimetric_room_goods_received_notes';
+      const vouchers = getStored<any[]>(key, []);
       const voucher = vouchers.find((v: any) => v.id === invoiceId || v.grnId === invoiceId || v.voucherId === invoiceId);
       if (voucher) {
         await persistentSyncEngine.enqueueSyncItem({
@@ -902,7 +902,7 @@ export const retrySyncInvoice = async (
         await persistentSyncEngine.drainSyncQueue(compId);
         voucher.synced = true;
         voucher.syncStatus = 'synced';
-        localStorage.setItem(invoiceType === 'direct_grv' ? 'saimetric_room_direct_grvs' : 'saimetric_room_goods_received_notes', JSON.stringify(vouchers));
+        setStored(key, vouchers);
         window.dispatchEvent(new Event('room_database_mutation'));
         return { success: true, message: `Voucher #${invoiceId} synced!` };
       }
@@ -913,8 +913,7 @@ export const retrySyncInvoice = async (
 
   if (invoiceType === 'cash_lift') {
     try {
-      const stored = localStorage.getItem('saimetric_room_cash_lifts');
-      const lifts = stored ? JSON.parse(stored) : [];
+      const lifts = getStored<any[]>('saimetric_room_cash_lifts', []);
       const lift = lifts.find((l: any) => l.id === invoiceId);
       if (lift) {
         await persistentSyncEngine.enqueueSyncItem({
@@ -930,7 +929,7 @@ export const retrySyncInvoice = async (
         await persistentSyncEngine.drainSyncQueue(compId);
         lift.synced = true;
         lift.syncStatus = 'synced';
-        localStorage.setItem('saimetric_room_cash_lifts', JSON.stringify(lifts));
+        setStored('saimetric_room_cash_lifts', lifts);
         window.dispatchEvent(new Event('room_database_mutation'));
         return { success: true, message: `Cash Lift #${invoiceId} synced!` };
       }
@@ -941,8 +940,7 @@ export const retrySyncInvoice = async (
 
   if (invoiceType === 'cash_log') {
     try {
-      const stored = localStorage.getItem('saimetric_room_cash_logs');
-      const logs = stored ? JSON.parse(stored) : [];
+      const logs = getStored<any[]>('saimetric_room_cash_logs', []);
       const log = logs.find((l: any) => l.id === invoiceId);
       if (log) {
         await persistentSyncEngine.enqueueSyncItem({
@@ -958,7 +956,7 @@ export const retrySyncInvoice = async (
         await persistentSyncEngine.drainSyncQueue(compId);
         log.synced = true;
         log.syncStatus = 'synced';
-        localStorage.setItem('saimetric_room_cash_logs', JSON.stringify(logs));
+        setStored('saimetric_room_cash_logs', logs);
         window.dispatchEvent(new Event('room_database_mutation'));
         return { success: true, message: `Cash Log #${invoiceId} synced!` };
       }
@@ -969,8 +967,7 @@ export const retrySyncInvoice = async (
 
   if (invoiceType === 'expense') {
     try {
-      const stored = localStorage.getItem('saimetric_room_expenses');
-      const expenses = stored ? JSON.parse(stored) : [];
+      const expenses = getStored<any[]>('saimetric_room_expenses', []);
       const exp = expenses.find((e: any) => e.id === invoiceId);
       if (exp) {
         await persistentSyncEngine.enqueueSyncItem({
@@ -986,7 +983,7 @@ export const retrySyncInvoice = async (
         await persistentSyncEngine.drainSyncQueue(compId);
         exp.synced = true;
         exp.syncStatus = 'synced';
-        localStorage.setItem('saimetric_room_expenses', JSON.stringify(expenses));
+        setStored('saimetric_room_expenses', expenses);
         window.dispatchEvent(new Event('room_database_mutation'));
         return { success: true, message: `Expense #${invoiceId} synced!` };
       }

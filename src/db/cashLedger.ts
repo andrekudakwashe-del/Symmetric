@@ -6,6 +6,8 @@ import {
   CashMovementSource,
 } from '../types';
 import { extractInvoiceRef } from '../utils/idFormatters';
+import { initIndexedDB, getAllFromIDBStore } from './indexedDBService';
+import { getStored, setStored } from './roomStorageEngine';
 
 export type { CashMovement };
 
@@ -87,30 +89,25 @@ const getBranchAliasesForTarget = (targetBranch: string): Set<string> => {
   if (MAIN_BRANCH_ALIASES.has(cleanTarget)) {
     MAIN_BRANCH_ALIASES.forEach((a) => aliases.add(a));
   }
-  if (typeof window !== 'undefined' && window.localStorage) {
-    try {
-      const raw = window.localStorage.getItem('saimetric_room_branches');
-      if (raw) {
-        const branches = JSON.parse(raw);
-        if (Array.isArray(branches)) {
-          const matched = branches.find((b: any) =>
-            [b?.branchId, b?.id, b?.code, b?.branch_id].some(
-              (v) => v && String(v).trim().toLowerCase() === cleanTarget
-            )
-          );
-          if (matched) {
-            [matched.branchId, matched.id, matched.code, matched.branch_id].forEach((v) => {
-              if (v) aliases.add(String(v).trim().toLowerCase());
-            });
-            if (matched.isMain) {
-              MAIN_BRANCH_ALIASES.forEach((a) => aliases.add(a));
-            }
-          }
+  try {
+    const branches = getStored<any[]>('saimetric_room_branches', []);
+    if (Array.isArray(branches) && branches.length > 0) {
+      const matched = branches.find((b: any) =>
+        [b?.branchId, b?.id, b?.code, b?.branch_id].some(
+          (v) => v && String(v).trim().toLowerCase() === cleanTarget
+        )
+      );
+      if (matched) {
+        [matched.branchId, matched.id, matched.code, matched.branch_id].forEach((v) => {
+          if (v) aliases.add(String(v).trim().toLowerCase());
+        });
+        if (matched.isMain) {
+          MAIN_BRANCH_ALIASES.forEach((a) => aliases.add(a));
         }
       }
-    } catch {
-      // ignore storage parse fallback
     }
+  } catch {
+    // ignore storage parse fallback
   }
   return aliases;
 };
@@ -124,68 +121,76 @@ const isCashBranchInScope = (recordBranchId?: string | null, targetBranchId?: st
   return getBranchAliasesForTarget(cleanTarget).has(cleanRecord);
 };
 
-/**
- * Initialize IndexedDB with required object store and indexes
- */
-import { initIndexedDB } from './indexedDBService';
-
 export const initCashLedgerIndexedDB = (): Promise<IDBDatabase | null> => {
   return initIndexedDB();
 };
-
-// Fire initial IDB setup in browser
-if (typeof window !== 'undefined') {
-  setTimeout(() => {
-    initCashLedgerIndexedDB().catch(() => {});
-  }, 50);
-}
 
 // In-memory fallback
 let memoryMovements: CashMovement[] = [];
 
 /**
- * Read all movements from storage
+ * Read all movements from storage safely via roomStorageEngine (handles IndexedDB overflow sentinels)
  */
 export const getAllMovements = (): CashMovement[] => {
-  if (typeof window === 'undefined' || !window.localStorage) {
-    return memoryMovements;
-  }
   try {
-    const raw = window.localStorage.getItem(CASH_MOVEMENTS_STORAGE_KEY);
-    if (!raw) return memoryMovements;
-    return JSON.parse(raw);
+    const stored = getStored<CashMovement[]>(CASH_MOVEMENTS_STORAGE_KEY, []);
+    if (Array.isArray(stored)) {
+      if (stored.length > 0 || memoryMovements.length === 0) {
+        memoryMovements = stored;
+      }
+      return stored.length > 0 ? stored : memoryMovements;
+    }
+    return Array.isArray(memoryMovements) ? memoryMovements : [];
   } catch (err) {
     console.error('Error reading cashMovements:', err);
-    return memoryMovements;
+    return Array.isArray(memoryMovements) ? memoryMovements : [];
   }
 };
 
+// Fire initial IDB setup and hydrate cash movements if localStorage overflowed
+if (typeof window !== 'undefined') {
+  setTimeout(() => {
+    initCashLedgerIndexedDB()
+      .then(async () => {
+        if (getAllMovements().length === 0) {
+          const idbRows = await getAllFromIDBStore<CashMovement>(IDB_STORE_NAME).catch(() => []);
+          if (Array.isArray(idbRows) && idbRows.length > 0) {
+            memoryMovements = idbRows;
+            setStored(CASH_MOVEMENTS_STORAGE_KEY, idbRows, { skipIdbOverwriteIfExisting: true });
+            if (typeof window.dispatchEvent === 'function') {
+              window.dispatchEvent(
+                new CustomEvent('saimetric_cash_movements_updated', {
+                  detail: { count: idbRows.length },
+                })
+              );
+            }
+          }
+        }
+      })
+      .catch(() => {});
+  }, 50);
+}
+
 /**
- * Save movements to localStorage and sync to IndexedDB
+ * Save movements via roomStorageEngine (safe localStorage + IndexedDB overflow) and sync to cashMovements IDB store
  */
 const saveAllMovements = (movements: CashMovement[]) => {
-  memoryMovements = movements;
-  if (typeof window !== 'undefined' && window.localStorage) {
-    try {
-      window.localStorage.setItem(CASH_MOVEMENTS_STORAGE_KEY, JSON.stringify(movements));
-      if (typeof window.dispatchEvent === 'function') {
-        window.dispatchEvent(
-          new CustomEvent('saimetric_cash_movements_updated', {
-            detail: { count: movements.length },
-          })
-        );
-        try {
-          window.dispatchEvent(new Event('storage'));
-        } catch {
-          // Safe fallback
-        }
-      }
-    } catch (err) {
-      console.error('Error saving cashMovements to localStorage:', err);
+  const safeMovements = Array.isArray(movements) ? movements : [];
+  memoryMovements = safeMovements;
+  try {
+    setStored(CASH_MOVEMENTS_STORAGE_KEY, safeMovements);
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+      window.dispatchEvent(
+        new CustomEvent('saimetric_cash_movements_updated', {
+          detail: { count: safeMovements.length },
+        })
+      );
     }
+  } catch (err) {
+    console.error('Error saving cashMovements:', err);
   }
 
-  // Also sync asynchronously to IndexedDB if available
+  // Also sync asynchronously to dedicated cashMovements IndexedDB store if available
   if (typeof window !== 'undefined' && window.indexedDB) {
     initCashLedgerIndexedDB().then((db) => {
       if (!db) return;
@@ -193,7 +198,7 @@ const saveAllMovements = (movements: CashMovement[]) => {
         const tx = db.transaction(IDB_STORE_NAME, 'readwrite');
         const store = tx.objectStore(IDB_STORE_NAME);
         store.clear();
-        movements.forEach((m) => store.put(m));
+        safeMovements.forEach((m) => store.put(m));
       } catch {
         // Silent IDB fallback
       }
@@ -474,14 +479,10 @@ const computeMissingDirectGrvPayouts = (
   currency: string = 'USD'
 ): number => {
   if (currency && currency.toUpperCase() !== 'USD') return 0;
-  if (typeof window === 'undefined' || !window.localStorage) return 0;
-
   let extraTotal = 0;
   try {
-    const rawGrvs = window.localStorage.getItem('saimetric_room_direct_grvs');
-    if (!rawGrvs) return 0;
-    const grvs = JSON.parse(rawGrvs);
-    if (!Array.isArray(grvs)) return 0;
+    const grvs = getStored<any[]>('saimetric_room_direct_grvs', []);
+    if (!Array.isArray(grvs) || grvs.length === 0) return 0;
 
     const parts = shiftId.split('_');
     const targetStaff = parts[0] || '';

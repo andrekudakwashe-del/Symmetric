@@ -12,6 +12,8 @@ export const STORAGE_KEYS = {
   CASH_COUNTS: 'saimetric_room_cash_counts',
   CASH_LIFTS: 'saimetric_room_cash_lifts',
   CASH_LOGS: 'saimetric_room_cash_logs',
+  CASH_MOVEMENTS: 'saimetric_room_cash_movements',
+  CUSTOMER_LEDGER: 'saimetric_room_customer_ledger',
   CUSTOMER_CHANGES: 'saimetric_room_customer_changes',
   CREDIT_SALES: 'saimetric_room_credit_sales',
   SALES: 'saimetric_room_sales',

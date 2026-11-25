@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { CustomerChangeReportItem, Salesperson, Customer } from '../../types';
 import {
   getCustomerChangeReport,
@@ -92,6 +92,12 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
   const [showRegisterCustomerModal, setShowRegisterCustomerModal] = useState<boolean>(false);
   const [registerCustomerInitialName, setRegisterCustomerInitialName] = useState<string>('');
   const [manualFormError, setManualFormError] = useState<string | null>(null);
+  const [payoutFormError, setPayoutFormError] = useState<string | null>(null);
+  const [isSubmittingManual, setIsSubmittingManual] = useState<boolean>(false);
+  const [isSubmittingPayout, setIsSubmittingPayout] = useState<boolean>(false);
+  const manualSubmittingRef = useRef<boolean>(false);
+  const payoutSubmittingRef = useRef<boolean>(false);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const safeCurrentUser: Salesperson = currentUser || {
     id: selectedStaffId || '001',
@@ -127,6 +133,8 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
       setManualCustomerPhone('');
     }
     setManualFormError(null);
+    setIsSubmittingManual(false);
+    manualSubmittingRef.current = false;
     setManualAmount('');
     setManualCustomNotes('');
     setManualInvoiceRef('');
@@ -140,6 +148,7 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
 
   const handleConfirmManualChange = (e: React.FormEvent) => {
     e.preventDefault();
+    if (manualSubmittingRef.current) return;
     setManualFormError(null);
     const amt = parseFloat(manualAmount);
     if (isNaN(amt) || amt <= 0) {
@@ -188,40 +197,60 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
     const staffName = selectedStaff?.name || currentUser?.name || 'Cashier';
     const staffRole = selectedStaff?.role || currentUser?.role || 'Staff';
 
-    recordManualCustomerChange({
-      customerName: finalCustName,
-      customerId: finalCustId,
-      phone: finalCustPhone,
-      amount: amt,
-      date: manualDate || getTodayDateString(),
-      notes: fullNotes,
-      reference: manualInvoiceRef.trim() || undefined,
-      cashReceivedInDrawer,
-      staffId,
-      staffName,
-      staffRole,
-    });
+    manualSubmittingRef.current = true;
+    setIsSubmittingManual(true);
+    try {
+      recordManualCustomerChange({
+        customerName: finalCustName,
+        customerId: finalCustId,
+        phone: finalCustPhone,
+        amount: amt,
+        date: manualDate || getTodayDateString(),
+        notes: fullNotes,
+        reference: manualInvoiceRef.trim() || undefined,
+        cashReceivedInDrawer,
+        staffId,
+        staffName,
+        staffRole,
+      });
 
-    setReportData(getCustomerChangeReport());
-    setSuccessToast(`Change of $${amt.toFixed(2)} booked for "${finalCustName}" on ${staffName}'s till. Form 4 updated.`);
-    setShowManualModal(false);
-
-    // Reset fields
-    setManualFormError(null);
-    setManualAmount('');
-    setManualCustomerName('');
-    setManualCustomerPhone('');
-    setSelectedCustomerId('');
-    setManualCustomNotes('');
-    setManualInvoiceRef('');
+      // Close modal & reset immediately so user gets instant feedback and cannot double-submit
+      setShowManualModal(false);
+      setManualFormError(null);
+      setManualAmount('');
+      setManualCustomerName('');
+      setManualCustomerPhone('');
+      setSelectedCustomerId('');
+      setManualCustomNotes('');
+      setManualInvoiceRef('');
+      setSuccessToast(`Change of $${amt.toFixed(2)} booked for "${finalCustName}" on ${staffName}'s till. Form 4 updated.`);
+      setReportData(getCustomerChangeReport());
+    } catch (err: any) {
+      console.error('[CustomerChangeReport] Error booking manual change:', err);
+      setManualFormError(err?.message || 'Could not save change booking. Please try again.');
+    } finally {
+      manualSubmittingRef.current = false;
+      setIsSubmittingManual(false);
+    }
   };
 
-  // Subscribe to real-time database updates and window events
+  // Auto-dismiss success toast after 5 seconds
+  useEffect(() => {
+    if (!successToast) return;
+    const t = setTimeout(() => setSuccessToast(null), 5000);
+    return () => clearTimeout(t);
+  }, [successToast]);
+
+  // Subscribe to real-time database updates and window events (coalesced to prevent multi-event UI freezes)
   useEffect(() => {
     const handleRefresh = () => {
-      setReportData(getCustomerChangeReport());
-      setSalespeople(getSalespeople());
-      setAllCustomers(getCustomers());
+      if (refreshTimerRef.current) return;
+      refreshTimerRef.current = setTimeout(() => {
+        refreshTimerRef.current = null;
+        setReportData(getCustomerChangeReport());
+        setSalespeople(getSalespeople());
+        setAllCustomers(getCustomers());
+      }, 0);
     };
     const unsub = subscribeToDatabase(handleRefresh);
     window.addEventListener('saimetric_customer_changes_updated', handleRefresh);
@@ -230,6 +259,10 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
     window.addEventListener('saimetric_salespeople_updated', handleRefresh);
     window.addEventListener('saimetric_cash_updated', handleRefresh);
     return () => {
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
       unsub();
       window.removeEventListener('saimetric_customer_changes_updated', handleRefresh);
       window.removeEventListener('saimetric_customers_updated', handleRefresh);
@@ -287,36 +320,49 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
   // Handle recording a change payout
   const handleConfirmPayout = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!payoutModalItem) return;
+    if (payoutSubmittingRef.current || !payoutModalItem) return;
+    setPayoutFormError(null);
 
     const amountNum = parseFloat(payoutAmount);
     if (isNaN(amountNum) || amountNum <= 0) {
-      alert('Please enter a valid payout amount greater than $0.00');
+      setPayoutFormError('Please enter a valid payout amount greater than $0.00.');
       return;
     }
 
+    const targetItem = payoutModalItem;
     const payoutStaff = salespeople.find((s) => s.id === payoutStaffId);
     const staffId = payoutStaff?.id || payoutStaffId || currentUser?.id || '001';
     const staffName = payoutStaff?.name || currentUser?.name || 'Cashier';
     const payoutDateStr = payoutDate || getTodayDateString();
 
-    settleCustomerChangePayout(
-      payoutModalItem.customerId,
-      payoutModalItem.customerName,
-      amountNum,
-      staffId,
-      staffName,
-      payoutNotes || `Change refund payout to customer`,
-      payoutDateStr
-    );
+    payoutSubmittingRef.current = true;
+    setIsSubmittingPayout(true);
+    try {
+      settleCustomerChangePayout(
+        targetItem.customerId,
+        targetItem.customerName,
+        amountNum,
+        staffId,
+        staffName,
+        payoutNotes || `Change refund payout to customer`,
+        payoutDateStr
+      );
 
-    setSuccessToast(
-      `Successfully paid out $${amountNum.toFixed(2)} change to ${payoutModalItem.customerName} (${staffName} till)`
-    );
-    setPayoutModalItem(null);
-    setPayoutAmount('');
-    setPayoutNotes('');
-    setReportData(getCustomerChangeReport());
+      setPayoutModalItem(null);
+      setPayoutFormError(null);
+      setPayoutAmount('');
+      setPayoutNotes('');
+      setSuccessToast(
+        `Successfully paid out $${amountNum.toFixed(2)} change to ${targetItem.customerName} (${staffName} till)`
+      );
+      setReportData(getCustomerChangeReport());
+    } catch (err: any) {
+      console.error('[CustomerChangeReport] Error recording payout:', err);
+      setPayoutFormError(err?.message || 'Could not record change payout. Please try again.');
+    } finally {
+      payoutSubmittingRef.current = false;
+      setIsSubmittingPayout(false);
+    }
   };
 
   // Export CSV
@@ -492,17 +538,17 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
         </div>
       </div>
 
-      {/* Success Toast */}
+      {/* Floating Success Toast (always visible regardless of scroll position) */}
       {successToast && (
-        <div className="p-4 bg-emerald-950/90 border border-emerald-500/50 rounded-2xl flex items-center justify-between text-emerald-200 text-xs shadow-xl animate-scaleUp">
-          <div className="flex items-center space-x-2.5">
+        <div className="fixed top-4 left-4 right-4 sm:left-auto sm:right-5 sm:max-w-md z-[60] p-4 bg-emerald-950/95 border border-emerald-400/60 rounded-2xl flex items-center justify-between text-emerald-100 text-xs shadow-2xl backdrop-blur-md animate-scaleUp">
+          <div className="flex items-center space-x-2.5 pr-2">
             <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
             <span className="font-semibold">{successToast}</span>
           </div>
           <button
             type="button"
             onClick={() => setSuccessToast(null)}
-            className="p-1 hover:bg-emerald-900/50 rounded-lg text-emerald-300"
+            className="p-1 hover:bg-emerald-900/50 rounded-lg text-emerald-300 shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
@@ -725,8 +771,11 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
                               onClick={() => {
                                 const staffList = getSalespeople();
                                 setSalespeople(staffList);
+                                setPayoutFormError(null);
+                                setIsSubmittingPayout(false);
+                                payoutSubmittingRef.current = false;
                                 setPayoutModalItem(item);
-                                setPayoutAmount(String(item.netChangeOwed));
+                                setPayoutAmount((Number(item.netChangeOwed) || 0).toFixed(2));
                                 setPayoutNotes(`Payout change balance to ${item.customerName}`);
                                 setPayoutDate(getTodayDateString());
                                 const matched = staffList.find((s) => s.id === currentUser?.id);
@@ -939,20 +988,29 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
                 />
               </div>
 
+              {payoutFormError && (
+                <div className="p-2.5 rounded-xl bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200 flex items-center space-x-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{payoutFormError}</span>
+                </div>
+              )}
+
               <div className="flex items-center space-x-3 pt-2">
                 <button
                   type="button"
+                  disabled={isSubmittingPayout}
                   onClick={() => setPayoutModalItem(null)}
-                  className="w-1/2 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs"
+                  className="w-1/2 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 font-bold text-xs"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="w-1/2 py-2.5 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-purple-600 hover:brightness-110 text-white font-bold text-xs shadow-lg flex items-center justify-center space-x-1.5"
+                  disabled={isSubmittingPayout}
+                  className="w-1/2 py-2.5 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-purple-600 hover:brightness-110 disabled:opacity-60 disabled:cursor-not-allowed text-white font-bold text-xs shadow-lg flex items-center justify-center space-x-1.5"
                 >
                   <Check className="w-4 h-4" />
-                  <span>Confirm Payout</span>
+                  <span>{isSubmittingPayout ? 'Saving...' : 'Confirm Payout'}</span>
                 </button>
               </div>
             </form>
@@ -1359,17 +1417,19 @@ export const CustomerChangeReport: React.FC<CustomerChangeReportProps> = ({
               <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-800">
                 <button
                   type="button"
+                  disabled={isSubmittingManual}
                   onClick={() => setShowManualModal(false)}
-                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-300 hover:text-white transition cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-xs font-bold text-slate-300 hover:text-white transition cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:brightness-110 text-xs font-black text-white shadow-lg transition active:scale-95 flex items-center space-x-1.5 cursor-pointer"
+                  disabled={isSubmittingManual}
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:brightness-110 disabled:opacity-60 disabled:cursor-not-allowed text-xs font-black text-white shadow-lg transition active:scale-95 flex items-center space-x-1.5 cursor-pointer"
                 >
                   <Coins className="w-3.5 h-3.5 text-amber-300" />
-                  <span>Book Change &amp; Update Ledger</span>
+                  <span>{isSubmittingManual ? 'Saving...' : 'Book Change & Update Ledger'}</span>
                 </button>
               </div>
             </form>

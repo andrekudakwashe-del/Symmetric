@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { CustomerCreditReportItem, Salesperson, Customer } from '../../types';
 import {
   getCustomerCreditReport,
@@ -100,6 +100,12 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
   const [showRegisterCustomerModal, setShowRegisterCustomerModal] = useState<boolean>(false);
   const [registerCustomerInitialName, setRegisterCustomerInitialName] = useState<string>('');
   const [manualFormError, setManualFormError] = useState<string | null>(null);
+  const [paymentFormError, setPaymentFormError] = useState<string | null>(null);
+  const [isSubmittingManual, setIsSubmittingManual] = useState<boolean>(false);
+  const [isSubmittingPayment, setIsSubmittingPayment] = useState<boolean>(false);
+  const manualSubmittingRef = useRef<boolean>(false);
+  const paymentSubmittingRef = useRef<boolean>(false);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const safeCurrentUser: Salesperson = currentUser || {
     id: selectedStaffId || '001',
@@ -135,6 +141,8 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
       setManualCustomerPhone('');
     }
     setManualFormError(null);
+    setIsSubmittingManual(false);
+    manualSubmittingRef.current = false;
     setManualAmount('');
     setCreditType('Cash Credit (Owner Approved)');
     setDisburseCashFromDrawer(true);
@@ -145,6 +153,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
 
   const handleConfirmManualCredit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (manualSubmittingRef.current) return;
     setManualFormError(null);
     const amt = parseFloat(manualAmount);
     if (isNaN(amt) || amt <= 0) {
@@ -195,42 +204,62 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     const staffName = selectedStaff?.name || currentUser?.name || 'Staff';
     const staffRole = selectedStaff?.role || currentUser?.role || 'Staff';
 
-    recordManualCustomerCredit({
-      customerName: finalCustName,
-      customerId: finalCustId,
-      phone: finalCustPhone,
-      amount: amt,
-      date: manualDate || getTodayDateString(),
-      dueDate: computedDueDate,
-      creditType,
-      itemDescription: creditType,
-      notes: manualNotes.trim() || `${creditType} advance recorded in report`,
-      staffId,
-      staffName,
-      staffRole,
-      authorizedByName: authorizedByName.trim() || 'Owner Approved',
-      disburseCashFromDrawer: creditType.toLowerCase().includes('cash') ? disburseCashFromDrawer : false,
-    });
+    manualSubmittingRef.current = true;
+    setIsSubmittingManual(true);
+    try {
+      recordManualCustomerCredit({
+        customerName: finalCustName,
+        customerId: finalCustId,
+        phone: finalCustPhone,
+        amount: amt,
+        date: manualDate || getTodayDateString(),
+        dueDate: computedDueDate,
+        creditType,
+        itemDescription: creditType,
+        notes: manualNotes.trim() || `${creditType} advance recorded in report`,
+        staffId,
+        staffName,
+        staffRole,
+        authorizedByName: authorizedByName.trim() || 'Owner Approved',
+        disburseCashFromDrawer: creditType.toLowerCase().includes('cash') ? disburseCashFromDrawer : false,
+      });
 
-    setReportData(getCustomerCreditReport());
-    setSuccessToast(`Credit of $${amt.toFixed(2)} recorded for "${finalCustName}" on ${staffName}'s till. Form 4 updated.`);
-    setShowManualCreditModal(false);
-
-    // Reset form
-    setManualFormError(null);
-    setManualAmount('');
-    setManualCustomerName('');
-    setManualCustomerPhone('');
-    setSelectedCustomerId('');
-    setManualNotes('');
+      // Close modal & reset immediately so user gets instant feedback and cannot double-submit
+      setShowManualCreditModal(false);
+      setManualFormError(null);
+      setManualAmount('');
+      setManualCustomerName('');
+      setManualCustomerPhone('');
+      setSelectedCustomerId('');
+      setManualNotes('');
+      setSuccessToast(`Credit of $${amt.toFixed(2)} recorded for "${finalCustName}" on ${staffName}'s till. Form 4 updated.`);
+      setReportData(getCustomerCreditReport());
+    } catch (err: any) {
+      console.error('[CustomerCreditReport] Error recording manual credit:', err);
+      setManualFormError(err?.message || 'Could not save credit booking. Please try again.');
+    } finally {
+      manualSubmittingRef.current = false;
+      setIsSubmittingManual(false);
+    }
   };
 
-  // Subscribe to real-time database updates and window events
+  // Auto-dismiss success toast after 5 seconds
+  useEffect(() => {
+    if (!successToast) return;
+    const t = setTimeout(() => setSuccessToast(null), 5000);
+    return () => clearTimeout(t);
+  }, [successToast]);
+
+  // Subscribe to real-time database updates and window events (coalesced to prevent multi-event UI freezes)
   useEffect(() => {
     const handleRefresh = () => {
-      setReportData(getCustomerCreditReport());
-      setSalespeople(getSalespeople());
-      setAllCustomers(getCustomers());
+      if (refreshTimerRef.current) return;
+      refreshTimerRef.current = setTimeout(() => {
+        refreshTimerRef.current = null;
+        setReportData(getCustomerCreditReport());
+        setSalespeople(getSalespeople());
+        setAllCustomers(getCustomers());
+      }, 0);
     };
     const unsub = subscribeToDatabase(handleRefresh);
     window.addEventListener('saimetric_credit_sales_updated', handleRefresh);
@@ -239,6 +268,10 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     window.addEventListener('saimetric_salespeople_updated', handleRefresh);
     window.addEventListener('saimetric_cash_updated', handleRefresh);
     return () => {
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = null;
+      }
       unsub();
       window.removeEventListener('saimetric_credit_sales_updated', handleRefresh);
       window.removeEventListener('saimetric_customers_updated', handleRefresh);
@@ -297,36 +330,49 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
   // Handle recording a debt payment
   const handleConfirmPayment = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!paymentModalItem) return;
+    if (paymentSubmittingRef.current || !paymentModalItem) return;
+    setPaymentFormError(null);
 
     const amountNum = parseFloat(paymentAmount);
     if (isNaN(amountNum) || amountNum <= 0) {
-      alert('Please enter a valid repayment amount greater than $0.00');
+      setPaymentFormError('Please enter a valid repayment amount greater than $0.00.');
       return;
     }
 
+    const targetItem = paymentModalItem;
     const payStaff = salespeople.find((s) => s.id === paymentStaffId);
     const staffId = payStaff?.id || paymentStaffId || currentUser?.id || '001';
     const staffName = payStaff?.name || currentUser?.name || 'Cashier';
     const payDateStr = paymentDate || getTodayDateString();
 
-    recordCustomerCreditPayment(
-      paymentModalItem.customerId,
-      paymentModalItem.customerName,
-      amountNum,
-      staffId,
-      staffName,
-      paymentNotes || `Debt repayment from ${paymentModalItem.customerName}`,
-      payDateStr
-    );
+    paymentSubmittingRef.current = true;
+    setIsSubmittingPayment(true);
+    try {
+      recordCustomerCreditPayment(
+        targetItem.customerId,
+        targetItem.customerName,
+        amountNum,
+        staffId,
+        staffName,
+        paymentNotes || `Debt repayment from ${targetItem.customerName}`,
+        payDateStr
+      );
 
-    setSuccessToast(
-      `Successfully recorded $${amountNum.toFixed(2)} repayment from ${paymentModalItem.customerName} (${staffName} till)`
-    );
-    setPaymentModalItem(null);
-    setPaymentAmount('');
-    setPaymentNotes('');
-    setReportData(getCustomerCreditReport());
+      setPaymentModalItem(null);
+      setPaymentFormError(null);
+      setPaymentAmount('');
+      setPaymentNotes('');
+      setSuccessToast(
+        `Successfully recorded $${amountNum.toFixed(2)} repayment from ${targetItem.customerName} (${staffName} till)`
+      );
+      setReportData(getCustomerCreditReport());
+    } catch (err: any) {
+      console.error('[CustomerCreditReport] Error recording repayment:', err);
+      setPaymentFormError(err?.message || 'Could not record debt repayment. Please try again.');
+    } finally {
+      paymentSubmittingRef.current = false;
+      setIsSubmittingPayment(false);
+    }
   };
 
   // Export CSV
@@ -508,17 +554,17 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
         </div>
       </div>
 
-      {/* Success Toast */}
+      {/* Floating Success Toast (always visible regardless of scroll position) */}
       {successToast && (
-        <div className="p-4 bg-emerald-950/90 border border-emerald-500/50 rounded-2xl flex items-center justify-between text-emerald-200 text-xs shadow-xl animate-scaleUp">
-          <div className="flex items-center space-x-2.5">
+        <div className="fixed top-4 left-4 right-4 sm:left-auto sm:right-5 sm:max-w-md z-[60] p-4 bg-emerald-950/95 border border-emerald-400/60 rounded-2xl flex items-center justify-between text-emerald-100 text-xs shadow-2xl backdrop-blur-md animate-scaleUp">
+          <div className="flex items-center space-x-2.5 pr-2">
             <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
             <span className="font-semibold">{successToast}</span>
           </div>
           <button
             type="button"
             onClick={() => setSuccessToast(null)}
-            className="p-1 hover:bg-emerald-900/50 rounded-lg text-emerald-300"
+            className="p-1 hover:bg-emerald-900/50 rounded-lg text-emerald-300 shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
@@ -763,8 +809,11 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                               onClick={() => {
                                 const staffList = getSalespeople();
                                 setSalespeople(staffList);
+                                setPaymentFormError(null);
+                                setIsSubmittingPayment(false);
+                                paymentSubmittingRef.current = false;
                                 setPaymentModalItem(item);
-                                setPaymentAmount(String(item.netDebtOwed));
+                                setPaymentAmount((Number(item.netDebtOwed) || 0).toFixed(2));
                                 setPaymentNotes(`Debt repayment from ${item.customerName}`);
                                 setPaymentDate(getTodayDateString());
                                 const matched = staffList.find((s) => s.id === currentUser?.id);
@@ -998,20 +1047,29 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
                 />
               </div>
 
+              {paymentFormError && (
+                <div className="p-2.5 rounded-xl bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200 flex items-center space-x-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  <span>{paymentFormError}</span>
+                </div>
+              )}
+
               <div className="flex items-center space-x-3 pt-2">
                 <button
                   type="button"
+                  disabled={isSubmittingPayment}
                   onClick={() => setPaymentModalItem(null)}
-                  className="w-1/2 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs"
+                  className="w-1/2 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 font-bold text-xs"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="w-1/2 py-2.5 rounded-xl bg-gradient-to-r from-[#FF8A00] to-amber-600 hover:brightness-110 text-slate-950 font-black text-xs shadow-lg flex items-center justify-center space-x-1.5"
+                  disabled={isSubmittingPayment}
+                  className="w-1/2 py-2.5 rounded-xl bg-gradient-to-r from-[#FF8A00] to-amber-600 hover:brightness-110 disabled:opacity-60 disabled:cursor-not-allowed text-slate-950 font-black text-xs shadow-lg flex items-center justify-center space-x-1.5"
                 >
                   <Check className="w-4 h-4" />
-                  <span>Confirm Repayment</span>
+                  <span>{isSubmittingPayment ? 'Saving...' : 'Confirm Repayment'}</span>
                 </button>
               </div>
             </form>
@@ -1461,17 +1519,19 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
               <div className="flex items-center justify-end space-x-2 pt-2 border-t border-slate-800">
                 <button
                   type="button"
+                  disabled={isSubmittingManual}
                   onClick={() => setShowManualCreditModal(false)}
-                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-slate-300 hover:text-white transition cursor-pointer"
+                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-xs font-bold text-slate-300 hover:text-white transition cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-[#FF8A00] to-amber-600 hover:brightness-110 text-xs font-black text-slate-950 shadow-lg transition active:scale-95 flex items-center space-x-1.5 cursor-pointer"
+                  disabled={isSubmittingManual}
+                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-[#FF8A00] to-amber-600 hover:brightness-110 disabled:opacity-60 disabled:cursor-not-allowed text-xs font-black text-slate-950 shadow-lg transition active:scale-95 flex items-center space-x-1.5 cursor-pointer"
                 >
                   <CreditCard className="w-3.5 h-3.5" />
-                  <span>Confirm &amp; Record Credit</span>
+                  <span>{isSubmittingManual ? 'Saving...' : 'Confirm & Record Credit'}</span>
                 </button>
               </div>
             </form>

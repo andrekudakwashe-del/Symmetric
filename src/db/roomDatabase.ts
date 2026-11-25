@@ -6428,7 +6428,7 @@ export const getRawStoredCashLogs = (): CashLogEntry[] => {
 
   if (hasDuplicates) {
     try {
-      localStorage.setItem(STORAGE_KEYS.CASH_LOGS, JSON.stringify(sanitized));
+      setStored(STORAGE_KEYS.CASH_LOGS, sanitized);
     } catch (_) {}
   }
   return sanitized;
@@ -7721,6 +7721,31 @@ export const addCustomerChange = (
     }
   }
 
+  // Rapid double-click guard for manual bookings / payouts (prevents accidental duplicate taps within 3s)
+  if (isManualEntry && !options?.fromSync) {
+    const nowMs = Date.now();
+    const normCustId = String(entry.customerId || '').trim().toLowerCase();
+    const normCustName = String(entry.customerName || '').trim().toLowerCase();
+    const normNotes = String(entry.notes || '').trim();
+    const recentDup = all.slice(0, 15).find((c) => {
+      const cMs = c.timestamp ? Date.parse(c.timestamp) : 0;
+      if (!cMs || Math.abs(nowMs - cMs) > 3000) return false;
+      if (c.date !== entry.date || String(c.staffId || '') !== String(entry.staffId || '')) return false;
+      const sameCust =
+        (normCustId && String(c.customerId || '').trim().toLowerCase() === normCustId) ||
+        (normCustName && String(c.customerName || '').trim().toLowerCase() === normCustName);
+      if (!sameCust) return false;
+      return (
+        Math.abs((Number(c.in) || 0) - inAmt) < 0.005 &&
+        Math.abs((Number(c.out) || 0) - outAmt) < 0.005 &&
+        String(c.notes || '').trim() === normNotes
+      );
+    });
+    if (recentDup) {
+      return recentDup;
+    }
+  }
+
   const cleanEntry: any = { ...entry };
   delete cleanEntry.fromMesh;
   delete cleanEntry.fromSync;
@@ -7739,105 +7764,117 @@ export const addCustomerChange = (
   setStored(STORAGE_KEYS.CUSTOMER_CHANGES, updated);
 
   if (!options?.fromSync) {
-    enqueueSync('CustomerChange', 'INSERT', {
-      ...created,
-      id: created.id,
-      changeId: created.id,
-      company_id: compId,
-      branch_id: brId,
-      ChangeID: created.id,
-      Timestamp: created.timestamp,
-      Date: created.date,
-      StaffID: created.staffId,
-      StaffName: created.staffName,
-      CustomerID: created.customerId || '',
-      CustomerName: created.customerName,
-      In: created.in,
-      Out: created.out,
-      Notes: created.notes || '',
-      Reference: created.reference || created.id,
-    });
+    try {
+      enqueueSync('CustomerChange', 'INSERT', {
+        ...created,
+        id: created.id,
+        changeId: created.id,
+        company_id: compId,
+        branch_id: brId,
+        ChangeID: created.id,
+        Timestamp: created.timestamp,
+        Date: created.date,
+        StaffID: created.staffId,
+        StaffName: created.staffName,
+        CustomerID: created.customerId || '',
+        CustomerName: created.customerName,
+        In: created.in,
+        Out: created.out,
+        Notes: created.notes || '',
+        Reference: created.reference || created.id,
+      });
+    } catch (err) {
+      console.warn('[addCustomerChange] enqueueSync warning:', err);
+    }
 
-    notifyDatabaseMutation({
-      mutationId: `MUT-CHG-${created.id}-${Date.now()}`,
-      sheetName: 'CustomerChange',
-      action: 'INSERT',
-      companyId: compId,
-      branchId: brId,
-      branchCode: getCurrentBranch()?.code || brId,
-      entityType: 'customer_change',
-      recordId: created.id,
-      payload: created,
-      fromSync: false,
-      timestamp: Date.now(),
-    });
+    try {
+      notifyDatabaseMutation({
+        mutationId: `MUT-CHG-${created.id}-${Date.now()}`,
+        sheetName: 'CustomerChange',
+        action: 'INSERT',
+        companyId: compId,
+        branchId: brId,
+        branchCode: getCurrentBranch()?.code || brId,
+        entityType: 'customer_change',
+        recordId: created.id,
+        payload: created,
+        fromSync: false,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      console.warn('[addCustomerChange] notifyDatabaseMutation warning:', err);
+    }
   }
 
   // Ensure cashMovements has change_received (In) or change_paid (Out) if affectsDrawer !== false
-  const shiftId = getShiftId(created.staffId, created.date, brId);
-  const invRef = created.reference || extractInvoiceRef(undefined, created.notes);
-  const shouldAffectDrawer = (entry as any).affectsDrawer !== false && !options?.skipCashMovement;
-  const existingMovements = getMovements(undefined, brId);
+  try {
+    const shiftId = getShiftId(created.staffId, created.date, brId);
+    const invRef = created.reference || extractInvoiceRef(undefined, created.notes);
+    const shouldAffectDrawer = (entry as any).affectsDrawer !== false && !options?.skipCashMovement;
+    const existingMovements = getMovements(undefined, brId);
 
-  if (shouldAffectDrawer && created.in > 0) {
-    const existingChangeIn = existingMovements.find(
-      (m) =>
-        matchesShift(m, shiftId, brId) &&
-        m.type === 'change_received' &&
-        (m.sourceRef === created.id ||
-          (!isManualEntry &&
-            invRef &&
-            (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #')) &&
-            (m.sourceRef?.includes(invRef) || m.notes?.includes(invRef))))
-    );
-    if (!existingChangeIn) {
-      const refSuffix = isManualEntry
-        ? `${invRef && !created.notes?.includes(invRef) ? ` (Ref: ${invRef})` : ''} [Manual Change]`
-        : `${invRef && !created.notes?.includes(invRef) ? ` (POS Invoice #${invRef})` : ''}`;
-      addMovement({
-        shiftId,
-        staffId: created.staffId,
-        date: created.date,
-        timestamp: created.timestamp,
-        type: 'change_received',
-        amount: created.in,
-        currency: 'USD',
-        direction: 'in',
-        affectsDrawer: true,
-        status: 'approved',
-        sourceModule: 'form3',
-        sourceRef: created.id,
-        notes: `Customer change in: ${created.customerName}${refSuffix}${created.notes ? ` (${created.notes})` : ''}`,
-        company_id: compId,
-        branch_id: brId,
-      });
+    if (shouldAffectDrawer && created.in > 0) {
+      const existingChangeIn = existingMovements.find(
+        (m) =>
+          matchesShift(m, shiftId, brId) &&
+          m.type === 'change_received' &&
+          (m.sourceRef === created.id ||
+            (!isManualEntry &&
+              invRef &&
+              (m.sourceModule === 'POS' || m.notes?.includes('POS Invoice #')) &&
+              (m.sourceRef?.includes(invRef) || m.notes?.includes(invRef))))
+      );
+      if (!existingChangeIn) {
+        const refSuffix = isManualEntry
+          ? `${invRef && !created.notes?.includes(invRef) ? ` (Ref: ${invRef})` : ''} [Manual Change]`
+          : `${invRef && !created.notes?.includes(invRef) ? ` (POS Invoice #${invRef})` : ''}`;
+        addMovement({
+          shiftId,
+          staffId: created.staffId,
+          date: created.date,
+          timestamp: created.timestamp,
+          type: 'change_received',
+          amount: created.in,
+          currency: 'USD',
+          direction: 'in',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form3',
+          sourceRef: created.id,
+          notes: `Customer change in: ${created.customerName}${refSuffix}${created.notes ? ` (${created.notes})` : ''}`,
+          company_id: compId,
+          branch_id: brId,
+        });
+      }
+    } else if (shouldAffectDrawer && created.out > 0) {
+      const existingChangeOut = existingMovements.find(
+        (m) =>
+          matchesShift(m, shiftId, brId) &&
+          m.type === 'change_paid' &&
+          m.sourceRef === created.id
+      );
+      if (!existingChangeOut) {
+        addMovement({
+          shiftId,
+          staffId: created.staffId,
+          date: created.date,
+          timestamp: created.timestamp,
+          type: 'change_paid',
+          amount: created.out,
+          currency: 'USD',
+          direction: 'out',
+          affectsDrawer: true,
+          status: 'approved',
+          sourceModule: 'form3',
+          sourceRef: created.id,
+          notes: `Customer change out: ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
+          company_id: compId,
+          branch_id: brId,
+        });
+      }
     }
-  } else if (shouldAffectDrawer && created.out > 0) {
-    const existingChangeOut = existingMovements.find(
-      (m) =>
-        matchesShift(m, shiftId, brId) &&
-        m.type === 'change_paid' &&
-        m.sourceRef === created.id
-    );
-    if (!existingChangeOut) {
-      addMovement({
-        shiftId,
-        staffId: created.staffId,
-        date: created.date,
-        timestamp: created.timestamp,
-        type: 'change_paid',
-        amount: created.out,
-        currency: 'USD',
-        direction: 'out',
-        affectsDrawer: true,
-        status: 'approved',
-        sourceModule: 'form3',
-        sourceRef: created.id,
-        notes: `Customer change out: ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
-        company_id: compId,
-        branch_id: brId,
-      });
-    }
+  } catch (err) {
+    console.warn('[addCustomerChange] cashMovement sync warning:', err);
   }
 
   notifyListeners();
@@ -8132,6 +8169,32 @@ export const addCreditSale = (
     }
   }
 
+  // Rapid double-click guard for manual credit bookings / repayments (prevents accidental duplicate taps within 3s)
+  if (entry.isManual && !options?.fromSync && !entry.fromMesh) {
+    const nowMs = Date.now();
+    const normCustId = String(entry.customerId || '').trim().toLowerCase();
+    const normCustName = String(entry.customerName || '').trim().toLowerCase();
+    const normNotes = String(entry.notes || '').trim();
+    const recentDup = all.slice(0, 15).find((c) => {
+      const cMs = c.timestamp ? Date.parse(c.timestamp) : 0;
+      if (!cMs || Math.abs(nowMs - cMs) > 3000) return false;
+      if (c.date !== entry.date || String(c.staffId || '') !== String(entry.staffId || '')) return false;
+      const sameCust =
+        (normCustId && String(c.customerId || '').trim().toLowerCase() === normCustId) ||
+        (normCustName && String(c.customerName || '').trim().toLowerCase() === normCustName);
+      if (!sameCust) return false;
+      return (
+        Math.abs((Number(c.out ?? c.amount) || 0) - outAmt) < 0.005 &&
+        Math.abs((Number(c.in) || 0) - inAmt) < 0.005 &&
+        c.status === entry.status &&
+        String(c.notes || '').trim() === normNotes
+      );
+    });
+    if (recentDup) {
+      return recentDup;
+    }
+  }
+
   const cleanEntry: any = { ...entry };
   delete cleanEntry.fromMesh;
   delete cleanEntry.fromSync;
@@ -8154,72 +8217,84 @@ export const addCreditSale = (
 
   if (!options?.fromSync && !(entry as any).fromMesh) {
     console.log(`[Row10] Direct enqueue: CreditSales ${created.id} (fromSync=${options?.fromSync ?? false})`);
-    enqueueSync('CreditSales', 'INSERT', {
-      ...created,
-      id: created.id,
-      creditId: created.id,
-      company_id: compId,
-      branch_id: brId,
-      Timestamp: created.timestamp,
-      CreditID: created.id,
-      Date: created.date,
-      StaffID: created.staffId,
-      StaffName: created.staffName,
-      CustomerID: created.customerId || '',
-      CustomerName: created.customerName,
-      Amount: created.amount,
-      In: created.in || 0,
-      Out: created.out || created.amount,
-      ItemDescription: created.itemDescription,
-      DueDate: created.dueDate || '',
-      Notes: created.notes || '',
-      Status: created.status,
-    });
-    notifyDatabaseMutation({
-      mutationId: `MUT-CRD-${created.id}-${Date.now()}`,
-      sheetName: 'CreditSales',
-      action: 'INSERT',
-      companyId: compId,
-      branchId: brId,
-      branchCode: getCurrentBranch()?.code || brId,
-      entityType: 'credit_sale',
-      recordId: created.id,
-      payload: created,
-      fromSync: false,
-      timestamp: Date.now(),
-    });
+    try {
+      enqueueSync('CreditSales', 'INSERT', {
+        ...created,
+        id: created.id,
+        creditId: created.id,
+        company_id: compId,
+        branch_id: brId,
+        Timestamp: created.timestamp,
+        CreditID: created.id,
+        Date: created.date,
+        StaffID: created.staffId,
+        StaffName: created.staffName,
+        CustomerID: created.customerId || '',
+        CustomerName: created.customerName,
+        Amount: created.amount,
+        In: created.in || 0,
+        Out: created.out || created.amount,
+        ItemDescription: created.itemDescription,
+        DueDate: created.dueDate || '',
+        Notes: created.notes || '',
+        Status: created.status,
+      });
+    } catch (err) {
+      console.warn('[addCreditSale] enqueueSync warning:', err);
+    }
+    try {
+      notifyDatabaseMutation({
+        mutationId: `MUT-CRD-${created.id}-${Date.now()}`,
+        sheetName: 'CreditSales',
+        action: 'INSERT',
+        companyId: compId,
+        branchId: brId,
+        branchCode: getCurrentBranch()?.code || brId,
+        entityType: 'credit_sale',
+        recordId: created.id,
+        payload: created,
+        fromSync: false,
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      console.warn('[addCreditSale] notifyDatabaseMutation warning:', err);
+    }
   }
 
   // If cash was repaid (In > 0), record cash movement if not already recorded (e.g., upfront deposit at POS)
   if (created.in && created.in > 0) {
-    const isPosInitialDeposit = created.notes?.includes('POS Credit Sale Invoice');
-    if (!isPosInitialDeposit) {
-      const shiftId = getShiftId(created.staffId, created.date, brId);
-      const existingMov = getMovements(undefined, brId).find(
-        (m) =>
-          matchesShift(m, shiftId, brId) &&
-          (m.type === 'credit_cash_payment' || m.type === 'credit_upfront_deposit') &&
-          (m.sourceRef === created.id || (created.notes && m.sourceRef && created.notes.includes(m.sourceRef)))
-      );
-      if (!existingMov) {
-        addMovement({
-          shiftId,
-          staffId: created.staffId,
-          date: created.date,
-          timestamp: created.timestamp,
-          type: 'credit_cash_payment',
-          amount: created.in,
-          currency: 'USD',
-          direction: 'in',
-          affectsDrawer: true,
-          status: 'approved',
-          sourceModule: 'form3',
-          sourceRef: created.id,
-          notes: `Credit debt cash payment from ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
-          company_id: compId,
-          branch_id: brId,
-        });
+    try {
+      const isPosInitialDeposit = created.notes?.includes('POS Credit Sale Invoice');
+      if (!isPosInitialDeposit) {
+        const shiftId = getShiftId(created.staffId, created.date, brId);
+        const existingMov = getMovements(undefined, brId).find(
+          (m) =>
+            matchesShift(m, shiftId, brId) &&
+            (m.type === 'credit_cash_payment' || m.type === 'credit_upfront_deposit') &&
+            (m.sourceRef === created.id || (created.notes && m.sourceRef && created.notes.includes(m.sourceRef)))
+        );
+        if (!existingMov) {
+          addMovement({
+            shiftId,
+            staffId: created.staffId,
+            date: created.date,
+            timestamp: created.timestamp,
+            type: 'credit_cash_payment',
+            amount: created.in,
+            currency: 'USD',
+            direction: 'in',
+            affectsDrawer: true,
+            status: 'approved',
+            sourceModule: 'form3',
+            sourceRef: created.id,
+            notes: `Credit debt cash payment from ${created.customerName}${created.notes ? ` (${created.notes})` : ''}`,
+            company_id: compId,
+            branch_id: brId,
+          });
+        }
       }
+    } catch (err) {
+      console.warn('[addCreditSale] cashMovement sync warning:', err);
     }
   }
 
@@ -14249,22 +14324,26 @@ export const recordManualCustomerChange = (params: {
     // safe fallback
   }
 
-  addAuditLog({
-    action: 'MANUAL_CHANGE_BOOKING',
-    severity: 'INFO',
-    staffId: params.staffId,
-    staffName: params.staffName,
-    staffRole: params.staffRole || 'Cashier',
-    amount: params.amount,
-    referenceId: created.id,
-    details: `Manual customer change booked: $${params.amount.toFixed(2)} owed to "${params.customerName.trim()}". Reason: ${params.notes || 'Customer rejected note / small change unavailable'}.${affectsDrawer ? ' [Cash IN till]' : ' [Ledger only / non-drawer]'}`,
-    metadata: {
-      customerId: params.customerId,
-      customerName: params.customerName,
-      reference: params.reference,
-      cashReceivedInDrawer: affectsDrawer,
-    },
-  });
+  try {
+    addAuditLog({
+      action: 'MANUAL_CHANGE_BOOKING',
+      severity: 'INFO',
+      staffId: params.staffId,
+      staffName: params.staffName,
+      staffRole: params.staffRole || 'Cashier',
+      amount: params.amount,
+      referenceId: created.id,
+      details: `Manual customer change booked: $${params.amount.toFixed(2)} owed to "${params.customerName.trim()}". Reason: ${params.notes || 'Customer rejected note / small change unavailable'}.${affectsDrawer ? ' [Cash IN till]' : ' [Ledger only / non-drawer]'}`,
+      metadata: {
+        customerId: params.customerId,
+        customerName: params.customerName,
+        reference: params.reference,
+        cashReceivedInDrawer: affectsDrawer,
+      },
+    });
+  } catch (err) {
+    console.warn('[recordManualCustomerChange] addAuditLog warning:', err);
+  }
 
   return created;
 };
@@ -14370,25 +14449,29 @@ export const recordManualCustomerCredit = (params: {
     // safe fallback
   }
 
-  addAuditLog({
-    action: 'MANUAL_CREDIT_ENTRY',
-    severity: 'WARNING',
-    staffId: params.staffId,
-    staffName: params.staffName,
-    staffRole: params.staffRole || 'Staff',
-    authorizedByName: params.authorizedByName,
-    authorizedById: params.authorizedById,
-    amount: params.amount,
-    referenceId: created.id,
-    details: `Manual credit approved: $${params.amount.toFixed(2)} for "${params.customerName.trim()}". Type: ${itemDesc}. Due: ${dueStr}.${authSuffix}${params.disburseCashFromDrawer ? ' [Cash disbursed from drawer]' : ''}`,
-    metadata: {
-      customerId: params.customerId,
-      customerName: params.customerName,
-      creditType: params.creditType,
-      dueDate: dueStr,
-      disburseCashFromDrawer: params.disburseCashFromDrawer,
-    },
-  });
+  try {
+    addAuditLog({
+      action: 'MANUAL_CREDIT_ENTRY',
+      severity: 'WARNING',
+      staffId: params.staffId,
+      staffName: params.staffName,
+      staffRole: params.staffRole || 'Staff',
+      authorizedByName: params.authorizedByName,
+      authorizedById: params.authorizedById,
+      amount: params.amount,
+      referenceId: created.id,
+      details: `Manual credit approved: $${params.amount.toFixed(2)} for "${params.customerName.trim()}". Type: ${itemDesc}. Due: ${dueStr}.${authSuffix}${params.disburseCashFromDrawer ? ' [Cash disbursed from drawer]' : ''}`,
+      metadata: {
+        customerId: params.customerId,
+        customerName: params.customerName,
+        creditType: params.creditType,
+        dueDate: dueStr,
+        disburseCashFromDrawer: params.disburseCashFromDrawer,
+      },
+    });
+  } catch (err) {
+    console.warn('[recordManualCustomerCredit] addAuditLog warning:', err);
+  }
 
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('saimetric_credit_sales_updated', { detail: created }));
@@ -17472,7 +17555,7 @@ export const getStockBatches = (): StockBatch[] => {
 
     if (generated.length > 0) {
       try {
-        localStorage.setItem(STORAGE_KEYS.STOCK_BATCHES, JSON.stringify(generated));
+        setStored(STORAGE_KEYS.STOCK_BATCHES, generated);
       } catch (err) {
         console.error('Error bootstrapping stock batches:', err);
       }

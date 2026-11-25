@@ -2,6 +2,7 @@ import { STORAGE_KEYS } from './storageKeys';
 import {
   getMeta,
   setMeta,
+  getAllFromIDBStore,
   ShardedStoreName,
   loadShardedCollection,
   syncShardedCollectionDelta,
@@ -157,6 +158,21 @@ const hasIndexedDb = (): boolean => {
   return false;
 };
 
+const loadNonShardedIdbCollection = async (key: string): Promise<any> => {
+  const metaVal = await getMeta(`room_${key}`);
+  if (metaVal !== null && metaVal !== undefined && (!Array.isArray(metaVal) || metaVal.length > 0)) {
+    return metaVal;
+  }
+  if (key === STORAGE_KEYS.CASH_MOVEMENTS) {
+    const storeRows = await getAllFromIDBStore<any>('cashMovements').catch(() => []);
+    if (Array.isArray(storeRows) && storeRows.length > 0) return storeRows;
+  } else if (key === STORAGE_KEYS.GOODS_RECEIVED_NOTES) {
+    const storeRows = await getAllFromIDBStore<any>('goodsReceivedNotes').catch(() => []);
+    if (Array.isArray(storeRows) && storeRows.length > 0) return storeRows;
+  }
+  return metaVal;
+};
+
 const hydrateOverflowKeyFromIdb = (key: string): void => {
   if (!hasIndexedDb()) return;
   if (pendingIdbKeyHydrations.has(key)) return;
@@ -173,7 +189,7 @@ const hydrateOverflowKeyFromIdb = (key: string): void => {
         }
         return rows;
       })
-    : getMeta(`room_${key}`);
+    : loadNonShardedIdbCollection(key);
 
   loadPromise
     .then((idbVal) => {
@@ -187,6 +203,15 @@ const hydrateOverflowKeyFromIdb = (key: string): void => {
             window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
           } else if (key === STORAGE_KEYS.SALES) {
             window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+          } else if (key === STORAGE_KEYS.CASH_MOVEMENTS) {
+            window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          } else if (key === STORAGE_KEYS.CASH_LOGS) {
+            window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
+          } else if (key === STORAGE_KEYS.CUSTOMER_LEDGER) {
+            window.dispatchEvent(new CustomEvent('saimetric_customer_ledger_updated'));
+          } else if (key === STORAGE_KEYS.GOODS_RECEIVED_NOTES) {
+            window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
           }
         }
       }
@@ -429,6 +454,8 @@ export async function rehydrateFromIndexedDB(): Promise<void> {
       },
       { key: STORAGE_KEYS.INVENTORY_ITEMS, idField: (i) => i.itemId || i.id },
       { key: STORAGE_KEYS.CASH_LOGS, idField: (c) => c.id },
+      { key: STORAGE_KEYS.CASH_MOVEMENTS, idField: (m) => m?.id },
+      { key: STORAGE_KEYS.CUSTOMER_LEDGER, idField: (e) => e?.id },
       { key: STORAGE_KEYS.CASH_COUNTS, idField: (c) => c.id },
       { key: STORAGE_KEYS.CREDIT_SALES, idField: (c) => c.id },
       { key: STORAGE_KEYS.CUSTOMER_CHANGES, idField: (c) => c.id },
@@ -484,7 +511,7 @@ export async function rehydrateFromIndexedDB(): Promise<void> {
               }
             }
           } else {
-            idbVal = await getMeta(`room_${key}`);
+            idbVal = await loadNonShardedIdbCollection(key);
           }
 
           if (Array.isArray(idbVal) && idbVal.length > 0) {
@@ -549,6 +576,8 @@ export async function rehydrateFromIndexedDB(): Promise<void> {
         window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_customer_ledger_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_grn_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
       }
@@ -560,7 +589,16 @@ export async function rehydrateFromIndexedDB(): Promise<void> {
 
 export function getStored<T>(key: string, fallback: T): T {
   if (memoryCache.has(key)) {
-    return memoryCache.get(key) as T;
+    const cached = memoryCache.get(key);
+    if (cached && typeof cached === 'object' && (cached as any).__overflow_idb) {
+      memoryCache.delete(key);
+      hydrateOverflowKeyFromIdb(key);
+      return fallback;
+    }
+    if (Array.isArray(fallback) && !Array.isArray(cached)) {
+      return fallback;
+    }
+    return cached as T;
   }
   try {
     if (typeof localStorage === 'undefined') return fallback;
@@ -573,6 +611,10 @@ export function getStored<T>(key: string, fallback: T): T {
     if (parsed && typeof parsed === 'object' && parsed.__overflow_idb) {
       // Data is overflowed to IndexedDB: trigger async single-flight IDB hydration & return fallback for now
       hydrateOverflowKeyFromIdb(key);
+      return fallback;
+    }
+    if (Array.isArray(fallback) && !Array.isArray(parsed)) {
+      console.warn(`[Storage] Expected array for ${key}, got ${typeof parsed}; returning fallback.`);
       return fallback;
     }
     memoryCache.set(key, parsed);
@@ -590,6 +632,10 @@ export function setStored<T>(
   options?: { skipIdbOverwriteIfExisting?: boolean; immediate?: boolean }
 ): void {
   try {
+    if (value && typeof value === 'object' && (value as any).__overflow_idb) {
+      console.warn(`[Storage] Blocked accidental write of __overflow_idb sentinel for ${key}`);
+      return;
+    }
     // 1. Update in-memory cache instantly (0ms UI latency & immediately consistent reads)
     memoryCache.set(key, value);
 
