@@ -248,12 +248,19 @@ export function generateClientNonce(): string {
 
 export interface ParsedPairDeepLink {
   wsUrl: string;
+  lastKnownHost: string;
+  port: number;
   pairCode?: string;
   hubId?: string;
+  mdnsHost?: string;
+  lanIps?: string[];
 }
 
+const MDNS_HOST_REGEX = /^[a-zA-Z0-9-]{1,63}(?:\.[a-zA-Z0-9-]{1,63})*$/;
+const IPV4_REGEX = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
+
 /**
- * Safely parses native-camera deep-link query params (?pairHost=...&pairCode=...&hubId=...).
+ * Safely parses native-camera deep-link query params (?pairHost=...&pairCode=...&hubId=...&mdnsHost=...).
  * Rejects dangerous schemes (javascript:, data:, file:) and only accepts valid ws/wss/LAN host inputs.
  */
 export function parsePairDeepLink(search: string): ParsedPairDeepLink | null {
@@ -261,24 +268,28 @@ export function parsePairDeepLink(search: string): ParsedPairDeepLink | null {
   try {
     const params = new URLSearchParams(search);
     const rawHost = (params.get('pairHost') || params.get('pairHub') || '').trim();
-    if (!rawHost) return null;
+    const rawMdns = (params.get('mdnsHost') || params.get('mdns') || '').trim().toLowerCase();
+    const safeMdns = rawMdns && MDNS_HOST_REGEX.test(rawMdns) ? rawMdns : undefined;
 
-    const lower = rawHost.toLowerCase();
+    if (!rawHost && !safeMdns) return null;
+
+    const effectiveHost = rawHost || `${safeMdns}:8080`;
+    const lower = effectiveHost.toLowerCase();
     if (lower.startsWith('javascript:') || lower.startsWith('data:') || lower.startsWith('file:')) {
       return null;
     }
 
-    let wsUrl = rawHost;
+    let wsUrl = effectiveHost;
     if (lower.startsWith('https://')) {
-      wsUrl = 'wss://' + rawHost.slice('https://'.length);
+      wsUrl = 'wss://' + effectiveHost.slice('https://'.length);
     } else if (lower.startsWith('http://')) {
-      wsUrl = 'ws://' + rawHost.slice('http://'.length);
+      wsUrl = 'ws://' + effectiveHost.slice('http://'.length);
     } else if (!lower.startsWith('ws://') && !lower.startsWith('wss://')) {
       // Allow strictly IPv4(:port) or hostname(:port)
-      if (!/^[a-zA-Z0-9.-]+(?::\d{1,5})?$/.test(rawHost)) {
+      if (!/^[a-zA-Z0-9.-]+(?::\d{1,5})?$/.test(effectiveHost)) {
         return null;
       }
-      wsUrl = rawHost.includes(':') ? `ws://${rawHost}` : `ws://${rawHost}:8080`;
+      wsUrl = effectiveHost.includes(':') ? `ws://${effectiveHost}` : `ws://${effectiveHost}:8080`;
     }
 
     const parsedUrl = new URL(wsUrl);
@@ -286,13 +297,25 @@ export function parsePairDeepLink(search: string): ParsedPairDeepLink | null {
       return null;
     }
 
+    const parsedPort = parsedUrl.port ? parseInt(parsedUrl.port, 10) : (parsedUrl.protocol === 'wss:' ? 443 : 8080);
+    const port = Number.isFinite(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 8080;
+    const lastKnownHost = `${parsedUrl.hostname}:${port}`;
+
     const rawCode = (params.get('pairCode') || params.get('code') || '').replace(/[^0-9A-Za-z-]/g, '').trim();
-    const rawHubId = (params.get('hubId') || '').replace(/[^0-9A-Za-z_-]/g, '').trim();
+    const rawHubId = (params.get('hubId') || params.get('hub_id') || '').replace(/[^0-9A-Za-z_-]/g, '').trim();
+    const rawLanIps = (params.get('lanIps') || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((ip) => IPV4_REGEX.test(ip));
 
     return {
-      wsUrl: parsedUrl.origin.replace(/^http/, 'ws'),
+      wsUrl: `${parsedUrl.protocol}//${lastKnownHost}`,
+      lastKnownHost,
+      port,
       ...(rawCode ? { pairCode: rawCode } : {}),
       ...(rawHubId ? { hubId: rawHubId } : {}),
+      ...(safeMdns ? { mdnsHost: safeMdns } : {}),
+      ...(rawLanIps.length > 0 ? { lanIps: rawLanIps } : {}),
     };
   } catch {
     return null;

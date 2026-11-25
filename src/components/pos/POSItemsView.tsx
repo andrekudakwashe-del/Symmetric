@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useDeferredValue } from 'react';
+import React, { useState, useMemo, useDeferredValue, useCallback, useRef, useEffect } from 'react';
 import { Product, CartItem, Salesperson, ActiveTab } from '../../types';
 import { FractionalWeightModal } from './FractionalWeightModal';
 import { QuickAddProductModal } from './QuickAddProductModal';
@@ -92,37 +92,7 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
     } catch (_) {}
   };
 
-  const handleProductTap = (product: Product) => {
-    if (product.sellByFraction) {
-      setFractionalModalProduct(product);
-    } else {
-      if (onUpdateQuantity && cartMap.has(product.id)) {
-        onUpdateQuantity(product.id, 1);
-      } else {
-        onAddToCart(product);
-      }
-    }
-  };
-
-  const handleProductDecrement = (product: Product) => {
-    if (onUpdateQuantity) {
-      const currentQty = cartMap.get(product.id) || 0;
-      if (currentQty <= 1) {
-        if (onRemoveItem) onRemoveItem(product.id);
-        else onRemoveOneFromCart(product);
-      } else {
-        onUpdateQuantity(product.id, -1);
-      }
-    } else {
-      onRemoveOneFromCart(product);
-    }
-  };
-
-  const handleRequestRemove = (product: Product) => {
-    setRemoveConfirmProduct(product);
-  };
-
-  // Cart helper map for O(1) lookup
+  // Cart helper map for O(1) lookup + ref for stable gesture handler identities
   const cartMap = useMemo(() => {
     const map = new Map<string, number>();
     cart.forEach((item) => {
@@ -130,6 +100,42 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
     });
     return map;
   }, [cart]);
+  const cartMapRef = useRef(cartMap);
+  cartMapRef.current = cartMap;
+
+  const handleProductTap = useCallback(
+    (product: Product) => {
+      if (product.sellByFraction) {
+        setFractionalModalProduct(product);
+      } else if (onUpdateQuantity && cartMapRef.current.has(product.id)) {
+        onUpdateQuantity(product.id, 1);
+      } else {
+        onAddToCart(product);
+      }
+    },
+    [onUpdateQuantity, onAddToCart]
+  );
+
+  const handleProductDecrement = useCallback(
+    (product: Product) => {
+      if (onUpdateQuantity) {
+        const currentQty = cartMapRef.current.get(product.id) || 0;
+        if (currentQty <= 1) {
+          if (onRemoveItem) onRemoveItem(product.id);
+          else onRemoveOneFromCart(product);
+        } else {
+          onUpdateQuantity(product.id, -1);
+        }
+      } else {
+        onRemoveOneFromCart(product);
+      }
+    },
+    [onUpdateQuantity, onRemoveItem, onRemoveOneFromCart]
+  );
+
+  const handleRequestRemove = useCallback((product: Product) => {
+    setRemoveConfirmProduct(product);
+  }, []);
 
   const totalCartCount = useMemo(() => {
     return cart.reduce((sum, item) => sum + item.quantity, 0);
@@ -151,29 +157,75 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
     return ['All', ...Array.from(set)];
   }, [products]);
 
-  // Filtered products (Optimized with deferredSearchQuery to eliminate keystroke lag)
+  // Pre-deduplicated + pre-indexed product catalog so keystroke filtering does O(1) string checks
+  const indexedProducts = useMemo(() => {
+    const seen = new Set<string>();
+    const entries: Array<{ product: Product; searchText: string }> = [];
+    for (const p of products) {
+      const key = p.id || p.sku;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const searchText = [
+        p.name || '',
+        p.sku || '',
+        p.category || '',
+        p.unit || '',
+        p.barcode ? String(p.barcode) : '',
+      ]
+        .join('\u0000')
+        .toLowerCase();
+      entries.push({ product: p, searchText });
+    }
+    return entries;
+  }, [products]);
+
+  // Filtered products (Optimized with deferredSearchQuery & precomputed index)
   const filteredProducts = useMemo(() => {
     const q = (deferredSearchQuery || '').toLowerCase().trim();
-    const list = products.filter((p) => {
-      const matchesCategory = selectedCategory === 'All' || p.category === selectedCategory;
-      const matchesSearch =
-        !q ||
-        (p.name && p.name.toLowerCase().includes(q)) ||
-        p.sku?.toLowerCase().includes(q) ||
-        p.category?.toLowerCase().includes(q) ||
-        p.unit?.toLowerCase().includes(q) ||
-        (p.barcode && String(p.barcode).includes(q));
-      return matchesCategory && matchesSearch;
-    });
-    // Deduplicate by product.id to guarantee no duplicate React keys
-    const seen = new Set<string>();
-    return list.filter((p) => {
-      const key = p.id || p.sku;
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-  }, [products, selectedCategory, deferredSearchQuery]);
+    const out: Product[] = [];
+    for (const entry of indexedProducts) {
+      const { product: p, searchText } = entry;
+      if (selectedCategory !== 'All' && p.category !== selectedCategory) continue;
+      if (q && !searchText.includes(q)) continue;
+      out.push(p);
+    }
+    return out;
+  }, [indexedProducts, selectedCategory, deferredSearchQuery]);
+
+  // Progressive DOM windowing: caps initial DOM mount to 120 tiles/rows on large 5k+ SKU stores
+  // and expands seamlessly on scroll so mobile WebViews maintain 60fps.
+  const CATALOG_PAGE_SIZE = 120;
+  const [visibleCount, setVisibleCount] = useState<number>(CATALOG_PAGE_SIZE);
+  const loadMoreSentinelRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setVisibleCount(CATALOG_PAGE_SIZE);
+  }, [selectedCategory, deferredSearchQuery, isListView]);
+
+  const visibleProducts = useMemo(
+    () =>
+      filteredProducts.length > visibleCount
+        ? filteredProducts.slice(0, visibleCount)
+        : filteredProducts,
+    [filteredProducts, visibleCount]
+  );
+
+  useEffect(() => {
+    const el = loadMoreSentinelRef.current;
+    if (!el || visibleCount >= filteredProducts.length || typeof IntersectionObserver === 'undefined') {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisibleCount((prev) => Math.min(filteredProducts.length, prev + CATALOG_PAGE_SIZE));
+        }
+      },
+      { rootMargin: '300px' }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [visibleCount, filteredProducts.length]);
 
   return (
     <div className="space-y-3 pb-28 select-none animate-fadeIn">
@@ -406,13 +458,13 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
       ) : isListView ? (
         /* List View Mode with Full Gesture Support */
         <div className="space-y-2">
-          {filteredProducts.map((product, idx) => {
+          {visibleProducts.map((product, idx) => {
             const qty = cartMap.get(product.id) || 0;
             const avatarBg = AVATAR_COLORS[idx % AVATAR_COLORS.length];
 
             return (
               <ProductGestureListRow
-                key={`${product.id}-${idx}`}
+                key={product.id || product.sku}
                 product={product}
                 quantityInCart={qty}
                 avatarBg={avatarBg}
@@ -422,36 +474,64 @@ export const POSItemsView: React.FC<POSItemsViewProps> = ({
               />
             );
           })}
+          {visibleCount < filteredProducts.length && (
+            <div ref={loadMoreSentinelRef} className="py-3 text-center">
+              <button
+                type="button"
+                onClick={() =>
+                  setVisibleCount((prev) => Math.min(filteredProducts.length, prev + CATALOG_PAGE_SIZE))
+                }
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition"
+              >
+                Showing {visibleProducts.length} of {filteredProducts.length} items — Load More
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         /* Grid View Mode matching Screenshot with Adjustable Density (3x4 Compact default) */
-        <div
-          className={
-            gridDensity === 'dense'
-              ? 'grid grid-cols-4 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-1.5 sm:gap-2'
-              : gridDensity === 'standard'
-              ? 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5 sm:gap-3'
-              : 'grid grid-cols-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 sm:gap-2.5'
-          }
-        >
-          {filteredProducts.map((product, idx) => {
-            const qty = cartMap.get(product.id) || 0;
-            const avatarBg = AVATAR_COLORS[idx % AVATAR_COLORS.length];
+        <>
+          <div
+            className={
+              gridDensity === 'dense'
+                ? 'grid grid-cols-4 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-1.5 sm:gap-2'
+                : gridDensity === 'standard'
+                ? 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5 sm:gap-3'
+                : 'grid grid-cols-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 sm:gap-2.5'
+            }
+          >
+            {visibleProducts.map((product, idx) => {
+              const qty = cartMap.get(product.id) || 0;
+              const avatarBg = AVATAR_COLORS[idx % AVATAR_COLORS.length];
 
-            return (
-              <ProductGestureCard
-                key={`${product.id}-${idx}`}
-                product={product}
-                quantityInCart={qty}
-                avatarBg={avatarBg}
-                density={gridDensity}
-                onTap={handleProductTap}
-                onDecrement={handleProductDecrement}
-                onRequestRemove={handleRequestRemove}
-              />
-            );
-          })}
-        </div>
+              return (
+                <ProductGestureCard
+                  key={product.id || product.sku}
+                  product={product}
+                  quantityInCart={qty}
+                  avatarBg={avatarBg}
+                  density={gridDensity}
+                  onTap={handleProductTap}
+                  onDecrement={handleProductDecrement}
+                  onRequestRemove={handleRequestRemove}
+                />
+              );
+            })}
+          </div>
+          {visibleCount < filteredProducts.length && (
+            <div ref={loadMoreSentinelRef} className="py-3 text-center">
+              <button
+                type="button"
+                onClick={() =>
+                  setVisibleCount((prev) => Math.min(filteredProducts.length, prev + CATALOG_PAGE_SIZE))
+                }
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold transition"
+              >
+                Showing {visibleProducts.length} of {filteredProducts.length} items — Load More
+              </button>
+            </div>
+          )}
+        </>
       )}
 
       {/* Remove Item from Sale Confirmation Modal (Triggered by 2-Second Long Hold) */}

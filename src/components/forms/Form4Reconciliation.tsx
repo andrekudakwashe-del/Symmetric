@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, Suspense, lazy } from 'react';
 import {
   Salesperson,
   ExpenseEntry,
@@ -118,16 +118,28 @@ import {
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
-import { DatabaseBackupModal } from '../common/DatabaseBackupModal';
-import { DatabaseRestoreModal } from '../common/DatabaseRestoreModal';
-import { CashierShiftReportModal } from './CashierShiftReportModal';
 import { buildCashierShiftReportData } from '../../services/cashierShiftReportService';
 import {
   calculateSupervisorExpectedCash,
   approveInternalConsumption,
   rejectInternalConsumption,
 } from '../../services/walletService';
-import { databaseBackupService } from '../../services/databaseBackupService';
+
+const DatabaseBackupModal = lazy(() =>
+  import('../common/DatabaseBackupModal').then((m) => ({
+    default: m.DatabaseBackupModal,
+  }))
+);
+const DatabaseRestoreModal = lazy(() =>
+  import('../common/DatabaseRestoreModal').then((m) => ({
+    default: m.DatabaseRestoreModal,
+  }))
+);
+const CashierShiftReportModal = lazy(() =>
+  import('./CashierShiftReportModal').then((m) => ({
+    default: m.CashierShiftReportModal,
+  }))
+);
 
 interface Form4ReconciliationProps {
   currentUser: Salesperson;
@@ -1212,6 +1224,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
 
       // 3. Automatically generate database backup payload and download to device
       try {
+        const { databaseBackupService } = await import('../../services/databaseBackupService');
         const payload = await databaseBackupService.generateDatabasePayload('EOD_HANDOVER');
         const contentStr = JSON.stringify(payload, null, 2);
         databaseBackupService.downloadBackupFileToDevice(backupFileName, contentStr);
@@ -3526,12 +3539,14 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       {/* CASHIER SHIFT REPORT & AUDIT DRILL-DOWN MODAL */}
       {/* ========================================================================= */}
       {selectedAuditData && (
-        <CashierShiftReportModal
-          report={selectedAuditData.reportData}
-          auditData={selectedAuditData}
-          date={date}
-          onClose={() => setAuditStaffId(null)}
-        />
+        <Suspense fallback={null}>
+          <CashierShiftReportModal
+            report={selectedAuditData.reportData}
+            auditData={selectedAuditData}
+            date={date}
+            onClose={() => setAuditStaffId(null)}
+          />
+        </Suspense>
       )}
 
       {/* Customer search modal */}
@@ -3543,22 +3558,30 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       />
 
       {/* End of Day (EOD) Encrypted Database Backup Modal */}
-      <DatabaseBackupModal
-        isOpen={showEodBackupModal}
-        onClose={() => setShowEodBackupModal(false)}
-        defaultType="EOD_HANDOVER"
-        staffName={currentUser.name}
-      />
+      {showEodBackupModal && (
+        <Suspense fallback={null}>
+          <DatabaseBackupModal
+            isOpen={showEodBackupModal}
+            onClose={() => setShowEodBackupModal(false)}
+            defaultType="EOD_HANDOVER"
+            staffName={currentUser.name}
+          />
+        </Suspense>
+      )}
 
       {/* Database Restore Modal for Supervisor to Upload Owner Master Update */}
-      <DatabaseRestoreModal
-        isOpen={showRestoreModal}
-        onClose={() => setShowRestoreModal(false)}
-        defaultMode="master_only"
-        onRestoreSuccess={() => {
-          window.location.reload();
-        }}
-      />
+      {showRestoreModal && (
+        <Suspense fallback={null}>
+          <DatabaseRestoreModal
+            isOpen={showRestoreModal}
+            onClose={() => setShowRestoreModal(false)}
+            defaultMode="master_only"
+            onRestoreSuccess={() => {
+              window.location.reload();
+            }}
+          />
+        </Suspense>
+      )}
 
       {/* Electronic Settlements Modal (EcoCash & ZiG Swipe Dual Verification) */}
       {showElectronicModal && (
@@ -4229,6 +4252,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
                   <button
                     type="button"
                     onClick={async () => {
+                      const { databaseBackupService } = await import('../../services/databaseBackupService');
                       const payload = await databaseBackupService.generateDatabasePayload('EOD_HANDOVER');
                       const contentStr = JSON.stringify(payload, null, 2);
                       databaseBackupService.downloadBackupFileToDevice(

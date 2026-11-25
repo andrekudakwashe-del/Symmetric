@@ -35,7 +35,8 @@ export default defineConfig(() => {
               if (id.includes('xlsx')) return 'vendor-xlsx';
               if (id.includes('recharts')) return 'vendor-charts';
               if (id.includes('mqtt')) return 'vendor-mqtt';
-              if (id.includes('html5-qrcode') || id.includes('qrcode')) return 'vendor-qr';
+              if (id.includes('html5-qrcode')) return 'vendor-qr-scanner';
+              if (id.includes('qrcode')) return 'vendor-qr-gen';
               if (id.includes('lucide-react')) return 'vendor-icons';
               return 'vendor-core';
             }

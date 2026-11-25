@@ -1,5 +1,7 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, Suspense } from 'react';
 import { Salesperson, Branch, StocktakeGuestPass, TemporaryCasualAccount } from '../../types';
+import { lazyWithRetry } from '../../utils/lazyWithRetry';
+import { ModuleErrorBoundary } from '../common/ModuleErrorBoundary';
 import {
   getSalespeople,
   getRawStoredSalespeople,
@@ -29,7 +31,7 @@ import {
   getActiveBranchStocktakeSessions,
   getActiveLockdownSession,
 } from '../../services/stocktakeAccessService';
-import { getRolePresetPermissions } from '../admin/StaffAccessManagementScreen';
+import { getRolePresetPermissions } from '../../utils/rolePresets';
 import {
   Shield,
   Lock,
@@ -65,9 +67,16 @@ import {
   Plane,
 } from 'lucide-react';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
-import { RegistrationScreen } from './RegistrationScreen';
-import { DatabaseRestoreModal } from '../common/DatabaseRestoreModal';
 import { initializeSystemConfigAndSync } from '../../services/systemConfig';
+
+const RegistrationScreen = lazyWithRetry(
+  () => import('./RegistrationScreen').then((m) => ({ default: m.RegistrationScreen })),
+  'RegistrationScreen'
+);
+const DatabaseRestoreModal = lazyWithRetry(
+  () => import('../common/DatabaseRestoreModal').then((m) => ({ default: m.DatabaseRestoreModal })),
+  'DatabaseRestoreModal'
+);
 import {
   authenticateOwnerWithAppsScript,
   authenticateStaffWithAppsScript,
@@ -1228,10 +1237,20 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   if (mode === 'register') {
     return (
       <div className="min-h-[100dvh] w-full max-w-[100vw] overflow-x-hidden overflow-y-auto bg-gradient-to-b from-slate-950 via-[#120d2b] to-slate-950 text-slate-100 flex flex-col justify-between p-3 sm:p-6">
-        <RegistrationScreen
-          onRegistrationSuccess={(owner) => handleCompleteLogin(owner)}
-          onSwitchToLogin={() => setMode('login')}
-        />
+        <ModuleErrorBoundary moduleName="Registration">
+          <Suspense
+            fallback={
+              <div className="flex-1 flex items-center justify-center p-8 text-xs font-bold text-slate-300">
+                Loading registration wizard...
+              </div>
+            }
+          >
+            <RegistrationScreen
+              onRegistrationSuccess={(owner) => handleCompleteLogin(owner)}
+              onSwitchToLogin={() => setMode('login')}
+            />
+          </Suspense>
+        </ModuleErrorBoundary>
         <div className="text-center text-xs text-slate-500 pb-2">
           <p>SAIMETRIC Multi-Tenant SaaS Architecture • Isolated Branch Data</p>
         </div>
@@ -2118,15 +2137,21 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       )}
 
       {/* Encrypted Backup Restore Modal (Stage 1 & Stage 2) */}
-      <DatabaseRestoreModal
-        isOpen={showRestoreModal}
-        onClose={() => setShowRestoreModal(false)}
-        defaultMode={restoreMode}
-        onRestoreSuccess={() => {
-          // Force page refresh so restored company, staff, and state are immediately active
-          window.location.reload();
-        }}
-      />
+      {showRestoreModal && (
+        <ModuleErrorBoundary moduleName="Backup Restore" compact>
+          <Suspense fallback={null}>
+            <DatabaseRestoreModal
+              isOpen={showRestoreModal}
+              onClose={() => setShowRestoreModal(false)}
+              defaultMode={restoreMode}
+              onRestoreSuccess={() => {
+                // Force page refresh so restored company, staff, and state are immediately active
+                window.location.reload();
+              }}
+            />
+          </Suspense>
+        </ModuleErrorBoundary>
+      )}
 
       {/* Footer info & Install App option */}
       <div className="text-center text-xs text-slate-500 pb-2 flex flex-col items-center space-y-2 max-w-sm mx-auto w-full">

@@ -149,6 +149,58 @@ import {
 } from '../data/initialData';
 import { persistentSyncEngine } from '../services/persistentSyncEngine';
 import { getMeta, setMeta, deleteMeta, purgeTenantContextCredentials } from './indexedDBService';
+import { STORAGE_KEYS } from './storageKeys';
+import {
+  subscribeToDatabase,
+  subscribeRoomDatabase,
+  beginBatchUpdate,
+  endBatchUpdate,
+  notifyListeners,
+  memoryCache,
+  flushPendingStorageWrites,
+  cleanupLocalStorageQuota,
+  rehydrateFromIndexedDB,
+  getStored,
+  setStored,
+} from './roomStorageEngine';
+import {
+  saleCreationListeners,
+  inMemorySeenSaleIds,
+  registerSeenSaleId,
+  onSaleCreated,
+  onSaleUpdated,
+  notifySaleUpdated,
+  onCashLogCreated,
+  notifyCashLogCreated,
+  onCashLogUpdated,
+  notifyCashLogUpdated,
+  onStaffChanged,
+  notifyStaffChanged,
+  onCustomerChanged,
+  notifyCustomerChanged,
+  onSupplierChanged,
+  notifySupplierChanged,
+  onBranchChanged,
+  notifyBranchChanged,
+  onCashAccountChanged,
+  notifyCashAccountChanged,
+  onCashTransferChanged,
+  notifyCashTransferChanged,
+  onExpenseChanged,
+  notifyExpenseChanged,
+  onDirectGrvChanged,
+  notifyDirectGrvChanged,
+  type SaleUpdateListener,
+  type CashLogListener,
+  type StaffChangeListener,
+  type CustomerChangeListener,
+  type SupplierChangeListener,
+  type BranchChangeListener,
+  type CashAccountChangeListener,
+  type CashTransferChangeListener,
+  type ExpenseChangeListener,
+  type DirectGrvChangeListener,
+} from './roomEventBus';
 import {
   getDualReadDirectGrvs,
   getDualReadSupplierInvoices,
@@ -179,6 +231,51 @@ import {
 } from '../utils/pinCrypto';
 
 export {
+  STORAGE_KEYS,
+  subscribeToDatabase,
+  subscribeRoomDatabase,
+  beginBatchUpdate,
+  endBatchUpdate,
+  notifyListeners,
+  flushPendingStorageWrites,
+  cleanupLocalStorageQuota,
+  rehydrateFromIndexedDB,
+  getStored,
+  setStored,
+  registerSeenSaleId,
+  onSaleCreated,
+  onSaleUpdated,
+  notifySaleUpdated,
+  onCashLogCreated,
+  notifyCashLogCreated,
+  onCashLogUpdated,
+  notifyCashLogUpdated,
+  onStaffChanged,
+  notifyStaffChanged,
+  onCustomerChanged,
+  notifyCustomerChanged,
+  onSupplierChanged,
+  notifySupplierChanged,
+  onBranchChanged,
+  notifyBranchChanged,
+  onCashAccountChanged,
+  notifyCashAccountChanged,
+  onCashTransferChanged,
+  notifyCashTransferChanged,
+  onExpenseChanged,
+  notifyExpenseChanged,
+  onDirectGrvChanged,
+  notifyDirectGrvChanged,
+  type SaleUpdateListener,
+  type CashLogListener,
+  type StaffChangeListener,
+  type CustomerChangeListener,
+  type SupplierChangeListener,
+  type BranchChangeListener,
+  type CashAccountChangeListener,
+  type CashTransferChangeListener,
+  type ExpenseChangeListener,
+  type DirectGrvChangeListener,
   getAllGoodsReceivedNotes,
   saveGoodsReceivedNote,
   runGrnMigration,
@@ -191,60 +288,6 @@ export {
   generatePinSalt,
   verifyPinHash,
   sanitizeUserForExport,
-};
-
-export const STORAGE_KEYS = {
-  SALESPEOPLE: 'saimetric_room_salespeople',
-  CUSTOMERS: 'saimetric_room_customers',
-  SUPPLIERS: 'saimetric_room_suppliers',
-  BRANCHES: 'saimetric_room_branches',
-  PRODUCTS: 'saimetric_room_products',
-  INVENTORY_ITEMS: 'saimetric_room_inventory_items',
-  GOODS_RECEIVED: 'saimetric_room_goods_received',
-  SUPPLIER_INVOICES: 'saimetric_room_supplier_invoices',
-  STOCK_MOVEMENTS: 'saimetric_room_stock_movements',
-  STOCKTAKE_SESSIONS: 'saimetric_room_stocktake_sessions',
-  CASH_COUNTS: 'saimetric_room_cash_counts',
-  CASH_LIFTS: 'saimetric_room_cash_lifts',
-  CASH_LOGS: 'saimetric_room_cash_logs',
-  CUSTOMER_CHANGES: 'saimetric_room_customer_changes',
-  CREDIT_SALES: 'saimetric_room_credit_sales',
-  SALES: 'saimetric_room_sales',
-  EXPENSES: 'saimetric_room_expenses',
-  RECONCILIATIONS: 'saimetric_room_reconciliations',
-  ADMIN_SALES: 'saimetric_room_admin_sales',
-  SYNC_QUEUE: 'saimetric_room_sync_queue',
-  SESSION_USER: 'saimetric_room_session_user',
-  SHEETS_CONFIG: 'saimetric_room_sheets_config',
-  OFFLINE_MODE: 'saimetric_room_offline_mode',
-  PARKED_SALES: 'saimetric_room_parked_sales',
-  STOCK_BATCHES: 'saimetric_room_stock_batches',
-  NEGATIVE_BALANCES: 'saimetric_room_negative_balances',
-  CATEGORIES: 'saimetric_room_categories',
-  AUDIT_LOGS: 'saimetric_room_audit_logs',
-  DIRECT_GRVS: 'saimetric_room_direct_grvs',
-  GOODS_RECEIVED_NOTES: 'saimetric_room_goods_received_notes',
-  COMPANIES: 'saimetric_room_companies',
-  CURRENT_COMPANY_ID: 'saimetric_room_current_company_id',
-  CURRENT_BRANCH_ID: 'saimetric_room_current_branch_id',
-  DELETED_BRANCH_IDS: 'saimetric_deleted_branch_ids',
-  PERMISSIONS: 'saimetric_room_permissions',
-  EXCHANGE_RATES: 'saimetric_room_exchange_rates',
-  CUSTOMER_GOODS_LEFT_BEHIND: 'saimetric_room_customer_goods_left_behind',
-  BRANCH_LOCKDOWNS: 'saimetric_room_branch_lockdowns',
-  FAST_MOVING_CHECKLIST: 'saimetric_room_fast_moving_checklist',
-  TEMPORARY_CASUALS: 'saimetric_room_temporary_casuals',
-  CASH_ACCOUNTS: 'saimetric_room_cash_accounts',
-  CASH_TRANSFERS: 'saimetric_room_cash_transfers',
-  CREDIT_GROUPS: 'saimetric_room_credit_groups',
-  CASH_GOVERNANCE_CONFIG: 'saimetric_room_cash_governance_config',
-  STOCKTAKE_ZONE_ASSIGNMENTS: 'saimetric_room_stocktake_zone_assignments',
-  BUSINESS_DAY_CLOSURES: 'saimetric_room_business_day_closures',
-  ELECTRONIC_SETTLEMENTS: 'saimetric_room_electronic_settlements',
-  WALLET_RECOVERY_QUEUE: 'saimetric_room_wallet_recovery_queue',
-  DELETED_RECORDS: 'saimetric_deleted_records',
-  DAILY_BLIND_CONFIGS: 'saimetric_room_daily_blind_configs',
-  DAILY_BLIND_COUNTS: 'saimetric_room_daily_blind_counts',
 };
 
 /**
@@ -521,448 +564,6 @@ export const DEFAULT_MULTI_CURRENCY_CONFIG: MultiCurrencyConfig = {
   updatedBy: 'System Default',
   isSystemDefault: true,
 };
-
-type Listener = () => void;
-const listeners: Set<Listener> = new Set();
-
-export const subscribeToDatabase = (listener: Listener) => {
-  listeners.add(listener);
-  return () => {
-    listeners.delete(listener);
-  };
-};
-
-export const subscribeRoomDatabase = subscribeToDatabase;
-
-let notifyScheduled = false;
-let notifyTimer: any = null;
-let batchDepth = 0;
-let batchDirty = false;
-let lastNotifyExecutedAt = 0;
-const NOTIFY_COALESCE_WINDOW_MS = 140;
-
-const executeNotifyListeners = () => {
-  notifyScheduled = false;
-  notifyTimer = null;
-  lastNotifyExecutedAt = Date.now();
-  listeners.forEach((fn) => {
-    try {
-      fn();
-    } catch (e) {
-      console.error('Listener error:', e);
-    }
-  });
-};
-
-/**
- * Begin a bulk database mutation window (e.g. Hub catchup or Cloud pull batch).
- * Suppresses intermediate React listener storms and flushes once cleanly on endBatchUpdate().
- */
-export const beginBatchUpdate = (): void => {
-  batchDepth++;
-};
-
-/**
- * End a bulk database mutation window. Fires a single coalesced UI notification if any writes occurred.
- */
-export const endBatchUpdate = (): void => {
-  if (batchDepth > 0) batchDepth--;
-  if (batchDepth === 0 && batchDirty) {
-    batchDirty = false;
-    notifyListeners();
-  }
-};
-
-// Leading + trailing coalesced listener notification:
-// - Single local user actions notify on the very next animation frame (0ms lag)
-// - Rapid sync bursts coalesce into ~1 render every 140ms instead of 60fps render storms
-export const notifyListeners = () => {
-  if (batchDepth > 0) {
-    batchDirty = true;
-    return;
-  }
-  if (notifyScheduled) return;
-  notifyScheduled = true;
-
-  const elapsed = Date.now() - lastNotifyExecutedAt;
-  if (elapsed >= NOTIFY_COALESCE_WINDOW_MS) {
-    if (typeof requestAnimationFrame !== 'undefined') {
-      requestAnimationFrame(executeNotifyListeners);
-    } else {
-      if (notifyTimer) clearTimeout(notifyTimer);
-      notifyTimer = setTimeout(executeNotifyListeners, 16);
-    }
-  } else {
-    const remaining = Math.max(16, NOTIFY_COALESCE_WINDOW_MS - elapsed);
-    if (notifyTimer) clearTimeout(notifyTimer);
-    notifyTimer = setTimeout(executeNotifyListeners, remaining);
-  }
-};
-
-// High-performance in-memory layer: Prevents synchronous localStorage I/O freezes on UI thread
-const memoryCache = new Map<string, any>();
-
-// Coalesced disk persistence queue: eliminates repeated synchronous JSON.stringify + localStorage.setItem
-// freezes during Hub/Internet sync while guaranteeing 100% durability via pagehide/beforeunload/visibilitychange flush.
-interface PendingStorageWrite {
-  value: any;
-  skipIdbOverwriteIfExisting?: boolean;
-}
-const pendingStorageWrites = new Map<string, PendingStorageWrite>();
-let storageFlushTimer: any = null;
-let storageMaxWaitTimer: any = null;
-const STORAGE_FLUSH_DEBOUNCE_MS = 120;
-const STORAGE_FLUSH_MAX_WAIT_MS = 400;
-
-const IMMEDIATE_PERSIST_KEYS = new Set<string>([
-  STORAGE_KEYS.SESSION_USER,
-  STORAGE_KEYS.CURRENT_COMPANY_ID,
-  STORAGE_KEYS.CURRENT_BRANCH_ID,
-  STORAGE_KEYS.OFFLINE_MODE,
-]);
-
-const persistSingleKeyNow = (key: string, value: any, skipIdbOverwriteIfExisting?: boolean): void => {
-  // Persist to localStorage safely with quota recovery
-  if (typeof localStorage !== 'undefined') {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch (err) {
-      console.warn(`[Storage] localStorage write for ${key} failed, attempting quota recovery:`, err);
-      try {
-        cleanupLocalStorageQuota();
-        localStorage.setItem(key, JSON.stringify(value));
-      } catch (retryErr) {
-        console.warn(`[Storage] LocalStorage quota still exceeded for ${key}. Preserving in IndexedDB & Memory:`, retryErr);
-        try {
-          if (Array.isArray(value)) {
-            localStorage.setItem(key, JSON.stringify(value.slice(-60)));
-          } else {
-            localStorage.setItem(key, JSON.stringify({ __overflow_idb: true, count: 1 }));
-          }
-        } catch {
-          try { localStorage.removeItem(key); } catch {}
-        }
-      }
-    }
-  }
-
-  // Persist asynchronously to IndexedDB meta store for bulletproof persistence across browser reloads
-  if (typeof window !== 'undefined' && window.indexedDB) {
-    if (skipIdbOverwriteIfExisting) {
-      getMeta(`room_${key}`)
-        .then((existing) => {
-          if (existing === null || existing === undefined) {
-            setMeta(`room_${key}`, value).catch(() => {});
-          }
-        })
-        .catch(() => {
-          setMeta(`room_${key}`, value).catch(() => {});
-        });
-    } else {
-      setMeta(`room_${key}`, value).catch(() => {});
-    }
-  }
-};
-
-export function flushPendingStorageWrites(): void {
-  if (storageFlushTimer) {
-    clearTimeout(storageFlushTimer);
-    storageFlushTimer = null;
-  }
-  if (storageMaxWaitTimer) {
-    clearTimeout(storageMaxWaitTimer);
-    storageMaxWaitTimer = null;
-  }
-  if (pendingStorageWrites.size === 0) return;
-
-  const entries = Array.from(pendingStorageWrites.entries());
-  pendingStorageWrites.clear();
-  for (const [key, entry] of entries) {
-    try {
-      persistSingleKeyNow(key, entry.value, entry.skipIdbOverwriteIfExisting);
-    } catch (err) {
-      console.error(`[Storage] Error flushing ${key}:`, err);
-    }
-  }
-}
-
-const scheduleStorageFlush = (): void => {
-  if (storageFlushTimer) clearTimeout(storageFlushTimer);
-  storageFlushTimer = setTimeout(() => {
-    flushPendingStorageWrites();
-  }, STORAGE_FLUSH_DEBOUNCE_MS);
-
-  if (!storageMaxWaitTimer) {
-    storageMaxWaitTimer = setTimeout(() => {
-      flushPendingStorageWrites();
-    }, STORAGE_FLUSH_MAX_WAIT_MS);
-  }
-};
-
-if (typeof window !== 'undefined') {
-  window.addEventListener('storage', (e) => {
-    if (e.key) {
-      memoryCache.delete(e.key);
-      notifyListeners();
-    }
-  });
-  // Guarantee zero data loss on tab close, refresh, or mobile app switch
-  window.addEventListener('pagehide', () => {
-    flushPendingStorageWrites();
-  });
-  window.addEventListener('beforeunload', () => {
-    flushPendingStorageWrites();
-  });
-  if (typeof document !== 'undefined') {
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') {
-        flushPendingStorageWrites();
-      }
-    });
-  }
-}
-
-export function cleanupLocalStorageQuota(): void {
-  try {
-    if (typeof localStorage === 'undefined') return;
-
-    // 1. Trim audit logs to last 10 entries
-    const rawAudit = localStorage.getItem(STORAGE_KEYS.AUDIT_LOGS);
-    if (rawAudit) {
-      try {
-        const parsed = JSON.parse(rawAudit);
-        if (Array.isArray(parsed) && parsed.length > 10) {
-          localStorage.setItem(STORAGE_KEYS.AUDIT_LOGS, JSON.stringify(parsed.slice(-10)));
-        }
-      } catch {}
-    }
-
-    // 2. Clear completed / synced items from sync queue
-    const rawQueue = localStorage.getItem(STORAGE_KEYS.SYNC_QUEUE);
-    if (rawQueue) {
-      try {
-        const parsed = JSON.parse(rawQueue);
-        if (Array.isArray(parsed)) {
-          const pendingOnly = parsed.filter((i: any) => i.status !== 'synced' && i.status !== 'done').slice(-30);
-          localStorage.setItem(STORAGE_KEYS.SYNC_QUEUE, JSON.stringify(pendingOnly));
-        }
-      } catch {}
-    }
-
-    // 3. Clear temporary migration staging rows and safety backup keys
-    const keysToRemove: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (!k) continue;
-      if (
-        k.startsWith('saimetric_safety_backup_') ||
-        k.startsWith('saimetric_migration_staged_') ||
-        k.startsWith('saimetric_staged_') ||
-        k.startsWith('saimetric_temp_') ||
-        k.startsWith('migration_staged_') ||
-        k.includes('_temp_preview')
-      ) {
-        keysToRemove.push(k);
-      }
-    }
-    keysToRemove.forEach((k) => {
-      try { localStorage.removeItem(k); } catch {}
-    });
-
-    // 4. Prune disaster recovery backups to only the 2 latest snapshots
-    const rawDr = localStorage.getItem('saimetric_dr_backups');
-    if (rawDr) {
-      try {
-        const parsed = JSON.parse(rawDr);
-        if (Array.isArray(parsed) && parsed.length > 2) {
-          localStorage.setItem('saimetric_dr_backups', JSON.stringify(parsed.slice(0, 2)));
-        }
-      } catch {}
-    }
-
-    // 5. Prune backup history down to 5 items
-    const rawHistory = localStorage.getItem('saimetric_backup_history');
-    if (rawHistory) {
-      try {
-        const parsed = JSON.parse(rawHistory);
-        if (Array.isArray(parsed) && parsed.length > 5) {
-          localStorage.setItem('saimetric_backup_history', JSON.stringify(parsed.slice(0, 5)));
-        }
-      } catch {}
-    }
-  } catch (e) {
-    console.warn('[Storage] cleanupLocalStorageQuota error:', e);
-  }
-}
-
-export async function rehydrateFromIndexedDB(): Promise<void> {
-  if (typeof window === 'undefined' || !window.indexedDB) return;
-  try {
-    const criticalCollectionKeys: { key: string; idField: (item: any) => string }[] = [
-      { key: STORAGE_KEYS.SALES, idField: (s) => s.id },
-      { key: STORAGE_KEYS.INVENTORY_ITEMS, idField: (i) => i.itemId || i.id },
-      { key: STORAGE_KEYS.CASH_LOGS, idField: (c) => c.id },
-      { key: STORAGE_KEYS.CASH_COUNTS, idField: (c) => c.id },
-      { key: STORAGE_KEYS.CREDIT_SALES, idField: (c) => c.id },
-      { key: STORAGE_KEYS.CUSTOMER_CHANGES, idField: (c) => c.id },
-      { key: STORAGE_KEYS.COMPANIES, idField: (c) => c.company_id },
-      { key: STORAGE_KEYS.BRANCHES, idField: (b) => b.branchId || b.id },
-      { key: STORAGE_KEYS.SALESPEOPLE, idField: (s) => s.id },
-      { key: STORAGE_KEYS.CUSTOMERS, idField: (c) => c.customerId || c.id },
-      { key: STORAGE_KEYS.SUPPLIERS, idField: (s) => s.supplierId || s.id },
-      { key: STORAGE_KEYS.SUPPLIER_INVOICES, idField: (s) => s.id },
-      { key: STORAGE_KEYS.EXPENSES, idField: (e) => e.id },
-      { key: STORAGE_KEYS.GOODS_RECEIVED, idField: (g) => g.id },
-      { key: STORAGE_KEYS.GOODS_RECEIVED_NOTES, idField: (g) => g.id },
-      { key: STORAGE_KEYS.DIRECT_GRVS, idField: (g) => g.id },
-      { key: STORAGE_KEYS.STOCK_MOVEMENTS, idField: (m) => m.id },
-      { key: STORAGE_KEYS.STOCKTAKE_SESSIONS, idField: (s) => s.id },
-      { key: STORAGE_KEYS.AUDIT_LOGS, idField: (a) => a.id },
-      { key: STORAGE_KEYS.RECONCILIATIONS, idField: (r) => r.id },
-      { key: STORAGE_KEYS.CASH_LIFTS, idField: (c) => c.id },
-      { key: STORAGE_KEYS.PARKED_SALES, idField: (p) => p.id },
-      { key: STORAGE_KEYS.CUSTOMER_GOODS_LEFT_BEHIND, idField: (g) => g.id },
-      { key: STORAGE_KEYS.DAILY_BLIND_CONFIGS, idField: (c) => c.id },
-      { key: STORAGE_KEYS.DAILY_BLIND_COUNTS, idField: (c) => c.id },
-    ];
-
-    const criticalScalarKeys = [
-      STORAGE_KEYS.SESSION_USER,
-      STORAGE_KEYS.CURRENT_COMPANY_ID,
-      STORAGE_KEYS.CURRENT_BRANCH_ID,
-      STORAGE_KEYS.EXCHANGE_RATES,
-      STORAGE_KEYS.SHEETS_CONFIG,
-    ];
-
-    let rehydratedAny = false;
-
-    // 1. Rehydrate Collections: Merge so zero records from IDB or local are lost
-    for (const { key, idField } of criticalCollectionKeys) {
-      try {
-        const idbVal = await getMeta(`room_${key}`);
-        if (Array.isArray(idbVal) && idbVal.length > 0) {
-          const currentLocal = getStored<any[]>(key, []);
-          const localIdSet = new Set(currentLocal.map(idField).filter(Boolean));
-          let hasNewFromIdb = false;
-          const merged = [...currentLocal];
-
-          for (const item of idbVal) {
-            const id = idField(item);
-            if (id && !localIdSet.has(id)) {
-              merged.push(item);
-              localIdSet.add(id);
-              hasNewFromIdb = true;
-            }
-          }
-
-          if (hasNewFromIdb || currentLocal.length === 0) {
-            memoryCache.set(key, merged);
-            try {
-              if (typeof localStorage !== 'undefined') {
-                localStorage.setItem(key, JSON.stringify(merged));
-              }
-            } catch {}
-            rehydratedAny = true;
-          }
-        }
-      } catch (err) {
-        console.warn(`[Storage] Rehydrate collection error for ${key}:`, err);
-      }
-    }
-
-    // 2. Rehydrate Scalars & Configs
-    for (const key of criticalScalarKeys) {
-      try {
-        let hasLocal = false;
-        if (typeof localStorage !== 'undefined') {
-          const raw = localStorage.getItem(key);
-          if (raw && raw !== 'null' && raw !== '""') {
-            hasLocal = true;
-          }
-        }
-        if (!hasLocal) {
-          const idbVal = await getMeta(`room_${key}`);
-          if (idbVal !== null && idbVal !== undefined) {
-            memoryCache.set(key, idbVal);
-            try {
-              if (typeof localStorage !== 'undefined') {
-                localStorage.setItem(key, JSON.stringify(idbVal));
-              }
-            } catch {}
-            rehydratedAny = true;
-          }
-        }
-      } catch (err) {
-        console.warn(`[Storage] Rehydrate scalar error for ${key}:`, err);
-      }
-    }
-
-    if (rehydratedAny) {
-      notifyListeners();
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
-        window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
-        window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
-      }
-    }
-  } catch (e) {
-    console.warn('[Storage] rehydrateFromIndexedDB error:', e);
-  }
-}
-
-export function getStored<T>(key: string, fallback: T): T {
-  if (memoryCache.has(key)) {
-    return memoryCache.get(key) as T;
-  }
-  try {
-    if (typeof localStorage === 'undefined') return fallback;
-    const raw = localStorage.getItem(key);
-    if (!raw) {
-      memoryCache.set(key, fallback);
-      return fallback;
-    }
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && parsed.__overflow_idb) {
-      // Data is overflowed to IndexedDB, return fallback until IDB rehydrates into memoryCache
-      return fallback;
-    }
-    memoryCache.set(key, parsed);
-    return parsed;
-  } catch (err) {
-    console.error(`Error reading ${key} from storage:`, err);
-    memoryCache.set(key, fallback);
-    return fallback;
-  }
-}
-
-export function setStored<T>(
-  key: string,
-  value: T,
-  options?: { skipIdbOverwriteIfExisting?: boolean; immediate?: boolean }
-): void {
-  try {
-    // 1. Update in-memory cache instantly (0ms UI latency & immediately consistent reads)
-    memoryCache.set(key, value);
-
-    // 2. Persist immediately for critical auth/context keys or when explicitly requested;
-    //    otherwise coalesce rapid disk writes (120ms debounce / 400ms max-wait, auto-flushed on pagehide/unload)
-    if (options?.immediate || IMMEDIATE_PERSIST_KEYS.has(key) || typeof window === 'undefined') {
-      pendingStorageWrites.delete(key);
-      persistSingleKeyNow(key, value, options?.skipIdbOverwriteIfExisting);
-    } else {
-      pendingStorageWrites.set(key, {
-        value,
-        skipIdbOverwriteIfExisting: options?.skipIdbOverwriteIfExisting,
-      });
-      scheduleStorageFlush();
-    }
-
-    // 3. Notify subscribers via batch-aware coalesced frame
-    notifyListeners();
-  } catch (err) {
-    console.error(`Error in setStored for ${key}:`, err);
-  }
-}
 
 /**
  * Extract canonical POS invoice reference from a CustomerChange or CreditSale entry.
@@ -9319,10 +8920,6 @@ export const generateInvoiceNumber = (staffId?: any, staffName?: string, branchI
 export const getNextInvoiceId = generateInvoiceNumber;
 export const generateInvoiceId = generateInvoiceNumber;
 
-type SaleCreationListener = (sale: SaleInvoice) => void;
-const saleCreationListeners: Set<SaleCreationListener> = new Set();
-
-const inMemorySeenSaleIds: Set<string> = new Set();
 let hasInitializedSeenSaleIds = false;
 
 export const initSeenSaleIds = () => {
@@ -9336,178 +8933,6 @@ export const initSeenSaleIds = () => {
       }
     }
   } catch (e) {}
-};
-
-export const registerSeenSaleId = (id: string) => {
-  if (!id) return;
-  inMemorySeenSaleIds.add(id);
-};
-
-export const onSaleCreated = (listener: SaleCreationListener) => {
-  saleCreationListeners.add(listener);
-  return () => {
-    saleCreationListeners.delete(listener);
-  };
-};
-
-export type SaleUpdateListener = (sale: SaleInvoice, extraCashLogs?: CashLogEntry[]) => void;
-const saleUpdateListeners: Set<SaleUpdateListener> = new Set();
-export const onSaleUpdated = (listener: SaleUpdateListener) => {
-  saleUpdateListeners.add(listener);
-  return () => {
-    saleUpdateListeners.delete(listener);
-  };
-};
-export const notifySaleUpdated = (sale: SaleInvoice, extraCashLogs?: CashLogEntry[]) => {
-  saleUpdateListeners.forEach((fn) => {
-    try {
-      fn(sale, extraCashLogs);
-    } catch (e) {
-      console.error('saleUpdateListener error:', e);
-    }
-  });
-};
-
-export type CashLogListener = (log: CashLogEntry) => void;
-const cashLogCreatedListeners: Set<CashLogListener> = new Set();
-const cashLogUpdatedListeners: Set<CashLogListener> = new Set();
-export const onCashLogCreated = (listener: CashLogListener) => {
-  cashLogCreatedListeners.add(listener);
-  return () => {
-    cashLogCreatedListeners.delete(listener);
-  };
-};
-export const notifyCashLogCreated = (log: CashLogEntry) => {
-  cashLogCreatedListeners.forEach((fn) => {
-    try {
-      fn(log);
-    } catch (e) {
-      console.error('cashLogCreatedListener error:', e);
-    }
-  });
-};
-export const onCashLogUpdated = (listener: CashLogListener) => {
-  cashLogUpdatedListeners.add(listener);
-  return () => {
-    cashLogUpdatedListeners.delete(listener);
-  };
-};
-export const notifyCashLogUpdated = (log: CashLogEntry) => {
-  cashLogUpdatedListeners.forEach((fn) => {
-    try {
-      fn(log);
-    } catch (e) {
-      console.error('cashLogUpdatedListener error:', e);
-    }
-  });
-};
-
-export type StaffChangeListener = (staff: Salesperson) => void;
-const staffChangeListeners: Set<StaffChangeListener> = new Set();
-export const onStaffChanged = (listener: StaffChangeListener) => {
-  staffChangeListeners.add(listener);
-  return () => {
-    staffChangeListeners.delete(listener);
-  };
-};
-export const notifyStaffChanged = (staff: Salesperson) => {
-  staffChangeListeners.forEach((fn) => {
-    try {
-      fn(staff);
-    } catch (e) {
-      console.error('staffChangeListener error:', e);
-    }
-  });
-};
-
-export type CustomerChangeListener = (customer: any) => void;
-const customerChangeListeners: Set<CustomerChangeListener> = new Set();
-export const onCustomerChanged = (listener: CustomerChangeListener) => {
-  customerChangeListeners.add(listener);
-  return () => {
-    customerChangeListeners.delete(listener);
-  };
-};
-export const notifyCustomerChanged = (customer: any) => {
-  customerChangeListeners.forEach((fn) => {
-    try {
-      fn(customer);
-    } catch (e) {
-      console.error('customerChangeListener error:', e);
-    }
-  });
-};
-
-export type SupplierChangeListener = (supplier: Supplier) => void;
-const supplierChangeListeners: Set<SupplierChangeListener> = new Set();
-export const onSupplierChanged = (listener: SupplierChangeListener) => {
-  supplierChangeListeners.add(listener);
-  return () => {
-    supplierChangeListeners.delete(listener);
-  };
-};
-export const notifySupplierChanged = (supplier: Supplier) => {
-  supplierChangeListeners.forEach((fn) => {
-    try {
-      fn(supplier);
-    } catch (e) {
-      console.error('supplierChangeListener error:', e);
-    }
-  });
-};
-
-export type BranchChangeListener = (branch: Branch) => void;
-const branchChangeListeners: Set<BranchChangeListener> = new Set();
-export const onBranchChanged = (listener: BranchChangeListener) => {
-  branchChangeListeners.add(listener);
-  return () => {
-    branchChangeListeners.delete(listener);
-  };
-};
-export const notifyBranchChanged = (branch: Branch) => {
-  branchChangeListeners.forEach((fn) => {
-    try {
-      fn(branch);
-    } catch (e) {
-      console.error('branchChangeListener error:', e);
-    }
-  });
-};
-
-export type CashAccountChangeListener = (account: CashAccount) => void;
-const cashAccountChangeListeners: Set<CashAccountChangeListener> = new Set();
-export const onCashAccountChanged = (listener: CashAccountChangeListener) => {
-  cashAccountChangeListeners.add(listener);
-  return () => {
-    cashAccountChangeListeners.delete(listener);
-  };
-};
-export const notifyCashAccountChanged = (account: CashAccount) => {
-  cashAccountChangeListeners.forEach((fn) => {
-    try {
-      fn(account);
-    } catch (e) {
-      console.error('cashAccountChangeListener error:', e);
-    }
-  });
-};
-
-export type CashTransferChangeListener = (transfer: CashTransfer) => void;
-const cashTransferChangeListeners: Set<CashTransferChangeListener> = new Set();
-export const onCashTransferChanged = (listener: CashTransferChangeListener) => {
-  cashTransferChangeListeners.add(listener);
-  return () => {
-    cashTransferChangeListeners.delete(listener);
-  };
-};
-export const notifyCashTransferChanged = (transfer: CashTransfer) => {
-  cashTransferChangeListeners.forEach((fn) => {
-    try {
-      fn(transfer);
-    } catch (e) {
-      console.error('cashTransferChangeListener error:', e);
-    }
-  });
 };
 
 export type ElectronicSettlementChangeListener = (settlement: ElectronicSettlementRecord) => void;
@@ -9524,42 +8949,6 @@ export const notifyElectronicSettlementChanged = (settlement: ElectronicSettleme
       fn(settlement);
     } catch (e) {
       console.error('electronicSettlementChangeListener error:', e);
-    }
-  });
-};
-
-export type ExpenseChangeListener = (expense: ExpenseEntry) => void;
-const expenseChangeListeners: Set<ExpenseChangeListener> = new Set();
-export const onExpenseChanged = (listener: ExpenseChangeListener) => {
-  expenseChangeListeners.add(listener);
-  return () => {
-    expenseChangeListeners.delete(listener);
-  };
-};
-export const notifyExpenseChanged = (expense: ExpenseEntry) => {
-  expenseChangeListeners.forEach((fn) => {
-    try {
-      fn(expense);
-    } catch (e) {
-      console.error('expenseChangeListener error:', e);
-    }
-  });
-};
-
-export type DirectGrvChangeListener = (grv: DirectGrv) => void;
-const directGrvChangeListeners: Set<DirectGrvChangeListener> = new Set();
-export const onDirectGrvChanged = (listener: DirectGrvChangeListener) => {
-  directGrvChangeListeners.add(listener);
-  return () => {
-    directGrvChangeListeners.delete(listener);
-  };
-};
-export const notifyDirectGrvChanged = (grv: DirectGrv) => {
-  directGrvChangeListeners.forEach((fn) => {
-    try {
-      fn(grv);
-    } catch (e) {
-      console.error('directGrvChangeListener error:', e);
     }
   });
 };
@@ -17638,6 +17027,38 @@ export const getTransactionsDigest = (
       const up = parseTimestampMs((s as any).updatedAt || (s as any).lastUpdated || s.createdDate);
       items.push({
         id,
+        updatedAt: up,
+      });
+    }
+  }
+
+  // 13. Tombstones (T2 Delete Authority — hydrated first on Cold Hubs)
+  else if (norm === 'tombstones' || norm === 'tombstone') {
+    const rawTombstones = getTombstones();
+    for (const t of rawTombstones) {
+      const id = t.entityId || (t as any).id;
+      if (!id) continue;
+      const up = parseTimestampMs(t.deletedAt || (t as any).timestamp || (t as any).updatedAt);
+      items.push({
+        id: String(id),
+        timestamp: up,
+        updatedAt: up,
+      });
+    }
+  }
+
+  // 14. Cash Accounts (T2)
+  else if (norm === 'cash_accounts' || norm === 'cash_account') {
+    const rawAccounts = getRawStoredCashAccounts();
+    for (const a of rawAccounts) {
+      const id = a.account_id || (a as any).id;
+      if (!id) continue;
+      const up = parseTimestampMs((a as any).updatedAt || (a as any).lastUpdated || (a as any).created_at);
+      const bal = Number((a as any).balance ?? (a as any).current_balance) || 0;
+      totalSum += bal;
+      items.push({
+        id: String(id),
+        total: bal,
         updatedAt: up,
       });
     }

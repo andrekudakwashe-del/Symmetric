@@ -12,7 +12,7 @@ import {
   InternalConsumption,
   StocktakeSession,
 } from '../types';
-import mqtt, { MqttClient } from 'mqtt';
+import type { MqttClient } from 'mqtt';
 import {
   getSales,
   getAllSales,
@@ -186,7 +186,22 @@ import {
 import { getMovements, addMovement, onCashMovementCreated, CashMovement } from '../db/cashLedger';
 import { persistentSyncEngine } from './persistentSyncEngine';
 import { getSyncMeta, setSyncMeta } from '../db/indexedDBService';
-import { LocalHubConfig, normalizeHubUrl, PairedHubProfile } from '../utils/localHubConfig';
+import {
+  LocalHubConfig,
+  normalizeHubUrl,
+  PairedHubProfile,
+  extractHostAndPort,
+  sanitizeLanIps,
+  sanitizeMdnsHost,
+  ActiveLeaderInfo,
+  HubMode,
+  HubRole,
+  normalizeBranchEpoch,
+  normalizeHubMode,
+  normalizeHubPriority,
+  normalizeHubRole,
+  sanitizeActiveLeaderInfo,
+} from '../utils/localHubConfig';
 import {
   computeClientAuthProof,
   computeHubAuthProof,
@@ -196,6 +211,13 @@ import {
   parsePairDeepLink,
 } from '../utils/hubAuthCrypto';
 import type { HubAuthState } from './sync/LocalHubAdapter';
+import { discoverPairedHub, DiscoveryStage } from './sync/hubRoamingDiscovery';
+import {
+  ColdHubHydrationQueue,
+  ColdHubHydrationProgress,
+  DEFAULT_COLD_HUB_ENTITY_ORDER,
+  yieldToMainThread,
+} from './sync/coldHubHydrationQueue';
 import {
   reportTrustedTimeSample,
   triggerClockTamperLock,
@@ -256,200 +278,61 @@ import {
   registerTombstoneLookup,
 } from './sync/syncIngestBridge';
 
-export { isPosActiveCheckout };
+import {
+  PackageSyncMode,
+  MeshConnectionMode,
+  MeshSyncProgress,
+  MeshEventLog,
+  VirtualDevice,
+  SyncCoreListener,
+  PREFS_BRANCH_KEY,
+  PREFS_BRANCH_ID_KEY,
+  PREFS_DEVICE_KEY,
+  PREFS_DEVICE_ID_KEY,
+  PREFS_COMPANY_KEY,
+  PREFS_AUTODETECT_KEY,
+  PUBLIC_MQTT_BROKERS,
+  computeIdsChecksum,
+  generateEntitySnapshot,
+  getPackageSyncMode,
+  calculateRecordHash,
+  playChime,
+  registerSyncCoreListener,
+  notifySyncCoreListeners,
+} from './mesh/meshTypesAndHelpers';
+import { lookupExistingRecordForEnvelope } from './mesh/envelopeRecordLookup';
+import {
+  buildGenericCloudConfigPacket,
+  HubCloudConfigPacket,
+} from './mesh/cloudConfigPacketBuilder';
+import {
+  ingestMeshSupplierRecord,
+  ingestMeshAdminSalesRecord,
+  ingestMeshCashCountRecord,
+  ingestMeshVoucherRecord,
+  ingestMeshClosureRecord,
+  ingestMeshSettlementRecord,
+  ingestMeshCategoriesRecord,
+  generateOfflineBatchPayloadForConfig,
+  ingestOfflineBatchPayloadForConfig,
+} from './mesh/meshIngestHandlers';
+import { StocktakeMeshTransport } from './mesh/stocktakeMeshTransport';
+import { VirtualMeshSimulator } from './mesh/virtualMeshSimulator';
 
-/**
- * 32-bit FNV-1a Checksum over sorted array of IDs
- */
-export const computeIdsChecksum = (ids: string[]): string => {
-  if (!Array.isArray(ids) || ids.length === 0) return '00000000';
-  const sorted = [...ids].sort();
-  let hash = 0x811c9dc5;
-  for (const id of sorted) {
-    const str = String(id);
-    for (let i = 0; i < str.length; i++) {
-      hash ^= str.charCodeAt(i);
-      hash = Math.imul(hash, 0x01000193);
-    }
-    hash ^= 124; // '|'
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+export {
+  isPosActiveCheckout,
+  computeIdsChecksum,
+  generateEntitySnapshot,
+  getPackageSyncMode,
+  calculateRecordHash,
+  registerSyncCoreListener,
 };
-
-/**
- * Generates compact aggregate snapshot for an entity type: count, totalSum, and idHash
- */
-export const generateEntitySnapshot = (
-  entityType: string,
-  startDate?: string,
-  endDate?: string
-): EntitySnapshot => {
-  const digest = getTransactionsDigest(entityType, startDate, endDate);
-  const ids = digest.items.map((it) => String(it.id));
-  const idHash = computeIdsChecksum(ids);
-
-  return {
-    entityType: digest.entityType,
-    startDate,
-    endDate,
-    count: digest.count,
-    totalSum: Number(digest.totalSum.toFixed(2)),
-    idHash,
-    generatedAt: Date.now(),
-  };
-};
-
-export type PackageSyncMode =
-  | 'CLOUD_ONLY_SUPABASE'
-  | 'CLOUD_ONLY_APPSCRIPTS'
-  | 'HUB_ONLY'
-  | 'HUB_CLOUD';
-
-export const getPackageSyncMode = (): PackageSyncMode => {
-  try {
-    const comp = getCurrentCompany();
-    const strategy = comp?.sync_strategy || 'HUB_CLOUD';
-    const backendType =
-      comp?.backend_type ||
-      comp?.backend_config?.backendType ||
-      (comp?.sheet_id ? 'sheets_appscript' : 'room');
-
-    if (strategy === 'CLOUD_ONLY') {
-      if (backendType === 'supabase') {
-        return 'CLOUD_ONLY_SUPABASE';
-      }
-      return 'CLOUD_ONLY_APPSCRIPTS';
-    }
-    if (strategy === 'HUB_ONLY') {
-      return 'HUB_ONLY';
-    }
-    return 'HUB_CLOUD';
-  } catch {
-    return 'HUB_CLOUD';
-  }
-};
-
-export type MeshConnectionMode = 'CLOUD_MESH' | 'LOCAL_HUB' | 'LOCAL_OFFLINE' | 'CLOUD_ONLY';
-
-export interface MeshSyncProgress {
-  isActive: boolean;
-  current: number;
-  total: number;
-  message: string;
-  percentage: number;
-}
-
-// Keys for localStorage persistence
-const PREFS_BRANCH_KEY = 'saimetric_mesh_branch_code';
-const PREFS_BRANCH_ID_KEY = 'saimetric_mesh_branch_id';
-const PREFS_DEVICE_KEY = 'saimetric_mesh_device_name';
-const PREFS_DEVICE_ID_KEY = 'saimetric_mesh_device_id';
-const PREFS_COMPANY_KEY = 'saimetric_mesh_company_id';
-const PREFS_AUTODETECT_KEY = 'saimetric_mesh_autodetect';
-
-// Public Zero-Config Secure WebSocket MQTT Brokers for Instant Cross-Device P2P
-const PUBLIC_MQTT_BROKERS = [
-  'wss://broker.emqx.io:8084/mqtt',
-  'wss://broker.hivemq.com:8884/mqtt',
-];
-
-export interface MeshEventLog {
-  id: string;
-  timestamp: string;
-  type:
-    | 'DISCOVERY'
-    | 'BROADCAST'
-    | 'EPIDEMIC_HOP'
-    | 'CONFLICT_RESOLVED'
-    | 'CLOUD_SYNC'
-    | 'ACK'
-    | 'SECURITY_DROP';
-  message: string;
-  sourceDevice: string;
-  targetDevice?: string;
-  ttl?: number;
-  uuid?: string;
-}
-
-export interface VirtualDevice {
-  id: string;
-  name: string;
-  companyId: string;
-  branchCode: string;
-  branchId: string;
-  isOnline: boolean;
-  hasInternet: boolean;
-  sales: Array<{
-    uuid: string;
-    deviceId: string;
-    timestamp: number;
-    invoiceNumber: string;
-    totalAmount: number;
-    syncStatus: 'pending' | 'synced';
-    hash: string;
-  }>;
-  pendingQueue: Array<{
-    uuid: string;
-    recordUuid: string;
-    tableName: string;
-    deviceId: string;
-    timestamp: number;
-    syncStatus: 'pending' | 'synced';
-    hash: string;
-    payload: any;
-  }>;
-}
-
-export function calculateRecordHash(uuid: string, deviceId: string, timestamp: number, total: number): string {
-  const raw = `${uuid}:${deviceId}:${timestamp}:${total}`;
-  let hash = 0;
-  for (let i = 0; i < raw.length; i++) {
-    const char = raw.charCodeAt(i);
-    hash = (hash << 5) - hash + char;
-    hash |= 0;
-  }
-  return 'H-' + Math.abs(hash).toString(16);
-}
-
-let lastChimeTime = 0;
-function playChime() {
-  const nowMs = Date.now();
-  if (nowMs - lastChimeTime < 1200) return; // Rate-limit chimes
-  lastChimeTime = nowMs;
-
-  try {
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    if (!AudioContextClass) return;
-    const ctx = new AudioContextClass();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.type = 'sine';
-    const now = ctx.currentTime;
-    osc.frequency.setValueAtTime(587.33, now); // D5
-    osc.frequency.setValueAtTime(880, now + 0.1); // A5
-    gain.gain.setValueAtTime(0.12, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
-    osc.start(now);
-    osc.stop(now + 0.35);
-    setTimeout(() => {
-      try {
-        ctx.close();
-      } catch (e) {}
-    }, 500);
-  } catch (e) {}
-}
-
-type SyncCoreListener = (envelope: any) => void;
-const syncCoreListeners: Set<SyncCoreListener> = new Set();
-
-export const registerSyncCoreListener = (handler: SyncCoreListener): (() => void) => {
-  syncCoreListeners.add(handler);
-  return () => {
-    syncCoreListeners.delete(handler);
-  };
+export type {
+  PackageSyncMode,
+  MeshConnectionMode,
+  MeshSyncProgress,
+  MeshEventLog,
+  VirtualDevice,
 };
 
 let _cloudSyncPaused = false;
@@ -495,10 +378,11 @@ class MeshSyncManager {
   private logs: MeshEventLog[] = [];
   private logListeners: Array<(logs: MeshEventLog[]) => void> = [];
   private peerListeners: Array<(count: number, peers: P2PMeshPeer[]) => void> = [];
-  private virtualDevices: VirtualDevice[] = [];
   private seenPacketIds: Set<string> = new Set();
   private opportunisticTimer: number | null = null;
   private autoDetectTimer: number | null = null;
+  private readonly virtualMeshSimulator: VirtualMeshSimulator;
+  private readonly stocktakeTransport: StocktakeMeshTransport;
 
   // Real Mesh Transport: Server Stream (SSE) & MQTT Over WebSocket
   private serverEventSource: EventSource | null = null;
@@ -512,7 +396,6 @@ class MeshSyncManager {
   private discoveredPeers: Map<string, P2PMeshPeer> = new Map();
   private heartbeatInterval: number | null = null;
   private pruneInterval: number | null = null;
-  private isSimulationMode: boolean = false;
 
   // Offline Local WebRTC & LAN Gateways
   private webrtcPeerConnection: RTCPeerConnection | null = null;
@@ -558,15 +441,50 @@ class MeshSyncManager {
   private autoHealIntervalTimer: number | null = null;
   private reconPushedTimestamps: Map<string, number> = new Map();
 
-  // Mutual Authentication, Pairing & OTA State
+  // Mutual Authentication, Pairing, IP Roaming & OTA State
   private localHubReconnectAttempts: number = 0;
   private legacyFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  private connectTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  private pairChallengeWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private activeClientNonce: string = '';
   private activeHubId: string | null = null;
+  private activeHubMdnsHost: string | null = null;
+  private activeHubLanIps: string[] = [];
   private activeHubVersion: string | null = null;
   private activeHubRuntime: 'ANDROID_APK' | 'TERMUX' | 'UNKNOWN' = 'UNKNOWN';
   private activeHubOtaSlot: string | null = null;
+  private activeHubRole: HubRole | null = null;
+  private activeHubPriority: number | null = null;
+  private activeHubBranchEpoch: number = 1;
+  private activeHubMode: HubMode = 'ACTIVE';
+  private activeHubIsColdHub: boolean = false;
+  private activeLeaderHubId: string | null = null;
+  private activeLeaderInfo: ActiveLeaderInfo | null = null;
+  private unpairedActiveLeader: ActiveLeaderInfo | null = null;
+  private isHandlingFailoverHandoff: boolean = false;
+  private pendingFailoverToastMessage: string | null = null;
+  private coldHubHydrationQueue!: ColdHubHydrationQueue;
+  private hubHydrationProgress: ColdHubHydrationProgress = {
+    active: false,
+    sweepId: null,
+    isColdHub: false,
+    currentEntity: null,
+    completedEntities: 0,
+    totalEntities: 0,
+    pushedRecords: 0,
+    totalRecords: 0,
+    currentChunk: 0,
+    totalChunks: 0,
+    pausedForCheckout: false,
+    updatedAt: Date.now(),
+  };
   private hubAuthError: string | null = null;
+  private lastAuthFailureWasRevoked: boolean = false;
+  private revokedHubIds: Set<string> = new Set();
+  private hubDiscoveryPromise: Promise<boolean> | null = null;
+  private isDiscoveringHub: boolean = false;
+  private discoveryStage: DiscoveryStage | null = null;
+  private pendingRoamedToast: boolean = false;
   private hubOtaStatus: { status: string; targetVersion?: string; etaSeconds?: number; message?: string; updatedAt: number } | null = null;
   private pendingPairRequest: {
     wsUrl: string;
@@ -574,6 +492,8 @@ class MeshSyncManager {
     clientNonce: string;
     visualCode?: string;
     hubId?: string;
+    mdnsHost?: string;
+    lanIps?: string[];
     branchName?: string;
     startedAt: number;
   } | null = null;
@@ -924,9 +844,30 @@ class MeshSyncManager {
   constructor() {
     this.config = this.loadConfig();
 
+    // Hydrate IndexedDB Multi-Hub Credential Vault backup asynchronously on boot
+    void LocalHubConfig.hydrateVaultFromIndexedDb().then(() => {
+      this.emitHubSecurityEvent();
+    });
+
     // Hexagonal Architecture Initialization: Adapters + SyncCore + Ingest Bridge
     this.localHubAdapter = new LocalHubAdapter();
     this.syncLocalHubContext();
+
+    // Non-freezing, ACK-paced Cold-Hub Hydration Queue
+    this.coldHubHydrationQueue = new ColdHubHydrationQueue({
+      isCheckoutActive: () => isPosActiveCheckout(),
+      isSocketReady: () => this.isLocalHubConnected && this.localHubAdapter.isReadyForSync(),
+      getSocketBufferedAmount: () => this.localHubAdapter.getBufferedAmount(),
+      pushSingleRecord: (entityType, recordId, sweepId, isColdHub) =>
+        this.pushSingleReconRecord(entityType, recordId, sweepId, isColdHub),
+      sendChunkMarker: (payload) => {
+        this.localHubAdapter.sendControlPacket(payload);
+      },
+      onProgress: (progress) => {
+        this.hubHydrationProgress = progress;
+        this.emitHubSecurityEvent();
+      },
+    });
 
     const cloudAdapter = this.getOrCreateSingleCloudAdapter();
     const initialAdapter =
@@ -969,32 +910,30 @@ class MeshSyncManager {
         clearTimeout(this.localHubLostGraceTimer);
         this.localHubLostGraceTimer = null;
       }
+      if (this.connectTimeoutTimer) {
+        clearTimeout(this.connectTimeoutTimer);
+        this.connectTimeoutTimer = null;
+      }
+      if (this.pairChallengeWaitTimer) {
+        clearTimeout(this.pairChallengeWaitTimer);
+        this.pairChallengeWaitTimer = null;
+      }
       this.localHubReconnectAttempts = 0;
       this.hubAuthError = null;
       this.lastHubPongReceivedAt = Date.now();
       this.syncLocalHubContext();
 
-      // 1. Explicit Pairing Flow (6-digit code OR TV-style 1-tap Hub approval)
+      // 1. Explicit Pairing Flow: wait briefly (up to 500ms) for AUTH_CHALLENGE first so
+      //    if this Hub's hubId is ALREADY paired, we immediately authenticate via Mutual HMAC
+      //    instead of ever forcing a re-pair!
       if (this.pendingPairRequest && normalizeHubUrl(this.pendingPairRequest.wsUrl) === normalizeHubUrl(hubUrl)) {
-        const activeInfo = this.getActiveBranchInfo();
-        this.localHubAdapter.setAuthState('PAIRING_PENDING', null);
-        this.localHubAdapter.sendControlPacket({
-          type: 'PAIR_REQUEST',
-          action: 'PAIR_REQUEST',
-          pairCode: this.pendingPairRequest.pairCode || '',
-          deviceId: this.config.deviceId,
-          deviceName: this.config.deviceName,
-          branchId: activeInfo.branchId,
-          branchName: activeInfo.branchName,
-          tenantId: activeInfo.companyId,
-          clientNonce: this.pendingPairRequest.clientNonce,
-          timestamp: Date.now(),
-        });
-        this.addLog(
-          'DISCOVERY',
-          `Pairing handshake sent to Local Hub (${hubUrl})...`,
-          this.config.deviceName
-        );
+        this.localHubAdapter.setAuthState('HANDSHAKING', null);
+        this.pairChallengeWaitTimer = setTimeout(() => {
+          this.pairChallengeWaitTimer = null;
+          if (!this.pendingPairRequest || !this.localHubAdapter.isConnected()) return;
+          if (this.localHubAdapter.getAuthState() === 'AUTHENTICATED') return;
+          this.sendPendingPairRequestPacket(hubUrl);
+        }, 500);
         this.emitHubSecurityEvent();
         return;
       }
@@ -1098,6 +1037,20 @@ class MeshSyncManager {
         return;
       }
 
+      if (pType === 'HUB_ROLE_STATUS') {
+        void this.handleHubRoleStatus(parsed);
+        return;
+      }
+
+      if (pType === 'RECON_PUSH_CHUNK_ACK' || pType === 'RECON_CHUNK_ACK') {
+        this.coldHubHydrationQueue.notifyAck({
+          sweepId: parsed.sweepId ? String(parsed.sweepId) : undefined,
+          entityType: parsed.entityType ? String(parsed.entityType) : undefined,
+          chunkIndex: typeof parsed.chunkIndex === 'number' ? parsed.chunkIndex : undefined,
+        });
+        return;
+      }
+
       if (pType === 'HUB_INFO') {
         // Record metadata even during pre-auth lobby; only trigger sync if authenticated or legacy backup
         this.activeHubId = parsed.hub_id || parsed.hubId || this.activeHubId;
@@ -1108,6 +1061,7 @@ class MeshSyncManager {
         if (parsed.ota_slot) {
           this.activeHubOtaSlot = String(parsed.ota_slot);
         }
+        this.applyHubFailoverMetadata(parsed);
         // If Hub explicitly reports auth_required === false and we are still handshaking on an unpaired Termux backup, activate immediately
         if (
           this.localHubAdapter.getAuthState() === 'HANDSHAKING' &&
@@ -1123,6 +1077,9 @@ class MeshSyncManager {
         }
         if (this.localHubAdapter.isReadyForSync()) {
           this.handleIncomingHubInfo(parsed);
+          if (normalizeHubMode(parsed.hubMode ?? parsed.hub_mode) === 'STANDBY' && parsed.activeLeaderInfo) {
+            void this.handleHubRoleStatus(parsed);
+          }
         }
         this.emitHubSecurityEvent();
       } else if (pType === 'RESET_CONFIRMED') {
@@ -1147,7 +1104,7 @@ class MeshSyncManager {
       } else if (pType === 'RECON_BACKFILL_PAYLOAD') {
         this.handleIncomingReconBackfill(parsed);
       } else if (pType === 'RECON_PUSH_BACKFILL_REQUEST') {
-        this.handleReconPushBackfillRequest(parsed);
+        void this.handleReconPushBackfillRequest(parsed);
       } else if (pType === 'HUB_CLOUD_BROADCAST') {
         this.handleHubCloudBroadcast(parsed);
       } else if (pType === 'SECURITY_ALERT') {
@@ -1194,6 +1151,22 @@ class MeshSyncManager {
       }
     } catch (e) {}
 
+    this.virtualMeshSimulator = new VirtualMeshSimulator({
+      getConfig: () => this.config,
+      addLog: (type, message, sourceDevice, targetDevice, ttl, uuid) =>
+        this.addLog(type, message, sourceDevice, targetDevice, ttl, uuid),
+      notifyPeerSubscribers: () => this.notifyPeerSubscribers(),
+    });
+    this.stocktakeTransport = new StocktakeMeshTransport({
+      getConfig: () => this.config,
+      isLocalHubConnected: () => this.isLocalHubConnected,
+      sendControlPacket: (packet) => this.localHubAdapter.sendControlPacket(packet),
+      dispatchEnvelope: (entityType, entityId, data, options) =>
+        this.dispatchEnvelope(entityType, entityId, data, options),
+      addLog: (type, message, sourceDevice) => this.addLog(type, message, sourceDevice),
+      notifyPeerSubscribers: () => this.notifyPeerSubscribers(),
+    });
+
     this.initServerStream();
     this.initBroadcastChannel();
     this.initVirtualMeshDefault();
@@ -1225,9 +1198,9 @@ class MeshSyncManager {
     } catch (e) {}
     this.startLocalGatewayPolling();
 
-    // Online / Offline & Instant Wake Reconnect listeners
+    // Online / Offline, Wi-Fi/Hotspot Network Change & Instant Wake Reconnect listeners
     if (typeof window !== 'undefined') {
-      // Check for native-camera deep-link pairing params (?pairHost=...&pairCode=...)
+      // Check for native-camera deep-link params (?pairHost=...&pairCode=...&hubId=...&mdnsHost=...)
       try {
         const deepLink = parsePairDeepLink(window.location.search || '');
         if (deepLink) {
@@ -1236,7 +1209,32 @@ class MeshSyncManager {
             window.history.replaceState({}, '', window.location.pathname + window.location.hash);
           } catch {}
           setTimeout(() => {
-            this.startHubPairing(deepLink.wsUrl, deepLink.pairCode);
+            // NEVER force re-pairing if hubId is already paired!
+            const existingByHubId = deepLink.hubId
+              ? LocalHubConfig.getPairedHubById(deepLink.hubId)
+              : null;
+            if (existingByHubId && !this.revokedHubIds.has(existingByHubId.hubId.toUpperCase())) {
+              const prevHost = existingByHubId.lastKnownHost.toLowerCase();
+              const nextHost = deepLink.lastKnownHost.toLowerCase();
+              LocalHubConfig.touchPairedHubProfile(existingByHubId.hubId, {
+                wsUrl: deepLink.wsUrl,
+                lastKnownHost: deepLink.lastKnownHost,
+                port: deepLink.port,
+                ...(deepLink.mdnsHost ? { mdnsHost: deepLink.mdnsHost } : {}),
+                ...(deepLink.lanIps ? { lanIps: deepLink.lanIps } : {}),
+              });
+              LocalHubConfig.setLocalHubUrl(deepLink.wsUrl);
+              if (prevHost && prevHost !== nextHost) {
+                this.pendingRoamedToast = true;
+              }
+              this.connectLocalHub(deepLink.wsUrl);
+              return;
+            }
+            this.startHubPairing(deepLink.wsUrl, deepLink.pairCode, {
+              hubId: deepLink.hubId,
+              mdnsHost: deepLink.mdnsHost,
+              lanIps: deepLink.lanIps,
+            });
           }, 800);
         }
       } catch {}
@@ -1244,17 +1242,22 @@ class MeshSyncManager {
       window.addEventListener('online', () => {
         this.addLog(
           'DISCOVERY',
-          'Network state restored. Reconnecting Local Hub & mesh relay...',
+          'Network state restored. Checking Local Hub IP & mesh relay...',
           this.config.deviceName
         );
         this.localHubReconnectAttempts = 0;
         if (!this.isLocalHubConnected && this.localHubAdapter.getAuthState() !== 'AUTH_FAILED') {
-          this.connectLocalHub();
+          if (LocalHubConfig.hasAnyPairedHub()) {
+            void this.discoverAndReconnectHub();
+          } else {
+            this.connectLocalHub();
+          }
         }
         this.initServerStream();
         this.initMqttRelay();
         this.evaluateConnectionPriority();
       });
+
       window.addEventListener('offline', () => {
         this.addLog(
           'DISCOVERY',
@@ -1262,14 +1265,42 @@ class MeshSyncManager {
           this.config.deviceName
         );
         this.evaluateConnectionPriority();
-        this.connectLocalHub();
+        if (LocalHubConfig.hasAnyPairedHub() && !this.isLocalHubConnected) {
+          void this.discoverAndReconnectHub();
+        } else {
+          this.connectLocalHub();
+        }
       });
+
+      // Wi-Fi SSID / Hotspot switch detection via Network Information API (navigator.connection)
+      try {
+        const navConn = (navigator as any)?.connection;
+        if (navConn && typeof navConn.addEventListener === 'function') {
+          navConn.addEventListener('change', () => {
+            this.addLog(
+              'DISCOVERY',
+              'Wi-Fi / network interface changed. Probing paired Local Hub at new IP...',
+              this.config.deviceName
+            );
+            this.localHubReconnectAttempts = 0;
+            if (LocalHubConfig.hasAnyPairedHub() && this.localHubAdapter.getAuthState() !== 'AUTH_FAILED') {
+              void this.discoverAndReconnectHub({ forceScan: !this.isLocalHubConnected });
+            } else if (!this.isLocalHubConnected && this.localHubAdapter.getAuthState() !== 'AUTH_FAILED') {
+              this.connectLocalHub();
+            }
+          });
+        }
+      } catch {}
 
       // When terminal awakens, tab regains focus or user unlocks device after being away
       window.addEventListener('focus', () => {
         if (!this.isLocalHubConnected && this.localHubAdapter.getAuthState() !== 'AUTH_FAILED') {
           this.localHubReconnectAttempts = 0;
-          this.connectLocalHub();
+          if (LocalHubConfig.hasAnyPairedHub()) {
+            void this.discoverAndReconnectHub();
+          } else {
+            this.connectLocalHub();
+          }
         }
         this.checkAndRequestCatchUpIfStale();
       });
@@ -1278,7 +1309,11 @@ class MeshSyncManager {
           if (document.visibilityState === 'visible') {
             if (!this.isLocalHubConnected && this.localHubAdapter.getAuthState() !== 'AUTH_FAILED') {
               this.localHubReconnectAttempts = 0;
-              this.connectLocalHub();
+              if (LocalHubConfig.hasAnyPairedHub()) {
+                void this.discoverAndReconnectHub();
+              } else {
+                this.connectLocalHub();
+              }
             }
             this.checkAndRequestCatchUpIfStale();
           }
@@ -1651,30 +1686,64 @@ class MeshSyncManager {
     authState: HubAuthState;
     hubUrl: string;
     hubId: string | null;
+    mdnsHost: string | null;
     hubVersion: string | null;
     hubRuntime: 'ANDROID_APK' | 'TERMUX' | 'UNKNOWN';
     otaSlot: string | null;
+    hubRole: HubRole | null;
+    hubPriority: number | null;
+    branchEpoch: number;
+    hubMode: HubMode;
+    isColdHub: boolean;
+    activeLeaderHubId: string | null;
+    activeLeaderInfo: ActiveLeaderInfo | null;
+    unpairedActiveLeader: ActiveLeaderInfo | null;
+    hydrationProgress: ColdHubHydrationProgress;
     isMutuallyAuthenticated: boolean;
     pairedProfile: PairedHubProfile | null;
+    hasPairedHubs: boolean;
     authError: string | null;
+    wasRevoked: boolean;
+    isDiscovering: boolean;
+    discoveryStage: DiscoveryStage | null;
     otaStatus: { status: string; targetVersion?: string; etaSeconds?: number; message?: string; updatedAt: number } | null;
     pendingPair: { wsUrl: string; visualCode?: string; hubId?: string; branchName?: string } | null;
   } {
     const hubUrl = LocalHubConfig.getLocalHubUrl();
     const pairedProfile =
       (this.activeHubId ? LocalHubConfig.getPairedHubById(this.activeHubId) : null) ||
-      LocalHubConfig.getPairedHubForUrl(hubUrl);
+      LocalHubConfig.getPairedHubForUrl(hubUrl) ||
+      LocalHubConfig.getPrimaryPairedHub(this.config.branchId);
     const authState = this.localHubAdapter.getAuthState();
+    const effectiveRole = this.activeHubRole || pairedProfile?.hubRole || null;
+    const effectivePriority =
+      this.activeHubPriority !== null
+        ? this.activeHubPriority
+        : pairedProfile?.hubPriority ?? null;
     return {
       authState,
       hubUrl,
       hubId: this.activeHubId || pairedProfile?.hubId || null,
+      mdnsHost: this.activeHubMdnsHost || pairedProfile?.mdnsHost || null,
       hubVersion: this.activeHubVersion || pairedProfile?.hubVersion || null,
       hubRuntime: this.activeHubRuntime !== 'UNKNOWN' ? this.activeHubRuntime : (pairedProfile?.hubRuntime || 'UNKNOWN'),
       otaSlot: this.activeHubOtaSlot,
+      hubRole: effectiveRole,
+      hubPriority: effectivePriority,
+      branchEpoch: Math.max(this.activeHubBranchEpoch, pairedProfile?.lastEpoch || 1),
+      hubMode: this.activeHubMode,
+      isColdHub: this.activeHubIsColdHub,
+      activeLeaderHubId: this.activeLeaderHubId,
+      activeLeaderInfo: this.activeLeaderInfo,
+      unpairedActiveLeader: this.unpairedActiveLeader,
+      hydrationProgress: { ...this.hubHydrationProgress },
       isMutuallyAuthenticated: authState === 'AUTHENTICATED',
       pairedProfile,
+      hasPairedHubs: LocalHubConfig.hasAnyPairedHub(),
       authError: this.hubAuthError,
+      wasRevoked: this.lastAuthFailureWasRevoked,
+      isDiscovering: this.isDiscoveringHub,
+      discoveryStage: this.discoveryStage,
       otaStatus: this.hubOtaStatus,
       pendingPair: this.pendingPairRequest
         ? {
@@ -1687,6 +1756,190 @@ class MeshSyncManager {
     };
   }
 
+  public dismissUnpairedActiveLeader(): void {
+    if (!this.unpairedActiveLeader) return;
+    this.unpairedActiveLeader = null;
+    this.emitHubSecurityEvent();
+  }
+
+  private applyHubFailoverMetadata(packet: any): {
+    hubRole?: HubRole;
+    hubPriority?: number;
+    branchEpoch?: number;
+    hubMode?: HubMode;
+    isColdHub?: boolean;
+    activeLeaderHubId?: string | null;
+    activeLeaderInfo?: ActiveLeaderInfo | null;
+  } {
+    if (!packet || typeof packet !== 'object') return {};
+    const rawRole = packet.hubRole ?? packet.hub_role;
+    const rawPriority = packet.hubPriority ?? packet.hub_priority;
+    const rawEpoch = packet.branchEpoch ?? packet.branch_epoch;
+    const rawMode = packet.hubMode ?? packet.hub_mode;
+    const rawCold = packet.isColdHub ?? packet.is_cold_hub;
+    const rawLeaderId = packet.activeLeaderHubId ?? packet.active_leader_hub_id;
+    const rawLeaderInfo = packet.activeLeaderInfo ?? packet.active_leader_info;
+
+    const hubRole = rawRole ? normalizeHubRole(rawRole) : undefined;
+    const hubPriority =
+      rawPriority !== undefined && rawPriority !== null
+        ? normalizeHubPriority(rawPriority, hubRole)
+        : hubRole
+        ? normalizeHubPriority(undefined, hubRole)
+        : undefined;
+    const branchEpoch =
+      rawEpoch !== undefined && rawEpoch !== null ? normalizeBranchEpoch(rawEpoch) : undefined;
+    const hubMode = rawMode ? normalizeHubMode(rawMode) : undefined;
+    const isColdHub = typeof rawCold === 'boolean' ? rawCold : undefined;
+    const activeLeaderHubId =
+      rawLeaderId !== undefined ? (rawLeaderId ? String(rawLeaderId).trim() : null) : undefined;
+    const activeLeaderInfo =
+      rawLeaderInfo !== undefined ? sanitizeActiveLeaderInfo(rawLeaderInfo) : undefined;
+
+    if (hubRole) this.activeHubRole = hubRole;
+    if (hubPriority !== undefined) this.activeHubPriority = hubPriority;
+    if (branchEpoch !== undefined) this.activeHubBranchEpoch = branchEpoch;
+    if (hubMode) this.activeHubMode = hubMode;
+    if (isColdHub !== undefined) this.activeHubIsColdHub = isColdHub;
+    if (activeLeaderHubId !== undefined) this.activeLeaderHubId = activeLeaderHubId;
+    if (activeLeaderInfo !== undefined) this.activeLeaderInfo = activeLeaderInfo;
+
+    return {
+      ...(hubRole ? { hubRole } : {}),
+      ...(hubPriority !== undefined ? { hubPriority } : {}),
+      ...(branchEpoch !== undefined ? { branchEpoch } : {}),
+      ...(hubMode ? { hubMode } : {}),
+      ...(isColdHub !== undefined ? { isColdHub } : {}),
+      ...(activeLeaderHubId !== undefined ? { activeLeaderHubId } : {}),
+      ...(activeLeaderInfo !== undefined ? { activeLeaderInfo } : {}),
+    };
+  }
+
+  /**
+   * Handles live `HUB_ROLE_STATUS` failover events from the currently connected Hub.
+   * When the connected Hub transitions to `STANDBY` and announces `activeLeaderInfo`:
+   *   1. Flush pending in-flight T1 outbox items cleanly.
+   *   2. Close the current socket and cancel any cold-hub hydration.
+   *   3. If `activeLeaderInfo.hubId` is already in the Multi-Hub Vault, reconnect silently via HMAC-SHA256!
+   *   4. If NOT paired yet (e.g., emergency replacement phone), surface the non-blocking
+   *      "New Active Branch Hub Detected — Approve Pairing" banner.
+   */
+  public async handleHubRoleStatus(packet: any): Promise<void> {
+    if (!packet || typeof packet !== 'object') return;
+    const meta = this.applyHubFailoverMetadata(packet);
+    const packetHubId = String(packet.hubId || packet.hub_id || this.activeHubId || '').trim();
+
+    if (packetHubId && (meta.hubRole || meta.hubPriority !== undefined || meta.branchEpoch !== undefined || meta.hubMode)) {
+      LocalHubConfig.touchPairedHubProfile(packetHubId, {
+        ...(meta.hubRole ? { hubRole: meta.hubRole } : {}),
+        ...(meta.hubPriority !== undefined ? { hubPriority: meta.hubPriority } : {}),
+        ...(meta.branchEpoch !== undefined ? { lastEpoch: meta.branchEpoch } : {}),
+        ...(meta.hubMode ? { hubMode: meta.hubMode } : {}),
+      });
+    }
+
+    this.emitHubSecurityEvent();
+
+    if (meta.hubMode !== 'STANDBY') {
+      return;
+    }
+
+    const leader = meta.activeLeaderInfo || this.activeLeaderInfo;
+    if (!leader || !leader.hubId || !leader.wsUrl) {
+      return;
+    }
+
+    // Strict tenant/branch scope check before switching Hubs
+    const activeInfo = this.getActiveBranchInfo();
+    const pktTenant = String(packet.tenantId || packet.tenant_id || '').trim().toUpperCase();
+    const pktBranch = String(packet.branchId || packet.branch_id || '').trim().toUpperCase();
+    const myTenant = String(activeInfo.companyId || this.config.companyId || '').trim().toUpperCase();
+    const myBranch = String(activeInfo.branchId || this.config.branchId || '').trim().toUpperCase();
+    if (pktTenant && myTenant && pktTenant !== myTenant) return;
+    if (pktBranch && myBranch && myBranch !== 'ALL' && pktBranch !== 'UNASSIGNED' && pktBranch !== myBranch) {
+      return;
+    }
+
+    // Already connected to this leader Hub on the same URL
+    const sameHubId = this.activeHubId && this.activeHubId.toUpperCase() === leader.hubId.toUpperCase();
+    const sameWsUrl =
+      normalizeHubUrl(this.localHubAdapter.getActiveHubUrl()) === normalizeHubUrl(leader.wsUrl);
+    if (sameHubId && sameWsUrl) {
+      return;
+    }
+
+    if (this.isHandlingFailoverHandoff) {
+      return;
+    }
+    this.isHandlingFailoverHandoff = true;
+
+    try {
+      // Cancel any in-flight cold hydration targeting the demoted STANDBY Hub
+      this.coldHubHydrationQueue.cancel();
+
+      // Flush pending T1 outbox before leaving the demoted Hub
+      if (this.isLocalHubConnected && this.localHubAdapter.isReadyForSync() && !this.isCloudOnlyMode) {
+        try {
+          await this.drainQueueToLocalHub();
+          await new Promise((r) => setTimeout(r, 150));
+        } catch {}
+      }
+
+      const leaderProfile = LocalHubConfig.getPairedHubById(leader.hubId);
+      const isRevoked = this.revokedHubIds.has(leader.hubId.toUpperCase());
+
+      if (leaderProfile && !isRevoked) {
+        this.unpairedActiveLeader = null;
+        const parsedLeader = extractHostAndPort(leader.wsUrl);
+        LocalHubConfig.touchPairedHubProfile(leader.hubId, {
+          wsUrl: leader.wsUrl,
+          lastWsUrl: leader.wsUrl,
+          lastIp: leader.lanIp || parsedLeader.hostname,
+          lastKnownHost: parsedLeader.hostPort,
+          port: leader.wsPort || parsedLeader.port,
+          lastPort: leader.wsPort || parsedLeader.port,
+          hubRole: leader.hubRole,
+          hubPriority: leader.hubPriority,
+          lastEpoch: leader.branchEpoch,
+          hubMode: 'ACTIVE',
+        });
+        LocalHubConfig.setLocalHubUrl(leader.wsUrl);
+
+        this.pendingFailoverToastMessage = `Switched to Active Branch Hub (${leader.hubRole}) — reconnected securely`;
+        this.addLog(
+          'DISCOVERY',
+          `Active Hub handoff: ${packetHubId || 'Previous Hub'} entered STANDBY -> silently failing over to ${leader.hubId} (${leader.hubRole}, Epoch ${leader.branchEpoch}) at ${leader.wsUrl}.`,
+          this.config.deviceName
+        );
+
+        if (this.localHubReconnectTimer) {
+          clearTimeout(this.localHubReconnectTimer);
+          this.localHubReconnectTimer = null;
+        }
+
+        await this.localHubAdapter.disconnect(true);
+        this.syncLocalHubContext();
+        void this.localHubAdapter.connect(leader.wsUrl);
+      } else {
+        // Emergency replacement Hub is ACTIVE on this branch but not yet in our Multi-Hub Vault
+        this.unpairedActiveLeader = leader;
+        this.addLog(
+          'DISCOVERY',
+          `New unpaired Active Branch Hub detected (${leader.hubId} / ${leader.hubRole} at ${leader.wsUrl}). Waiting for operator pairing approval.`,
+          this.config.deviceName
+        );
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('saimetric_unpaired_leader_detected', { detail: leader })
+          );
+        }
+      }
+      this.emitHubSecurityEvent();
+    } finally {
+      this.isHandlingFailoverHandoff = false;
+    }
+  }
+
   private emitHubSecurityEvent(): void {
     if (typeof window !== 'undefined') {
       window.dispatchEvent(
@@ -1697,20 +1950,238 @@ class MeshSyncManager {
     }
   }
 
+  private emitHubToast(message: string): void {
+    if (typeof window !== 'undefined' && message) {
+      window.dispatchEvent(
+        new CustomEvent('saimetric_hub_toast', {
+          detail: { message },
+        })
+      );
+    }
+  }
+
+  private sendPendingPairRequestPacket(hubUrl: string): void {
+    if (!this.pendingPairRequest) return;
+    const activeInfo = this.getActiveBranchInfo();
+    this.localHubAdapter.setAuthState('PAIRING_PENDING', null);
+    this.localHubAdapter.sendControlPacket({
+      type: 'PAIR_REQUEST',
+      action: 'PAIR_REQUEST',
+      pairCode: this.pendingPairRequest.pairCode || '',
+      deviceId: this.config.deviceId,
+      deviceName: this.config.deviceName,
+      branchId: activeInfo.branchId,
+      branchName: activeInfo.branchName,
+      tenantId: activeInfo.companyId,
+      clientNonce: this.pendingPairRequest.clientNonce,
+      timestamp: Date.now(),
+    });
+    this.addLog(
+      'DISCOVERY',
+      `Pairing handshake sent to Local Hub (${hubUrl})...`,
+      this.config.deviceName
+    );
+    this.emitHubSecurityEvent();
+  }
+
+  /**
+   * Deterministic 3-Hub Failover & Wi-Fi/Hotspot IP Roaming Discovery:
+   *   - Filters strictly to the logged-in user's `tenantId` and `branchId`.
+   *   - Ranks candidates by ACTIVE > STANDBY, highest branchEpoch, highest hubPriority,
+   *     lowest hubId, and paired tie-break across all 3 branch Hubs (PRIMARY / BACKUP / TILL_FALLBACK).
+   *   - Reconnects silently via Mutual HMAC-SHA256 when the winning Hub is already in the Multi-Hub Vault,
+   *     or triggers the non-blocking "New Active Branch Hub Detected — Approve Pairing" banner if unpaired.
+   */
+  public async discoverAndReconnectHub(options?: {
+    skipLastKnown?: boolean;
+    forceScan?: boolean;
+    allowUnpairedDiscovery?: boolean;
+  }): Promise<boolean> {
+    if (this.hubDiscoveryPromise) {
+      return this.hubDiscoveryPromise;
+    }
+
+    const pairedHubs = LocalHubConfig.getPairedHubs();
+    if (pairedHubs.length === 0 && !options?.allowUnpairedDiscovery) {
+      return false;
+    }
+
+    if (this.isLocalHubConnected && !options?.forceScan) {
+      return true;
+    }
+
+    const activeInfo = this.getActiveBranchInfo();
+    const effectiveTenantId = activeInfo.companyId || this.config.companyId;
+    const effectiveBranchId = activeInfo.branchId || this.config.branchId;
+
+    const preferredHub =
+      (this.activeHubId ? LocalHubConfig.getPairedHubById(this.activeHubId) : null) ||
+      LocalHubConfig.getPrimaryPairedHub(effectiveBranchId);
+
+    this.isDiscoveringHub = true;
+    this.discoveryStage = options?.skipLastKnown ? 'MDNS' : 'LAST_KNOWN';
+    this.emitHubSecurityEvent();
+
+    this.hubDiscoveryPromise = (async () => {
+      try {
+        const result = await discoverPairedHub(pairedHubs, preferredHub, {
+          skipLastKnown: options?.skipLastKnown,
+          preferredTenantId: effectiveTenantId,
+          preferredBranchId: effectiveBranchId,
+          allowUnpairedActiveLeader: true,
+          onStageChange: (stage) => {
+            this.discoveryStage = stage;
+            this.emitHubSecurityEvent();
+          },
+        });
+
+        if (!result) {
+          return false;
+        }
+
+        // If an emergency replacement ACTIVE Hub is discovered for this branch/tenant,
+        // do not force-connect unauthenticated — present the non-blocking Approve Pairing banner!
+        if (!result.isPaired) {
+          const leaderInfo: ActiveLeaderInfo = {
+            hubId: result.hubId,
+            hubRole: result.hubRole || 'PRIMARY',
+            hubPriority: result.hubPriority ?? 100,
+            branchEpoch: result.branchEpoch ?? 1,
+            lanIp: result.lastIp || extractHostAndPort(result.wsUrl).hostname,
+            wsPort: result.port || 8080,
+            wsUrl: result.wsUrl,
+          };
+          this.unpairedActiveLeader = leaderInfo;
+          this.addLog(
+            'DISCOVERY',
+            `New Active Branch Hub detected (${leaderInfo.hubId} / ${leaderInfo.hubRole} at ${leaderInfo.wsUrl}). Operator pairing approval required.`,
+            this.config.deviceName
+          );
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent('saimetric_unpaired_leader_detected', { detail: leaderInfo })
+            );
+          }
+          this.emitHubSecurityEvent();
+          return false;
+        }
+
+        const existing = LocalHubConfig.getPairedHubById(result.hubId);
+        const prevHost = existing?.lastKnownHost?.toLowerCase() || '';
+        const newHost = result.lastKnownHost.toLowerCase();
+        const ipActuallyChanged = result.ipChanged || (Boolean(prevHost) && prevHost !== newHost);
+        const switchedToDifferentHub =
+          Boolean(this.activeHubId) &&
+          this.activeHubId!.toUpperCase() !== result.hubId.toUpperCase();
+
+        LocalHubConfig.touchPairedHubProfile(result.hubId, {
+          wsUrl: result.wsUrl,
+          lastWsUrl: result.wsUrl,
+          lastIp: result.lastIp || extractHostAndPort(result.wsUrl).hostname,
+          lastKnownHost: result.lastKnownHost,
+          port: result.port,
+          lastPort: result.port,
+          ...(result.mdnsHost ? { mdnsHost: result.mdnsHost } : {}),
+          ...(result.lanIps && result.lanIps.length > 0 ? { lanIps: result.lanIps } : {}),
+          ...(result.hubRole ? { hubRole: result.hubRole } : {}),
+          ...(result.hubPriority !== undefined ? { hubPriority: result.hubPriority } : {}),
+          ...(result.branchEpoch !== undefined ? { lastEpoch: result.branchEpoch } : {}),
+          ...(result.hubMode ? { hubMode: result.hubMode } : {}),
+        });
+        LocalHubConfig.setLocalHubUrl(result.wsUrl);
+        this.unpairedActiveLeader = null;
+
+        if (switchedToDifferentHub) {
+          this.pendingFailoverToastMessage = `Switched to Active Branch Hub (${result.hubRole || existing?.hubRole || 'HUB'}) — reconnected securely`;
+          this.addLog(
+            'DISCOVERY',
+            `Failover elected paired Hub ${result.hubId} (${result.hubRole || 'HUB'}, Epoch ${result.branchEpoch || 1}) at ${result.lastKnownHost} via ${result.discoveredVia}. Authenticating...`,
+            this.config.deviceName
+          );
+        } else if (ipActuallyChanged) {
+          this.pendingRoamedToast = true;
+          this.addLog(
+            'DISCOVERY',
+            `Paired Hub ${result.hubId} found at new Wi-Fi IP (${result.lastKnownHost} via ${result.discoveredVia}). Authenticating...`,
+            this.config.deviceName
+          );
+        }
+
+        if (this.localHubReconnectTimer) {
+          clearTimeout(this.localHubReconnectTimer);
+          this.localHubReconnectTimer = null;
+        }
+
+        // Cancel any cold-hub hydration targeting the previous socket and connect to the winning Hub
+        this.coldHubHydrationQueue.cancel();
+        await this.localHubAdapter.disconnect(true);
+        this.syncLocalHubContext();
+        void this.localHubAdapter.connect(result.wsUrl);
+        return true;
+      } catch (err) {
+        console.warn('[MeshSync] Roaming discovery error:', err);
+        return false;
+      } finally {
+        this.isDiscoveringHub = false;
+        this.discoveryStage = null;
+        this.hubDiscoveryPromise = null;
+        this.emitHubSecurityEvent();
+      }
+    })();
+
+    return this.hubDiscoveryPromise;
+  }
+
   /**
    * Starts a zero-camera pairing session with a Local Hub (Android APK or Auth-enabled Termux).
-   * Works with either a 6-digit code OR TV-style 1-tap approval on the Hub screen.
+   * If `hint.hubId` is ALREADY paired (and not revoked), updates its host & connects via Mutual HMAC instead!
    */
-  public startHubPairing(rawUrl: string, pairCode?: string): void {
+  public startHubPairing(
+    rawUrl: string,
+    pairCode?: string,
+    hint?: { hubId?: string; mdnsHost?: string; lanIps?: string[] }
+  ): void {
     const cleanUrl = LocalHubConfig.setLocalHubUrl(rawUrl);
+    const parsedHost = extractHostAndPort(cleanUrl);
+
+    // Never re-pair an already-paired hubId unless it was explicitly revoked
+    if (hint?.hubId) {
+      const existing = LocalHubConfig.getPairedHubById(hint.hubId);
+      if (existing && !this.revokedHubIds.has(existing.hubId.toUpperCase())) {
+        const prevHost = existing.lastKnownHost.toLowerCase();
+        LocalHubConfig.touchPairedHubProfile(existing.hubId, {
+          wsUrl: cleanUrl,
+          lastKnownHost: parsedHost.hostPort,
+          port: parsedHost.port,
+          ...(hint.mdnsHost ? { mdnsHost: hint.mdnsHost } : {}),
+          ...(hint.lanIps ? { lanIps: hint.lanIps } : {}),
+        });
+        if (prevHost && prevHost !== parsedHost.hostPort.toLowerCase()) {
+          this.pendingRoamedToast = true;
+        }
+        this.pendingPairRequest = null;
+        this.hubAuthError = null;
+        this.lastAuthFailureWasRevoked = false;
+        this.emitHubSecurityEvent();
+        void this.localHubAdapter.disconnect(true).then(() => {
+          this.connectLocalHub(cleanUrl);
+        });
+        return;
+      }
+    }
+
     const cleanCode = String(pairCode || '').replace(/[^0-9A-Za-z]/g, '').trim();
     const clientNonce = generateClientNonce();
 
     this.hubAuthError = null;
+    this.lastAuthFailureWasRevoked = false;
     this.pendingPairRequest = {
       wsUrl: cleanUrl,
       ...(cleanCode ? { pairCode: cleanCode } : {}),
       clientNonce,
+      ...(hint?.hubId ? { hubId: hint.hubId } : {}),
+      ...(hint?.mdnsHost ? { mdnsHost: hint.mdnsHost } : {}),
+      ...(hint?.lanIps ? { lanIps: hint.lanIps } : {}),
       startedAt: Date.now(),
     };
 
@@ -1727,6 +2198,10 @@ class MeshSyncManager {
   }
 
   public cancelHubPairing(): void {
+    if (this.pairChallengeWaitTimer) {
+      clearTimeout(this.pairChallengeWaitTimer);
+      this.pairChallengeWaitTimer = null;
+    }
     this.pendingPairRequest = null;
     if (this.localHubAdapter.getAuthState() === 'PAIRING_PENDING') {
       void this.localHubAdapter.disconnect(true);
@@ -1735,14 +2210,18 @@ class MeshSyncManager {
   }
 
   /**
-   * Unpairs the given Hub (or active URL), allowing explicit switch to a new Hub or Termux backup.
+   * Unpairs the given Hub (or active hubId/URL), allowing explicit switch to a new Hub or Termux backup.
    */
   public unpairLocalHub(hubIdOrUrl?: string): void {
     const target = hubIdOrUrl || this.activeHubId || LocalHubConfig.getLocalHubUrl();
     LocalHubConfig.removePairedHubProfile(target);
+    if (target) this.revokedHubIds.delete(String(target).trim().toUpperCase());
     this.hubAuthError = null;
+    this.lastAuthFailureWasRevoked = false;
     this.pendingPairRequest = null;
     this.activeHubId = null;
+    this.activeHubMdnsHost = null;
+    this.activeHubLanIps = [];
     this.localHubAdapter.setAuthState('DISCONNECTED', null);
     this.emitHubSecurityEvent();
     void this.localHubAdapter.disconnect(true).then(() => {
@@ -1770,6 +2249,7 @@ class MeshSyncManager {
     this.isLocalHubLost = false;
     this.localHubDisconnectedAt = null;
     this.hubAuthError = null;
+    this.lastAuthFailureWasRevoked = false;
     this.hubOtaStatus = null;
     this.lastHubPongReceivedAt = Date.now();
     this.syncLocalHubContext();
@@ -1837,6 +2317,10 @@ class MeshSyncManager {
       clearTimeout(this.legacyFallbackTimer);
       this.legacyFallbackTimer = null;
     }
+    if (this.pairChallengeWaitTimer) {
+      clearTimeout(this.pairChallengeWaitTimer);
+      this.pairChallengeWaitTimer = null;
+    }
 
     const hubUrl = this.localHubAdapter.getActiveHubUrl() || LocalHubConfig.getLocalHubUrl();
     const hubId = String(packet.hubId || packet.hub_id || '').trim();
@@ -1844,21 +2328,56 @@ class MeshSyncManager {
     const nonce = String(packet.nonce || '').trim();
     const challengeTs = Number(packet.timestamp || Date.now());
     const authRequired = packet.auth_required !== false;
+    const challengeMdns = sanitizeMdnsHost(packet.mdnsHost || packet.mdns_host);
+    const challengeLanIps = sanitizeLanIps(packet.lanIps || packet.lan_ips);
 
     this.activeHubId = hubId || this.activeHubId;
+    if (challengeMdns) this.activeHubMdnsHost = challengeMdns;
+    if (challengeLanIps.length > 0) this.activeHubLanIps = challengeLanIps;
     if (packet.version) this.activeHubVersion = String(packet.version);
     if (packet.hub_runtime === 'ANDROID_APK' || packet.hub_runtime === 'TERMUX') {
       this.activeHubRuntime = packet.hub_runtime;
     }
+    const challengeFailover = this.applyHubFailoverMetadata(packet);
 
-    // If we are in an explicit pairing flow, ignore AUTH_CHALLENGE (PAIR_REQUEST is already in flight)
-    if (this.pendingPairRequest) {
+    // REQUIREMENT 1 & 2: ALWAYS look up paired credentials strictly by `hubId` FIRST (never by IP!).
+    const profileByHubId = hubId ? LocalHubConfig.getPairedHubById(hubId) : null;
+    const isExplicitlyRevoked = hubId ? this.revokedHubIds.has(hubId.toUpperCase()) : false;
+
+    // If `deviceSecret` exists for `msg.hubId` (and not revoked), IMMEDIATELY authenticate via
+    // Mutual HMAC-SHA256 regardless of which IP/hostname we connected through — NEVER re-pair!
+    if (profileByHubId && !isExplicitlyRevoked) {
+      if (this.pendingPairRequest) {
+        this.pendingPairRequest = null;
+      }
+      // Persist any updated mdnsHost / lanIps / role / epoch learned from AUTH_CHALLENGE
+      if (
+        challengeMdns ||
+        challengeLanIps.length > 0 ||
+        challengeFailover.hubRole ||
+        challengeFailover.hubPriority !== undefined ||
+        challengeFailover.branchEpoch !== undefined ||
+        challengeFailover.hubMode
+      ) {
+        LocalHubConfig.touchPairedHubProfile(profileByHubId.hubId, {
+          ...(challengeMdns ? { mdnsHost: challengeMdns } : {}),
+          ...(challengeLanIps.length > 0 ? { lanIps: challengeLanIps } : {}),
+          ...(challengeFailover.hubRole ? { hubRole: challengeFailover.hubRole } : {}),
+          ...(challengeFailover.hubPriority !== undefined ? { hubPriority: challengeFailover.hubPriority } : {}),
+          ...(challengeFailover.branchEpoch !== undefined ? { lastEpoch: challengeFailover.branchEpoch } : {}),
+          ...(challengeFailover.hubMode ? { hubMode: challengeFailover.hubMode } : {}),
+        });
+      }
+    } else if (this.pendingPairRequest) {
+      // Only start PAIR_REQUEST if pairedHubs[hubId] does not exist (or was explicitly revoked)
+      if (challengeMdns) this.pendingPairRequest.mdnsHost = challengeMdns;
+      if (challengeLanIps.length > 0) this.pendingPairRequest.lanIps = challengeLanIps;
+      if (hubId) this.pendingPairRequest.hubId = hubId;
+      this.sendPendingPairRequestPacket(hubUrl);
       return;
     }
 
-    const profile =
-      (hubId ? LocalHubConfig.getPairedHubById(hubId) : null) ||
-      LocalHubConfig.getPairedHubForUrl(hubUrl);
+    const profile = profileByHubId;
 
     if (!profile) {
       if (!authRequired) {
@@ -1941,7 +2460,11 @@ class MeshSyncManager {
     const hubId = String(packet.hubId || packet.hub_id || this.activeHubId || '').trim();
     const branchId = String(packet.branchId || packet.branch_id || '').trim();
     const serverTime = Number(packet.serverTime || packet.timestamp || 0);
+    const okMdns = sanitizeMdnsHost(packet.mdnsHost || packet.mdns_host) || this.activeHubMdnsHost || undefined;
+    const okLanIps = sanitizeLanIps(packet.lanIps || packet.lan_ips);
+    const mergedLanIps = okLanIps.length > 0 ? okLanIps : this.activeHubLanIps;
 
+    // Look up strictly by hubId first!
     const profile =
       (hubId ? LocalHubConfig.getPairedHubById(hubId) : null) ||
       LocalHubConfig.getPairedHubForUrl(hubUrl);
@@ -1983,6 +2506,18 @@ class MeshSyncManager {
 
     this.activeClientNonce = '';
     this.activeHubId = hubId || profile.hubId;
+    if (okMdns) this.activeHubMdnsHost = okMdns;
+    if (mergedLanIps.length > 0) this.activeHubLanIps = mergedLanIps;
+    this.revokedHubIds.delete(profile.hubId.toUpperCase());
+    const okFailover = this.applyHubFailoverMetadata(packet);
+
+    if (
+      this.unpairedActiveLeader &&
+      this.unpairedActiveLeader.hubId.toUpperCase() === profile.hubId.toUpperCase()
+    ) {
+      this.unpairedActiveLeader = null;
+    }
+
     if (packet.version) this.activeHubVersion = String(packet.version);
     if (packet.hub_runtime === 'ANDROID_APK' || packet.hub_runtime === 'TERMUX') {
       this.activeHubRuntime = packet.hub_runtime;
@@ -1992,17 +2527,52 @@ class MeshSyncManager {
       reportTrustedTimeSample(serverTime, 'LOCAL_HUB');
     }
 
+    const parsedActive = extractHostAndPort(hubUrl);
+    const prevHost = profile.lastKnownHost.toLowerCase();
+    const hostChanged = Boolean(prevHost) && prevHost !== parsedActive.hostPort.toLowerCase();
+
+    // Update lastKnownHost, mdnsHost, lanIps, role, priority, epoch & mode under pairedHubs[hubId] ONLY after AUTH_OK passes!
     LocalHubConfig.touchPairedHubProfile(profile.hubId, {
       wsUrl: hubUrl,
+      lastWsUrl: hubUrl,
+      lastIp: parsedActive.hostname,
+      lastKnownHost: parsedActive.hostPort,
+      port: parsedActive.port,
+      lastPort: parsedActive.port,
+      ...(okMdns ? { mdnsHost: okMdns } : {}),
+      ...(mergedLanIps.length > 0 ? { lanIps: mergedLanIps } : {}),
       ...(branchId ? { branchId } : {}),
       ...(packet.branchName || packet.branch_name ? { branchName: String(packet.branchName || packet.branch_name) } : {}),
       ...(packet.version ? { hubVersion: String(packet.version) } : {}),
       ...(this.activeHubRuntime !== 'UNKNOWN' ? { hubRuntime: this.activeHubRuntime } : {}),
+      ...(okFailover.hubRole ? { hubRole: okFailover.hubRole } : {}),
+      ...(okFailover.hubPriority !== undefined ? { hubPriority: okFailover.hubPriority } : {}),
+      ...(okFailover.branchEpoch !== undefined ? { lastEpoch: okFailover.branchEpoch } : {}),
+      ...(okFailover.hubMode ? { hubMode: okFailover.hubMode } : {}),
       lastConnectedAt: Date.now(),
     });
 
+    if (LocalHubConfig.getLocalHubUrl() !== normalizeHubUrl(hubUrl)) {
+      LocalHubConfig.setLocalHubUrl(hubUrl);
+    }
+
     this.localHubAdapter.setAuthState('AUTHENTICATED', profile.deviceSecret);
     this.completePostAuthHubSession(hubUrl, true);
+
+    if (this.pendingFailoverToastMessage) {
+      const msg = this.pendingFailoverToastMessage;
+      this.pendingFailoverToastMessage = null;
+      this.pendingRoamedToast = false;
+      this.emitHubToast(msg);
+    } else if (this.pendingRoamedToast || hostChanged) {
+      this.pendingRoamedToast = false;
+      this.emitHubToast('Hub found at new Wi-Fi IP — reconnected securely');
+    }
+
+    // If this authenticated Hub is currently STANDBY and points to an ACTIVE leader, follow handoff automatically
+    if (okFailover.hubMode === 'STANDBY' && okFailover.activeLeaderInfo) {
+      void this.handleHubRoleStatus(packet);
+    }
   }
 
   private handleAuthFailed(packet: any): void {
@@ -2011,6 +2581,17 @@ class MeshSyncManager {
       this.legacyFallbackTimer = null;
     }
     const reason = String(packet.reason || packet.message || 'Authentication rejected by Local Hub.');
+    const lowerReason = reason.toLowerCase();
+    const isRevoked =
+      lowerReason.includes('revok') ||
+      lowerReason.includes('unrecognized device') ||
+      lowerReason.includes('pair this device');
+
+    this.lastAuthFailureWasRevoked = isRevoked;
+    if (isRevoked && this.activeHubId) {
+      this.revokedHubIds.add(this.activeHubId.toUpperCase());
+    }
+
     this.hubAuthError = reason;
     this.localHubAdapter.setAuthState('AUTH_FAILED', null);
     this.addLog('SECURITY_DROP', `Hub Auth Rejected: ${reason}`, this.config.deviceName);
@@ -2048,13 +2629,28 @@ class MeshSyncManager {
       clearTimeout(this.legacyFallbackTimer);
       this.legacyFallbackTimer = null;
     }
+    if (this.pairChallengeWaitTimer) {
+      clearTimeout(this.pairChallengeWaitTimer);
+      this.pairChallengeWaitTimer = null;
+    }
 
     const hubUrl = this.pendingPairRequest?.wsUrl || this.localHubAdapter.getActiveHubUrl() || LocalHubConfig.getLocalHubUrl();
+    const parsedHost = extractHostAndPort(hubUrl);
     const hubId = String(packet.hubId || packet.hub_id || `HUB-${Date.now()}`).trim();
     const branchId = String(packet.branchId || packet.branch_id || this.config.branchId || 'BR-MAIN').trim();
     const branchName = String(packet.branchName || packet.branch_name || this.config.branchName || branchId).trim();
     const tenantId = String(packet.tenantId || packet.tenant_id || this.config.companyId || 'COMP-001').trim();
     const deviceSecret = String(packet.deviceSecret || '').trim();
+    const mdnsHost =
+      sanitizeMdnsHost(packet.mdnsHost || packet.mdns_host) ||
+      this.pendingPairRequest?.mdnsHost ||
+      this.activeHubMdnsHost ||
+      undefined;
+    const lanIps = sanitizeLanIps([
+      ...sanitizeLanIps(packet.lanIps || packet.lan_ips),
+      ...(this.pendingPairRequest?.lanIps || []),
+      ...this.activeHubLanIps,
+    ]);
 
     if (!deviceSecret) {
       this.handlePairRejected({ message: 'Hub did not return a device pairing key.' });
@@ -2068,14 +2664,34 @@ class MeshSyncManager {
         ? 'TERMUX'
         : 'UNKNOWN';
 
+    const pairFailover = this.applyHubFailoverMetadata(packet);
+    const role = pairFailover.hubRole || normalizeHubRole(packet.hubRole ?? packet.hub_role);
+    const priority =
+      pairFailover.hubPriority !== undefined
+        ? pairFailover.hubPriority
+        : normalizeHubPriority(packet.hubPriority ?? packet.hub_priority, role);
+    const epoch = pairFailover.branchEpoch ?? normalizeBranchEpoch(packet.branchEpoch ?? packet.branch_epoch);
+    const mode = pairFailover.hubMode || normalizeHubMode(packet.hubMode ?? packet.hub_mode);
+
     LocalHubConfig.savePairedHubProfile({
       hubId,
       wsUrl: hubUrl,
+      lastWsUrl: hubUrl,
+      lastIp: parsedHost.hostname,
+      lastKnownHost: parsedHost.hostPort,
+      port: parsedHost.port,
+      lastPort: parsedHost.port,
+      ...(mdnsHost ? { mdnsHost } : {}),
+      ...(lanIps.length > 0 ? { lanIps } : {}),
       branchId,
       branchName,
       tenantId,
       deviceId: this.config.deviceId,
       deviceSecret,
+      hubRole: role,
+      hubPriority: priority,
+      lastEpoch: epoch,
+      hubMode: mode,
       ...(packet.hubPubKey ? { hubPubKey: String(packet.hubPubKey) } : {}),
       ...(packet.version ? { hubVersion: String(packet.version) } : {}),
       hubRuntime: runtime,
@@ -2083,11 +2699,16 @@ class MeshSyncManager {
       lastConnectedAt: Date.now(),
     });
 
+    this.revokedHubIds.delete(hubId.toUpperCase());
+    this.unpairedActiveLeader = null;
     this.pendingPairRequest = null;
     this.activeHubId = hubId;
+    if (mdnsHost) this.activeHubMdnsHost = mdnsHost;
+    if (lanIps.length > 0) this.activeHubLanIps = lanIps;
     this.activeHubVersion = packet.version ? String(packet.version) : this.activeHubVersion;
     this.activeHubRuntime = runtime;
     this.hubAuthError = null;
+    this.lastAuthFailureWasRevoked = false;
 
     this.localHubAdapter.setAuthState('AUTHENTICATED', deviceSecret);
     this.completePostAuthHubSession(hubUrl, true);
@@ -2146,40 +2767,7 @@ class MeshSyncManager {
   // OFFLINE TRANSPORT A: OPTICAL QR BATCH SYNC (Air-gapped, zero-network)
   // =========================================================================
   public generateOfflineBatchPayload(): string {
-    const allSales = getSales();
-    const recentSales = allSales.slice(0, 15);
-    const payload = {
-      type: 'SAIMETRIC_OFFLINE_BATCH',
-      version: 2,
-      companyId: this.config.companyId,
-      branchId: this.config.branchId,
-      branchCode: this.config.branchCode,
-      originDeviceId: this.config.deviceId,
-      originDeviceName: this.config.deviceName,
-      timestamp: Date.now(),
-      sales: recentSales.map((s) => ({
-        id: s.id,
-        timestamp: s.timestamp,
-        customerName: s.customerName,
-        staffName: s.staffName || 'Staff',
-        total: s.total,
-        tax: s.tax,
-        paymentMethod: s.paymentMethod,
-        company_id: this.config.companyId,
-        branch_id: this.config.branchId,
-        items: (s.items || []).map((it) => ({
-          id: it.id,
-          name: it.name,
-          quantity: it.quantity,
-          unitPrice: it.unitPrice,
-          total: it.total,
-        })),
-      })),
-      deletedItemIds: getDeletedInventoryItems()
-        .filter((d) => (d.companyId || '').toUpperCase() === (this.config.companyId || '').toUpperCase())
-        .slice(-50),
-    };
-    return JSON.stringify(payload);
+    return generateOfflineBatchPayloadForConfig(this.config);
   }
 
   public ingestOfflineBatchPayload(rawString: string): {
@@ -2188,76 +2776,11 @@ class MeshSyncManager {
     message: string;
     details?: string;
   } {
-    try {
-      const parsed = JSON.parse(rawString);
-      if (!parsed || parsed.type !== 'SAIMETRIC_OFFLINE_BATCH' || !Array.isArray(parsed.sales)) {
-        return { success: false, syncedCount: 0, message: 'Invalid offline QR packet format.' };
-      }
-
-      // Strict tenant isolation
-      const packetComp = (parsed.companyId || parsed.company_id || '').trim().toUpperCase();
-      const localComp = (this.config.companyId || '').trim().toUpperCase();
-      if (packetComp && localComp && packetComp !== localComp) {
-        return {
-          success: false,
-          syncedCount: 0,
-          message: `Security Isolation: QR code belongs to tenant [${packetComp}], but this terminal is on [${localComp}].`,
-        };
-      }
-
-      // Strict branch isolation
-      const packetBranch = (parsed.branchId || parsed.branchCode || '').trim().toUpperCase();
-      const localBranchId = (this.config.branchId || '').trim().toUpperCase();
-      const localBranchCode = (this.config.branchCode || '').trim().toUpperCase();
-      if (packetBranch && packetBranch !== localBranchId && packetBranch !== localBranchCode) {
-        return {
-          success: false,
-          syncedCount: 0,
-          message: `Branch mismatch: Beacon is for branch [${packetBranch}], but this terminal is assigned to [${localBranchCode}].`,
-        };
-      }
-
-      let count = 0;
-      for (const s of parsed.sales) {
-        const didIngest = ingestMeshSale({
-          ...s,
-          company_id: this.config.companyId,
-          branch_id: this.config.branchId,
-          fromMesh: true,
-        });
-        if (didIngest) count++;
-      }
-
-      // Sync offline deleted items across peer terminals
-      let deletedCount = 0;
-      if (Array.isArray(parsed.deletedItemIds)) {
-        for (const del of parsed.deletedItemIds) {
-          if (del && del.itemId) {
-            const didDel = ingestMeshInventoryDelete(del.itemId, del.companyId || this.config.companyId);
-            if (didDel) deletedCount++;
-          }
-        }
-      }
-
-      playChime();
-      this.addLog(
-        'EPIDEMIC_HOP',
-        `Air-Gapped Optical QR: Ingested ${count} sales and ${deletedCount} deleted records from ${parsed.originDeviceName || 'Terminal'} into local Room database!`,
-        parsed.originDeviceName || 'Airgap QR',
-        this.config.deviceName
-      );
-
-      this.notifyPeerSubscribers();
-
-      return {
-        success: true,
-        syncedCount: count,
-        message: `Successfully ingested ${count} sale(s) into local database!`,
-        details: `${parsed.sales.length} sale(s) processed from ${parsed.originDeviceName} (${parsed.branchCode}). Inventory decremented & daily totals updated.`,
-      };
-    } catch (e: any) {
-      return { success: false, syncedCount: 0, message: e.message || 'Error parsing offline batch.' };
-    }
+    return ingestOfflineBatchPayloadForConfig(rawString, this.config, {
+      addLog: (type, message, sourceDevice, targetDevice) =>
+        this.addLog(type, message, sourceDevice, targetDevice),
+      notifyPeerSubscribers: () => this.notifyPeerSubscribers(),
+    });
   }
 
   // =========================================================================
@@ -2399,174 +2922,8 @@ class MeshSyncManager {
     return 'HUB_CLOUD';
   }
 
-  private buildGenericCloudConfigPacket(): {
-    strategy: 'HUB_CLOUD';
-    databaseType: string;
-    credentials: Record<string, any>;
-    companyId?: string;
-    gatewayUrl?: string;
-    runtimePolicy?: Record<string, any>;
-  } | null {
-    try {
-      const comp: any = getCurrentCompany();
-      const backendCfg: any = comp?.backend_config || {};
-      const rawType = String(backendCfg?.backendType || comp?.backend_type || '').toLowerCase().trim();
-      const rawSheets = getRawStoredSheetsConfig() as any;
-      const alreadyPurged = isCloudConfigPurged();
-      const resolvedGatewayUrl =
-        typeof window !== 'undefined' && window.location?.origin && /^https?:\/\//i.test(window.location.origin)
-          ? `${window.location.origin}/api/sync/gateway`
-          : '';
-      const defaultRuntimePolicy = {
-        protocolVersion: '4.0',
-        pushBatchSize: 20,
-        pullMaxPages: 12,
-        requestTimeoutMs: 45000,
-        syncIntervalMs: 5 * 60 * 1000,
-        clockDriftToleranceMs: 5 * 60 * 1000,
-        blockBackdatedVoidsOnly: true,
-        blockedBackdateActions: ['VOID', 'REFUND'],
-        blockedMasterSheetIds: ['1gtbI5TKx5qgH4g39re7hjKMlp94KZWnLhipGZ49rfPE'],
-        t2EntityTypes: [],
-        globalBranchEntityTypes: [],
-        retentionDays: 30,
-        maxStorageMb: 2048,
-        genericBucketMaxItems: 5000,
-      };
-
-      // 1. Check MongoDB credentials
-      const mongoCfg = backendCfg?.mongodb || {};
-      const mongoUri = String(
-        mongoCfg?.mongoUri ||
-          mongoCfg?.uri ||
-          (typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_mongo_uri') : '') ||
-          ''
-      ).trim();
-      if (rawType === 'mongodb' || mongoUri) {
-        const credentials: Record<string, any> = {
-          mongoUri,
-          ...(mongoCfg?.url ? { url: String(mongoCfg.url).trim() } : {}),
-          ...(mongoCfg?.apiKey ? { apiKey: String(mongoCfg.apiKey).trim() } : {}),
-          ...(mongoCfg?.database ? { database: String(mongoCfg.database).trim() } : {}),
-        };
-        if (mongoUri || credentials.url || credentials.apiKey) {
-          return {
-            strategy: 'HUB_CLOUD',
-            databaseType: 'mongodb',
-            credentials,
-            companyId: comp?.company_id,
-            ...(resolvedGatewayUrl ? { gatewayUrl: resolvedGatewayUrl } : {}),
-            runtimePolicy: defaultRuntimePolicy,
-          };
-        }
-      }
-
-      // 2. Check Supabase credentials (routed through frozen Cloud Sync Gateway when available)
-      const sbCfg = backendCfg?.supabase || {};
-      const sbUrl = String(
-        sbCfg?.projectUrl ||
-          sbCfg?.url ||
-          (typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_supabase_url') : '') ||
-          ''
-      ).trim();
-      const sbApiKey = String(
-        sbCfg?.serviceRoleKey ||
-          sbCfg?.anonKey ||
-          sbCfg?.apiKey ||
-          (typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_supabase_key') : '') ||
-          ''
-      ).trim();
-      if (rawType === 'supabase' || (sbUrl && sbApiKey)) {
-        if (sbUrl || sbApiKey) {
-          return {
-            strategy: 'HUB_CLOUD',
-            databaseType: 'supabase',
-            credentials: {
-              url: sbUrl,
-              apiKey: sbApiKey,
-              ...(sbCfg?.anonKey ? { anonKey: String(sbCfg.anonKey).trim() } : {}),
-              ...(sbCfg?.serviceRoleKey ? { serviceRoleKey: String(sbCfg.serviceRoleKey).trim() } : {}),
-              ...(sbCfg?.schema ? { schema: String(sbCfg.schema).trim() } : {}),
-            },
-            companyId: comp?.company_id,
-            ...(resolvedGatewayUrl ? { gatewayUrl: resolvedGatewayUrl } : {}),
-            runtimePolicy: defaultRuntimePolicy,
-          };
-        }
-      }
-
-      // 3. Check Firebase credentials (routed through frozen Cloud Sync Gateway when available)
-      const fbCfg = backendCfg?.firebase || {};
-      const fbProjectId = String(fbCfg?.projectId || '').trim();
-      const fbApiKey = String(fbCfg?.apiKey || '').trim();
-      if (rawType === 'firebase' || fbProjectId || fbApiKey) {
-        if (fbProjectId || fbApiKey) {
-          return {
-            strategy: 'HUB_CLOUD',
-            databaseType: 'firebase',
-            credentials: {
-              ...(fbCfg?.databaseURL ? { url: String(fbCfg.databaseURL).trim() } : {}),
-              apiKey: fbApiKey,
-              projectId: fbProjectId,
-              ...(fbCfg?.appId ? { appId: String(fbCfg.appId).trim() } : {}),
-              ...(fbCfg?.authDomain ? { authDomain: String(fbCfg.authDomain).trim() } : {}),
-              ...(fbCfg?.firestoreRegion ? { firestoreRegion: String(fbCfg.firestoreRegion).trim() } : {}),
-              ...(fbCfg?.databaseId ? { databaseId: String(fbCfg.databaseId).trim() } : {}),
-            },
-            companyId: comp?.company_id,
-            ...(resolvedGatewayUrl ? { gatewayUrl: resolvedGatewayUrl } : {}),
-            runtimePolicy: defaultRuntimePolicy,
-          };
-        }
-      }
-
-      // 4. Check Apps Script / Google Sheets credentials (speaks the same frozen 3-action protocol natively)
-      const sheetsCfg = backendCfg?.sheets || {};
-      const activeSheetsCfg = alreadyPurged ? null : getSheetsConfig();
-      const webhookUrl = String(
-        sheetsCfg?.webhookUrl ||
-          comp?.webhook_url ||
-          rawSheets?.deploymentUrl ||
-          rawSheets?.webhookUrl ||
-          (!alreadyPurged ? activeSheetsCfg?.webhookUrl || '' : '')
-      ).trim();
-      const masterWebhookUrl = String(
-        sheetsCfg?.masterWebhookUrl ||
-          rawSheets?.masterWebhookUrl ||
-          (!alreadyPurged ? activeSheetsCfg?.masterWebhookUrl || '' : '')
-      ).trim();
-      const spreadsheetId = String(
-        sheetsCfg?.spreadsheetId ||
-          comp?.sheet_id ||
-          rawSheets?.spreadsheetId ||
-          (!alreadyPurged ? activeSheetsCfg?.spreadsheetId || '' : '')
-      ).trim();
-      const sheetFolderId = String(sheetsCfg?.sheetFolderId || comp?.sheet_folder_id || '').trim();
-
-      if (webhookUrl || masterWebhookUrl || spreadsheetId) {
-        const compIdForTok = comp?.company_id;
-        const jwtToken = getTenantAuthToken(compIdForTok);
-        const routingEpoch = getRoutingEpoch(compIdForTok);
-        return {
-          strategy: 'HUB_CLOUD',
-          databaseType: 'appscripts',
-          credentials: {
-            url: webhookUrl || masterWebhookUrl,
-            ...(masterWebhookUrl ? { masterWebhookUrl } : {}),
-            ...(spreadsheetId ? { spreadsheetId } : {}),
-            ...(sheetFolderId ? { sheetFolderId } : {}),
-            ...(jwtToken ? { token: jwtToken, jwt: jwtToken } : {}),
-            routingEpoch,
-            isolationMode: sheetsCfg?.isolationMode || comp?.branch_isolation_mode || 'ROW_LEVEL',
-          },
-          companyId: compIdForTok,
-          runtimePolicy: defaultRuntimePolicy,
-        };
-      }
-    } catch (err) {
-      console.warn('[MeshSync] Error reading cloud configuration for Hub handshake:', err);
-    }
-    return null;
+  private buildGenericCloudConfigPacket(): HubCloudConfigPacket | null {
+    return buildGenericCloudConfigPacket();
   }
 
   public getElectedCloudRelayLeaderId(): string | null {
@@ -2683,6 +3040,10 @@ class MeshSyncManager {
       clearTimeout(this.localHubReconnectTimer);
       this.localHubReconnectTimer = null;
     }
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
 
     if (this.localHubAdapter.hasActiveOrConnectingSocket()) {
       return;
@@ -2694,6 +3055,19 @@ class MeshSyncManager {
     this.syncLocalHubContext();
     this.addLog('DISCOVERY', `Connecting to Local WebSocket Hub at ${hubUrl}...`, this.config.deviceName);
     void this.localHubAdapter.connect(hubUrl);
+
+    // Step 1 fail-fast watchdog (~1.5s): if a paired Hub's lastKnownHost stalls (e.g. switched Wi-Fi subnet),
+    // abort the stalled TCP attempt and launch Step 2 (mDNS) -> Step 3 (/health) IP roaming discovery!
+    if (!customUrl && !this.pendingPairRequest && LocalHubConfig.hasAnyPairedHub()) {
+      this.connectTimeoutTimer = setTimeout(() => {
+        this.connectTimeoutTimer = null;
+        if (!this.localHubAdapter.isConnected() && !this.isDiscoveringHub) {
+          void this.localHubAdapter.disconnect(true).then(() => {
+            void this.discoverAndReconnectHub({ skipLastKnown: true });
+          });
+        }
+      }, 1500);
+    }
   }
 
   private enqueueHubPackets(packets: any[]) {
@@ -2772,335 +3146,7 @@ class MeshSyncManager {
    * T1 append-only dedupe and T2 60-second LWW before any write hits the database.
    */
   private lookupExistingRecordForEnvelope(envelope: SyncEnvelope): any {
-    const spec = ENTITY_REGISTRY[envelope.entityType];
-    if (!spec) return undefined;
-
-    if (envelope.action === 'DELETE') {
-      return undefined;
-    }
-
-    const cleanId = String(envelope.entityId || '').trim();
-    const cleanUpper = cleanId.toUpperCase();
-    const data: any = envelope.data || {};
-
-    if (spec.class === 'T2') {
-      switch (envelope.entityType) {
-        case 'inventory_item': {
-          const found = getRawStoredInventoryItems().find(
-            (it: any) => String(it.itemId || it.id || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = Math.max(
-            parseTimestampMs((found as any).hubTimestamp),
-            parseTimestampMs((found as any).updatedAt),
-            parseTimestampMs((found as any).lastUpdated)
-          );
-          return ts > 0 ? { ...found, updatedAt: ts, hubTimestamp: ts } : undefined;
-        }
-        case 'staff': {
-          const found = getRawStoredSalespeople().find(
-            (s: any) => String(s.id || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'customer': {
-          const found = getRawStoredCustomers().find(
-            (c: any) =>
-              String(c.customerId || c.id || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'branch': {
-          const normCanon = (raw?: string) => {
-            const c = String(raw || '').trim().toUpperCase();
-            return c === '1' || c === 'BR001' || c === 'BR-MAIN' ? 'BR-MAIN' : c;
-          };
-          const targetUpper = normCanon(cleanUpper);
-          const found = getAllBranches().find(
-            (b: any) =>
-              normCanon(b.branchId || b.id || b.branch_id) === targetUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'cash_account': {
-          const found = getRawStoredCashAccounts().find(
-            (a: any) =>
-              String(a.account_id || a.id || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'multi_currency': {
-          const ts = getMultiCurrencyUpdatedAt();
-          return ts > 0 ? { updatedAt: ts } : undefined;
-        }
-        case 'permissions_matrix': {
-          const ts = getPermissionsMatrixUpdatedAt();
-          return ts > 0 ? { updatedAt: ts } : undefined;
-        }
-        case 'role_configs': {
-          const ts = getRoleDefinitionsUpdatedAt();
-          return ts > 0 ? { updatedAt: ts } : undefined;
-        }
-        case 'inventory_category': {
-          const cats = getCategories();
-          const maxTs = Math.max(
-            ...cats.map((c: any) =>
-              parseTimestampMs(c.updatedAt || c.lastUpdated || c.timestamp || 0)
-            ),
-            0
-          );
-          return maxTs > 0 ? { updatedAt: maxTs } : undefined;
-        }
-        case 'credit_group': {
-          const found = getCreditGroups().find(
-            (g: any) => String(g.id || g.groupId || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'supplier': {
-          const found = getRawStoredSuppliers().find(
-            (s: any) =>
-              String(s.supplierId || s.id || s.SupplierID || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'stocktake_session': {
-          const found = getRawStoredStocktakeSessions().find(
-            (s: any) =>
-              String(s.sessionId || s.id || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'daily_blind_config': {
-          const found = getRawStoredDailyBlindConfigs().find(
-            (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'daily_blind_count': {
-          const found = getRawStoredDailyBlindCounts().find(
-            (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
-          );
-          if (!found) return undefined;
-          const ts = extractRecordTimestamp(found);
-          return ts > 0 ? { ...found, updatedAt: ts } : undefined;
-        }
-        case 'casual_worker': {
-          const casuals = getTemporaryCasuals();
-          const maxTs = Math.max(...casuals.map((c: any) => extractRecordTimestamp(c)), 0);
-          return maxTs > 0 ? { updatedAt: maxTs } : undefined;
-        }
-        default:
-          return undefined;
-      }
-    }
-
-    // T1 Append-Only Entities: check existing record, allowing legitimate state transitions
-    switch (envelope.entityType) {
-      case 'sale': {
-        const isSaleUpdate =
-          envelope.action === 'UPSERT' ||
-          Boolean(envelope.meta?.isSaleUpdate) ||
-          data?.status === 'Refunded' ||
-          data?.status === 'Voided' ||
-          data?.mobileVerificationStatus === 'VERIFIED' ||
-          data?.mobileVerificationStatus === 'FLAGGED' ||
-          Boolean(data?.hasExchanges);
-        if (isSaleUpdate) return undefined;
-        return getAllSales().find(
-          (s: any) => String(s.id || '').trim().toUpperCase() === cleanUpper
-        );
-      }
-      case 'expense': {
-        const existing = getRawStoredExpenses().find(
-          (e: any) => String(e.id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const statusChanged =
-          (data?.status && data.status !== existing.status) ||
-          envelope.action === 'UPSERT';
-        return statusChanged ? undefined : existing;
-      }
-      case 'direct_grv': {
-        const existing = getRawStoredDirectGrvs().find(
-          (g: any) =>
-            String(g.id || g.grvNumber || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const statusChanged =
-          (data?.status && data.status !== existing.status) ||
-          envelope.action === 'UPSERT';
-        return statusChanged ? undefined : existing;
-      }
-      case 'internal_consumption': {
-        const existing = getInternalConsumptions().find(
-          (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const statusChanged =
-          (data?.status && data.status !== existing.status) ||
-          envelope.action === 'UPSERT';
-        return statusChanged ? undefined : existing;
-      }
-      case 'customer_change': {
-        const existing = getRawStoredCustomerChanges().find(
-          (c: any) =>
-            String(c.id || c.changeId || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const sameCustomer =
-          !data?.customerId ||
-          !existing.customerId ||
-          String(data.customerId).trim().toUpperCase() === String(existing.customerId).trim().toUpperCase();
-        const sameAmounts =
-          Math.abs((Number(data?.in) || 0) - (Number(existing.in) || 0)) < 0.005 &&
-          Math.abs((Number(data?.out) || 0) - (Number(existing.out) || 0)) < 0.005;
-        const changed =
-          !sameCustomer ||
-          !sameAmounts ||
-          (data?.status && data.status !== (existing as any).status) ||
-          envelope.action === 'UPSERT';
-        return changed ? undefined : existing;
-      }
-      case 'credit_sale': {
-        const existing = getRawStoredCreditSales().find(
-          (c: any) =>
-            String(c.id || c.creditId || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const sameCustomer =
-          !data?.customerId ||
-          !existing.customerId ||
-          String(data.customerId).trim().toUpperCase() === String(existing.customerId).trim().toUpperCase();
-        const sameAmounts =
-          Math.abs((Number(data?.out ?? data?.amount) || 0) - (Number((existing as any).out ?? (existing as any).amount) || 0)) < 0.005 &&
-          Math.abs((Number(data?.in) || 0) - (Number((existing as any).in) || 0)) < 0.005;
-        const changed =
-          !sameCustomer ||
-          !sameAmounts ||
-          (data?.status && data.status !== (existing as any).status) ||
-          (data?.paidAmount !== undefined && data.paidAmount !== (existing as any).paidAmount) ||
-          envelope.action === 'UPSERT';
-        return changed ? undefined : existing;
-      }
-      case 'cash_log':
-        return getRawStoredCashLogs().find(
-          (c: any) =>
-            String(c.id || `${c.date}_${c.timestamp}`).trim().toUpperCase() === cleanUpper
-        );
-      case 'cash_movement':
-        return getMovements().find(
-          (m: any) => String(m.id || '').trim().toUpperCase() === cleanUpper
-        );
-      case 'cash_lift':
-        return getRawStoredCashLifts().find(
-          (l: any) => String(l.id || '').trim().toUpperCase() === cleanUpper
-        );
-      case 'cash_transfer': {
-        const existing = getRawStoredCashTransfers().find(
-          (t: any) =>
-            String(t.transfer_id || t.id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const existingTs = extractRecordTimestamp(existing);
-        const incomingTs = envelope.updatedAt || extractRecordTimestamp(data);
-        const changed =
-          envelope.action === 'UPSERT' ||
-          (data?.status && data.status !== (existing as any).status) ||
-          (data?.amount !== undefined && Math.abs(Number(data.amount) - Number((existing as any).amount || 0)) > 0.005) ||
-          (incomingTs > existingTs);
-        return changed ? undefined : existing;
-      }
-      case 'stock_movement':
-        return getRawStoredStockMovements().find(
-          (m: any) =>
-            String(m.id || m.txnId || m.movementId || '').trim().toUpperCase() === cleanUpper
-        );
-      case 'goods_received':
-        return getRawStoredGoodsReceived().find(
-          (g: any) => String(g.id || g.grnId || '').trim().toUpperCase() === cleanUpper
-        );
-      case 'supervisor_approval':
-      case 'audit_log':
-        return getRawStoredAuditLogs().find(
-          (a: any) => String(a.id || '').trim().toUpperCase() === cleanUpper
-        );
-      case 'reconciliation': {
-        const existing = getRawStoredReconciliations().find(
-          (r: any) => String(r.id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const existingTs = extractRecordTimestamp(existing);
-        const incomingTs = envelope.updatedAt || extractRecordTimestamp(data);
-        const changed =
-          envelope.action === 'UPSERT' ||
-          (data?.status && data.status !== (existing as any).status) ||
-          (incomingTs > existingTs);
-        return changed ? undefined : existing;
-      }
-      case 'admin_sales':
-        return getRawStoredAdminSales().find(
-          (a: any) => String(a.id || '').trim().toUpperCase() === cleanUpper
-        );
-      case 'cash_count': {
-        const existing = getRawStoredCashCounts().find(
-          (c: any) => String(c.id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (!existing) return undefined;
-        const existingTs = extractRecordTimestamp(existing);
-        const incomingTs = Math.max(
-          Number(envelope.updatedAt || 0),
-          extractRecordTimestamp(data)
-        );
-        // Reject strictly older packets so stale replays never overwrite newer edits
-        if (existingTs > 0 && incomingTs > 0 && incomingTs < existingTs) {
-          return existing;
-        }
-        const totalChanged =
-          data?.finalCashOutTotal !== undefined &&
-          Math.abs(Number(data.finalCashOutTotal) - Number((existing as any).finalCashOutTotal || 0)) > 0.005;
-        const notesChanged =
-          data?.notes !== undefined &&
-          String(data.notes || '') !== String((existing as any).notes || '');
-        const denomChanged =
-          data?.denominations &&
-          JSON.stringify(data.denominations) !== JSON.stringify((existing as any).denominations || {});
-        const changed =
-          envelope.action === 'UPSERT' ||
-          incomingTs > existingTs ||
-          totalChanged ||
-          notesChanged ||
-          denomChanged;
-        return changed ? undefined : existing;
-      }
-      case 'supplier_invoice_voucher':
-        return getRawStoredSupplierInvoiceVouchers().find(
-          (v: any) =>
-            String(v.voucherId || v.id || '').trim().toUpperCase() === cleanUpper
-        );
-      case 'business_day_closure':
-        return getRawStoredBusinessDayClosures().find(
-          (b: any) => String(b.id || '').trim().toUpperCase() === cleanUpper
-        );
-      default:
-        return undefined;
-    }
+    return lookupExistingRecordForEnvelope(envelope);
   }
 
   /**
@@ -3835,11 +3881,7 @@ class MeshSyncManager {
       return;
     }
 
-    syncCoreListeners.forEach((fn) => {
-      try {
-        fn(packet);
-      } catch {}
-    });
+    notifySyncCoreListeners(packet);
 
     const pType = String(packet.type || packet.action || '');
     const pTypeUpper = pType.toUpperCase();
@@ -4239,6 +4281,7 @@ class MeshSyncManager {
   }
 
   private handleLocalHubLost(reason: string) {
+    this.coldHubHydrationQueue.cancel();
     if (this.localHubHeartbeatTimer) {
       clearInterval(this.localHubHeartbeatTimer);
       this.localHubHeartbeatTimer = null;
@@ -4295,7 +4338,13 @@ class MeshSyncManager {
       return;
     }
 
-    // Jittered exponential backoff (1.5s -> 3s -> 6s -> 12s max) for smooth fast LAN recovery
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
+
+    // Jittered exponential backoff (1.5s -> 3s -> 6s -> 12s max) with automatic IP Roaming Discovery
+    // whenever the device has paired Hubs and the old IP stopped answering.
     if (!this.localHubReconnectTimer) {
       const attempt = Math.min(this.localHubReconnectAttempts, 3);
       this.localHubReconnectAttempts += 1;
@@ -4303,7 +4352,15 @@ class MeshSyncManager {
       const jitter = Math.floor(Math.random() * 600);
       this.localHubReconnectTimer = window.setTimeout(() => {
         this.localHubReconnectTimer = null;
-        this.connectLocalHub();
+        if (LocalHubConfig.hasAnyPairedHub() && !this.pendingPairRequest) {
+          void this.discoverAndReconnectHub().then((found) => {
+            if (!found && !this.isLocalHubConnected && !this.localHubAdapter.hasActiveOrConnectingSocket()) {
+              this.connectLocalHub();
+            }
+          });
+        } else {
+          this.connectLocalHub();
+        }
       }, baseDelay + jitter);
     }
   }
@@ -5101,6 +5158,11 @@ class MeshSyncManager {
         markTombstonesSyncedToHub(ackIds, packet.targetEntityType);
       }
     }
+
+    // Advance ACK-paced Cold-Hub Hydration smoothly even on Hubs that emit per-record SYNC_ACK
+    this.coldHubHydrationQueue.notifyAck({
+      entityType: packet.entityType ? String(packet.entityType) : undefined,
+    });
   }
 
   private notifyConnectionModeChange() {
@@ -5271,10 +5333,23 @@ class MeshSyncManager {
   }
 
   public handleReconSweepTrigger(packet: any): void {
-    const sweepId = packet.sweepId || `sweep-${Date.now()}`;
-    const targetEntities: string[] = Array.isArray(packet.targetEntities)
-      ? packet.targetEntities
-      : ['sales', 'customer_changes', 'credit_sales', 'cash_logs', 'stock_movements', 'direct_grvs', 'expenses', 'inventory', 'customers', 'suppliers', 'staff', 'branches'];
+    const sweepCfg = this.coldHubHydrationQueue.registerSweep({
+      sweepId: packet?.sweepId,
+      isColdHub: Boolean(packet?.isColdHub ?? packet?.is_cold_hub),
+      pushChunkSize: packet?.pushChunkSize ?? packet?.push_chunk_size,
+      targetEntities: Array.isArray(packet?.targetEntities) ? packet.targetEntities : undefined,
+    });
+
+    if (sweepCfg.isColdHub) {
+      this.activeHubIsColdHub = true;
+      this.emitHubSecurityEvent();
+    }
+
+    const sweepId = sweepCfg.sweepId;
+    const targetEntities: string[] =
+      sweepCfg.targetEntities.length > 0
+        ? sweepCfg.targetEntities
+        : [...DEFAULT_COLD_HUB_ENTITY_ORDER];
 
     if (isPosActiveCheckout()) {
       console.log(`[Recon Sweep] 🛒 POS terminal is active in checkout. Deferring sweep (${sweepId}) by 60s.`);
@@ -5284,26 +5359,42 @@ class MeshSyncManager {
       return;
     }
 
-    console.log(`[Recon Sweep] 🚀 Processing snapshot sweep (${sweepId}) for ${targetEntities.length} entities...`);
+    console.log(
+      `[Recon Sweep] 🚀 Processing ${sweepCfg.isColdHub ? 'COLD-HUB ' : ''}snapshot sweep (${sweepId}) for ${targetEntities.length} entities (chunkSize=${sweepCfg.pushChunkSize})...`
+    );
 
-    for (const ent of targetEntities) {
-      try {
-        const snapshot = generateEntitySnapshot(ent, packet.dateRange?.start, packet.dateRange?.end);
-        const snapPacket = {
-          type: 'SYNC_SNAPSHOT_RESPONSE',
-          action: 'SYNC_SNAPSHOT_RESPONSE',
-          sweepId,
-          entityType: ent,
-          snapshot,
-          deviceId: this.config.deviceId,
-          timestamp: Date.now(),
-        };
-
-        this.localHubAdapter.sendControlPacket(snapPacket);
-      } catch (err: any) {
-        console.warn(`[Recon Sweep] Error generating snapshot for ${ent}:`, err?.message);
+    // Yield between each entity snapshot so cold-hub 13-entity sweeps NEVER block the UI or checkout thread
+    void (async () => {
+      for (const ent of targetEntities) {
+        if (!this.isLocalHubConnected || !this.localHubAdapter.isReadyForSync()) {
+          return;
+        }
+        // Pause gracefully if cashier opens checkout mid-sweep
+        while (isPosActiveCheckout()) {
+          await new Promise((r) => setTimeout(r, 1500));
+          if (!this.isLocalHubConnected || !this.localHubAdapter.isReadyForSync()) {
+            return;
+          }
+        }
+        try {
+          const snapshot = generateEntitySnapshot(ent, packet.dateRange?.start, packet.dateRange?.end);
+          const snapPacket = {
+            type: 'SYNC_SNAPSHOT_RESPONSE',
+            action: 'SYNC_SNAPSHOT_RESPONSE',
+            sweepId,
+            entityType: ent,
+            isColdHub: sweepCfg.isColdHub,
+            snapshot,
+            deviceId: this.config.deviceId,
+            timestamp: Date.now(),
+          };
+          this.localHubAdapter.sendControlPacket(snapPacket);
+        } catch (err: any) {
+          console.warn(`[Recon Sweep] Error generating snapshot for ${ent}:`, err?.message);
+        }
+        await yieldToMainThread(sweepCfg.isColdHub ? 25 : 10);
       }
-    }
+    })();
   }
 
   public handleSyncSnapshotRequest(packet: any): void {
@@ -5444,6 +5535,10 @@ class MeshSyncManager {
       users: 'staff',
       branches: 'branch',
       branch: 'branch',
+      cash_accounts: 'cash_account',
+      cash_account: 'cash_account',
+      tombstones: 'tombstone',
+      tombstone: 'tombstone',
     };
     const canonEntity = canonMap[entityType];
     if (!canonEntity || !ENTITY_REGISTRY[canonEntity]) return;
@@ -5585,7 +5680,7 @@ class MeshSyncManager {
 
   public async handleReconPushBackfillRequest(packet: any): Promise<void> {
     if (!packet) return;
-    const sweepId = packet.sweepId || 'unknown';
+    const sweepId = String(packet.sweepId || `sweep-${Date.now()}`).trim();
     const entityType = String(packet.entityType || packet.entity || 'sales').toLowerCase().trim();
     const missingIds: string[] = Array.isArray(packet.missingIds)
       ? packet.missingIds
@@ -5593,14 +5688,6 @@ class MeshSyncManager {
       ? packet.ids
       : [];
     if (missingIds.length === 0) return;
-
-    if (isPosActiveCheckout()) {
-      console.log(`[Auto-Heal] 🛒 POS active checkout. Deferring push backfill (${missingIds.length} IDs) by 60s.`);
-      setTimeout(() => {
-        this.handleReconPushBackfillRequest(packet);
-      }, 60000);
-      return;
-    }
 
     const now = Date.now();
     // Prune loop-guard entries older than 60s
@@ -5610,236 +5697,339 @@ class MeshSyncManager {
       }
     }
 
-    console.log(`[Auto-Heal] 📤 Hub requested ${missingIds.length} missing "${entityType}" record(s) (sweep: ${sweepId})`);
+    const sweepCfg = this.coldHubHydrationQueue.getSweepConfig(sweepId);
+    const isColdHub = Boolean(packet.isColdHub ?? packet.is_cold_hub ?? sweepCfg?.isColdHub ?? false);
+    const pushChunkSize = packet.pushChunkSize ?? packet.push_chunk_size ?? sweepCfg?.pushChunkSize ?? 25;
 
-    let pushedCount = 0;
-    for (let i = 0; i < missingIds.length; i++) {
-      const rawId = missingIds[i];
-      if (!rawId) continue;
-      const cleanId = String(rawId).trim();
-      const cleanUpper = cleanId.toUpperCase();
-      const dedupeKey = `${entityType}:${cleanUpper}`;
+    console.log(
+      `[Auto-Heal] 📤 Queuing ${missingIds.length} missing "${entityType}" record(s) for chunked ACK-paced push (sweep: ${sweepId}, coldHub=${isColdHub}, chunkSize=${pushChunkSize})`
+    );
 
-      // Prevent infinite recon push loops within a 60s cooldown window
-      const lastPushed = this.reconPushedTimestamps.get(dedupeKey);
-      if (lastPushed && Date.now() - lastPushed < 60000) {
-        continue;
-      }
+    // Delegate strictly to ColdHubHydrationQueue (entity-ordered, chunked, checkout-pausing, ACK-paced)
+    this.coldHubHydrationQueue.enqueuePushJob({
+      sweepId,
+      entityType,
+      missingIds,
+      pushChunkSize: Number(pushChunkSize),
+      isColdHub,
+    });
+  }
 
-      if (entityType === 'sales' || entityType === 'sale') {
-        const sale = getSaleById(cleanId);
-        if (sale) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const payloadSale: SaleInvoice = {
-            ...sale,
-            ...(typeof (sale as any).isCloudSynced === 'boolean'
-              ? { isCloudSynced: (sale as any).isCloudSynced }
-              : (sale as any).synced
-              ? { isCloudSynced: true }
-              : {}),
-          };
-          if (sale.status === 'Refunded' || sale.status === 'Voided' || sale.mobileVerificationStatus) {
-            await this.broadcastSaleUpdate(payloadSale);
-          } else {
-            await this.broadcastSale(payloadSale, { isReconPush: true });
-          }
-          pushedCount++;
-        }
-      } else if (entityType === 'customer_changes' || entityType === 'customer_change') {
-        const rec = getRawStoredCustomerChanges().find((c) =>
-          [c.id, (c as any).changeId].some(
-            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
-          )
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastCustomerChange(cleanRec, { isReconPush: true });
-          pushedCount++;
-        }
-      } else if (entityType === 'credit_sales' || entityType === 'credit_sale') {
-        const rec = getRawStoredCreditSales().find((c) =>
-          [c.id, (c as any).creditId, (c as any).creditSaleId].some(
-            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
-          )
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastCreditSale(cleanRec, { isReconPush: true });
-          pushedCount++;
-        }
-      } else if (entityType === 'cash_logs' || entityType === 'cash_log') {
-        const rec = getRawStoredCashLogs().find(
-          (c) => String(c.id || `${c.date}_${c.timestamp}` || '').trim().toUpperCase() === cleanUpper
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          await this.dispatchEnvelope('cash_log', cleanId, cleanRec, {
-            action: 'APPEND',
-            topicSuffix: 'cash_log',
-            packetId: `CL-RECON-${cleanId}-${Date.now()}`,
-            meta: { isReconPush: true },
-          });
-          pushedCount++;
-        }
-      } else if (entityType === 'stock_movements' || entityType === 'stock_movement') {
-        const allMoves = getRawStoredStockMovements();
-        const rec = allMoves.find(
-          (m: any) => String(m.id || m.txnId || m.movementId || '').trim().toUpperCase() === cleanUpper
-        );
-        if (rec) {
-          const recId = String((rec as any).id || rec.movementId || rec.txnId || cleanId).trim();
-          const baseId = stripStockMovementDupSuffix(recId);
-          // Never push back an echo -dup- clone if the canonical base record exists for the same item
-          if (recId !== baseId && allMoves.some((other: any) => {
-            const oId = String(other.id || other.movementId || other.txnId || '').trim();
-            return stripStockMovementDupSuffix(oId) === baseId && String(other.itemId || '').trim() === String(rec.itemId || '').trim();
-          })) {
-            continue;
-          }
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = {
-            ...rec,
-            id: recId,
-            movementId: rec.movementId || recId,
-            txnId: rec.txnId || recId,
-          };
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          await this.dispatchEnvelope('stock_movement', recId, cleanRec, {
-            action: 'APPEND',
-            topicSuffix: 'stock_movement',
-            packetId: `SM-RECON-${recId}-${Date.now()}`,
-            meta: { isReconPush: true },
-          });
-          pushedCount++;
-        }
-      } else if (entityType === 'direct_grvs' || entityType === 'direct_grv' || entityType === 'grv') {
-        const rec = getRawStoredDirectGrvs().find(
-          (g: any) => String(g.id || g.grvId || g.grvNumber || g.reference || '').trim().toUpperCase() === cleanUpper
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          const grvStatusUpper = String(cleanRec.status || '').toUpperCase();
-          await this.dispatchEnvelope('direct_grv', cleanId, cleanRec, {
-            action: grvStatusUpper && grvStatusUpper !== 'PENDING' ? 'UPSERT' : 'APPEND',
-            topicSuffix: 'direct_grv',
-            packetId: `GRV-RECON-${cleanId}-${Date.now()}`,
-            meta: { isReconPush: true },
-          });
-          pushedCount++;
-        }
-      } else if (entityType === 'expenses' || entityType === 'expense') {
-        const rec = getRawStoredExpenses().find(
-          (e) => String(e.id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          const expStatusLower = String(cleanRec.status || '').toLowerCase();
-          await this.dispatchEnvelope('expense', cleanId, cleanRec, {
-            action: expStatusLower && expStatusLower !== 'pending' && expStatusLower !== 'pending_supervisor' ? 'UPSERT' : 'APPEND',
-            topicSuffix: 'expense',
-            packetId: `EXP-RECON-${cleanId}-${Date.now()}`,
-            meta: { isReconPush: true },
-          });
-          pushedCount++;
-        }
-      } else if (entityType === 'inventory' || entityType === 'inventory_item' || entityType === 'products') {
-        const rec = getRawStoredInventoryItems().find(
-          (it) => String(it.itemId || (it as any).id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastInventoryItem(cleanRec, extractRecordTimestamp(cleanRec) || Date.now(), { isReconPush: true });
-          pushedCount++;
-        }
-      } else if (entityType === 'customers' || entityType === 'customer') {
-        const rec = getRawStoredCustomers().find((c) =>
-          [c.customerId, (c as any).id].some(
-            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
-          )
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastCustomer(cleanRec, { isReconPush: true });
-          pushedCount++;
-        }
-      } else if (entityType === 'suppliers' || entityType === 'supplier') {
-        const rec = getRawStoredSuppliers().find((s) =>
-          [s.supplierId, (s as any).id].some(
-            (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
-          )
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastSupplier(cleanRec, { isReconPush: true });
-          pushedCount++;
-        }
-      } else if (entityType === 'staff' || entityType === 'salespeople' || entityType === 'users') {
-        const rec = getRawStoredSalespeople().find(
-          (s) => String(s.id || '').trim().toUpperCase() === cleanUpper
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastStaff(cleanRec, { isReconPush: true });
-          pushedCount++;
-        }
-      } else if (entityType === 'branches' || entityType === 'branch') {
-        const normCanon = (raw?: string) => {
-          const c = String(raw || '').trim().toUpperCase();
-          return c === '1' || c === 'BR001' || c === 'BR-MAIN' ? 'BR-MAIN' : c;
-        };
-        const targetCanon = normCanon(cleanUpper);
-        const rec = getBranches().find(
-          (b: any) => normCanon(b.branchId || b.id || b.branch_id) === targetCanon
-        );
-        if (rec) {
-          this.reconPushedTimestamps.set(dedupeKey, Date.now());
-          const cleanRec: any = { ...rec };
-          delete cleanRec.fromMesh;
-          delete cleanRec.fromSync;
-          if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
-          this.broadcastBranch(cleanRec, { isReconPush: true });
-          pushedCount++;
-        }
-      }
+  private async pushSingleReconRecord(
+    rawEntityType: string,
+    rawId: string,
+    sweepId: string,
+    isColdHub: boolean
+  ): Promise<boolean> {
+    if (!rawId) return false;
+    const entityType = String(rawEntityType || '').toLowerCase().trim();
+    const cleanId = String(rawId).trim();
+    const cleanUpper = cleanId.toUpperCase();
+    // Scope cooldown by activeHubId + sweepId during Cold-Hub hydration so a newly started
+    // Backup/Till Hub immediately receives records even if Primary Hub was just synced seconds ago.
+    const dedupeKey = isColdHub
+      ? `${this.activeHubId || 'HUB'}:${sweepId}:${entityType}:${cleanUpper}`
+      : `${this.activeHubId || 'HUB'}:${entityType}:${cleanUpper}`;
 
-      if ((i + 1) % 25 === 0) {
-        await new Promise((r) => setTimeout(r, 15));
-      }
+    const lastPushed = this.reconPushedTimestamps.get(dedupeKey);
+    if (lastPushed && Date.now() - lastPushed < 60000) {
+      return false;
     }
 
-    console.log(`[Auto-Heal] ✅ Pushed ${pushedCount}/${missingIds.length} missing "${entityType}" record(s) to Hub (sweep: ${sweepId})`);
+    if (entityType === 'tombstones' || entityType === 'tombstone') {
+      const rec = getTombstones().find(
+        (t: any) => String(t.entityId || t.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        await this.dispatchEnvelope('tombstone', String(rec.entityId || cleanId), rec, {
+          action: 'DELETE',
+          topicSuffix: 'tombstone',
+          packetId: `TMB-RECON-${cleanId}-${Date.now()}`,
+          targetBranchId: 'ALL',
+          meta: { isReconPush: true },
+        });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'cash_accounts' || entityType === 'cash_account') {
+      const rec = getRawStoredCashAccounts().find(
+        (a: any) => String(a.account_id || a.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        await this.dispatchEnvelope('cash_account', String(rec.account_id || cleanId), cleanRec, {
+          action: 'UPSERT',
+          topicSuffix: 'cash_account',
+          packetId: `CA-RECON-${cleanId}-${Date.now()}`,
+          targetBranchId: cleanRec.branch_id || this.config.branchId,
+          meta: { isReconPush: true },
+        });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'sales' || entityType === 'sale') {
+      const sale = getSaleById(cleanId);
+      if (sale) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const payloadSale: SaleInvoice = {
+          ...sale,
+          ...(typeof (sale as any).isCloudSynced === 'boolean'
+            ? { isCloudSynced: (sale as any).isCloudSynced }
+            : (sale as any).synced
+            ? { isCloudSynced: true }
+            : {}),
+        };
+        if (sale.status === 'Refunded' || sale.status === 'Voided' || sale.mobileVerificationStatus) {
+          await this.broadcastSaleUpdate(payloadSale);
+        } else {
+          await this.broadcastSale(payloadSale, { isReconPush: true });
+        }
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'customer_changes' || entityType === 'customer_change') {
+      const rec = getRawStoredCustomerChanges().find((c) =>
+        [c.id, (c as any).changeId].some(
+          (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+        )
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        this.broadcastCustomerChange(cleanRec, { isReconPush: true });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'credit_sales' || entityType === 'credit_sale') {
+      const rec = getRawStoredCreditSales().find((c) =>
+        [c.id, (c as any).creditId, (c as any).creditSaleId].some(
+          (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+        )
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        this.broadcastCreditSale(cleanRec, { isReconPush: true });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'cash_logs' || entityType === 'cash_log') {
+      const rec = getRawStoredCashLogs().find(
+        (c) => String(c.id || `${c.date}_${c.timestamp}` || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        await this.dispatchEnvelope('cash_log', cleanId, cleanRec, {
+          action: 'APPEND',
+          topicSuffix: 'cash_log',
+          packetId: `CL-RECON-${cleanId}-${Date.now()}`,
+          meta: { isReconPush: true },
+        });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'stock_movements' || entityType === 'stock_movement') {
+      const allMoves = getRawStoredStockMovements();
+      const rec = allMoves.find(
+        (m: any) => String(m.id || m.txnId || m.movementId || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        const recId = String((rec as any).id || rec.movementId || rec.txnId || cleanId).trim();
+        const baseId = stripStockMovementDupSuffix(recId);
+        // Never push back an echo -dup- clone if the canonical base record exists for the same item
+        if (
+          recId !== baseId &&
+          allMoves.some((other: any) => {
+            const oId = String(other.id || other.movementId || other.txnId || '').trim();
+            return (
+              stripStockMovementDupSuffix(oId) === baseId &&
+              String(other.itemId || '').trim() === String(rec.itemId || '').trim()
+            );
+          })
+        ) {
+          return false;
+        }
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = {
+          ...rec,
+          id: recId,
+          movementId: rec.movementId || recId,
+          txnId: rec.txnId || recId,
+        };
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        await this.dispatchEnvelope('stock_movement', recId, cleanRec, {
+          action: 'APPEND',
+          topicSuffix: 'stock_movement',
+          packetId: `SM-RECON-${recId}-${Date.now()}`,
+          meta: { isReconPush: true },
+        });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'direct_grvs' || entityType === 'direct_grv' || entityType === 'grv') {
+      const rec = getRawStoredDirectGrvs().find(
+        (g: any) => String(g.id || g.grvId || g.grvNumber || g.reference || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        const grvStatusUpper = String(cleanRec.status || '').toUpperCase();
+        await this.dispatchEnvelope('direct_grv', cleanId, cleanRec, {
+          action: grvStatusUpper && grvStatusUpper !== 'PENDING' ? 'UPSERT' : 'APPEND',
+          topicSuffix: 'direct_grv',
+          packetId: `GRV-RECON-${cleanId}-${Date.now()}`,
+          meta: { isReconPush: true },
+        });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'expenses' || entityType === 'expense') {
+      const rec = getRawStoredExpenses().find(
+        (e) => String(e.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        const expStatusLower = String(cleanRec.status || '').toLowerCase();
+        await this.dispatchEnvelope('expense', cleanId, cleanRec, {
+          action:
+            expStatusLower && expStatusLower !== 'pending' && expStatusLower !== 'pending_supervisor'
+              ? 'UPSERT'
+              : 'APPEND',
+          topicSuffix: 'expense',
+          packetId: `EXP-RECON-${cleanId}-${Date.now()}`,
+          meta: { isReconPush: true },
+        });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'inventory' || entityType === 'inventory_item' || entityType === 'products') {
+      const rec = getRawStoredInventoryItems().find(
+        (it) => String(it.itemId || (it as any).id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        this.broadcastInventoryItem(cleanRec, extractRecordTimestamp(cleanRec) || Date.now(), {
+          isReconPush: true,
+        });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'customers' || entityType === 'customer') {
+      const rec = getRawStoredCustomers().find((c) =>
+        [c.customerId, (c as any).id].some(
+          (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+        )
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        this.broadcastCustomer(cleanRec, { isReconPush: true });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'suppliers' || entityType === 'supplier') {
+      const rec = getRawStoredSuppliers().find((s) =>
+        [s.supplierId, (s as any).id].some(
+          (val) => val != null && String(val).trim().toUpperCase() === cleanUpper
+        )
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        this.broadcastSupplier(cleanRec, { isReconPush: true });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'staff' || entityType === 'salespeople' || entityType === 'users') {
+      const rec = getRawStoredSalespeople().find(
+        (s) => String(s.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        this.broadcastStaff(cleanRec, { isReconPush: true });
+        return true;
+      }
+      return false;
+    }
+
+    if (entityType === 'branches' || entityType === 'branch') {
+      const normCanon = (raw?: string) => {
+        const c = String(raw || '').trim().toUpperCase();
+        return c === '1' || c === 'BR001' || c === 'BR-MAIN' ? 'BR-MAIN' : c;
+      };
+      const targetCanon = normCanon(cleanUpper);
+      const rec = getBranches().find(
+        (b: any) => normCanon(b.branchId || b.id || b.branch_id) === targetCanon
+      );
+      if (rec) {
+        this.reconPushedTimestamps.set(dedupeKey, Date.now());
+        const cleanRec: any = { ...rec };
+        delete cleanRec.fromMesh;
+        delete cleanRec.fromSync;
+        if (cleanRec.isCloudSynced || cleanRec.synced) cleanRec.isCloudSynced = true;
+        this.broadcastBranch(cleanRec, { isReconPush: true });
+        return true;
+      }
+      return false;
+    }
+
+    return false;
   }
 
   public onScanSuccess(decodedText: string): void {
@@ -6284,7 +6474,10 @@ class MeshSyncManager {
   // =========================================================================
   // TRANSPORT 1: REAL-TIME MQTT OVER WEBSOCKET RELAY (Bypasses router isolation)
   // =========================================================================
-  private initMqttRelay() {
+  private async initMqttRelay() {
+    if (typeof window === 'undefined') return;
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+
     if (this.mqttClient) {
       try {
         this.mqttClient.end(true);
@@ -6295,8 +6488,10 @@ class MeshSyncManager {
     this.brokerName = brokerUrl.includes('emqx') ? 'EMQX Public Mesh Relay' : 'HiveMQ Public Mesh Relay';
 
     try {
+      const mqttMod = await import('mqtt');
+      const mqttLib = mqttMod.default || (mqttMod as any);
       const clientId = `saimetric_${this.config.deviceId}_${Math.random().toString(36).substring(2, 7)}`;
-      const client = mqtt.connect(brokerUrl, {
+      const client: MqttClient = mqttLib.connect(brokerUrl, {
         clientId,
         clean: true,
         connectTimeout: 5000,
@@ -6406,7 +6601,7 @@ class MeshSyncManager {
           this.addLog('DISCOVERY', `Peer disconnected: ${peer.name} (${id})`, this.config.deviceName);
         }
       }
-      if (changed && !this.isSimulationMode) {
+      if (changed && !this.virtualMeshSimulator.isSimulationActive()) {
         this.notifyPeerSubscribers();
       }
     }, 15000);
@@ -6728,7 +6923,7 @@ class MeshSyncManager {
         this.requestCatchUpSync(packetOrigin).catch(() => {});
       }
 
-      if (!this.isSimulationMode) {
+      if (!this.virtualMeshSimulator.isSimulationActive()) {
         this.notifyPeerSubscribers();
       }
     } else {
@@ -6858,204 +7053,35 @@ class MeshSyncManager {
   }
 
   // =========================================================================
-  // T1 INGESTORS: SUPPLIERS, ADMIN SALES, CASH COUNTS, VOUCHERS (BATCH A)
+  // T1 & T2 INGESTORS (DELEGATED TO src/services/mesh/meshIngestHandlers.ts)
   // =========================================================================
 
   public ingestMeshSupplier(payload: any): boolean {
-    if (!payload || (!payload.supplierId && !payload.id && !payload.SupplierID)) return false;
-    try {
-      const supp = {
-        ...payload,
-        supplierId: payload.supplierId || payload.id || payload.SupplierID,
-        name: payload.name || payload.Name || '',
-        category: payload.category || payload.Category,
-        phone: payload.phone || payload.Phone,
-        address: payload.address || payload.Address,
-        city: payload.city || payload.City,
-        paymentTerms: payload.paymentTerms || payload.PaymentTerms,
-        taxNumber: payload.taxNumber || payload.TaxNumber,
-      };
-      addSupplier(supp, { fromSync: true });
-      window.dispatchEvent(new Event('saimetric_suppliers_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_suppliers_updated', { detail: supp }));
-      return true;
-    } catch (e) {
-      console.warn('[MeshSyncService] ingestMeshSupplier error:', e);
-      return false;
-    }
+    return ingestMeshSupplierRecord(payload);
   }
 
   public ingestMeshAdminSales(payload: any): boolean {
-    if (!payload || (!payload.id && !payload.staffId)) return false;
-    try {
-      const entry = saveAdminSalesEntry(
-        payload.date || new Date().toISOString().split('T')[0],
-        payload.staffId || 'ADMIN',
-        payload.staffName || 'Admin Sales',
-        Number(payload.salesAmount || payload.amount || 0),
-        payload.notes || '',
-        {
-          fromSync: true,
-          id: payload.id,
-          timestamp: payload.timestamp,
-          company_id: payload.company_id || payload.companyId,
-          branch_id: payload.branch_id || payload.branchId,
-        }
-      );
-      window.dispatchEvent(new Event('saimetric_admin_sales_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_admin_sales_updated', { detail: entry }));
-      return true;
-    } catch (e) {
-      console.warn('[MeshSyncService] ingestMeshAdminSales error:', e);
-      return false;
-    }
+    return ingestMeshAdminSalesRecord(payload);
   }
 
   public ingestMeshCashCount(payload: any): boolean {
-    if (!payload || (!payload.id && !payload.staffId)) return false;
-    try {
-      const cleanPayload: any = { ...payload };
-      delete cleanPayload.fromMesh;
-      delete cleanPayload.fromSync;
-      const res = saveFinalCashCount(
-        {
-          id: cleanPayload.id,
-          timestamp: cleanPayload.timestamp,
-          updatedAt: cleanPayload.updatedAt || cleanPayload.hubTimestamp,
-          lastUpdated: cleanPayload.lastUpdated,
-          staffId: cleanPayload.staffId,
-          staffName: cleanPayload.staffName || 'Staff',
-          denominations: cleanPayload.denominations || {},
-          finalCashOutTotal: Number(cleanPayload.finalCashOutTotal ?? cleanPayload.total ?? 0),
-          notes: cleanPayload.notes || '',
-          date: cleanPayload.date,
-          branchId: cleanPayload.branchId || cleanPayload.branch_id,
-          branch_id: cleanPayload.branch_id || cleanPayload.branchId,
-          companyId: cleanPayload.companyId || cleanPayload.company_id,
-          company_id: cleanPayload.company_id || cleanPayload.companyId,
-          ...(cleanPayload.isCloudSynced !== undefined ? { isCloudSynced: cleanPayload.isCloudSynced } : {}),
-        },
-        { fromSync: true }
-      );
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(new Event('saimetric_cash_counts_updated'));
-        window.dispatchEvent(new CustomEvent('saimetric_cash_counts_updated', { detail: res.countRecord }));
-        window.dispatchEvent(new Event('saimetric_cash_movements_updated'));
-        window.dispatchEvent(new Event('saimetric_cash_updated'));
-      }
-      return true;
-    } catch (e) {
-      console.warn('[MeshSyncService] ingestMeshCashCount error:', e);
-      return false;
-    }
+    return ingestMeshCashCountRecord(payload);
   }
 
   public ingestMeshVoucher(payload: any): boolean {
-    if (!payload || (!payload.voucherId && !payload.id)) return false;
-    try {
-      const voucher = saveSupplierInvoiceVoucher(
-        {
-          ...payload,
-          voucherId: payload.voucherId || payload.id,
-        },
-        { fromSync: true }
-      );
-      window.dispatchEvent(new Event('saimetric_vouchers_updated'));
-      window.dispatchEvent(new Event('saimetric_supplier_invoices_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_vouchers_updated', { detail: voucher }));
-      return true;
-    } catch (e) {
-      console.warn('[MeshSyncService] ingestMeshVoucher error:', e);
-      return false;
-    }
+    return ingestMeshVoucherRecord(payload);
   }
 
-  // =========================================================================
-  // T1 & T2 INGESTORS: CLOSURES, SETTLEMENTS, CATEGORIES (BATCH B+C)
-  // =========================================================================
-
   public ingestMeshClosure(payload: any): boolean {
-    if (!payload || (!payload.id && !payload.date)) return false;
-    try {
-      const res = saveBusinessDayClosure(
-        {
-          ...payload,
-          id: payload.id || `EOD-${payload.date}-${payload.branchId || 'BR-MAIN'}`,
-        },
-        { fromSync: true }
-      );
-      window.dispatchEvent(new Event('saimetric_closures_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_closures_updated', { detail: res.closure }));
-      return true;
-    } catch (e) {
-      console.warn('[MeshSyncService] ingestMeshClosure error:', e);
-      return false;
-    }
+    return ingestMeshClosureRecord(payload);
   }
 
   public ingestMeshSettlement(payload: any): boolean {
-    if (!payload || (!payload.id && !payload.date)) return false;
-    try {
-      saveElectronicSettlement(
-        {
-          ...payload,
-          id: payload.id || `SETTLE-${payload.date}-${payload.branchId || 'BR-MAIN'}`,
-        },
-        { fromSync: true }
-      );
-      window.dispatchEvent(new Event('saimetric_settlements_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_settlements_updated', { detail: payload }));
-      return true;
-    } catch (e) {
-      console.warn('[MeshSyncService] ingestMeshSettlement error:', e);
-      return false;
-    }
+    return ingestMeshSettlementRecord(payload);
   }
 
   public ingestMeshCategories(payload: any): boolean {
-    const rawCategories = Array.isArray(payload) ? payload : (payload?.categories || payload?.item || payload?.data);
-    if (!Array.isArray(rawCategories)) return false;
-
-    const tombstones = getTombstones();
-    const catTombstones = tombstones.filter(
-      (t) => normalizeTombstoneEntityType(t.entityType) === 'inventory_category'
-    );
-    const incomingCatTs = parseTimestampMs(payload?.updatedAt || payload?.lastUpdated || payload?.hubTimestamp || 0);
-    const filteredCategories = rawCategories.filter((cat: any) => {
-      const catId = String(cat?.categoryId || cat?.id || '').trim().toUpperCase();
-      if (!catId) return true;
-      const tomb = catTombstones.find(
-        (t) => String(t.entityId || '').trim().toUpperCase() === catId
-      );
-      if (!tomb) return true;
-      const catItemTs = parseTimestampMs(cat?.updatedAt || cat?.lastUpdated || 0) || incomingCatTs;
-      return !(Number(tomb.deletedAt || 0) > catItemTs);
-    });
-
-    // T2 LWW Guard (60000ms skew tolerance)
-    const existingCats = getCategories();
-    const existingTime = Math.max(
-      ...existingCats.map((c: any) => parseTimestampMs(c.updatedAt || c.lastUpdated || c.timestamp || 0)),
-      0
-    );
-    const incomingTime = incomingCatTs;
-
-    if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
-      console.warn(
-        `[LWW Client] 🛡️ Rejected stale categories update (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
-      );
-      return false;
-    }
-
-    try {
-      saveCategories(filteredCategories, { fromSync: true });
-      window.dispatchEvent(new Event('saimetric_categories_updated'));
-      window.dispatchEvent(new CustomEvent('saimetric_categories_updated', { detail: filteredCategories }));
-      return true;
-    } catch (e) {
-      console.warn('[MeshSyncService] ingestMeshCategories error:', e);
-      return false;
-    }
+    return ingestMeshCategoriesRecord(payload);
   }
 
   // =========================================================================
@@ -9446,8 +9472,8 @@ class MeshSyncManager {
   // PEER LIST COMPUTATION
   // =========================================================================
   public getOnlineDeviceCount(): number {
-    if (this.isSimulationMode) {
-      return this.virtualDevices.filter((d) => d.isOnline).length;
+    if (this.virtualMeshSimulator.isSimulationActive()) {
+      return this.virtualMeshSimulator.getOnlineSimulatedCount();
     }
     const now = Date.now();
     let count = 0;
@@ -9522,20 +9548,10 @@ class MeshSyncManager {
     let count: number;
     let peersList: P2PMeshPeer[];
 
-    if (this.isSimulationMode) {
-      count = this.virtualDevices.filter((d) => d.isOnline).length;
-      peersList = this.virtualDevices.map((d) => ({
-        id: d.id,
-        name: d.name,
-        isOnline: d.isOnline,
-        hasInternet: d.hasInternet,
-        lastSeen: Date.now(),
-        pendingCount: d.pendingQueue.length,
-        totalSalesCount: d.sales.length,
-        branchCode: d.branchCode,
-        branchId: d.branchId,
-        companyId: d.companyId,
-      }));
+    if (this.virtualMeshSimulator.isSimulationActive()) {
+      const sim = this.virtualMeshSimulator.getSimulatedPeersSnapshot();
+      count = sim.count;
+      peersList = sim.peers;
     } else {
       peersList = this.getRealPeers();
       count = peersList.filter((p) => !p.isThisDevice).length;
@@ -9607,158 +9623,42 @@ class MeshSyncManager {
   }
 
   // =========================================================================
-  // SIMULATION & TEST PLAN LAB
+  // SIMULATION & TEST PLAN LAB (DELEGATED TO src/services/mesh/virtualMeshSimulator.ts)
   // =========================================================================
   public setSimulationMode(active: boolean) {
-    this.isSimulationMode = active;
-    this.notifyPeerSubscribers();
+    this.virtualMeshSimulator.setSimulationMode(active);
   }
 
   public isSimulationActive(): boolean {
-    return this.isSimulationMode;
+    return this.virtualMeshSimulator.isSimulationActive();
   }
 
   public initVirtualMeshDefault() {
-    this.virtualDevices = [];
-    for (let i = 1; i <= 10; i++) {
-      this.virtualDevices.push({
-        id: `DEV-VIRTUAL-${i}`,
-        name: `Terminal ${i}`,
-        companyId: this.config.companyId,
-        branchCode: this.config.branchCode,
-        branchId: this.config.branchId || 'BR-MAIN',
-        isOnline: i <= 3,
-        hasInternet: false,
-        sales: [],
-        pendingQueue: [],
-      });
-    }
+    this.virtualMeshSimulator.initVirtualMeshDefault();
   }
 
   public getVirtualDevices(): VirtualDevice[] {
-    return [...this.virtualDevices];
+    return this.virtualMeshSimulator.getVirtualDevices();
   }
 
   public addVirtualDevice(name?: string): VirtualDevice {
-    const nextIdx = this.virtualDevices.length + 1;
-    const dev: VirtualDevice = {
-      id: `DEV-VIRTUAL-${nextIdx}`,
-      name: name || `Terminal ${nextIdx}`,
-      companyId: this.config.companyId,
-      branchCode: this.config.branchCode,
-      branchId: this.config.branchId || 'BR-MAIN',
-      isOnline: true,
-      hasInternet: false,
-      sales: [],
-      pendingQueue: [],
-    };
-    this.virtualDevices.push(dev);
-    this.addLog('DISCOVERY', `Device ${dev.name} added to Virtual Lab`, dev.name);
-    this.notifyPeerSubscribers();
-    return dev;
+    return this.virtualMeshSimulator.addVirtualDevice(name);
   }
 
   public toggleDeviceOnline(deviceId: string) {
-    const dev = this.virtualDevices.find((d) => d.id === deviceId);
-    if (!dev) return;
-    dev.isOnline = !dev.isOnline;
-    this.addLog('DISCOVERY', `Device ${dev.name} powered ${dev.isOnline ? 'ON' : 'OFF'}`, dev.name);
-    this.notifyPeerSubscribers();
+    this.virtualMeshSimulator.toggleDeviceOnline(deviceId);
   }
 
   public toggleDeviceInternet(deviceId: string) {
-    const dev = this.virtualDevices.find((d) => d.id === deviceId);
-    if (!dev) return;
-    dev.hasInternet = !dev.hasInternet;
-    this.addLog('CLOUD_SYNC', `Device ${dev.name} Internet: ${dev.hasInternet ? 'ACTIVE' : 'OFFLINE'}`, dev.name);
-    if (dev.hasInternet) {
-      this.triggerOpportunisticCloudSync(deviceId);
-    }
+    this.virtualMeshSimulator.toggleDeviceInternet(deviceId);
   }
 
   public makeSaleOnDevice(deviceId: string, amount: number = 45.0, customerName: string = 'Walk-in') {
-    const dev = this.virtualDevices.find((d) => d.id === deviceId);
-    if (!dev || !dev.isOnline) {
-      throw new Error(`Device ${deviceId} is offline or not found.`);
-    }
-
-    const uuid = 'SALE-' + Math.random().toString(36).substring(2, 9).toUpperCase();
-    const invoiceNumber = generateInvoiceNumber(deviceId, dev.name);
-    const timestamp = Date.now();
-    const hash = calculateRecordHash(uuid, deviceId, timestamp, amount);
-
-    const saleRecord = {
-      uuid,
-      deviceId,
-      timestamp,
-      invoiceNumber,
-      totalAmount: amount,
-      syncStatus: 'pending' as const,
-      hash,
-    };
-    dev.sales.unshift(saleRecord);
-
-    const queueItem = {
-      uuid: 'Q-' + Math.random().toString(36).substring(2, 9),
-      recordUuid: uuid,
-      tableName: 'Sales',
-      deviceId,
-      timestamp,
-      syncStatus: 'pending' as const,
-      hash,
-      payload: { id: invoiceNumber, timestamp: new Date().toISOString(), customerName, total: amount },
-    };
-    dev.pendingQueue.unshift(queueItem);
-
-    this.addLog('BROADCAST', `Sale ${invoiceNumber} ($${amount.toFixed(2)}) created on ${dev.name}`, dev.name, undefined, 5, uuid);
-
-    const otherOnlinePeers = this.virtualDevices.filter((d) => d.id !== deviceId && d.isOnline);
-    otherOnlinePeers.forEach((peer) => {
-      if (!peer.sales.some((s) => s.uuid === uuid)) {
-        peer.sales.unshift({ ...saleRecord });
-        peer.pendingQueue.unshift({ ...queueItem });
-        this.addLog('EPIDEMIC_HOP', `Epidemic Hop: Sale ${invoiceNumber} replicated to ${peer.name} (TTL=4)`, dev.name, peer.name, 4, uuid);
-      }
-    });
-
-    this.notifyPeerSubscribers();
-    return { uuid, invoiceNumber };
+    return this.virtualMeshSimulator.makeSaleOnDevice(deviceId, amount, customerName);
   }
 
   public async triggerOpportunisticCloudSync(deviceId?: string): Promise<{ syncedCount: number }> {
-    const targetDevs = deviceId
-      ? this.virtualDevices.filter((d) => d.id === deviceId)
-      : this.virtualDevices.filter((d) => d.isOnline && d.hasInternet);
-
-    if (targetDevs.length === 0) return { syncedCount: 0 };
-
-    let totalSynced = 0;
-    const syncedUuids: string[] = [];
-
-    for (const dev of targetDevs) {
-      if (dev.pendingQueue.length === 0) continue;
-      const countToSync = dev.pendingQueue.length;
-      totalSynced += countToSync;
-      dev.pendingQueue.forEach((q) => syncedUuids.push(q.recordUuid));
-      dev.sales.forEach((s) => {
-        if (syncedUuids.includes(s.uuid)) s.syncStatus = 'synced';
-      });
-      dev.pendingQueue = [];
-      this.addLog('CLOUD_SYNC', `Opportunistic Cloud Sync: ${dev.name} uploaded ${countToSync} records to Apps Script.`, dev.name);
-    }
-
-    if (syncedUuids.length > 0) {
-      this.virtualDevices.forEach((peer) => {
-        if (peer.isOnline) {
-          peer.pendingQueue = peer.pendingQueue.filter((q) => !syncedUuids.includes(q.recordUuid));
-          peer.sales.forEach((s) => {
-            if (syncedUuids.includes(s.uuid)) s.syncStatus = 'synced';
-          });
-        }
-      });
-    }
-
-    return { syncedCount: totalSynced };
+    return this.virtualMeshSimulator.triggerOpportunisticCloudSync(deviceId);
   }
 
   private startOpportunisticCloudSyncTimer() {
@@ -9784,69 +9684,7 @@ class MeshSyncManager {
   public async executeOfficialTestPlan(
     onStepUpdate?: (step: number, title: string, details: string) => void
   ): Promise<boolean> {
-    this.isSimulationMode = true;
-    this.addLog('DISCOVERY', '=== INITIATING ENHANCED TEST PLAN ===', 'TestRunner');
-
-    onStepUpdate?.(1, 'Setup Initial Mesh & Verify Auto-Detection', `Tenant [${this.config.companyId}] and Branch [${this.config.branchCode}] auto-detected...`);
-    this.virtualDevices.forEach((d, idx) => {
-      d.isOnline = idx < 3;
-      d.hasInternet = false;
-      d.sales = [];
-      d.pendingQueue = [];
-    });
-    this.notifyPeerSubscribers();
-    await new Promise((r) => setTimeout(r, 600));
-
-    onStepUpdate?.(2, 'Record Sales & Inventory Changes on Device 1', 'Recording 3 sales and 1 stock update on Device 1...');
-    this.makeSaleOnDevice('DEV-VIRTUAL-1', 50.0, 'Customer Alpha');
-    this.makeSaleOnDevice('DEV-VIRTUAL-1', 120.0, 'Customer Beta');
-    this.makeSaleOnDevice('DEV-VIRTUAL-1', 35.0, 'Customer Gamma');
-    await new Promise((r) => setTimeout(r, 600));
-
-    onStepUpdate?.(3, 'Add Device 4 & Verify Old Sales & Inventory', 'Powering on Device 4. Auto-discovering mesh...');
-    const dev4 = this.virtualDevices.find((d) => d.id === 'DEV-VIRTUAL-4');
-    if (dev4) {
-      dev4.isOnline = true;
-      const dev1 = this.virtualDevices.find((d) => d.id === 'DEV-VIRTUAL-1');
-      if (dev1) {
-        dev4.sales = [...dev1.sales];
-        dev4.pendingQueue = [...dev1.pendingQueue];
-      }
-      this.notifyPeerSubscribers();
-    }
-    await new Promise((r) => setTimeout(r, 800));
-
-    const dev4Sales = dev4 ? dev4.sales.length : 0;
-    if (dev4Sales !== 3) {
-      this.addLog('CONFLICT_RESOLVED', `Verification FAILED: Device 4 has ${dev4Sales} sales (expected 3)`, 'TestRunner');
-      return false;
-    }
-    this.addLog('DISCOVERY', 'Verification PASSED: Device 4 received all prior records!', 'TestRunner');
-
-    onStepUpdate?.(4, 'Disconnect Devices 1 & 2', 'Simulating disconnect of Devices 1 and 2...');
-    const dev1 = this.virtualDevices.find((d) => d.id === 'DEV-VIRTUAL-1');
-    const dev2 = this.virtualDevices.find((d) => d.id === 'DEV-VIRTUAL-2');
-    if (dev1) dev1.isOnline = false;
-    if (dev2) dev2.isOnline = false;
-    this.notifyPeerSubscribers();
-    await new Promise((r) => setTimeout(r, 600));
-
-    onStepUpdate?.(5, 'Make Sales on Devices 3 & 4', 'Recording sales on Device 3 and Device 4...');
-    this.makeSaleOnDevice('DEV-VIRTUAL-3', 75.0, 'Customer Delta');
-    this.makeSaleOnDevice('DEV-VIRTUAL-4', 90.0, 'Customer Epsilon');
-    await new Promise((r) => setTimeout(r, 800));
-
-    onStepUpdate?.(6, 'Internet on Device 4 -> Cloud Sync & Mesh Receipt Broadcast', 'Device 4 uploads to Apps Script & sends sync ACK to mesh...');
-    if (dev4) {
-      dev4.hasInternet = true;
-      const syncResult = await this.triggerOpportunisticCloudSync('DEV-VIRTUAL-4');
-      this.addLog('ACK', `Receipt ACK broadcasted: Other terminals marked synced. Double-posting prevented!`, 'TestRunner');
-      this.addLog('CLOUD_SYNC', `Cloud Sync completed! Uploaded ${syncResult.syncedCount} records.`, 'TestRunner');
-    }
-    await new Promise((r) => setTimeout(r, 600));
-
-    onStepUpdate?.(7, 'Test Plan Complete', 'Full database sharing and anti-double-posting verified successfully.');
-    return true;
+    return this.virtualMeshSimulator.executeOfficialTestPlan(onStepUpdate);
   }
 
   public async clearAllSyncQueues(): Promise<{ idbCleared: boolean; roomDbCleared: boolean }> {
@@ -9885,105 +9723,16 @@ class MeshSyncManager {
     }
   }
 
-  /**
-   * Safeguard 4: 'Tornado' Test Simulation
-   * Simulates 5 devices making sales at the exact same millisecond.
-   * Proves that KM5-YYMMDD-HHMMSS-Random format prevents collisions.
-   */
   public async simulateTornadoBurst(
     numDevices: number = 5,
     salesPerDevice: number = 10
-  ): Promise<{
-    totalGenerated: number;
-    devicesCount: number;
-    salesPerDevice: number;
-    uniqueInvoicesCount: number;
-    collisionsDetected: number;
-    fixedTimestamp: number;
-    durationMs: number;
-    passed: boolean;
-    sampleInvoices: string[];
-    devices: string[];
-  }> {
-    const start = performance.now();
-    const fixedMs = Date.now(); // Exact same millisecond for all devices!
-    const fixedDate = new Date(fixedMs);
-    const yy = String(fixedDate.getFullYear()).slice(-2);
-    const mm = String(fixedDate.getMonth() + 1).padStart(2, '0');
-    const dd = String(fixedDate.getDate()).padStart(2, '0');
-    const hh = String(fixedDate.getHours()).padStart(2, '0');
-    const min = String(fixedDate.getMinutes()).padStart(2, '0');
-    const ss = String(fixedDate.getSeconds()).padStart(2, '0');
-
-    // Virtual devices with mix of unique and identical staff initials to test collision resilience
-    const virtualDeviceStaff = [
-      { id: 'DEV-TILL-1', name: 'Till 1 (Main Cashier)', prefix: 'KM5' },
-      { id: 'DEV-TILL-2', name: 'Till 2 (Second Cashier)', prefix: 'KM5' }, // Same prefix at same millisecond!
-      { id: 'DEV-MOB-1', name: 'Mobile Rover 1', prefix: 'TM3' },
-      { id: 'DEV-MOB-2', name: 'Mobile Rover 2', prefix: 'KM5' }, // Same prefix at same millisecond!
-      { id: 'DEV-EXP-1', name: 'Express Terminal', prefix: 'KA1' },
-    ].slice(0, numDevices);
-
-    const generatedInvoices: string[] = [];
-    const seenSet = new Set<string>();
-    let collisions = 0;
-
-    for (const dev of virtualDeviceStaff) {
-      for (let i = 0; i < salesPerDevice; i++) {
-        const rand = String(Math.floor(100 + Math.random() * 900));
-        const invId = `${dev.prefix}-${yy}${mm}${dd}-${hh}${min}${ss}-${rand}`;
-        if (seenSet.has(invId)) {
-          collisions++;
-        } else {
-          seenSet.add(invId);
-        }
-        generatedInvoices.push(invId);
-      }
-    }
-
-    const durationMs = Math.round((performance.now() - start) * 100) / 100;
-    const totalGenerated = virtualDeviceStaff.length * salesPerDevice;
-    const passed = collisions === 0 && seenSet.size === totalGenerated;
-
-    this.addLog(
-      'CONFLICT_RESOLVED',
-      `🌪️ TORNADO BURST TEST (${totalGenerated} sales at exact millisecond ${fixedMs}): Generated ${seenSet.size}/${totalGenerated} unique invoices across ${virtualDeviceStaff.length} devices. Collisions: ${collisions}. Result: ${passed ? 'PASSED (100% COLLISION RESILIENT)' : 'FAILED'}.`,
-      'TornadoSimulator'
-    );
-
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('saimetric_tornado_test_completed', {
-          detail: {
-            totalGenerated,
-            devicesCount: virtualDeviceStaff.length,
-            salesPerDevice,
-            uniqueInvoicesCount: seenSet.size,
-            collisionsDetected: collisions,
-            durationMs,
-            passed,
-            sampleInvoices: generatedInvoices.slice(0, 5),
-          },
-        })
-      );
-    }
-
-    return {
-      totalGenerated,
-      devicesCount: virtualDeviceStaff.length,
-      salesPerDevice,
-      uniqueInvoicesCount: seenSet.size,
-      collisionsDetected: collisions,
-      fixedTimestamp: fixedMs,
-      durationMs,
-      passed,
-      sampleInvoices: generatedInvoices.slice(0, 5),
-      devices: virtualDeviceStaff.map((d) => `${d.name} [${d.prefix}]`),
-    };
+  ) {
+    return this.virtualMeshSimulator.simulateTornadoBurst(numDevices, salesPerDevice);
   }
 
   // =========================================================================
   // BLIND DOUBLE-COUNT STOCKTAKE & ZONE CLAIMING PROTOCOL DISPATCHERS
+  // (DELEGATED TO src/services/mesh/stocktakeMeshTransport.ts)
   // =========================================================================
   public claimStocktakeZone(
     sessionId: string,
@@ -9993,23 +9742,7 @@ class MeshSyncManager {
     staffName: string,
     zoneName?: string
   ): void {
-    void this.dispatchEnvelope(
-      'stocktake_zone_claim',
-      zoneId,
-      {
-        sessionId,
-        zoneId,
-        slot,
-        staffId,
-        staffName,
-        zoneName: zoneName || zoneId,
-        branchId: this.config.branchId,
-      },
-      {
-        action: 'UPSERT',
-        topicSuffix: 'stocktake/zone_claim',
-      }
-    );
+    this.stocktakeTransport.claimStocktakeZone(sessionId, zoneId, slot, staffId, staffName, zoneName);
   }
 
   public submitBlindStocktakeCount(
@@ -10020,26 +9753,7 @@ class MeshSyncManager {
     staffName: string,
     lines: any[]
   ): void {
-    void this.dispatchEnvelope(
-      'stocktake_count_submission',
-      `${sessionId}:${zoneId}:${slot}`,
-      {
-        sessionId,
-        zoneId,
-        slot,
-        staffId,
-        staffName,
-        lines,
-        branchId: this.config.branchId,
-      },
-      {
-        action: 'APPEND',
-        topicSuffix: 'stocktake/blind_count_submit',
-      }
-    );
-    if (this.localHubAdapter.isConnected()) {
-      this.addLog('EPIDEMIC_HOP', `Blind count for Zone ${zoneId} (Slot ${slot}) sent to Local Hub.`, this.config.deviceName);
-    }
+    this.stocktakeTransport.submitBlindStocktakeCount(sessionId, zoneId, slot, staffId, staffName, lines);
   }
 
   public proposeJointRecount(
@@ -10049,22 +9763,7 @@ class MeshSyncManager {
     staffName: string,
     lines: any[]
   ): void {
-    void this.dispatchEnvelope(
-      'stocktake_joint_proposal',
-      zoneId,
-      {
-        sessionId,
-        zoneId,
-        proposedBySlot: slot,
-        proposedByName: staffName,
-        recountLines: lines,
-        branchId: this.config.branchId,
-      },
-      {
-        action: 'UPSERT',
-        topicSuffix: 'stocktake/joint_proposal',
-      }
-    );
+    this.stocktakeTransport.proposeJointRecount(sessionId, zoneId, slot, staffName, lines);
   }
 
   public finalizeJointRecount(
@@ -10073,23 +9772,7 @@ class MeshSyncManager {
     resolvedLines: any[],
     resolvedByName: string
   ): void {
-    void this.dispatchEnvelope(
-      'stocktake_joint_finalized',
-      zoneId,
-      {
-        sessionId,
-        zoneId,
-        resolvedLines,
-        signedByA: true,
-        signedByB: true,
-        resolvedByName,
-        branchId: this.config.branchId,
-      },
-      {
-        action: 'APPEND',
-        topicSuffix: 'stocktake/joint_finalized',
-      }
-    );
+    this.stocktakeTransport.finalizeJointRecount(sessionId, zoneId, resolvedLines, resolvedByName);
   }
 
   public unlockStocktakeSegment(
@@ -10100,58 +9783,11 @@ class MeshSyncManager {
     actorName: string,
     reason: string
   ): void {
-    const now = Date.now();
-    void this.dispatchEnvelope(
-      'stocktake_segment_unlock',
-      `${sessionId}:${segmentId}:${now}`,
-      {
-        sessionId,
-        zoneId: segmentId,
-        segmentId,
-        target,
-        actorId,
-        actorName,
-        reason,
-        branchId: this.config.branchId,
-      },
-      {
-        action: 'APPEND',
-        updatedAt: now,
-        topicSuffix: 'stocktake/segment_unlock',
-      }
-    );
-    if (this.localHubAdapter.isConnected()) {
-      this.addLog(
-        'EPIDEMIC_HOP',
-        `Segment ${segmentId} (${target}) unlocked by ${actorName}: ${reason}`,
-        this.config.deviceName
-      );
-    }
+    this.stocktakeTransport.unlockStocktakeSegment(sessionId, segmentId, target, actorId, actorName, reason);
   }
 
   public broadcastCasualWorkers(casuals: any[]): void {
-    // CRITICAL SECURITY: Ensure only pin_hash and pin_salt are transmitted over Local Hub
-    let maxUpdatedAt = 0;
-    const sanitized = Array.isArray(casuals)
-      ? casuals.map((c) => {
-          const salt = c.pin_salt || generatePinSalt();
-          const hash = c.pin_hash || (c.pin ? hashPin(c.pin, salt) : hashPin('1234', salt));
-          const cUp = typeof c.updatedAt === 'number' && c.updatedAt > 0
-            ? c.updatedAt
-            : (c.updatedAt ? new Date(c.updatedAt).getTime() : (c.createdAt ? new Date(c.createdAt).getTime() : Date.now()));
-          if (cUp > maxUpdatedAt) maxUpdatedAt = cUp;
-          const copy = { ...c, pin_hash: hash, pin_salt: salt, updatedAt: cUp, lastUpdated: c.lastUpdated || new Date(cUp).toISOString() };
-          delete copy.pin;
-          return copy;
-        })
-      : [];
-
-    const now = maxUpdatedAt || Date.now();
-    void this.dispatchEnvelope('casual_worker', 'CASUAL_WORKERS_LIST', sanitized, {
-      action: 'UPSERT',
-      updatedAt: now,
-      topicSuffix: 'stocktake/casual_workers_sync',
-    });
+    this.stocktakeTransport.broadcastCasualWorkers(casuals);
   }
 
   public broadcastStocktakeLockdown(
@@ -10162,82 +9798,15 @@ class MeshSyncManager {
     reason?: string,
     lockedBy?: string
   ): void {
-    const now = Date.now();
-    const nowIso = new Date(now).toISOString();
-    void this.dispatchEnvelope(
-      'branch_lockdown',
-      sessionId || branchId,
-      {
-        branchId,
-        sessionId,
-        isLocked,
-        lockedBy,
-        lockedByName,
-        lockedAt: isLocked ? nowIso : undefined,
-        reason,
-        updatedAt: now,
-        lastUpdated: nowIso,
-      },
-      {
-        action: 'UPSERT',
-        updatedAt: now,
-        targetBranchId: branchId,
-        topicSuffix: 'stocktake/lockdown_broadcast',
-      }
-    );
+    this.stocktakeTransport.broadcastStocktakeLockdown(branchId, sessionId, isLocked, lockedByName, reason, lockedBy);
   }
 
   public requestStocktakeSessionList(): void {
-    if (!this.isLocalHubConnected) return;
-    try {
-      this.localHubAdapter.sendControlPacket({
-        type: 'STOCKTAKE_SESSION_LIST_REQUEST',
-        action: 'STOCKTAKE_SESSION_LIST_REQUEST',
-        deviceId: this.config.deviceId,
-        deviceName: this.config.deviceName,
-        timestamp: Date.now(),
-      });
-    } catch (e) {
-      console.warn('[MeshSync] Error sending STOCKTAKE_SESSION_LIST_REQUEST:', e);
-    }
+    this.stocktakeTransport.requestStocktakeSessionList();
   }
 
   public broadcastStocktakeSession(session: StocktakeSession): void {
-    if (!session || !session.sessionId) return;
-    const recUpdatedAt =
-      typeof session.updatedAt === 'number' && session.updatedAt > 0
-        ? session.updatedAt
-        : session.lastUpdated
-        ? new Date(session.lastUpdated).getTime()
-        : session.timestamp
-        ? new Date(session.timestamp).getTime()
-        : Date.now();
-
-    void this.dispatchEnvelope(
-      'stocktake_session',
-      session.sessionId,
-      {
-        ...session,
-        sessionName: session.title,
-        startedBy: session.createdByName || session.createdBy,
-        startedAt: session.timestamp,
-        branchId: session.branchId || this.config.branchId,
-        updatedAt: recUpdatedAt,
-        lastUpdated: session.lastUpdated || new Date(recUpdatedAt).toISOString(),
-      },
-      {
-        action: 'UPSERT',
-        updatedAt: recUpdatedAt,
-        targetBranchId: session.branchId || this.config.branchId,
-        topicSuffix: 'stocktake/session_started',
-      }
-    );
-    this.addLog(
-      'BROADCAST',
-      `Stocktake session "${session.title}" [${session.sessionId}] (${session.status}) synced via SyncCore.`,
-      this.config.deviceName
-    );
-    this.notifyPeerSubscribers();
+    this.stocktakeTransport.broadcastStocktakeSession(session);
   }
 
   public broadcastStocktakeSessionStarted(data: {
@@ -10254,50 +9823,11 @@ class MeshSyncManager {
     updatedAt?: number | string;
     [key: string]: any;
   }): void {
-    const recUpdatedAt = typeof (data as any).updatedAt === 'number' && (data as any).updatedAt > 0
-      ? (data as any).updatedAt
-      : ((data as any).updatedAt ? new Date((data as any).updatedAt).getTime() : (data.startedAt ? new Date(data.startedAt).getTime() : Date.now()));
-
-    void this.dispatchEnvelope(
-      'stocktake_session',
-      data.sessionId,
-      {
-        ...data,
-        branchId: data.branchId || this.config.branchId,
-        updatedAt: recUpdatedAt,
-      },
-      {
-        action: 'UPSERT',
-        updatedAt: recUpdatedAt,
-        targetBranchId: data.branchId || this.config.branchId,
-        topicSuffix: 'stocktake/session_started',
-      }
-    );
-    this.addLog(
-      'BROADCAST',
-      `Stocktake session "${data.sessionName}" [${data.sessionId}] started with ${data.segments.length} segment(s). Broadcasted to Hub & peers.`,
-      this.config.deviceName
-    );
-    this.notifyPeerSubscribers();
+    this.stocktakeTransport.broadcastStocktakeSessionStarted(data);
   }
 
   public broadcastStocktakeSegmentCreated(sessionId: string, segment: any): void {
-    const segId = segment?.segmentId || segment?.id || sessionId;
-    void this.dispatchEnvelope(
-      'stocktake_segment',
-      segId,
-      { sessionId, segment },
-      {
-        action: 'UPSERT',
-        topicSuffix: 'stocktake/segment_created',
-      }
-    );
-    this.addLog(
-      'BROADCAST',
-      `Stocktake segment "${segment.name || segment.segmentId}" [${segment.segmentId}] created. Broadcasted to Hub & peers.`,
-      this.config.deviceName
-    );
-    this.notifyPeerSubscribers();
+    this.stocktakeTransport.broadcastStocktakeSegmentCreated(sessionId, segment);
   }
 
   public sendSyncEnvelope(envelope: any): boolean {

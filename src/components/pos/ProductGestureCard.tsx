@@ -13,7 +13,7 @@ interface ProductGestureCardProps {
   onRequestRemove: (product: Product) => void;
 }
 
-export const ProductGestureCard: React.FC<ProductGestureCardProps> = ({
+const ProductGestureCardComponent: React.FC<ProductGestureCardProps> = ({
   product,
   quantityInCart,
   avatarBg,
@@ -361,3 +361,5 @@ export const ProductGestureCard: React.FC<ProductGestureCardProps> = ({
     </div>
   );
 };
+
+export const ProductGestureCard = React.memo(ProductGestureCardComponent);

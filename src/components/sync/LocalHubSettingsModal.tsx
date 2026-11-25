@@ -37,7 +37,7 @@ import {
   CloudDownload,
   Lock,
 } from 'lucide-react';
-import { Html5Qrcode } from 'html5-qrcode';
+import type { Html5Qrcode } from 'html5-qrcode';
 import {
   LocalHubConfig,
   normalizeHubUrl,
@@ -106,6 +106,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
   // Zero-Camera Mutual Auth & Multi-Branch Pairing State
   const [pairCodeInput, setPairCodeInput] = useState<string>('');
   const [showQrFallback, setShowQrFallback] = useState<boolean>(false);
+  const [showPairDifferentHub, setShowPairDifferentHub] = useState<boolean>(false);
   const [hubSecurity, setHubSecurity] = useState(() => meshSyncService.getHubSecurityStatus());
   const [pairedHubs, setPairedHubs] = useState<PairedHubProfile[]>(() => LocalHubConfig.getPairedHubs());
   const [isCheckingOta, setIsCheckingOta] = useState<boolean>(false);
@@ -113,16 +114,23 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
   useEffect(() => {
     if (!isOpen) {
       stopCamera();
+      setShowPairDifferentHub(false);
       return;
     }
 
-    setHubUrlInput(LocalHubConfig.getLocalHubUrl());
+    const initialSec = meshSyncService.getHubSecurityStatus();
+    if (initialSec.unpairedActiveLeader?.wsUrl) {
+      setHubUrlInput(initialSec.unpairedActiveLeader.wsUrl);
+      setShowPairDifferentHub(true);
+    } else {
+      setHubUrlInput(LocalHubConfig.getLocalHubUrl());
+    }
     setForceLocalHub(LocalHubConfig.getForceLocalHub());
     setConnStatus(meshSyncService.getConnectionStatus());
     setConnMode(meshSyncService.getConnectionMode());
     setHubBranchId(LocalHubConfig.getHubBranchId());
     setHubBranchName(LocalHubConfig.getHubBranchName());
-    setHubSecurity(meshSyncService.getHubSecurityStatus());
+    setHubSecurity(initialSec);
     setPairedHubs(LocalHubConfig.getPairedHubs());
 
     const unsubMode = meshSyncService.subscribeConnectionMode((mode) => {
@@ -200,6 +208,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
         } catch {}
       }
 
+      const { Html5Qrcode } = await import('html5-qrcode');
       const qr = new Html5Qrcode(scannerRegionId, { verbose: false });
       html5QrCodeRef.current = qr;
 
@@ -209,15 +218,24 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
         async (decodedText) => {
           await stopCamera();
           const trimmed = String(decodedText || '').trim();
-          // Support deep-link QR codes (?pairHost=...&pairCode=...) from the Android Hub APK
+          // Support deep-link QR codes (?pairHost=...&pairCode=...&hubId=...&mdnsHost=...) from the Android Hub APK
           const queryIdx = trimmed.indexOf('?');
           if (queryIdx !== -1) {
             const parsedLink = parsePairDeepLink(trimmed.slice(queryIdx));
             if (parsedLink) {
               setHubUrlInput(parsedLink.wsUrl);
               setPairCodeInput(parsedLink.pairCode || '');
-              meshSyncService.startHubPairing(parsedLink.wsUrl, parsedLink.pairCode);
-              setSaveSuccessNotice(`Pairing securely with scanned Hub: ${parsedLink.wsUrl}`);
+              const alreadyPaired = parsedLink.hubId ? LocalHubConfig.getPairedHubById(parsedLink.hubId) : null;
+              meshSyncService.startHubPairing(parsedLink.wsUrl, parsedLink.pairCode, {
+                hubId: parsedLink.hubId,
+                mdnsHost: parsedLink.mdnsHost,
+                lanIps: parsedLink.lanIps,
+              });
+              setSaveSuccessNotice(
+                alreadyPaired
+                  ? `Recognized paired Hub ${alreadyPaired.hubId} — reconnecting securely via Mutual HMAC at ${parsedLink.wsUrl}`
+                  : `Pairing securely with scanned Hub: ${parsedLink.wsUrl}`
+              );
               setTimeout(() => setSaveSuccessNotice(null), 5000);
               return;
             }
@@ -264,6 +282,17 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     setPairCodeInput('');
     setSaveSuccessNotice('Hub unpaired. You can now pair a new Hub or connect to a Termux backup.');
     setTimeout(() => setSaveSuccessNotice(null), 4000);
+  };
+
+  const handleFindHubOnWifi = async () => {
+    setSaveSuccessNotice('Scanning Wi-Fi / Hotspot for your paired Hub (mDNS & /health)...');
+    const found = await meshSyncService.discoverAndReconnectHub({ forceScan: true });
+    if (found) {
+      setSaveSuccessNotice('Paired Hub located! Reconnecting securely via Mutual HMAC...');
+    } else {
+      setSaveSuccessNotice('Paired Hub not reachable on current Wi-Fi/Hotspot yet. Check that the Hub is powered on and on the same network.');
+    }
+    setTimeout(() => setSaveSuccessNotice(null), 5000);
   };
 
   const handleCheckHubUpdate = () => {
@@ -546,6 +575,15 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                         <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-200 border border-emerald-500/30 font-bold">
                           {hubSecurity.hubRuntime === 'ANDROID_APK' ? 'Android Hub APK' : 'Termux Secured'}
                         </span>
+                        {hubSecurity.hubRole && (
+                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/25 text-indigo-200 border border-indigo-400/35 font-bold">
+                            {hubSecurity.hubRole.replace('_', ' ')}
+                            {hubSecurity.hubPriority !== null ? ` • P${hubSecurity.hubPriority}` : ''}
+                          </span>
+                        )}
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-200 border border-slate-700 font-bold">
+                          {hubSecurity.hubMode} • E{hubSecurity.branchEpoch}
+                        </span>
                         {hubSecurity.hubVersion && (
                           <span className="text-[10px] font-mono text-emerald-300/80">
                             v{hubSecurity.hubVersion}
@@ -554,6 +592,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                       </div>
                       <p className="text-[11px] text-emerald-200/80 font-mono truncate">
                         {hubSecurity.hubId || 'Paired Hub'}
+                        {hubSecurity.mdnsHost ? ` • ${hubSecurity.mdnsHost}` : ''}
                         {hubSecurity.otaSlot ? ` • Slot ${hubSecurity.otaSlot}` : ''}
                         {' • Anti-Spoof Verified'}
                       </p>
@@ -676,152 +715,137 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               </div>
             )}
 
-            {/* PRIMARY CARD: Zero-Camera Hub Connection & Secure Pairing (Works on Desktop & Mobile) */}
-            <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
-              <div className="flex items-center justify-between gap-2">
-                <div>
-                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
-                    <KeyRound className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Connect or Pair Local Hub (No Camera Needed)</span>
-                  </h3>
-                  <p className="text-[11px] text-slate-400 mt-0.5">
-                    Works on Desktop PCs &amp; Mobile. Enter Hub IP + 6-digit code, or leave code blank to approve on the Hub screen.
+            {/* Live Cold-Hub Hydration Progress */}
+            {hubSecurity.hydrationProgress?.active && (
+              <div className="p-3.5 rounded-2xl bg-indigo-950/50 border border-indigo-500/40 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <RefreshCw className={`w-4 h-4 text-indigo-300 shrink-0 ${hubSecurity.hydrationProgress.pausedForCheckout ? '' : 'animate-spin'}`} />
+                    <span className="text-xs font-black uppercase tracking-wider text-indigo-200 truncate">
+                      {hubSecurity.hydrationProgress.pausedForCheckout
+                        ? 'Cold-Hub Hydration Paused (POS Checkout Active)'
+                        : hubSecurity.hydrationProgress.isColdHub
+                        ? 'Hydrating Backup / Cold Hub'
+                        : 'Reconciling Branch Records'}
+                    </span>
+                  </div>
+                  <span className="text-[11px] font-mono text-indigo-200 shrink-0">
+                    {hubSecurity.hydrationProgress.pushedRecords}/{hubSecurity.hydrationProgress.totalRecords}
+                  </span>
+                </div>
+                <div className="w-full h-1.5 rounded-full bg-slate-900 overflow-hidden">
+                  <div
+                    className="h-full bg-indigo-400 transition-all duration-300"
+                    style={{
+                      width: `${Math.min(
+                        100,
+                        hubSecurity.hydrationProgress.totalRecords > 0
+                          ? Math.round(
+                              (hubSecurity.hydrationProgress.pushedRecords /
+                                hubSecurity.hydrationProgress.totalRecords) *
+                                100
+                            )
+                          : 0
+                      )}%`,
+                    }}
+                  />
+                </div>
+                <p className="text-[11px] text-indigo-300/85 font-mono truncate">
+                  Entity: {hubSecurity.hydrationProgress.currentEntity || 'preparing'} • Chunk{' '}
+                  {hubSecurity.hydrationProgress.currentChunk}/{hubSecurity.hydrationProgress.totalChunks} (ACK-paced, non-blocking)
+                </p>
+              </div>
+            )}
+
+            {/* Non-Blocking Banner for Emergency Replacement / Unpaired Active Branch Hub */}
+            {hubSecurity.unpairedActiveLeader && (
+              <div className="p-3.5 rounded-2xl bg-amber-950/45 border border-amber-500/50 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <ShieldAlert className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <p className="text-xs font-black uppercase tracking-wider text-amber-200">
+                        New Active Branch Hub Detected — Approve Pairing
+                      </p>
+                      <p className="text-[11px] text-amber-100/85 font-mono truncate mt-0.5">
+                        {hubSecurity.unpairedActiveLeader.hubRole} (P{hubSecurity.unpairedActiveLeader.hubPriority} • E{hubSecurity.unpairedActiveLeader.branchEpoch}) • {hubSecurity.unpairedActiveLeader.hubId}
+                      </p>
+                      <p className="text-[11px] text-amber-200/80 mt-1">
+                        Endpoint pre-filled below ({hubSecurity.unpairedActiveLeader.wsUrl}). Enter the 6-digit code, tap Pair &amp; Approve on Hub, or scan its QR code.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => meshSyncService.dismissUnpairedActiveLeader()}
+                    className="text-amber-300/70 hover:text-amber-100 p-1 rounded-lg transition cursor-pointer"
+                    title="Dismiss notice"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Live Wi-Fi Roaming Discovery Indicator */}
+            {hubSecurity.isDiscovering && (
+              <div className="p-3.5 rounded-2xl bg-indigo-950/50 border border-indigo-500/40 flex items-center gap-3">
+                <Search className="w-4 h-4 text-indigo-300 animate-pulse shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-xs font-black uppercase tracking-wider text-indigo-200">
+                    Finding Active Branch Hub on Wi-Fi...
+                  </p>
+                  <p className="text-[11px] text-indigo-300/90 truncate">
+                    {hubSecurity.discoveryStage === 'LAST_KNOWN'
+                      ? 'Step 1/3: Checking remembered Branch Hubs (Primary / Backup / Till)...'
+                      : hubSecurity.discoveryStage === 'MDNS'
+                      ? `Step 2/3: Resolving mDNS hostname (${hubSecurity.mdnsHost || '.local'})...`
+                      : hubSecurity.discoveryStage === 'HOTSPOT_PROBE'
+                      ? 'Step 3/3: Probing hotspot & router gateways (/health)...'
+                      : 'Step 3/3: Scanning local Wi-Fi subnet for Active Branch Hub...'}
                   </p>
                 </div>
               </div>
+            )}
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                <div className="sm:col-span-2">
-                  <label htmlFor="hub-url-input" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
-                    Hub IP or WebSocket URL
-                  </label>
-                  <input
-                    id="hub-url-input"
-                    type="text"
-                    value={hubUrlInput}
-                    onChange={(e) => setHubUrlInput(e.target.value)}
-                    placeholder="ws://192.168.43.1:8080"
-                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                  />
-                </div>
-                <div>
-                  <label htmlFor="hub-pair-code-input" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
-                    6-Digit Code (Optional)
-                  </label>
-                  <input
-                    id="hub-pair-code-input"
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={8}
-                    value={pairCodeInput}
-                    onChange={(e) => setPairCodeInput(e.target.value.replace(/[^0-9A-Za-z-]/g, ''))}
-                    placeholder="e.g. 482917"
-                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs font-mono tracking-widest text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={handleStartSecurePairing}
-                  className="flex-1 sm:flex-none text-xs font-black px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white transition active:scale-95 shadow flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  <ShieldCheck className="w-3.5 h-3.5" />
-                  <span>{pairCodeInput.trim() ? 'Pair with Code' : 'Pair & Approve on Hub'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleApplyUrl()}
-                  className="flex-1 sm:flex-none text-xs font-bold px-3.5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition active:scale-95 shadow cursor-pointer"
-                  title="Connect directly (uses saved key if paired, or open Termux backup mode)"
-                >
-                  Connect / Termux Backup
-                </button>
-                <button
-                  type="button"
-                  onClick={handleTestConnection}
-                  disabled={isTesting}
-                  className="text-xs font-bold px-3 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition active:scale-95 disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  {isTesting ? (
-                    <>
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                      <span>Testing...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Activity className="w-3.5 h-3.5 text-indigo-400" />
-                      <span>Test</span>
-                    </>
-                  )}
-                </button>
-              </div>
-
-              {/* Quick Preset Buttons */}
-              <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mr-1">
-                  Presets:
-                </span>
-                {[
-                  'ws://192.168.43.1:8080',
-                  'ws://192.168.1.100:8080',
-                  'ws://10.0.0.1:8080',
-                  'ws://localhost:8080',
-                ].map((preset) => (
-                  <button
-                    key={preset}
-                    type="button"
-                    onClick={() => {
-                      setHubUrlInput(preset);
-                      handleApplyUrl(preset);
-                    }}
-                    className="text-[10px] font-mono px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800 transition cursor-pointer"
-                  >
-                    {preset}
-                  </button>
-                ))}
-              </div>
-
-              {/* Test Result Display */}
-              {testResult && (
-                <div
-                  className={`p-3 rounded-xl border text-xs flex items-start gap-2.5 ${
-                    testResult.success
-                      ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-200'
-                      : 'bg-rose-500/15 border-rose-500/30 text-rose-200'
-                  }`}
-                >
-                  {testResult.success ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                  ) : (
-                    <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                  )}
+            {/* Saved Branch Hubs (Multi-Branch & Wi-Fi IP Roaming Manager — Keyed by hubId) */}
+            {pairedHubs.length > 0 && (
+              <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <p className="font-bold">
-                      {testResult.success
-                        ? `Connection Successful! Latency: ${testResult.latencyMs}ms`
-                        : 'Connection Test Failed'}
-                    </p>
-                    <p className="text-[11px] opacity-90 mt-0.5">
-                      {testResult.success
-                        ? 'The Local Hub responded promptly. Real-time master-spoke sync is functional.'
-                        : testResult.error}
+                    <h3 className="text-xs font-black uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
+                      <Building2 className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Paired Branch Hubs ({pairedHubs.length})</span>
+                    </h3>
+                    <p className="text-[10px] text-slate-400 mt-0.5">
+                      Credentials are keyed by Hub ID — Wi-Fi &amp; hotspot IP changes reconnect automatically without re-pairing.
                     </p>
                   </div>
-                </div>
-              )}
-            </div>
-
-            {/* Saved Branch Hubs (Multi-Branch Roaming Manager) */}
-            {pairedHubs.length > 0 && (
-              <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
-                    <Building2 className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Paired Branch Hubs ({pairedHubs.length})</span>
-                  </h3>
-                  <span className="text-[10px] text-slate-500">Auto-authenticates when roaming</span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={handleFindHubOnWifi}
+                      disabled={hubSecurity.isDiscovering}
+                      className="text-[11px] font-bold px-2.5 py-1.5 rounded-xl bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/35 transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                      title="Scan mDNS, hotspot gateways, and local Wi-Fi subnet for your paired Hub"
+                    >
+                      <Wifi className={`w-3.5 h-3.5 ${hubSecurity.isDiscovering ? 'animate-pulse' : ''}`} />
+                      <span>{hubSecurity.isDiscovering ? 'Scanning...' : 'Find Hub on Wi-Fi'}</span>
+                    </button>
+                    {!hubSecurity.wasRevoked && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const next = !showPairDifferentHub;
+                          setShowPairDifferentHub(next);
+                          if (!next) stopCamera();
+                        }}
+                        className="text-[11px] font-bold px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition cursor-pointer"
+                      >
+                        {showPairDifferentHub ? 'Hide Pairing' : 'Pair Different Hub'}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="space-y-2">
                   {pairedHubs.map((hub) => {
@@ -845,12 +869,32 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                             <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
                               {hub.branchId}
                             </span>
+                            {hub.hubRole && (
+                              <span
+                                className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-bold ${
+                                  hub.hubRole === 'PRIMARY'
+                                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                    : hub.hubRole === 'BACKUP'
+                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                    : 'bg-sky-500/20 text-sky-300 border border-sky-500/30'
+                                }`}
+                              >
+                                {hub.hubRole.replace('_', ' ')}
+                                {hub.hubPriority !== undefined ? ` P${hub.hubPriority}` : ''}
+                              </span>
+                            )}
+                            {hub.lastEpoch !== undefined && (
+                              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-slate-800/90 text-slate-300">
+                                E{hub.lastEpoch}
+                              </span>
+                            )}
                             <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">
                               {hub.hubRuntime === 'ANDROID_APK' ? 'APK' : hub.hubRuntime === 'TERMUX' ? 'TERMUX' : 'HUB'}
                             </span>
                           </div>
                           <p className="text-[10px] font-mono text-slate-400 truncate mt-0.5">
-                            {hub.wsUrl} • {hub.hubId}
+                            {hub.hubId} • IP: {hub.lastKnownHost || hub.wsUrl}
+                            {hub.mdnsHost ? ` • mDNS: ${hub.mdnsHost}` : ''}
                           </p>
                         </div>
                         <div className="flex items-center gap-1.5 shrink-0">
@@ -880,75 +924,222 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               </div>
             )}
 
-            {/* Optional Fallback: Camera QR Scanner (Collapsed by default so Desktops stay clean) */}
-            <div className="p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
-              <button
-                type="button"
-                onClick={() => {
-                  const next = !showQrFallback;
-                  setShowQrFallback(next);
-                  if (!next) stopCamera();
-                }}
-                className="w-full flex items-center justify-between text-left cursor-pointer"
-              >
-                <div className="flex items-center gap-2">
-                  <Camera className="w-3.5 h-3.5 text-slate-400" />
-                  <span className="text-xs font-bold text-slate-300">
-                    Optional: Scan Hub QR Code (Mobile Camera)
-                  </span>
-                </div>
-                {showQrFallback ? (
-                  <ChevronUp className="w-4 h-4 text-slate-400" />
-                ) : (
-                  <ChevronDown className="w-4 h-4 text-slate-400" />
-                )}
-              </button>
-
-              {showQrFallback && (
-                <div className="space-y-3 pt-1 border-t border-slate-800/80">
+            {/* Pairing UI (Manual Pair Code & Optional QR): Shown ONLY for new devices, revoked devices, unpaired active leaders, or when operator explicitly taps "Pair Different Hub" */}
+            {(!hubSecurity.hasPairedHubs || hubSecurity.wasRevoked || showPairDifferentHub || Boolean(hubSecurity.pendingPair) || Boolean(hubSecurity.unpairedActiveLeader)) && (
+              <>
+                <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
                   <div className="flex items-center justify-between gap-2">
-                    <p className="text-[11px] text-slate-400">
-                      Tip: You can also scan the Hub QR using your phone&apos;s built-in camera app to auto-pair without browser camera permissions.
-                    </p>
-                    {!isScanning ? (
-                      <button
-                        type="button"
-                        onClick={startCamera}
-                        className="text-xs font-bold px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white shadow transition flex items-center gap-1.5 shrink-0 active:scale-95 cursor-pointer"
-                      >
-                        <Camera className="w-3.5 h-3.5" />
-                        <span>Open Camera</span>
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={stopCamera}
-                        className="text-xs font-bold px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white shadow transition flex items-center gap-1.5 shrink-0 active:scale-95 cursor-pointer"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                        <span>Stop Camera</span>
-                      </button>
-                    )}
-                  </div>
-
-                  {cameraError && (
-                    <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2">
-                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-                      <span>{cameraError}</span>
-                    </div>
-                  )}
-
-                  {isScanning && (
-                    <div className="relative overflow-hidden rounded-2xl border-2 border-dashed border-indigo-500/50 bg-black flex flex-col items-center justify-center p-2 min-h-[220px]">
-                      <div id={scannerRegionId} className="w-full max-w-[280px]" />
-                      <p className="text-[11px] text-slate-400 mt-2 font-medium animate-pulse">
-                        Scanning for Local Hub QR code...
+                    <div>
+                      <h3 className="text-xs font-black uppercase tracking-wider text-slate-200 flex items-center gap-1.5">
+                        <KeyRound className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>
+                          {hubSecurity.wasRevoked
+                            ? 'Re-Pair Revoked Terminal'
+                            : hubSecurity.hasPairedHubs
+                            ? 'Pair a Different Local Hub (No Camera Needed)'
+                            : 'Connect or Pair Local Hub (No Camera Needed)'}
+                        </span>
+                      </h3>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        Works on Desktop PCs &amp; Mobile. Enter Hub IP + 6-digit code, or leave code blank to approve on the Hub screen.
                       </p>
                     </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div className="sm:col-span-2">
+                      <label htmlFor="hub-url-input" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                        Hub IP or WebSocket URL
+                      </label>
+                      <input
+                        id="hub-url-input"
+                        type="text"
+                        value={hubUrlInput}
+                        onChange={(e) => setHubUrlInput(e.target.value)}
+                        placeholder="ws://192.168.43.1:8080"
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs font-mono text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="hub-pair-code-input" className="block text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">
+                        6-Digit Code (Optional)
+                      </label>
+                      <input
+                        id="hub-pair-code-input"
+                        type="text"
+                        inputMode="numeric"
+                        maxLength={8}
+                        value={pairCodeInput}
+                        onChange={(e) => setPairCodeInput(e.target.value.replace(/[^0-9A-Za-z-]/g, ''))}
+                        placeholder="e.g. 482917"
+                        className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3.5 py-2.5 text-xs font-mono tracking-widest text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={handleStartSecurePairing}
+                      className="flex-1 sm:flex-none text-xs font-black px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white transition active:scale-95 shadow flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      <span>{pairCodeInput.trim() ? 'Pair with Code' : 'Pair & Approve on Hub'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleApplyUrl()}
+                      className="flex-1 sm:flex-none text-xs font-bold px-3.5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white transition active:scale-95 shadow cursor-pointer"
+                      title="Connect directly (uses saved key if paired, or open Termux backup mode)"
+                    >
+                      Connect / Termux Backup
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleTestConnection}
+                      disabled={isTesting}
+                      className="text-xs font-bold px-3 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition active:scale-95 disabled:opacity-50 flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      {isTesting ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                          <span>Testing...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Activity className="w-3.5 h-3.5 text-indigo-400" />
+                          <span>Test</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  {/* Quick Preset Buttons */}
+                  <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                    <span className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mr-1">
+                      Presets:
+                    </span>
+                    {[
+                      'ws://192.168.43.1:8080',
+                      'ws://192.168.1.100:8080',
+                      'ws://10.0.0.1:8080',
+                      'ws://localhost:8080',
+                    ].map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        onClick={() => {
+                          setHubUrlInput(preset);
+                          handleApplyUrl(preset);
+                        }}
+                        className="text-[10px] font-mono px-2 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-800 transition cursor-pointer"
+                      >
+                        {preset}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Test Result Display */}
+                  {testResult && (
+                    <div
+                      className={`p-3 rounded-xl border text-xs flex items-start gap-2.5 ${
+                        testResult.success
+                          ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-200'
+                          : 'bg-rose-500/15 border-rose-500/30 text-rose-200'
+                      }`}
+                    >
+                      {testResult.success ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                      ) : (
+                        <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                      )}
+                      <div>
+                        <p className="font-bold">
+                          {testResult.success
+                            ? `Connection Successful! Latency: ${testResult.latencyMs}ms`
+                            : 'Connection Test Failed'}
+                        </p>
+                        <p className="text-[11px] opacity-90 mt-0.5">
+                          {testResult.success
+                            ? 'The Local Hub responded promptly. Real-time master-spoke sync is functional.'
+                            : testResult.error}
+                        </p>
+                      </div>
+                    </div>
                   )}
                 </div>
-              )}
-            </div>
+
+                {/* Optional Fallback: Camera QR Scanner (Collapsed by default so Desktops stay clean) */}
+                <div className="p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800 space-y-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = !showQrFallback;
+                      setShowQrFallback(next);
+                      if (!next) stopCamera();
+                    }}
+                    className="w-full flex items-center justify-between text-left cursor-pointer"
+                  >
+                    <div className="flex items-center gap-2">
+                      <Camera className="w-3.5 h-3.5 text-slate-400" />
+                      <span className="text-xs font-bold text-slate-300">
+                        Optional: Scan Hub QR Code (Mobile Camera)
+                      </span>
+                    </div>
+                    {showQrFallback ? (
+                      <ChevronUp className="w-4 h-4 text-slate-400" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4 text-slate-400" />
+                    )}
+                  </button>
+
+                  {showQrFallback && (
+                    <div className="space-y-3 pt-1 border-t border-slate-800/80">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[11px] text-slate-400">
+                          Tip: You can also scan the Hub QR using your phone&apos;s built-in camera app to auto-pair without browser camera permissions.
+                        </p>
+                        {!isScanning ? (
+                          <button
+                            type="button"
+                            onClick={startCamera}
+                            className="text-xs font-bold px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white shadow transition flex items-center gap-1.5 shrink-0 active:scale-95 cursor-pointer"
+                          >
+                            <Camera className="w-3.5 h-3.5" />
+                            <span>Open Camera</span>
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={stopCamera}
+                            className="text-xs font-bold px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white shadow transition flex items-center gap-1.5 shrink-0 active:scale-95 cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                            <span>Stop Camera</span>
+                          </button>
+                        )}
+                      </div>
+
+                      {cameraError && (
+                        <div className="p-2.5 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs flex items-center gap-2">
+                          <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                          <span>{cameraError}</span>
+                        </div>
+                      )}
+
+                      {isScanning && (
+                        <div className="relative overflow-hidden rounded-2xl border-2 border-dashed border-indigo-500/50 bg-black flex flex-col items-center justify-center p-2 min-h-[220px]">
+                          <div id={scannerRegionId} className="w-full max-w-[280px]" />
+                          <p className="text-[11px] text-slate-400 mt-2 font-medium animate-pulse">
+                            Scanning for Local Hub QR code...
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
 
             {/* Force Local Hub Toggle */}
             <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 flex items-center justify-between gap-4">

@@ -1,7 +1,12 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Suspense } from 'react';
 import { Radio, RefreshCw, X } from 'lucide-react';
 import { meshSyncService, MeshConnectionMode } from '../../services/meshSyncService';
-import { LocalHubSettingsModal } from '../sync/LocalHubSettingsModal';
+import { lazyWithRetry } from '../../utils/lazyWithRetry';
+
+const LocalHubSettingsModal = lazyWithRetry(
+  () => import('../sync/LocalHubSettingsModal').then((m) => ({ default: m.LocalHubSettingsModal })),
+  'LocalHubSettingsModal'
+);
 
 interface OfflineIndicatorProps {
   isSimulatedOffline?: boolean;
@@ -103,12 +108,14 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
   // If fully online in Cloud Mesh and no simulation, banner is not needed
   const isOnlineCloud = isBrowserOnline && !isSimulatedOffline && connMode === 'CLOUD_MESH';
   if (isOnlineCloud || dismissed) {
-    return (
-      <LocalHubSettingsModal
-        isOpen={isModalOpen}
-        onClose={() => setIsModalOpen(false)}
-      />
-    );
+    return isModalOpen ? (
+      <Suspense fallback={null}>
+        <LocalHubSettingsModal
+          isOpen={isModalOpen}
+          onClose={() => setIsModalOpen(false)}
+        />
+      </Suspense>
+    ) : null;
   }
 
   // 1. Alert Once Banner (Toast / Dynamics 365 style):
@@ -157,10 +164,14 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
           </div>
         </aside>
 
-        <LocalHubSettingsModal
-          isOpen={isModalOpen}
-          onClose={() => setIsModalOpen(false)}
-        />
+        {isModalOpen && (
+          <Suspense fallback={null}>
+            <LocalHubSettingsModal
+              isOpen={isModalOpen}
+              onClose={() => setIsModalOpen(false)}
+            />
+          </Suspense>
+        )}
       </>
     );
   }
@@ -214,10 +225,14 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
           </div>
         </aside>
 
-        <LocalHubSettingsModal
-          isOpen={isModalOpen}
-          onClose={() => setIsModalOpen(false)}
-        />
+        {isModalOpen && (
+          <Suspense fallback={null}>
+            <LocalHubSettingsModal
+              isOpen={isModalOpen}
+              onClose={() => setIsModalOpen(false)}
+            />
+          </Suspense>
+        )}
       </>
     );
   }
@@ -225,20 +240,12 @@ export const OfflineIndicator: React.FC<OfflineIndicatorProps> = ({
   // 3. Silent Reconnect Grace Period:
   // If disconnected but under 2 minutes (not marked as isLocalHubLost), show NO banner.
   // The app silently reconnects in the background without disturbing the cashier or cashier UI.
-  if (connDetails.isReconnecting || !connDetails.isLocalHubLost) {
-    return (
+  return isModalOpen ? (
+    <Suspense fallback={null}>
       <LocalHubSettingsModal
         isOpen={isModalOpen}
         onClose={() => setIsModalOpen(false)}
       />
-    );
-  }
-
-  // Fallback modal container
-  return (
-    <LocalHubSettingsModal
-      isOpen={isModalOpen}
-      onClose={() => setIsModalOpen(false)}
-    />
-  );
+    </Suspense>
+  ) : null;
 };

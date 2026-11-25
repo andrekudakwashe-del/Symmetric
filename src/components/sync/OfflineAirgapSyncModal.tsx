@@ -17,7 +17,7 @@ import {
   Zap,
   Flashlight,
 } from 'lucide-react';
-import { Html5Qrcode } from 'html5-qrcode';
+import type { Html5Qrcode } from 'html5-qrcode';
 import { meshSyncService } from '../../services/meshSyncService';
 import { getSales } from '../../db/roomDatabase';
 import { OfflineQRCode } from '../common/OfflineQRCode';
@@ -135,6 +135,7 @@ export const OfflineAirgapSyncModal: React.FC<OfflineAirgapSyncModalProps> = ({
         } catch (e) {}
       }
 
+      const { Html5Qrcode } = await import('html5-qrcode');
       const qr = new Html5Qrcode(qrRegionId, {
         useBarCodeDetectorIfSupported: false,
         verbose: false,

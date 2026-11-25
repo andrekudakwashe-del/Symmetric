@@ -56,7 +56,7 @@ export interface TenantContextRecord {
 }
 
 export const IDB_NAME = 'saimetric_cash_db';
-export const CURRENT_IDB_SCHEMA_VERSION = 6; // Incremented for deleted_records tombstone store
+export const CURRENT_IDB_SCHEMA_VERSION = 7; // v7: Sharded high-volume stores (sales, inventoryItems, cashLogs, stockMovements)
 export const CURRENT_SAAS_SCHEMA_VERSION = 1; // Master SaaS schema version from backend
 
 export const IDB_STORES: Record<string, StoreDefinition> = {
@@ -140,6 +140,53 @@ export const IDB_STORES: Record<string, StoreDefinition> = {
   meta: {
     keyPath: 'key',
     indexes: [],
+  },
+  // Phase 2B: Dedicated sharded high-volume stores eliminating monolithic meta JSON re-writes
+  sales: {
+    keyPath: 'id',
+    indexes: [
+      { name: 'company_id', keyPath: 'company_id', options: { unique: false } },
+      { name: 'branch_id', keyPath: 'branch_id', options: { unique: false } },
+      { name: 'date', keyPath: 'date', options: { unique: false } },
+      { name: 'staffId', keyPath: 'staffId', options: { unique: false } },
+      { name: 'status', keyPath: 'status', options: { unique: false } },
+      { name: 'lastUpdated', keyPath: 'lastUpdated', options: { unique: false } },
+      { name: 'company_branch', keyPath: ['company_id', 'branch_id'], options: { unique: false } },
+    ],
+  },
+  inventoryItems: {
+    keyPath: 'itemId',
+    indexes: [
+      { name: 'company_id', keyPath: 'company_id', options: { unique: false } },
+      { name: 'branch_id', keyPath: 'branch_id', options: { unique: false } },
+      { name: 'sku', keyPath: 'sku', options: { unique: false } },
+      { name: 'category', keyPath: 'category', options: { unique: false } },
+      { name: 'lastUpdated', keyPath: 'lastUpdated', options: { unique: false } },
+      { name: 'company_branch', keyPath: ['company_id', 'branch_id'], options: { unique: false } },
+    ],
+  },
+  cashLogs: {
+    keyPath: 'id',
+    indexes: [
+      { name: 'company_id', keyPath: 'company_id', options: { unique: false } },
+      { name: 'branch_id', keyPath: 'branch_id', options: { unique: false } },
+      { name: 'date', keyPath: 'date', options: { unique: false } },
+      { name: 'staffId', keyPath: 'staffId', options: { unique: false } },
+      { name: 'status', keyPath: 'status', options: { unique: false } },
+      { name: 'lastUpdated', keyPath: 'lastUpdated', options: { unique: false } },
+      { name: 'company_branch', keyPath: ['company_id', 'branch_id'], options: { unique: false } },
+    ],
+  },
+  stockMovements: {
+    keyPath: 'id',
+    indexes: [
+      { name: 'company_id', keyPath: 'company_id', options: { unique: false } },
+      { name: 'branch_id', keyPath: 'branch_id', options: { unique: false } },
+      { name: 'date', keyPath: 'date', options: { unique: false } },
+      { name: 'itemId', keyPath: 'itemId', options: { unique: false } },
+      { name: 'type', keyPath: 'type', options: { unique: false } },
+      { name: 'company_branch', keyPath: ['company_id', 'branch_id'], options: { unique: false } },
+    ],
   },
 };
 
@@ -737,3 +784,209 @@ export async function purgeTenantContextCredentials(company_id?: string): Promis
     console.warn('[IDB] Failed to purge tenantContext credentials:', err);
   }
 }
+
+// ==================== PHASE 2B: SHARDED HIGH-VOLUME STORES & DELTA SYNC ====================
+
+export type ShardedStoreName = 'sales' | 'inventoryItems' | 'cashLogs' | 'stockMovements';
+
+const shardedStampCaches = new Map<ShardedStoreName, Map<string, string>>();
+const shardedWriteChains = new Map<ShardedStoreName, Promise<any>>();
+
+const getKeyPathForShardedStore = (storeName: ShardedStoreName): string =>
+  storeName === 'inventoryItems' ? 'itemId' : 'id';
+
+export const normalizeShardedRecord = (storeName: ShardedStoreName, raw: any): any | null => {
+  if (!raw || typeof raw !== 'object') return null;
+  const company_id = String(raw.company_id || raw.companyId || 'COMP-001').trim();
+  const branch_id = String(raw.branch_id || raw.branchId || 'ALL').trim();
+
+  if (storeName === 'inventoryItems') {
+    const itemId = String(raw.itemId || raw.id || '').trim();
+    if (!itemId) return null;
+    if (
+      raw.itemId === itemId &&
+      raw.company_id === company_id &&
+      raw.branch_id === branch_id
+    ) {
+      return raw;
+    }
+    return { ...raw, itemId, company_id, branch_id };
+  }
+
+  const id = String(raw.id || '').trim();
+  if (!id) return null;
+  if (raw.id === id && raw.company_id === company_id && raw.branch_id === branch_id) {
+    return raw;
+  }
+  return { ...raw, id, company_id, branch_id };
+};
+
+/**
+ * Fast deterministic stamp covering mutating fields so unchanged rows never get re-written to IndexedDB.
+ */
+export const computeShardedRecordStamp = (rec: any): string => {
+  if (!rec || typeof rec !== 'object') return '';
+  const ts = rec.lastUpdated || rec.updatedAt || rec.timestamp || rec.version || '';
+  const status = rec.status || '';
+  const qty =
+    rec.stockQuantity ?? rec.quantity ?? rec.qtyChange ?? rec.amount ?? rec.totalAmount ?? '';
+  const cases = rec.stockCases ?? '';
+  const price = rec.price ?? rec.sellingPrice ?? rec.costPrice ?? '';
+  const syncFlag = `${rec.synced ?? ''}_${rec.cloudSynced ?? ''}_${rec.syncedToCloud ?? ''}_${rec.hubSynced ?? ''}`;
+  const flags = `${rec.voided ?? ''}_${rec.isDeleted ?? ''}_${rec.deleted ?? ''}`;
+  const itemsLen = Array.isArray(rec.items) ? rec.items.length : 0;
+  const keysLen = Object.keys(rec).length;
+  return `${ts}|${status}|${qty}|${cases}|${price}|${syncFlag}|${flags}|${itemsLen}|${keysLen}|${rec.name || rec.itemName || ''}|${rec.barcode || ''}|${rec.customerName || ''}|${rec.notes || ''}`;
+};
+
+export const seedShardedDeltaCache = (storeName: ShardedStoreName, records: any[]): void => {
+  const keyField = getKeyPathForShardedStore(storeName);
+  const nextMap = new Map<string, string>();
+  for (const r of records) {
+    if (!r || typeof r !== 'object') continue;
+    const id = String(r[keyField] || r.id || '').trim();
+    if (!id) continue;
+    nextMap.set(id, computeShardedRecordStamp(r));
+  }
+  shardedStampCaches.set(storeName, nextMap);
+};
+
+export async function loadShardedCollection<T = any>(
+  storeName: ShardedStoreName,
+  seedDelta: boolean = true
+): Promise<T[]> {
+  try {
+    const rows = await getAllFromIDBStore<T>(storeName);
+    if (seedDelta && Array.isArray(rows) && rows.length > 0) {
+      seedShardedDeltaCache(storeName, rows);
+    }
+    return rows || [];
+  } catch (err) {
+    console.warn(`[IDB] loadShardedCollection(${storeName}) failed:`, err);
+    return [];
+  }
+}
+
+/**
+ * Persists ONLY changed/inserted records and removed IDs for high-volume collections
+ * in a single atomic IndexedDB readwrite transaction, serialized per store.
+ */
+export function syncShardedCollectionDelta(
+  storeName: ShardedStoreName,
+  records: any[]
+): Promise<{ putCount: number; deleteCount: number }> {
+  const prevChain = shardedWriteChains.get(storeName) || Promise.resolve();
+  const nextRun = prevChain
+    .catch(() => {})
+    .then(async (): Promise<{ putCount: number; deleteCount: number }> => {
+      if (!Array.isArray(records)) return { putCount: 0, deleteCount: 0 };
+
+      const db = await initIndexedDB();
+      if (!db || !db.objectStoreNames.contains(storeName)) {
+        return { putCount: 0, deleteCount: 0 };
+      }
+
+      const keyField = getKeyPathForShardedStore(storeName);
+      let prevMap = shardedStampCaches.get(storeName);
+
+      // If cache is cold, read existing keys+stamps from IDB once so deletes are exact and redundant puts skipped
+      if (!prevMap) {
+        prevMap = new Map<string, string>();
+        try {
+          const existing = await getAllFromIDBStore<any>(storeName);
+          for (const item of existing) {
+            const k = String(item?.[keyField] || '').trim();
+            if (k) prevMap.set(k, computeShardedRecordStamp(item));
+          }
+        } catch {
+          // Proceed with empty map -> upserts all current records
+        }
+      }
+
+      const nextMap = new Map<string, string>();
+      const toPut: any[] = [];
+      const toDelete: string[] = [];
+
+      for (const raw of records) {
+        const normalized = normalizeShardedRecord(storeName, raw);
+        if (!normalized) continue;
+        const key = String(normalized[keyField]);
+        const stamp = computeShardedRecordStamp(normalized);
+        nextMap.set(key, stamp);
+        if (prevMap.get(key) !== stamp) {
+          toPut.push(normalized);
+        }
+      }
+
+      for (const oldKey of prevMap.keys()) {
+        if (!nextMap.has(oldKey)) {
+          toDelete.push(oldKey);
+        }
+      }
+
+      shardedStampCaches.set(storeName, nextMap);
+
+      if (toPut.length === 0 && toDelete.length === 0) {
+        return { putCount: 0, deleteCount: 0 };
+      }
+
+      return await new Promise<{ putCount: number; deleteCount: number }>((resolve) => {
+        try {
+          const tx = db.transaction(storeName, 'readwrite');
+          const store = tx.objectStore(storeName);
+          for (const rec of toPut) {
+            store.put(rec);
+          }
+          for (const delId of toDelete) {
+            store.delete(delId);
+          }
+          tx.oncomplete = () => resolve({ putCount: toPut.length, deleteCount: toDelete.length });
+          tx.onerror = () => resolve({ putCount: 0, deleteCount: 0 });
+        } catch {
+          resolve({ putCount: 0, deleteCount: 0 });
+        }
+      });
+    });
+
+  shardedWriteChains.set(storeName, nextRun);
+  return nextRun;
+}
+
+export async function queryShardedByCompanyBranch<T = any>(
+  storeName: ShardedStoreName,
+  companyId: string,
+  branchId: string
+): Promise<T[]> {
+  try {
+    const res = await executeTx<T[]>(storeName, 'readonly', (store) => {
+      if (store.indexNames.contains('company_branch')) {
+        const idx = store.index('company_branch');
+        return idx.getAll([companyId, branchId]);
+      }
+      return store.getAll();
+    });
+    return res || [];
+  } catch (err) {
+    console.warn(`[IDB] queryShardedByCompanyBranch(${storeName}) error:`, err);
+    return [];
+  }
+}
+
+export async function queryShardedByDate<T = any>(
+  storeName: ShardedStoreName,
+  date: string
+): Promise<T[]> {
+  try {
+    const res = await executeTx<T[]>(storeName, 'readonly', (store) => {
+      if (store.indexNames.contains('date')) {
+        return store.index('date').getAll(date);
+      }
+      return store.getAll();
+    });
+    return res || [];
+  } catch (err) {
+    console.warn(`[IDB] queryShardedByDate(${storeName}) error:`, err);
+    return [];
+  }
+}
+

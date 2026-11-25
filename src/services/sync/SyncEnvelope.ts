@@ -27,6 +27,9 @@ export type ReconPacketType =
   | 'SYNC_ID_DIGEST_RESPONSE'
   | 'RECON_BACKFILL_PAYLOAD'
   | 'RECON_PUSH_BACKFILL_REQUEST'
+  | 'RECON_PUSH_CHUNK_COMPLETE'
+  | 'RECON_PUSH_CHUNK_ACK'
+  | 'HUB_ROLE_STATUS'
   | 'HUB_CLOUD_BROADCAST';
 
 export interface EntitySnapshot {
@@ -79,6 +82,8 @@ export interface TransactionsDigestResult {
 export interface ReconSweepTriggerPacket {
   type: 'RECON_SWEEP_TRIGGER';
   sweepId: string;
+  isColdHub?: boolean;
+  pushChunkSize?: number;
   targetEntities: string[];
   dateRange?: { start?: string; end?: string };
   hubTimestamp: number;
@@ -120,6 +125,8 @@ export interface ReconPushBackfillRequestPacket {
   sweepId?: string;
   entityType: string;
   missingIds: string[];
+  pushChunkSize?: number;
+  isColdHub?: boolean;
   hubTimestamp?: number;
   originDeviceId?: string;
 }

@@ -12,7 +12,7 @@ interface ProductGestureListRowProps {
   onRequestRemove: (product: Product) => void;
 }
 
-export const ProductGestureListRow: React.FC<ProductGestureListRowProps> = ({
+const ProductGestureListRowComponent: React.FC<ProductGestureListRowProps> = ({
   product,
   quantityInCart,
   avatarBg,
@@ -255,3 +255,5 @@ export const ProductGestureListRow: React.FC<ProductGestureListRowProps> = ({
     </div>
   );
 };
+
+export const ProductGestureListRow = React.memo(ProductGestureListRowComponent);

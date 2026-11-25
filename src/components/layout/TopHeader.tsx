@@ -1,5 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, Suspense } from 'react';
 import { Salesperson, ActiveTab } from '../../types';
+import { lazyWithRetry } from '../../utils/lazyWithRetry';
 import {
   Cloud,
   CloudOff,
@@ -29,10 +30,17 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { PWAInstallButton } from '../pwa/PWAInstallButton';
-import { ShareDeviceModal } from '../common/ShareDeviceModal';
 import { meshSyncService, MeshConnectionMode } from '../../services/meshSyncService';
-import { LocalHubSettingsModal } from '../sync/LocalHubSettingsModal';
 import { TenantBranchSwitcher } from '../admin/TenantBranchSwitcher';
+
+const ShareDeviceModal = lazyWithRetry(
+  () => import('../common/ShareDeviceModal').then((m) => ({ default: m.ShareDeviceModal })),
+  'ShareDeviceModal'
+);
+const LocalHubSettingsModal = lazyWithRetry(
+  () => import('../sync/LocalHubSettingsModal').then((m) => ({ default: m.LocalHubSettingsModal })),
+  'LocalHubSettingsModal'
+);
 import { persistentSyncEngine, SyncQueueStats } from '../../services/persistentSyncEngine';
 import { getCurrentCompany } from '../../db/roomDatabase';
 import { getTenantBackendConfig, getBackendAdapter } from '../../services/backendAdapter/adapterRegistry';
@@ -746,16 +754,24 @@ export const TopHeader: React.FC<TopHeaderProps> = ({
       )}
 
       {/* Share / Connect Other Devices Modal */}
-      <ShareDeviceModal
-        isOpen={showShareModal}
-        onClose={() => setShowShareModal(false)}
-      />
+      {showShareModal && (
+        <Suspense fallback={null}>
+          <ShareDeviceModal
+            isOpen={showShareModal}
+            onClose={() => setShowShareModal(false)}
+          />
+        </Suspense>
+      )}
 
       {/* Local WebSocket Hub Settings & QR Scanner Modal */}
-      <LocalHubSettingsModal
-        isOpen={isLocalHubModalOpen}
-        onClose={() => setIsLocalHubModalOpen(false)}
-      />
+      {isLocalHubModalOpen && (
+        <Suspense fallback={null}>
+          <LocalHubSettingsModal
+            isOpen={isLocalHubModalOpen}
+            onClose={() => setIsLocalHubModalOpen(false)}
+          />
+        </Suspense>
+      )}
     </>
   );
 };

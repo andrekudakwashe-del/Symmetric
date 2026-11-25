@@ -20,15 +20,11 @@ import {
 import { AndroidStatusBar } from './components/layout/AndroidStatusBar';
 import { TopHeader } from './components/layout/TopHeader';
 import { BottomNavigation } from './components/layout/BottomNavigation';
-import { LoginScreen } from './components/auth/LoginScreen';
-import { TrialExpiredLockScreen } from './components/auth/TrialExpiredLockScreen';
-import { HomeDashboard } from './components/dashboard/HomeDashboard';
 import { getActiveCartItemCount, subscribeToPOSCart } from './utils/posCartStorage';
 import { historyNavigationService } from './services/historyNavigationService';
 import { OfflineIndicator } from './components/pwa/OfflineIndicator';
 import { SyncProgressIndicator } from './components/common/SyncProgressIndicator';
-import { ExchangeRatesModal } from './components/common/ExchangeRatesModal';
-import { SuperAdminDashboard } from './components/admin/SuperAdminDashboard';
+import { ModuleErrorBoundary } from './components/common/ModuleErrorBoundary';
 import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield, X } from 'lucide-react';
 import { initializeSystemConfigAndSync, fetchGlobalSystemConfig } from './services/systemConfig';
 import { persistentSyncEngine } from './services/persistentSyncEngine';
@@ -43,8 +39,16 @@ import { isTabAllowedUnderLockdownOrStocktake } from './services/stocktakeAccess
 import { prefetchAppModules } from './services/modulePrefetcher';
 import { lazyWithRetry } from './utils/lazyWithRetry';
 import { isDeviceTimeAutomatic } from './utils/clockSecurity';
+import type { ActiveLeaderInfo } from './utils/localHubConfig';
+import type { ColdHubHydrationProgress } from './services/sync/coldHubHydrationQueue';
 
 // Resilient lazy-loaded operational & admin modules (dramatically reduces initial startup payload)
+const LoginScreen = lazyWithRetry(() => import('./components/auth/LoginScreen').then(m => ({ default: m.LoginScreen })), 'LoginScreen');
+const HomeDashboard = lazyWithRetry(() => import('./components/dashboard/HomeDashboard').then(m => ({ default: m.HomeDashboard })), 'HomeDashboard');
+const TrialExpiredLockScreen = lazyWithRetry(() => import('./components/auth/TrialExpiredLockScreen').then(m => ({ default: m.TrialExpiredLockScreen })), 'TrialExpiredLockScreen');
+const ExchangeRatesModal = lazyWithRetry(() => import('./components/common/ExchangeRatesModal').then(m => ({ default: m.ExchangeRatesModal })), 'ExchangeRatesModal');
+const SuperAdminDashboard = lazyWithRetry(() => import('./components/admin/SuperAdminDashboard').then(m => ({ default: m.SuperAdminDashboard })), 'SuperAdminDashboard');
+const LocalHubSettingsModal = lazyWithRetry(() => import('./components/sync/LocalHubSettingsModal').then(m => ({ default: m.LocalHubSettingsModal })), 'LocalHubSettingsModal');
 const POSRegister = lazyWithRetry(() => import('./components/pos/POSRegister').then(m => ({ default: m.POSRegister })), 'POSRegister');
 const POSOrdersHistory = lazyWithRetry(() => import('./components/pos/POSOrdersHistory').then(m => ({ default: m.POSOrdersHistory })), 'POSOrdersHistory');
 const CashBalancingModule = lazyWithRetry(() => import('./components/forms/CashBalancingModule').then(m => ({ default: m.CashBalancingModule })), 'CashBalancingModule');
@@ -130,6 +134,13 @@ export default function App() {
   const [editingReportTemplateId, setEditingReportTemplateId] = useState<string | null>(null);
   const [isHamburgerOpen, setIsHamburgerOpen] = useState(false);
   const [isPrinterModalOpen, setIsPrinterModalOpen] = useState(false);
+  const [unpairedActiveLeader, setUnpairedActiveLeader] = useState<ActiveLeaderInfo | null>(
+    () => meshSyncService.getHubSecurityStatus().unpairedActiveLeader || null
+  );
+  const [coldHydrationProgress, setColdHydrationProgress] = useState<ColdHubHydrationProgress | null>(
+    () => meshSyncService.getHubSecurityStatus().hydrationProgress || null
+  );
+  const [isFailoverPairModalOpen, setIsFailoverPairModalOpen] = useState(false);
 
   // Inactivity tracking state
   const lastActivityRef = useRef<number>(Date.now());
@@ -201,6 +212,37 @@ export default function App() {
     };
     window.addEventListener('saimetric_eod_completed', onEodDone);
     return () => window.removeEventListener('saimetric_eod_completed', onEodDone);
+  }, []);
+
+  // Listen to Local Hub IP roaming / security toast notifications (non-blocking)
+  useEffect(() => {
+    const onHubToast = (event: Event) => {
+      const detail = (event as CustomEvent<{ message?: string }>).detail;
+      if (detail?.message) {
+        showToastNotification(detail.message, 4500);
+      }
+    };
+    const onHubSecurityUpdated = (event: Event) => {
+      const detail = (event as CustomEvent<any>).detail;
+      if (detail) {
+        setUnpairedActiveLeader(detail.unpairedActiveLeader || null);
+        setColdHydrationProgress(detail.hydrationProgress || null);
+      }
+    };
+    const onUnpairedLeader = (event: Event) => {
+      const detail = (event as CustomEvent<ActiveLeaderInfo>).detail;
+      if (detail?.hubId) {
+        setUnpairedActiveLeader(detail);
+      }
+    };
+    window.addEventListener('saimetric_hub_toast', onHubToast);
+    window.addEventListener('saimetric_hub_security_updated', onHubSecurityUpdated);
+    window.addEventListener('saimetric_unpaired_leader_detected', onUnpairedLeader);
+    return () => {
+      window.removeEventListener('saimetric_hub_toast', onHubToast);
+      window.removeEventListener('saimetric_hub_security_updated', onHubSecurityUpdated);
+      window.removeEventListener('saimetric_unpaired_leader_detected', onUnpairedLeader);
+    };
   }, []);
 
   const handleOpenSuperAdmin = () => {
@@ -617,7 +659,11 @@ export default function App() {
           isOffline={isOfflineMode}
           onToggleOffline={() => setIsOfflineMode(!isOfflineMode)}
         />
-        <LoginScreen onLoginSuccess={handleLoginSuccess} lockoutMessage={lockoutMessage} />
+        <ModuleErrorBoundary moduleName="Login Screen">
+          <Suspense fallback={<ViewLoadingFallback />}>
+            <LoginScreen onLoginSuccess={handleLoginSuccess} lockoutMessage={lockoutMessage} />
+          </Suspense>
+        </ModuleErrorBoundary>
         <OfflineIndicator isSimulatedOffline={isOfflineMode} dockPosition="top" />
       </div>
     );
@@ -637,10 +683,14 @@ export default function App() {
           isOffline={isOfflineMode}
           onToggleOffline={() => setIsOfflineMode(!isOfflineMode)}
         />
-        <TrialExpiredLockScreen
-          onUnlockSuccess={() => setDbVersion((v) => v + 1)}
-          onLogout={() => handleLogout()}
-        />
+        <ModuleErrorBoundary moduleName="Subscription Lock">
+          <Suspense fallback={<ViewLoadingFallback />}>
+            <TrialExpiredLockScreen
+              onUnlockSuccess={() => setDbVersion((v) => v + 1)}
+              onLogout={() => handleLogout()}
+            />
+          </Suspense>
+        </ModuleErrorBoundary>
       </div>
     );
   }
@@ -806,7 +856,12 @@ export default function App() {
             </button>
           </div>
         ) : (
-          <Suspense fallback={<ViewLoadingFallback />}>
+          <ModuleErrorBoundary
+            key={activeTab}
+            moduleName={activeTab}
+            onReturnHome={() => setActiveTab('home')}
+          >
+            <Suspense fallback={<ViewLoadingFallback />}>
             {/* POS REGISTER WORKFLOW (Screens 1, 2, 3) */}
         {(activeTab === 'home' ||
           activeTab === 'pos' ||
@@ -1489,6 +1544,7 @@ export default function App() {
           <P2PMeshSyncHub onBack={() => setActiveTab('home')} />
         )}
           </Suspense>
+          </ModuleErrorBoundary>
         )}
       </main>
 
@@ -1524,22 +1580,27 @@ export default function App() {
         onOpenSuperAdmin={isSuperAdmin ? handleOpenSuperAdmin : undefined}
       />
 
-      {/* SaaS Multi-Tenant Management Dashboard (statically imported for instant 0ms opening without Suspense blank flash) */}
+      {/* SaaS Multi-Tenant Management Dashboard (lazy-loaded on demand) */}
       {isSuperAdmin && isSuperAdminModalOpen && (
-        <SuperAdminDashboard
-          isOpen={isSuperAdminModalOpen}
-          currentUser={currentUser}
-          onClose={() => setIsSuperAdminModalOpen(false)}
-          onOpenSheetSetup={() => setIsSyncModalOpen(true)}
-          onOpenReportBuilder={() => {
-            setIsSuperAdminModalOpen(false);
-            setActiveTab('custom_reports');
-          }}
-        />
+        <ModuleErrorBoundary moduleName="Super Admin Console">
+          <Suspense fallback={<ModalLoadingFallback />}>
+            <SuperAdminDashboard
+              isOpen={isSuperAdminModalOpen}
+              currentUser={currentUser}
+              onClose={() => setIsSuperAdminModalOpen(false)}
+              onOpenSheetSetup={() => setIsSyncModalOpen(true)}
+              onOpenReportBuilder={() => {
+                setIsSuperAdminModalOpen(false);
+                setActiveTab('custom_reports');
+              }}
+            />
+          </Suspense>
+        </ModuleErrorBoundary>
       )}
 
       {/* Lazy-loaded Admin and Auxiliary Modals */}
-      <Suspense fallback={<ModalLoadingFallback />}>
+      <ModuleErrorBoundary moduleName="Modal Panel">
+        <Suspense fallback={<ModalLoadingFallback />}>
         {/* 4. Google Sheets Sync Modal */}
         {isSyncModalOpen && (
           <GoogleSheetsSyncModal
@@ -1592,10 +1653,89 @@ export default function App() {
           />
         )}
       </Suspense>
+      </ModuleErrorBoundary>
 
       {/* 11. PWA Offline Status Banner & Mesh Sync Progress */}
       <OfflineIndicator isSimulatedOffline={isOfflineMode} />
       <SyncProgressIndicator />
+
+      {/* 12. Non-Blocking 3-Hub Failover Banner when an Emergency Replacement Hub is Detected */}
+      {unpairedActiveLeader && !isFailoverPairModalOpen && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-20 left-3 right-3 sm:left-auto sm:right-4 sm:max-w-md z-40 rounded-2xl bg-slate-900/95 border border-amber-500/50 shadow-2xl p-3.5 text-slate-100 backdrop-blur-md"
+        >
+          <div className="flex items-start gap-2.5">
+            <div className="w-8 h-8 rounded-xl bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-300 shrink-0 mt-0.5">
+              <Shield className="w-4 h-4" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-black tracking-wide text-amber-200">
+                New Active Branch Hub Detected — Approve Pairing
+              </p>
+              <p className="text-[11px] text-slate-300 font-mono truncate mt-0.5">
+                {unpairedActiveLeader.hubRole} • {unpairedActiveLeader.hubId} • {unpairedActiveLeader.lanIp}:{unpairedActiveLeader.wsPort}
+              </p>
+              <div className="flex items-center gap-2 mt-2">
+                <button
+                  type="button"
+                  onClick={() => setIsFailoverPairModalOpen(true)}
+                  className="text-[11px] font-black px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white transition cursor-pointer"
+                >
+                  Approve Pairing
+                </button>
+                <button
+                  type="button"
+                  onClick={() => meshSyncService.dismissUnpairedActiveLeader()}
+                  className="text-[11px] font-bold px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 transition cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => meshSyncService.dismissUnpairedActiveLeader()}
+              className="text-slate-400 hover:text-white p-1 rounded-lg transition cursor-pointer"
+              aria-label="Dismiss active hub notification"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* 13. Non-Blocking Cold-Hub Hydration Progress Indicator */}
+      {coldHydrationProgress?.active && coldHydrationProgress.isColdHub && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-20 left-3 z-30 max-w-xs rounded-xl bg-slate-900/90 border border-indigo-500/40 shadow-lg px-3 py-2 text-[11px] text-slate-200 backdrop-blur-md pointer-events-none"
+        >
+          <div className="flex items-center gap-2">
+            <Wifi className="w-3.5 h-3.5 text-indigo-400 animate-pulse shrink-0" />
+            <span className="font-bold truncate">
+              {coldHydrationProgress.pausedForCheckout
+                ? 'Backup Hub hydration paused during checkout'
+                : `Hydrating Backup Hub: ${coldHydrationProgress.currentEntity || 'syncing'} (${coldHydrationProgress.pushedRecords}/${coldHydrationProgress.totalRecords})`}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* 14. Failover Pairing Modal triggered directly from the Non-Blocking Banner */}
+      {isFailoverPairModalOpen && (
+        <ModuleErrorBoundary moduleName="Local Hub Settings" compact>
+          <Suspense fallback={<ModalLoadingFallback />}>
+            <LocalHubSettingsModal
+              isOpen={isFailoverPairModalOpen}
+              onClose={() => setIsFailoverPairModalOpen(false)}
+              initialTab="connect"
+            />
+          </Suspense>
+        </ModuleErrorBoundary>
+      )}
     </div>
   );
 }

@@ -41,6 +41,10 @@ const CONTROL_PACKET_TYPES = new Set([
   'SYNC_ID_DIGEST_REQUEST',
   'RECON_BACKFILL_PAYLOAD',
   'RECON_PUSH_BACKFILL_REQUEST',
+  'RECON_PUSH_CHUNK_COMPLETE',
+  'RECON_PUSH_CHUNK_ACK',
+  'RECON_CHUNK_ACK',
+  'HUB_ROLE_STATUS',
   'HUB_CLOUD_BROADCAST',
   'SYNC_CLOUD_CONFIG_ACK',
   'HUB_ROUTING_EPOCH_UPDATED',
@@ -162,6 +166,10 @@ export class LocalHubAdapter implements SyncAdapter {
     return this.isConnected() || this.isConnecting();
   }
 
+  public getBufferedAmount(): number {
+    return this.ws ? this.ws.bufferedAmount || 0 : 0;
+  }
+
   public async connect(customUrl?: string): Promise<void> {
     if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
 
@@ -248,6 +256,9 @@ export class LocalHubAdapter implements SyncAdapter {
               pType === 'SYNC_ID_DIGEST_REQUEST' ||
               pType === 'RECON_BACKFILL_PAYLOAD' ||
               pType === 'RECON_PUSH_BACKFILL_REQUEST' ||
+              pType === 'RECON_PUSH_CHUNK_ACK' ||
+              pType === 'RECON_CHUNK_ACK' ||
+              pType === 'HUB_ROLE_STATUS' ||
               pType === 'HUB_CLOUD_BROADCAST' ||
               pType === 'SYNC_CLOUD_CONFIG_ACK' ||
               pType === 'HUB_ROUTING_EPOCH_UPDATED' ||

@@ -20,7 +20,7 @@ import {
   Layers,
   X,
 } from 'lucide-react';
-import { Html5Qrcode } from 'html5-qrcode';
+import type { Html5Qrcode } from 'html5-qrcode';
 import { localSyncService, TillMeshRole, LocalSyncStats, LocalPeerInfo } from '../services/localSyncService';
 import { syncService } from '../services/syncService';
 import { OfflineQRCode } from './common/OfflineQRCode';
@@ -107,6 +107,7 @@ export const QrPairing: React.FC<QrPairingProps> = ({ onClose, className = '' })
         } catch (_) {}
       }
 
+      const { Html5Qrcode } = await import('html5-qrcode');
       const qr = new Html5Qrcode(scannerRegionId, { verbose: false });
       html5QrCodeRef.current = qr;
 

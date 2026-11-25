@@ -1,13 +1,32 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import { Salesperson, ActiveTab } from '../../types';
-import { Form1CashCount } from './Form1CashCount';
-import { Form2CashLog } from './Form2CashLog';
-import { Form3SalesEntry } from './Form3SalesEntry';
-import { Form4Reconciliation } from './Form4Reconciliation';
-import { WhereIsMyMoneyView } from './WhereIsMyMoneyView';
-import { AccountsClerkVoucherView } from '../cashCustody/AccountsClerkVoucherView';
-import { OwnerHqCommandCenter } from '../cashCustody/OwnerHqCommandCenter';
 import { isSupervisorOrAbove } from '../../db/roomDatabase';
+
+const Form1CashCount = lazy(() =>
+  import('./Form1CashCount').then((m) => ({ default: m.Form1CashCount }))
+);
+const Form2CashLog = lazy(() =>
+  import('./Form2CashLog').then((m) => ({ default: m.Form2CashLog }))
+);
+const Form3SalesEntry = lazy(() =>
+  import('./Form3SalesEntry').then((m) => ({ default: m.Form3SalesEntry }))
+);
+const Form4Reconciliation = lazy(() =>
+  import('./Form4Reconciliation').then((m) => ({ default: m.Form4Reconciliation }))
+);
+const WhereIsMyMoneyView = lazy(() =>
+  import('./WhereIsMyMoneyView').then((m) => ({ default: m.WhereIsMyMoneyView }))
+);
+const AccountsClerkVoucherView = lazy(() =>
+  import('../cashCustody/AccountsClerkVoucherView').then((m) => ({
+    default: m.AccountsClerkVoucherView,
+  }))
+);
+const OwnerHqCommandCenter = lazy(() =>
+  import('../cashCustody/OwnerHqCommandCenter').then((m) => ({
+    default: m.OwnerHqCommandCenter,
+  }))
+);
 import {
   Coins,
   ReceiptText,
@@ -227,78 +246,86 @@ export const CashBalancingModule: React.FC<CashBalancingModuleProps> = ({
 
       {/* Render Active Form */}
       <div>
-        {subTab === 'form1' && (
-          <Form1CashCount
-            currentUser={currentUser}
-            onNavigateToCashLog={() => setSubTab('form2')}
-            onNavigateToHome={onNavigateHome}
-            onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
-          />
-        )}
+        <Suspense
+          fallback={
+            <div className="p-8 text-center bg-slate-900/70 border border-slate-800 rounded-3xl text-xs font-semibold text-slate-400 animate-pulse">
+              Loading Cash Balancing module...
+            </div>
+          }
+        >
+          {subTab === 'form1' && (
+            <Form1CashCount
+              currentUser={currentUser}
+              onNavigateToCashLog={() => setSubTab('form2')}
+              onNavigateToHome={onNavigateHome}
+              onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
+            />
+          )}
 
-        {subTab === 'form2' && (
-          <Form2CashLog
-            currentUser={currentUser}
-            onNavigateToCashCount={() => setSubTab('form1')}
-            onNavigateToCustomerChange={() => setSubTab('form3')}
-            onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
-            onNavigateToHome={onNavigateHome}
-            onNavigateToDirectGrv={onNavigateToDirectGrv}
-          />
-        )}
-
-        {subTab === 'form3' && (
-          <Form3SalesEntry
-            currentUser={currentUser}
-            preselectedCustomer={preselectedCustomer}
-            onNavigateToCashLog={() => setSubTab('form2')}
-            onNavigateToHome={onNavigateHome}
-            onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
-          />
-        )}
-
-        {subTab === 'form4' && (
-          canAccessSupervisorEOD ? (
-            <Form4Reconciliation
+          {subTab === 'form2' && (
+            <Form2CashLog
               currentUser={currentUser}
               onNavigateToCashCount={() => setSubTab('form1')}
               onNavigateToCustomerChange={() => setSubTab('form3')}
+              onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
               onNavigateToHome={onNavigateHome}
+              onNavigateToDirectGrv={onNavigateToDirectGrv}
             />
-          ) : (
-            <div className="p-8 text-center bg-slate-900 border border-slate-800 rounded-3xl space-y-3">
-              <div className="w-12 h-12 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto text-xl font-bold">
-                🔒
+          )}
+
+          {subTab === 'form3' && (
+            <Form3SalesEntry
+              currentUser={currentUser}
+              preselectedCustomer={preselectedCustomer}
+              onNavigateToCashLog={() => setSubTab('form2')}
+              onNavigateToHome={onNavigateHome}
+              onNavigateToReconcile={canAccessSupervisorEOD ? () => setSubTab('form4') : undefined}
+            />
+          )}
+
+          {subTab === 'form4' && (
+            canAccessSupervisorEOD ? (
+              <Form4Reconciliation
+                currentUser={currentUser}
+                onNavigateToCashCount={() => setSubTab('form1')}
+                onNavigateToCustomerChange={() => setSubTab('form3')}
+                onNavigateToHome={onNavigateHome}
+              />
+            ) : (
+              <div className="p-8 text-center bg-slate-900 border border-slate-800 rounded-3xl space-y-3">
+                <div className="w-12 h-12 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center mx-auto text-xl font-bold">
+                  🔒
+                </div>
+                <h3 className="text-lg font-bold text-white">Supervisor or Manager Access Required</h3>
+                <p className="text-xs text-slate-400 max-w-md mx-auto">
+                  Form 4 is restricted to Supervisors, Managers, and Business Owners. Cashiers finish their end-of-day on Form 2.
+                </p>
               </div>
-              <h3 className="text-lg font-bold text-white">Supervisor or Manager Access Required</h3>
-              <p className="text-xs text-slate-400 max-w-md mx-auto">
-                Form 4 is restricted to Supervisors, Managers, and Business Owners. Cashiers finish their end-of-day on Form 2.
-              </p>
-            </div>
-          )
-        )}
+            )
+          )}
 
-        {subTab === 'where_is_my_money' && (
-          <WhereIsMyMoneyView
-            currentUser={currentUser}
-            onNavigateToCustody={() => setSubTab('custody_vouchers')}
-          />
-        )}
+          {subTab === 'where_is_my_money' && (
+            <WhereIsMyMoneyView
+              currentUser={currentUser}
+              onNavigateToCustody={() => setSubTab('custody_vouchers')}
+            />
+          )}
 
-        {subTab === 'custody_vouchers' && (
-          <AccountsClerkVoucherView
-            currentUser={currentUser}
-            onOpenOwnerCommand={() => setSubTab('hq_command')}
-          />
-        )}
+          {subTab === 'custody_vouchers' && (
+            <AccountsClerkVoucherView
+              currentUser={currentUser}
+              onOpenOwnerCommand={() => setSubTab('hq_command')}
+            />
+          )}
 
-        {subTab === 'hq_command' && (
-          <OwnerHqCommandCenter
-            currentUser={currentUser}
-            onClose={() => setSubTab('custody_vouchers')}
-            onNavigateClerk={() => setSubTab('custody_vouchers')}
-          />
-        )}
+          {subTab === 'hq_command' && (
+            <OwnerHqCommandCenter
+              currentUser={currentUser}
+              onClose={() => setSubTab('custody_vouchers')}
+              onNavigateClerk={() => setSubTab('custody_vouchers')}
+            />
+          )}
+        </Suspense>
       </div>
     </div>
   );
