@@ -34,7 +34,8 @@ export interface MeshEventLog {
     | 'CONFLICT_RESOLVED'
     | 'CLOUD_SYNC'
     | 'ACK'
-    | 'SECURITY_DROP';
+    | 'SECURITY_DROP'
+    | 'STORAGE';
   message: string;
   sourceDevice: string;
   targetDevice?: string;

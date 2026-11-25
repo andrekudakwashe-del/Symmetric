@@ -1,7 +1,8 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { SaleInvoice, ActiveTab, PaymentMethod, Salesperson } from '../../types';
 import { getSales, getAllSales, getAllBranchesSales, refundSaleInvoice, voidSaleInvoice, editSaleInvoice, isSupervisorOrAbove, subscribeToDatabase, getTodayDateString, getCurrentBranch } from '../../db/roomDatabase';
 import { toDateStringSafe, isSameDaySafe } from '../../utils/dateUtils';
+import { useVirtualTableSlice } from '../common/VirtualWindow';
 import {
   Receipt,
   Search,
@@ -23,7 +24,6 @@ import {
   ShieldAlert,
   AlertCircle,
   Clock,
-  ArrowDown,
   X,
   Pencil,
   Building2,
@@ -58,10 +58,6 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
   const [actionNotice, setActionNotice] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [editingInvoice, setEditingInvoice] = useState<SaleInvoice | null>(null);
   const [authorizedEditor, setAuthorizedEditor] = useState<Salesperson | null>(null);
-
-  // Pagination: number of receipts visible on page
-  const PAGE_SIZE = 10;
-  const [visibleCount, setVisibleCount] = useState<number>(PAGE_SIZE);
 
   // Older Receipts Period State
   // Default industry-standard period: Yesterday and 2 more days going backwards (3 days prior)
@@ -261,10 +257,19 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     });
   }, [periodFilteredSales, paymentFilter, statusFilter, searchQuery]);
 
-  // Sliced for page visibility
+  const receiptsTableScrollRef = useRef<HTMLDivElement | null>(null);
+  const receiptVirtualSlice = useVirtualTableSlice({
+    totalCount: filteredSales.length,
+    estimateRowHeight: 68,
+    overscan: 10,
+    virtualizeThreshold: 40,
+    scrollContainerRef: receiptsTableScrollRef,
+  });
+
+  // Virtualized window slice (O(1) DOM rows even across 50,000+ receipts)
   const displayedSales = useMemo(() => {
-    return filteredSales.slice(0, visibleCount);
-  }, [filteredSales, visibleCount]);
+    return filteredSales.slice(receiptVirtualSlice.startIndex, receiptVirtualSlice.endIndex);
+  }, [filteredSales, receiptVirtualSlice.startIndex, receiptVirtualSlice.endIndex]);
 
   const refundedCount = useMemo(() => {
     return filteredSales.filter((s) => s.status === 'Refunded').length;
@@ -333,7 +338,6 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
 
   const handleApplyOlderPeriod = (period: 'past3days' | 'last7days' | 'last30days' | 'custom' | 'all') => {
     setActivePeriodType(period);
-    setVisibleCount(PAGE_SIZE);
     setShowOlderReceiptsModal(false);
   };
 
@@ -455,7 +459,6 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
               type="button"
               onClick={() => {
                 setActivePeriodType('today');
-                setVisibleCount(PAGE_SIZE);
               }}
               className="px-3 py-2 bg-slate-800/80 hover:bg-slate-700 text-xs font-bold text-slate-300 rounded-2xl transition border border-slate-700"
             >
@@ -517,7 +520,6 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
               value={searchQuery}
               onChange={(e) => {
                 setSearchQuery(e.target.value);
-                setVisibleCount(PAGE_SIZE);
               }}
               className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-10 pr-4 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
             />
@@ -529,7 +531,6 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
               value={paymentFilter}
               onChange={(e) => {
                 setPaymentFilter(e.target.value);
-                setVisibleCount(PAGE_SIZE);
               }}
               className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-2.5 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
             >
@@ -548,7 +549,6 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
               value={statusFilter}
               onChange={(e) => {
                 setStatusFilter(e.target.value);
-                setVisibleCount(PAGE_SIZE);
               }}
               className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-2.5 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
             >
@@ -588,12 +588,12 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         </div>
       )}
 
-      {/* Receipts Table (Showing receipts that comfortably fit the page) */}
+      {/* Virtualized Receipts Table (O(1) DOM rows for smooth 60fps scrolling) */}
       <div className="bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden shadow-xl">
-        <div className="overflow-x-auto">
+        <div ref={receiptsTableScrollRef} className="overflow-auto max-h-[70vh]">
           <table className="w-full text-left text-xs border-collapse">
-            <thead>
-              <tr className="bg-slate-950/80 border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider text-[10px]">
+            <thead className="sticky top-0 z-10">
+              <tr className="bg-slate-950 border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider text-[10px]">
                 <th className="py-3 px-4">Receipt # &amp; Cloud Sync</th>
                 <th className="py-3 px-3">Status</th>
                 <th className="py-3 px-4">Date &amp; Time</th>
@@ -605,7 +605,13 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800/60 font-sans">
-              {displayedSales.map((sale, sIdx) => {
+              {receiptVirtualSlice.topSpacerHeight > 0 && (
+                <tr aria-hidden="true">
+                  <td colSpan={8} style={{ height: `${receiptVirtualSlice.topSpacerHeight}px`, padding: 0, border: 0 }} />
+                </tr>
+              )}
+              {displayedSales.map((sale, localIdx) => {
+                const sIdx = receiptVirtualSlice.startIndex + localIdx;
                 const isCredit = sale.paymentMethod === 'Credit';
                 const isCash = sale.paymentMethod === 'Cash';
                 const isRefunded = sale.status === 'Refunded';
@@ -770,6 +776,12 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
                 );
               })}
 
+              {receiptVirtualSlice.bottomSpacerHeight > 0 && (
+                <tr aria-hidden="true">
+                  <td colSpan={8} style={{ height: `${receiptVirtualSlice.bottomSpacerHeight}px`, padding: 0, border: 0 }} />
+                </tr>
+              )}
+
               {filteredSales.length === 0 && (
                 <tr>
                   <td colSpan={8} className="py-12 text-center text-slate-500">
@@ -785,23 +797,18 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
           </table>
         </div>
 
-        {/* Load More Pagination Bar */}
-        {filteredSales.length > displayedSales.length && (
-          <div className="p-3 border-t border-slate-800 bg-slate-950/50 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs">
-            <span className="text-slate-400">
-              Showing <strong className="text-white">{displayedSales.length}</strong> of{' '}
-              <strong className="text-white">{filteredSales.length}</strong> receipts
+        {/* Virtualized Table Status Bar */}
+        {filteredSales.length > 0 && (
+          <div className="px-4 py-2.5 border-t border-slate-800 bg-slate-950/50 flex items-center justify-between text-[11px] text-slate-400">
+            <span>
+              Viewing <strong className="text-white">{receiptVirtualSlice.startIndex + 1}–{receiptVirtualSlice.endIndex}</strong> of{' '}
+              <strong className="text-white">{filteredSales.length.toLocaleString()}</strong> receipts
             </span>
-
-            <button
-              type="button"
-              id="btn-load-more-receipts"
-              onClick={() => setVisibleCount((prev) => prev + PAGE_SIZE)}
-              className="px-4 py-2 rounded-2xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-xs shadow transition active:scale-95 flex items-center space-x-1.5"
-            >
-              <ArrowDown className="w-3.5 h-3.5" />
-              <span>Load More Receipts (+{PAGE_SIZE})</span>
-            </button>
+            {receiptVirtualSlice.isVirtualized && (
+              <span className="font-mono text-[10px] text-emerald-400">
+                Virtualized ({displayedSales.length} rows mounted)
+              </span>
+            )}
           </div>
         )}
       </div>

@@ -63,6 +63,13 @@ const CONTROL_PACKET_TYPES = new Set([
   'HEARTBEAT',
   'PONG',
   'SECURITY_ALERT',
+  'STORAGE_PRESSURE_ALERT',
+  'STORAGE_STATUS_RESPONSE',
+  'ARCHIVE_PACK_LIST_RESPONSE',
+  'ARCHIVE_PACK_CREATED',
+  'ARCHIVE_PACK_DOWNLOAD_CHUNK',
+  'ARCHIVE_PACK_EVICT_ACK',
+  'ARCHIVE_PACK_ERROR',
 ]);
 
 const SENSITIVE_SIGNED_ACTIONS = new Set([
@@ -266,6 +273,28 @@ export class LocalHubAdapter implements SyncAdapter {
               pType === 'SECURITY_ALERT'
             ) {
               this.onControlPacketCallback?.(pType, parsed);
+              return;
+            }
+
+            if (pType === 'STORAGE_PRESSURE_ALERT') {
+              if (this.authState === 'AUTHENTICATED' || this.authState === 'LEGACY_BACKUP') {
+                this.onControlPacketCallback?.(pType, parsed);
+              }
+              return;
+            }
+
+            if (
+              pType === 'STORAGE_STATUS_RESPONSE' ||
+              pType === 'ARCHIVE_PACK_LIST_RESPONSE' ||
+              pType === 'ARCHIVE_PACK_CREATED' ||
+              pType === 'ARCHIVE_PACK_DOWNLOAD_CHUNK' ||
+              pType === 'ARCHIVE_PACK_EVICT_ACK' ||
+              pType === 'ARCHIVE_PACK_ERROR'
+            ) {
+              // Strictly require completed Mutual-HMAC AUTH_OK for authenticated storage/archive RPC responses
+              if (this.authState === 'AUTHENTICATED') {
+                this.onControlPacketCallback?.(pType, parsed);
+              }
               return;
             }
           }

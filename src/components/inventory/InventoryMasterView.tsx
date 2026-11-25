@@ -35,6 +35,7 @@ import { InventoryItem, Salesperson } from '../../types';
 import { useScrollDirection } from '../../hooks/useScrollDirection';
 import { ProductAddEditModal } from './ProductAddEditModal';
 import { ProductAuditTrailModal } from './ProductAuditTrailModal';
+import { VirtualList, useVirtualTableSlice } from '../common/VirtualWindow';
 import {
   downloadInventoryCsv,
   downloadInventoryExpandedCsv,
@@ -359,6 +360,19 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
       (a.itemName || '').localeCompare(b.itemName || '', undefined, { sensitivity: 'base' })
     );
   }, [items, deferredSearchQuery, selectedCategory, filterLowStockOnly]);
+
+  const inventoryTableScrollRef = useRef<HTMLDivElement | null>(null);
+  const inventoryTableSlice = useVirtualTableSlice({
+    totalCount: filteredItems.length,
+    estimateRowHeight: 68,
+    overscan: 10,
+    virtualizeThreshold: 45,
+    scrollContainerRef: inventoryTableScrollRef,
+  });
+  const visibleTableItems = useMemo(
+    () => filteredItems.slice(inventoryTableSlice.startIndex, inventoryTableSlice.endIndex),
+    [filteredItems, inventoryTableSlice.startIndex, inventoryTableSlice.endIndex]
+  );
 
   // Default active selected item for simplistic view
   const activeSelectedItem = useMemo(() => {
@@ -1000,15 +1014,22 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                   )}
                 </div>
               ) : (
-                <div className="space-y-2">
-                  {filteredItems.map((item, idx) => {
+                <VirtualList
+                  items={filteredItems}
+                  estimateRowHeight={148}
+                  gapPx={8}
+                  overscan={6}
+                  virtualizeThreshold={45}
+                  containerClassName="max-h-[72vh] overflow-y-auto pr-1"
+                  innerClassName="space-y-2"
+                  getKey={(item, idx) => `${item.itemId}-${idx}`}
+                  renderItem={(item) => {
                     const isSelected = activeSelectedItem?.itemId === item.itemId;
                     const canSellCase = Boolean(item.canSellAsCase);
                     const isLow = item.stockCases <= item.reorderLevelCases || item.stockSingles <= item.reorderLevelUnits;
 
                     return (
                       <div
-                        key={`${item.itemId}-${idx}`}
                         id={`item-card-${item.itemId}`}
                         onClick={() => handleItemCardClick(item)}
                         className={`p-3.5 rounded-2xl border transition-all cursor-pointer ${
@@ -1151,8 +1172,8 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         </div>
                       </div>
                     );
-                  })}
-                </div>
+                  }}
+                />
               )}
             </div>
 
@@ -1375,9 +1396,9 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             </button>
           </div>
 
-          <div className="overflow-x-auto">
+          <div ref={inventoryTableScrollRef} className="overflow-auto max-h-[72vh]">
             <table className="w-full text-left text-sm">
-              <thead>
+              <thead className="sticky top-0 z-10">
                 <tr className="bg-slate-100 text-slate-700 text-xs uppercase tracking-wider font-bold border-b border-slate-200">
                   <th className="py-3 px-4">Item ID / SKU</th>
                   <th className="py-3 px-4">Product Name & Category</th>
@@ -1400,17 +1421,24 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                     </td>
                   </tr>
                 ) : (
-                  filteredItems.map((item, idx) => {
-                    const isLowCases = item.stockCases <= item.reorderLevelCases;
-                    const isZeroSingles = item.stockSingles === 0;
-                    const costPerUnit = item.costPerCase / (item.unitsPerCase || 1);
+                  <>
+                    {inventoryTableSlice.topSpacerHeight > 0 && (
+                      <tr aria-hidden="true">
+                        <td colSpan={11} style={{ height: `${inventoryTableSlice.topSpacerHeight}px`, padding: 0, border: 0 }} />
+                      </tr>
+                    )}
+                    {visibleTableItems.map((item, localIdx) => {
+                      const idx = inventoryTableSlice.startIndex + localIdx;
+                      const isLowCases = item.stockCases <= item.reorderLevelCases;
+                      const isZeroSingles = item.stockSingles === 0;
+                      const costPerUnit = item.costPerCase / (item.unitsPerCase || 1);
 
-                    return (
-                      <tr
-                        key={`${item.itemId}-${idx}`}
-                        onClick={() => handleItemCardClick(item)}
-                        className="hover:bg-slate-50/75 transition-colors group cursor-pointer"
-                      >
+                      return (
+                        <tr
+                          key={`${item.itemId}-${idx}`}
+                          onClick={() => handleItemCardClick(item)}
+                          className="hover:bg-slate-50/75 transition-colors group cursor-pointer"
+                        >
                         <td className="py-3.5 px-4">
                           <div className="font-mono font-black text-slate-950">{item.itemId}</div>
                           <div className="text-xs text-slate-500 font-mono">{item.sku || 'No SKU'}</div>
@@ -1563,13 +1591,30 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                             )}
                           </div>
                         </td>
+                        </tr>
+                      );
+                    })}
+                    {inventoryTableSlice.bottomSpacerHeight > 0 && (
+                      <tr aria-hidden="true">
+                        <td colSpan={11} style={{ height: `${inventoryTableSlice.bottomSpacerHeight}px`, padding: 0, border: 0 }} />
                       </tr>
-                    );
-                  })
+                    )}
+                  </>
                 )}
               </tbody>
             </table>
           </div>
+          {inventoryTableSlice.isVirtualized && (
+            <div className="px-4 py-2 border-t border-slate-100 bg-slate-50/80 flex items-center justify-between text-[11px] text-slate-500">
+              <span>
+                Viewing <strong className="text-slate-800">{inventoryTableSlice.startIndex + 1}–{inventoryTableSlice.endIndex}</strong> of{' '}
+                <strong className="text-slate-800">{filteredItems.length.toLocaleString()}</strong> SKUs
+              </span>
+              <span className="font-mono text-[10px] text-emerald-700">
+                Virtualized ({visibleTableItems.length} rows mounted)
+              </span>
+            </div>
+          )}
         </div>
       )}
 

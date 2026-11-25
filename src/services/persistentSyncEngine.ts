@@ -77,9 +77,16 @@ import {
   setRoutingEpoch,
   resetCloudCatchupCursors,
 } from './sync/highWaterMarks';
+import {
+  SyncCircuitBreaker,
+  CircuitBreakerSnapshot,
+  CircuitBreakerState,
+  classifySyncError,
+  computeJitteredBackoffMs,
+  withCrossTabSyncLock,
+  isWebLocksSupported,
+} from './sync/syncResilience';
 
-// Exponential backoff schedule in milliseconds: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 300s (cap)
-const BACKOFF_SCHEDULE_MS = [1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 300000];
 const MAX_SYNC_RETRIES = 20;
 
 export interface SyncQueueStats {
@@ -90,6 +97,9 @@ export interface SyncQueueStats {
   failed: number;
   lastSyncTime?: string;
   lastError?: string;
+  circuitState?: CircuitBreakerState;
+  circuitCooldownSec?: number;
+  webLocksActive?: boolean;
 }
 
 type SyncStatsListener = (stats: SyncQueueStats) => void;
@@ -97,6 +107,11 @@ type TenantAlertListener = (alert: { type: 'STATUS_CHANGED' | 'SHEET_CHANGED' | 
 
 class PersistentSyncEngine {
   private activeCompanyDrains: Set<string> = new Set();
+  private circuitBreaker = new SyncCircuitBreaker({
+    failureThreshold: 3,
+    baseCooldownMs: 30_000,
+    maxCooldownMs: 300_000,
+  });
   private queueIntervalId: any = null;
   private deltaIntervalId: any = null;
   private tenantIntervalId: any = null;
@@ -106,6 +121,15 @@ class PersistentSyncEngine {
   private lastBackgroundTime = 0;
   private isInitialized = false;
   private isOutboundSyncPaused = false;
+
+  public getCircuitBreakerSnapshot(): CircuitBreakerSnapshot {
+    return this.circuitBreaker.getSnapshot();
+  }
+
+  public resetCircuitBreaker(): void {
+    this.circuitBreaker.reset();
+    this.notifyStats().catch(() => {});
+  }
 
   public pauseOutboundSync(): void {
     this.isOutboundSyncPaused = true;
@@ -255,7 +279,8 @@ class PersistentSyncEngine {
     });
 
     window.addEventListener('online', () => {
-      console.info('[SyncEngine] Device went online. Triggering immediate queue drain.');
+      console.info('[SyncEngine] Device went online. Resetting circuit breaker and triggering immediate queue drain.');
+      this.circuitBreaker.reset();
       this.drainSyncQueue().catch(() => {});
     });
   }
@@ -383,9 +408,13 @@ class PersistentSyncEngine {
   public enqueueSyncItem = this.enqueueWrite.bind(this);
 
   /**
-   * Drains pending items with tenant isolation and high-speed batching for high volume items.
+   * Drains pending items with tenant isolation, cross-tab exclusivity lock,
+   * circuit-breaker outage protection, and high-speed batching.
    */
-  public async drainSyncQueue(companyId?: string): Promise<{ processed: number; succeeded: number; failed: number }> {
+  public async drainSyncQueue(
+    companyId?: string,
+    options?: { bypassCircuit?: boolean }
+  ): Promise<{ processed: number; succeeded: number; failed: number }> {
     const activeCloud = getActiveCloudConfig();
     if (activeCloud.databaseType !== 'appscripts') {
       return { processed: 0, succeeded: 0, failed: 0 };
@@ -405,6 +434,32 @@ class PersistentSyncEngine {
       return { processed: 0, succeeded: 0, failed: 0 };
     }
 
+    if (options?.bypassCircuit) {
+      this.circuitBreaker.reset();
+    } else if (!this.circuitBreaker.canAttempt()) {
+      const snap = this.circuitBreaker.getSnapshot();
+      console.info(
+        `[SyncEngine] Circuit breaker OPEN (${Math.ceil(snap.cooldownRemainingMs / 1000)}s cooldown remaining); deferring drain.`
+      );
+      await this.notifyStats(activeCompId);
+      return { processed: 0, succeeded: 0, failed: 0 };
+    }
+
+    const lockResult = await withCrossTabSyncLock(
+      `saimetric_sync_drain_${activeCompId}`,
+      async () => this.executeLockedDrain(activeCompId),
+      { processed: 0, succeeded: 0, failed: 0 }
+    );
+
+    if (!lockResult.acquired) {
+      console.info(`[SyncEngine] Another browser tab holds drain lock for ${activeCompId}; skipping duplicate drain.`);
+    }
+    return lockResult.result;
+  }
+
+  private async executeLockedDrain(
+    activeCompId: string
+  ): Promise<{ processed: number; succeeded: number; failed: number }> {
     this.activeCompanyDrains.add(activeCompId);
     let processed = 0;
     let succeeded = 0;
@@ -464,6 +519,7 @@ class PersistentSyncEngine {
                   postedIds: chunk.map((b) => b.id),
                   sheetName: 'InventoryMaster',
                 });
+                this.circuitBreaker.recordSuccess();
                 succeeded += chunk.length;
                 processed += chunk.length;
                 continue;
@@ -536,6 +592,7 @@ class PersistentSyncEngine {
                   markReceiptAsSynced(bReqIds, bItemIds);
                   markRecordsCloudSynced(bItemIds, bReqIds, 'Transactions', false);
                 } catch {}
+                this.circuitBreaker.recordSuccess();
                 succeeded += chunk.length;
                 processed += chunk.length;
                 continue;
@@ -551,6 +608,12 @@ class PersistentSyncEngine {
       const remainingItems = await getPendingSyncQueueItems(now, activeCompId);
 
       for (const item of remainingItems) {
+        if (this.circuitBreaker.getSnapshot().state === 'OPEN') {
+          console.warn(
+            `[SyncEngine] Circuit breaker tripped OPEN mid-drain; deferring remaining ${remainingItems.length - processed} item(s) without burning retries.`
+          );
+          break;
+        }
         const success = await this.pushSingleItem(item);
         processed++;
         if (success) {
@@ -630,6 +693,7 @@ class PersistentSyncEngine {
           this.forceRefreshBranches().catch(() => {});
         }
 
+        this.circuitBreaker.recordSuccess();
         await this.notifyStats();
         return true;
       } else {
@@ -638,18 +702,27 @@ class PersistentSyncEngine {
     } catch (err: any) {
       const nextRetries = item.retries + 1;
       const errorMsg = err?.message || String(err);
+      const category = classifySyncError(errorMsg);
 
-      if (nextRetries >= MAX_SYNC_RETRIES) {
-        // Give up after 20 attempts -> mark failed, require manual retry
+      if (category === 'PERMANENT') {
+        // Poison-pill / non-retryable validation or isolation error -> quarantine immediately into DLQ
+        await updateSyncItem(item.id, {
+          status: 'failed',
+          retries: nextRetries,
+          lastError: `[Quarantined: permanent error] ${errorMsg}`,
+        });
+      } else if (nextRetries >= MAX_SYNC_RETRIES) {
+        // Exhausted transient retries -> move to Dead-Letter Queue for manual admin inspection
+        this.circuitBreaker.recordTransientFailure(errorMsg);
         await updateSyncItem(item.id, {
           status: 'failed',
           retries: nextRetries,
           lastError: `Exceeded ${MAX_SYNC_RETRIES} attempts. Last error: ${errorMsg}`,
         });
       } else {
-        // Exponential backoff
-        const backoffIdx = Math.min(nextRetries - 1, BACKOFF_SCHEDULE_MS.length - 1);
-        const backoffDelay = BACKOFF_SCHEDULE_MS[Math.max(0, backoffIdx)];
+        // Transient outage -> trip/advance circuit breaker & schedule jittered exponential backoff
+        this.circuitBreaker.recordTransientFailure(errorMsg);
+        const backoffDelay = computeJitteredBackoffMs(nextRetries);
         const nextRetryAt = Date.now() + backoffDelay;
 
         await updateSyncItem(item.id, {
@@ -1398,6 +1471,7 @@ class PersistentSyncEngine {
     const failedItem = all.slice().reverse().find((i) => i.status === 'failed');
     const doneItem = all.slice().reverse().find((i) => i.status === 'done');
 
+    const breaker = this.circuitBreaker.getSnapshot();
     return {
       total: all.length,
       pending,
@@ -1406,7 +1480,15 @@ class PersistentSyncEngine {
       failed,
       lastSyncTime: doneItem?.createdAt,
       lastError: failedItem?.lastError,
+      circuitState: breaker.state,
+      circuitCooldownSec: Math.ceil(breaker.cooldownRemainingMs / 1000),
+      webLocksActive: isWebLocksSupported(),
     };
+  }
+
+  public async exportFailedItems(companyId?: string): Promise<PersistentSyncItem[]> {
+    const activeComp = companyId || getCurrentCompanyId();
+    return await getSyncQueueItems('failed', activeComp);
   }
 
   public async compactAndCleanup(companyId?: string): Promise<{ originalCount: number; compactedCount: number; removedCount: number }> {
@@ -1419,6 +1501,7 @@ class PersistentSyncEngine {
   }
 
   public async retryItem(id: string): Promise<boolean> {
+    this.circuitBreaker.reset();
     await updateSyncItem(id, {
       status: 'pending',
       nextRetryAt: Date.now(),
@@ -1434,9 +1517,11 @@ class PersistentSyncEngine {
     return false;
   }
 
-  public async retryAllFailed(companyId?: string): Promise<void> {
+  public async retryAllFailed(companyId?: string): Promise<number> {
     const activeComp = companyId || getCurrentCompanyId();
     const all = await getSyncQueueItems('failed', activeComp);
+    if (all.length === 0) return 0;
+    this.circuitBreaker.reset();
     for (const item of all) {
       await updateSyncItem(item.id, {
         status: 'pending',
@@ -1446,7 +1531,8 @@ class PersistentSyncEngine {
       });
     }
     await this.notifyStats(activeComp);
-    this.drainSyncQueue(activeComp).catch(() => {});
+    this.drainSyncQueue(activeComp, { bypassCircuit: true }).catch(() => {});
+    return all.length;
   }
 
   public async clearDone(): Promise<number> {

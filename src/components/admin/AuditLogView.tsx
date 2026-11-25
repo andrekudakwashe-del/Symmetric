@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import { AuditLogEntry, AuditAction, AuditSeverity } from '../../types';
 import { getAuditLogs, subscribeToDatabase } from '../../db/roomDatabase';
+import { VirtualList } from '../common/VirtualWindow';
 import {
   ShieldCheck,
   ShieldAlert,
@@ -424,10 +425,16 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({ onBack }) => {
             </p>
           </div>
         ) : (
-          <div className="divide-y divide-slate-800/80 overflow-x-auto">
-            {filteredLogs.map((entry, idx) => (
+          <VirtualList
+            items={filteredLogs}
+            estimateRowHeight={112}
+            overscan={8}
+            virtualizeThreshold={40}
+            containerClassName="max-h-[72vh] overflow-y-auto overflow-x-auto"
+            innerClassName="divide-y divide-slate-800/80"
+            getKey={(entry, idx) => `${entry.id || 'aud'}-${idx}`}
+            renderItem={(entry) => (
               <div
-                key={`${entry.id || 'aud'}-${idx}`}
                 id={`audit-log-entry-${entry.id}`}
                 className="p-4 sm:p-5 hover:bg-slate-800/40 transition flex flex-col md:flex-row md:items-start justify-between gap-3 text-xs"
               >
@@ -488,8 +495,8 @@ export const AuditLogView: React.FC<AuditLogViewProps> = ({ onBack }) => {
                   </div>
                 )}
               </div>
-            ))}
-          </div>
+            )}
+          />
         )}
       </div>
     </div>

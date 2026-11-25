@@ -13,6 +13,9 @@ import {
   Layers,
   Trash2,
   RotateCcw,
+  Download,
+  ShieldAlert,
+  Sparkles,
 } from 'lucide-react';
 import {
   persistentSyncEngine,
@@ -83,7 +86,9 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
     setIsDraining(true);
     setActionMessage('Draining queue & pushing pending writes...');
     try {
-      const res = await persistentSyncEngine.drainSyncQueue(currentCompany.company_id);
+      const res = await persistentSyncEngine.drainSyncQueue(currentCompany.company_id, {
+        bypassCircuit: true,
+      });
       setActionMessage(`Queue processed: ${res.succeeded} succeeded, ${res.failed} failed.`);
       await loadData();
     } catch (err: any) {
@@ -158,6 +163,53 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
     const cleared = await persistentSyncEngine.clearDone();
     setActionMessage(`Cleared ${cleared} completed records from persistent queue.`);
     await loadData();
+  };
+
+  const handleRetryAllFailed = async () => {
+    setIsDraining(true);
+    setActionMessage('Re-queuing all Dead-Letter items and probing Cloud sync...');
+    try {
+      const count = await persistentSyncEngine.retryAllFailed(currentCompany.company_id);
+      setActionMessage(
+        count > 0
+          ? `Re-queued ${count} failed item(s) for immediate retry.`
+          : 'No failed items to retry.'
+      );
+      await loadData();
+    } catch (err: any) {
+      setActionMessage(`Retry failed: ${err.message || String(err)}`);
+    } finally {
+      setIsDraining(false);
+    }
+  };
+
+  const handleExportFailedJson = async () => {
+    try {
+      const failedItems = await persistentSyncEngine.exportFailedItems(currentCompany.company_id);
+      if (failedItems.length === 0) {
+        setActionMessage('No failed items available to export.');
+        return;
+      }
+      const payload = {
+        exportedAt: new Date().toISOString(),
+        companyId: currentCompany.company_id,
+        branchId: currentBranch?.branchId || 'BR-MAIN',
+        count: failedItems.length,
+        items: failedItems,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `saimetric-dlq-${currentCompany.company_id}-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setActionMessage(`Exported ${failedItems.length} quarantined item(s) as JSON backup.`);
+    } catch (err: any) {
+      setActionMessage(`Export error: ${err.message || String(err)}`);
+    }
   };
 
   const filteredItems = items.filter((item) => {
@@ -265,6 +317,31 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
             </div>
           </div>
 
+          {/* Circuit Breaker Outage Protection Banner */}
+          {stats.circuitState === 'OPEN' && (
+            <div className="p-3.5 rounded-xl bg-amber-950/60 border border-amber-500/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+              <div className="flex items-start gap-2.5">
+                <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-bold text-amber-200">
+                    Cloud Sync Circuit Breaker Active (Cooling down {stats.circuitCooldownSec ?? 0}s)
+                  </div>
+                  <div className="text-[11px] text-amber-300/80">
+                    Paused automatic retries after repeated transient failures to protect battery and preserve pending transaction retry counts.
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleForceResync}
+                disabled={isDraining}
+                className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-[11px] shrink-0 transition cursor-pointer disabled:opacity-50"
+              >
+                Probe Now
+              </button>
+            </div>
+          )}
+
           {/* Quick Action Buttons */}
           <div className="flex flex-wrap gap-2.5">
             <button
@@ -274,6 +351,14 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isDraining ? 'animate-spin' : ''}`} />
               <span>Force Resync (Drain Queue)</span>
+            </button>
+
+            <button
+              onClick={handleCompactQueue}
+              className="flex items-center space-x-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold text-xs transition"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+              <span>Compact Queue</span>
             </button>
 
             <button
@@ -302,6 +387,26 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
               <Database className={`w-3.5 h-3.5 ${isRefreshingTenant ? 'animate-spin' : ''}`} />
               <span>Refresh Tenant Context</span>
             </button>
+
+            {stats.failed > 0 && (
+              <>
+                <button
+                  onClick={handleRetryAllFailed}
+                  disabled={isDraining}
+                  className="flex items-center space-x-1.5 px-3 py-2 rounded-xl bg-rose-600/25 hover:bg-rose-600/40 text-rose-200 border border-rose-500/40 font-semibold text-xs transition disabled:opacity-50"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Retry All Failed ({stats.failed})</span>
+                </button>
+                <button
+                  onClick={handleExportFailedJson}
+                  className="flex items-center space-x-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-200 border border-amber-500/30 font-semibold text-xs transition"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Export Failed JSON</span>
+                </button>
+              </>
+            )}
 
             {stats.done > 0 && (
               <button
@@ -461,7 +566,17 @@ export const SyncDiagnosticsModal: React.FC<SyncDiagnosticsModalProps> = ({
         {/* Footer */}
         <div className="px-5 py-3 bg-slate-900 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
           <div>
-            Background Worker: <span className="text-emerald-400 font-semibold">Active (30s queue / 60s delta & tenant)</span>
+            Background Worker:{' '}
+            <span className="text-emerald-400 font-semibold">
+              Active (30s queue / 60s delta &amp; tenant)
+            </span>
+            <span className="mx-2 text-slate-600">•</span>
+            <span>
+              Multi-Tab Lock:{' '}
+              <strong className="text-indigo-300">
+                {stats.webLocksActive ? 'Web Locks API' : 'Lease Fallback'}
+              </strong>
+            </span>
           </div>
           <button
             onClick={onClose}

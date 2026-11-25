@@ -219,6 +219,18 @@ import {
   yieldToMainThread,
 } from './sync/coldHubHydrationQueue';
 import {
+  HubStorageRpcManager,
+  type HubStorageCapacity,
+  type HubStoragePressureAlert,
+  type HubStorageSnapshot,
+  type HubArchivePackListResult,
+  type HubArchiveCreateOptions,
+  type HubArchiveCreateResult,
+  type HubArchiveDownloadProgress,
+  type HubArchiveDownloadResult,
+  type HubArchiveEvictResult,
+} from './mesh/hubStorageService';
+import {
   reportTrustedTimeSample,
   triggerClockTamperLock,
   recordSecurityAlert,
@@ -464,6 +476,7 @@ class MeshSyncManager {
   private isHandlingFailoverHandoff: boolean = false;
   private pendingFailoverToastMessage: string | null = null;
   private coldHubHydrationQueue!: ColdHubHydrationQueue;
+  private hubStorageManager!: HubStorageRpcManager;
   private hubHydrationProgress: ColdHubHydrationProgress = {
     active: false,
     sweepId: null,
@@ -869,6 +882,14 @@ class MeshSyncManager {
       },
     });
 
+    // Hub v4.2.0 Encrypted WAL Storage Telemetry, Pressure Alerts & Authenticated .saimpack RPCs
+    this.hubStorageManager = new HubStorageRpcManager({
+      isAuthenticated: () =>
+        this.isLocalHubConnected && this.localHubAdapter.getAuthState() === 'AUTHENTICATED',
+      sendPacket: (payload) => this.localHubAdapter.sendControlPacket(payload),
+      getActiveHubId: () => this.activeHubId,
+    });
+
     const cloudAdapter = this.getOrCreateSingleCloudAdapter();
     const initialAdapter =
       this.isLocalHubActive() && !this.isCloudOnlyMode
@@ -1051,6 +1072,26 @@ class MeshSyncManager {
         return;
       }
 
+      if (
+        pType === 'STORAGE_PRESSURE_ALERT' ||
+        pType === 'STORAGE_STATUS_RESPONSE' ||
+        pType === 'ARCHIVE_PACK_LIST_RESPONSE' ||
+        pType === 'ARCHIVE_PACK_CREATED' ||
+        pType === 'ARCHIVE_PACK_DOWNLOAD_CHUNK' ||
+        pType === 'ARCHIVE_PACK_EVICT_ACK' ||
+        pType === 'ARCHIVE_PACK_ERROR'
+      ) {
+        this.hubStorageManager.handleIncomingPacket(pType, parsed);
+        if (pType === 'STORAGE_PRESSURE_ALERT') {
+          this.addLog(
+            'STORAGE',
+            `Local Hub storage pressure alert: ${parsed.stage || 'WARNING'} (${parsed.usagePct ?? '?'}% — ${parsed.totalRecords ?? '?'} / ${parsed.softRecordLimit ?? '?'} records, ${parsed.unsyncedT1Count ?? 0} unsynced T1).`,
+            this.activeHubId || 'Local Hub'
+          );
+        }
+        return;
+      }
+
       if (pType === 'HUB_INFO') {
         // Record metadata even during pre-auth lobby; only trigger sync if authenticated or legacy backup
         this.activeHubId = parsed.hub_id || parsed.hubId || this.activeHubId;
@@ -1060,6 +1101,12 @@ class MeshSyncManager {
         }
         if (parsed.ota_slot) {
           this.activeHubOtaSlot = String(parsed.ota_slot);
+        }
+        if (parsed.storageCapacity || parsed.storage_capacity) {
+          this.hubStorageManager.updateFromHealth(
+            parsed.storageCapacity || parsed.storage_capacity,
+            this.activeHubId || undefined
+          );
         }
         this.applyHubFailoverMetadata(parsed);
         // If Hub explicitly reports auth_required === false and we are still handshaking on an unpaired Termux backup, activate immediately
@@ -1762,6 +1809,48 @@ class MeshSyncManager {
     this.emitHubSecurityEvent();
   }
 
+  public getHubStorageSnapshot(): HubStorageSnapshot {
+    return this.hubStorageManager.getSnapshot();
+  }
+
+  public subscribeHubStorage(listener: (snap: HubStorageSnapshot) => void): () => void {
+    return this.hubStorageManager.subscribe(listener);
+  }
+
+  public dismissHubStorageAlert(): void {
+    this.hubStorageManager.dismissBanner();
+  }
+
+  public ingestHubHealthStorageCapacity(rawCapacity: any, hubId?: string): void {
+    this.hubStorageManager.updateFromHealth(rawCapacity, hubId || this.activeHubId || undefined);
+  }
+
+  public queryHubStorageStatus(): Promise<HubStorageCapacity | null> {
+    return this.hubStorageManager.queryStorageStatus();
+  }
+
+  public listHubArchivePacks(): Promise<HubArchivePackListResult> {
+    return this.hubStorageManager.listArchivePacks();
+  }
+
+  public createHubArchivePack(options: HubArchiveCreateOptions = {}): Promise<HubArchiveCreateResult> {
+    return this.hubStorageManager.createArchivePack(options);
+  }
+
+  public downloadHubArchivePack(
+    packId: string,
+    options?: {
+      onProgress?: (progress: HubArchiveDownloadProgress) => void;
+      autoSaveToBrowser?: boolean;
+    }
+  ): Promise<HubArchiveDownloadResult> {
+    return this.hubStorageManager.downloadArchivePack(packId, options);
+  }
+
+  public confirmHubArchiveEvict(packId: string, payloadSha256: string): Promise<HubArchiveEvictResult> {
+    return this.hubStorageManager.confirmArchiveEvict(packId, payloadSha256);
+  }
+
   private applyHubFailoverMetadata(packet: any): {
     hubRole?: HubRole;
     hubPriority?: number;
@@ -2039,6 +2128,10 @@ class MeshSyncManager {
           return false;
         }
 
+        if (result.storageCapacity) {
+          this.hubStorageManager.updateFromHealth(result.storageCapacity, result.hubId);
+        }
+
         // If an emergency replacement ACTIVE Hub is discovered for this branch/tenant,
         // do not force-connect unauthenticated — present the non-blocking Approve Pairing banner!
         if (!result.isPaired) {
@@ -2299,6 +2392,15 @@ class MeshSyncManager {
     this.emitHubSecurityEvent();
     this.notifyPeerSubscribers(true);
     this.notifyConnectionModeChange();
+
+    // Non-blocking storage telemetry poll after Mutual-HMAC AUTH_OK (Hub v4.2.0+)
+    if (isMutualAuth) {
+      setTimeout(() => {
+        if (this.isLocalHubConnected && this.localHubAdapter.getAuthState() === 'AUTHENTICATED') {
+          this.hubStorageManager.queryStorageStatus().catch(() => {});
+        }
+      }, 1500);
+    }
 
     // Fallback for legacy Hubs without HUB_INFO response
     setTimeout(async () => {
@@ -4282,6 +4384,7 @@ class MeshSyncManager {
 
   private handleLocalHubLost(reason: string) {
     this.coldHubHydrationQueue.cancel();
+    this.hubStorageManager.handleDisconnected();
     if (this.localHubHeartbeatTimer) {
       clearInterval(this.localHubHeartbeatTimer);
       this.localHubHeartbeatTimer = null;

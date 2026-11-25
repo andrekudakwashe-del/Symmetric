@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, Suspense } from 'react';
 import {
   X,
   Wifi,
@@ -36,8 +36,15 @@ import {
   Building2,
   CloudDownload,
   Lock,
+  Archive,
 } from 'lucide-react';
 import type { Html5Qrcode } from 'html5-qrcode';
+import { lazyWithRetry } from '../../utils/lazyWithRetry';
+
+const HubStorageArchivePanel = lazyWithRetry(
+  () => import('./HubStorageArchivePanel'),
+  'HubStorageArchivePanel'
+);
 import {
   LocalHubConfig,
   normalizeHubUrl,
@@ -59,7 +66,7 @@ import {
 interface LocalHubSettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
-  initialTab?: 'connect' | 'host' | 'code' | 'sync';
+  initialTab?: 'connect' | 'host' | 'code' | 'sync' | 'archives';
 }
 
 export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
@@ -69,7 +76,10 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
 }) => {
   const [hubUrlInput, setHubUrlInput] = useState<string>(() => LocalHubConfig.getLocalHubUrl());
   const [forceLocalHub, setForceLocalHub] = useState<boolean>(() => LocalHubConfig.getForceLocalHub());
-  const [activeTab, setActiveTab] = useState<'connect' | 'host' | 'code' | 'sync'>(initialTab);
+  const [activeTab, setActiveTab] = useState<'connect' | 'host' | 'code' | 'sync' | 'archives'>(initialTab);
+  const [hubStorageStage, setHubStorageStage] = useState(
+    () => meshSyncService.getHubStorageSnapshot().bannerStage
+  );
 
   // Script download & copy states
   const [scriptCode, setScriptCode] = useState<string>('');
@@ -159,6 +169,11 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     };
     window.addEventListener('saimetric_hub_security_updated', handleSecurityUpdate);
 
+    const unsubStorage = meshSyncService.subscribeHubStorage((snap) => {
+      setHubStorageStage(snap.bannerStage);
+    });
+    setActiveTab(initialTab);
+
     getTermuxHubHeredocCode().then((code) => {
       if (code) setScriptCode(code);
     });
@@ -166,10 +181,11 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     return () => {
       unsubMode();
       unsubConfig();
+      unsubStorage();
       window.removeEventListener('saimetric_hub_security_updated', handleSecurityUpdate);
       stopCamera();
     };
-  }, [isOpen]);
+  }, [isOpen, initialTab]);
 
   const handleConfirmResetHub = async () => {
     setIsResettingHub(true);
@@ -479,16 +495,16 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
           </div>
         </div>
 
-        {/* Tab Toggle: Connect (Client) vs Host (QR Display) vs Termux Code vs Sync Manager */}
+        {/* Tab Toggle: Connect (Client) vs Host (QR Display) vs Termux Code vs Sync Manager vs Archives */}
         <div className="px-4 sm:px-5 pt-4">
-          <div className="grid grid-cols-4 p-1 bg-slate-950 rounded-2xl border border-slate-800 text-xs font-bold gap-1">
+          <div className="grid grid-cols-5 p-1 bg-slate-950 rounded-2xl border border-slate-800 text-[11px] sm:text-xs font-bold gap-1">
             <button
               type="button"
               onClick={() => {
                 setActiveTab('connect');
                 stopCamera();
               }}
-              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1.5 ${
+              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 ${
                 activeTab === 'connect'
                   ? 'bg-indigo-600 text-white shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
@@ -503,7 +519,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                 setActiveTab('host');
                 stopCamera();
               }}
-              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1.5 ${
+              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 ${
                 activeTab === 'host'
                   ? 'bg-indigo-600 text-white shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
@@ -521,7 +537,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                   getTermuxHubHeredocCode().then((c) => setScriptCode(c));
                 }
               }}
-              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1.5 relative ${
+              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 relative ${
                 activeTab === 'code'
                   ? 'bg-indigo-600 text-white shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
@@ -536,7 +552,7 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
                 setActiveTab('sync');
                 stopCamera();
               }}
-              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1.5 ${
+              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 ${
                 activeTab === 'sync'
                   ? 'bg-indigo-600 text-white shadow-md'
                   : 'text-slate-400 hover:text-slate-200'
@@ -544,6 +560,32 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
             >
               <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
               <span>Sync Mgr</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('archives');
+                stopCamera();
+              }}
+              className={`py-2 rounded-xl transition cursor-pointer flex items-center justify-center gap-1 relative ${
+                activeTab === 'archives'
+                  ? 'bg-indigo-600 text-white shadow-md'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Archive className="w-3.5 h-3.5 text-amber-400" />
+              <span>Archives</span>
+              {hubStorageStage !== 'NORMAL' && (
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    hubStorageStage === 'CRITICAL_STORAGE'
+                      ? 'bg-rose-500 animate-ping'
+                      : hubStorageStage === 'ARCHIVE_RECOMMENDED_90'
+                      ? 'bg-orange-400'
+                      : 'bg-amber-400'
+                  }`}
+                />
+              )}
             </button>
           </div>
         </div>
@@ -1624,6 +1666,19 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
               </div>
             </div>
           </div>
+        )}
+
+        {/* Tab 5: Hub Storage & Offline Archives (.saimpack) */}
+        {activeTab === 'archives' && (
+          <Suspense
+            fallback={
+              <div className="p-8 text-center text-xs text-slate-400">
+                Loading Hub Storage &amp; Offline Archive Manager...
+              </div>
+            }
+          >
+            <HubStorageArchivePanel />
+          </Suspense>
         )}
 
         {/* Footer */}

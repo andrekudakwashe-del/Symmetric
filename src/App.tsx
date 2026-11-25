@@ -17,6 +17,7 @@ import {
   isBranchInLockdown,
   checkPreviousBusinessDayStatus,
 } from './db/roomDatabase';
+import { startBrowserStorageQuotaGuard } from './db/storageQuotaGuard';
 import { AndroidStatusBar } from './components/layout/AndroidStatusBar';
 import { TopHeader } from './components/layout/TopHeader';
 import { BottomNavigation } from './components/layout/BottomNavigation';
@@ -29,6 +30,7 @@ import { ShieldCheck, Clock, Wifi, Crown, AlertTriangle, Shield, X } from 'lucid
 import { initializeSystemConfigAndSync, fetchGlobalSystemConfig } from './services/systemConfig';
 import { persistentSyncEngine } from './services/persistentSyncEngine';
 import { meshSyncService } from './services/meshSyncService';
+import { HubStoragePressureBanner } from './components/sync/HubStoragePressureBanner';
 import { FunctionalHamburgerMenu } from './components/layout/FunctionalHamburgerMenu';
 import {
   getLandingTabForUser,
@@ -41,6 +43,7 @@ import { lazyWithRetry } from './utils/lazyWithRetry';
 import { isDeviceTimeAutomatic } from './utils/clockSecurity';
 import type { ActiveLeaderInfo } from './utils/localHubConfig';
 import type { ColdHubHydrationProgress } from './services/sync/coldHubHydrationQueue';
+import { PWAUpdateBanner } from './components/pwa/PWAUpdateBanner';
 
 // Resilient lazy-loaded operational & admin modules (dramatically reduces initial startup payload)
 const LoginScreen = lazyWithRetry(() => import('./components/auth/LoginScreen').then(m => ({ default: m.LoginScreen })), 'LoginScreen');
@@ -141,6 +144,7 @@ export default function App() {
     () => meshSyncService.getHubSecurityStatus().hydrationProgress || null
   );
   const [isFailoverPairModalOpen, setIsFailoverPairModalOpen] = useState(false);
+  const [isHubArchiveModalOpen, setIsHubArchiveModalOpen] = useState(false);
 
   // Inactivity tracking state
   const lastActivityRef = useRef<number>(Date.now());
@@ -172,36 +176,9 @@ export default function App() {
     }, durationMs);
   };
 
-  // Smart Update banner listener (Update-on-Reload pattern for production)
-  const [updateAvailable, setUpdateAvailable] = useState<boolean>(false);
-  const waitingWorkerRef = useRef<ServiceWorker | null>(null);
-
   useEffect(() => {
-    const handleUpdateReady = (event: Event) => {
-      const customEvent = event as CustomEvent<{ registration?: ServiceWorkerRegistration; waitingWorker?: ServiceWorker }>;
-      if (customEvent.detail?.waitingWorker) {
-        waitingWorkerRef.current = customEvent.detail.waitingWorker;
-      }
-      setUpdateAvailable(true);
-    };
-
-    window.addEventListener('saimetric_update_ready', handleUpdateReady);
-    return () => {
-      window.removeEventListener('saimetric_update_ready', handleUpdateReady);
-    };
+    startBrowserStorageQuotaGuard();
   }, []);
-
-  const handleApplyUpdate = () => {
-    try {
-      if (waitingWorkerRef.current) {
-        waitingWorkerRef.current.postMessage({ type: 'SKIP_WAITING' });
-      }
-    } catch (e) {
-      console.warn('Error signaling SKIP_WAITING to Service Worker:', e);
-    }
-    // Step 3: The Update Action: When the user taps the banner, call window.location.reload()
-    window.location.reload();
-  };
 
   // Listen to EOD completion to automatically clear any day-lock notifications and inform user
   useEffect(() => {
@@ -637,18 +614,7 @@ export default function App() {
     handleNavigateTab(tab);
   };
 
-  const smartUpdateBanner = updateAvailable ? (
-    <div
-      onClick={handleApplyUpdate}
-      role="alert"
-      className="fixed top-0 left-0 right-0 z-[10000] bg-gradient-to-r from-indigo-600 via-indigo-500 to-indigo-600 text-white font-bold text-xs sm:text-sm py-2.5 px-4 text-center shadow-xl cursor-pointer hover:bg-indigo-500 active:scale-[0.99] transition-all flex items-center justify-center gap-2 border-b border-indigo-400/40 select-none animate-fadeIn"
-    >
-      <span>🚀 SAIMETRIC v2.0 is ready. Tap to update.</span>
-      <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-white/20 text-white font-black tracking-wider ml-1">
-        Update
-      </span>
-    </div>
-  ) : null;
+  const smartUpdateBanner = <PWAUpdateBanner />;
 
   // If user is not logged in, display the Android Material 3 Login Screen
   if (!currentUser) {
@@ -1724,14 +1690,25 @@ export default function App() {
         </div>
       )}
 
-      {/* 14. Failover Pairing Modal triggered directly from the Non-Blocking Banner */}
-      {isFailoverPairModalOpen && (
+      {/* 14. Non-Blocking Admin/Manager Hub v4.2.0 Storage Pressure Banner */}
+      <HubStoragePressureBanner
+        currentUser={currentUser}
+        isSuperAdmin={isSuperAdmin}
+        onOpenArchiveManager={() => setIsHubArchiveModalOpen(true)}
+        onTriggerCloudSync={() => setIsSyncModalOpen(true)}
+      />
+
+      {/* 15. Failover Pairing & Hub Storage Archive Modal triggered from Non-Blocking Banners */}
+      {(isFailoverPairModalOpen || isHubArchiveModalOpen) && (
         <ModuleErrorBoundary moduleName="Local Hub Settings" compact>
           <Suspense fallback={<ModalLoadingFallback />}>
             <LocalHubSettingsModal
-              isOpen={isFailoverPairModalOpen}
-              onClose={() => setIsFailoverPairModalOpen(false)}
-              initialTab="connect"
+              isOpen={isFailoverPairModalOpen || isHubArchiveModalOpen}
+              onClose={() => {
+                setIsFailoverPairModalOpen(false);
+                setIsHubArchiveModalOpen(false);
+              }}
+              initialTab={isHubArchiveModalOpen ? 'archives' : 'connect'}
             />
           </Suspense>
         </ModuleErrorBoundary>

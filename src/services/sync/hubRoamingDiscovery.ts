@@ -29,6 +29,10 @@ import {
   sanitizeLanIps,
   sanitizeMdnsHost,
 } from '../../utils/localHubConfig';
+import {
+  HubStorageCapacity,
+  normalizeStorageCapacity,
+} from '../mesh/hubStorageService';
 
 export type DiscoveryStage = 'LAST_KNOWN' | 'MDNS' | 'HOTSPOT_PROBE' | 'SUBNET_PROBE';
 
@@ -52,6 +56,7 @@ export interface DiscoveredHubCandidate {
   lanIps?: string[];
   isPaired: boolean;
   discoveredVia: DiscoveryStage;
+  storageCapacity?: HubStorageCapacity | null;
 }
 
 export interface HubDiscoveryResult {
@@ -75,6 +80,7 @@ export interface HubDiscoveryResult {
   isPaired: boolean;
   discoveredVia: DiscoveryStage;
   ipChanged: boolean;
+  storageCapacity?: HubStorageCapacity | null;
 }
 
 const HOTSPOT_AND_GATEWAY_IPS = [
@@ -425,6 +431,11 @@ async function probeHttpHealthCandidate(
     const safePort = effectivePort > 0 && effectivePort <= 65535 ? Math.floor(effectivePort) : port;
     const hostPort = `${host}:${safePort}`;
 
+    const storageCapacity = normalizeStorageCapacity(
+      data.storageCapacity || data.storage_capacity,
+      matchedProfile?.hubId || reportedHubId
+    );
+
     return {
       ip: host,
       port: safePort,
@@ -445,6 +456,7 @@ async function probeHttpHealthCandidate(
       lanIps: sanitizeLanIps(data.lanIps || data.lan_ips),
       isPaired,
       discoveredVia,
+      storageCapacity,
     };
   } catch {
     return null;
@@ -549,6 +561,7 @@ function toDiscoveryResult(
     isPaired: winner.isPaired,
     discoveredVia: winner.discoveredVia,
     ipChanged: winner.lastKnownHost.toLowerCase() !== previousHostPort.toLowerCase(),
+    storageCapacity: winner.storageCapacity ?? null,
   };
 }
 

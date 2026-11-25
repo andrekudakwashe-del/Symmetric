@@ -8,8 +8,10 @@
     "start": "node server.ts",
     "build": "vite build",
     "build:hub-ota": "node scripts/build-hub-ota.mjs",
+    "test": "tsx scripts/run-regression-tests.ts",
     "check:budgets": "node scripts/check-budgets.mjs",
-    "verify": "npm run lint && npm run build && npm run check:budgets",
+    "check:arch": "node scripts/check-architecture.mjs",
+    "verify": "npm run lint && npm test && npm run build && npm run check:budgets && npm run check:arch",
     "lint": "tsc --noEmit",
     "preview": "vite preview"
   },
@@ -38,6 +40,7 @@
     "tailwindcss": "^4.1.1",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
-    "vite": "^6.2.1"
+    "vite": "^6.2.1",
+    "vite-plugin-pwa": "^2.0.0"
   }
 }

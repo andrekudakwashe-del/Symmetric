@@ -16,12 +16,12 @@ const DIST_ASSETS = path.join(DIST_DIR, 'assets');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 
 const BUDGETS = {
-  // Phase 2C ratchet budgets (gzipped KB)
+  // Phase 5 permanent governance budgets (gzipped KB)
   maxEntryJsGzipKb: 420,          // index-*.js alone
-  maxInitialPreloadJsGzipKb: 625, // Entry JS + modulepreload JS in dist/index.html
+  maxInitialPreloadJsGzipKb: 600, // Entry JS + modulepreload JS in dist/index.html
   maxSingleLazyChunkGzipKb: 200,  // Any single non-entry chunk (including vendor-core)
-  maxAppLazyChunkGzipKb: 110,     // Any single non-vendor app feature lazy chunk
-  maxPublicStaticMb: 4,           // Total public/ excluding public/hub-ota & termux-hub.js
+  maxAppLazyChunkGzipKb: 100,     // Any single non-vendor app feature lazy chunk
+  maxPublicStaticMb: 2,           // Total public/ excluding public/hub-ota & termux-hub.js
   forbiddenPreloadVendors: ['vendor-mqtt', 'vendor-qr-scanner', 'vendor-qr-gen', 'vendor-xlsx', 'vendor-charts'],
 };
 
