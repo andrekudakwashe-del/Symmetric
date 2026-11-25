@@ -16,7 +16,10 @@ import type { MqttClient } from 'mqtt';
 import {
   getSales,
   getAllSales,
+  getRawStoredSales,
   getSaleById,
+  extractCanonicalSaleId,
+  deduplicateStoredSales,
   addSale,
   getSyncQueue,
   getSheetsConfig,
@@ -1187,13 +1190,17 @@ class MeshSyncManager {
 
     this.syncActiveAdapter();
 
-    // Pre-populate known and broadcasted invoice IDs from local DB for fast O(1) deduplication
+    // Pre-populate known and broadcasted invoice IDs from local DB for fast O(1) case-insensitive deduplication
     try {
-      const existingSales = getAllSales();
+      const existingSales = getRawStoredSales();
       for (const s of existingSales) {
-        if (s && s.id) {
-          this.knownSaleIds.add(s.id);
-          this.broadcastedInvoiceIds.add(s.id);
+        const cid = extractCanonicalSaleId(s);
+        if (cid) {
+          const upper = cid.toUpperCase();
+          this.knownSaleIds.add(cid);
+          this.knownSaleIds.add(upper);
+          this.broadcastedInvoiceIds.add(cid);
+          this.broadcastedInvoiceIds.add(upper);
         }
       }
     } catch (e) {}
@@ -2408,7 +2415,7 @@ class MeshSyncManager {
         this.drainQueueToLocalHub();
         this.hasPerformedInitialCatchup = true;
         this.lastInitialCatchupTime = Date.now();
-        const lastSync = await this.getLastInventorySyncTimestamp();
+        const lastSync = await this.getSafeCatchUpSinceTimestamp();
         this.requestCatchUpSync('ALL', lastSync, false, false).catch(() => {});
       }
     }, 2000);
@@ -3320,8 +3327,9 @@ class MeshSyncManager {
 
     switch (envelope.entityType) {
       case 'sale': {
-        const saleId = envelope.entityId || this.extractInvoiceId(d) || d.id;
+        const saleId = String(extractCanonicalSaleId(d) || envelope.entityId || this.extractInvoiceId(d) || '').trim();
         if (!saleId || !d) return;
+        const saleIdUpper = saleId.toUpperCase();
         const isLegacyInv = /^INV-/i.test(saleId);
         const isSaleUpdate =
           envelope.action === 'UPSERT' ||
@@ -3332,11 +3340,13 @@ class MeshSyncManager {
           d.mobileVerificationStatus === 'FLAGGED' ||
           Boolean(d.hasExchanges);
 
-        if (this.knownSaleIds.has(saleId) && !isSaleUpdate) {
+        if ((this.knownSaleIds.has(saleId) || this.knownSaleIds.has(saleIdUpper)) && !isSaleUpdate) {
           return;
         }
         this.knownSaleIds.add(saleId);
+        this.knownSaleIds.add(saleIdUpper);
         this.broadcastedInvoiceIds.add(saleId);
+        this.broadcastedInvoiceIds.add(saleIdUpper);
 
         const attachedLogs: CashLogEntry[] = Array.isArray(d.reversalCashLogs)
           ? d.reversalCashLogs
@@ -3355,6 +3365,9 @@ class MeshSyncManager {
           branch_id: cleanSaleData.branch_id || cleanSaleData.branchId || this.config.branchId,
           fromMesh: true,
         } as any);
+        if (ingested) {
+          void this.setLastSalesSyncTimestamp(Date.now()).catch(() => {});
+        }
 
         if (attachedLogs.length > 0) {
           attachedLogs.forEach((cl) => {
@@ -4824,21 +4837,23 @@ class MeshSyncManager {
       const unsyncedSales = allSales.filter(
         (s) =>
           s &&
-          s.id &&
+          extractCanonicalSaleId(s) &&
           !(s as any).fromMesh &&
           !(s as any).syncedToHub &&
           (!s.synced || s.syncStatus !== 'synced' || (s as any).isCloudSynced === true)
       );
 
-      const branchMatchedSales = unsyncedSales.filter((s) => {
-        const sBranch = (s.branchId || s.branch_id || '').trim().toUpperCase();
-        return !sBranch || sBranch === currentHubBranch.toUpperCase();
-      });
+      const branchesForFlush = getBranches();
+      const isSaleForCurrentHubBranch = (s: SaleInvoice): boolean => {
+        const sBranch = (s.branchId || s.branch_id || (s as any).branchCode || '').trim().toUpperCase();
+        if (!sBranch || sBranch === 'ALL' || sBranch === currentHubBranch.toUpperCase()) {
+          return true;
+        }
+        return isRecordInBranchScope(sBranch, currentHubBranch, branchesForFlush, this.config.companyId);
+      };
 
-      const foreignBranchSales = unsyncedSales.filter((s) => {
-        const sBranch = (s.branchId || s.branch_id || '').trim().toUpperCase();
-        return sBranch && sBranch !== currentHubBranch.toUpperCase();
-      });
+      const branchMatchedSales = unsyncedSales.filter(isSaleForCurrentHubBranch);
+      const foreignBranchSales = unsyncedSales.filter((s) => !isSaleForCurrentHubBranch(s));
 
       if (branchMatchedSales.length > 0) {
         this.addLog(
@@ -4847,9 +4862,12 @@ class MeshSyncManager {
           this.config.deviceName
         );
 
+        const flushedSaleIds = new Set<string>();
         for (const sale of branchMatchedSales) {
-          if (!/^INV-/i.test(sale.id) && !sale.synced) {
-            this.pendingSaleAcks.set(sale.id, {
+          const saleId = extractCanonicalSaleId(sale);
+          if (!saleId) continue;
+          if (!/^INV-/i.test(saleId) && !sale.synced) {
+            this.pendingSaleAcks.set(saleId, {
               sale,
               sentAt: Date.now(),
               lastRetryAt: Date.now(),
@@ -4859,27 +4877,51 @@ class MeshSyncManager {
 
           const saleIsCloudSynced = (sale as any).isCloudSynced === true;
           const saleEnvelope: SyncEnvelope = {
-            packetId: `OFFLINE-FLUSH-${sale.id}-${Date.now()}`,
+            packetId: `OFFLINE-FLUSH-${saleId}-${Date.now()}`,
             entityType: 'sale',
-            entityId: sale.id,
-            action: 'APPEND',
-            data: saleIsCloudSynced ? { ...sale, isCloudSynced: true } : sale,
+            entityId: saleId,
+            action: sale.status === 'Refunded' || sale.status === 'Voided' ? 'UPSERT' : 'APPEND',
+            data: saleIsCloudSynced ? { ...sale, id: saleId, isCloudSynced: true } : { ...sale, id: saleId },
             updatedAt: sale.timestamp || Date.now(),
             originDeviceId: this.config.deviceId,
             targetBranchId: currentHubBranch,
             class: 'T1',
             ...(saleIsCloudSynced ? { isCloudSynced: true } : {}),
             meta: {
-              wireAction: 'SALE_RECORD',
+              wireAction: sale.status === 'Refunded' || sale.status === 'Voided' ? 'SALE_UPDATE' : 'SALE_RECORD',
               isOfflineCatchup: true,
+              ...(sale.status === 'Refunded' || sale.status === 'Voided' ? { isSaleUpdate: true } : {}),
             },
           };
 
           try {
-            await this.localHubAdapter.broadcast(saleEnvelope);
+            const res = await this.localHubAdapter.broadcast(saleEnvelope);
+            if (res.success) {
+              flushedSaleIds.add(saleId.toUpperCase());
+              this.broadcastedInvoiceIds.add(saleId);
+              this.broadcastedInvoiceIds.add(saleId.toUpperCase());
+            }
           } catch (err) {
             console.warn('[MeshSync] Error sending offline sale to hub:', err);
           }
+        }
+
+        if (flushedSaleIds.size > 0) {
+          try {
+            const rawAll = getRawStoredSales();
+            let touched = false;
+            const marked = rawAll.map((s) => {
+              const cid = extractCanonicalSaleId(s).toUpperCase();
+              if (cid && flushedSaleIds.has(cid) && !(s as any).syncedToHub) {
+                touched = true;
+                return { ...s, syncedToHub: true };
+              }
+              return s;
+            });
+            if (touched) {
+              setStored(STORAGE_KEYS.SALES, marked);
+            }
+          } catch {}
         }
       }
 
@@ -5189,7 +5231,7 @@ class MeshSyncManager {
       this.hasPerformedInitialCatchup = true;
       this.lastInitialCatchupTime = Date.now();
       const branchId = this.hubBranchId || 'ALL';
-      const lastSync = await this.getLastInventorySyncTimestamp();
+      const lastSync = await this.getSafeCatchUpSinceTimestamp();
       this.addLog(
         'BROADCAST',
         `Flush-Before-Pull Complete: Local Hub acknowledged flush. Requesting Delta Catch-Up for [${branchId}]...`,
@@ -5665,33 +5707,43 @@ class MeshSyncManager {
       for (let idx = 0; idx < batchRecords.length; idx++) {
         const rec = batchRecords[idx];
         if (!rec || typeof rec !== 'object') continue;
-        const recId = String(
-          rec.id ||
-            rec.itemId ||
-            rec.branchId ||
-            rec.branch_id ||
-            rec.BranchID ||
-            rec.customerId ||
-            rec.grvNumber ||
-            rec.changeId ||
-            rec.creditId ||
-            rec.movementId ||
-            rec.txnId ||
-            `${canonEntity}-${start + idx}`
-        );
+        let recId = '';
+        if (canonEntity === 'sale') {
+          recId = extractCanonicalSaleId(rec);
+          if (!recId) {
+            console.warn('[Auto-Heal] Skipping recon backfill sale record without valid invoice ID:', rec);
+            continue;
+          }
+        } else {
+          recId = String(
+            rec.id ||
+              rec.itemId ||
+              rec.branchId ||
+              rec.branch_id ||
+              rec.BranchID ||
+              rec.customerId ||
+              rec.grvNumber ||
+              rec.changeId ||
+              rec.creditId ||
+              rec.movementId ||
+              rec.txnId ||
+              `${canonEntity}-${start + idx}`
+          ).trim();
+        }
+        const normalizedRec = canonEntity === 'sale' && rec.id !== recId ? { ...rec, id: recId } : rec;
         const recTs =
-          extractRecordTimestamp(rec) ||
-          parseTimestampMs(rec.hubTimestamp ?? rec.updatedAt ?? rec.timestamp);
+          extractRecordTimestamp(normalizedRec) ||
+          parseTimestampMs(normalizedRec.hubTimestamp ?? normalizedRec.updatedAt ?? normalizedRec.timestamp);
         const envelope: SyncEnvelope = {
           packetId: `RECON-${sweepId}-${canonEntity}-${recId}-${recTs}-${start + idx}`,
           entityType: canonEntity,
           entityId: recId,
           action: spec.appendOnly ? 'APPEND' : 'UPSERT',
-          data: rec,
+          data: normalizedRec,
           updatedAt: recTs,
-          hubTimestamp: parseTimestampMs(rec.hubTimestamp ?? rec.updatedAt) || undefined,
+          hubTimestamp: parseTimestampMs(normalizedRec.hubTimestamp ?? normalizedRec.updatedAt) || undefined,
           originDeviceId: 'LOCAL_HUB_RECON',
-          targetBranchId: rec.branch_id || rec.branchId || this.config.branchId,
+          targetBranchId: normalizedRec.branch_id || normalizedRec.branchId || this.config.branchId,
           class: spec.class,
         };
         await this.ingestEnvelopeThroughSyncCore(envelope, 'Local Hub Recon', {
@@ -7354,6 +7406,72 @@ class MeshSyncManager {
     }
   }
 
+  public static readonly LAST_SALES_SYNC_KEY = 'saimetric_last_sales_sync';
+
+  public async getLastSalesSyncTimestamp(): Promise<string> {
+    const scopedKey = `${MeshSyncManager.LAST_SALES_SYNC_KEY}_${this.config.branchId}_${this.config.companyId}`;
+    try {
+      const meta = await getSyncMeta(scopedKey);
+      if (meta && meta.lastSyncAt) {
+        return meta.lastSyncAt;
+      }
+      if (meta && meta.lastServerTime) {
+        const num = Number(meta.lastServerTime);
+        if (!isNaN(num) && num > 0) {
+          return new Date(num).toISOString();
+        }
+      }
+    } catch (_) {}
+
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const stored = window.localStorage.getItem(scopedKey);
+      if (stored) {
+        const num = Number(stored);
+        if (!isNaN(num) && num > 0) {
+          return new Date(num).toISOString();
+        }
+        const parsed = new Date(stored).getTime();
+        if (!isNaN(parsed) && parsed > 0) {
+          return new Date(parsed).toISOString();
+        }
+      }
+    }
+
+    // Default to 48 hours ago when uninitialized so recent sales are never skipped by newer inventory edits
+    return new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+  }
+
+  public async setLastSalesSyncTimestamp(val: number | string): Promise<void> {
+    const numTimestamp = typeof val === 'number' ? val : (Date.parse(String(val)) || Date.now());
+    const isoTimestamp = new Date(numTimestamp).toISOString();
+    const scopedKey = `${MeshSyncManager.LAST_SALES_SYNC_KEY}_${this.config.branchId}_${this.config.companyId}`;
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(scopedKey, String(numTimestamp));
+    }
+    try {
+      await setSyncMeta(scopedKey, isoTimestamp, String(numTimestamp));
+    } catch (_) {}
+  }
+
+  /**
+   * Returns the earliest safe catch-up cursor across inventory and sales so syncing an
+   * inventory edit can NEVER fast-forward the catch-up window past missed sales.
+   */
+  public async getSafeCatchUpSinceTimestamp(): Promise<string> {
+    const [invIso, salesIso] = await Promise.all([
+      this.getLastInventorySyncTimestamp(),
+      this.getLastSalesSyncTimestamp(),
+    ]);
+    if (invIso === '0') return '0';
+    const invMs = Date.parse(invIso);
+    const salesMs = Date.parse(salesIso);
+    if (!Number.isFinite(invMs) || invMs <= 0) return '0';
+    if (!Number.isFinite(salesMs) || salesMs <= 0) return invIso;
+    // Apply a 5-minute overlap cushion to absorb clock skew between tills
+    const earliestMs = Math.max(0, Math.min(invMs, salesMs) - 5 * 60 * 1000);
+    return new Date(earliestMs).toISOString();
+  }
+
   public getLastMeshSyncTimestamp(): string {
     if (typeof window !== 'undefined' && window.localStorage) {
       const stored = window.localStorage.getItem(MeshSyncManager.LAST_INVENTORY_SYNC_KEY);
@@ -7426,7 +7544,7 @@ class MeshSyncManager {
       if (force) {
         sinceTimestamp = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
       } else {
-        sinceTimestamp = await this.getLastInventorySyncTimestamp();
+        sinceTimestamp = await this.getSafeCatchUpSinceTimestamp();
       }
     }
 
@@ -7739,9 +7857,23 @@ class MeshSyncManager {
       }
     }
 
-    // 1. Ingest Sales (T1 - Append-Only Merge)
+    // 1. Ingest Sales (T1 - Append-Only Merge with canonical deduplication & status monotonicity)
     if (Array.isArray(delta.sales) && delta.sales.length > 0) {
       mergeT1Records(STORAGE_KEYS.SALES, delta.sales);
+      try {
+        deduplicateStoredSales();
+      } catch {}
+      for (const s of delta.sales) {
+        const cid = extractCanonicalSaleId(s);
+        if (cid) {
+          const upper = cid.toUpperCase();
+          this.knownSaleIds.add(cid);
+          this.knownSaleIds.add(upper);
+          this.broadcastedInvoiceIds.add(cid);
+          this.broadcastedInvoiceIds.add(upper);
+        }
+      }
+      void this.setLastSalesSyncTimestamp(Date.now()).catch(() => {});
       salesIngested += delta.sales.length;
       overallProcessed += delta.sales.length;
       if (typeof window !== 'undefined') {
@@ -8540,10 +8672,12 @@ class MeshSyncManager {
   public async broadcastSale(sale: SaleInvoice, options?: { isReconPush?: boolean }) {
     const isReconPush = Boolean(options?.isReconPush);
     if (this.isIngestingFromHub && !isReconPush) return;
-    if (!sale || !sale.id) return;
+    const saleId = extractCanonicalSaleId(sale);
+    if (!sale || !saleId) return;
+    const saleIdUpper = saleId.toUpperCase();
 
     // Check if already broadcasted by this device (bypassed for explicit Hub recon push backfill)
-    if (!isReconPush && this.broadcastedInvoiceIds.has(sale.id)) {
+    if (!isReconPush && (this.broadcastedInvoiceIds.has(saleId) || this.broadcastedInvoiceIds.has(saleIdUpper))) {
       return;
     }
 
@@ -8555,17 +8689,21 @@ class MeshSyncManager {
     // Check local database: if this invoice already exists in stored sales from mesh
     if (!isReconPush) {
       const storedSales = getAllSales();
-      const existing = storedSales.find((s) => s.id === sale.id);
+      const existing = storedSales.find((s) => extractCanonicalSaleId(s).toUpperCase() === saleIdUpper);
       if (existing && (existing as any).fromMesh) {
-        this.broadcastedInvoiceIds.add(sale.id);
-        this.knownSaleIds.add(sale.id);
+        this.broadcastedInvoiceIds.add(saleId);
+        this.broadcastedInvoiceIds.add(saleIdUpper);
+        this.knownSaleIds.add(saleId);
+        this.knownSaleIds.add(saleIdUpper);
         return;
       }
     }
 
     // Mark as broadcasted so we never send it to the Hub again
-    this.broadcastedInvoiceIds.add(sale.id);
-    this.knownSaleIds.add(sale.id);
+    this.broadcastedInvoiceIds.add(saleId);
+    this.broadcastedInvoiceIds.add(saleIdUpper);
+    this.knownSaleIds.add(saleId);
+    this.knownSaleIds.add(saleIdUpper);
 
     // Safeguard 1: Register in pendingSaleAcks to await {"type": "SYNC_RECEIPT", "invoice_id": "..."}
     // Requirement 4: Legacy INV- sales & recon backfill pushes must NOT trigger Watchdog retries

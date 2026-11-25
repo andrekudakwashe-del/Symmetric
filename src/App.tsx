@@ -749,7 +749,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <Clock className="w-4 h-4 text-amber-400 shrink-0" />
             <span className="truncate">
-              <strong>14-Day Free Trial:</strong> {subStatus.daysRemaining} day(s) remaining for <strong>{currentCompany.company_name}</strong> (Expires {currentCompany.next_billing_date})
+              <strong>14-Day Free Trial:</strong> {subStatus.daysRemaining} day(s) remaining for <strong>{currentCompany.company_name}</strong> (Expires {subStatus.nextBillingDate})
             </span>
           </div>
           <button

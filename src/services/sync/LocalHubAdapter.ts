@@ -576,6 +576,14 @@ export class LocalHubAdapter implements SyncAdapter {
       (typeof wirePacket.type === 'string' && wirePacket.type.startsWith('STOCKTAKE_')) ||
       (typeof wirePacket.action === 'string' && wirePacket.action.startsWith('STOCKTAKE_'));
 
+    const canonHubBranchAlias = (b?: string | null): string => {
+      const u = String(b || '').trim().toUpperCase();
+      if (u === '1' || u === 'BR001' || u === 'BR-MAIN' || u === 'HQ-01' || u === 'MAIN') {
+        return 'BR-MAIN';
+      }
+      return u;
+    };
+
     const hubBranch = this.context.hubBranchId;
     const isBranchMismatch =
       !isCatalogPacket &&
@@ -583,7 +591,7 @@ export class LocalHubAdapter implements SyncAdapter {
       Boolean(hubBranch) &&
       hubBranch !== 'UNASSIGNED' &&
       Boolean(targetBranch) &&
-      targetBranch !== hubBranch!.toUpperCase() &&
+      canonHubBranchAlias(targetBranch) !== canonHubBranchAlias(hubBranch) &&
       targetBranch !== 'ALL';
 
     if (this.context.isCloudOnlyMode || isBranchMismatch) {
@@ -1523,13 +1531,17 @@ export class LocalHubAdapter implements SyncAdapter {
       entityId = String(
         unwrapped.invoice_id ||
           unwrapped.invoiceId ||
+          unwrapped.InvoiceID ||
           unwrapped.saleId ||
           data?.id ||
           data?.invoice_id ||
           data?.invoiceId ||
+          data?.InvoiceID ||
+          data?.invoiceNumber ||
+          unwrapped.invoiceNumber ||
           unwrapped.id ||
           ''
-      );
+      ).trim();
       isSaleUpdate =
         unwrapped.action === 'SALE_UPDATE' ||
         data?.status === 'Refunded' ||

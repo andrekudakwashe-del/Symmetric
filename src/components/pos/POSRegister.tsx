@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Product,
   Customer,
@@ -182,6 +182,8 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
   const [showCurrencyPickerModal, setShowCurrencyPickerModal] = useState<boolean>(false);
   const [multiConfig, setMultiConfig] = useState(() => getMultiCurrencyConfig());
   const [proofOfPaymentRef, setProofOfPaymentRef] = useState<string>('');
+  const isSubmittingCheckoutRef = useRef<boolean>(false);
+  const checkoutIdempotencyKeyRef = useRef<string>('');
 
   // Load data
   const loadData = () => {
@@ -580,6 +582,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
     setOpenCashWithdrawal(!!withCashOut);
     setCashWithdrawalInput('');
     setProofOfPaymentRef('');
+    checkoutIdempotencyKeyRef.current = `CHK-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
     setShowCheckoutModal(true);
   };
 
@@ -664,7 +667,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
 
   // Process and finalize checkout
   const handleProcessCheckout = (options?: { bypassCreditReview?: boolean; extraNote?: string }) => {
-    if (cart.length === 0 || isProcessingCheckout) return;
+    if (cart.length === 0 || isProcessingCheckout || isSubmittingCheckoutRef.current) return;
 
     const bypassCreditReview = Boolean(options?.bypassCreditReview);
 
@@ -765,8 +768,12 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       }
     }
 
+    isSubmittingCheckoutRef.current = true;
     setIsProcessingCheckout(true);
     setCheckoutWarning(null);
+    if (!checkoutIdempotencyKeyRef.current) {
+      checkoutIdempotencyKeyRef.current = `CHK-${Date.now()}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    }
 
     try {
       const saleItems: SaleItem[] = cart.map((item) => {
@@ -834,6 +841,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
         : saleNotes;
 
       const newSale = addSale({
+        checkoutIdempotencyKey: checkoutIdempotencyKeyRef.current,
         timestamp: new Date().toISOString(),
         date: today,
         customerId,
@@ -891,6 +899,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       });
 
       // Reset checkout state and show receipt modal
+      checkoutIdempotencyKeyRef.current = '';
       setShowCheckoutModal(false);
       setSelectedCurrency('USD');
       setCashWithdrawalInput('');
@@ -915,6 +924,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
         `Unable to complete invoice: ${err?.message || 'Unexpected error while saving transaction. Please try again.'}`
       );
     } finally {
+      isSubmittingCheckoutRef.current = false;
       setIsProcessingCheckout(false);
     }
   };

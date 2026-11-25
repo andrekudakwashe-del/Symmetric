@@ -420,7 +420,13 @@ export async function rehydrateFromIndexedDB(): Promise<void> {
   if (!hasIndexedDb()) return;
   try {
     const criticalCollectionKeys: { key: string; idField: (item: any) => string }[] = [
-      { key: STORAGE_KEYS.SALES, idField: (s) => s.id },
+      {
+        key: STORAGE_KEYS.SALES,
+        idField: (s) =>
+          String(s?.id || s?.invoice_id || s?.invoiceId || s?.InvoiceID || s?.invoiceNumber || '')
+            .trim()
+            .toUpperCase(),
+      },
       { key: STORAGE_KEYS.INVENTORY_ITEMS, idField: (i) => i.itemId || i.id },
       { key: STORAGE_KEYS.CASH_LOGS, idField: (c) => c.id },
       { key: STORAGE_KEYS.CASH_COUNTS, idField: (c) => c.id },

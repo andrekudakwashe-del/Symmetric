@@ -943,6 +943,198 @@ export const healCustomerNamesAndChangeCreditLedgers = (): {
  * Prevents catchup arrays or empty deltas from wiping or overwriting local T1 records.
  * If incomingRecords is empty (length === 0), it does absolutely nothing and avoids touching local storage.
  */
+const SYNTHETIC_OR_BRANCH_SALE_ID_RE = /^(SALE-\d+|_INC_.*|_EXISTING_.*|BR-[A-Z0-9_-]+|HQ-\d+|ALL|UNASSIGNED|UNKNOWN)$/i;
+
+export const extractCanonicalSaleId = (sale: any): string => {
+  if (!sale || typeof sale !== 'object') return '';
+  const candidates = [
+    sale.id,
+    sale.invoice_id,
+    sale.invoiceId,
+    sale.InvoiceID,
+    sale.invoiceNumber,
+    sale.InvoiceNumber,
+    sale.saleId,
+  ];
+  for (const raw of candidates) {
+    const val = String(raw || '').trim();
+    if (val) return val;
+  }
+  return '';
+};
+
+const isCorruptFallbackSaleId = (id: string): boolean => {
+  const clean = String(id || '').trim();
+  if (!clean) return true;
+  return SYNTHETIC_OR_BRANCH_SALE_ID_RE.test(clean);
+};
+
+const getSaleStatusRank = (status: any): number => {
+  const u = String(status || '').trim().toUpperCase();
+  if (u === 'REFUNDED' || u === 'VOIDED') return 3;
+  if (u === 'COMPLETED') return 2;
+  if (u === 'PENDING' || u === 'DRAFT') return 1;
+  return 0;
+};
+
+const mergeTwoSaleRecords = (prev: any, incoming: any): any => {
+  const canonicalId = extractCanonicalSaleId(prev) || extractCanonicalSaleId(incoming);
+  const prevRank = getSaleStatusRank(prev?.status);
+  const incRank = getSaleStatusRank(incoming?.status);
+  const merged: any = { ...prev, ...incoming };
+  if (canonicalId) {
+    merged.id = canonicalId;
+  }
+
+  // Strictly monotonic sale status: Refunded/Voided can NEVER be downgraded back to Completed
+  if (prevRank > incRank) {
+    merged.status = prev.status;
+    if (prev.refundReason !== undefined) merged.refundReason = prev.refundReason;
+    if (prev.refundedAt !== undefined) merged.refundedAt = prev.refundedAt;
+    if (prev.refundApprovedBy !== undefined) merged.refundApprovedBy = prev.refundApprovedBy;
+    if (prev.refundApprovedById !== undefined) merged.refundApprovedById = prev.refundApprovedById;
+    if (prev.voidReason !== undefined) merged.voidReason = prev.voidReason;
+    if (prev.voidedAt !== undefined) merged.voidedAt = prev.voidedAt;
+    if (prev.voidApprovedBy !== undefined) merged.voidApprovedBy = prev.voidApprovedBy;
+    if (prev.voidApprovedById !== undefined) merged.voidApprovedById = prev.voidApprovedById;
+  }
+
+  // Preserve longer exchanges array & exchange flags
+  const prevEx = Array.isArray(prev?.exchanges) ? prev.exchanges : [];
+  const incEx = Array.isArray(incoming?.exchanges) ? incoming.exchanges : [];
+  if (prevEx.length > incEx.length) {
+    merged.exchanges = prevEx;
+    merged.hasExchanges = prev.hasExchanges ?? true;
+    if (prev.netTotal !== undefined) merged.netTotal = prev.netTotal;
+  }
+
+  // Preserve finalized mobile verification status
+  const isFinalMob = (s: any) => {
+    const u = String(s || '').trim().toUpperCase();
+    return u === 'VERIFIED' || u === 'FLAGGED';
+  };
+  if (isFinalMob(prev?.mobileVerificationStatus) && !isFinalMob(incoming?.mobileVerificationStatus)) {
+    merged.mobileVerificationStatus = prev.mobileVerificationStatus;
+    merged.mobileVerifiedAmountInCurrency = prev.mobileVerifiedAmountInCurrency;
+    merged.mobileExpectedAmountInCurrency = prev.mobileExpectedAmountInCurrency;
+    merged.mobileVerifiedRef = prev.mobileVerifiedRef;
+    merged.mobileVerifiedBy = prev.mobileVerifiedBy;
+    merged.mobileVerifiedByName = prev.mobileVerifiedByName;
+    merged.mobileVerifiedAt = prev.mobileVerifiedAt;
+    merged.mobileDisputeReason = prev.mobileDisputeReason;
+    merged.mobileDisputeResolution = prev.mobileDisputeResolution;
+    merged.mobileShortfallUsd = prev.mobileShortfallUsd;
+  }
+
+  // Preserve monotonic sync/cloud flags
+  if (prev?.synced === true || incoming?.synced === true) merged.synced = true;
+  if (prev?.isCloudSynced === true || incoming?.isCloudSynced === true) merged.isCloudSynced = true;
+  if (prev?.syncedToHub === true || incoming?.syncedToHub === true) merged.syncedToHub = true;
+  if (!merged.server_received_at && prev?.server_received_at) {
+    merged.server_received_at = prev.server_received_at;
+  }
+  if (!merged.checkoutIdempotencyKey && prev?.checkoutIdempotencyKey) {
+    merged.checkoutIdempotencyKey = prev.checkoutIdempotencyKey;
+  }
+  return merged;
+};
+
+export const deduplicateSalesEntries = (records: any[]): any[] => {
+  if (!Array.isArray(records) || records.length === 0) return [];
+
+  const byCanonicalId = new Map<string, any>();
+  const byIdempotencyKey = new Map<string, string>();
+  const corruptCandidates: any[] = [];
+
+  const buildExactSignature = (s: any): string => {
+    const dt = String(s?.date || '').trim();
+    const ts = String(s?.timestamp || '').trim();
+    const tot = Math.round((Number(s?.total) || 0) * 100);
+    const itemsSig = String(s?.itemsSummary || '').trim().toUpperCase();
+    const staff = String(s?.staffId || '').trim().toUpperCase();
+    return `${dt}|${ts}|${tot}|${itemsSig}|${staff}`;
+  };
+
+  for (const raw of records) {
+    if (!raw || typeof raw !== 'object') continue;
+    const rec = { ...raw };
+    delete rec.fromMesh;
+    delete rec.fromSync;
+
+    const canonicalId = extractCanonicalSaleId(rec);
+    if (!canonicalId || isCorruptFallbackSaleId(canonicalId)) {
+      corruptCandidates.push(rec);
+      continue;
+    }
+
+    rec.id = canonicalId;
+    const upperId = canonicalId.toUpperCase();
+    const idemKey = String(rec.checkoutIdempotencyKey || '').trim().toUpperCase();
+
+    // If same checkoutIdempotencyKey already mapped to an invoice, merge into that canonical entry
+    const mappedId = idemKey ? byIdempotencyKey.get(idemKey) : undefined;
+    const targetKey = mappedId || upperId;
+    const prev = byCanonicalId.get(targetKey);
+    if (prev) {
+      const merged = mergeTwoSaleRecords(prev, rec);
+      byCanonicalId.set(targetKey, merged);
+    } else {
+      byCanonicalId.set(targetKey, rec);
+    }
+    if (idemKey && !byIdempotencyKey.has(idemKey)) {
+      byIdempotencyKey.set(idemKey, targetKey);
+    }
+  }
+
+  // Only keep corrupt/missing-ID rows if they have non-zero value AND do NOT match an existing real invoice's exact timestamp+total+items
+  if (corruptCandidates.length > 0) {
+    const existingSignatures = new Set<string>();
+    byCanonicalId.forEach((s) => existingSignatures.add(buildExactSignature(s)));
+    const seenCorruptSigs = new Set<string>();
+    for (const c of corruptCandidates) {
+      const totalNum = Number(c?.total) || 0;
+      const hasItems = Array.isArray(c?.items) && c.items.length > 0;
+      if (totalNum <= 0 && !hasItems) continue;
+      const sig = buildExactSignature(c);
+      if (existingSignatures.has(sig) || seenCorruptSigs.has(sig)) {
+        continue;
+      }
+      seenCorruptSigs.add(sig);
+      const existingId = extractCanonicalSaleId(c);
+      const fallbackKey = existingId ? existingId.toUpperCase() : `FP-${computeDeterministicLedgerHash([sig])}`;
+      if (!byCanonicalId.has(fallbackKey)) {
+        byCanonicalId.set(fallbackKey, { ...c, id: existingId || fallbackKey });
+      }
+    }
+  }
+
+  return Array.from(byCanonicalId.values());
+};
+
+export const deduplicateStoredSales = (): number => {
+  if (hasPendingIdbOverflow(STORAGE_KEYS.SALES)) return 0;
+  const current = getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, []);
+  if (!Array.isArray(current) || current.length === 0) return 0;
+  const cleaned = deduplicateSalesEntries(current) as SaleInvoice[];
+  const removed = current.length - cleaned.length;
+  const normalizedChanged =
+    removed > 0 ||
+    cleaned.some((s, idx) => !current[idx] || current[idx].id !== s.id || current[idx].status !== s.status);
+  if (normalizedChanged) {
+    setStored(STORAGE_KEYS.SALES, cleaned);
+    inMemorySeenSaleIds.clear();
+    for (const s of cleaned) {
+      const cid = extractCanonicalSaleId(s);
+      if (cid) {
+        inMemorySeenSaleIds.add(cid);
+        inMemorySeenSaleIds.add(cid.toUpperCase());
+      }
+    }
+    notifyListeners();
+  }
+  return Math.max(0, removed);
+};
+
 export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[] => {
   // If the delta array is empty (length === 0), do absolutely nothing. Do not touch local storage.
   if (!incomingRecords || !Array.isArray(incomingRecords) || incomingRecords.length === 0) {
@@ -963,7 +1155,10 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
       item.changeId ||
       item.grvNumber ||
       item.invoice_id ||
+      item.invoiceId ||
+      item.InvoiceID ||
       item.invoiceNumber ||
+      item.InvoiceNumber ||
       item.supplierId ||
       item.voucherId ||
       item.grvId ||
@@ -977,10 +1172,34 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
     ).trim();
   };
 
-  // Populate map with existing local records
-  existing.forEach((item, idx) => {
-    const key = getRecordId(item) || `_existing_${idx}`;
-    map.set(key, item);
+  const getDeterministicFallbackKey = (item: any): string => {
+    const hash = computeDeterministicLedgerHash([
+      storageKey,
+      item?.date || item?.Date || '',
+      item?.timestamp || item?.Timestamp || item?.createdAt || '',
+      item?.total ?? item?.amount ?? item?.in ?? item?.out ?? 0,
+      item?.staffId || item?.StaffID || '',
+      item?.itemsSummary || item?.description || item?.notes || '',
+      item?.reference || '',
+    ]);
+    return `_FP_${hash}`;
+  };
+
+  // Populate map with existing local records (case-insensitive canonical key)
+  existing.forEach((rawItem) => {
+    if (!rawItem || typeof rawItem !== 'object') return;
+    const rawKey = getRecordId(rawItem);
+    const mapKey = rawKey ? rawKey.toUpperCase() : getDeterministicFallbackKey(rawItem);
+    const normalizedItem =
+      storageKey === STORAGE_KEYS.SALES && rawKey && !rawItem.id
+        ? { ...rawItem, id: rawKey }
+        : rawItem;
+    const prev = map.get(mapKey);
+    if (prev && storageKey === STORAGE_KEYS.SALES) {
+      map.set(mapKey, mergeTwoSaleRecords(prev, normalizedItem));
+    } else if (!prev) {
+      map.set(mapKey, normalizedItem);
+    }
   });
 
   // Iterate over incoming delta: update Map if ID exists (or add if new), enforcing monotonic finalized status
@@ -1013,11 +1232,25 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
   };
 
   incomingRecords.forEach((rawItem) => {
-    if (!rawItem) return;
+    if (!rawItem || typeof rawItem !== 'object') return;
     const item = { ...rawItem };
     delete item.fromMesh;
     delete item.fromSync;
-    const key = getRecordId(item);
+
+    if (storageKey === STORAGE_KEYS.SALES) {
+      const canonicalSaleId = extractCanonicalSaleId(item);
+      if (!canonicalSaleId || isCorruptFallbackSaleId(canonicalSaleId)) {
+        return; // Never ingest malformed/ID-less sales under random keys
+      }
+      item.id = canonicalSaleId;
+      const saleKey = canonicalSaleId.toUpperCase();
+      const prev = map.get(saleKey);
+      map.set(saleKey, prev ? mergeTwoSaleRecords(prev, item) : item);
+      return;
+    }
+
+    const rawKey = getRecordId(item);
+    const key = rawKey ? rawKey.toUpperCase() : '';
     if (key) {
       const prev = map.get(key);
       if (!prev) {
@@ -1039,9 +1272,10 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
           Math.abs(prevOut - incOut) > 0.005;
         if (isDifferentTxn) {
           const suffix = computeDeterministicLedgerHash([incCust, item.date, incIn, incOut, item.reference || item.notes]);
-          const resolvedId = `${key}-C${suffix}`;
-          if (!map.has(resolvedId)) {
-            map.set(resolvedId, { ...item, id: resolvedId, changeId: resolvedId });
+          const resolvedId = `${rawKey}-C${suffix}`;
+          const resolvedKey = resolvedId.toUpperCase();
+          if (!map.has(resolvedKey)) {
+            map.set(resolvedKey, { ...item, id: resolvedId, changeId: resolvedId });
           }
           return;
         }
@@ -1058,9 +1292,10 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
           Math.abs(prevIn - incIn) > 0.005;
         if (isDifferentTxn) {
           const suffix = computeDeterministicLedgerHash([incCust, item.date, incOut, incIn, item.reference || item.notes]);
-          const resolvedId = `${key}-C${suffix}`;
-          if (!map.has(resolvedId)) {
-            map.set(resolvedId, { ...item, id: resolvedId, creditId: resolvedId });
+          const resolvedId = `${rawKey}-C${suffix}`;
+          const resolvedKey = resolvedId.toUpperCase();
+          if (!map.has(resolvedKey)) {
+            map.set(resolvedKey, { ...item, id: resolvedId, creditId: resolvedId });
           }
           return;
         }
@@ -1104,7 +1339,10 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
       }
       map.set(key, mergedItem);
     } else {
-      map.set(`_inc_${Math.random()}`, item);
+      const fbKey = getDeterministicFallbackKey(item);
+      if (!map.has(fbKey)) {
+        map.set(fbKey, item);
+      }
     }
   });
 
@@ -1152,7 +1390,9 @@ export const mergeT1Records = (storageKey: string, incomingRecords: any[]): any[
 
   const mergedRaw = Array.from(map.values());
   const merged =
-    storageKey === STORAGE_KEYS.CASH_LOGS
+    storageKey === STORAGE_KEYS.SALES
+      ? deduplicateSalesEntries(mergedRaw)
+      : storageKey === STORAGE_KEYS.CASH_LOGS
       ? deduplicateCashLogs(mergedRaw.map((r) => normalizeCashLogRecord(r)))
       : storageKey === STORAGE_KEYS.CUSTOMER_CHANGES
       ? deduplicateCustomerChangeEntries(mergedRaw)
@@ -1793,13 +2033,14 @@ export const initRoomDatabase = () => {
     }
   }
 
-  // Ensure initial sales for all demo companies exist in sales store
+  // Ensure initial sales for all demo companies exist and deduplicate any corrupt/duplicate sales
   if (!hasPendingIdbOverflow(STORAGE_KEYS.SALES)) {
     const currentSales = getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
-    const existingSaleIds = new Set(currentSales.map((s) => s.id));
-    const missingSales = INITIAL_SALES.filter((s) => !existingSaleIds.has(s.id));
-    if (missingSales.length > 0) {
-      setStored(STORAGE_KEYS.SALES, [...currentSales, ...missingSales], {
+    const dedupedSales = deduplicateSalesEntries(currentSales) as SaleInvoice[];
+    const existingSaleIds = new Set(dedupedSales.map((s) => extractCanonicalSaleId(s).toUpperCase()).filter(Boolean));
+    const missingSales = INITIAL_SALES.filter((s) => !existingSaleIds.has(String(s.id || '').trim().toUpperCase()));
+    if (missingSales.length > 0 || dedupedSales.length !== currentSales.length) {
+      setStored(STORAGE_KEYS.SALES, [...dedupedSales, ...missingSales], {
         skipIdbOverwriteIfExisting: currentSales === INITIAL_SALES,
       });
     }
@@ -8633,10 +8874,7 @@ export const getSaleById = (id: string): SaleInvoice | undefined => {
   const clean = String(id || '').trim().toUpperCase();
   if (!clean) return undefined;
   return getRawStoredSales().find(
-    (s) =>
-      ((s.id || (s as any).invoice_id || (s as any).invoiceId || '') as string)
-        .trim()
-        .toUpperCase() === clean
+    (s) => extractCanonicalSaleId(s).toUpperCase() === clean
   );
 };
 
@@ -8791,10 +9029,12 @@ export const initSeenSaleIds = () => {
   if (hasInitializedSeenSaleIds) return;
   hasInitializedSeenSaleIds = true;
   try {
-    const list = getAllSales();
+    const list = getRawStoredSales();
     for (const s of list) {
-      if (s && s.id) {
-        inMemorySeenSaleIds.add(s.id);
+      const cid = extractCanonicalSaleId(s);
+      if (cid) {
+        inMemorySeenSaleIds.add(cid);
+        inMemorySeenSaleIds.add(cid.toUpperCase());
       }
     }
   } catch (e) {}
@@ -9036,8 +9276,12 @@ export const applyMobileMoneyVerificationLedgerEffects = (
   }
 };
 
-export const ingestMeshSale = (sale: SaleInvoice): boolean => {
-  if (!sale || !sale.id) return false;
+export const ingestMeshSale = (rawSale: SaleInvoice): boolean => {
+  if (!rawSale || typeof rawSale !== 'object') return false;
+  const canonicalId = extractCanonicalSaleId(rawSale);
+  if (!canonicalId || isCorruptFallbackSaleId(canonicalId)) return false;
+  const cleanUpperId = canonicalId.toUpperCase();
+  const sale: SaleInvoice = rawSale.id === canonicalId ? rawSale : { ...rawSale, id: canonicalId };
 
   const isSaleUpdate =
     sale.status === 'Refunded' ||
@@ -9047,10 +9291,10 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     Boolean(sale.hasExchanges) ||
     Boolean((sale as any).isUpdate);
 
-  // Ultra-fast O(1) in-memory deduplication check for brand new sales:
+  // Ultra-fast O(1) case-insensitive in-memory deduplication check for brand new sales:
   // Updates (refunds, voids, exchanges, mobile verification) bypass this check
   initSeenSaleIds();
-  if (!isSaleUpdate && inMemorySeenSaleIds.has(sale.id)) {
+  if (!isSaleUpdate && (inMemorySeenSaleIds.has(canonicalId) || inMemorySeenSaleIds.has(cleanUpperId))) {
     return false;
   }
 
@@ -9086,11 +9330,19 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
     return false;
   }
 
-  // Register in memory immediately to prevent race conditions during burst processing
-  inMemorySeenSaleIds.add(sale.id);
+  // Register in memory immediately (both exact & uppercase) to prevent race conditions during burst processing
+  inMemorySeenSaleIds.add(canonicalId);
+  inMemorySeenSaleIds.add(cleanUpperId);
 
   const list = getRawStoredSales();
-  const existingIdx = list.findIndex((s) => s.id === sale.id);
+  const incomingIdemKey = String((sale as any).checkoutIdempotencyKey || '').trim().toUpperCase();
+  const existingIdx = list.findIndex((s) => {
+    if (extractCanonicalSaleId(s).toUpperCase() === cleanUpperId) return true;
+    if (incomingIdemKey && String((s as any).checkoutIdempotencyKey || '').trim().toUpperCase() === incomingIdemKey) {
+      return true;
+    }
+    return false;
+  });
   const existing = existingIdx >= 0 ? list[existingIdx] : null;
 
   if (existing) {
@@ -9121,11 +9373,14 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
       return false;
     }
 
-    // APPLY UPDATE (preserving finalized mobile verification if incoming lacks it):
-    const updatedSale: SaleInvoice = {
-      ...existing,
+    // APPLY UPDATE (strictly preserving finalized Refunded/Voided and mobile verification statuses):
+    const updatedSale: SaleInvoice = mergeTwoSaleRecords(existing, {
       ...sale,
-      status: sale.status || existing.status,
+      id: extractCanonicalSaleId(existing) || canonicalId,
+      status:
+        getSaleStatusRank(existing.status) > getSaleStatusRank(sale.status)
+          ? existing.status
+          : (sale.status || existing.status),
       refundReason: sale.refundReason || existing.refundReason,
       refundedAt: sale.refundedAt || existing.refundedAt,
       refundApprovedBy: sale.refundApprovedBy || existing.refundApprovedBy,
@@ -9177,7 +9432,7 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
         existingMobFinal && !incomingMobFinal
           ? existing.mobileShortfallUsd
           : (sale.mobileShortfallUsd ?? existing.mobileShortfallUsd),
-    };
+    });
 
     list[existingIdx] = updatedSale;
     setStored(STORAGE_KEYS.SALES, list);
@@ -9502,12 +9757,16 @@ export const ingestMeshSale = (sale: SaleInvoice): boolean => {
 
   const normalized: SaleInvoice = {
     ...sale,
+    id: canonicalId,
     company_id: sale.company_id || sale.companyId || currentCompany,
     companyId: sale.company_id || sale.companyId || currentCompany,
     branch_id: sale.branch_id || sale.branchId || currentBranch,
     branchId: sale.branch_id || sale.branchId || currentBranch,
   };
-  const updated = [normalized, ...list.filter((s) => s.id !== sale.id)];
+  const updated = [
+    normalized,
+    ...list.filter((s) => extractCanonicalSaleId(s).toUpperCase() !== cleanUpperId),
+  ];
   setStored(STORAGE_KEYS.SALES, updated);
 
   // Decrement product stock in inventory
@@ -9968,6 +10227,7 @@ export const processWalletRecoveryQueue = async (): Promise<void> => {
 export const addSale = (
   saleData: Omit<SaleInvoice, 'id' | 'synced'> & {
     id?: string;
+    checkoutIdempotencyKey?: string;
     recordCashLog?: boolean;
     recordCreditEntry?: boolean;
     recordChangeEntry?: boolean;
@@ -9981,11 +10241,22 @@ export const addSale = (
   }
 ): SaleInvoice => {
   const all = getRawStoredSales();
+  const cleanIdemKey = String(saleData.checkoutIdempotencyKey || '').trim().toUpperCase();
+  if (cleanIdemKey) {
+    const existingByKey = all.find(
+      (s) => String((s as any).checkoutIdempotencyKey || '').trim().toUpperCase() === cleanIdemKey
+    );
+    if (existingByKey) {
+      return existingByKey;
+    }
+  }
+
   const currentCompany = getCurrentCompanyId();
   const currentBranch = getCurrentBranchId();
   const compId = saleData.company_id || saleData.companyId || currentCompany;
   const brId = saleData.branch_id || saleData.branchId || currentBranch;
-  const invId = saleData.id || getNextInvoiceId(saleData.staffId, saleData.staffName, brId);
+  const invId = String(saleData.id || getNextInvoiceId(saleData.staffId, saleData.staffName, brId)).trim();
+  const upperInvId = invId.toUpperCase();
   recordUsedSequentialId(compId, 'invoice', invId);
   const companiesList = getCompanies();
   const matchedComp = companiesList.find((c) => c.company_id === compId);
@@ -10032,9 +10303,10 @@ export const addSale = (
     updatedAt: (saleData as any).updatedAt || nowMs,
     lastUpdated: (saleData as any).lastUpdated || nowIso,
   };
-  const updated = [created, ...all.filter((s) => s.id !== invId)];
+  const updated = [created, ...all.filter((s) => extractCanonicalSaleId(s).toUpperCase() !== upperInvId)];
   setStored(STORAGE_KEYS.SALES, updated);
   registerSeenSaleId(invId);
+  registerSeenSaleId(upperInvId);
 
   // Fire-and-forget push to server central store for multi-tier persistence
   if (typeof fetch !== 'undefined' && !saleData.fromMesh) {
@@ -10059,26 +10331,34 @@ export const addSale = (
       .catch(() => {});
   }
 
-  // 1. Decrement product stock in inventory and log audit trail
-  if (Array.isArray(created.items)) {
-    created.items.forEach((item) => {
-      if (item.id && item.quantity > 0) {
-        updateProductStock(item.id, -item.quantity, undefined, undefined, {
-          staffId: created.staffId,
-          staffName: created.staffName,
-          referenceId: created.id,
-          reason: `POS Sale Outflow: Sold ${item.quantity} ${item.name || ''} to ${created.customerName || 'Customer'} (Invoice #${created.id})`,
-          actionTaken: 'POS_SALE',
-          txnType: 'SALE',
-        });
-      }
-    });
-  }
+  // Wrap secondary ledger side-effects so an error in stock/cash/wallet NEVER aborts
+  // enqueueSync or saleCreationListeners (Hub broadcast), which previously trapped
+  // un-broadcasted local ghost invoices on one device.
+  try {
+    // 1. Decrement product stock in inventory and log audit trail
+    if (Array.isArray(created.items)) {
+      created.items.forEach((item) => {
+        if (item.id && item.quantity > 0) {
+          try {
+            updateProductStock(item.id, -item.quantity, undefined, undefined, {
+              staffId: created.staffId,
+              staffName: created.staffName,
+              referenceId: created.id,
+              reason: `POS Sale Outflow: Sold ${item.quantity} ${item.name || ''} to ${created.customerName || 'Customer'} (Invoice #${created.id})`,
+              actionTaken: 'POS_SALE',
+              txnType: 'SALE',
+            });
+          } catch (stockErr) {
+            console.error('[addSale] Non-fatal stock deduction error for item', item.id, stockErr);
+          }
+        }
+      });
+    }
 
-  // 2. Ensure customer exists in unified customer database
-  if (created.customerName && created.customerName !== 'Walk-in Customer') {
-    ensureCustomerExists(created.customerName, created.staffId);
-  }
+    // 2. Ensure customer exists in unified customer database
+    if (created.customerName && created.customerName !== 'Walk-in Customer') {
+      ensureCustomerExists(created.customerName, created.staffId);
+    }
 
   // 2b. If customer used existing store credit / change funds, record deduction in CustomerChange (Form 3)
   if (created.customerCreditUsed && created.customerCreditUsed > 0) {
@@ -10425,6 +10705,9 @@ export const addSale = (
         branch_id: brId,
       });
     }
+  }
+  } catch (sideEffectErr) {
+    console.error('[addSale] Non-fatal ledger side-effect error for invoice', created.id, sideEffectErr);
   }
 
   // Save full canonical SaleInvoice to Sheet "Sales" (camelCase + legacy PascalCase aliases)
@@ -16265,11 +16548,17 @@ export const getTransactionsDigest = (
   }> = [];
   let totalSum = 0;
 
-  // 1. Sales (T1)
+  // 1. Sales (T1) — tenant & branch scoped with canonical ID normalization so Hub recon matches dashboard
   if (norm === 'sales' || norm === 'sale') {
-    const rawSales = getRawStoredSales();
-    for (const s of rawSales) {
-      if (!s || !s.id) continue;
+    const scopedSales = getAllSales();
+    const seenDigestIds = new Set<string>();
+    for (const s of scopedSales) {
+      if (!s) continue;
+      const saleId = extractCanonicalSaleId(s);
+      if (!saleId || isCorruptFallbackSaleId(saleId)) continue;
+      const upperId = saleId.toUpperCase();
+      if (seenDigestIds.has(upperId)) continue;
+      seenDigestIds.add(upperId);
       const t = parseTimestampMs(s.timestamp || s.updatedAt || s.date);
       if (inRange(t)) {
         const amt = Number(s.total) || 0;
@@ -16277,7 +16566,7 @@ export const getTransactionsDigest = (
           totalSum += amt;
         }
         items.push({
-          id: s.id,
+          id: saleId,
           total: amt,
           status: s.status || 'Completed',
           timestamp: t,
@@ -24382,12 +24671,33 @@ export const getSubscriptionStatus = (companyOrId?: Company | string | null): Su
     };
   }
 
-  // TRIAL MODE: Calculate 14-day window
+  // TRIAL MODE: Calculate 14-day window safely without producing NaN on ISO or missing dates
   const now = new Date();
-  const billingDate = new Date(company.next_billing_date + 'T23:59:59');
-  const diffTime = billingDate.getTime() - now.getTime();
-  const daysRemaining = Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
+  const rawBilling = String(company.next_billing_date || '').trim();
+  let billingMs = NaN;
+  if (rawBilling) {
+    billingMs = rawBilling.includes('T')
+      ? Date.parse(rawBilling)
+      : Date.parse(`${rawBilling}T23:59:59`);
+    if (!Number.isFinite(billingMs)) {
+      billingMs = Date.parse(rawBilling);
+    }
+  }
+  if (!Number.isFinite(billingMs) && company.trial_start_date) {
+    const trialStartMs = Date.parse(String(company.trial_start_date));
+    if (Number.isFinite(trialStartMs)) {
+      billingMs = trialStartMs + 14 * 24 * 60 * 60 * 1000;
+    }
+  }
+  const diffTime = Number.isFinite(billingMs) ? billingMs - now.getTime() : 14 * 24 * 60 * 60 * 1000;
+  const daysRemaining = Number.isFinite(diffTime)
+    ? Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)))
+    : 14;
   const isExpired = daysRemaining <= 0;
+  const resolvedNextBillingDate =
+    rawBilling && Number.isFinite(billingMs)
+      ? rawBilling.slice(0, 10)
+      : new Date(now.getTime() + daysRemaining * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
   return {
     isExpired,
@@ -24398,7 +24708,7 @@ export const getSubscriptionStatus = (companyOrId?: Company | string | null): Su
     message: isExpired
       ? '14-Day Free Trial Expired - Payment Confirmation Required'
       : `${daysRemaining} Day${daysRemaining === 1 ? '' : 's'} Remaining in 14-Day Free Trial`,
-    nextBillingDate: company.next_billing_date,
+    nextBillingDate: resolvedNextBillingDate,
     plan: company.plan,
     companyName: company.company_name,
     ownerEmail: company.owner_email,

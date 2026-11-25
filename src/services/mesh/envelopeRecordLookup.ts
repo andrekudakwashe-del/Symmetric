@@ -201,7 +201,10 @@ export function lookupExistingRecordForEnvelope(envelope: SyncEnvelope): any {
         Boolean(data?.hasExchanges);
       if (isSaleUpdate) return undefined;
       return getAllSales().find(
-        (s: any) => String(s.id || '').trim().toUpperCase() === cleanUpper
+        (s: any) =>
+          String(s.id || s.invoice_id || s.invoiceId || s.InvoiceID || s.invoiceNumber || '')
+            .trim()
+            .toUpperCase() === cleanUpper
       );
     }
     case 'expense': {
