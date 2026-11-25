@@ -191,7 +191,11 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
     setFormEmail('');
     setFormPin('');
     setFormRole('CASHIER');
-    const defaultBId = getCurrentBranchId() || (branches[0]?.branchId || '1');
+    const rawCurrentBranch = getCurrentBranchId();
+    const defaultBId =
+      rawCurrentBranch && rawCurrentBranch !== 'ALL'
+        ? rawCurrentBranch
+        : (branches[0]?.branchId || branches[0]?.id || 'BR-MAIN');
     const defaultBranch = branches.find((b) => (b.branchId || b.id) === defaultBId);
     setFormBranchId(defaultBId);
     setFormBranchAssignments([
@@ -265,8 +269,8 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
       return;
     }
     if (!editingStaff || formPin) {
-      if (!/^\d{6}$/.test(formPin) && !/^\d{4}$/.test(formPin)) {
-        setFormError('PIN must be 4 or 6 numeric digits (e.g. 123456).');
+      if (!/^\d{6}$/.test(formPin)) {
+        setFormError('PIN must be exactly 6 numeric digits (e.g. 123456) to match the login keypad.');
         return;
       }
     }
@@ -282,14 +286,20 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
       }
     }
 
-    // Ensure at least one branch assignment exists
-    let finalAssignments = [...formBranchAssignments];
+    const concreteDefaultBranchId = (() => {
+      if (formBranchId && formBranchId !== 'ALL') return formBranchId;
+      const curBr = getCurrentBranchId();
+      if (curBr && curBr !== 'ALL') return curBr;
+      return branches[0]?.branchId || branches[0]?.id || 'BR-MAIN';
+    })();
+
+    // Ensure at least one concrete branch assignment exists (never save 'ALL' as a branch assignment)
+    let finalAssignments = formBranchAssignments.filter((a) => a && a.branchId && a.branchId !== 'ALL');
     if (finalAssignments.length === 0) {
-      const fallbackBId = formBranchId || getCurrentBranchId() || '1';
-      const fallbackBranch = branches.find((b) => (b.branchId || b.id) === fallbackBId);
+      const fallbackBranch = branches.find((b) => (b.branchId || b.id) === concreteDefaultBranchId);
       finalAssignments = [
         {
-          branchId: fallbackBId,
+          branchId: concreteDefaultBranchId,
           branchName: fallbackBranch?.name || 'Primary Branch',
           role: (['BRANCH_MANAGER', 'SUPERVISOR', 'CASHIER', 'STOCK_CLERK'].includes(formRole)
             ? (formRole as any)
@@ -302,7 +312,10 @@ export const StaffAccessManagementScreen: React.FC<StaffAccessManagementScreenPr
 
     // Determine primary branch
     const primaryAssignment = finalAssignments.find((a) => a.isPrimary) || finalAssignments[0];
-    const resolvedBranchId = primaryAssignment?.branchId || formBranchId || '1';
+    const resolvedBranchId =
+      primaryAssignment?.branchId && primaryAssignment.branchId !== 'ALL'
+        ? primaryAssignment.branchId
+        : concreteDefaultBranchId;
 
     try {
       if (editingStaff) {

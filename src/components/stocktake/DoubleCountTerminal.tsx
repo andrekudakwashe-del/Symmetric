@@ -44,6 +44,7 @@ import {
   getFastMovingChecklist,
   authenticateCasualWorker,
   getTemporaryCasuals,
+  subscribeToDatabase,
 } from '../../db/roomDatabase';
 import {
   resolveStocktakePersona,
@@ -705,6 +706,35 @@ export const DoubleCountTerminal: React.FC<DoubleCountTerminalProps> = ({
     }
     setVisibleCount(PAGE_SIZE);
   }, [segment, counterSlot, session.sessionId, getDraftKey]);
+
+  // Reactively pick up inventory when IndexedDB hydration or cloud sync completes after mount
+  useEffect(() => {
+    const refreshCatalog = () => {
+      const freshItems = getInventoryItems(session.branchId, session.company_id);
+      if (freshItems.length === 0) return;
+      setInventoryList((prev) => (prev.length === freshItems.length ? prev : freshItems));
+      setLines((prevLines) => {
+        if (prevLines.length > 0) {
+          // Preserve any existing/counted lines while appending newly hydrated products
+          const existingIds = new Set(prevLines.map((l) => l.itemId.toUpperCase()));
+          const missing = freshItems.filter((it) => !existingIds.has(it.itemId.toUpperCase()));
+          if (missing.length === 0) return prevLines;
+          return [...prevLines, ...buildZeroSeededCatalog(missing)];
+        }
+        const baseCatalog = buildZeroSeededCatalog(freshItems);
+        const existing = counterSlot === 'A' ? segment.count1 : segment.count2;
+        return existing && existing.length > 0
+          ? mergeOverlayOntoCatalog(baseCatalog, existing)
+          : baseCatalog;
+      });
+    };
+    const unsubDb = subscribeToDatabase(refreshCatalog);
+    window.addEventListener('saimetric_inventory_updated', refreshCatalog);
+    return () => {
+      unsubDb();
+      window.removeEventListener('saimetric_inventory_updated', refreshCatalog);
+    };
+  }, [session.branchId, session.company_id, segment, counterSlot]);
 
   // Collapse upper header on scroll down to give counter maximum vertical screen space
   useEffect(() => {

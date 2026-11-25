@@ -152,6 +152,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
   const [changeLeftBehind, setChangeLeftBehind] = useState<boolean>(false);
   const [actualChangeLeftInput, setActualChangeLeftInput] = useState<string>('');
   const [checkoutWarning, setCheckoutWarning] = useState<string | null>(null);
+  const [isProcessingCheckout, setIsProcessingCheckout] = useState<boolean>(false);
   const [showCustomerPickerInCheckout, setShowCustomerPickerInCheckout] = useState<boolean>(false);
   const [showSearchCustomerModal, setShowSearchCustomerModal] = useState<boolean>(false);
 
@@ -662,8 +663,10 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
   };
 
   // Process and finalize checkout
-  const handleProcessCheckout = () => {
-    if (cart.length === 0) return;
+  const handleProcessCheckout = (options?: { bypassCreditReview?: boolean; extraNote?: string }) => {
+    if (cart.length === 0 || isProcessingCheckout) return;
+
+    const bypassCreditReview = Boolean(options?.bypassCreditReview);
 
     // Enforce registered customer rule for Change Left Behind
     if (paymentMethod === 'Cash' && changeLeftBehind) {
@@ -712,7 +715,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       const creditSummary = getCustomerCreditSummary(selectedCustomerId, parsedCreditAmount);
       const isSuper = isSupervisorOrAbove(currentUser?.role);
 
-      if (!isSuper && !creditAuthorizedBy) {
+      if (!isSuper && !creditAuthorizedBy && !bypassCreditReview) {
         if (policy.mode === 'STRICT_UPFRONT') {
           setCreditApprovalRequiredReason('Store Policy: Every credit sale requires supervisor authorization PIN.');
           setAllowQueueForReview(false);
@@ -737,7 +740,7 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
 
     // Enforce case reserve threshold protection on wholesale case items (zero quantity leakage)
     for (const item of cart) {
-      const reserve = Math.max(0, item.product.caseReserveThreshold || 0);
+      const reserve = Math.max(0, Number(item.product.caseReserveThreshold) || 0);
       if (reserve > 0 && item.product.canSellAsCase) {
         const itemCases = Number(item.product.stockCases) || 0;
         const requestedCases = Number(item.quantity) || 0;
@@ -762,130 +765,158 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
       }
     }
 
-    const saleItems: SaleItem[] = cart.map((item) => {
-      const unitPrice =
-        item.customPrice !== undefined ? item.customPrice : item.product.price;
-      const prodCost = item.product.costPrice !== undefined ? item.product.costPrice : undefined;
-      return {
-        id: item.product.id,
-        name: item.product.name,
-        sku: item.product.sku,
-        category: item.product.category,
-        quantity: item.quantity,
-        unitPrice,
-        total: unitPrice * item.quantity,
-        costPrice: prodCost,
-        costPerUnitAverage: prodCost,
-        costPerUnitLatest: prodCost,
-        unitsPerPack: item.product.unitsPerPack,
-        unitsPerCase: item.product.unitsPerCase,
-        variantId: item.product.variantId,
-      };
-    });
+    setIsProcessingCheckout(true);
+    setCheckoutWarning(null);
 
-    const itemsSummary = cart
-      .map((item) => {
-        const qtyStr = item.quantity % 1 === 0 ? item.quantity : item.quantity.toFixed(3).replace(/\.?0+$/, '');
-        return `${qtyStr}x ${item.product.name}`;
-      })
-      .join(', ');
+    try {
+      const saleItems: SaleItem[] = cart.map((item) => {
+        const rawUnitPrice =
+          item.customPrice !== undefined ? item.customPrice : item.product.price;
+        const unitPrice = Number.isFinite(Number(rawUnitPrice)) ? Number(rawUnitPrice) : 0;
+        const rawQty = Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : 0;
+        const parsedCost = Number(item.product.costPrice);
+        const prodCost =
+          item.product.costPrice !== undefined && Number.isFinite(parsedCost)
+            ? parsedCost
+            : undefined;
+        return {
+          id: item.product.id,
+          name: item.product.name,
+          sku: item.product.sku,
+          category: item.product.category,
+          quantity: rawQty,
+          unitPrice,
+          total: unitPrice * rawQty,
+          costPrice: prodCost,
+          costPerUnitAverage: prodCost,
+          costPerUnitLatest: prodCost,
+          unitsPerPack: item.product.unitsPerPack,
+          unitsPerCase: item.product.unitsPerCase,
+          variantId: item.product.variantId,
+        };
+      });
 
-    const customerName = activeCustomer ? activeCustomer.name : 'Walk-in Customer';
-    const customerId = activeCustomer ? activeCustomer.customerId : 'C_WALKIN';
-    const today = getTodayDateString();
+      const itemsSummary = cart
+        .map((item) => {
+          const qty = Number(item.quantity) || 0;
+          const qtyStr = qty % 1 === 0 ? qty : qty.toFixed(3).replace(/\.?0+$/, '');
+          return `${qtyStr}x ${item.product.name}`;
+        })
+        .join(', ');
 
-    const isEco = paymentMethod === 'EcoCash' || paymentMethod === 'EcoCash/Mobile' || selectedCurrency === 'EcoCash';
-    const isZig = paymentMethod === 'ZiG' || selectedCurrency === 'ZiG';
-    const effectiveCur = isEco ? 'EcoCash' : isZig ? 'ZiG' : (selectedCurrency !== 'USD' ? selectedCurrency : undefined);
-    const multiRates = multiConfig.rates || {};
-    const effectiveRate =
-      currentRate > 0 && selectedCurrency !== 'USD'
-        ? currentRate
-        : isEco
-        ? (multiRates['EcoCash']?.rateToUsd || multiRates['EcoCash']?.rateToBase || 1.05)
-        : isZig
-        ? (multiRates['ZiG']?.rateToUsd || multiRates['ZiG']?.rateToBase || 26.5)
-        : (currentRate || 1);
+      const customerName = activeCustomer ? activeCustomer.name : 'Walk-in Customer';
+      const customerId = activeCustomer ? activeCustomer.customerId : 'C_WALKIN';
+      const today = getTodayDateString();
 
-    const effectiveTotalInCur = effectiveCur ? cartTotal * effectiveRate : undefined;
-    const effectiveWithdrawalInCur = effectiveCur && parsedCashWithdrawal > 0 ? parsedCashWithdrawal * effectiveRate : undefined;
-    const effectiveTotalChargedInCur = effectiveCur ? (cartTotal + parsedCashWithdrawal) * effectiveRate : undefined;
+      const isEco = paymentMethod === 'EcoCash' || paymentMethod === 'EcoCash/Mobile' || selectedCurrency === 'EcoCash';
+      const isZig = paymentMethod === 'ZiG' || selectedCurrency === 'ZiG';
+      const effectiveCur = isEco ? 'EcoCash' : isZig ? 'ZiG' : (selectedCurrency !== 'USD' ? selectedCurrency : undefined);
+      const multiRates = multiConfig.rates || {};
+      const rawEffectiveRate =
+        currentRate > 0 && selectedCurrency !== 'USD'
+          ? currentRate
+          : isEco
+          ? (multiRates['EcoCash']?.rateToUsd || multiRates['EcoCash']?.rateToBase || 1.05)
+          : isZig
+          ? (multiRates['ZiG']?.rateToUsd || multiRates['ZiG']?.rateToBase || 26.5)
+          : (currentRate || 1);
+      const effectiveRate =
+        Number.isFinite(Number(rawEffectiveRate)) && Number(rawEffectiveRate) > 0
+          ? Number(rawEffectiveRate)
+          : 1;
 
-    const newSale = addSale({
-      timestamp: new Date().toISOString(),
-      date: today,
-      customerId,
-      customerName,
-      items: saleItems,
-      itemsSummary,
-      subtotal: cartSubtotal,
-      discount: calculatedDiscount,
-      tax: taxAmount,
-      total: cartTotal,
-      currency: effectiveCur,
-      exchangeRate: effectiveCur ? effectiveRate : undefined,
-      totalInCurrency: effectiveTotalInCur,
-      cashWithdrawalAmount: parsedCashWithdrawal > 0 ? parsedCashWithdrawal : undefined,
-      cashWithdrawalInCurrency: effectiveWithdrawalInCur,
-      totalChargedInCurrency: effectiveTotalChargedInCur,
-      grossTenderUsd:
-        parsedCashWithdrawal > 0
-          ? cartTotal + parsedCashWithdrawal
-          : cartTotal,
-      proofOfPaymentRef: proofOfPaymentRef.trim() || undefined,
-      paymentReference: proofOfPaymentRef.trim() || undefined,
-      paymentMethod,
-      cashTendered:
-        paymentMethod === 'Cash'
-          ? parsedCashTendered > 0
-            ? parsedCashTendered
-            : cartTotal
-          : undefined,
-      changeDue:
-        paymentMethod === 'Cash'
-          ? parsedCashTendered > 0
-            ? Math.max(0, parsedCashTendered - cartTotal)
-            : 0
-          : undefined,
-      changeLeftBehind: paymentMethod === 'Cash' ? changeLeftBehind : undefined,
-      changeAmountLeftBehind:
-        paymentMethod === 'Cash' && changeLeftBehind
-          ? parsedActualChangeLeft
-          : undefined,
-      creditAmount:
-        paymentMethod === 'Credit' ? parsedCreditAmount : undefined,
-      creditDueDate: paymentMethod === 'Credit' ? creditDueDate : undefined,
-      creditDeposit: paymentMethod === 'Credit' ? parsedCreditDeposit : undefined,
-      creditBalanceOwed: paymentMethod === 'Credit' ? creditBalanceOwed : undefined,
-      staffId: currentUser?.id || '001',
-      staffName: currentUser?.name || 'Cashier',
-      companyId: getCurrentCompanyId() || currentUser?.companyId || currentUser?.company_id || 'COMP-001',
-      company_id: getCurrentCompanyId() || currentUser?.companyId || currentUser?.company_id || 'COMP-001',
-      branchId: getCurrentBranchId() || currentUser?.branchId || currentUser?.branch_id || 'BR-MAIN',
-      branch_id: getCurrentBranchId() || currentUser?.branchId || currentUser?.branch_id || 'BR-MAIN',
-      branchName: getCurrentBranch()?.name || currentUser?.branchName || 'Main Branch',
-      notes: saleNotes,
-      status: 'Completed',
-    });
+      const effectiveTotalInCur = effectiveCur ? cartTotal * effectiveRate : undefined;
+      const effectiveWithdrawalInCur = effectiveCur && parsedCashWithdrawal > 0 ? parsedCashWithdrawal * effectiveRate : undefined;
+      const effectiveTotalChargedInCur = effectiveCur ? (cartTotal + parsedCashWithdrawal) * effectiveRate : undefined;
 
-    // Reset checkout state and show receipt modal
-    setShowCheckoutModal(false);
-    setSelectedCurrency('USD');
-    setCashWithdrawalInput('');
-    setOpenCashWithdrawal(false);
-    setCompletedInvoice(newSale);
-    setCart([]);
-    clearPOSCartDraft();
-    setDiscountInput('0');
-    setTaxAmount(0);
-    setOtherCharges(0);
-    setSaleNotes('');
-    setLockdownAuthorizedBy(null);
-    loadData();
+      const combinedNotes = options?.extraNote
+        ? (saleNotes ? `${saleNotes} ${options.extraNote}` : options.extraNote)
+        : saleNotes;
 
-    // Dispatch via offline local mesh to Host Till and peer terminals immediately
-    syncService.dispatchSale(newSale).catch(() => {});
-    meshSyncService.broadcastSale(newSale).catch(() => {});
+      const newSale = addSale({
+        timestamp: new Date().toISOString(),
+        date: today,
+        customerId,
+        customerName,
+        items: saleItems,
+        itemsSummary,
+        subtotal: cartSubtotal,
+        discount: calculatedDiscount,
+        tax: taxAmount,
+        total: cartTotal,
+        currency: effectiveCur,
+        exchangeRate: effectiveCur ? effectiveRate : undefined,
+        totalInCurrency: effectiveTotalInCur,
+        cashWithdrawalAmount: parsedCashWithdrawal > 0 ? parsedCashWithdrawal : undefined,
+        cashWithdrawalInCurrency: effectiveWithdrawalInCur,
+        totalChargedInCurrency: effectiveTotalChargedInCur,
+        grossTenderUsd:
+          parsedCashWithdrawal > 0
+            ? cartTotal + parsedCashWithdrawal
+            : cartTotal,
+        proofOfPaymentRef: proofOfPaymentRef.trim() || undefined,
+        paymentReference: proofOfPaymentRef.trim() || undefined,
+        paymentMethod,
+        cashTendered:
+          paymentMethod === 'Cash'
+            ? parsedCashTendered > 0
+              ? parsedCashTendered
+              : cartTotal
+            : undefined,
+        changeDue:
+          paymentMethod === 'Cash'
+            ? parsedCashTendered > 0
+              ? Math.max(0, parsedCashTendered - cartTotal)
+              : 0
+            : undefined,
+        changeLeftBehind: paymentMethod === 'Cash' ? changeLeftBehind : undefined,
+        changeAmountLeftBehind:
+          paymentMethod === 'Cash' && changeLeftBehind
+            ? parsedActualChangeLeft
+            : undefined,
+        creditAmount:
+          paymentMethod === 'Credit' ? parsedCreditAmount : undefined,
+        creditDueDate: paymentMethod === 'Credit' ? creditDueDate : undefined,
+        creditDeposit: paymentMethod === 'Credit' ? parsedCreditDeposit : undefined,
+        creditBalanceOwed: paymentMethod === 'Credit' ? creditBalanceOwed : undefined,
+        staffId: currentUser?.id || '001',
+        staffName: currentUser?.name || 'Cashier',
+        companyId: getCurrentCompanyId() || currentUser?.companyId || currentUser?.company_id || 'COMP-001',
+        company_id: getCurrentCompanyId() || currentUser?.companyId || currentUser?.company_id || 'COMP-001',
+        branchId: getCurrentBranchId() || currentUser?.branchId || currentUser?.branch_id || 'BR-MAIN',
+        branch_id: getCurrentBranchId() || currentUser?.branchId || currentUser?.branch_id || 'BR-MAIN',
+        branchName: getCurrentBranch()?.name || currentUser?.branchName || 'Main Branch',
+        notes: combinedNotes,
+        status: 'Completed',
+      });
+
+      // Reset checkout state and show receipt modal
+      setShowCheckoutModal(false);
+      setSelectedCurrency('USD');
+      setCashWithdrawalInput('');
+      setOpenCashWithdrawal(false);
+      setCompletedInvoice(newSale);
+      setCart([]);
+      clearPOSCartDraft();
+      setDiscountInput('0');
+      setTaxAmount(0);
+      setOtherCharges(0);
+      setSaleNotes('');
+      setCreditAuthorizedBy(null);
+      setAllowQueueForReview(false);
+      setLockdownAuthorizedBy(null);
+      loadData();
+
+      // Dispatch via syncService (meshSyncService already broadcasts automatically via onSaleCreated)
+      syncService.dispatchSale(newSale).catch(() => {});
+    } catch (err: any) {
+      console.error('[POSRegister] Checkout failed:', err);
+      setCheckoutWarning(
+        `Unable to complete invoice: ${err?.message || 'Unexpected error while saving transaction. Please try again.'}`
+      );
+    } finally {
+      setIsProcessingCheckout(false);
+    }
   };
 
   return (
@@ -1131,13 +1162,13 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
                       <button
                         type="button"
                         onClick={() => {
-                          setSaleNotes((prev) => (prev ? `${prev} [PENDING SUPERVISOR REVIEW]` : '[PENDING SUPERVISOR REVIEW]'));
                           setCheckoutWarning(null);
                           setShowCreditSupervisorModal(false);
                           showToast('Credit sale queued for Supervisor Review (Mode B)');
-                          setTimeout(() => {
-                            handleProcessCheckout();
-                          }, 50);
+                          handleProcessCheckout({
+                            bypassCreditReview: true,
+                            extraNote: '[PENDING SUPERVISOR REVIEW]',
+                          });
                         }}
                         className="px-2.5 py-1.5 bg-amber-600 hover:bg-amber-500 text-white rounded-xl text-[11px] font-bold flex items-center space-x-1.5 shadow-sm"
                         title="Process credit sale now and route to supervisor review dashboard"
@@ -1711,12 +1742,14 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={handleProcessCheckout}
+                  onClick={() => handleProcessCheckout()}
                   disabled={
+                    isProcessingCheckout ||
                     (paymentMethod === 'Credit' && !isRegisteredCustomer) ||
                     (paymentMethod === 'Cash' && changeLeftBehind && !isRegisteredCustomer)
                   }
                   className={`flex-1 py-3 rounded-2xl font-black text-xs shadow-lg flex items-center justify-center space-x-1.5 transition active:scale-95 ${
+                    isProcessingCheckout ||
                     (paymentMethod === 'Credit' && !isRegisteredCustomer) ||
                     (paymentMethod === 'Cash' && changeLeftBehind && !isRegisteredCustomer)
                       ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
@@ -1731,8 +1764,10 @@ export const POSRegister: React.FC<POSRegisterProps> = ({
                 >
                   <Check className="w-4 h-4" />
                   <span>
-                    {(paymentMethod === 'Credit' && !isRegisteredCustomer) ||
-                    (paymentMethod === 'Cash' && changeLeftBehind && !isRegisteredCustomer)
+                    {isProcessingCheckout
+                      ? 'Processing...'
+                      : (paymentMethod === 'Credit' && !isRegisteredCustomer) ||
+                        (paymentMethod === 'Cash' && changeLeftBehind && !isRegisteredCustomer)
                       ? 'Customer Registration Required'
                       : 'Complete & Print'}
                   </span>

@@ -175,6 +175,15 @@ export function resolveItemCost(
     );
   });
 
+  const toNum = (v: unknown, fallback = 0): number => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const toPosNum = (v: unknown): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+
   // 5. Cost & stock calculation
   let avgCost = 0;
   let latestCost = 0;
@@ -185,55 +194,62 @@ export function resolveItemCost(
   let canonicalKey = cleanId || cleanName || 'UNKNOWN';
 
   if (matchedInv) {
-    const unitsPerCase = Math.max(1, matchedInv.unitsPerCase || 1);
+    const unitsPerCase = Math.max(1, toNum(matchedInv.unitsPerCase, 1));
+    const invCostPerUnit = toPosNum(matchedInv.costPerUnit);
+    const invCostPerCase = toPosNum(matchedInv.costPerCase);
+    const invAvgUnitCost = toPosNum(matchedInv.averageCostPerUnit);
+    const invLatestUnitCost = toPosNum(matchedInv.latestCostPerUnit);
+    const invAvgCaseCost = toPosNum(matchedInv.averageCostPerCase);
+    const invLatestCaseCost = toPosNum(matchedInv.latestCostPerCase);
+
     const fallbackUnitCost =
-      matchedInv.costPerUnit !== undefined && matchedInv.costPerUnit > 0
-        ? matchedInv.costPerUnit
-        : (matchedInv.costPerCase || 0) / unitsPerCase;
+      invCostPerUnit > 0
+        ? invCostPerUnit
+        : invCostPerCase / unitsPerCase;
 
     const avgUnitCost =
-      matchedInv.averageCostPerUnit !== undefined && matchedInv.averageCostPerUnit > 0
-        ? matchedInv.averageCostPerUnit
+      invAvgUnitCost > 0
+        ? invAvgUnitCost
         : fallbackUnitCost;
 
-    const grnUnitCost = getLatestGrnUnitCost(matchedInv.itemId, matchedInv.sku);
+    const grnUnitCost = toPosNum(getLatestGrnUnitCost(matchedInv.itemId, matchedInv.sku));
 
     const latestUnitCost =
-      grnUnitCost !== undefined && grnUnitCost > 0
+      grnUnitCost > 0
         ? grnUnitCost
-        : (matchedInv.latestCostPerUnit !== undefined && matchedInv.latestCostPerUnit > 0
-            ? matchedInv.latestCostPerUnit
-            : (matchedInv.costPerUnit && matchedInv.costPerUnit > 0
-                ? matchedInv.costPerUnit
+        : (invLatestUnitCost > 0
+            ? invLatestUnitCost
+            : (invCostPerUnit > 0
+                ? invCostPerUnit
                 : fallbackUnitCost));
 
     if (isCase) {
       itemType = 'case';
       const caseCostFallback =
-        matchedInv.costPerCase !== undefined && matchedInv.costPerCase > 0
-          ? matchedInv.costPerCase
+        invCostPerCase > 0
+          ? invCostPerCase
           : fallbackUnitCost * unitsPerCase;
 
       avgCost =
-        matchedInv.averageCostPerCase !== undefined && matchedInv.averageCostPerCase > 0
-          ? matchedInv.averageCostPerCase
+        invAvgCaseCost > 0
+          ? invAvgCaseCost
           : (avgUnitCost * unitsPerCase || caseCostFallback);
 
-      const grnCaseCost = grnUnitCost ? grnUnitCost * unitsPerCase : undefined;
+      const grnCaseCost = grnUnitCost > 0 ? grnUnitCost * unitsPerCase : 0;
       latestCost =
-        grnCaseCost !== undefined && grnCaseCost > 0
+        grnCaseCost > 0
           ? grnCaseCost
-          : (matchedInv.latestCostPerCase !== undefined && matchedInv.latestCostPerCase > 0
-              ? matchedInv.latestCostPerCase
-              : (matchedInv.costPerCase && matchedInv.costPerCase > 0
-                  ? matchedInv.costPerCase
+          : (invLatestCaseCost > 0
+              ? invLatestCaseCost
+              : (invCostPerCase > 0
+                  ? invCostPerCase
                   : latestUnitCost * unitsPerCase || caseCostFallback));
 
       currentStock =
         matchedInv.stockCases !== undefined
-          ? matchedInv.stockCases
-          : Math.floor((matchedInv.totalUnits || 0) / unitsPerCase);
-      reorderLevel = matchedInv.reorderLevelCases ?? 2;
+          ? toNum(matchedInv.stockCases, 0)
+          : Math.floor(toNum(matchedInv.totalUnits, 0) / unitsPerCase);
+      reorderLevel = toNum(matchedInv.reorderLevelCases, 2);
       canonicalKey = `${matchedInv.itemId}-CASE`;
       resolvedDisplayName = /\bcase\b/i.test(rawName)
         ? rawName
@@ -261,26 +277,27 @@ export function resolveItemCost(
       // Detect units in pack (e.g. 10s, 5s, 2s, 10pk, 20pk)
       const packUnitsMatch = cleanName.match(/(\d+)\s*(s|pk|pack)/i);
       const unitsInPack =
-        variant?.unitsPerPack ||
-        Number((item as any).unitsPerPack) ||
-        (packUnitsMatch ? Number(packUnitsMatch[1]) : (cleanName.includes('ninja') ? 10 : 1));
+        toPosNum(variant?.unitsPerPack) ||
+        toPosNum((item as any).unitsPerPack) ||
+        (packUnitsMatch ? toPosNum(packUnitsMatch[1]) || 1 : (cleanName.includes('ninja') ? 10 : 1));
 
+      const variantCostPrice = toPosNum(variant?.costPrice);
       const vCostFallback =
-        variant?.costPrice !== undefined && variant.costPrice > 0
-          ? variant.costPrice
+        variantCostPrice > 0
+          ? variantCostPrice
           : fallbackUnitCost * unitsInPack;
 
       avgCost =
-        variant?.costPrice !== undefined && variant.costPrice > 0
-          ? variant.costPrice
+        variantCostPrice > 0
+          ? variantCostPrice
           : (avgUnitCost * unitsInPack || vCostFallback);
 
       latestCost =
-        variant?.costPrice !== undefined && variant.costPrice > 0
-          ? variant.costPrice
+        variantCostPrice > 0
+          ? variantCostPrice
           : (latestUnitCost * unitsInPack || vCostFallback);
 
-      currentStock = Math.floor((matchedInv.totalUnits || 0) / Math.max(1, unitsInPack));
+      currentStock = Math.floor(toNum(matchedInv.totalUnits, 0) / Math.max(1, unitsInPack));
       reorderLevel = 5;
       canonicalKey = variant
         ? `${matchedInv.itemId}__${variant.id}`
@@ -292,8 +309,8 @@ export function resolveItemCost(
       itemType = 'unit';
       avgCost = avgUnitCost;
       latestCost = latestUnitCost;
-      currentStock = matchedInv.totalUnits ?? matchedInv.stockSingles ?? 0;
-      reorderLevel = matchedInv.reorderLevelUnits ?? 5;
+      currentStock = toNum(matchedInv.totalUnits ?? matchedInv.stockSingles, 0);
+      reorderLevel = toNum(matchedInv.reorderLevelUnits, 5);
       canonicalKey =
         matchedInv.canSellAsCase || (matchedInv.packagingVariants && matchedInv.packagingVariants.length > 0)
           ? `${matchedInv.itemId}-UNIT`
@@ -301,16 +318,16 @@ export function resolveItemCost(
       resolvedDisplayName = rawName || `${matchedInv.itemName} Each`;
     }
   } else if (matchedProduct) {
-    const prodCost = matchedProduct.costPrice || matchedProduct.costPerUnit || 0;
-    const grnProdCost = getLatestGrnUnitCost(matchedProduct.id, matchedProduct.sku);
+    const prodCost = toPosNum(matchedProduct.costPrice) || toPosNum(matchedProduct.costPerUnit);
+    const grnProdCost = toPosNum(getLatestGrnUnitCost(matchedProduct.id, matchedProduct.sku));
     if (prodCost > 0) {
       avgCost = prodCost;
-      latestCost = grnProdCost !== undefined && grnProdCost > 0 ? grnProdCost : prodCost;
-    } else if (grnProdCost !== undefined && grnProdCost > 0) {
+      latestCost = grnProdCost > 0 ? grnProdCost : prodCost;
+    } else if (grnProdCost > 0) {
       avgCost = grnProdCost;
       latestCost = grnProdCost;
     }
-    currentStock = matchedProduct.stockQuantity ?? 0;
+    currentStock = toNum(matchedProduct.stockQuantity, 0);
     canonicalKey = matchedProduct.id;
     resolvedDisplayName = matchedProduct.name;
     if (matchedProduct.id.endsWith('-CASE')) itemType = 'case';
@@ -319,34 +336,39 @@ export function resolveItemCost(
 
   // 6. Fallback checks if cost from inventory master is not available
   if (avgCost <= 0) {
-    const snapshotCost = (item as any).costPrice;
-    if (snapshotCost !== undefined && Number(snapshotCost) > 0) {
-      avgCost = Number(snapshotCost);
-      latestCost = Number(snapshotCost);
+    const snapshotCost = toPosNum((item as any).costPrice);
+    if (snapshotCost > 0) {
+      avgCost = snapshotCost;
+      latestCost = snapshotCost;
     }
   }
 
   if (avgCost <= 0) {
-    const snapAvg = Number((item as any).costPerUnitAverage);
+    const snapAvg = toPosNum((item as any).costPerUnitAverage);
     // Discard dummy 70% fallback if it was generated automatically
     const isDummyFallback = unitPrice > 0 && snapAvg > 0 && Math.abs(snapAvg - unitPrice * 0.7) < 0.001;
     if (snapAvg > 0 && !isDummyFallback) {
       avgCost = snapAvg;
-      latestCost = Number((item as any).costPerUnitLatest) || snapAvg;
+      latestCost = toPosNum((item as any).costPerUnitLatest) || snapAvg;
     }
   }
 
   // Also check if sale item has a recorded latest cost snapshot
-  const itemLatestSnap = Number((item as any).costPerUnitLatest) || Number((item as any).latestCost);
+  const itemLatestSnap = toPosNum((item as any).costPerUnitLatest) || toPosNum((item as any).latestCost);
   if (itemLatestSnap > 0) {
     latestCost = itemLatestSnap;
   }
 
   // Final emergency fallback if totally unknown
+  const safeUnitPrice = toNum(unitPrice, 0);
   if (avgCost <= 0) {
-    avgCost = unitPrice > 0 ? Number((unitPrice * 0.7).toFixed(4)) : 0;
+    avgCost = safeUnitPrice > 0 ? Number((safeUnitPrice * 0.7).toFixed(4)) : 0;
     latestCost = avgCost;
   }
+
+  avgCost = toNum(avgCost, 0);
+  latestCost = toNum(latestCost, avgCost);
+  currentStock = toNum(currentStock, 0);
 
   let stockStatus: 'Out of Stock' | 'Low Stock' | 'In Stock' = 'In Stock';
   if (currentStock <= 0) stockStatus = 'Out of Stock';

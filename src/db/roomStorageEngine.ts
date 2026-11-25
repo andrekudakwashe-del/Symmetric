@@ -127,10 +127,29 @@ const IMMEDIATE_PERSIST_KEYS = new Set<string>([
   STORAGE_KEYS.CURRENT_COMPANY_ID,
   STORAGE_KEYS.CURRENT_BRANCH_ID,
   STORAGE_KEYS.OFFLINE_MODE,
+  STORAGE_KEYS.SALESPEOPLE,
 ]);
 
 const LOCALSTORAGE_SOFT_LIMIT_CHARS = 120_000;
 const pendingIdbKeyHydrations = new Set<string>();
+
+/**
+ * Returns true when localStorage contains an IndexedDB overflow sentinel for `key`
+ * and the real dataset has not yet been hydrated into memoryCache.
+ * Startup migrations must skip overwriting these keys until hydration completes.
+ */
+export const hasPendingIdbOverflow = (key: string): boolean => {
+  if (memoryCache.has(key)) return false;
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw || !raw.includes('__overflow_idb')) return false;
+    const parsed = JSON.parse(raw);
+    return Boolean(parsed && typeof parsed === 'object' && parsed.__overflow_idb);
+  } catch {
+    return false;
+  }
+};
 
 const hasIndexedDb = (): boolean => {
   if (typeof window !== 'undefined' && Boolean(window.indexedDB)) return true;
@@ -161,6 +180,15 @@ const hydrateOverflowKeyFromIdb = (key: string): void => {
       if (idbVal !== null && idbVal !== undefined && (!Array.isArray(idbVal) || idbVal.length > 0)) {
         memoryCache.set(key, idbVal);
         notifyListeners();
+        if (typeof window !== 'undefined') {
+          if (key === STORAGE_KEYS.INVENTORY_ITEMS) {
+            window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          } else if (key === STORAGE_KEYS.SALESPEOPLE) {
+            window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
+          } else if (key === STORAGE_KEYS.SALES) {
+            window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
+          }
+        }
       }
     })
     .catch(() => {})
@@ -515,6 +543,8 @@ export async function rehydrateFromIndexedDB(): Promise<void> {
         window.dispatchEvent(new CustomEvent('saimetric_sales_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_salespeople_updated'));
       }
     }
   } catch (e) {

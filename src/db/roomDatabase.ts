@@ -170,6 +170,7 @@ import {
   flushPendingStorageWrites,
   cleanupLocalStorageQuota,
   rehydrateFromIndexedDB,
+  hasPendingIdbOverflow,
   getStored,
   setStored,
 } from './roomStorageEngine';
@@ -1687,107 +1688,127 @@ export const initRoomDatabase = () => {
   cleanPhantomBranchDuplicates();
 
   // Ensure initial salespeople for all demo companies exist (excluding deleted tombstones) and deduplicate
-  const staffList = getStored<Salesperson[]>(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE);
-  const staffTombstoneIds = new Set(
-    getTombstones()
-      .filter((t) => normalizeRoomTombstoneType(t.entityType) === 'staff')
-      .map((t) => String(t.entityId || '').trim().toUpperCase())
-  );
-  const seenStaffIds = new Set<string>();
-  const sanitizedStaff: Salesperson[] = [];
-  let staffCleaned = false;
-  for (const s of staffList) {
-    if (!s || !s.id) continue;
-    const cleanId = String(s.id).trim();
-    if (staffTombstoneIds.has(cleanId.toUpperCase())) {
-      staffCleaned = true;
-      continue;
+  if (!hasPendingIdbOverflow(STORAGE_KEYS.SALESPEOPLE)) {
+    const staffList = getStored<Salesperson[]>(STORAGE_KEYS.SALESPEOPLE, INITIAL_SALESPEOPLE);
+    const staffTombstoneIds = new Set(
+      getTombstones()
+        .filter((t) => normalizeRoomTombstoneType(t.entityType) === 'staff')
+        .map((t) => String(t.entityId || '').trim().toUpperCase())
+    );
+    const seenStaffIds = new Set<string>();
+    const sanitizedStaff: Salesperson[] = [];
+    let staffCleaned = false;
+    for (const s of staffList) {
+      if (!s || !s.id) continue;
+      const cleanId = String(s.id).trim();
+      if (staffTombstoneIds.has(cleanId.toUpperCase())) {
+        staffCleaned = true;
+        continue;
+      }
+      if (!seenStaffIds.has(cleanId)) {
+        seenStaffIds.add(cleanId);
+        sanitizedStaff.push(s);
+      } else {
+        staffCleaned = true;
+      }
     }
-    if (!seenStaffIds.has(cleanId)) {
-      seenStaffIds.add(cleanId);
-      sanitizedStaff.push(s);
-    } else {
-      staffCleaned = true;
+    const missingStaff = INITIAL_SALESPEOPLE.filter((s) => {
+      const cleanUpper = String(s.id).trim().toUpperCase();
+      return !seenStaffIds.has(String(s.id).trim()) && !staffTombstoneIds.has(cleanUpper);
+    }).map((s) => ({
+      ...s,
+      version: (s as any).version ?? 0,
+      mutationSource: (s as any).mutationSource || ('SEED' as const),
+      updatedAt: (s as any).updatedAt ?? 0,
+    }));
+    if (missingStaff.length > 0 || staffCleaned) {
+      setStored(STORAGE_KEYS.SALESPEOPLE, [...sanitizedStaff, ...missingStaff], {
+        skipIdbOverwriteIfExisting: sanitizedStaff.length === 0,
+      });
     }
-  }
-  const missingStaff = INITIAL_SALESPEOPLE.filter((s) => {
-    const cleanUpper = String(s.id).trim().toUpperCase();
-    return !seenStaffIds.has(String(s.id).trim()) && !staffTombstoneIds.has(cleanUpper);
-  }).map((s) => ({
-    ...s,
-    version: (s as any).version ?? 0,
-    mutationSource: (s as any).mutationSource || ('SEED' as const),
-    updatedAt: (s as any).updatedAt ?? 0,
-  }));
-  if (missingStaff.length > 0 || staffCleaned) {
-    setStored(STORAGE_KEYS.SALESPEOPLE, [...sanitizedStaff, ...missingStaff]);
   }
 
   // Ensure initial inventory items for all demo companies exist in inventory store and deduplicate
-  const allInvStore = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
-  const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
-  const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
-  const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
+  // CRITICAL: Never overwrite an IndexedDB-overflowed catalog with demo fallback items on cold boot!
+  if (!hasPendingIdbOverflow(STORAGE_KEYS.INVENTORY_ITEMS)) {
+    const allInvStore = getStored<InventoryItem[]>(STORAGE_KEYS.INVENTORY_ITEMS, INITIAL_INVENTORY_ITEMS);
+    const deletedRegistryKey = 'saimetric_deleted_inventory_ids';
+    const deletedList = getStored<Array<{ itemId: string; companyId: string; deletedAt: string }>>(deletedRegistryKey, []);
+    const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
 
-  const dedupedInvMap = new Map<string, InventoryItem>();
-  for (const item of allInvStore) {
-    const rawId = (item.itemId || (item as any).id || '').trim();
-    if (!rawId) continue;
-    item.itemId = rawId;
-    (item as any).id = rawId;
-    const cleanId = rawId.toUpperCase();
-    const comp = normTenant(item.company_id || (item as any).companyId);
-    const key = `${cleanId}::${comp}`;
+    const dedupedInvMap = new Map<string, InventoryItem>();
+    for (const item of allInvStore) {
+      const rawId = (item.itemId || (item as any).id || '').trim();
+      if (!rawId) continue;
+      item.itemId = rawId;
+      (item as any).id = rawId;
+      const cleanId = rawId.toUpperCase();
+      const comp = normTenant(item.company_id || (item as any).companyId);
+      const key = `${cleanId}::${comp}`;
 
-    // Only drop if deletion record exists and is newer than item updatedAt
-    const delRecord = deletedList.find((d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === comp);
-    if (delRecord && delRecord.deletedAt) {
-      const itemTime = extractRecordTimestamp(item);
-      const delTime = parseTimestampMs(delRecord.deletedAt);
-      if (delTime >= itemTime) {
-        continue;
+      // Only drop if deletion record exists and is newer than item updatedAt
+      const delRecord = deletedList.find((d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === comp);
+      if (delRecord && delRecord.deletedAt) {
+        const itemTime = extractRecordTimestamp(item);
+        const delTime = parseTimestampMs(delRecord.deletedAt);
+        if (delTime >= itemTime) {
+          continue;
+        }
+      }
+
+      if (!dedupedInvMap.has(key)) {
+        dedupedInvMap.set(key, item);
       }
     }
+    for (const initItem of INITIAL_INVENTORY_ITEMS) {
+      const rawId = (initItem.itemId || (initItem as any).id || '').trim();
+      if (!rawId) continue;
+      initItem.itemId = rawId;
+      (initItem as any).id = rawId;
+      const cleanId = rawId.toUpperCase();
+      const comp = normTenant(initItem.company_id || (initItem as any).companyId);
+      const key = `${cleanId}::${comp}`;
 
-    if (!dedupedInvMap.has(key)) {
-      dedupedInvMap.set(key, item);
-    }
-  }
-  for (const initItem of INITIAL_INVENTORY_ITEMS) {
-    const rawId = (initItem.itemId || (initItem as any).id || '').trim();
-    if (!rawId) continue;
-    initItem.itemId = rawId;
-    (initItem as any).id = rawId;
-    const cleanId = rawId.toUpperCase();
-    const comp = normTenant(initItem.company_id || (initItem as any).companyId);
-    const key = `${cleanId}::${comp}`;
+      const delRecord = deletedList.find((d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === comp);
+      if (delRecord && delRecord.deletedAt) {
+        const initTime = extractRecordTimestamp(initItem);
+        const delTime = parseTimestampMs(delRecord.deletedAt);
+        if (delTime >= initTime) {
+          continue;
+        }
+      }
 
-    const delRecord = deletedList.find((d) => (d.itemId || '').toUpperCase() === cleanId && normTenant(d.companyId) === comp);
-    if (delRecord && delRecord.deletedAt) {
-      const initTime = extractRecordTimestamp(initItem);
-      const delTime = parseTimestampMs(delRecord.deletedAt);
-      if (delTime >= initTime) {
-        continue;
+      if (!dedupedInvMap.has(key)) {
+        dedupedInvMap.set(key, initItem);
       }
     }
-
-    if (!dedupedInvMap.has(key)) {
-      dedupedInvMap.set(key, initItem);
+    const cleanInvStore = Array.from(dedupedInvMap.values());
+    const invChanged =
+      cleanInvStore.length !== allInvStore.length ||
+      cleanInvStore.some((item, idx) => item !== allInvStore[idx]);
+    if (invChanged) {
+      setStored(STORAGE_KEYS.INVENTORY_ITEMS, cleanInvStore, {
+        skipIdbOverwriteIfExisting: allInvStore === INITIAL_INVENTORY_ITEMS,
+      });
     }
   }
-  const cleanInvStore = Array.from(dedupedInvMap.values());
-  setStored(STORAGE_KEYS.INVENTORY_ITEMS, cleanInvStore);
 
   // Ensure initial sales for all demo companies exist in sales store
-  const currentSales = getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
-  const existingSaleIds = new Set(currentSales.map((s) => s.id));
-  const missingSales = INITIAL_SALES.filter((s) => !existingSaleIds.has(s.id));
-  if (missingSales.length > 0) {
-    setStored(STORAGE_KEYS.SALES, [...currentSales, ...missingSales]);
+  if (!hasPendingIdbOverflow(STORAGE_KEYS.SALES)) {
+    const currentSales = getStored<SaleInvoice[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
+    const existingSaleIds = new Set(currentSales.map((s) => s.id));
+    const missingSales = INITIAL_SALES.filter((s) => !existingSaleIds.has(s.id));
+    if (missingSales.length > 0) {
+      setStored(STORAGE_KEYS.SALES, [...currentSales, ...missingSales], {
+        skipIdbOverwriteIfExisting: currentSales === INITIAL_SALES,
+      });
+    }
   }
 
   // Backfill company_id and branch_id for any existing records in local storage
   const backfillCompanyBranch = <T extends Record<string, any>>(key: string, defaultList: T[]): void => {
+    // Never overwrite collections waiting for async IndexedDB overflow hydration
+    if (hasPendingIdbOverflow(key)) return;
     const list = getStored<T[]>(key, defaultList);
     let changed = false;
     const migrated = list.map((item) => {
@@ -1815,7 +1836,7 @@ export const initRoomDatabase = () => {
       return item;
     });
     if (changed) {
-      setStored(key, migrated);
+      setStored(key, migrated, { skipIdbOverwriteIfExisting: list === defaultList });
     }
   };
 
@@ -3524,43 +3545,49 @@ export const getStaffBranchAssignments = (staff: Salesperson): StaffBranchAssign
   ];
 };
 
-export const getStaffRoleInBranch = (staff: Salesperson, branchId: string): Role => {
+export const getStaffRoleInBranch = (staff: Salesperson, branchId: string, companyId?: string): Role => {
   if (staff.role === 'OWNER' || staff.role === 'SUPER_ADMIN') {
     return staff.role;
   }
-  const branches = getBranches();
+  const resolvedCompanyId = companyId || staff.company_id || staff.companyId;
+  const branches = resolvedCompanyId ? getBranchesForCompany(resolvedCompanyId) : getBranches();
   if (staff.branchAssignments && Array.isArray(staff.branchAssignments)) {
     const match = staff.branchAssignments.find(
-      (b) => b?.branchId && (b.branchId === branchId || isRecordInBranchScope(b.branchId, branchId, branches))
+      (b) => b?.branchId && (b.branchId === branchId || isRecordInBranchScope(b.branchId, branchId, branches, resolvedCompanyId, resolvedCompanyId))
     );
     if (match && match.role) {
       return match.role;
     }
   }
   const staffBranch = staff.branchId || staff.branch_id;
-  if (staffBranch && (staffBranch === branchId || isRecordInBranchScope(staffBranch, branchId, branches))) {
+  if (staffBranch && (staffBranch === branchId || isRecordInBranchScope(staffBranch, branchId, branches, resolvedCompanyId, resolvedCompanyId))) {
     return staff.role;
   }
   return staff.role || 'CASHIER';
 };
 
-export const isStaffAssignedToBranch = (staff: Salesperson, branchId: string): boolean => {
+export const isStaffAssignedToBranch = (staff: Salesperson, branchId: string, companyId?: string): boolean => {
   if (staff.role === 'OWNER' || staff.role === 'SUPER_ADMIN') {
     return true; // Owner has an account across the company, but must select which branch to log in to
   }
   if (!branchId || branchId === 'ALL') {
     return true;
   }
-  const branches = getBranches();
+  const resolvedCompanyId = companyId || staff.company_id || staff.companyId;
+  const branches = resolvedCompanyId ? getBranchesForCompany(resolvedCompanyId) : getBranches();
   if (staff.branchAssignments && Array.isArray(staff.branchAssignments) && staff.branchAssignments.length > 0) {
     return staff.branchAssignments.some(
-      (b) => Boolean(b?.branchId) && isRecordInBranchScope(b.branchId, branchId, branches)
+      (b) =>
+        Boolean(b?.branchId) &&
+        (b.branchId === 'ALL' || isRecordInBranchScope(b.branchId, branchId, branches, resolvedCompanyId, resolvedCompanyId))
     );
   }
   const assignedIds = (staff as any).assignedBranchIds;
   if (Array.isArray(assignedIds) && assignedIds.length > 0) {
     return assignedIds.some(
-      (id: any) => Boolean(id) && isRecordInBranchScope(String(id), branchId, branches)
+      (id: any) =>
+        Boolean(id) &&
+        (String(id) === 'ALL' || isRecordInBranchScope(String(id), branchId, branches, resolvedCompanyId, resolvedCompanyId))
     );
   }
   const assigned = staff.branchId || staff.branch_id;
@@ -3570,7 +3597,7 @@ export const isStaffAssignedToBranch = (staff: Salesperson, branchId: string): b
   if (assigned === 'ALL') {
     return true;
   }
-  return isRecordInBranchScope(assigned, branchId, branches);
+  return isRecordInBranchScope(assigned, branchId, branches, resolvedCompanyId, resolvedCompanyId);
 };
 
 export const updateStaffBranchAssignments = (
@@ -5644,14 +5671,17 @@ export const updateProductStock = (
   }
 
   const item = getInventoryItemById(realId);
-  if (item && deltaQty !== 0) {
-    const prevCases = item.stockCases;
-    const prevSingles = item.stockSingles;
+  const safeDeltaQty = Number(deltaQty) || 0;
+  const safeUnitsToDeductPerQty = Math.max(0.001, Number(unitsToDeductPerQty) || 1);
+  if (item && safeDeltaQty !== 0) {
+    const itemUnitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
+    const prevCases = Number(item.stockCases) || 0;
+    const prevSingles = Number(item.stockSingles) || 0;
 
-    if (deltaQty < 0) {
+    if (safeDeltaQty < 0) {
       const unitsToDeduct = sellAsCase
-        ? Math.abs(deltaQty) * item.unitsPerCase
-        : Math.abs(deltaQty) * unitsToDeductPerQty;
+        ? Math.abs(safeDeltaQty) * itemUnitsPerCase
+        : Math.abs(safeDeltaQty) * safeUnitsToDeductPerQty;
       const currentUser = getCurrentUser();
       deductStockFIFO({
         itemId: realId,
@@ -5663,34 +5693,34 @@ export const updateProductStock = (
       });
     }
 
-    let newCases = item.stockCases;
-    let newSingles = item.stockSingles;
+    let newCases = prevCases;
+    let newSingles = prevSingles;
 
     if (sellAsCase) {
-      newCases = newCases + deltaQty;
+      newCases = newCases + safeDeltaQty;
       if (newCases < 0) {
-        newSingles = newSingles + (newCases * item.unitsPerCase);
+        newSingles = newSingles + (newCases * itemUnitsPerCase);
         newCases = 0;
       }
     } else {
-      const netSinglesDelta = deltaQty * unitsToDeductPerQty;
+      const netSinglesDelta = safeDeltaQty * safeUnitsToDeductPerQty;
       newSingles = newSingles + netSinglesDelta;
       // If selling singles/variants and singles run out, but cases are available, auto-break case
       if (newSingles < 0 && newCases > 0) {
-        const casesNeeded = Math.ceil(Math.abs(newSingles) / item.unitsPerCase);
+        const casesNeeded = Math.ceil(Math.abs(newSingles) / itemUnitsPerCase);
         if (casesNeeded <= newCases) {
           newCases -= casesNeeded;
-          newSingles += casesNeeded * item.unitsPerCase;
+          newSingles += casesNeeded * itemUnitsPerCase;
         } else {
-          newSingles += newCases * item.unitsPerCase;
+          newSingles += newCases * itemUnitsPerCase;
           newCases = 0;
         }
       }
     }
 
-    const finalSingles = Number(newSingles.toFixed(3));
-    const finalCases = Math.max(0, newCases);
-    const finalTotalUnits = Number(((finalCases * item.unitsPerCase) + finalSingles).toFixed(3));
+    const finalSingles = Number((Number.isFinite(newSingles) ? newSingles : 0).toFixed(3));
+    const finalCases = Math.max(0, Number.isFinite(newCases) ? newCases : 0);
+    const finalTotalUnits = Number(((finalCases * itemUnitsPerCase) + finalSingles).toFixed(3));
 
     const updatedItem: InventoryItem = {
       ...item,
@@ -9967,11 +9997,13 @@ export const addSale = (
   const snapshottedItems = Array.isArray(saleData.items)
     ? saleData.items.map((item) => {
         const resolved = resolveItemCost(item, invItems, prods);
+        const safeAvgCost = Number.isFinite(Number(resolved.avgCost)) ? Number(resolved.avgCost) : 0;
+        const safeLatestCost = Number.isFinite(Number(resolved.latestCost)) ? Number(resolved.latestCost) : safeAvgCost;
         return {
           ...item,
-          costPrice: Number(resolved.avgCost.toFixed(4)),
-          costPerUnitAverage: Number(resolved.avgCost.toFixed(4)),
-          costPerUnitLatest: Number(resolved.latestCost.toFixed(4)),
+          costPrice: Number(safeAvgCost.toFixed(4)),
+          costPerUnitAverage: Number(safeAvgCost.toFixed(4)),
+          costPerUnitLatest: Number(safeLatestCost.toFixed(4)),
         };
       })
     : [];
@@ -10285,13 +10317,15 @@ export const addSale = (
   if (isNonDefaultCurrency && saleData.recordCashLog !== false) {
     const cur: 'ZiG' | 'EcoCash' | string = isZiG ? 'ZiG' : isEcoCash ? 'EcoCash' : (saleCurrency || 'EcoCash');
     const currencyConfig = getMultiCurrencyConfig();
-    const rate =
+    const rawRate =
       created.exchangeRate ||
       currencyConfig.rates[cur]?.rateToUsd ||
       currencyConfig.rates[cur]?.rateToBase ||
       (isEcoCash ? (currencyConfig.rates['EcoCash']?.rateToUsd || 27.0) : (cur === 'ZiG' ? 26.5 : 27.0));
-    const saleUsdAmount = created.total; // in USD
-    const curAmount = created.totalInCurrency || (saleUsdAmount * rate);
+    const rate = Number.isFinite(Number(rawRate)) && Number(rawRate) > 0 ? Number(rawRate) : 1;
+    const saleUsdAmount = Number.isFinite(Number(created.total)) ? Number(created.total) : 0; // in USD
+    const rawCurAmount = created.totalInCurrency !== undefined ? Number(created.totalInCurrency) : NaN;
+    const curAmount = Number.isFinite(rawCurAmount) && rawCurAmount > 0 ? rawCurAmount : (saleUsdAmount * rate);
 
     // 5a. Deduct non-cash sale in Form 2 as base currency (USD) so cashier balances
     addCashLog({
@@ -10339,10 +10373,13 @@ export const addSale = (
     // 5b. If Cash Withdrawal occurred, deduct withdrawal in Form 2 as base currency (USD)
     // Untaxed, not considered a sale, but physical USD cash is handed out from till!
     if (created.cashWithdrawalAmount && Number(created.cashWithdrawalAmount) > 0) {
-      const withdrawalUsd = Number(created.cashWithdrawalAmount);
-      const withdrawalInCur = created.cashWithdrawalInCurrency || (withdrawalUsd * rate);
-      const grossUsd = Number(created.grossTenderUsd) || (saleUsdAmount + withdrawalUsd);
-      const grossInCur = Number(created.totalChargedInCurrency) || (grossUsd * rate);
+      const withdrawalUsd = Number(created.cashWithdrawalAmount) || 0;
+      const rawWdrInCur = Number(created.cashWithdrawalInCurrency);
+      const withdrawalInCur = Number.isFinite(rawWdrInCur) && rawWdrInCur > 0 ? rawWdrInCur : (withdrawalUsd * rate);
+      const rawGrossUsd = Number(created.grossTenderUsd);
+      const grossUsd = Number.isFinite(rawGrossUsd) && rawGrossUsd > 0 ? rawGrossUsd : (saleUsdAmount + withdrawalUsd);
+      const rawGrossInCur = Number(created.totalChargedInCurrency);
+      const grossInCur = Number.isFinite(rawGrossInCur) && rawGrossInCur > 0 ? rawGrossInCur : (grossUsd * rate);
       const popRef = created.proofOfPaymentRef || created.paymentReference || '';
       const refNote = popRef ? ` | Ref/POP: ${popRef}` : '';
 
@@ -14124,12 +14161,12 @@ export const getAllInventoryItems = (branchId?: string): InventoryItem[] => {
   });
 };
 
-export const getInventoryItems = (): InventoryItem[] => {
-  const currentCompany = getCurrentCompanyId();
-  const currentBranch = getCurrentBranchId();
+export const getInventoryItems = (branchIdOverride?: string, companyIdOverride?: string): InventoryItem[] => {
+  const currentCompany = companyIdOverride || getCurrentCompanyId();
+  const currentBranch = branchIdOverride || getCurrentBranchId();
   const sessionUser = getSessionUser();
   const all = getAllInventoryItems(currentBranch);
-  const branches = getBranches();
+  const branches = companyIdOverride ? getBranchesForCompany(companyIdOverride) : getBranches();
   const normTenant = (c?: string) => (!c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase());
   let list: InventoryItem[];
   if (sessionUser?.role === 'SUPER_ADMIN' && (!currentCompany || currentCompany === 'COMP-MASTER')) {
@@ -24040,6 +24077,12 @@ export function pruneLocalCompaniesToAllowlist(keepCompanyIds: string[]): {
     const clean = String(id || '').trim().toUpperCase();
     if (clean) keepSet.add(clean);
   });
+  // Always protect the currently active company so a transient/incomplete remote sheet
+  // response never wipes the tenant or staff the admin is actively working in
+  const activeSessionCompany = String(getCurrentCompanyId() || '').trim().toUpperCase();
+  if (activeSessionCompany) {
+    keepSet.add(activeSessionCompany);
+  }
 
   const isKept = (cid?: string | null): boolean => {
     const norm = String(cid || '').trim().toUpperCase();
@@ -24065,12 +24108,13 @@ export function pruneLocalCompaniesToAllowlist(keepCompanyIds: string[]): {
   const removedBranches = Math.max(0, currentBranches.length - keptBranches.length);
   setStored(STORAGE_KEYS.BRANCHES, keptBranches);
 
-  // 3. Prune salespeople / users (always preserve SUPER_ADMIN / protected email)
+  // 3. Prune salespeople / users (always preserve SUPER_ADMIN, protected email, and unsynced local staff)
   const currentUsers = getStored<any[]>(STORAGE_KEYS.SALESPEOPLE, []);
   const keptUsers = currentUsers.filter((u) => {
     const role = String(u?.role || '').trim().toUpperCase();
     const email = String(u?.email || '').trim().toLowerCase();
     if (role === 'SUPER_ADMIN' || email === PROTECTED_SUPER_ADMIN_EMAIL) return true;
+    if (u?.synced === false || u?.mutationSource === 'LOCAL_UI') return true;
     const cid = u?.company_id || u?.companyId || u?.CompanyID || '';
     return isKept(cid);
   });
@@ -26785,7 +26829,7 @@ export const resolveDailyBlindTargetItems = (
 } => {
   const targetBranch = branchId || getCurrentBranchId();
   const targetCompany = companyId || getCurrentCompanyId();
-  const branchItems = getInventoryItems().filter((it) => it && !it.isDeleted && it.itemId);
+  const branchItems = getInventoryItems(targetBranch, targetCompany).filter((it) => it && !it.isDeleted && it.itemId);
   const itemById = new Map<string, InventoryItem>();
   branchItems.forEach((it) => itemById.set(normDailyBlindId(it.itemId), it));
 

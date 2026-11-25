@@ -174,17 +174,23 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     }
   });
 
-  // Selected Company for Sign-in: locked to registered company if device is registered!
+  // Selected Company for Sign-in: preserve the active tenant on logout when valid, else fall back to registered device company
   const [selectedCompanyId, setSelectedCompanyId] = useState<string>(() => {
     try {
-      const savedReg = localStorage.getItem(DEVICE_COMPANY_ID_KEY);
-      if (savedReg) return savedReg;
-      const saved = getCurrentCompanyId();
       const list = getCompanies();
-      if (saved && list.some((c) => c.company_id === saved)) {
-        return saved;
+      const savedCurrent = getCurrentCompanyId();
+      const savedReg = localStorage.getItem(DEVICE_COMPANY_ID_KEY);
+      if (
+        savedCurrent &&
+        savedCurrent !== 'COMP-MASTER' &&
+        list.some((c) => c.company_id === savedCurrent)
+      ) {
+        return savedCurrent;
       }
-      return list[0]?.company_id || 'COMP-001';
+      if (savedReg && (list.length === 0 || list.some((c) => c.company_id === savedReg))) {
+        return savedReg;
+      }
+      return savedReg || list[0]?.company_id || 'COMP-001';
     } catch {
       return 'COMP-001';
     }
@@ -451,14 +457,14 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   // Get staff strictly isolated to selected company & branch, ordered by terminal lastLoginAt descending
   const companyStaff = useMemo(() => {
     const all = getActiveStaffForCompany(selectedCompanyId);
-    const filtered = all.filter((s) => isStaffAssignedToBranch(s, selectedBranchId));
+    const filtered = all.filter((s) => isStaffAssignedToBranch(s, selectedBranchId, selectedCompanyId));
     const staffToUse = filtered.length > 0 ? filtered : all;
     const seen = new Set<string>();
     const unique: Salesperson[] = [];
     for (const s of staffToUse) {
       if (seen.has(s.id)) continue;
       seen.add(s.id);
-      const branchRole = getStaffRoleInBranch(s, selectedBranchId);
+      const branchRole = getStaffRoleInBranch(s, selectedBranchId, selectedCompanyId);
       unique.push({
         ...s,
         role: branchRole || s.role,
@@ -1189,8 +1195,8 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setError('Please select a staff member first.');
       return;
     }
-    if (pin.length !== 6) {
-      setError('Please enter your complete 6-digit PIN.');
+    if (pin.length !== 6 && pin.length !== 4) {
+      setError('Please enter your 6-digit PIN (or 4-digit legacy PIN).');
       return;
     }
     verifyPin(pin, selectedStaff);
@@ -1218,7 +1224,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
             verifyCasualPin(pin, selectedCasual);
           }
         } else if (selectedStaff) {
-          if (pin.length === 6) {
+          if (pin.length === 6 || pin.length === 4) {
             verifyPin(pin, selectedStaff);
           } else if (pin.length === 0) {
             handleDirectQuickLogin(selectedStaff);

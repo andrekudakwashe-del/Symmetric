@@ -114,19 +114,19 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
     return () => unsub();
   }, [invoice?.id]);
 
-  // Automatic Printing on checkout if configured
+  // Automatic Printing on checkout if configured (skip blocking system print dialog inside embedded iframes)
   useEffect(() => {
     if (isOpen && invoice && invoice.id && autoPrintedRef.current !== invoice.id) {
       autoPrintedRef.current = invoice.id;
       const cfg = getPrinterConfig(invoice.company_id || invoice.companyId);
-      if (cfg.autoPrintOnCheckout) {
+      if (cfg.autoPrintOnCheckout && !isIframe) {
         const timer = setTimeout(() => {
           handlePrintReceipt();
         }, 500);
         return () => clearTimeout(timer);
       }
     }
-  }, [isOpen, invoice?.id]);
+  }, [isOpen, invoice?.id, isIframe]);
 
   if (!isOpen || !invoice) return null;
 

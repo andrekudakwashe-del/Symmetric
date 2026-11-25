@@ -22,6 +22,7 @@ import {
   addFastMovingChecklistItem,
   removeFastMovingChecklistItem,
   getInventoryItems,
+  subscribeToDatabase,
 } from '../../db/roomDatabase';
 
 interface FastMovingChecklistTabProps {
@@ -44,12 +45,18 @@ export const FastMovingChecklistTab: React.FC<FastMovingChecklistTabProps> = ({
   const loadData = () => {
     const list = getFastMovingChecklist();
     setChecklist(list);
-    setInventoryList(getInventoryItems());
+    setInventoryList(getInventoryItems(session.branchId, session.company_id));
   };
 
   useEffect(() => {
     loadData();
-  }, []);
+    const unsubDb = subscribeToDatabase(loadData);
+    window.addEventListener('saimetric_inventory_updated', loadData);
+    return () => {
+      unsubDb();
+      window.removeEventListener('saimetric_inventory_updated', loadData);
+    };
+  }, [session.branchId, session.company_id]);
 
   const handleAddItem = (e: React.FormEvent) => {
     e.preventDefault();

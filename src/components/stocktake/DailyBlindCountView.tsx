@@ -45,6 +45,7 @@ import {
   saveDailyBlindBranchConfig,
   submitDailyBlindCount,
   submitDailyBlindStaffExplanations,
+  subscribeToDatabase,
 } from '../../db/roomDatabase';
 import { isDailyBlindDesignatedAuditor } from '../../services/stocktakeAccessService';
 
@@ -117,13 +118,15 @@ export const DailyBlindCountView: React.FC<DailyBlindCountViewProps> = ({
   const [notice, setNotice] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Live refresh whenever local/mesh/cloud updates arrive
+  // Live refresh whenever local/mesh/cloud updates or IndexedDB hydration arrive
   useEffect(() => {
     const onUpdated = () => setRefreshTick((t) => t + 1);
+    const unsubDb = subscribeToDatabase(onUpdated);
     window.addEventListener('saimetric_daily_blind_updated', onUpdated);
     window.addEventListener('saimetric_inventory_updated', onUpdated);
     window.addEventListener('saimetric_sales_updated', onUpdated);
     return () => {
+      unsubDb();
       window.removeEventListener('saimetric_daily_blind_updated', onUpdated);
       window.removeEventListener('saimetric_inventory_updated', onUpdated);
       window.removeEventListener('saimetric_sales_updated', onUpdated);
