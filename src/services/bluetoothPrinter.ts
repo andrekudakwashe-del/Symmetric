@@ -659,7 +659,10 @@ class BluetoothThermalPrinter {
   /**
    * Request Bluetooth device pair and discover GATT write characteristics
    */
-  public async connect(): Promise<boolean> {
+  public async connect(options?: { forceRepair?: boolean; forgetFirst?: boolean }): Promise<boolean> {
+    const forceRepair = Boolean(options?.forceRepair);
+    const forgetFirst = Boolean(options?.forgetFirst);
+
     if (!this.isSupported()) {
       throw new Error(
         'Web Bluetooth API is not supported in this browser. Please use Google Chrome (Desktop, Mac, or Android) or Microsoft Edge.'
@@ -675,15 +678,31 @@ class BluetoothThermalPrinter {
       throw err;
     }
 
-    if (this.isConnected()) {
+    if (!forceRepair && !forgetFirst && this.isConnected()) {
       return true;
     }
 
-    // Clean up any lingering previous device GATT connection
+    // Stop any background reconnect polling so it cannot race with manual pairing/re-pairing
+    this.stopAutoReconnectLoop();
+
+    if (forgetFirst) {
+      try {
+        localStorage.removeItem(SAVED_PRINTER_KEY);
+      } catch {
+        // ignore storage errors
+      }
+    }
+
+    // Synchronously tear down any lingering/stale GATT connection before requestDevice()
+    // so the browser's transient user gesture token is never lost.
     if (this.device && this.device.gatt) {
       try {
-        await this.device.gatt.disconnect();
+        this.device.gatt.disconnect();
       } catch {}
+    }
+    this.characteristic = null;
+    if (forceRepair || forgetFirst) {
+      this.device = null;
     }
 
     try {

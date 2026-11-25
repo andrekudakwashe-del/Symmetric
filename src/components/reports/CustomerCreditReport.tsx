@@ -36,7 +36,10 @@ import {
   Tag,
   Banknote,
   ShieldCheck,
+  UserPlus,
 } from 'lucide-react';
+import { CustomerAutocompleteInput } from '../common/CustomerAutocompleteInput';
+import { CustomerRegistrationModal } from '../customers/CustomerRegistrationModal';
 
 interface CustomerCreditReportProps {
   currentUser?: Salesperson | null;
@@ -82,7 +85,6 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
 
   // Manual Credit Modal State (e.g. days where owner actually approves cash credit or goods credit)
   const [showManualCreditModal, setShowManualCreditModal] = useState<boolean>(false);
-  const [manualCreditCustomerType, setManualCreditCustomerType] = useState<'existing' | 'new'>('existing');
   const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
   const [manualCustomerName, setManualCustomerName] = useState<string>('');
   const [manualCustomerPhone, setManualCustomerPhone] = useState<string>('');
@@ -95,6 +97,17 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
   const [manualNotes, setManualNotes] = useState<string>('');
   const [manualDate, setManualDate] = useState<string>(() => getTodayDateString());
   const [allCustomers, setAllCustomers] = useState<Customer[]>(() => getCustomers());
+  const [showRegisterCustomerModal, setShowRegisterCustomerModal] = useState<boolean>(false);
+  const [registerCustomerInitialName, setRegisterCustomerInitialName] = useState<string>('');
+  const [manualFormError, setManualFormError] = useState<string | null>(null);
+
+  const safeCurrentUser: Salesperson = currentUser || {
+    id: selectedStaffId || '001',
+    name: salespeople.find((s) => s.id === selectedStaffId)?.name || 'Staff',
+    role: salespeople.find((s) => s.id === selectedStaffId)?.role || 'Cashier',
+    pin: '0000',
+    active: 'Y',
+  };
 
   const handleOpenManualCreditModal = (targetCustomer?: CustomerCreditReportItem | Customer | null) => {
     const list = getCustomers();
@@ -106,16 +119,22 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
       setSelectedStaffId(matched ? matched.id : (staffList[0]?.id || currentUser?.id || '001'));
     }
     if (targetCustomer) {
-      setManualCreditCustomerType('existing');
-      const custId = (targetCustomer as any).customerId || (targetCustomer as any).id || '';
-      setSelectedCustomerId(custId);
-      setManualCustomerName((targetCustomer as any).customerName || (targetCustomer as any).name || '');
-      setManualCustomerPhone(targetCustomer.phone || '');
+      const targetName = (targetCustomer as any).customerName || (targetCustomer as any).name || '';
+      const rawCustId = (targetCustomer as any).customerId || (targetCustomer as any).id || '';
+      const matchedDbCust = list.find(
+        (c) =>
+          (rawCustId && (c.customerId === rawCustId || c.id === rawCustId)) ||
+          (targetName && c.name && c.name.trim().toLowerCase() === targetName.trim().toLowerCase())
+      );
+      setSelectedCustomerId(matchedDbCust?.customerId || rawCustId);
+      setManualCustomerName(matchedDbCust?.name || targetName);
+      setManualCustomerPhone(matchedDbCust?.phone || targetCustomer.phone || '');
     } else {
       setSelectedCustomerId('');
       setManualCustomerName('');
       setManualCustomerPhone('');
     }
+    setManualFormError(null);
     setManualAmount('');
     setCreditType('Cash Credit (Owner Approved)');
     setDisburseCashFromDrawer(true);
@@ -126,28 +145,42 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
 
   const handleConfirmManualCredit = (e: React.FormEvent) => {
     e.preventDefault();
+    setManualFormError(null);
     const amt = parseFloat(manualAmount);
     if (isNaN(amt) || amt <= 0) {
-      alert('Please enter a valid credit amount greater than $0.00');
+      setManualFormError('Please enter a valid credit amount greater than $0.00.');
       return;
     }
 
+    const latestCustomers = getCustomers();
+    setAllCustomers(latestCustomers);
+
     let finalCustName = manualCustomerName.trim();
-    let finalCustId = selectedCustomerId;
+    let finalCustId = selectedCustomerId.trim();
+    let finalCustPhone = manualCustomerPhone.trim();
 
-    if (manualCreditCustomerType === 'existing') {
-      const found = allCustomers.find((c) => c.customerId === selectedCustomerId || c.id === selectedCustomerId);
-      if (found) {
-        finalCustName = found.name;
-        finalCustId = found.customerId || found.id;
-        if (!manualCustomerPhone && found.phone) {
-          setManualCustomerPhone(found.phone);
-        }
+    const matchedCustomer =
+      (finalCustId
+        ? latestCustomers.find((c) => c.customerId === finalCustId || c.id === finalCustId)
+        : undefined) ||
+      (finalCustName
+        ? latestCustomers.find((c) => c.name && c.name.trim().toLowerCase() === finalCustName.toLowerCase())
+        : undefined);
+
+    if (matchedCustomer) {
+      finalCustName = matchedCustomer.name;
+      finalCustId = matchedCustomer.customerId || matchedCustomer.id || '';
+      if (!finalCustPhone && matchedCustomer.phone) {
+        finalCustPhone = matchedCustomer.phone;
       }
-    }
-
-    if (!finalCustName) {
-      alert('Please select an existing customer or enter a customer name.');
+    } else {
+      if (!finalCustName) {
+        setManualFormError('Please search and select a customer, or register a new customer.');
+        return;
+      }
+      setManualFormError(
+        `"${finalCustName}" is not registered in the Customer Database yet. Tap "Register New Customer" above to save them first.`
+      );
       return;
     }
 
@@ -165,7 +198,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     recordManualCustomerCredit({
       customerName: finalCustName,
       customerId: finalCustId,
-      phone: manualCustomerPhone.trim(),
+      phone: finalCustPhone,
       amount: amt,
       date: manualDate || getTodayDateString(),
       dueDate: computedDueDate,
@@ -184,6 +217,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     setShowManualCreditModal(false);
 
     // Reset form
+    setManualFormError(null);
     setManualAmount('');
     setManualCustomerName('');
     setManualCustomerPhone('');
@@ -196,6 +230,7 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
     const handleRefresh = () => {
       setReportData(getCustomerCreditReport());
       setSalespeople(getSalespeople());
+      setAllCustomers(getCustomers());
     };
     const unsub = subscribeToDatabase(handleRefresh);
     window.addEventListener('saimetric_credit_sales_updated', handleRefresh);
@@ -1147,83 +1182,96 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
             </div>
 
             <form onSubmit={handleConfirmManualCredit} className="space-y-4">
-              {/* Customer Selector Type */}
+              {/* Searchable Customer Selection & Unified Registration */}
               <div className="space-y-2">
-                <label className="text-xs font-bold text-slate-300 flex items-center space-x-1.5">
-                  <User className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Customer Selection *</span>
-                </label>
-                <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1 rounded-2xl border border-slate-800">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-slate-300 flex items-center space-x-1.5">
+                    <User className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Search &amp; Select Customer *</span>
+                  </label>
                   <button
                     type="button"
-                    onClick={() => setManualCreditCustomerType('existing')}
-                    className={`py-1.5 text-xs font-bold rounded-xl transition cursor-pointer ${
-                      manualCreditCustomerType === 'existing'
-                        ? 'bg-[#FF8A00] text-slate-950 shadow-sm'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
+                    onClick={() => {
+                      setRegisterCustomerInitialName(selectedCustomerId ? '' : manualCustomerName.trim());
+                      setShowRegisterCustomerModal(true);
+                    }}
+                    className="px-2.5 py-1 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] hover:opacity-95 text-white text-[11px] font-bold flex items-center space-x-1 shadow-sm transition active:scale-95 cursor-pointer"
                   >
-                    Existing Customer
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setManualCreditCustomerType('new')}
-                    className={`py-1.5 text-xs font-bold rounded-xl transition cursor-pointer ${
-                      manualCreditCustomerType === 'new'
-                        ? 'bg-[#FF8A00] text-slate-950 shadow-sm'
-                        : 'text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    Walk-in / New Customer
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>+ Register New Customer</span>
                   </button>
                 </div>
 
-                {manualCreditCustomerType === 'existing' ? (
-                  <div>
-                    <select
-                      value={selectedCustomerId}
-                      onChange={(e) => {
-                        setSelectedCustomerId(e.target.value);
-                        const found = allCustomers.find(
-                          (c) => c.customerId === e.target.value || c.id === e.target.value
-                        );
-                        if (found) {
-                          setManualCustomerName(found.name);
-                          if (found.phone) setManualCustomerPhone(found.phone);
-                        }
+                <CustomerAutocompleteInput
+                  id="input-manual-credit-customer-search"
+                  value={manualCustomerName}
+                  theme="orange"
+                  required
+                  showBalances={true}
+                  placeholder="Type name, phone, or ID to search customer..."
+                  inputClassName="bg-slate-950 py-2.5 text-xs"
+                  onChange={(name, matched) => {
+                    setManualCustomerName(name);
+                    setSelectedCustomerId(matched ? matched.customerId || matched.id || '' : '');
+                    setManualCustomerPhone(matched?.phone || '');
+                    setManualFormError(null);
+                  }}
+                  onSelectCustomer={(cust) => {
+                    setManualCustomerName(cust.name);
+                    setSelectedCustomerId(cust.customerId || cust.id || '');
+                    setManualCustomerPhone(cust.phone || '');
+                    setManualFormError(null);
+                  }}
+                  onRegisterNew={(typedName) => {
+                    setRegisterCustomerInitialName(typedName || manualCustomerName.trim());
+                    setShowRegisterCustomerModal(true);
+                  }}
+                />
+
+                {selectedCustomerId ? (
+                  <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-[11px]">
+                    <div className="flex items-center space-x-2 min-w-0">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span className="font-bold text-emerald-200 truncate">{manualCustomerName}</span>
+                      <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold shrink-0">
+                        {formatDisplayId(selectedCustomerId, 'customer')}
+                      </span>
+                      {manualCustomerPhone && (
+                        <span className="text-slate-400 font-mono truncate hidden sm:inline">
+                          {manualCustomerPhone}
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10px] text-emerald-400 font-semibold shrink-0 ml-2">Linked</span>
+                  </div>
+                ) : manualCustomerName.trim() ? (
+                  <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-amber-950/40 border border-amber-500/30 text-[11px] text-amber-200">
+                    <span className="truncate">
+                      Not in database yet — select a match above or register now.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRegisterCustomerInitialName(manualCustomerName.trim());
+                        setShowRegisterCustomerModal(true);
                       }}
-                      required
-                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#FF8A00]"
+                      className="px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-[10px] shrink-0 transition cursor-pointer"
                     >
-                      <option value="">-- Choose Existing Customer --</option>
-                      {allCustomers.map((cust) => (
-                        <option key={cust.id || cust.customerId} value={cust.customerId || cust.id}>
-                          {cust.name} {cust.phone ? `(${cust.phone})` : ''} #{cust.customerId || cust.id}
-                        </option>
-                      ))}
-                    </select>
+                      Register &ldquo;{manualCustomerName.trim()}&rdquo;
+                    </button>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <div>
-                      <input
-                        type="text"
-                        placeholder="Customer Full Name *"
-                        required
-                        value={manualCustomerName}
-                        onChange={(e) => setManualCustomerName(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#FF8A00]"
-                      />
-                    </div>
-                    <div>
-                      <input
-                        type="text"
-                        placeholder="Phone Number (Optional)"
-                        value={manualCustomerPhone}
-                        onChange={(e) => setManualCustomerPhone(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-[#FF8A00]"
-                      />
-                    </div>
+                  <p className="text-[10px] text-slate-400">
+                    Search across {allCustomers.length} registered customer{allCustomers.length === 1 ? '' : 's'} by name, phone, or ID.
+                  </p>
+                )}
+
+                {manualFormError && (
+                  <div className="p-2.5 rounded-xl bg-rose-950/60 border border-rose-500/40 text-xs text-rose-200 flex items-center justify-between gap-2">
+                    <span className="flex items-center space-x-1.5">
+                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                      <span>{manualFormError}</span>
+                    </span>
                   </div>
                 )}
               </div>
@@ -1430,6 +1478,22 @@ export const CustomerCreditReport: React.FC<CustomerCreditReportProps> = ({
           </div>
         </div>
       )}
+
+      {/* Unified Customer Registration Modal (identical to POS Register & Customer Module) */}
+      <CustomerRegistrationModal
+        isOpen={showRegisterCustomerModal}
+        onClose={() => setShowRegisterCustomerModal(false)}
+        currentUser={safeCurrentUser}
+        initialName={registerCustomerInitialName}
+        onCustomerCreated={(created) => {
+          setAllCustomers(getCustomers());
+          setSelectedCustomerId(created.customerId || created.id || '');
+          setManualCustomerName(created.name);
+          setManualCustomerPhone(created.phone || '');
+          setManualFormError(null);
+          setShowRegisterCustomerModal(false);
+        }}
+      />
     </div>
   );
 };

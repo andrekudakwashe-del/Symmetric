@@ -62,6 +62,7 @@ import { FormStepNavigation } from '../common/FormStepNavigation';
 import { CustomerAutocompleteInput } from '../common/CustomerAutocompleteInput';
 import { CustomerChangeReport } from '../reports/CustomerChangeReport';
 import { CustomerCreditReport } from '../reports/CustomerCreditReport';
+import { CustomerRegistrationModal } from '../customers/CustomerRegistrationModal';
 import { formatDisplayId } from '../../utils/idFormatters';
 
 interface Form3CustomerChangeProps {
@@ -2222,86 +2223,26 @@ export const Form3CustomerChange: React.FC<Form3CustomerChangeProps> = ({
         </div>
       )}
 
-      {/* ==================== QUICK CUSTOMER REGISTRATION MODAL ==================== */}
-      {registerModalData.isOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn">
-          <div className="w-full max-w-md bg-slate-900 border border-purple-500/40 rounded-3xl p-5 sm:p-6 shadow-2xl text-slate-100 space-y-4 animate-scaleUp">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <div className="flex items-center space-x-2.5">
-                <div className="w-9 h-9 rounded-xl bg-purple-600/30 text-purple-300 flex items-center justify-center">
-                  <UserPlus className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-base font-black text-white">Register New Customer</h3>
-                  <p className="text-xs text-slate-400">Save to Customer Database (Sheet &quot;Customers&quot;)</p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setRegisterModalData({ isOpen: false, name: '', phone: '', address: '' })}
-                className="p-1.5 rounded-full hover:bg-slate-800 text-slate-400 hover:text-white"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <form onSubmit={handleSaveModalCustomer} className="space-y-3.5">
-              <div>
-                <label className="block text-xs font-bold text-slate-300 mb-1">
-                  Customer / Business Name <span className="text-rose-400">*</span>
-                </label>
-                <input
-                  type="text"
-                  value={registerModalData.name}
-                  onChange={(e) => setRegisterModalData({ ...registerModalData, name: e.target.value })}
-                  placeholder="e.g. Farai Masango or Mufakose Mart"
-                  className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white outline-none focus:border-[#6A4DFF]"
-                  required
-                  autoFocus
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-300 mb-1">Phone Number (Optional)</label>
-                <input
-                  type="tel"
-                  value={registerModalData.phone}
-                  onChange={(e) => setRegisterModalData({ ...registerModalData, phone: e.target.value })}
-                  placeholder="+263 77 123 4567"
-                  className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white outline-none focus:border-[#6A4DFF]"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-slate-300 mb-1">Physical Address / City (Optional)</label>
-                <input
-                  type="text"
-                  value={registerModalData.address}
-                  onChange={(e) => setRegisterModalData({ ...registerModalData, address: e.target.value })}
-                  placeholder="e.g. Stand 104, Harare CBD"
-                  className="w-full px-3.5 py-2 rounded-xl bg-slate-950 border border-slate-700 text-sm text-white outline-none focus:border-[#6A4DFF]"
-                />
-              </div>
-
-              <div className="pt-2 flex items-center justify-end space-x-2">
-                <button
-                  type="button"
-                  onClick={() => setRegisterModalData({ isOpen: false, name: '', phone: '', address: '' })}
-                  className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2 rounded-xl bg-gradient-to-r from-[#6A4DFF] to-purple-600 hover:brightness-110 text-white text-xs font-bold shadow-lg"
-                >
-                  Save & Link Customer
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      {/* ==================== UNIFIED CUSTOMER REGISTRATION MODAL ==================== */}
+      <CustomerRegistrationModal
+        isOpen={registerModalData.isOpen}
+        onClose={() => setRegisterModalData({ isOpen: false, name: '', phone: '', address: '' })}
+        currentUser={currentUser}
+        initialName={registerModalData.name}
+        onCustomerCreated={(newCust) => {
+          if (registerModalData.targetSection === 'change' && registerModalData.targetRowId) {
+            handleSelectCustomerForChangeRow(registerModalData.targetRowId, newCust);
+          } else if (registerModalData.targetSection === 'credit' && registerModalData.targetRowId) {
+            handleSelectCustomerForCreditRow(registerModalData.targetRowId, newCust);
+          } else if (registerModalData.targetSection === 'single') {
+            setSingleCustomerName(newCust.name);
+            setSingleCustomerId(newCust.customerId);
+          }
+          setRegisterModalData({ isOpen: false, name: '', phone: '', address: '' });
+          setQuickSavedCustomer(newCust.name);
+          setTimeout(() => setQuickSavedCustomer(null), 3500);
+        }}
+      />
 
       {/* ==================== PRINT VOUCHER SLIP MODAL ==================== */}
       {voucherData && (

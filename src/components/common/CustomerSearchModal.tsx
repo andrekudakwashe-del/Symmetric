@@ -53,7 +53,7 @@ export const CustomerSearchModal: React.FC<CustomerSearchModalProps> = ({
 
   return (
     <>
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn select-none">
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn select-none">
         <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden text-slate-100 flex flex-col max-h-[85vh] animate-scaleUp">
           {/* Header */}
           <div className="bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] p-4 text-white flex items-center justify-between">
@@ -273,6 +273,7 @@ export const CustomerSearchModal: React.FC<CustomerSearchModalProps> = ({
         isOpen={isRegisterModalOpen}
         onClose={() => setIsRegisterModalOpen(false)}
         currentUser={safeUser}
+        initialName={searchQuery}
         onCustomerCreated={handleCustomerCreated}
       />
     </>

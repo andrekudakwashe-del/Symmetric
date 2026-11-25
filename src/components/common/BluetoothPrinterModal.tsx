@@ -118,7 +118,7 @@ export const BluetoothPrinterModal: React.FC<BluetoothPrinterModalProps> = ({
       setErrorMsg(null);
       setSuccessMsg(null);
       setIsBusy(true);
-      await bluetoothPrinter.connect();
+      await bluetoothPrinter.connect({ forceRepair: true });
       setSuccessMsg(
         `Connected to ${bluetoothPrinter.getConnectedDeviceName() || 'Thermal Printer'}!`
       );

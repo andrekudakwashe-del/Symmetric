@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Customer, Salesperson } from '../../types';
 import {
   peekNextCustomerId,
@@ -15,6 +15,7 @@ interface CustomerRegistrationModalProps {
   onClose: () => void;
   currentUser: Salesperson;
   onCustomerCreated?: (customer: Customer) => void;
+  initialName?: string;
 }
 
 export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps> = ({
@@ -22,6 +23,7 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
   onClose,
   currentUser,
   onCustomerCreated,
+  initialName = '',
 }) => {
   const nextId = peekNextCustomerId();
   const isAuthorizedToSetCredit = isSupervisorOrAbove(currentUser.role) || Boolean(currentUser.permissions?.canGrantCredit);
@@ -38,6 +40,20 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
   const [maxCreditReceiptCount, setMaxCreditReceiptCount] = useState('2');
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      setName((initialName || '').trim());
+      setPhone('');
+      setAddress('');
+      setCreditAllowed(false);
+      setCreditLimit('0.00');
+      setSelectedGroupId('CGRP-001');
+      setMaxCreditReceiptCount('2');
+      setError(null);
+      setIsSubmitting(false);
+    }
+  }, [isOpen, initialName]);
 
   if (!isOpen) return null;
 
@@ -117,8 +133,8 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn">
-      <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden text-slate-100 animate-scaleUp">
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn">
+      <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden text-slate-100 animate-scaleUp max-h-[92vh] flex flex-col">
         {/* Modal Header */}
         <div className="bg-gradient-to-r from-[#6A4DFF] to-[#FF8A00] p-4 text-white flex items-center justify-between">
           <div className="flex items-center space-x-2.5">
@@ -140,7 +156,7 @@ export const CustomerRegistrationModal: React.FC<CustomerRegistrationModalProps>
         </div>
 
         {/* Modal Form */}
-        <form onSubmit={handleSubmit} className="p-5 space-y-4">
+        <form onSubmit={handleSubmit} className="p-5 space-y-4 overflow-y-auto">
           {/* Auto Customer ID & Staff Info Pill */}
           <div className="flex items-center justify-between p-3 rounded-2xl bg-slate-950/60 border border-slate-800 text-xs">
             <div className="flex items-center space-x-2 text-slate-300">

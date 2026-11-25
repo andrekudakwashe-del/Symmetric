@@ -17,6 +17,7 @@ import {
   Radio,
   WifiOff,
   Bluetooth,
+  RefreshCw,
 } from 'lucide-react';
 import {
   bluetoothPrinter,
@@ -77,9 +78,12 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
   );
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [isPrinting, setIsPrinting] = useState(false);
+  const [isPrinterActionBusy, setIsPrinterActionBusy] = useState<'repair' | 'pair' | null>(null);
   const [printSuccessToast, setPrintSuccessToast] = useState<string | null>(null);
+  const [printerErrorToast, setPrinterErrorToast] = useState<string | null>(null);
 
   const isIframe = isRunningInIframe();
+  const isBluetoothSupported = bluetoothPrinter.isSupported();
   const autoPrintedRef = useRef<string | null>(null);
 
   // Sync printer configuration whenever company or modal opens
@@ -253,11 +257,13 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
       );
 
       if (res.queued) {
+        setPrinterErrorToast(null);
         setPrintSuccessToast(
-          '⏳ Printer is turned off. Receipt queued — it will automatically print as soon as you turn the printer on!'
+          '⏳ Printer disconnected or off. Receipt queued — tap Re-pair or Pair below to reconnect & print!'
         );
         setTimeout(() => setPrintSuccessToast(null), 6000);
       } else {
+        setPrinterErrorToast(null);
         setPrintSuccessToast('✓ Receipt printed to thermal printer!');
         setTimeout(() => setPrintSuccessToast(null), 3000);
       }
@@ -266,6 +272,64 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
       handleSystemPrint();
     } finally {
       setIsPrinting(false);
+    }
+  };
+
+  const handleBluetoothPrinterAction = async (mode: 'repair' | 'pair') => {
+    if (isIframe) {
+      setPrinterErrorToast(
+        'Web Bluetooth is restricted inside embedded preview frames. Open the app in a browser tab to pair or re-pair your printer.'
+      );
+      return;
+    }
+
+    if (!isBluetoothSupported) {
+      setPrinterErrorToast(
+        'Web Bluetooth is not supported in this browser. Please use Google Chrome or Microsoft Edge.'
+      );
+      return;
+    }
+
+    const hadQueuedJob = isCurrentJobQueued;
+    try {
+      setPrinterErrorToast(null);
+      setPrintSuccessToast(null);
+      setIsPrinterActionBusy(mode);
+
+      await bluetoothPrinter.connect({
+        forceRepair: true,
+        forgetFirst: mode === 'pair',
+      });
+
+      const connectedName = bluetoothPrinter.getConnectedDeviceName() || 'Thermal Printer';
+      const verb = mode === 'repair' ? 'Re-paired' : 'Paired';
+      setPrintSuccessToast(
+        hadQueuedJob
+          ? `✓ ${verb} to ${connectedName}! Printing queued receipt...`
+          : `✓ ${verb} & connected to ${connectedName}! Ready to print.`
+      );
+      setTimeout(() => setPrintSuccessToast(null), 4500);
+    } catch (err: any) {
+      const isPolicy = isBluetoothPermissionsBlocked(err);
+      if (isPolicy) {
+        setPrinterErrorToast(
+          'Web Bluetooth is blocked inside this embedded preview frame. Open in a dedicated browser tab.'
+        );
+      } else {
+        const isCancelled =
+          err?.name === 'NotFoundError' ||
+          (typeof err?.message === 'string' &&
+            err.message.toLowerCase().includes('cancelled'));
+        if (isCancelled) {
+          setPrinterErrorToast('Bluetooth picker closed without selecting a printer.');
+        } else {
+          setPrinterErrorToast(
+            err?.message || 'Bluetooth connection failed. Ensure your printer is powered on and Bluetooth is enabled.'
+          );
+        }
+      }
+    } finally {
+      setIsPrinterActionBusy(null);
     }
   };
 
@@ -443,8 +507,8 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
           {isCurrentJobQueued ? (
             <div className="bg-amber-500 text-white px-4 py-2 text-xs font-bold flex items-center justify-between animate-fadeIn">
               <div className="flex items-center space-x-2">
-                <Clock className="w-4 h-4 animate-spin" />
-                <span>Printer is turned off. Receipt queued &amp; will auto-print when powered on!</span>
+                <Clock className="w-4 h-4 animate-spin shrink-0" />
+                <span>Receipt queued — tap Re-pair or Pair below to reconnect &amp; auto-print!</span>
               </div>
             </div>
           ) : !printerStatus.isRadioAvailable ? (
@@ -485,7 +549,15 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
           {printSuccessToast && (
             <div className="bg-emerald-600 text-white px-4 py-2.5 text-xs font-bold flex items-center justify-between animate-fadeIn shadow-md">
               <span>{printSuccessToast}</span>
-              <button onClick={() => setPrintSuccessToast(null)} className="text-white/80 hover:text-white ml-2">✕</button>
+              <button type="button" onClick={() => setPrintSuccessToast(null)} className="text-white/80 hover:text-white ml-2">✕</button>
+            </div>
+          )}
+
+          {/* Printer Connection Error Toast */}
+          {printerErrorToast && (
+            <div className="bg-rose-600 text-white px-4 py-2.5 text-xs font-bold flex items-center justify-between animate-fadeIn shadow-md">
+              <span>{printerErrorToast}</span>
+              <button type="button" onClick={() => setPrinterErrorToast(null)} className="text-white/80 hover:text-white ml-2">✕</button>
             </div>
           )}
 
@@ -820,6 +892,45 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
               >
                 <Share2 className="w-4 h-4" />
                 <span className="hidden sm:inline">WhatsApp</span>
+              </button>
+            </div>
+
+            {/* Quick Printer Re-pair & Pair Controls (Instant Recovery on Print Failure) */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                id="btn-receipt-repair-printer"
+                type="button"
+                onClick={() => handleBluetoothPrinterAction('repair')}
+                disabled={isPrinting || isPrinterActionBusy !== null}
+                className="py-2.5 px-3 rounded-xl bg-amber-50 hover:bg-amber-100 active:bg-amber-200 border border-amber-200 text-amber-900 font-extrabold text-xs flex items-center justify-center space-x-1.5 transition active:scale-95 disabled:opacity-50"
+                title="Re-pair or refresh Bluetooth thermal printer connection"
+              >
+                <RefreshCw
+                  className={`w-3.5 h-3.5 text-amber-700 ${
+                    isPrinterActionBusy === 'repair' ? 'animate-spin' : ''
+                  }`}
+                />
+                <span>
+                  {isPrinterActionBusy === 'repair' ? 'Re-pairing...' : 'Re-pair Printer'}
+                </span>
+              </button>
+
+              <button
+                id="btn-receipt-pair-printer"
+                type="button"
+                onClick={() => handleBluetoothPrinterAction('pair')}
+                disabled={isPrinting || isPrinterActionBusy !== null}
+                className="py-2.5 px-3 rounded-xl bg-blue-50 hover:bg-blue-100 active:bg-blue-200 border border-blue-200 text-blue-900 font-extrabold text-xs flex items-center justify-center space-x-1.5 transition active:scale-95 disabled:opacity-50"
+                title="Pair a new or switched Bluetooth thermal printer"
+              >
+                <Bluetooth
+                  className={`w-3.5 h-3.5 text-blue-700 ${
+                    isPrinterActionBusy === 'pair' ? 'animate-pulse' : ''
+                  }`}
+                />
+                <span>
+                  {isPrinterActionBusy === 'pair' ? 'Pairing...' : 'Pair Printer'}
+                </span>
               </button>
             </div>
 

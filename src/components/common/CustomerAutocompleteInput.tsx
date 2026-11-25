@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Customer } from '../../types';
-import { getCustomers, getCustomerChanges, getCreditSales } from '../../db/roomDatabase';
+import { getCustomers, getCustomerChanges, getCreditSales, subscribeToDatabase } from '../../db/roomDatabase';
 import { formatDisplayId } from '../../utils/idFormatters';
 import {
   User,
@@ -12,6 +12,7 @@ import {
   MapPin,
   ChevronDown,
   Sparkles,
+  X,
 } from 'lucide-react';
 
 interface CustomerAutocompleteInputProps {
@@ -54,13 +55,22 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
   const [allChanges, setAllChanges] = useState(() => getCustomerChanges());
   const [allCredits, setAllCredits] = useState(() => getCreditSales());
 
-  // Refresh customer and balance data when opened
+  // Refresh customer and balance data when opened or when customers database updates
   useEffect(() => {
-    if (isOpen) {
+    const refreshData = () => {
       setAllCustomers(getCustomers());
       setAllChanges(getCustomerChanges());
       setAllCredits(getCreditSales());
+    };
+    if (isOpen) {
+      refreshData();
     }
+    const unsub = subscribeToDatabase(refreshData);
+    window.addEventListener('saimetric_customers_updated', refreshData);
+    return () => {
+      unsub();
+      window.removeEventListener('saimetric_customers_updated', refreshData);
+    };
   }, [isOpen]);
 
   // Click outside listener
@@ -82,8 +92,8 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
 
   const filteredCustomers = useMemo(() => {
     if (!query) {
-      // If empty query but opened, return first 8 recent customers
-      return allCustomers.slice(0, 8);
+      // If empty query but opened, return first 25 customers
+      return allCustomers.slice(0, 25);
     }
 
     return allCustomers
@@ -106,7 +116,7 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
         if (bStarts && !aStarts) return 1;
         return aName.localeCompare(bName);
       })
-      .slice(0, 8);
+      .slice(0, 25);
   }, [allCustomers, query]);
 
   // Check if current typed value is an exact match to a registered customer
@@ -251,7 +261,7 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
           }}
           onKeyDown={handleKeyDown}
           placeholder={placeholder}
-          className={`w-full px-3 py-2 rounded-xl bg-slate-900 border text-xs text-white placeholder-slate-500 outline-none transition ${
+          className={`w-full pl-3 pr-24 py-2 rounded-xl bg-slate-900 border text-xs text-white placeholder-slate-500 outline-none transition ${
             disabled
               ? 'opacity-70 cursor-not-allowed bg-slate-950/60 border-slate-800 text-slate-400'
               : exactMatch
@@ -262,23 +272,38 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
           } ${themeBorderFocus} ${inputClassName}`}
         />
 
-        {/* Status indicator / Customer ID badge inside input */}
-        <div className="absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center space-x-1.5 pointer-events-none">
+        {/* Status indicator / Customer ID badge & Clear button inside input */}
+        <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center space-x-1">
           {exactMatch ? (
             <span
               title={exactMatch.customerId}
-              className="text-[10px] bg-emerald-500/20 text-emerald-300 font-mono-num font-bold px-1.5 py-0.5 rounded flex items-center space-x-1"
+              className="text-[10px] bg-emerald-500/20 text-emerald-300 font-mono-num font-bold px-1.5 py-0.5 rounded flex items-center space-x-1 pointer-events-none"
             >
               <Check className="w-3 h-3 text-emerald-400" />
               <span>{formatDisplayId(exactMatch.customerId, 'customer')}</span>
             </span>
           ) : query && !disabled ? (
-            <span className="text-[10px] bg-purple-500/20 text-purple-300 font-semibold px-1.5 py-0.5 rounded flex items-center space-x-1">
+            <span className="text-[10px] bg-purple-500/20 text-purple-300 font-semibold px-1.5 py-0.5 rounded flex items-center space-x-1 pointer-events-none">
               <Sparkles className="w-3 h-3 text-purple-400" />
               <span>New</span>
             </span>
           ) : (
-            <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+            <ChevronDown className="w-3.5 h-3.5 text-slate-500 pointer-events-none" />
+          )}
+          {safeValue && !disabled && (
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                onChange('', undefined);
+                setIsOpen(true);
+                inputRef.current?.focus();
+              }}
+              className="p-0.5 rounded-full text-slate-400 hover:text-white hover:bg-slate-800 transition cursor-pointer"
+              title="Clear customer search"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
           )}
         </div>
       </div>
@@ -304,14 +329,13 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
                 const hasDebt = balances && balances.creditOwed > 0;
 
                 return (
-                  <div
+                  <button
                     key={`${cust.customerId || 'cust'}-${idx}`}
-                    onMouseDown={(e) => {
-                      e.preventDefault(); // Prevent input blur before selection
-                      handleSelect(cust);
-                    }}
+                    type="button"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => handleSelect(cust)}
                     onMouseEnter={() => setHighlightedIndex(idx)}
-                    className={`px-3 py-2 rounded-xl cursor-pointer text-xs transition-colors flex items-center justify-between gap-2 ${
+                    className={`w-full text-left px-3 py-2 rounded-xl cursor-pointer text-xs transition-colors flex items-center justify-between gap-2 ${
                       isSelected
                         ? 'bg-purple-600/30 text-white border border-purple-500/40'
                         : 'text-slate-200 hover:bg-slate-800/80'
@@ -364,7 +388,7 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
                         )}
                       </div>
                     )}
-                  </div>
+                  </button>
                 );
               })
             ) : (
@@ -374,28 +398,31 @@ export const CustomerAutocompleteInput: React.FC<CustomerAutocompleteInputProps>
             )}
 
             {/* Register New Customer Button in Dropdown */}
-            {query && !exactMatch && (
-              <div
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  if (onRegisterNew) {
-                    onRegisterNew(value.trim());
-                  }
+            {onRegisterNew && (!exactMatch || !query) && (
+              <button
+                type="button"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  onRegisterNew(safeValue.trim());
                   setIsOpen(false);
                 }}
                 onMouseEnter={() => setHighlightedIndex(filteredCustomers.length)}
-                className={`p-2.5 rounded-xl cursor-pointer bg-purple-950/70 hover:bg-purple-900/80 border border-purple-500/40 text-purple-200 flex items-center justify-between text-xs font-bold transition ${
+                className={`w-full text-left p-2.5 rounded-xl cursor-pointer bg-purple-950/70 hover:bg-purple-900/80 border border-purple-500/40 text-purple-200 flex items-center justify-between text-xs font-bold transition ${
                   highlightedIndex === filteredCustomers.length ? 'ring-2 ring-purple-400' : ''
                 }`}
               >
                 <div className="flex items-center space-x-2">
                   <Plus className="w-4 h-4 text-[#FF8A00]" />
-                  <span>Register &ldquo;{value.trim()}&rdquo; in Customer Database</span>
+                  <span>
+                    {query
+                      ? `Register "${safeValue.trim()}" in Customer Database`
+                      : 'Register New Customer in Database'}
+                  </span>
                 </div>
-                <span className="text-[10px] bg-[#6A4DFF] text-white px-2 py-0.5 rounded-full">
-                  1-Click Save
+                <span className="text-[10px] bg-[#6A4DFF] text-white px-2 py-0.5 rounded-full shrink-0">
+                  Register
                 </span>
-              </div>
+              </button>
             )}
           </div>
         </div>
