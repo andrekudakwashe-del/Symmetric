@@ -25,14 +25,15 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
   const branchName = po.branchName || branch?.name || 'Main Store';
   const branchCode = branch?.code || po.branch_id || '';
   const isFinal = po.status === 'APPROVED' || po.status === 'PARTIALLY_RECEIVED' || po.status === 'RECEIVED';
-  const statusLabel = po.status.replace(/_/g, ' ');
+  const statusLabel = String(po.status || 'DRAFT').replace(/_/g, ' ');
 
   const rowsHtml = (po.lines || [])
     .map((line, idx) => {
       const hasCustomDesc =
-        line.poDescription &&
-        line.masterDescription &&
-        line.poDescription.trim().toLowerCase() !== line.masterDescription.trim().toLowerCase();
+        Boolean(line?.poDescription) &&
+        Boolean(line?.masterDescription) &&
+        String(line.poDescription || '').trim().toLowerCase() !==
+          String(line.masterDescription || '').trim().toLowerCase();
       const qtyParts: string[] = [];
       if (Number(line.orderCases || 0) > 0) {
         qtyParts.push(`${line.orderCases} cs (${line.unitsPerCase}/cs)`);

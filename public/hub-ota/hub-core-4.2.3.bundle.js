@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* Saimetric Local Hub Core OTA Bundle v4.2.3 — Built 2026-11-26T10:33:01.120Z */
+/* Saimetric Local Hub Core OTA Bundle v4.2.3 — Built 2026-11-26T11:13:51.886Z */
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __commonJS = (cb, mod) => function __require() {
   try {

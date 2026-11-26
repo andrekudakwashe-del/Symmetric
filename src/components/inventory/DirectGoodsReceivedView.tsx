@@ -195,18 +195,21 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     const mappedRows: DirectRow[] = [];
     selectedLines.forEach((line, idx) => {
       const catalogItem = items.find(
-        (it) => it.itemId.toUpperCase() === line.itemId.toUpperCase()
+        (it) => String(it?.itemId || '').toUpperCase() === String(line.itemId || '').toUpperCase()
       );
       const masterId = catalogItem?.itemId || line.itemId;
       // ALWAYS pick the original Inventory Master description so Master is never altered by PO flavours
-      const masterName = catalogItem?.name || line.masterDescription;
+      const masterName =
+        String(catalogItem?.itemName || catalogItem?.name || line.masterDescription || 'Item').trim();
       const upc = Math.max(1, Number(catalogItem?.unitsPerCase || line.unitsPerCase || 1));
-      const sellingPrice =
-        catalogItem?.sellingPriceUnit !== undefined ? String(catalogItem.sellingPriceUnit) : '';
+      const rawSell = catalogItem?.sellPriceUnit ?? catalogItem?.sellingPriceUnit ?? catalogItem?.sellingPrice;
+      const sellingPrice = rawSell !== undefined && rawSell !== null ? String(rawSell) : '';
+      const rawCaseCost = Number(catalogItem?.costPerCase ?? catalogItem?.costPriceCase ?? 0);
+      const rawUnitCost = Number(catalogItem?.costPerUnit ?? catalogItem?.costPriceUnit ?? 0);
       const flavourNote =
         line.poDescription &&
-        line.poDescription.trim().toLowerCase() !== masterName.trim().toLowerCase()
-          ? line.poDescription.trim()
+        String(line.poDescription).trim().toLowerCase() !== masterName.toLowerCase()
+          ? String(line.poDescription).trim()
           : undefined;
 
       if (line.receiveCases > 0) {
@@ -219,8 +222,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           qtyPerCaseDefault: upc,
           quantityCases: String(line.receiveCases),
           quantitySingles: '',
-          pricePerCase: String(Number(line.caseCost || catalogItem?.costPriceCase || 0)),
-          lastCost: Number(catalogItem?.costPriceCase || line.caseCost || 0),
+          pricePerCase: String(Number(line.caseCost || rawCaseCost || 0)),
+          lastCost: Number(rawCaseCost || line.caseCost || 0),
           sellingPrice,
           batchNumber: '',
           expiryDate: '',
@@ -240,8 +243,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           qtyPerCaseDefault: upc,
           quantityCases: '',
           quantitySingles: String(line.receiveSingles),
-          pricePerCase: String(Number(line.unitCost || catalogItem?.costPriceUnit || 0)),
-          lastCost: Number(catalogItem?.costPriceUnit || line.unitCost || 0),
+          pricePerCase: String(Number(line.unitCost || rawUnitCost || 0)),
+          lastCost: Number(rawUnitCost || line.unitCost || 0),
           sellingPrice,
           batchNumber: '',
           expiryDate: '',

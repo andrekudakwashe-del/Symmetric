@@ -83,10 +83,11 @@ export const PurchaseOrderPickerModal: React.FC<PurchaseOrderPickerModalProps> =
       return;
     }
     if (initialPoId) {
+      const targetUpper = String(initialPoId || '').toUpperCase();
       const match = receivablePos.find(
         (p) =>
-          p.id.toUpperCase() === initialPoId.toUpperCase() ||
-          p.poNumber.toUpperCase() === initialPoId.toUpperCase()
+          String(p?.id || '').toUpperCase() === targetUpper ||
+          String(p?.poNumber || '').toUpperCase() === targetUpper
       );
       if (match) {
         hydrateLineSelection(match);
@@ -97,16 +98,17 @@ export const PurchaseOrderPickerModal: React.FC<PurchaseOrderPickerModalProps> =
   }, [isOpen, initialPoId, receivablePos]);
 
   const filteredPos = useMemo(() => {
-    const q = searchTerm.trim().toLowerCase();
+    const q = String(searchTerm || '').trim().toLowerCase();
     if (!q) return receivablePos;
     return receivablePos.filter((po) => {
-      if (po.poNumber.toLowerCase().includes(q)) return true;
-      if (po.supplierName.toLowerCase().includes(q)) return true;
+      if (!po) return false;
+      if (String(po.poNumber || po.id || '').toLowerCase().includes(q)) return true;
+      if (String(po.supplierName || '').toLowerCase().includes(q)) return true;
       return (po.lines || []).some(
         (l) =>
-          l.poDescription.toLowerCase().includes(q) ||
-          l.masterDescription.toLowerCase().includes(q) ||
-          l.code.toLowerCase().includes(q)
+          String(l?.poDescription || '').toLowerCase().includes(q) ||
+          String(l?.masterDescription || '').toLowerCase().includes(q) ||
+          String(l?.code || '').toLowerCase().includes(q)
       );
     });
   }, [receivablePos, searchTerm]);
@@ -315,7 +317,8 @@ export const PurchaseOrderPickerModal: React.FC<PurchaseOrderPickerModalProps> =
                     const qty = receiveQtyMap[line.lineId] || { cases: 0, singles: 0 };
                     const fullyReceived = Number(line.receivedUnits || 0) >= Math.max(1, Number(line.totalUnits || 0));
                     const isVariant =
-                      line.poDescription.trim().toLowerCase() !== line.masterDescription.trim().toLowerCase();
+                      String(line.poDescription || '').trim().toLowerCase() !==
+                      String(line.masterDescription || '').trim().toLowerCase();
 
                     return (
                       <tr

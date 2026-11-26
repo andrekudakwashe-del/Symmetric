@@ -51,6 +51,28 @@ const addDaysIso = (days: number) => {
   return d.toISOString().split('T')[0];
 };
 
+const getCatalogItemName = (it: any): string =>
+  String(it?.itemName || it?.name || it?.productName || it?.description || it?.itemId || 'Unnamed Product').trim();
+
+const getCatalogCaseCost = (it: any): number => {
+  const upc = Math.max(1, Number(it?.unitsPerCase || 1));
+  const rawCase = Number(it?.costPerCase ?? it?.costPriceCase ?? 0);
+  if (rawCase > 0) return rawCase;
+  const rawUnit = Number(it?.costPerUnit ?? it?.costPriceUnit ?? it?.lastCostPrice ?? it?.costPrice ?? 0);
+  return Number((rawUnit * upc).toFixed(2));
+};
+
+const getCatalogUnitCost = (it: any): number => {
+  const upc = Math.max(1, Number(it?.unitsPerCase || 1));
+  const rawUnit = Number(it?.costPerUnit ?? it?.costPriceUnit ?? it?.lastCostPrice ?? it?.costPrice ?? 0);
+  if (rawUnit > 0) return rawUnit;
+  const rawCase = Number(it?.costPerCase ?? it?.costPriceCase ?? 0);
+  return rawCase > 0 ? Number((rawCase / upc).toFixed(4)) : 0;
+};
+
+const getSupplierDisplayName = (s: any): string =>
+  String(s?.name || s?.supplierName || s?.companyName || '').trim();
+
 export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> = ({
   isOpen,
   currentUser,
@@ -115,16 +137,16 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
     } else {
       setPoNumber(generateNextPoNumber(currentBranch?.code));
       const matchedSup =
-        (initialSupplierId && suppliers.find((s) => s.supplierId === initialSupplierId)) ||
+        (initialSupplierId && suppliers.find((s) => (s.supplierId || s.id) === initialSupplierId)) ||
         (initialSupplierName &&
-          suppliers.find((s) => s.name.toLowerCase() === initialSupplierName.toLowerCase())) ||
+          suppliers.find((s) => getSupplierDisplayName(s).toLowerCase() === String(initialSupplierName || '').toLowerCase())) ||
         undefined;
-      setSupplierId(matchedSup?.supplierId || initialSupplierId || '');
-      setSupplierName(matchedSup?.name || initialSupplierName || '');
+      setSupplierId(matchedSup?.supplierId || matchedSup?.id || initialSupplierId || '');
+      setSupplierName(getSupplierDisplayName(matchedSup) || initialSupplierName || '');
       setSupplierPhone(matchedSup?.phone || '');
       setSupplierEmail(matchedSup?.email || '');
       setSupplierAddress(matchedSup?.address || '');
-      setSupplierQuery(matchedSup?.name || initialSupplierName || '');
+      setSupplierQuery(getSupplierDisplayName(matchedSup) || initialSupplierName || '');
       setOrderDate(todayIso());
       setExpectedDeliveryDate(addDaysIso(3));
       setPaymentTerms('Cash on Delivery / Account');
@@ -140,51 +162,49 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
   }, [isOpen, editingPo, initialLines, initialSupplierId, initialSupplierName]);
 
   const filteredSuppliers = useMemo(() => {
-    const q = supplierQuery.trim().toLowerCase();
-    if (!q) return suppliers.slice(0, 12);
-    return suppliers
+    const q = String(supplierQuery || '').trim().toLowerCase();
+    const list = Array.isArray(suppliers) ? suppliers : [];
+    if (!q) return list.slice(0, 12);
+    return list
       .filter(
         (s) =>
-          s.name.toLowerCase().includes(q) ||
-          String(s.phone || '').toLowerCase().includes(q) ||
-          String(s.category || '').toLowerCase().includes(q)
+          getSupplierDisplayName(s).toLowerCase().includes(q) ||
+          String(s?.phone || '').toLowerCase().includes(q) ||
+          String(s?.category || '').toLowerCase().includes(q)
       )
       .slice(0, 12);
   }, [suppliers, supplierQuery]);
 
   const filteredProducts = useMemo(() => {
-    const q = productQuery.trim().toLowerCase();
+    const q = String(productQuery || '').trim().toLowerCase();
     if (!q) return [];
-    return inventoryItems
+    const list = Array.isArray(inventoryItems) ? inventoryItems : [];
+    return list
       .filter(
         (it) =>
-          it.name.toLowerCase().includes(q) ||
-          String(it.itemId || '').toLowerCase().includes(q) ||
-          String(it.barcode || '').toLowerCase().includes(q) ||
-          String(it.category || '').toLowerCase().includes(q)
+          getCatalogItemName(it).toLowerCase().includes(q) ||
+          String(it?.itemId || it?.sku || '').toLowerCase().includes(q) ||
+          String(it?.barcode || '').toLowerCase().includes(q) ||
+          String(it?.category || '').toLowerCase().includes(q)
       )
       .slice(0, 12);
   }, [inventoryItems, productQuery]);
 
   const addProductLine = (item: InventoryItem) => {
-    const upc = Math.max(1, Number(item.unitsPerCase || 1));
-    const caseCost =
-      Number(item.costPriceCase || 0) > 0
-        ? Number(item.costPriceCase)
-        : Number((Number(item.costPriceUnit || 0) * upc).toFixed(2));
-    const unitCost =
-      Number(item.costPriceUnit || 0) > 0
-        ? Number(item.costPriceUnit)
-        : Number((caseCost / upc).toFixed(4));
+    const upc = Math.max(1, Number(item?.unitsPerCase || 1));
+    const caseCost = getCatalogCaseCost(item);
+    const unitCost = getCatalogUnitCost(item);
+    const masterName = getCatalogItemName(item);
+    const itemCode = String(item?.sku || item?.code || item?.itemId || '').trim();
     const newLineId = makeLineId();
     const newLine: PurchaseOrderLine = {
       lineId: newLineId,
-      itemId: item.itemId,
-      code: item.itemId,
-      barcode: item.barcode || undefined,
-      masterDescription: item.name,
-      poDescription: item.name,
-      category: item.category,
+      itemId: String(item?.itemId || itemCode),
+      code: itemCode,
+      barcode: item?.barcode || undefined,
+      masterDescription: masterName,
+      poDescription: masterName,
+      category: item?.category,
       orderCases: 1,
       orderSingles: 0,
       unitsPerCase: upc,
@@ -405,12 +425,13 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
                 <div className="absolute left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg max-h-56 overflow-y-auto z-30">
                   {filteredSuppliers.map((sup) => (
                     <button
-                      key={sup.supplierId}
+                      key={sup.supplierId || sup.id || getSupplierDisplayName(sup)}
                       type="button"
                       onClick={() => {
-                        setSupplierId(sup.supplierId);
-                        setSupplierName(sup.name);
-                        setSupplierQuery(sup.name);
+                        const sName = getSupplierDisplayName(sup);
+                        setSupplierId(sup.supplierId || sup.id || '');
+                        setSupplierName(sName);
+                        setSupplierQuery(sName);
                         setSupplierPhone(sup.phone || '');
                         setSupplierEmail(sup.email || '');
                         setSupplierAddress(sup.address || '');
@@ -418,7 +439,7 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
                       }}
                       className="w-full text-left px-3 py-2 hover:bg-slate-50 border-b border-slate-100 last:border-b-0 flex items-center justify-between gap-2 cursor-pointer"
                     >
-                      <span className="text-sm font-semibold text-slate-900 truncate">{sup.name}</span>
+                      <span className="text-sm font-semibold text-slate-900 truncate">{getSupplierDisplayName(sup)}</span>
                       <span className="text-[11px] text-slate-500 shrink-0">{sup.phone || sup.category || ''}</span>
                     </button>
                   ))}
@@ -521,22 +542,22 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
             {filteredProducts.length > 0 && (
               <div className="absolute left-0 right-0 mt-1.5 bg-white border border-slate-200 rounded-xl shadow-xl max-h-64 overflow-y-auto z-30">
                 {filteredProducts.map((it) => {
-                  const upc = Math.max(1, Number(it.unitsPerCase || 1));
-                  const cCost =
-                    Number(it.costPriceCase || 0) > 0
-                      ? Number(it.costPriceCase)
-                      : Number(it.costPriceUnit || 0) * upc;
+                  const upc = Math.max(1, Number(it?.unitsPerCase || 1));
+                  const cCost = getCatalogCaseCost(it);
+                  const displayName = getCatalogItemName(it);
+                  const stockCases = Number(it?.stockCases ?? it?.currentStockCases ?? 0);
+                  const stockSingles = Number(it?.stockSingles ?? it?.currentStockSingles ?? 0);
                   return (
                     <button
-                      key={it.itemId}
+                      key={it.itemId || displayName}
                       type="button"
                       onClick={() => addProductLine(it)}
                       className="w-full text-left px-4 py-2.5 hover:bg-indigo-50/70 border-b border-slate-100 last:border-b-0 flex items-center justify-between gap-3 cursor-pointer"
                     >
                       <div className="min-w-0">
-                        <div className="text-sm font-semibold text-slate-900 truncate">{it.name}</div>
+                        <div className="text-sm font-semibold text-slate-900 truncate">{displayName}</div>
                         <div className="text-[11px] text-slate-500 font-mono">
-                          {it.itemId} &middot; {upc}/case &middot; Stock: {it.stockCases || 0} cs {it.stockSingles || 0} u
+                          {it.sku || it.itemId} &middot; {upc}/case &middot; Stock: {stockCases} cs {stockSingles} u
                         </div>
                       </div>
                       <div className="flex items-center gap-3 shrink-0">
@@ -584,7 +605,8 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
                   ) : (
                     lines.map((line, idx) => {
                       const isEdited =
-                        line.poDescription.trim().toLowerCase() !== line.masterDescription.trim().toLowerCase();
+                        String(line.poDescription || '').trim().toLowerCase() !==
+                        String(line.masterDescription || '').trim().toLowerCase();
                       return (
                         <tr key={line.lineId} className="hover:bg-slate-50/70 align-top">
                           <td className="py-3 px-3 text-xs font-mono text-slate-500 pt-4">{idx + 1}</td>

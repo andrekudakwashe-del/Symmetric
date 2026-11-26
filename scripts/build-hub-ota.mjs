@@ -72,8 +72,14 @@ function runKeygen() {
 }
 
 function loadPrivateKey() {
-  const envKey = String(process.env.HUB_OTA_PRIVATE_KEY || '').trim();
+  let envKey = String(process.env.HUB_OTA_PRIVATE_KEY || '').trim();
   if (envKey) {
+    if (
+      (envKey.startsWith('"') && envKey.endsWith('"')) ||
+      (envKey.startsWith("'") && envKey.endsWith("'"))
+    ) {
+      envKey = envKey.slice(1, -1).trim();
+    }
     const normalized = envKey.includes('\\n') ? envKey.replace(/\\n/g, '\n') : envKey;
     return crypto.createPrivateKey(normalized);
   }

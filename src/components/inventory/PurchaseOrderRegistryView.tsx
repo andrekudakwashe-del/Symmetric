@@ -179,18 +179,19 @@ export const PurchaseOrderRegistryView: React.FC<PurchaseOrderRegistryViewProps>
   }, [orders]);
 
   const filteredOrders = useMemo(() => {
-    const q = searchTerm.trim().toLowerCase();
+    const q = String(searchTerm || '').trim().toLowerCase();
     return orders.filter((po) => {
+      if (!po) return false;
       if (statusFilter !== 'ALL' && po.status !== statusFilter) return false;
       if (!q) return true;
-      if (po.poNumber.toLowerCase().includes(q)) return true;
-      if (po.supplierName.toLowerCase().includes(q)) return true;
-      if ((po.createdByName || '').toLowerCase().includes(q)) return true;
+      if (String(po.poNumber || po.id || '').toLowerCase().includes(q)) return true;
+      if (String(po.supplierName || '').toLowerCase().includes(q)) return true;
+      if (String(po.createdByName || '').toLowerCase().includes(q)) return true;
       return (po.lines || []).some(
         (l) =>
-          l.poDescription.toLowerCase().includes(q) ||
-          l.masterDescription.toLowerCase().includes(q) ||
-          l.code.toLowerCase().includes(q)
+          String(l?.poDescription || '').toLowerCase().includes(q) ||
+          String(l?.masterDescription || '').toLowerCase().includes(q) ||
+          String(l?.code || '').toLowerCase().includes(q)
       );
     });
   }, [orders, statusFilter, searchTerm]);

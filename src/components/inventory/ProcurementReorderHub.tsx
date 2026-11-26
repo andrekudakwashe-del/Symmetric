@@ -91,42 +91,47 @@ export type CalculationWindow = 7 | 14 | 30 | 60 | 90 | 'weighted';
 /** Robust helper to always return the human-readable product name, never falling back to just code */
 export const getItemName = (item: any): string => {
   if (!item) return '';
-  const rawId = (item.itemId || item.id || item.sku || '').trim();
+  const rawId = String(item.itemId || item.id || item.sku || '').trim();
+  const rawIdUpper = rawId.toUpperCase();
 
   // 1. If item.itemName is defined and is NOT equal to the raw ID/SKU code
-  if (item.itemName && item.itemName.trim() && item.itemName.trim().toUpperCase() !== rawId.toUpperCase()) {
-    return item.itemName.trim();
+  const itemNameStr = String(item.itemName || '').trim();
+  if (itemNameStr && itemNameStr.toUpperCase() !== rawIdUpper) {
+    return itemNameStr;
   }
   // 2. If item.name is defined and is NOT equal to the raw ID/SKU code
-  if (item.name && item.name.trim() && item.name.trim().toUpperCase() !== rawId.toUpperCase()) {
-    return item.name.trim();
+  const nameStr = String(item.name || '').trim();
+  if (nameStr && nameStr.toUpperCase() !== rawIdUpper) {
+    return nameStr;
   }
   // 3. If item.productName is defined
-  if (item.productName && item.productName.trim() && item.productName.trim().toUpperCase() !== rawId.toUpperCase()) {
-    return item.productName.trim();
+  const productNameStr = String(item.productName || '').trim();
+  if (productNameStr && productNameStr.toUpperCase() !== rawIdUpper) {
+    return productNameStr;
   }
   // 4. Try catalog lookup in INITIAL_INVENTORY_ITEMS by itemId or sku
   if (rawId) {
     const matched = INITIAL_INVENTORY_ITEMS.find(
       (init) =>
-        (init.itemId && init.itemId.toUpperCase() === rawId.toUpperCase()) ||
-        (init.sku && init.sku.toUpperCase() === rawId.toUpperCase())
+        (init.itemId && String(init.itemId).toUpperCase() === rawIdUpper) ||
+        (init.sku && String(init.sku).toUpperCase() === rawIdUpper)
     );
     if (matched && matched.itemName) {
-      return matched.itemName;
+      return String(matched.itemName);
     }
   }
   // 5. If item has description and it's not the rawId
-  if (item.description && item.description.trim() && item.description.trim().toUpperCase() !== rawId.toUpperCase()) {
-    return item.description.trim();
+  const descStr = String(item.description || '').trim();
+  if (descStr && descStr.toUpperCase() !== rawIdUpper) {
+    return descStr;
   }
-  return item.itemName || item.name || item.productName || item.description || item.itemId || 'Unnamed Product';
+  return itemNameStr || nameStr || productNameStr || descStr || rawId || 'Unnamed Product';
 };
 
 /** Helper to return the item's SKU / Code */
 export const getItemCode = (item: any): string => {
   if (!item) return '';
-  return item.sku || item.code || item.itemId || '';
+  return String(item.sku || item.code || item.itemId || '');
 };
 
 export interface ItemSupplierLink {
@@ -388,7 +393,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
   const fastMovingItemIds = useMemo(() => {
     const set = new Set<string>();
     fastMovingList.forEach((f) => {
-      if (f.itemId) set.add(f.itemId.trim().toUpperCase());
+      if (f?.itemId) set.add(String(f.itemId).trim().toUpperCase());
     });
     return set;
   }, [fastMovingList]);
@@ -402,7 +407,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     suppliers.forEach((s) => {
       const sId = s.supplierId || s.id;
       if (sId) map.set(sId, s);
-      if (s.name) map.set(s.name.trim().toLowerCase(), s);
+      if (s?.name) map.set(String(s.name).trim().toLowerCase(), s);
     });
     return map;
   }, [suppliers]);
@@ -421,23 +426,23 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     const historicalSuppliersByItem = new Map<string, Set<string>>();
     try {
       const grns = getStored<GoodsReceivedEntry[]>(STORAGE_KEYS.GOODS_RECEIVED, INITIAL_GOODS_RECEIVED);
-      grns.forEach((g) => {
-        if (g.itemId && g.supplier) {
+      (Array.isArray(grns) ? grns : []).forEach((g) => {
+        if (g?.itemId && g?.supplier) {
           if (!historicalSuppliersByItem.has(g.itemId)) {
             historicalSuppliersByItem.set(g.itemId, new Set());
           }
-          historicalSuppliersByItem.get(g.itemId)!.add(g.supplier.trim().toLowerCase());
+          historicalSuppliersByItem.get(g.itemId)!.add(String(g.supplier).trim().toLowerCase());
         }
       });
       const invoices = getStored<SupplierInvoiceVoucher[]>(STORAGE_KEYS.SUPPLIER_INVOICES, INITIAL_SUPPLIER_INVOICES);
-      invoices.forEach((inv) => {
-        if (inv.supplier && Array.isArray(inv.items)) {
+      (Array.isArray(invoices) ? invoices : []).forEach((inv) => {
+        if (inv?.supplier && Array.isArray(inv.items)) {
           inv.items.forEach((it) => {
-            if (it.itemId) {
+            if (it?.itemId) {
               if (!historicalSuppliersByItem.has(it.itemId)) {
                 historicalSuppliersByItem.set(it.itemId, new Set());
               }
-              historicalSuppliersByItem.get(it.itemId)!.add(inv.supplier.trim().toLowerCase());
+              historicalSuppliersByItem.get(it.itemId)!.add(String(inv.supplier).trim().toLowerCase());
             }
           });
         }
@@ -446,28 +451,31 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       // fallback
     }
 
+    const matchSupplierName = (s: Supplier | undefined | null, needle: string) =>
+      String(s?.name || (s as any)?.supplierName || '').toLowerCase().includes(needle);
+
     // Category default vendor resolution for items without an explicit vendor
     const resolveCategoryVendor = (category?: string): Supplier | undefined => {
-      const cat = (category || '').toLowerCase();
+      const cat = String(category || '').toLowerCase();
       if (cat.includes('beverage') || cat.includes('drink') || cat.includes('juice') || cat.includes('water')) {
-        return suppliers.find((s) => s.name.toLowerCase().includes('delta'));
+        return suppliers.find((s) => matchSupplierName(s, 'delta'));
       }
       if (cat.includes('bakery') || cat.includes('bread') || cat.includes('flour') || cat.includes('confectionery')) {
-        return suppliers.find((s) => s.name.toLowerCase().includes('bakers inn'));
+        return suppliers.find((s) => matchSupplierName(s, 'bakers inn'));
       }
       if (cat.includes('dairy') || cat.includes('milk') || cat.includes('cheese') || cat.includes('yoghurt')) {
-        return suppliers.find((s) => s.name.toLowerCase().includes('dairibord'));
+        return suppliers.find((s) => matchSupplierName(s, 'dairibord'));
       }
       if (cat.includes('oil') || cat.includes('fat') || cat.includes('margarine')) {
         return (
-          suppliers.find((s) => s.name.toLowerCase().includes('olivine')) ||
-          suppliers.find((s) => s.name.toLowerCase().includes('mega market'))
+          suppliers.find((s) => matchSupplierName(s, 'olivine')) ||
+          suppliers.find((s) => matchSupplierName(s, 'mega market'))
         );
       }
       // General groceries & FMCG staples
       return (
-        suppliers.find((s) => s.name.toLowerCase().includes('national foods')) ||
-        suppliers.find((s) => s.name.toLowerCase().includes('mega market')) ||
+        suppliers.find((s) => matchSupplierName(s, 'national foods')) ||
+        suppliers.find((s) => matchSupplierName(s, 'mega market')) ||
         suppliers[0]
       );
     };
@@ -488,7 +496,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
         if (directId) {
           primarySupplier = suppliersMap.get(directId);
         } else if (directName) {
-          primarySupplier = suppliersMap.get(directName.trim().toLowerCase());
+          primarySupplier = suppliersMap.get(String(directName).trim().toLowerCase());
         }
       }
 
@@ -539,13 +547,13 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       }
 
       // Add prominent FMCG wholesale distributor (Mega Market Wholesale) as an alternative supplier if not primary
-      const megaMarket = suppliers.find((s) => s.name.toLowerCase().includes('mega market'));
+      const megaMarket = suppliers.find((s) => matchSupplierName(s, 'mega market'));
       if (megaMarket) {
         const mmId = megaMarket.supplierId || megaMarket.id;
         if (mmId && !addedIds.has(mmId)) {
           allList.push({
             id: mmId,
-            name: megaMarket.name,
+            name: megaMarket.name || 'Mega Market',
             isPrimary: false,
             leadTimeDays: megaMarket.leadTimeDays || 1, // Rapid 1-day delivery for urgent stockouts
             paymentTerms: megaMarket.paymentTerms || 'Cash on Delivery (COD)',
@@ -555,7 +563,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       }
 
       // Add National Foods as an alternative supplier if not primary
-      const natFoods = suppliers.find((s) => s.name.toLowerCase().includes('national foods'));
+      const natFoods = suppliers.find((s) => matchSupplierName(s, 'national foods'));
       if (natFoods) {
         const nfId = natFoods.supplierId || natFoods.id;
         if (nfId && !addedIds.has(nfId)) {
@@ -619,8 +627,8 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       const isSale =
         m.txnType === 'SALE' ||
         m.movementType === 'SALE' ||
-        (m.actionTaken && m.actionTaken.includes('SOLD')) ||
-        (m.promptShown && m.promptShown.toLowerCase().includes('sale'));
+        (m.actionTaken && String(m.actionTaken).includes('SOLD')) ||
+        (m.promptShown && String(m.promptShown).toLowerCase().includes('sale'));
 
       if (!isSale) return;
 
@@ -793,9 +801,9 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
         unitSellingPrice > 0 ? Math.max(0, ((unitSellingPrice - unitCost) / unitSellingPrice) * 100) : 0;
 
       // Dual-Criteria Velocity Classification
-      const rawCode = (item.itemId || '').toUpperCase();
-      const rawSku = (item.sku || '').toUpperCase();
-      const rawBarcode = (item.barcode || '').toUpperCase();
+      const rawCode = String(item.itemId || '').toUpperCase();
+      const rawSku = String(item.sku || '').toUpperCase();
+      const rawBarcode = String(item.barcode || '').toUpperCase();
       const isChecklistFastMover =
         fastMovingItemIds.has(rawCode) ||
         (rawSku ? fastMovingItemIds.has(rawSku) : false) ||
@@ -1001,12 +1009,12 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
         if (entry.supplierId || entry.supplierName !== 'Unassigned Vendor') return false;
       } else if (selectedSupplierId !== 'ALL') {
         const targetSup = suppliersMap.get(selectedSupplierId);
-        const targetName = targetSup?.name?.toLowerCase();
+        const targetName = String(targetSup?.name || (targetSup as any)?.supplierName || '').toLowerCase();
         const matchesId = entry.supplierId === selectedSupplierId;
-        const matchesName = targetName && entry.supplierName.toLowerCase() === targetName;
+        const matchesName = targetName && String(entry.supplierName || '').toLowerCase() === targetName;
         const matchesAlt = entry.allSuppliers
           ? entry.allSuppliers.some(
-              (s) => s.id === selectedSupplierId || (targetName && s.name.toLowerCase() === targetName)
+              (s) => s?.id === selectedSupplierId || (targetName && String(s?.name || '').toLowerCase() === targetName)
             )
           : false;
         if (!matchesId && !matchesName && !matchesAlt) return false;
@@ -1024,17 +1032,19 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       if (budgetFilter === 'UNFUNDED' && (entry.isFundedInBudget || entry.priorityTier === 'HEALTHY')) return false;
 
       // Search query across Real Product Name, Code, Barcode, Category, and Primary/Alt Supplier Name
-      if (searchQuery.trim()) {
-        const q = searchQuery.toLowerCase().trim();
+      if (String(searchQuery || '').trim()) {
+        const q = String(searchQuery || '').toLowerCase().trim();
         const itemName = getItemName(entry.item);
         const itemCode = getItemCode(entry.item);
         const nameMatch = itemName.toLowerCase().includes(q);
         const codeMatch = itemCode.toLowerCase().includes(q);
-        const idMatch = entry.item.itemId ? entry.item.itemId.toLowerCase().includes(q) : false;
-        const barcodeMatch = entry.item.barcode ? entry.item.barcode.toLowerCase().includes(q) : false;
-        const catMatch = entry.item.category ? entry.item.category.toLowerCase().includes(q) : false;
-        const supMatch = entry.supplierName ? entry.supplierName.toLowerCase().includes(q) : false;
-        const altSupMatch = entry.allSuppliers ? entry.allSuppliers.some((s) => s.name.toLowerCase().includes(q)) : false;
+        const idMatch = entry.item.itemId ? String(entry.item.itemId).toLowerCase().includes(q) : false;
+        const barcodeMatch = entry.item.barcode ? String(entry.item.barcode).toLowerCase().includes(q) : false;
+        const catMatch = entry.item.category ? String(entry.item.category).toLowerCase().includes(q) : false;
+        const supMatch = entry.supplierName ? String(entry.supplierName).toLowerCase().includes(q) : false;
+        const altSupMatch = entry.allSuppliers
+          ? entry.allSuppliers.some((s) => String(s?.name || '').toLowerCase().includes(q))
+          : false;
 
         if (!nameMatch && !codeMatch && !idMatch && !barcodeMatch && !catMatch && !supMatch && !altSupMatch) {
           return false;
@@ -1195,12 +1205,12 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     const q = poSupplierSearchQuery.toLowerCase().trim();
     return suppliers.filter(
       (s) =>
-        s.name.toLowerCase().includes(q) ||
-        (s.contactPerson && s.contactPerson.toLowerCase().includes(q)) ||
-        (s.phone && s.phone.toLowerCase().includes(q)) ||
-        (s.city && s.city.toLowerCase().includes(q)) ||
-        (s.category && s.category.toLowerCase().includes(q)) ||
-        (s.supplierId && s.supplierId.toLowerCase().includes(q))
+        String(s?.name || '').toLowerCase().includes(q) ||
+        (s?.contactPerson && String(s.contactPerson).toLowerCase().includes(q)) ||
+        (s?.phone && String(s.phone).toLowerCase().includes(q)) ||
+        (s?.city && String(s.city).toLowerCase().includes(q)) ||
+        (s?.category && String(s.category).toLowerCase().includes(q)) ||
+        (s?.supplierId && String(s.supplierId).toLowerCase().includes(q))
     );
   }, [suppliers, poSupplierSearchQuery]);
 
@@ -3325,13 +3335,13 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                     <div className="absolute left-0 right-0 top-10 z-20 bg-white rounded-2xl shadow-xl border border-slate-200 max-h-56 overflow-y-auto divide-y divide-slate-100">
                       {inventoryItems
                         .filter((it) => {
-                          const q = adHocSearchQuery.toLowerCase();
+                          const q = String(adHocSearchQuery || '').toLowerCase();
                           const itName = getItemName(it).toLowerCase();
                           const itCode = getItemCode(it).toLowerCase();
                           return (
                             itName.includes(q) ||
                             itCode.includes(q) ||
-                            (it.barcode && it.barcode.toLowerCase().includes(q))
+                            (it.barcode && String(it.barcode).toLowerCase().includes(q))
                           );
                         })
                         .slice(0, 8)
