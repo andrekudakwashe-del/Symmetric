@@ -247,6 +247,7 @@ var BASE_TAB_COLUMNS = {
   "StocktakeUnlockLog": ["UnlockID", "CompanyID", "BranchID", "SessionID", "SegmentID", "TargetSlot", "ActorID", "ActorName", "Reason", "UnlockedAt"],
   "DailyBlindConfigs": ["ConfigID", "CompanyID", "BranchID", "SelectedItemIdsJSON", "DesignatedAuditorID", "DesignatedAuditorName", "UpdatedBy", "UpdatedAt"],
   "DailyBlindCounts": ["CountID", "CompanyID", "BranchID", "BranchName", "Date", "ListSource", "CountedByID", "CountedByName", "SubmittedAt", "Status", "TotalItemsCounted", "MatchedCount", "VarianceItemCount", "NetVarianceUnits", "NetVarianceCostValue", "AbsVarianceCostValue", "ReviewedByName", "ReviewedAt", "ArchivedAt", "AuditorSummaryNote", "LinesJSON", "UpdatedAt"],
+  "PurchaseOrders": ["POID", "PONumber", "CompanyID", "BranchID", "BranchName", "SupplierID", "SupplierName", "OrderDate", "ExpectedDeliveryDate", "PaymentTerms", "Status", "Subtotal", "TaxAmount", "GrandTotal", "TotalCases", "TotalUnits", "CreatedByID", "CreatedByName", "ApprovedByID", "ApprovedByName", "ApprovedAt", "RejectedByName", "RejectionReason", "LinkedGrvIdsJSON", "Notes", "LinesJSON", "UpdatedAt"],
   "CasualWorkers": ["CasualID", "CompanyID", "BranchID", "SessionID", "Name", "Phone", "HomeBranchID", "WorkerType", "PassCodeHash", "AssignedZones", "ExpiresAt", "IsActive", "UpdatedAt"],
   "BranchLockdowns": ["BranchID", "CompanyID", "IsLocked", "SessionID", "LockedBy", "LockedByName", "LockedAt", "Reason", "UpdatedAt"],
 
@@ -325,6 +326,7 @@ var ENTITY_TO_TAB = {
   "stocktake_segment_unlock": "StocktakeUnlockLog",
   "daily_blind_config": "DailyBlindConfigs",
   "daily_blind_count": "DailyBlindCounts",
+  "purchase_order": "PurchaseOrders",
   "casual_worker": "CasualWorkers",
   "branch_lockdown": "BranchLockdowns",
   "system_settings": "SystemSettings",
@@ -351,6 +353,7 @@ var T2_ENTITY_TYPES = {
   "stocktake_zone_assignment": true,
   "daily_blind_config": true,
   "daily_blind_count": true,
+  "purchase_order": true,
   "casual_worker": true,
   "branch_lockdown": true,
   "sheets_config": true,
@@ -1908,6 +1911,12 @@ function extractEntityIdFromPayload(entityType, entityId, d) {
         return firstNonEmptyVal_([d.AuditID, d.auditId, d.id, d.entityId]);
       case "branch_lockdown":
         return firstNonEmptyVal_([d.branchId, d.branch_id, d.BranchID]) || "BR-MAIN";
+      case "daily_blind_config":
+        return firstNonEmptyVal_([d.id, d.configId, d.ConfigID, d.entityId]);
+      case "daily_blind_count":
+        return firstNonEmptyVal_([d.id, d.countId, d.CountID, d.entityId]);
+      case "purchase_order":
+        return firstNonEmptyVal_([d.id, d.poNumber, d.PONumber, d.POID, d.entityId]);
       case "multi_currency":
         return "MULTI_CURRENCY_CONFIG";
       case "permissions_matrix":
@@ -1949,6 +1958,16 @@ function extractEntityIdFromPayload(entityType, entityId, d) {
   if (normType === "inventory_category") return "CATEGORIES_SNAPSHOT";
   if (normType === "casual_worker" && Array.isArray(d)) return "CASUAL_WORKERS_BATCH";
   return "";
+}
+
+function getCashTransferStatusRank_(status) {
+  var s = String(status || "").toUpperCase().trim();
+  if (s === "DRAFT") return 0;
+  if (s === "PENDING_APPROVAL" || s === "PENDING_ACCEPTANCE") return 1;
+  if (s === "IN_TRANSIT") return 2;
+  if (s === "APPROVED") return 3;
+  if (s === "RECEIVED" || s === "COMPLETED" || s === "RETURNED" || s === "CANCELLED" || s === "REJECTED") return 4;
+  return 0;
 }
 
 function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, serverSeq, compId, branchId) {
@@ -2375,7 +2394,7 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
       obj.LinkedGrvID = d.linked_grv_id || d.linkedGrvId || "";
       obj.BankName = d.bank_name || d.bankName || "";
       obj.Status = d.status || "PENDING";
-      obj.Rank = d.rank !== undefined ? d.rank : 0;
+      obj.Rank = Math.max(Number(d.rank || 0), getCashTransferStatusRank_(d.status));
       obj.LinkedCashLogIDs = JSON.stringify(d.linked_cash_log_ids || []);
       obj.StaffID = d.created_by_user_id || d.staffId || d.createdBy || "";
       obj.StaffName = d.created_by_user_name || d.staffName || d.createdByName || "";
@@ -2456,6 +2475,63 @@ function buildRowObjectForEntity(entityType, entityId, d, envelope, metaObj, ser
       obj.ActorName = d.actorName || "";
       obj.Reason = d.reason || "";
       obj.UnlockedAt = d.unlockedAt || isoServerNow;
+      break;
+    case "daily_blind_config":
+      obj.ConfigID = entityId;
+      obj.SelectedItemIdsJSON = JSON.stringify(Array.isArray(d.selectedItemIds) ? d.selectedItemIds : []);
+      obj.DesignatedAuditorID = d.designatedAuditorId || "";
+      obj.DesignatedAuditorName = d.designatedAuditorName || "";
+      obj.UpdatedBy = d.updatedByName || d.updatedBy || "";
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "daily_blind_count":
+      obj.CountID = entityId;
+      obj.BranchName = d.branchName || branchId;
+      obj.Date = d.date || isoServerNow.split("T")[0];
+      obj.ListSource = d.listSource || "ADMIN_SELECTED";
+      obj.CountedByID = d.countedById || "";
+      obj.CountedByName = d.countedByName || "";
+      obj.SubmittedAt = d.submittedAt || isoClientUpdated;
+      obj.Status = d.status || "SUBMITTED";
+      obj.TotalItemsCounted = Number(d.totalItemsCounted || (Array.isArray(d.lines) ? d.lines.length : 0));
+      obj.MatchedCount = Number(d.matchedCount || 0);
+      obj.VarianceItemCount = Number(d.varianceItemCount || 0);
+      obj.NetVarianceUnits = Number(d.netVarianceUnits || 0);
+      obj.NetVarianceCostValue = Number(d.netVarianceCostValue || 0);
+      obj.AbsVarianceCostValue = Number(d.absVarianceCostValue || 0);
+      obj.ReviewedByName = d.reviewedByName || "";
+      obj.ReviewedAt = d.reviewedAt || "";
+      obj.ArchivedAt = d.archivedAt || "";
+      obj.AuditorSummaryNote = d.auditorSummaryNote || "";
+      obj.LinesJSON = JSON.stringify(Array.isArray(d.lines) ? d.lines : []);
+      obj.UpdatedAt = isoClientUpdated;
+      break;
+    case "purchase_order":
+      obj.POID = entityId;
+      obj.PONumber = d.poNumber || entityId;
+      obj.BranchName = d.branchName || branchId;
+      obj.SupplierID = d.supplierId || "";
+      obj.SupplierName = d.supplierName || "";
+      obj.OrderDate = d.orderDate || isoServerNow.split("T")[0];
+      obj.ExpectedDeliveryDate = d.expectedDeliveryDate || "";
+      obj.PaymentTerms = d.paymentTerms || "";
+      obj.Status = d.status || "DRAFT";
+      obj.Subtotal = Number(d.subtotal || 0);
+      obj.TaxAmount = Number(d.taxAmount || 0);
+      obj.GrandTotal = Number(d.grandTotal || 0);
+      obj.TotalCases = Number(d.totalCases || 0);
+      obj.TotalUnits = Number(d.totalUnits || 0);
+      obj.CreatedByID = d.createdById || "";
+      obj.CreatedByName = d.createdByName || "";
+      obj.ApprovedByID = d.approvedById || "";
+      obj.ApprovedByName = d.approvedByName || "";
+      obj.ApprovedAt = d.approvedAt || "";
+      obj.RejectedByName = d.rejectedByName || "";
+      obj.RejectionReason = d.rejectionReason || "";
+      obj.LinkedGrvIdsJSON = JSON.stringify(Array.isArray(d.linkedGrvIds) ? d.linkedGrvIds : []);
+      obj.Notes = d.notes || "";
+      obj.LinesJSON = JSON.stringify(Array.isArray(d.lines) ? d.lines : []);
+      obj.UpdatedAt = isoClientUpdated;
       break;
     case "casual_worker":
       obj.CasualID = entityId;
@@ -2681,6 +2757,7 @@ function getIdColumnsForEntityType(entityType) {
     case "stocktake_segment_unlock": return ["UnlockID", "id"];
     case "daily_blind_config": return ["ConfigID", "id"];
     case "daily_blind_count": return ["CountID", "id"];
+    case "purchase_order": return ["POID", "PONumber", "id"];
     case "casual_worker": return ["CasualID", "id"];
     case "branch_lockdown": return ["BranchID", "branchId"];
     case "tombstone": return ["TombstoneKey", "TargetEntityID"];
@@ -3035,7 +3112,7 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
       }
     }
 
-    if (entityType === "branch_lockdown" && d && d.sessionId) {
+    if (entityType === "branch_lockdown" && d && d.isLocked && d.sessionId) {
       var lockSessionConflict = checkActiveStocktakeSessionConflict(targetSs, envComp, envBranch, d.sessionId, "COUNTING", tombsMap);
       if (lockSessionConflict) {
         conflicts.push({
@@ -3148,13 +3225,27 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
           }
         }
 
+        var isAuthoritativeLockdownUnlock = false;
+        if (entityType === "branch_lockdown" && d && d.isLocked === false) {
+          var exLockSess = String((existingState.data && existingState.data.sessionId) || existingState.raw.SessionID || "").trim().toUpperCase();
+          var inLockSess = String(d.sessionId || "").trim().toUpperCase();
+          if (!inLockSess || !exLockSess || inLockSess === exLockSess) {
+            isAuthoritativeLockdownUnlock = true;
+            if (existingState.version > 0 && inVersion <= existingState.version) {
+              env.version = existingState.version + 1;
+              d.version = env.version;
+              inVersion = env.version;
+            }
+          }
+        }
+
         if (exSource === "USER_EDIT" && (inSource === "SEED" || inSource === "MIGRATION")) {
-          if (!isStaffNewerPin) isRejectedStale = true;
+          if (!isStaffNewerPin && !isAuthoritativeLockdownUnlock) isRejectedStale = true;
         } else if (existingState.version > 0 && inVersion > 0 && inVersion < existingState.version) {
-          if (!isStaffNewerPin) isRejectedStale = true;
+          if (!isStaffNewerPin && !isAuthoritativeLockdownUnlock) isRejectedStale = true;
         } else if (existingState.updatedAt > 0 && incomingUpdatedMs > 0 && existingState.updatedAt > incomingUpdatedMs + 60000) {
           var hasStrictlyHigherVersion = existingState.version > 0 && inVersion > existingState.version;
-          if (!(inSource === "USER_EDIT" && exSource === "SEED") && !hasStrictlyHigherVersion && !isStaffNewerPin) {
+          if (!(inSource === "USER_EDIT" && exSource === "SEED") && !hasStrictlyHigherVersion && !isStaffNewerPin && !isAuthoritativeLockdownUnlock) {
             isRejectedStale = true;
           }
         }
@@ -3235,8 +3326,8 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
         }
       } else {
         if (entityType === "cash_transfer" && existingState.data) {
-          var exRank = Number(existingState.data.rank || 0);
-          var inRank = Number(d.rank || 0);
+          var exRank = Math.max(Number(existingState.data.rank || 0), getCashTransferStatusRank_(existingState.data.status));
+          var inRank = Math.max(Number(d.rank || 0), getCashTransferStatusRank_(d.status));
           var mergedLinks = [];
           var linkMap = {};
           var oldLinks = Array.isArray(existingState.data.linked_cash_log_ids) ? existingState.data.linked_cash_log_ids : [];
@@ -3245,7 +3336,19 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
           for (var nl = 0; nl < newLinks.length; nl++) { if (!linkMap[newLinks[nl]]) { linkMap[newLinks[nl]] = true; mergedLinks.push(newLinks[nl]); } }
           if (inRank < exRank) {
             d = existingState.data;
+          } else {
+            var mergedTr = {};
+            for (var tk in existingState.data) {
+              if (existingState.data.hasOwnProperty(tk)) mergedTr[tk] = existingState.data[tk];
+            }
+            for (var nk in d) {
+              if (d.hasOwnProperty(nk) && d[nk] !== undefined && d[nk] !== null && d[nk] !== "") {
+                mergedTr[nk] = d[nk];
+              }
+            }
+            d = mergedTr;
           }
+          d.rank = Math.max(exRank, inRank);
           d.linked_cash_log_ids = mergedLinks;
         } else if (entityType === "sale") {
           var allowSaleUpdate = (d.status === "Refunded" || d.status === "Voided" ||
@@ -3305,6 +3408,52 @@ function handlePushEnvelopes(req, masterSsOpt, targetSs, companyId, branchId) {
       } else {
         bucket.keyMap[dedupeRowKey] = bucket.rows.length;
         bucket.rows.push(rowArr);
+      }
+    }
+
+    // Auto-release BranchLockdowns whenever a stocktake_session closes or explicitly disengages lockdown
+    if (entityType === "stocktake_session" && d) {
+      var stStatusUpper = String(d.status || "").trim().toUpperCase();
+      var shouldReleaseLock =
+        stStatusUpper === "APPROVED_POSTED" ||
+        stStatusUpper === "ARCHIVED" ||
+        stStatusUpper === "CANCELLED" ||
+        d.isLockdownActive === false ||
+        d.lockdownRequested === false;
+      if (shouldReleaseLock) {
+        try {
+          var autoLockSh = targetSs.getSheetByName("BranchLockdowns");
+          if (autoLockSh && autoLockSh.getLastRow() >= 2) {
+            var autoLockVals = autoLockSh.getDataRange().getValues();
+            var autoLockH = autoLockVals[0];
+            var aSessCol = autoLockH.indexOf("SessionID");
+            var aIsCol = autoLockH.indexOf("IsLocked");
+            var aSeqCol = autoLockH.indexOf("server_seq");
+            var aUpdCol = autoLockH.indexOf("server_updated_at");
+            var aPayCol = autoLockH.indexOf("payload_json");
+            var targetSessUp = String(entityId || d.sessionId || "").trim().toUpperCase();
+            for (var alr = 1; alr < autoLockVals.length; alr++) {
+              var aRowSess = aSessCol !== -1 ? String(autoLockVals[alr][aSessCol] || "").trim().toUpperCase() : "";
+              var aRowLocked = aIsCol !== -1 && (autoLockVals[alr][aIsCol] === true || String(autoLockVals[alr][aIsCol]).toUpperCase() === "TRUE");
+              if (aRowLocked && targetSessUp && aRowSess === targetSessUp) {
+                var aUnlockSeq = allocateNextServerSeq(targetSs, envComp);
+                maxServerSeq = Math.max(maxServerSeq, aUnlockSeq);
+                if (aIsCol !== -1) autoLockSh.getRange(alr + 1, aIsCol + 1).setValue(false);
+                if (aSeqCol !== -1) autoLockSh.getRange(alr + 1, aSeqCol + 1).setValue(aUnlockSeq);
+                if (aUpdCol !== -1) autoLockSh.getRange(alr + 1, aUpdCol + 1).setValue(serverNowIso);
+                if (aPayCol !== -1 && autoLockVals[alr][aPayCol]) {
+                  try {
+                    var parsedAutoLk = JSON.parse(String(autoLockVals[alr][aPayCol]));
+                    parsedAutoLk.isLocked = false;
+                    parsedAutoLk.updatedAt = Date.now();
+                    parsedAutoLk.lastUpdated = serverNowIso;
+                    autoLockSh.getRange(alr + 1, aPayCol + 1).setValue(JSON.stringify(parsedAutoLk));
+                  } catch (alpe) {}
+                }
+              }
+            }
+          }
+        } catch (autoLkErr) {}
       }
     }
 
@@ -3828,6 +3977,7 @@ function handleLegacyActionAsEnvelope(actionNorm, req, masterSsOpt, targetSs, co
     "stocktake_segments": "stocktake_segment",
     "daily_blind_configs": "daily_blind_config",
     "daily_blind_counts": "daily_blind_count",
+    "purchase_orders": "purchase_order",
     "casual_workers": "casual_worker",
     "tombstones": "tombstone"
   };

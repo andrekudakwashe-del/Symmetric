@@ -18,6 +18,8 @@ import {
   getCashGovernanceConfig,
   saveCashGovernanceConfig,
   getSalespeople,
+  getBranches,
+  isRecordInBranchScope,
   subscribeToDatabase,
 } from '../../db/roomDatabase';
 import {
@@ -211,14 +213,21 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
   // Safe, Clerk, and Transit balances (pure derivation from state — never write to DB during render!)
   const branchSafe = useMemo<CashAccount>(() => {
     const targetBranch = getCurrentBranchId();
+    const branches = getBranches();
+    const companyId = getCurrentCompanyId();
     const match =
-      accounts.find((a) => a.account_type === 'SAFE' && (a.branch_id === targetBranch || targetBranch === 'ALL')) ||
-      accounts.find((a) => a.account_type === 'SAFE');
+      accounts.find(
+        (a) =>
+          a.account_type === 'SAFE' &&
+          (targetBranch === 'ALL' ||
+            a.branch_id === targetBranch ||
+            isRecordInBranchScope(a.branch_id, targetBranch, branches, companyId, a.company_id))
+      ) || accounts.find((a) => a.account_type === 'SAFE');
     if (match) return match;
     const nowIso = new Date().toISOString();
     return {
       account_id: `ACC-BR-SAFE-${targetBranch || 'BR-MAIN'}`,
-      company_id: getCurrentCompanyId(),
+      company_id: companyId,
       branch_id: targetBranch || 'BR-MAIN',
       account_type: 'SAFE',
       account_name: 'Branch Safe',
@@ -232,14 +241,21 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
 
   const clerkFloat = useMemo<CashAccount>(() => {
     const targetBranch = getCurrentBranchId();
+    const branches = getBranches();
+    const companyId = getCurrentCompanyId();
     const match =
-      accounts.find((a) => a.account_type === 'CLERK_FLOAT' && (a.branch_id === targetBranch || targetBranch === 'ALL')) ||
-      accounts.find((a) => a.account_type === 'CLERK_FLOAT');
+      accounts.find(
+        (a) =>
+          a.account_type === 'CLERK_FLOAT' &&
+          (targetBranch === 'ALL' ||
+            a.branch_id === targetBranch ||
+            isRecordInBranchScope(a.branch_id, targetBranch, branches, companyId, a.company_id))
+      ) || accounts.find((a) => a.account_type === 'CLERK_FLOAT');
     if (match) return match;
     const nowIso = new Date().toISOString();
     return {
       account_id: `ACC-CLERK-${targetBranch || 'BR-MAIN'}`,
-      company_id: getCurrentCompanyId(),
+      company_id: companyId,
       branch_id: targetBranch || 'BR-MAIN',
       account_type: 'CLERK_FLOAT',
       account_name: 'Accounts Clerk Petty Float',
@@ -449,12 +465,16 @@ export const AccountsClerkVoucherView: React.FC<AccountsClerkVoucherViewProps> =
       const created = createCashTransferVoucher({
         type: modalType,
         from_account_id:
-          modalType === 'BANK_WITHDRAWAL'
+          modalType === 'CAPITAL_INFUSION'
+            ? 'EXTERNAL_CAPITAL'
+            : modalType === 'BANK_WITHDRAWAL'
             ? matchedBankAcc?.account_id || fromAccountId || branchSafe.account_id
             : fromAccountId || branchSafe.account_id,
         to_account_id:
           modalType === 'BANK_DEPOSIT'
             ? matchedBankAcc?.account_id || toAccountId || undefined
+            : modalType === 'CAPITAL_INFUSION'
+            ? toAccountId || branchSafe.account_id
             : toAccountId || undefined,
         amount: numAmount,
         initiator: currentUser,

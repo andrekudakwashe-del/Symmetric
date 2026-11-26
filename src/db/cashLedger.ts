@@ -6,6 +6,7 @@ import {
   CashMovementSource,
 } from '../types';
 import { extractInvoiceRef } from '../utils/idFormatters';
+import { isSameDaySafe } from '../utils/dateUtils';
 import { initIndexedDB, getAllFromIDBStore } from './indexedDBService';
 import { getStored, setStored } from './roomStorageEngine';
 
@@ -235,32 +236,21 @@ export const addMovement = (
   const currentCompany = m.company_id || getActiveCompanyId();
   const shiftId = m.shiftId || getShiftId(m.staffId, m.date, currentBranch);
 
-  // Validate supervisor lift against available drawer balance
-  if (
-    m.type === 'supervisor_lift' &&
-    m.affectsDrawer &&
-    (m.status === 'approved' || m.status === 'pending-POS-auto') &&
-    !options?.allowNegativeBalance &&
-    !m.fromMesh
-  ) {
-    const currency = m.currency || 'USD';
-    const currentBal = computeDrawerBalance(shiftId, currency, currentBranch);
-    if (m.amount > currentBal) {
-      throw new Error(
-        `Supervisor lift of $${m.amount.toFixed(2)} exceeds available drawer balance of $${currentBal.toFixed(2)}.`
-      );
-    }
-  }
+  // Supervisor cash lifts are strictly blind: never block or reveal expected book drawer balance.
+  // Any physical overage/shortage is reconciled cleanly at Form 4 EOD cash balancing.
 
   const current = getAllMovements();
 
-  // Idempotency guard: prevent duplicate POS/Form2 multi-currency & sale movements with same (type, sourceRef, shiftId, branch)
+  // Idempotency guard: prevent duplicate POS/Form2/Custody movements with same (type, sourceRef, shiftId, branch)
   const idempotentRefTypes: CashMovementType[] = [
     'ecocash_cash_out',
     'zig_cash_out',
     'ecocash_sale',
     'zig_sale',
     'cash_sale',
+    'opening_float',
+    'float_adjustment',
+    'supervisor_lift',
   ];
   if (m.id) {
     const existingById = current.find((item) => item.id === m.id);
@@ -481,14 +471,70 @@ const computeMissingDirectGrvPayouts = (
   if (currency && currency.toUpperCase() !== 'USD') return 0;
   let extraTotal = 0;
   try {
-    const grvs = getStored<any[]>('saimetric_room_direct_grvs', []);
-    if (!Array.isArray(grvs) || grvs.length === 0) return 0;
+    const legacyGrvs = getStored<any[]>('saimetric_room_direct_grvs', []);
+    const unifiedGrns = getStored<any[]>('saimetric_room_goods_received_notes', []);
+    const combinedMap = new Map<string, any>();
+    if (Array.isArray(unifiedGrns)) {
+      unifiedGrns.forEach((u: any) => {
+        if (!u || u.sourceTemplate !== 'direct_delivery') return;
+        const raw = u._rawDirectGrv ? { ...u._rawDirectGrv, status: u.status || u._rawDirectGrv.status } : null;
+        if (!raw) return;
+        const key = String(raw.id || raw.grvNumber || '').trim().toUpperCase();
+        if (key) combinedMap.set(key, raw);
+      });
+    }
+    if (Array.isArray(legacyGrvs)) {
+      legacyGrvs.forEach((g: any) => {
+        if (!g) return;
+        const key = String(g.id || g.grvNumber || '').trim().toUpperCase();
+        if (key) combinedMap.set(key, g);
+      });
+    }
+    const grvs = Array.from(combinedMap.values());
+    if (grvs.length === 0) return 0;
 
     const parts = shiftId.split('_');
     const targetStaff = parts[0] || '';
     const targetDate = parts[1] || '';
     const shiftBranch = targetBranch || parts[2] || getActiveBranchId();
     const tStaff = normalizeStaffKey(targetStaff);
+
+    // Build known staff ID set & resolve target staff name for orphan attribution fallback
+    const allStaff = getStored<any[]>('saimetric_room_salespeople', []);
+    const knownStaffExact = new Set<string>();
+    const knownStaffNorm = new Set<string>();
+    let targetStaffNameLower = '';
+    const activeComp = getActiveCompanyId();
+    if (Array.isArray(allStaff)) {
+      allStaff.forEach((s: any) => {
+        if (!s || !s.id) return;
+        if (!isCashCompanyInScope(s.companyId || s.company_id, activeComp)) return;
+        const cid = String(s.id).trim().toLowerCase();
+        knownStaffExact.add(cid);
+        const nid = normalizeStaffKey(cid);
+        if (nid) knownStaffNorm.add(nid);
+        if (
+          cid === String(targetStaff).trim().toLowerCase() ||
+          (nid && tStaff && nid === tStaff)
+        ) {
+          targetStaffNameLower = String(s.name || '').trim().toLowerCase();
+        }
+      });
+    }
+
+    const isTargetStaffMatch = (opId?: string, opName?: string): boolean => {
+      if (!targetStaff) return true;
+      const cleanOpId = String(opId || '').trim().toLowerCase();
+      const cleanTarget = String(targetStaff).trim().toLowerCase();
+      if (cleanOpId && cleanOpId === cleanTarget) return true;
+      const normOp = normalizeStaffKey(opId);
+      if (normOp && tStaff && normOp === tStaff) return true;
+      if (cleanOpId && (knownStaffExact.has(cleanOpId) || (normOp && knownStaffNorm.has(normOp)))) {
+        return false;
+      }
+      const cleanName = String(opName || '').trim().toLowerCase();
+      return Boolean(targetStaffNameLower && cleanName && cleanName === targetStaffNameLower);
+    };
 
     grvs.forEach((g: any) => {
       if (!g || g.status === 'REJECTED') return;
@@ -503,13 +549,12 @@ const computeMissingDirectGrvPayouts = (
       }
 
       const gComp = g.companyId || g.company_id;
-      if (!isCashCompanyInScope(gComp, getActiveCompanyId())) return;
+      if (!isCashCompanyInScope(gComp, activeComp)) return;
 
       const gBranch = g.branchId || g.branch_id;
       if (shiftBranch && gBranch && !isCashBranchInScope(gBranch, shiftBranch)) return;
 
-      const gDate = String(g.date || g.createdAt || '').slice(0, 10);
-      if (targetDate && gDate && gDate !== targetDate) return;
+      if (targetDate && !isSameDaySafe(g.date, g.createdAt || g.timestamp, targetDate)) return;
 
       const grvNumUpper = String(g.grvNumber || '').trim().toUpperCase();
       const grvIdUpper = String(g.id || '').trim().toUpperCase();
@@ -525,9 +570,13 @@ const computeMissingDirectGrvPayouts = (
         g.payments.forEach((p: any) => {
           const amt = Number(p.amount) || 0;
           if (amt <= 0) return;
-          const pStaff = normalizeStaffKey(p.userId);
+          const pIdLower = String(p.userId || '').trim().toLowerCase();
+          const pNorm = normalizeStaffKey(p.userId);
+          const isOrphanedOperator =
+            !pIdLower || (!knownStaffExact.has(pIdLower) && (!pNorm || !knownStaffNorm.has(pNorm)));
           const staffMatch =
-            !targetStaff || p.userId === targetStaff || (pStaff && tStaff && pStaff === tStaff);
+            isTargetStaffMatch(p.userId, p.userName) ||
+            (isOrphanedOperator && isTargetStaffMatch(g.receivedByStaffId, g.receivedByStaffName));
           const compositeKey = grvNumUpper ? `${tStaff}_${grvNumUpper}-${String(p.userId || '').trim().toUpperCase()}` : '';
           if (staffMatch && !(compositeKey && seenGrvRefs.has(compositeKey))) {
             if (grvNumUpper) seenGrvRefs.add(`${tStaff}_${grvNumUpper}`);
@@ -536,12 +585,7 @@ const computeMissingDirectGrvPayouts = (
           }
         });
       } else if (g.payFromTill !== false && (Number(g.totalCost) || 0) > 0) {
-        const gStaff = normalizeStaffKey(g.receivedByStaffId);
-        const staffMatch =
-          !targetStaff ||
-          g.receivedByStaffId === targetStaff ||
-          (gStaff && tStaff && gStaff === tStaff);
-        if (staffMatch) {
+        if (isTargetStaffMatch(g.receivedByStaffId, g.receivedByStaffName)) {
           if (grvNumUpper) seenGrvRefs.add(`${tStaff}_${grvNumUpper}`);
           if (grvIdUpper) seenGrvRefs.add(`${tStaff}_${grvIdUpper}`);
           extraTotal += Number(g.totalCost) || 0;

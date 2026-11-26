@@ -154,6 +154,8 @@ export default function App() {
   // Cross-form navigation state (e.g. from Customer directory -> create sale for customer)
   const [salePreselectedCustomer, setSalePreselectedCustomer] = useState<Customer | string | null>(null);
   const [targetDirectGrvId, setTargetDirectGrvId] = useState<string | null>(null);
+  const [targetPoIdForDirectGrv, setTargetPoIdForDirectGrv] = useState<string | null>(null);
+  const [targetPoIdForNormalGrv, setTargetPoIdForNormalGrv] = useState<string | null>(null);
 
   // Active in-progress POS register draft items count
   const [cartCount, setCartCount] = useState<number>(() => getActiveCartItemCount());
@@ -1260,6 +1262,8 @@ export default function App() {
               onOpenReorderHub={() => handleNavigateTab('procurement_reorder')}
               preselectedGrvId={targetDirectGrvId}
               onClearPreselectedGrv={() => setTargetDirectGrvId(null)}
+              preselectedPoId={targetPoIdForDirectGrv}
+              onClearPreselectedPo={() => setTargetPoIdForDirectGrv(null)}
             />
           </div>
         )}
@@ -1274,12 +1278,20 @@ export default function App() {
           />
         )}
 
-        {/* PROCUREMENT & REORDER PLANNING HUB */}
+        {/* PURCHASE ORDERS & REORDER INSIGHTS HUB */}
         {(activeTab === 'procurement_reorder' || activeTab === 'reorder_hub') && (
           <Suspense fallback={<ViewLoadingFallback />}>
             <ProcurementReorderHub
               currentUser={currentUser}
               onNavigateToDirectGrv={() => handleNavigateTab('direct_grv')}
+              onReceiveDirectGrvPo={(poId) => {
+                setTargetPoIdForDirectGrv(poId);
+                handleNavigateTab('direct_grv');
+              }}
+              onReceiveNormalGrvPo={(poId) => {
+                setTargetPoIdForNormalGrv(poId);
+                handleNavigateTab('goods_received');
+              }}
               onGoToMaster={() => handleNavigateTab('inventory')}
             />
           </Suspense>
@@ -1289,6 +1301,8 @@ export default function App() {
         {activeTab === 'goods_received' && (
           <GoodsReceivedView
             currentUser={currentUser}
+            preselectedPoId={targetPoIdForNormalGrv}
+            onClearPreselectedPo={() => setTargetPoIdForNormalGrv(null)}
             onGoToMaster={() => handleNavigateTab('inventory')}
             onGoToHome={() => handleNavigateTab('home')}
           />

@@ -67,7 +67,7 @@ let hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1]
 // Runtime & Mutual-Auth Security Mode
 // - Termux backup defaults to HUB_REQUIRE_AUTH = false for zero-friction continuity
 // - Android Hub APK (HUB_RUNTIME=ANDROID_APK) or --require-auth enforces strict mutual HMAC auth
-const HUB_VERSION = '4.2.0';
+const HUB_VERSION = '4.2.3';
 const HUB_RUNTIME = String(process.env.HUB_RUNTIME || 'TERMUX').toUpperCase() === 'ANDROID_APK'
   ? 'ANDROID_APK'
   : 'TERMUX';
@@ -816,6 +816,7 @@ const T2_CANONICAL_TYPES = new Set([
   'stocktake_segment_unlock',
   'daily_blind_config',
   'daily_blind_count',
+  'purchase_order',
   'permissions_matrix',
   'role_configs',
   'multi_currency',
@@ -884,6 +885,7 @@ function mapHubEntityToCanonicalType(entityType) {
   if (t === 'STOCKTAKE_BLIND_COUNT' || t === 'STOCKTAKE_COUNT_SUBMISSION') return 'stocktake_count_submission';
   if (t === 'DAILY_BLIND_CONFIG' || t === 'DAILY_BLIND_CONFIGS' || t === 'DAILY_BLIND_CONFIG_SYNC') return 'daily_blind_config';
   if (t === 'DAILY_BLIND_COUNT' || t === 'DAILY_BLIND_COUNTS' || t === 'DAILY_BLIND_COUNT_SYNC') return 'daily_blind_count';
+  if (t === 'PURCHASE_ORDER' || t === 'PURCHASE_ORDERS' || t === 'PURCHASE_ORDER_SYNC') return 'purchase_order';
   if (t === 'TOMBSTONE' || t === 'TOMBSTONES') return 'tombstone';
   if (t === 'PERMISSIONS_MATRIX') return 'permissions_matrix';
   if (t === 'ROLE_CONFIGS') return 'role_configs';
@@ -917,6 +919,7 @@ function getHubCanonicalEntityId(record, canonicalType) {
   if (canonicalType === 'stocktake_zone_assignment') return String(record.id || `${record.sessionId || ''}::${record.zoneId || ''}`).trim();
   if (canonicalType === 'daily_blind_config') return String(record.id || record.configId || '').trim();
   if (canonicalType === 'daily_blind_count') return String(record.id || record.countId || '').trim();
+  if (canonicalType === 'purchase_order') return String(record.id || record.poNumber || record.poId || '').trim();
   if (canonicalType === 'permissions_matrix') return 'PERMISSIONS_MATRIX';
   if (canonicalType === 'role_configs') return 'ROLE_CONFIGS';
   if (canonicalType === 'multi_currency') return 'MULTI_CURRENCY_CONFIG';
@@ -1459,6 +1462,7 @@ let stocktakeSessionsStore = [];
 let stocktakeSegmentsStore = [];
 let dailyBlindConfigsStore = [];
 let dailyBlindCountsStore = [];
+let purchaseOrdersStore = [];
 
 // Staff & Customer Master Stores (Synced across multi-device Wi-Fi)
 let salespeopleStore = [];
@@ -1916,6 +1920,7 @@ function loadData() {
       if (Array.isArray(parsed.stocktakeSegments)) stocktakeSegmentsStore = parsed.stocktakeSegments;
       if (Array.isArray(parsed.dailyBlindConfigs)) dailyBlindConfigsStore = parsed.dailyBlindConfigs;
       if (Array.isArray(parsed.dailyBlindCounts)) dailyBlindCountsStore = parsed.dailyBlindCounts;
+      if (Array.isArray(parsed.purchaseOrders)) purchaseOrdersStore = parsed.purchaseOrders;
       if (Array.isArray(parsed.tombstones)) tombstonesStore = parsed.tombstones;
       if (Array.isArray(parsed.securityAlerts)) securityAlertsStore = parsed.securityAlerts;
       if (parsed.permissionsMatrix && Array.isArray(parsed.permissionsMatrix.rules)) {
@@ -2017,6 +2022,7 @@ function buildSerializedDataPayload() {
     stocktakeSessions: stocktakeSessionsStore,
     dailyBlindConfigs: dailyBlindConfigsStore,
     dailyBlindCounts: dailyBlindCountsStore,
+    purchaseOrders: purchaseOrdersStore,
     stocktakeSegments: stocktakeSegmentsStore,
     tombstones: tombstonesStore,
     securityAlerts: securityAlertsStore,
@@ -4595,26 +4601,35 @@ wss.on('connection', (ws, req) => {
 
       if (pType === 'STOCKTAKE_LOCKDOWN_BROADCAST') {
         const brId = packet.branchId || packet.branch_id || hubBranchId;
-        const brNorm = String(brId || '').trim().toUpperCase();
+        const canonHubLockBr = (b) => {
+          const u = String(b || '').trim().toUpperCase();
+          if (u === '1' || u === 'BR001' || u === 'BR-001' || u === 'BR-MAIN' || u === 'HQ-01' || u === 'MAIN') return 'BR-MAIN';
+          return u;
+        };
+        const brCanon = canonHubLockBr(brId);
         const hubNow = Date.now();
         const hubIso = new Date(hubNow).toISOString();
         const incomingTime = getTimestamp(packet) || hubNow;
-        const existingLock = branchLockdownsStore[brId] || branchLockdownsStore[brNorm];
+        const existingLock =
+          branchLockdownsStore[brId] ||
+          Object.entries(branchLockdownsStore || {}).find(
+            ([k, st]) => st && (canonHubLockBr(k) === brCanon || canonHubLockBr(st.branchId) === brCanon)
+          )?.[1];
         const existingTime = existingLock ? getTimestamp(existingLock) : 0;
 
         // Bind lockdown strictly to the branch's authoritative active stocktake session
         const activeSessionForBranch = stocktakeSessionsStore.find((s) => {
           if (!s || !s.sessionId) return false;
           if (isTombstoned(s.sessionId, 'stocktake_session', getTimestamp(s))) return false;
-          const sBranch = String(s.branchId || hubBranchId || '').trim().toUpperCase();
+          const sBranch = canonHubLockBr(s.branchId || hubBranchId || '');
           const sStatus = String(s.status || '').toUpperCase();
-          return (!brNorm || !sBranch || sBranch === brNorm) && ACTIVE_FLOOR_STATUSES_SET.has(sStatus);
+          return (!brCanon || !sBranch || sBranch === brCanon) && ACTIVE_FLOOR_STATUSES_SET.has(sStatus);
         });
         const incomingSessId = String(packet.sessionId || '').trim().toUpperCase();
         const activeSessId = activeSessionForBranch ? String(activeSessionForBranch.sessionId || '').trim().toUpperCase() : '';
         const existingLockSessId = existingLock && existingLock.sessionId ? String(existingLock.sessionId).trim().toUpperCase() : '';
 
-        if (activeSessId && incomingSessId && incomingSessId !== activeSessId) {
+        if (packet.isLocked && activeSessId && incomingSessId && incomingSessId !== activeSessId) {
           console.log(
             `[Termux Hub] 🛡️ Lockdown Session Guard: Rejected lockdown packet for ${brId} from non-active session [${incomingSessId}] while [${activeSessId}] is active.`
           );
@@ -4632,35 +4647,55 @@ wss.on('connection', (ws, req) => {
           return;
         }
         if (existingLock && existingLock.isLocked && existingLockSessId && !packet.isLocked && incomingSessId && incomingSessId !== existingLockSessId) {
-          console.log(
-            `[Termux Hub] 🛡️ Lockdown Unlock Guard: Rejected unlock for ${brId} from mismatched session [${incomingSessId}] (owned by [${existingLockSessId}]).`
+          const existingOwnerSess = stocktakeSessionsStore.find(
+            (s) => s && String(s.sessionId || '').trim().toUpperCase() === existingLockSessId
           );
-          try {
-            ws.send(JSON.stringify({
-              type: 'STOCKTAKE_LOCKDOWN_BROADCAST',
-              action: 'STOCKTAKE_LOCKDOWN_BROADCAST',
-              ...existingLock,
-              origin_device_id: 'LOCAL_HUB',
-              timestamp: hubNow,
-            }));
-          } catch (e) {}
-          return;
+          const ownerIsStillActive = Boolean(
+            existingOwnerSess && ACTIVE_FLOOR_STATUSES_SET.has(String(existingOwnerSess.status || '').toUpperCase())
+          );
+          if (ownerIsStillActive) {
+            console.log(
+              `[Termux Hub] 🛡️ Lockdown Unlock Guard: Rejected unlock for ${brId} from mismatched session [${incomingSessId}] (owned by [${existingLockSessId}]).`
+            );
+            try {
+              ws.send(JSON.stringify({
+                type: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                action: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                ...existingLock,
+                origin_device_id: 'LOCAL_HUB',
+                timestamp: hubNow,
+              }));
+            } catch (e) {}
+            return;
+          }
         }
 
-        if (existingLock && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+        const isAuthoritativeUnlock =
+          !packet.isLocked &&
+          (!existingLock?.isLocked || !existingLockSessId || !incomingSessId || incomingSessId === existingLockSessId || !activeSessId);
+
+        if (!isAuthoritativeUnlock && existingLock && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
           console.log(`[Termux Hub] 🛡️ LWW Reject: Stale STOCKTAKE_LOCKDOWN_BROADCAST for ${brId}`);
           return;
         }
+        for (const k of Object.keys(branchLockdownsStore || {})) {
+          if (canonHubLockBr(k) === brCanon || canonHubLockBr(branchLockdownsStore[k]?.branchId) === brCanon) {
+            delete branchLockdownsStore[k];
+          }
+        }
+        const effectiveUpdatedAt = Math.max(incomingTime, isAuthoritativeUnlock && existingTime > 0 ? existingTime + 1 : 0, hubNow);
         branchLockdownsStore[brId] = {
           branchId: brId,
+          companyId: packet.companyId || packet.company_id || hubTenantId,
+          company_id: packet.company_id || packet.companyId || hubTenantId,
           isLocked: Boolean(packet.isLocked),
-          sessionId: packet.sessionId,
+          sessionId: packet.sessionId || existingLock?.sessionId,
           lockedAt: packet.isLocked ? (packet.lockedAt || hubIso) : undefined,
           lockedBy: packet.lockedBy,
           lockedByName: packet.lockedByName,
           reason: packet.reason,
-          updatedAt: incomingTime,
-          lastUpdated: packet.lastUpdated || hubIso,
+          updatedAt: effectiveUpdatedAt,
+          lastUpdated: packet.lastUpdated || new Date(effectiveUpdatedAt).toISOString(),
           isCloudSynced: false,
         };
         scheduleSave();
@@ -4966,11 +5001,12 @@ wss.on('connection', (ws, req) => {
             stocktakeSessionsStore.unshift(sessionObj);
           }
 
-          if (
+          const isClosedSessionStatus =
             sessionObj.status === 'APPROVED_POSTED' ||
             sessionObj.status === 'ARCHIVED' ||
-            sessionObj.status === 'CANCELLED'
-          ) {
+            sessionObj.status === 'CANCELLED';
+
+          if (isClosedSessionStatus) {
             casualWorkersStore.forEach((cw) => {
               if (cw && cw.sessionId === sessionId && cw.active) {
                 cw.active = false;
@@ -4979,6 +5015,48 @@ wss.on('connection', (ws, req) => {
                 cw.isCloudSynced = false;
               }
             });
+          }
+
+          // Auto-release branchLockdownsStore if this session closed/completed or explicitly disengaged lockdown
+          if ((isClosedSessionStatus || sessionObj.isLockdownActive === false) && branchLockdownsStore && typeof branchLockdownsStore === 'object') {
+            const cleanSessUpper = String(sessionId || '').trim().toUpperCase();
+            const sessBrCanon = String(sessionObj.branchId || hubBranchId || '').trim().toUpperCase();
+            for (const brK of Object.keys(branchLockdownsStore)) {
+              const lk = branchLockdownsStore[brK];
+              if (!lk || !lk.isLocked) continue;
+              const lkSessUpper = String(lk.sessionId || '').trim().toUpperCase();
+              const lkBrUpper = String(lk.branchId || brK || '').trim().toUpperCase();
+              if (lkSessUpper === cleanSessUpper || (!lkSessUpper && lkBrUpper === sessBrCanon)) {
+                const releasedLock = {
+                  ...lk,
+                  branchId: lk.branchId || sessionObj.branchId || brK,
+                  isLocked: false,
+                  lockedAt: undefined,
+                  sessionId,
+                  reason: isClosedSessionStatus
+                    ? `Auto-released: stocktake ${sessionId} is ${sessionObj.status}`
+                    : `Lockdown disengaged for stocktake ${sessionId}`,
+                  updatedAt: Math.max(hubNow, getTimestamp(lk) + 1),
+                  lastUpdated: hubIso,
+                  isCloudSynced: false,
+                };
+                branchLockdownsStore[brK] = releasedLock;
+                const unlockBroadcastStr = JSON.stringify({
+                  type: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                  action: 'STOCKTAKE_LOCKDOWN_BROADCAST',
+                  ...releasedLock,
+                  origin_device_id: 'LOCAL_HUB',
+                  timestamp: hubNow,
+                });
+                wss.clients.forEach((client) => {
+                  if (client.readyState === WebSocket.OPEN) {
+                    try {
+                      client.send(unlockBroadcastStr);
+                    } catch (e) {}
+                  }
+                });
+              }
+            }
           }
 
           if (Array.isArray(sessionObj.segments) && sessionObj.segments.length > 0) {
@@ -5576,10 +5654,11 @@ wss.on('connection', (ws, req) => {
               }
             });
           } else {
-            console.log(`[Termux Hub] ⚠️ Zone ${zoneId} DISCREPANCY: ${discrepancies.length} variance item(s). Alerting Teams A & B.`);
+            console.log(`[Termux Hub] ⚠️ Zone ${zoneId} DISCREPANCY: ${discrepancies.length} variance item(s), preserving ${verifiedCounts.length} matched line(s). Alerting Teams A & B.`);
             if (zoneRec) {
               zoneRec.status = 'VARIANCE_FLAGGED';
               zoneRec.discrepancies = discrepancies;
+              zoneRec.verifiedCounts = verifiedCounts;
             }
             if (sessIdx >= 0) {
               const sess = stocktakeSessionsStore[sessIdx];
@@ -5589,6 +5668,7 @@ wss.on('connection', (ws, req) => {
                   seg.status = 'DISCREPANCY_RECOUNT';
                   seg.discrepancies = discrepancies;
                   seg.discrepancyCount = discrepancies.length;
+                  seg.verifiedCounts = verifiedCounts;
                   seg.hasCountA = true;
                   seg.hasCountB = true;
                   seg.count1Submitted = true;
@@ -5606,6 +5686,8 @@ wss.on('connection', (ws, req) => {
               status: 'VARIANCE_FLAGGED',
               discrepancies,
               discrepancyCount: discrepancies.length,
+              verifiedCounts,
+              matchedCount: verifiedCounts.length,
               teamAStaffName: subA.staffName,
               teamBStaffName: subB.staffName,
               zone: zoneRec,
@@ -5734,12 +5816,86 @@ wss.on('connection', (ws, req) => {
         const staffName = packet.resolvedByName || packet.staffName || 'Dual Counters';
         const resolvedIso = new Date().toISOString();
 
-        console.log(`[Termux Hub] 🏆 Zone ${zoneId} JOINT RECOUNT FINALIZED & VERIFIED by ${staffName} (${resolvedLines.length} lines).`);
+        // Preserve ALL initially matched lines from blindVaultStore + existing zone/segment verifiedCounts,
+        // then overlay resolvedLines on top so matched lines are NEVER discarded on joint recount!
+        const mergedMap = new Map();
+        const addVerifiedEntry = (raw, forcedSource) => {
+          if (!raw || !raw.itemId) return;
+          const k = String(raw.itemId).trim().toUpperCase();
+          const upc = Math.max(1, Number(raw.unitsPerCase || 1));
+          const tot =
+            raw.totalUnits !== undefined && raw.totalUnits !== null
+              ? Number(raw.totalUnits)
+              : Number(raw.cases || 0) * upc + Number(raw.singles || 0);
+          const prev = mergedMap.get(k);
+          mergedMap.set(k, {
+            itemId: raw.itemId,
+            itemName: raw.itemName || prev?.itemName || raw.itemId,
+            category: raw.category ?? prev?.category,
+            sku: raw.sku ?? prev?.sku,
+            unitsPerCase: upc,
+            cases: Math.floor(tot / upc),
+            singles: tot % upc,
+            totalUnits: tot,
+            source: forcedSource || raw.source || prev?.source || 'MATCHED',
+            resolvedBy: forcedSource ? staffName : (raw.resolvedBy || prev?.resolvedBy),
+          });
+        };
+
+        // 1. Reconstruct matched lines from blindVaultStore if both Team A & Team B submissions exist
+        const vaultKey = `${sessionId || 'DEFAULT'}_${zoneId}`;
+        const vaultEntry = blindVaultStore[vaultKey];
+        if (vaultEntry?.countA?.lines && vaultEntry?.countB?.lines) {
+          const vMapA = new Map();
+          const vMapB = new Map();
+          (vaultEntry.countA.lines || []).forEach((l) => {
+            if (l && l.itemId) vMapA.set(String(l.itemId).trim().toUpperCase(), l);
+          });
+          (vaultEntry.countB.lines || []).forEach((l) => {
+            if (l && l.itemId) vMapB.set(String(l.itemId).trim().toUpperCase(), l);
+          });
+          new Set([...vMapA.keys(), ...vMapB.keys()]).forEach((k) => {
+            const a = vMapA.get(k);
+            const b = vMapB.get(k);
+            const base = a || b;
+            if (!base) return;
+            const upc = Math.max(1, Number(base.unitsPerCase || 1));
+            const aTot = a ? (a.totalUnits !== undefined && a.totalUnits !== null ? Number(a.totalUnits) : Number(a.cases || 0) * upc + Number(a.singles || 0)) : 0;
+            const bTot = b ? (b.totalUnits !== undefined && b.totalUnits !== null ? Number(b.totalUnits) : Number(b.cases || 0) * upc + Number(b.singles || 0)) : 0;
+            if (aTot === bTot && aTot > 0) {
+              addVerifiedEntry({ ...base, unitsPerCase: upc, cases: Math.floor(aTot / upc), singles: aTot % upc, totalUnits: aTot, source: 'MATCHED' });
+            }
+          });
+        }
 
         let zoneRec = zoneAssignmentsStore.find((z) => z.zoneId === zoneId && (!sessionId || z.sessionId === sessionId));
+        if (zoneRec && Array.isArray(zoneRec.verifiedCounts)) {
+          zoneRec.verifiedCounts.forEach((v) => addVerifiedEntry(v));
+        }
+
+        const sessIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
+        const existingSegForMerge =
+          sessIdx >= 0 && Array.isArray(stocktakeSessionsStore[sessIdx].segments)
+            ? stocktakeSessionsStore[sessIdx].segments.find((s) => (s.segmentId || s.id) === zoneId)
+            : null;
+        if (existingSegForMerge && Array.isArray(existingSegForMerge.verifiedCounts)) {
+          existingSegForMerge.verifiedCounts.forEach((v) => addVerifiedEntry(v));
+        }
+
+        const segIdx = stocktakeSegmentsStore.findIndex((sg) => (sg.segmentId || sg.id) === zoneId);
+        if (segIdx >= 0 && Array.isArray(stocktakeSegmentsStore[segIdx].verifiedCounts)) {
+          stocktakeSegmentsStore[segIdx].verifiedCounts.forEach((v) => addVerifiedEntry(v));
+        }
+
+        // 2. Overlay resolved joint-recount lines on top
+        resolvedLines.forEach((r) => addVerifiedEntry(r, 'JOINT_RECOUNT'));
+        const finalVerifiedCounts = Array.from(mergedMap.values());
+
+        console.log(`[Termux Hub] 🏆 Zone ${zoneId} JOINT RECOUNT FINALIZED & VERIFIED by ${staffName} (${resolvedLines.length} recounted -> ${finalVerifiedCounts.length} total verified lines).`);
+
         if (zoneRec) {
           zoneRec.status = 'VERIFIED';
-          zoneRec.verifiedCounts = resolvedLines;
+          zoneRec.verifiedCounts = finalVerifiedCounts;
           zoneRec.comparisonFinalized = true;
           zoneRec.comparisonFinalizedAt = resolvedIso;
           zoneRec.comparisonFinalizedBy = staffName;
@@ -5751,27 +5907,19 @@ wss.on('connection', (ws, req) => {
           zoneRec.jointRecount.lines = resolvedLines;
         }
 
-        const sessIdx = stocktakeSessionsStore.findIndex((s) => s.sessionId === sessionId);
-        if (sessIdx >= 0) {
-          const sess = stocktakeSessionsStore[sessIdx];
-          if (Array.isArray(sess.segments)) {
-            const seg = sess.segments.find((s) => (s.segmentId || s.id) === zoneId);
-            if (seg) {
-              seg.status = 'VERIFIED';
-              seg.verifiedCounts = resolvedLines;
-              seg.discrepancies = [];
-              seg.discrepancyCount = 0;
-              seg.comparisonFinalized = true;
-              seg.comparisonFinalizedAt = resolvedIso;
-              seg.comparisonFinalizedBy = staffName;
-            }
-          }
+        if (existingSegForMerge) {
+          existingSegForMerge.status = 'VERIFIED';
+          existingSegForMerge.verifiedCounts = finalVerifiedCounts;
+          existingSegForMerge.discrepancies = [];
+          existingSegForMerge.discrepancyCount = 0;
+          existingSegForMerge.comparisonFinalized = true;
+          existingSegForMerge.comparisonFinalizedAt = resolvedIso;
+          existingSegForMerge.comparisonFinalizedBy = staffName;
         }
 
-        const segIdx = stocktakeSegmentsStore.findIndex((sg) => (sg.segmentId || sg.id) === zoneId);
         if (segIdx >= 0) {
           stocktakeSegmentsStore[segIdx].status = 'VERIFIED';
-          stocktakeSegmentsStore[segIdx].verifiedCounts = resolvedLines;
+          stocktakeSegmentsStore[segIdx].verifiedCounts = finalVerifiedCounts;
           stocktakeSegmentsStore[segIdx].discrepancies = [];
           stocktakeSegmentsStore[segIdx].discrepancyCount = 0;
           stocktakeSegmentsStore[segIdx].comparisonFinalized = true;
@@ -5781,14 +5929,14 @@ wss.on('connection', (ws, req) => {
 
         scheduleSave();
 
-        // Broadcast verification & status updates to all peers
+        // Broadcast verification & status updates to all peers with FULL merged verifiedCounts
         const verifiedPacket = {
           type: 'STOCKTAKE_MATCH_VERIFIED',
           sessionId,
           zoneId,
           status: 'VERIFIED',
           comparisonFinalized: true,
-          verifiedCounts: resolvedLines,
+          verifiedCounts: finalVerifiedCounts,
           resolvedByName: staffName,
           source: 'JOINT_RECOUNT',
           timestamp: Date.now(),
@@ -5800,7 +5948,7 @@ wss.on('connection', (ws, req) => {
           zoneId,
           status: 'VERIFIED',
           comparisonFinalized: true,
-          verifiedCounts: resolvedLines,
+          verifiedCounts: finalVerifiedCounts,
           timestamp: Date.now(),
         };
 
@@ -6716,20 +6864,42 @@ wss.on('connection', (ws, req) => {
         pType === 'daily_blind_config' ||
         sheetName === 'DailyBlindConfigs' ||
         packet.entityType === 'daily_blind_config';
-      const dbcId = payload ? (payload.id || payload.configId) : (packet.id || packet.entityId);
+      const dbcPayload =
+        (payload && typeof payload === 'object' ? payload : null) ||
+        (packet.config && typeof packet.config === 'object' ? packet.config : null) ||
+        (isDailyBlindConfigPacket ? packet : null);
+      const dbcId = dbcPayload ? (dbcPayload.id || dbcPayload.configId || packet.id || packet.entityId) : '';
 
-      if (isDailyBlindConfigPacket && payload && dbcId) {
-        const incomingTime = getTimestamp(payload) || getTimestamp(packet) || Date.now();
-        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
+      if (isDailyBlindConfigPacket && dbcPayload && dbcId) {
+        const incomingTime = getTimestamp(dbcPayload) || getTimestamp(packet) || Date.now();
+        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, dbcPayload);
+        const cleanCfg = {
+          id: dbcId,
+          company_id: dbcPayload.company_id || dbcPayload.companyId || packet.company_id || packet.companyId || hubTenantId,
+          branch_id: dbcPayload.branch_id || dbcPayload.branchId || packet.branch_id || packet.branchId || hubBranchId,
+          selectedItemIds: Array.isArray(dbcPayload.selectedItemIds) ? dbcPayload.selectedItemIds : [],
+          designatedAuditorId: dbcPayload.designatedAuditorId,
+          designatedAuditorName: dbcPayload.designatedAuditorName,
+          updatedBy: dbcPayload.updatedBy,
+          updatedByName: dbcPayload.updatedByName,
+          updatedAt: incomingTime,
+          version: Number(dbcPayload.version || 1),
+          mutationSource: dbcPayload.mutationSource || 'USER_EDIT',
+        };
         const exIdx = dailyBlindConfigsStore.findIndex((c) => c && String(c.id).toUpperCase() === String(dbcId).toUpperCase());
-        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && dailyBlindConfigsStore[exIdx].isCloudSynced === true);
+        const resolvedCloudSynced = incomingCloudSynced;
         if (exIdx >= 0) {
           const existingTime = getTimestamp(dailyBlindConfigsStore[exIdx]) || 0;
           if (incomingTime >= existingTime - 60000) {
-            dailyBlindConfigsStore[exIdx] = { ...dailyBlindConfigsStore[exIdx], ...payload, id: dbcId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) };
+            dailyBlindConfigsStore[exIdx] = {
+              ...dailyBlindConfigsStore[exIdx],
+              ...cleanCfg,
+              id: dbcId,
+              isCloudSynced: resolvedCloudSynced,
+            };
           }
         } else {
-          dailyBlindConfigsStore.push({ ...payload, id: dbcId, ...(resolvedCloudSynced ? { isCloudSynced: true } : {}) });
+          dailyBlindConfigsStore.push({ ...cleanCfg, id: dbcId, isCloudSynced: resolvedCloudSynced });
         }
         scheduleSave();
         if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'DAILY_BLIND_CONFIG', dbcId);
@@ -6741,40 +6911,147 @@ wss.on('connection', (ws, req) => {
         pType === 'daily_blind_count' ||
         sheetName === 'DailyBlindCounts' ||
         packet.entityType === 'daily_blind_count';
-      const dbcntId = payload ? (payload.id || payload.countId) : (packet.id || packet.entityId);
+      const dbcntPayload =
+        (payload && typeof payload === 'object' ? payload : null) ||
+        (packet.record && typeof packet.record === 'object' ? packet.record : null) ||
+        (isDailyBlindCountPacket ? packet : null);
+      const dbcntId = dbcntPayload ? (dbcntPayload.id || dbcntPayload.countId || packet.id || packet.entityId) : '';
 
-      if (isDailyBlindCountPacket && payload && dbcntId) {
+      if (isDailyBlindCountPacket && dbcntPayload && dbcntId) {
         const statusRank = { SUBMITTED: 1, EXPLANATION_REQUESTED: 2, EXPLANATION_SUBMITTED: 3, ARCHIVED: 4 };
-        const incomingTime = getTimestamp(payload) || getTimestamp(packet) || Date.now();
-        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
+        const incomingTime = getTimestamp(dbcntPayload) || getTimestamp(packet) || Date.now();
+        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, dbcntPayload);
+        const cleanCount = {
+          ...dbcntPayload,
+          id: dbcntId,
+          company_id: dbcntPayload.company_id || dbcntPayload.companyId || packet.company_id || packet.companyId || hubTenantId,
+          branch_id: dbcntPayload.branch_id || dbcntPayload.branchId || packet.branch_id || packet.branchId || hubBranchId,
+          updatedAt: incomingTime,
+          reportOnly: true,
+        };
+        delete cleanCount.type;
+        delete cleanCount.action;
+        delete cleanCount.payload;
+        delete cleanCount.record;
         const exIdx = dailyBlindCountsStore.findIndex((r) => r && String(r.id).toUpperCase() === String(dbcntId).toUpperCase());
-        const resolvedCloudSynced = incomingCloudSynced || (exIdx >= 0 && dailyBlindCountsStore[exIdx].isCloudSynced === true);
+        const resolvedCloudSynced = incomingCloudSynced;
         if (exIdx >= 0) {
           const existingRec = dailyBlindCountsStore[exIdx];
           const exRank = statusRank[existingRec.status] || 1;
-          const incRank = statusRank[payload.status] || 1;
+          const incRank = statusRank[cleanCount.status] || 1;
           const existingTime = getTimestamp(existingRec) || 0;
-          if (existingRec.status !== 'ARCHIVED' || payload.status === 'ARCHIVED') {
+          if (existingRec.status !== 'ARCHIVED' || cleanCount.status === 'ARCHIVED') {
             if (incRank > exRank || (incRank === exRank && incomingTime >= existingTime - 60000)) {
               dailyBlindCountsStore[exIdx] = {
                 ...existingRec,
-                ...payload,
+                ...cleanCount,
                 id: dbcntId,
                 reportOnly: true,
-                ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+                isCloudSynced: resolvedCloudSynced,
               };
             }
           }
         } else {
           dailyBlindCountsStore.push({
-            ...payload,
+            ...cleanCount,
             id: dbcntId,
             reportOnly: true,
-            ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+            isCloudSynced: resolvedCloudSynced,
           });
         }
         scheduleSave();
         if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'DAILY_BLIND_COUNT', dbcntId);
+      }
+
+      const isPurchaseOrderPacket =
+        pType === 'PURCHASE_ORDER' ||
+        pType === 'PURCHASE_ORDER_SYNC' ||
+        pType === 'PURCHASE_ORDERS' ||
+        pType === 'purchase_order' ||
+        sheetName === 'PurchaseOrders' ||
+        packet.entityType === 'purchase_order';
+      const poPayload =
+        (packet.purchaseOrder && typeof packet.purchaseOrder === 'object' ? packet.purchaseOrder : null) ||
+        (payload && typeof payload === 'object' ? payload : null) ||
+        (isPurchaseOrderPacket ? packet : null);
+      const poId = poPayload ? (poPayload.id || poPayload.poNumber || packet.id || packet.entityId) : '';
+
+      if (isPurchaseOrderPacket && poPayload && poId) {
+        const poStatusRank = {
+          DRAFT: 1,
+          REJECTED: 2,
+          PENDING_APPROVAL: 3,
+          APPROVED: 4,
+          PARTIALLY_RECEIVED: 5,
+          RECEIVED: 6,
+          CANCELLED: 7,
+        };
+        const incomingTime = getTimestamp(poPayload) || getTimestamp(packet) || Date.now();
+        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, poPayload);
+        const cleanPo = {
+          ...poPayload,
+          id: poId,
+          poNumber: poPayload.poNumber || poId,
+          company_id: poPayload.company_id || poPayload.companyId || packet.company_id || packet.companyId || hubTenantId,
+          branch_id: poPayload.branch_id || poPayload.branchId || packet.branch_id || packet.branchId || hubBranchId,
+          updatedAt: incomingTime,
+        };
+        delete cleanPo.type;
+        delete cleanPo.action;
+        delete cleanPo.payload;
+        delete cleanPo.purchaseOrder;
+        const exIdx = purchaseOrdersStore.findIndex(
+          (r) =>
+            r &&
+            (String(r.id || '').toUpperCase() === String(poId).toUpperCase() ||
+              String(r.poNumber || '').toUpperCase() === String(poId).toUpperCase())
+        );
+        if (exIdx >= 0) {
+          const existingRec = purchaseOrdersStore[exIdx];
+          const exRank = poStatusRank[existingRec.status] || 1;
+          const incRank = poStatusRank[cleanPo.status] || 1;
+          const existingTime = getTimestamp(existingRec) || 0;
+          const shouldApply =
+            !(exRank >= 4 && incRank < 4 && incomingTime <= existingTime + 120000) &&
+            (incRank > exRank || incomingTime >= existingTime - 2000);
+          if (shouldApply) {
+            const linkedGrvs = Array.from(
+              new Set([...(existingRec.linkedGrvIds || []), ...(cleanPo.linkedGrvIds || [])].filter(Boolean))
+            );
+            const exLineMap = new Map();
+            (Array.isArray(existingRec.lines) ? existingRec.lines : []).forEach((l) => {
+              if (l && l.lineId) exLineMap.set(l.lineId, l);
+            });
+            const mergedLines = (Array.isArray(cleanPo.lines) ? cleanPo.lines : existingRec.lines || []).map((l) => {
+              const prev = l && l.lineId ? exLineMap.get(l.lineId) : null;
+              if (!prev) return l;
+              return {
+                ...l,
+                receivedUnits: Math.max(Number(l.receivedUnits || 0), Number(prev.receivedUnits || 0)),
+                receivedCases: Math.max(Number(l.receivedCases || 0), Number(prev.receivedCases || 0)),
+              };
+            });
+            purchaseOrdersStore[exIdx] = {
+              ...existingRec,
+              ...cleanPo,
+              id: existingRec.id || poId,
+              lines: mergedLines,
+              linkedGrvIds: linkedGrvs,
+              approvedById: cleanPo.approvedById || existingRec.approvedById,
+              approvedByName: cleanPo.approvedByName || existingRec.approvedByName,
+              approvedAt: cleanPo.approvedAt || existingRec.approvedAt,
+              isCloudSynced: incomingCloudSynced,
+            };
+          }
+        } else {
+          purchaseOrdersStore.push({
+            ...cleanPo,
+            id: poId,
+            isCloudSynced: incomingCloudSynced,
+          });
+        }
+        scheduleSave();
+        if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'PURCHASE_ORDER', poId);
       }
 
       // =====================================================================
@@ -6971,9 +7248,13 @@ wss.on('connection', (ws, req) => {
             console.log(`[Termux Hub] 🛡️ Rejected stale Cash Transfer downgrade for ${tId} (${trObj.status} < ${prevTr.status})`);
             try {
               ws.send(JSON.stringify({
+                packetId: `HUB-TRF-FIX-${tId}-${prevTr.status || 'ST'}-${hubNow}`,
                 type: 'CASH_TRANSFER',
                 action: 'CASH_TRANSFER_UPDATE',
+                entityType: 'cash_transfer',
                 target_branch_id: isGlobalTransfer ? 'ALL' : (prevTr.branch_id || 'BR-MAIN'),
+                companyId: prevTr.company_id || packet.companyId,
+                branchId: prevTr.branch_id || packet.branchId,
                 cashTransfer: prevTr,
                 payload: prevTr,
                 origin_device_id: 'LOCAL_HUB',
@@ -6981,22 +7262,42 @@ wss.on('connection', (ws, req) => {
                 timestamp: hubNow,
               }));
             } catch (e) {}
+            return;
           } else {
-            const resolvedCloudSynced = incomingCloudSynced || (prevTr && prevTr.isCloudSynced === true);
+            const prevLinksCount = Array.isArray(prevTr?.linked_cash_log_ids) ? prevTr.linked_cash_log_ids.length : 0;
+            const nextLinksCount = Array.isArray(trObj.linked_cash_log_ids) ? trObj.linked_cash_log_ids.length : 0;
+            const hasMeaningfulChange =
+              !prevTr ||
+              nextRank > prevRank ||
+              String(prevTr.status || '').toUpperCase() !== String(trObj.status || '').toUpperCase() ||
+              nextLinksCount > prevLinksCount ||
+              (trObj.received_by_user_id && trObj.received_by_user_id !== prevTr.received_by_user_id) ||
+              (trObj.approved_by_user_id && trObj.approved_by_user_id !== prevTr.approved_by_user_id);
+            // CRITICAL: When a peer advances transfer status locally (e.g. PENDING_ACCEPTANCE -> COMPLETED),
+            // NEVER inherit prevTr.isCloudSynced=true! Clear it so the Hub pushes the updated status to Cloud!
+            const resolvedCloudSynced = incomingCloudSynced || (!hasMeaningfulChange && Boolean(prevTr && prevTr.isCloudSynced === true));
+            const mergedLinks = Array.from(
+              new Set([
+                ...(Array.isArray(prevTr?.linked_cash_log_ids) ? prevTr.linked_cash_log_ids : []),
+                ...(Array.isArray(trObj.linked_cash_log_ids) ? trObj.linked_cash_log_ids : []),
+              ])
+            );
             const stampedTransfer = {
               ...(prevTr || {}),
               ...trObj,
               transfer_id: tId,
               amount: safeAmt,
+              rank: Math.max(prevRank, nextRank),
+              linked_cash_log_ids: mergedLinks,
               target_branch_id: isGlobalTransfer ? 'ALL' : (trObj.target_branch_id || trObj.branch_id || prevTr?.branch_id || 'BR-MAIN'),
               updatedAt: hubNow,
               hubTimestamp: hubNow,
               lastUpdated: hubIso,
-              ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+              isCloudSynced: resolvedCloudSynced,
             };
             if (exIdx >= 0) {
               cashTransfersStore[exIdx] = stampedTransfer;
-              console.log(`[Termux Hub] 🔄 Updated Cash Transfer [${tId}] -> ${stampedTransfer.status}`);
+              console.log(`[Termux Hub] 🔄 Updated Cash Transfer [${tId}] -> ${stampedTransfer.status} (cloudSynced=${resolvedCloudSynced})`);
             } else {
               cashTransfersStore.unshift(stampedTransfer);
               console.log(`[Termux Hub] 📥 Accepted Cash Transfer [${tId}] (${stampedTransfer.type} $${safeAmt.toFixed(2)}, status=${stampedTransfer.status})`);
@@ -7018,8 +7319,10 @@ wss.on('connection', (ws, req) => {
             if (incomingCloudSynced) broadcastCloudSyncAck(ws, 'CASH_TRANSFER', tId);
 
             const trBroadcastStr = JSON.stringify({
+              packetId: `HUB-TRF-${tId}-${stampedTransfer.status || 'ST'}-${hubNow}`,
               type: 'CASH_TRANSFER',
               action: stampedTransfer.status && stampedTransfer.status !== 'DRAFT' ? 'CASH_TRANSFER_UPDATE' : 'CASH_TRANSFER',
+              entityType: 'cash_transfer',
               target_branch_id: stampedTransfer.target_branch_id,
               companyId: stampedTransfer.company_id || packet.companyId,
               branchId: stampedTransfer.branch_id || packet.branchId,
@@ -7034,6 +7337,7 @@ wss.on('connection', (ws, req) => {
                 try { client.send(trBroadcastStr); } catch (e) {}
               }
             });
+            return;
           }
         }
       }
@@ -7999,8 +8303,13 @@ wss.on('connection', (ws, req) => {
             );
             try {
               ws.send(JSON.stringify({
+                packetId: `HUB-CACC-FIX-${accId}-${hubNow}`,
                 type: 'CASH_ACCOUNT',
                 action: 'CASH_ACCOUNT_SYNC',
+                entityType: 'cash_account',
+                companyId: existing.company_id || packet.companyId,
+                branchId: existing.branch_id || packet.branchId,
+                target_branch_id: (existing.account_type === 'HQ_SAFE' || existing.account_type === 'BANK_ACCOUNT' || existing.branch_id === 'HQ') ? 'ALL' : (existing.branch_id || packet.branchId || 'BR-MAIN'),
                 cashAccount: existing,
                 payload: existing,
                 updatedAt: existingTime,
@@ -8017,25 +8326,37 @@ wss.on('connection', (ws, req) => {
 
         if (accepted) {
           const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, rawCashAccObj);
-          const resolvedCloudSynced = incomingCloudSynced || (aIdx >= 0 && cashAccountsStore[aIdx].isCloudSynced === true);
+          const prevAcc = aIdx >= 0 ? cashAccountsStore[aIdx] : null;
+          const balanceChanged =
+            !prevAcc ||
+            Math.abs((Number(rawCashAccObj.current_balance) || 0) - (Number(prevAcc.current_balance) || 0)) > 0.005 ||
+            Math.abs((Number(rawCashAccObj.native_balance) || 0) - (Number(prevAcc.native_balance) || 0)) > 0.005;
+          // CRITICAL: Never preserve stale isCloudSynced=true when a local balance update arrives!
+          const resolvedCloudSynced = incomingCloudSynced || (!balanceChanged && Boolean(prevAcc && prevAcc.isCloudSynced === true));
+          const isGlobalAcc =
+            rawCashAccObj.account_type === 'HQ_SAFE' ||
+            rawCashAccObj.account_type === 'BANK_ACCOUNT' ||
+            String(rawCashAccObj.branch_id || '').toUpperCase().trim() === 'HQ';
           const stamped = {
+            ...(prevAcc || {}),
             ...rawCashAccObj,
             account_id: accId,
             id: accId,
+            target_branch_id: isGlobalAcc ? 'ALL' : (rawCashAccObj.target_branch_id || rawCashAccObj.branch_id || prevAcc?.branch_id || 'BR-MAIN'),
             updatedAt: hubNow,
             hubTimestamp: hubNow,
             lastUpdated: hubIso,
             updated_at: hubIso,
-            ...(resolvedCloudSynced ? { isCloudSynced: true } : {}),
+            isCloudSynced: resolvedCloudSynced,
           };
 
           if (aIdx >= 0) {
-            cashAccountsStore[aIdx] = { ...cashAccountsStore[aIdx], ...stamped };
+            cashAccountsStore[aIdx] = stamped;
           } else {
             cashAccountsStore.unshift(stamped);
           }
           scheduleSave();
-          console.log(`[Termux Hub] 💰 Synced Cash Account: ${stamped.account_name || accId} (${accId}) stamped at ${hubIso}`);
+          console.log(`[Termux Hub] 💰 Synced Cash Account: ${stamped.account_name || accId} (${accId}) bal=$${Number(stamped.current_balance || 0).toFixed(2)} (cloudSynced=${resolvedCloudSynced})`);
 
           // Send SYNC_ACK
           try {
@@ -8054,8 +8375,13 @@ wss.on('connection', (ws, req) => {
 
           // Broadcast updated cash account to other peers
           const accBroadcastStr = JSON.stringify({
+            packetId: `HUB-CACC-${accId}-${hubNow}`,
             type: 'CASH_ACCOUNT',
             action: 'CASH_ACCOUNT_SYNC',
+            entityType: 'cash_account',
+            companyId: stamped.company_id || packet.companyId,
+            branchId: stamped.branch_id || packet.branchId,
+            target_branch_id: stamped.target_branch_id,
             cashAccount: stamped,
             payload: stamped,
             origin_device_id: 'LOCAL_HUB',
@@ -8068,6 +8394,7 @@ wss.on('connection', (ws, req) => {
             }
           });
         }
+        return;
       }
 
       // =====================================================================
@@ -8439,7 +8766,9 @@ wss.on('connection', (ws, req) => {
           .filter((item) => !isTombstoned(item.sessionId || item.id, 'stocktake_session', getTimestamp(item)))
           .filter((item) => isMatch(item, reqComp, reqBranch));
         const missedZoneAssignments = zoneAssignmentsStore.filter((item) => isMatch(item, reqComp, reqBranch));
-        const missedBranchLockdowns = branchLockdownsStore.filter((item) => isMatch(item, reqComp, reqBranch));
+        const missedBranchLockdowns = Object.values(branchLockdownsStore || {}).filter(
+          (item) => item && isMatch(item, reqComp, reqBranch)
+        );
         const missedBusinessDayClosures = businessDayClosuresStore.filter((item) => isMatch(item, reqComp, reqBranch));
         const missedElectronicSettlements = electronicSettlementsStore.filter(
           (item) => isMatch(item, reqComp, 'ALL') && (getTimestamp(item) >= sinceTime || packet.isForced || isExplicitZero)
@@ -8447,6 +8776,9 @@ wss.on('connection', (ws, req) => {
         const missedStocktakeSegments = stocktakeSegmentsStore.filter((item) => isMatch(item, reqComp, reqBranch));
         const missedDailyBlindConfigs = dailyBlindConfigsStore.filter((item) => isMatch(item, reqComp, reqBranch));
         const missedDailyBlindCounts = dailyBlindCountsStore.filter(
+          (item) => isMatch(item, reqComp, reqBranch) && (getTimestamp(item) >= sinceTime || packet.isForced || isExplicitZero)
+        );
+        const missedPurchaseOrders = purchaseOrdersStore.filter(
           (item) => isMatch(item, reqComp, reqBranch) && (getTimestamp(item) >= sinceTime || packet.isForced || isExplicitZero)
         );
         const missedSecurityAlerts = securityAlertsStore.filter((item) => isMatch(item, reqComp, 'ALL')).slice(0, 50);
@@ -8528,6 +8860,7 @@ wss.on('connection', (ws, req) => {
             stocktakeSegments: missedStocktakeSegments,
             dailyBlindConfigs: missedDailyBlindConfigs,
             dailyBlindCounts: missedDailyBlindCounts,
+            purchaseOrders: missedPurchaseOrders,
             tombstones: missedTombstones,
             ...(missedGenericEnvelopes.length > 0 ? { genericEnvelopes: missedGenericEnvelopes } : {}),
             ...(Array.isArray(permissionsMatrixStore.rules) && permissionsMatrixStore.rules.length > 0 && ((permissionsMatrixStore.updatedAt || 0) >= sinceTime || packet.isForced || isExplicitZero)
@@ -8873,6 +9206,7 @@ async function syncEdgeToCloudSupabase() {
         stocktake_zone_assignment: { arr: zoneAssignmentsStore, keyFn: (r) => r.id || `${r.sessionId || ''}::${r.zoneId || ''}` },
         daily_blind_config: { arr: dailyBlindConfigsStore, keyFn: (r) => r.id || r.configId },
         daily_blind_count: { arr: dailyBlindCountsStore, keyFn: (r) => r.id || r.countId },
+        purchase_order: { arr: purchaseOrdersStore, keyFn: (r) => r.id || r.poNumber },
       };
 
       const targetSpec = storeByType[eType];
@@ -9089,6 +9423,7 @@ async function syncEdgeToCloudSupabase() {
       { hubType: 'STOCKTAKE_ZONE_ASSIGNMENT', store: zoneAssignmentsStore },
       { hubType: 'DAILY_BLIND_CONFIG', store: dailyBlindConfigsStore },
       { hubType: 'DAILY_BLIND_COUNT', store: dailyBlindCountsStore },
+      { hubType: 'PURCHASE_ORDER', store: purchaseOrdersStore },
       { hubType: 'INVENTORY', store: inventoryStore },
       { hubType: 'CUSTOMER', store: customersStore },
       { hubType: 'STAFF', store: salespeopleStore },

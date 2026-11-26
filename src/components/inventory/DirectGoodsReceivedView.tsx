@@ -61,8 +61,10 @@ import {
   getTodayDateString,
   subscribeRoomDatabase,
   verifySalespersonPin,
+  recordPurchaseOrderReceipt,
 } from '../../db/roomDatabase';
 import { cleanNumberInput } from './GoodsReceivedView';
+import { PurchaseOrderPickerModal, PurchaseOrderSelectionPayload } from './PurchaseOrderPickerModal';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
 import { formatDisplayId } from '../../utils/idFormatters';
@@ -76,6 +78,8 @@ interface DirectGoodsReceivedViewProps {
   onClearTargetGrv?: () => void;
   preselectedGrvId?: string | null;
   onClearPreselectedGrv?: () => void;
+  preselectedPoId?: string | null;
+  onClearPreselectedPo?: () => void;
 }
 
 interface DirectRow {
@@ -94,6 +98,8 @@ interface DirectRow {
   expiryDate?: string;
   trackExpiry?: boolean;
   shelfLifeDays?: number;
+  poLineId?: string;
+  poFlavourNote?: string;
 }
 
 interface PaymentRowState {
@@ -114,6 +120,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   onClearTargetGrv,
   preselectedGrvId,
   onClearPreselectedGrv,
+  preselectedPoId,
+  onClearPreselectedPo,
 }) => {
   const effectiveTargetGrvId = targetGrvId || preselectedGrvId;
   const effectiveClear = onClearTargetGrv || onClearPreselectedGrv;
@@ -163,7 +171,98 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const [supplierFilterTerm, setSupplierFilterTerm] = useState<string>('');
   const [invoiceNo, setInvoiceNo] = useState<string>('');
   const [purchaseOrderNo, setPurchaseOrderNo] = useState<string>('');
+  const [linkedPoId, setLinkedPoId] = useState<string | null>(null);
+  const [isPoPickerOpen, setIsPoPickerOpen] = useState<boolean>(false);
   const [selectedBranchId, setSelectedBranchId] = useState<string>(currentBranch.branchId);
+
+  // Auto-open Purchase Order item selector when navigated directly from an Approved PO
+  useEffect(() => {
+    if (preselectedPoId) {
+      setActiveTab('create_direct_grv');
+      setIsPoPickerOpen(true);
+    }
+  }, [preselectedPoId]);
+
+  const handleLoadFromPurchaseOrder = (payload: PurchaseOrderSelectionPayload) => {
+    const { po, selectedLines } = payload;
+    setLinkedPoId(po.id);
+    setPurchaseOrderNo(po.poNumber);
+    if (po.supplierName) {
+      setSupplierName(po.supplierName);
+      setSupplierId(po.supplierId || '');
+      setSupplierFilterTerm('');
+    }
+    const mappedRows: DirectRow[] = [];
+    selectedLines.forEach((line, idx) => {
+      const catalogItem = items.find(
+        (it) => it.itemId.toUpperCase() === line.itemId.toUpperCase()
+      );
+      const masterId = catalogItem?.itemId || line.itemId;
+      // ALWAYS pick the original Inventory Master description so Master is never altered by PO flavours
+      const masterName = catalogItem?.name || line.masterDescription;
+      const upc = Math.max(1, Number(catalogItem?.unitsPerCase || line.unitsPerCase || 1));
+      const sellingPrice =
+        catalogItem?.sellingPriceUnit !== undefined ? String(catalogItem.sellingPriceUnit) : '';
+      const flavourNote =
+        line.poDescription &&
+        line.poDescription.trim().toLowerCase() !== masterName.trim().toLowerCase()
+          ? line.poDescription.trim()
+          : undefined;
+
+      if (line.receiveCases > 0) {
+        mappedRows.push({
+          id: `po-row-${Date.now()}-${idx}-c`,
+          productId: masterId,
+          productName: masterName,
+          category: catalogItem?.category,
+          receiveAs: 'Cases',
+          qtyPerCaseDefault: upc,
+          quantityCases: String(line.receiveCases),
+          quantitySingles: '',
+          pricePerCase: String(Number(line.caseCost || catalogItem?.costPriceCase || 0)),
+          lastCost: Number(catalogItem?.costPriceCase || line.caseCost || 0),
+          sellingPrice,
+          batchNumber: '',
+          expiryDate: '',
+          trackExpiry: catalogItem?.trackExpiry,
+          shelfLifeDays: catalogItem?.shelfLifeDays,
+          poLineId: line.poLineId,
+          poFlavourNote: flavourNote,
+        });
+      }
+      if (line.receiveSingles > 0) {
+        mappedRows.push({
+          id: `po-row-${Date.now()}-${idx}-s`,
+          productId: masterId,
+          productName: masterName,
+          category: catalogItem?.category,
+          receiveAs: 'Singles',
+          qtyPerCaseDefault: upc,
+          quantityCases: '',
+          quantitySingles: String(line.receiveSingles),
+          pricePerCase: String(Number(line.unitCost || catalogItem?.costPriceUnit || 0)),
+          lastCost: Number(catalogItem?.costPriceUnit || line.unitCost || 0),
+          sellingPrice,
+          batchNumber: '',
+          expiryDate: '',
+          trackExpiry: catalogItem?.trackExpiry,
+          shelfLifeDays: catalogItem?.shelfLifeDays,
+          poLineId: line.poLineId,
+          poFlavourNote: flavourNote,
+        });
+      }
+    });
+
+    if (mappedRows.length > 0) {
+      setRows(mappedRows);
+    }
+    setIsPoPickerOpen(false);
+    if (onClearPreselectedPo) onClearPreselectedPo();
+    showToast(
+      'success',
+      `Loaded ${mappedRows.length} line(s) from ${po.poNumber} mapped to original Inventory Master items.`
+    );
+  };
 
   // Direct GRV Draft Auto-Save State (for sudden clerk exit / power outage recovery)
   const [lastDirectDraftSavedAt, setLastDirectDraftSavedAt] = useState<string | null>(null);
@@ -192,19 +291,108 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const [productSearchTerm, setProductSearchTerm] = useState<string>('');
   const [mobileViewMode, setMobileViewMode] = useState<'CARDS' | 'TABLE'>('CARDS');
 
+  // Canonical operator list: always includes the currently logged-in user so the select never silently falls back to another staff member
+  const operatorStaffOptions = useMemo<Salesperson[]>(() => {
+    const list = [...staffList];
+    if (currentUser?.id) {
+      const cleanCurId = String(currentUser.id).trim().toLowerCase();
+      const normCurId = cleanCurId.replace(/^usr-|^staff-|^0+/, '');
+      const cleanCurEmail = String((currentUser as any).email || '').trim().toLowerCase();
+      const cleanCurName = String(currentUser.name || '').trim().toLowerCase();
+      const alreadyIncluded = list.some((s) => {
+        const sId = String(s.id || '').trim().toLowerCase();
+        const normSId = sId.replace(/^usr-|^staff-|^0+/, '');
+        if (sId === cleanCurId || (normCurId && normSId && normSId === normCurId)) return true;
+        if (cleanCurEmail && String((s as any).email || '').trim().toLowerCase() === cleanCurEmail) return true;
+        if (cleanCurName && String(s.name || '').trim().toLowerCase() === cleanCurName) return true;
+        return false;
+      });
+      if (!alreadyIncluded) {
+        list.unshift(currentUser);
+      }
+    }
+    return list;
+  }, [staffList, currentUser]);
+
+  const defaultOperator = useMemo<{ id: string; name: string }>(() => {
+    if (currentUser?.id) {
+      const cleanCurId = String(currentUser.id).trim().toLowerCase();
+      const normCurId = cleanCurId.replace(/^usr-|^staff-|^0+/, '');
+      const cleanCurEmail = String((currentUser as any).email || '').trim().toLowerCase();
+      const cleanCurName = String(currentUser.name || '').trim().toLowerCase();
+      const matched =
+        operatorStaffOptions.find((s) => String(s.id || '').trim().toLowerCase() === cleanCurId) ||
+        operatorStaffOptions.find((s) => {
+          const normSId = String(s.id || '').trim().toLowerCase().replace(/^usr-|^staff-|^0+/, '');
+          return Boolean(normCurId && normSId && normSId === normCurId);
+        }) ||
+        (cleanCurEmail
+          ? operatorStaffOptions.find((s) => String((s as any).email || '').trim().toLowerCase() === cleanCurEmail)
+          : undefined) ||
+        (cleanCurName
+          ? operatorStaffOptions.find((s) => String(s.name || '').trim().toLowerCase() === cleanCurName)
+          : undefined);
+      if (matched) return { id: matched.id, name: matched.name };
+      return { id: currentUser.id, name: currentUser.name || 'Cashier' };
+    }
+    if (operatorStaffOptions.length > 0) {
+      return { id: operatorStaffOptions[0].id, name: operatorStaffOptions[0].name };
+    }
+    return { id: '', name: 'Cashier' };
+  }, [operatorStaffOptions, currentUser]);
+
+  const hasManuallySelectedOperatorRef = useRef<boolean>(false);
+
   // Till Payments & Multi-Cashier Allocations (Direct Payout from Till Drawer)
   const [payFromTill, setPayFromTill] = useState<boolean>(true);
-  const [paymentRows, setPaymentRows] = useState<PaymentRowState[]>([
+  const [paymentRows, setPaymentRows] = useState<PaymentRowState[]>(() => [
     {
       id: 'pay-1',
-      userId: currentUser?.id || 'USR-003',
-      userName: currentUser?.name || 'Cashier',
+      userId: defaultOperator.id,
+      userName: defaultOperator.name,
       amount: '',
       drawerId: 'Till 1',
       pin: '',
     },
   ]);
   const [paymentErrors, setPaymentErrors] = useState<{ [key: string]: string }>({});
+
+  // Keep payment rows aligned with the logged-in user (and heal any stale/unmatched operator IDs)
+  useEffect(() => {
+    if (!defaultOperator.id) return;
+    setPaymentRows((prev) => {
+      if (prev.length === 0) {
+        return [
+          {
+            id: 'pay-1',
+            userId: defaultOperator.id,
+            userName: defaultOperator.name,
+            amount: '',
+            drawerId: 'Till 1',
+            pin: '',
+          },
+        ];
+      }
+      let changed = false;
+      const next = prev.map((row, idx) => {
+        const matchedOpt = operatorStaffOptions.find((s) => s.id === row.userId);
+        if (!matchedOpt) {
+          changed = true;
+          return { ...row, userId: defaultOperator.id, userName: defaultOperator.name };
+        }
+        if (idx === 0 && !hasManuallySelectedOperatorRef.current && row.userId !== defaultOperator.id) {
+          changed = true;
+          return { ...row, userId: defaultOperator.id, userName: defaultOperator.name };
+        }
+        if (matchedOpt.name !== row.userName) {
+          changed = true;
+          return { ...row, userName: matchedOpt.name };
+        }
+        return row;
+      });
+      return changed ? next : prev;
+    });
+  }, [defaultOperator.id, defaultOperator.name, operatorStaffOptions]);
 
   // Supervisor Approval Modal
   const [approvingGrv, setApprovingGrv] = useState<DirectGrv | null>(null);
@@ -241,9 +429,21 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           if (parsed.supplierId) setSupplierId(parsed.supplierId);
           if (parsed.invoiceNo) setInvoiceNo(parsed.invoiceNo);
           if (parsed.purchaseOrderNo) setPurchaseOrderNo(parsed.purchaseOrderNo);
-          if (parsed.selectedBranchId) setSelectedBranchId(parsed.selectedBranchId);
+          if (parsed.selectedBranchId && branches.some((b) => b.branchId === parsed.selectedBranchId)) {
+            setSelectedBranchId(parsed.selectedBranchId);
+          }
           if (Array.isArray(parsed.rows)) setRows(parsed.rows);
-          if (Array.isArray(parsed.paymentRows)) setPaymentRows(parsed.paymentRows);
+          if (
+            Array.isArray(parsed.paymentRows) &&
+            parsed.paymentRows.length > 0 &&
+            (!parsed.draftOwnerId || !currentUser?.id || parsed.draftOwnerId === currentUser.id) &&
+            parsed.paymentRows.every((pr: any) => operatorStaffOptions.some((s) => s.id === pr.userId))
+          ) {
+            setPaymentRows(parsed.paymentRows);
+            if (parsed.paymentRows[0]?.userId && parsed.paymentRows[0].userId !== defaultOperator.id) {
+              hasManuallySelectedOperatorRef.current = true;
+            }
+          }
           if (parsed.payFromTill !== undefined) setPayFromTill(parsed.payFromTill);
           setLastDirectDraftSavedAt(parsed.savedAt || 'Saved');
           setHasRestoredDirectDraft(true);
@@ -265,6 +465,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       try {
         const timeNow = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
         const draftData = {
+          draftOwnerId: currentUser?.id || defaultOperator.id,
           grvNumber,
           voucherDate,
           supplierName,
@@ -294,6 +495,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     selectedBranchId,
     paymentRows,
     payFromTill,
+    currentUser?.id,
+    defaultOperator.id,
   ]);
 
   const handleDiscardDirectDraft = () => {
@@ -323,6 +526,17 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
         sellingPrice: '',
         batchNumber: '',
         expiryDate: '',
+      },
+    ]);
+    hasManuallySelectedOperatorRef.current = false;
+    setPaymentRows([
+      {
+        id: `pay-${Date.now()}`,
+        userId: defaultOperator.id,
+        userName: defaultOperator.name,
+        amount: '',
+        drawerId: 'Till 1',
+        pin: '',
       },
     ]);
     showToast('success', 'Direct Supplies Received Voucher draft discarded.');
@@ -567,15 +781,18 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const handleAddPaymentRow = () => {
     // Find next staff member not already in payment rows
     const usedIds = new Set(paymentRows.map((p) => p.userId));
-    const nextStaff = staffList.find((s) => !usedIds.has(s.id)) || staffList[0] || currentUser;
+    const nextStaff =
+      operatorStaffOptions.find((s) => !usedIds.has(s.id)) ||
+      operatorStaffOptions[0] ||
+      currentUser;
 
     // Remaining unpaid amount to pre-fill
     const remaining = Math.max(0, voucherTotals.totalCost - paymentBreakdown.totalSettled);
 
     const newPayment: PaymentRowState = {
       id: `pay-${Date.now()}`,
-      userId: nextStaff?.id || 'USR-004',
-      userName: nextStaff?.name || 'Cashier',
+      userId: nextStaff?.id || defaultOperator.id,
+      userName: nextStaff?.name || defaultOperator.name,
       amount: remaining > 0 ? remaining : '',
       drawerId: `Till ${paymentRows.length + 1}`,
       pin: '',
@@ -592,11 +809,14 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   };
 
   const handleUpdatePaymentRow = (id: string, field: keyof PaymentRowState, value: any) => {
+    if (field === 'userId') {
+      hasManuallySelectedOperatorRef.current = true;
+    }
     setPaymentRows((prev) =>
       prev.map((p) => {
         if (p.id !== id) return p;
         if (field === 'userId') {
-          const staff = staffList.find((s) => s.id === value);
+          const staff = operatorStaffOptions.find((s) => s.id === value);
           return { ...p, userId: value, userName: staff?.name || p.userName };
         }
         return { ...p, [field]: value };
@@ -704,7 +924,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           if (!p.pin.trim()) {
             errors[p.id] = `PIN required for ${p.userName}`;
           } else {
-            const staff = staffList.find((s) => s.id === p.userId);
+            const staff = operatorStaffOptions.find((s) => s.id === p.userId);
             if (staff && !verifySalespersonPin(staff, p.pin) && p.pin !== '1234' && p.pin !== '4321') {
               errors[p.id] = `Invalid PIN for ${p.userName}`;
             }
@@ -754,21 +974,24 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     if (payFromTill) {
       formattedPayments = paymentRows
         .filter((p) => (Number(p.amount) || 0) > 0)
-        .map((p) => ({
-          userId: p.userId,
-          userName: p.userName,
-          amount: Number(p.amount) || 0,
-          drawerId: p.drawerId,
-          pinConfirmed: true,
-          confirmedAt: new Date().toISOString(),
-        }));
+        .map((p) => {
+          const matchedOp = operatorStaffOptions.find((s) => s.id === p.userId);
+          return {
+            userId: matchedOp?.id || defaultOperator.id,
+            userName: matchedOp?.name || p.userName || defaultOperator.name,
+            amount: Number(p.amount) || 0,
+            drawerId: p.drawerId,
+            pinConfirmed: true,
+            confirmedAt: new Date().toISOString(),
+          };
+        });
 
-      // If user chose to pay from till but left payment amount inputs blank, auto-default to current cashier and full voucher total:
+      // If user chose to pay from till but left payment amount inputs blank, auto-default to current logged-in operator and full voucher total:
       if (formattedPayments.length === 0 && voucherTotals.totalCost > 0) {
         formattedPayments = [
           {
-            userId: currentUser?.id || 'USR-003',
-            userName: currentUser?.name || 'Cashier',
+            userId: defaultOperator.id || currentUser?.id || '',
+            userName: defaultOperator.name || currentUser?.name || 'Cashier',
             amount: voucherTotals.totalCost,
             drawerId: 'Till 1',
             pinConfirmed: true,
@@ -810,8 +1033,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       unpaidBalance: unpaidInvoiceBalance,
       creditBalance: unpaidInvoiceBalance,
       payments: formattedPayments,
-      receivedByStaffId: currentUser?.id || 'USR-003',
-      receivedByStaffName: currentUser?.name || 'Cashier',
+      receivedByStaffId: defaultOperator.id || currentUser?.id || '',
+      receivedByStaffName: defaultOperator.name || currentUser?.name || 'Cashier',
       createdAt: new Date().toISOString(),
       synced: false,
     };
@@ -839,6 +1062,24 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       );
     }
 
+    // Record receipt against linked Purchase Order (if any)
+    if (linkedPoId || purchaseOrderNo.trim()) {
+      const receiptLines = rows
+        .filter((r) => r.productId && ((Number(r.quantityCases) || 0) > 0 || (Number(r.quantitySingles) || 0) > 0))
+        .map((r) => {
+          const upc = Math.max(1, Number(r.qtyPerCaseDefault || 1));
+          const c = r.receiveAs === 'Cases' ? Number(r.quantityCases || 0) : 0;
+          const s = r.receiveAs === 'Singles' ? Number(r.quantitySingles || 0) : 0;
+          return {
+            poLineId: r.poLineId,
+            itemId: r.productId,
+            receivedCases: c,
+            receivedUnits: Math.round(c * upc + s),
+          };
+        });
+      recordPurchaseOrderReceipt(linkedPoId || purchaseOrderNo.trim(), newDirectGrv.grvNumber, receiptLines);
+    }
+
     const updatedGrvs = getDirectGrvs();
     setDirectGrvs(updatedGrvs);
     setHistoryFilter('ALL');
@@ -863,11 +1104,13 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setSupplierFilterTerm('');
     setInvoiceNo('');
     setPurchaseOrderNo('');
+    setLinkedPoId(null);
+    hasManuallySelectedOperatorRef.current = false;
     setPaymentRows([
       {
         id: `pay-${Date.now()}`,
-        userId: currentUser?.id || 'USR-003',
-        userName: currentUser?.name || 'Cashier',
+        userId: defaultOperator.id,
+        userName: defaultOperator.name,
         amount: '',
         drawerId: 'Till 1',
         pin: '',
@@ -1358,6 +1601,56 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                   placeholder="e.g. INV-88219 / DN-402"
                   className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3.5 py-2.5 text-sm focus:outline-none focus:border-amber-500 font-mono"
                 />
+              </div>
+
+              {/* Optional Purchase Order Link */}
+              <div className="space-y-1.5 md:col-span-2 lg:col-span-4">
+                <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-800/70 border border-slate-700/80 rounded-xl px-3.5 py-2.5">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <FileText className="w-4 h-4 text-indigo-400 shrink-0" />
+                    <div className="min-w-0">
+                      <div className="text-xs font-bold text-white">
+                        {purchaseOrderNo ? `Linked Purchase Order: ${purchaseOrderNo}` : 'Purchase Order (Optional)'}
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        {purchaseOrderNo
+                          ? 'Receiving lines map directly to original Inventory Master SKUs & names.'
+                          : 'Select an approved Purchase Order to pull in specific products, or receive directly without a PO.'}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <input
+                      type="text"
+                      value={purchaseOrderNo}
+                      onChange={(e) => {
+                        setPurchaseOrderNo(e.target.value);
+                        if (!e.target.value.trim()) setLinkedPoId(null);
+                      }}
+                      placeholder="PO # (optional)"
+                      className="w-36 bg-slate-900 border border-slate-700 text-white rounded-lg px-2.5 py-1.5 text-xs font-mono focus:outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setIsPoPickerOpen(true)}
+                      className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition cursor-pointer whitespace-nowrap"
+                    >
+                      Select Purchase Order
+                    </button>
+                    {purchaseOrderNo && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPurchaseOrderNo('');
+                          setLinkedPoId(null);
+                        }}
+                        className="px-2 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-semibold cursor-pointer"
+                      >
+                        Unlink
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -2362,7 +2655,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                             onChange={(e) => handleUpdatePaymentRow(payRow.id, 'userId', e.target.value)}
                             className="w-full bg-slate-800 border border-slate-700 text-white rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-amber-500 font-medium"
                           >
-                            {staffList.map((s, sIdx) => (
+                            {operatorStaffOptions.map((s, sIdx) => (
                               <option key={`${s.id}-${sIdx}`} value={s.id}>
                                 {s.name} ({s.role})
                               </option>
@@ -3330,6 +3623,16 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           </div>
         </div>
       )}
+      <PurchaseOrderPickerModal
+        isOpen={isPoPickerOpen}
+        initialPoId={preselectedPoId || linkedPoId}
+        branchId={selectedBranchId}
+        onClose={() => {
+          setIsPoPickerOpen(false);
+          if (onClearPreselectedPo) onClearPreselectedPo();
+        }}
+        onSelectLines={handleLoadFromPurchaseOrder}
+      />
     </div>
   );
 };

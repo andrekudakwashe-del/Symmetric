@@ -616,16 +616,14 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     if (res.success && res.session) {
       meshSyncService.broadcastStocktakeSession(res.session);
       meshSyncService.broadcastCasualWorkers(getTemporaryCasuals());
-      if (session.isLockdownActive || session.countType === 'FULL_LOCKDOWN') {
-        meshSyncService.broadcastStocktakeLockdown(
-          res.session.branchId,
-          res.session.sessionId,
-          false,
-          adminName,
-          `Stocktake ${res.session.sessionId} committed & lockdown released.`,
-          adminId
-        );
-      }
+      meshSyncService.broadcastStocktakeLockdown(
+        res.session.branchId,
+        res.session.sessionId,
+        false,
+        adminName,
+        `Stocktake ${res.session.sessionId} committed & lockdown released.`,
+        adminId
+      );
       refreshSession(res.session);
       setShowApprovalModal(false);
       setActiveView('AUDIT_CERT');

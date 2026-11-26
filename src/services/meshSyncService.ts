@@ -103,6 +103,8 @@ import {
   getRawStoredDailyBlindCounts,
   ingestMeshDailyBlindConfig,
   ingestMeshDailyBlindCount,
+  getRawStoredPurchaseOrders,
+  ingestMeshPurchaseOrder,
   getCreditGroups,
   ingestMeshInventoryDelete,
   getDeletedInventoryItems,
@@ -3505,6 +3507,16 @@ class MeshSyncManager {
         }
         break;
 
+      case 'purchase_order':
+        if (d) {
+          const poId = d.id || d.poNumber || envelope.entityId;
+          if (ingestMeshPurchaseOrder({ ...d, id: poId, poNumber: d.poNumber || poId }) && !isSilent && typeof window !== 'undefined') {
+            playChime();
+            window.dispatchEvent(new CustomEvent('saimetric_purchase_orders_updated', { detail: { record: d } }));
+          }
+        }
+        break;
+
       case 'stock_movement':
         if (d) {
           if (ingestMeshStockMovement(d) && !isSilent && typeof window !== 'undefined') {
@@ -4149,7 +4161,7 @@ class MeshSyncManager {
     }
 
     if (pTypeUpper === 'STOCKTAKE_VARIANCE_ALERT') {
-      markZoneVariance(packet.zoneId, packet.discrepancies || [], packet.sessionId);
+      markZoneVariance(packet.zoneId, packet.discrepancies || [], packet.sessionId, packet.verifiedCounts);
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new Event('saimetric_stocktake_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_stocktake_variance_alert', { detail: packet }));
@@ -5009,6 +5021,17 @@ class MeshSyncManager {
       await flushT1List(getRawStoredCreditSales(), 'credit_sale', 'OFFLINE-CR', (c) => String(c?.id || c?.creditId || ''));
       await flushT1List(getRawStoredCustomerChanges(), 'customer_change', 'OFFLINE-CHG', (c) => String(c?.id || c?.changeId || ''));
       await flushT1List(getRawStoredCashLifts(), 'cash_lift', 'OFFLINE-CLIFT', (l) => String(l?.id || l?.liftId || ''));
+      const trReconnectCutoff = Date.now() - 48 * 60 * 60 * 1000;
+      const getTrStatusRank = (st?: string): number => {
+        const u = String(st || '').toUpperCase().trim();
+        if (u === 'DRAFT') return 0;
+        if (u === 'PENDING_APPROVAL' || u === 'PENDING_ACCEPTANCE') return 1;
+        if (u === 'IN_TRANSIT') return 2;
+        if (u === 'APPROVED') return 3;
+        if (u === 'RECEIVED' || u === 'COMPLETED' || u === 'RETURNED' || u === 'CANCELLED' || u === 'REJECTED') return 4;
+        return 0;
+      };
+      const allBranchesForTr = getBranches();
       for (const tr of getRawStoredCashTransfers()) {
         const tId = String(tr?.transfer_id || (tr as any)?.id || '');
         if (!tId) continue;
@@ -5022,18 +5045,36 @@ class MeshSyncManager {
           tr?.type === 'BRANCH_TO_HQ' ||
           tr?.type === 'BANK_DEPOSIT' ||
           tr?.type === 'BANK_WITHDRAWAL' ||
+          tr?.type === 'ELECTRONIC_SETTLEMENT' ||
           tr?.type === 'CAPITAL_INFUSION' ||
           tr?.type === 'SUPPLIER_PAYMENT' ||
           tr?.type === 'THIRD_PARTY_PAYOUT';
-        if (!isGlobalTr && rBranch && rBranch !== 'ALL' && rBranch !== currentHubBranch.toUpperCase()) continue;
-        if ((tr as any).synced && (tr as any).isCloudSynced !== true) continue;
+        const branchOk =
+          isGlobalTr ||
+          !rBranch ||
+          rBranch === 'ALL' ||
+          currentHubBranch.toUpperCase() === 'ALL' ||
+          isRecordInBranchScope(tr?.branch_id, currentHubBranch, allBranchesForTr, this.config.companyId, tr?.company_id);
+        if (!branchOk) continue;
+        const trUpdatedMs = parseTimestampMs(tr?.updatedAt || tr?.lastUpdated || tr?.created_at) || Date.now();
+        const isPendingOrRecent =
+          tr?.status === 'PENDING_ACCEPTANCE' ||
+          tr?.status === 'PENDING_APPROVAL' ||
+          tr?.status === 'IN_TRANSIT' ||
+          trUpdatedMs >= trReconnectCutoff;
+        if ((tr as any).isCloudSynced === true && (tr as any).synced === true && !isPendingOrRecent) continue;
+        const trRank = getTrStatusRank(tr?.status);
         const env: SyncEnvelope = {
-          packetId: `OFFLINE-TRF-${tId}-${Date.now()}`,
+          packetId: `OFFLINE-TRF-${tId}-${tr?.status || 'ST'}-${trUpdatedMs}-${Date.now()}`,
           entityType: 'cash_transfer',
           entityId: tId,
           action: tr?.status && tr.status !== 'DRAFT' ? 'UPSERT' : 'APPEND',
-          data: { ...tr, target_branch_id: isGlobalTr ? 'ALL' : (tr?.branch_id || currentHubBranch) },
-          updatedAt: parseTimestampMs(tr?.updatedAt || tr?.lastUpdated || tr?.created_at) || Date.now(),
+          data: {
+            ...tr,
+            rank: Math.max(Number((tr as any)?.rank || 0), trRank),
+            target_branch_id: isGlobalTr ? 'ALL' : (tr?.branch_id || currentHubBranch),
+          },
+          updatedAt: trUpdatedMs,
           originDeviceId: this.config.deviceId,
           targetBranchId: isGlobalTr ? 'ALL' : (tr?.branch_id || currentHubBranch),
           class: 'T1',
@@ -5145,6 +5186,100 @@ class MeshSyncManager {
       }
       if (lastStocktakeSync === 0 && allSessions.length > 0) {
         setLastStocktakeSessionSync(Date.now());
+      }
+
+      // 4.5b Daily Blind Count Product Lists & Reports Delta Sync on reconnect
+      const normBlindTenant = (c?: string) =>
+        !c || c === 'COMP-001' || c === 'COMP-MASTER' || c === 'DEFAULT' ? 'COMP-001' : c.trim().toUpperCase();
+      const localBlindConfigs = getRawStoredDailyBlindConfigs().filter((cfg: any) => {
+        if (!cfg || !cfg.id) return false;
+        const cComp = cfg.company_id || cfg.companyId;
+        if (cComp && this.config.companyId && normBlindTenant(cComp) !== normBlindTenant(this.config.companyId)) {
+          return false;
+        }
+        return true;
+      });
+      for (const cfg of localBlindConfigs) {
+        const ts = parseTimestampMs(cfg.updatedAt || (cfg as any).lastUpdated || Date.now());
+        void this.localHubAdapter.broadcast({
+          packetId: `DBC-FLUSH-${cfg.id}-${ts}`,
+          entityType: 'daily_blind_config',
+          entityId: String(cfg.id),
+          action: 'UPSERT',
+          data: cfg,
+          updatedAt: ts,
+          version: Number((cfg as any).version || 1),
+          mutationSource: 'USER_EDIT',
+          originDeviceId: this.config.deviceId,
+          targetBranchId: cfg.branch_id || (cfg as any).branchId || currentHubBranch,
+          class: 'T2',
+          meta: {
+            companyId: cfg.company_id || this.config.companyId,
+            sheetName: 'DailyBlindConfigs',
+            isReconPush: true,
+          },
+        });
+      }
+
+      const localBlindCounts = getRawStoredDailyBlindCounts().filter((rec: any) => {
+        if (!rec || !rec.id) return false;
+        const rComp = rec.company_id || rec.companyId;
+        if (rComp && this.config.companyId && normBlindTenant(rComp) !== normBlindTenant(this.config.companyId)) {
+          return false;
+        }
+        return true;
+      });
+      for (const rec of localBlindCounts) {
+        const ts = parseTimestampMs(rec.updatedAt || rec.submittedAt || Date.now());
+        void this.localHubAdapter.broadcast({
+          packetId: `DBCNT-FLUSH-${rec.id}-${ts}`,
+          entityType: 'daily_blind_count',
+          entityId: String(rec.id),
+          action: 'UPSERT',
+          data: rec,
+          updatedAt: ts,
+          version: Number((rec as any).version || 1),
+          mutationSource: 'USER_EDIT',
+          originDeviceId: this.config.deviceId,
+          targetBranchId: rec.branch_id || (rec as any).branchId || currentHubBranch,
+          class: 'T2',
+          meta: {
+            companyId: rec.company_id || this.config.companyId,
+            sheetName: 'DailyBlindCounts',
+            isReconPush: true,
+          },
+        });
+      }
+
+      const localPurchaseOrders = getRawStoredPurchaseOrders().filter((po: any) => {
+        if (!po || (!po.id && !po.poNumber)) return false;
+        const pComp = po.company_id || po.companyId;
+        if (pComp && this.config.companyId && normBlindTenant(pComp) !== normBlindTenant(this.config.companyId)) {
+          return false;
+        }
+        return true;
+      });
+      for (const po of localPurchaseOrders) {
+        const poId = String(po.id || po.poNumber);
+        const ts = parseTimestampMs(po.updatedAt || po.createdAt || Date.now());
+        void this.localHubAdapter.broadcast({
+          packetId: `PO-FLUSH-${poId}-${ts}`,
+          entityType: 'purchase_order',
+          entityId: poId,
+          action: 'UPSERT',
+          data: po,
+          updatedAt: ts,
+          version: Number((po as any).version || 1),
+          mutationSource: 'USER_EDIT',
+          originDeviceId: this.config.deviceId,
+          targetBranchId: po.branch_id || (po as any).branchId || currentHubBranch,
+          class: 'T2',
+          meta: {
+            companyId: po.company_id || po.companyId || this.config.companyId,
+            sheetName: 'PurchaseOrders',
+            isReconPush: true,
+          },
+        });
       }
 
       // 4.6 Multi-Currency & Exchange Rates Delta Sync on reconnect (never push untouched System Default)
@@ -8265,6 +8400,9 @@ class MeshSyncManager {
           { isReconBackfill: true }
         );
       }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_daily_blind_updated'));
+      }
     }
 
     if (Array.isArray((delta as any).dailyBlindCounts) && (delta as any).dailyBlindCounts.length > 0) {
@@ -8289,6 +8427,32 @@ class MeshSyncManager {
       }
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_daily_blind_updated'));
+      }
+    }
+
+    if (Array.isArray((delta as any).purchaseOrders) && (delta as any).purchaseOrders.length > 0) {
+      for (const po of (delta as any).purchaseOrders) {
+        if (!po || (!po.id && !po.poNumber)) continue;
+        const poId = String(po.id || po.poNumber);
+        const ts = extractRecordTimestamp(po);
+        await this.ingestEnvelopeThroughSyncCore(
+          {
+            packetId: `CATCHUP-PO-${poId}-${ts}`,
+            entityType: 'purchase_order',
+            entityId: poId,
+            action: 'UPSERT',
+            data: po,
+            updatedAt: ts,
+            originDeviceId: packetOrigin || 'MESH_CATCHUP',
+            targetBranchId: po.branch_id || po.branchId || this.config.branchId,
+            class: 'T2',
+          },
+          originName,
+          { isReconBackfill: true }
+        );
+      }
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_purchase_orders_updated'));
       }
     }
 
@@ -9591,7 +9755,10 @@ class MeshSyncManager {
       rawTarget === 'dailyblindconfigs' ||
       rawTarget === 'daily_blind_count' ||
       rawTarget === 'daily_blind_counts' ||
-      rawTarget === 'dailyblindcounts';
+      rawTarget === 'dailyblindcounts' ||
+      rawTarget === 'purchase_order' ||
+      rawTarget === 'purchase_orders' ||
+      rawTarget === 'purchaseorders';
 
     if (isT2Entity) {
       return;

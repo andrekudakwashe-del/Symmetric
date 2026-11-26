@@ -72,6 +72,9 @@ import {
   DailyBlindCountLine,
   DailyBlindCountRecord,
   DailyBlindCountStatus,
+  PurchaseOrder,
+  PurchaseOrderLine,
+  PurchaseOrderStatus,
 } from '../types';
 import {
   addMovement,
@@ -2754,10 +2757,12 @@ export const getSalespeople = (): Salesperson[] => {
     // Strict branch isolation with fallback for main branch aliases (1 and BR-MAIN) and unassigned/offline staff:
     const sBranch = s.branchId || s.branch_id;
     let branchMatches = false;
+    const upperRole = String(s.role || '').toUpperCase();
+    const isElevatedRole = upperRole === 'OWNER' || upperRole === 'SUPER_ADMIN' || upperRole === 'ADMIN';
     if (sBranch === 'ALL' || sBranch === currentBranch) {
       branchMatches = true;
     } else if (!sBranch) {
-      branchMatches = isRecordInBranchScope(sBranch, currentBranch, undefined, currentCompany, sComp) || s.role === 'OWNER' || s.role === 'SUPER_ADMIN';
+      branchMatches = isRecordInBranchScope(sBranch, currentBranch, undefined, currentCompany, sComp) || isElevatedRole;
     } else {
       const isMainBranchMatch = isRecordInBranchScope(sBranch, currentBranch, undefined, currentCompany, sComp);
       if (isMainBranchMatch) {
@@ -2770,7 +2775,7 @@ export const getSalespeople = (): Salesperson[] => {
         )
       ) {
         branchMatches = true;
-      } else if (s.role === 'OWNER' || s.role === 'SUPER_ADMIN') {
+      } else if (isElevatedRole) {
         branchMatches = true;
       }
     }
@@ -7137,6 +7142,14 @@ export const addCashLift = (data: {
   date?: string;
   destinationAccountId?: string; // Optional destination safe/clerk account
 }): { liftRecord: CashLiftRecord; cashLogRecord: CashLogEntry } => {
+  const safeLiftAmount = Math.round((Number(data.totalAmount) || 0) * 100) / 100;
+  if (!Number.isFinite(safeLiftAmount) || safeLiftAmount <= 0) {
+    throw new Error('Cash lift amount must be greater than $0.00.');
+  }
+  if (!data.cashierId || !data.supervisorId) {
+    throw new Error('Both Cashier and Supervisor are required to authorize a cash lift.');
+  }
+
   const now = new Date();
   const dateStr = data.date || getTodayDateString();
   const currentCompany = getCurrentCompanyId();
@@ -7145,30 +7158,33 @@ export const addCashLift = (data: {
   const allLifts = getRawStoredCashLifts();
   const liftId = `LIFT-${Date.now().toString().slice(-6)}`;
 
-  // Validate supervisor lift against drawer balance, with configurable overage tolerance
+  // Supervisor cash lifts are strictly BLIND: NEVER reject, block, or expose expected book drawer balance.
+  // Silently record background audit metadata if physical cash lifted exceeds live book balance;
+  // any true overage/shortage is reconciled formally at Form 4 EOD cash balancing.
   const shiftId = getShiftId(data.cashierId, dateStr, currentBranch);
   const currentBal = computeDrawerBalance(shiftId, 'USD', currentBranch);
-  const govConfig = getCashGovernanceConfig();
   let overageAmount = 0;
 
-  if (data.totalAmount > currentBal) {
-    if (govConfig.allowOverageLifts) {
-      overageAmount = Math.round((data.totalAmount - currentBal) * 100) / 100;
+  if (safeLiftAmount > currentBal) {
+    overageAmount = Math.round((safeLiftAmount - currentBal) * 100) / 100;
+    try {
       addAuditLog({
         action: 'CASH_LIFT_OVERAGE' as any,
-        severity: 'WARNING',
+        severity: 'INFO',
         staffId: data.supervisorId,
         staffName: data.supervisorName,
-        details: `Supervisor lifted $${data.totalAmount.toFixed(2)} exceeding live drawer book balance of $${currentBal.toFixed(2)} (Cashier Overage of +$${overageAmount.toFixed(2)}). Reason: ${data.reason || 'Cashier Overage / Customer Tips'}`,
+        details: `Blind supervisor lift of $${safeLiftAmount.toFixed(2)} recorded for ${data.cashierName} (live drawer book at lift time: $${currentBal.toFixed(2)}). Reconciled at Form 4 EOD.`,
         referenceId: liftId,
-        amount: data.totalAmount,
-        metadata: { cashierId: data.cashierId, cashierName: data.cashierName, currentBal, liftAmount: data.totalAmount, overageAmount },
+        amount: safeLiftAmount,
+        metadata: {
+          cashierId: data.cashierId,
+          cashierName: data.cashierName,
+          currentBal,
+          liftAmount: safeLiftAmount,
+          overageAmount,
+        },
       });
-    } else {
-      throw new Error(
-        `Cash lift of $${data.totalAmount.toFixed(2)} exceeds the authorized cash governance limit. Enable "Allow Overage Lifts" in Cash Governance Settings to permit blind lifts.`
-      );
-    }
+    } catch (_) {}
   }
 
   const newLift: CashLiftRecord = {
@@ -7179,7 +7195,7 @@ export const addCashLift = (data: {
     cashierName: data.cashierName,
     supervisorId: data.supervisorId,
     supervisorName: data.supervisorName,
-    totalAmount: data.totalAmount,
+    totalAmount: safeLiftAmount,
     denominations: data.denominations,
     reason: data.reason,
     notes: data.notes,
@@ -7193,80 +7209,91 @@ export const addCashLift = (data: {
   };
 
   // Summarize denominations for description/notes
-  const denomSummary = Object.entries(data.denominations)
+  const denomSummary = Object.entries(data.denominations || {})
     .filter(([_, qty]) => Number(qty) > 0)
     .map(([note, qty]) => `${qty}x$${note}`)
     .join(', ');
 
-  // Auto-populate Form 2 CashLog entry for Cash Lift (cash collected OUT of till by supervisor)
-  const cashLogRecord = addCashLog({
-    timestamp: newLift.timestamp,
-    date: dateStr,
-    staffId: data.cashierId,
-    staffName: data.cashierName,
-    companyId: currentCompany,
-    company_id: currentCompany,
-    branchId: currentBranch,
-    branch_id: currentBranch,
-    line: 'Cash',
-    description: `Supervisor Cash Lift: ${data.supervisorName} collected $${data.totalAmount.toFixed(2)} from Cashier ${data.cashierName}${overageAmount > 0 ? ` [Incl. +$${overageAmount.toFixed(2)} Overage]` : ''}${data.reason ? ` (${data.reason})` : ''}`,
-    in: 0,
-    out: data.totalAmount, // Deducted in Form 2 CashLog as base USD so cash drawer balances!
-    category: 'Cash Lift / Supervisor Pick-Up',
-    reference: liftId,
-    notes: `Denominations: ${denomSummary || 'Denominations counted'}. Verified by Cashier (${data.cashierName}) and Supervisor (${data.supervisorName}).${overageAmount > 0 ? ` Cashier had +$${overageAmount.toFixed(2)} overage.` : ''}`,
-  });
+  let cashLogRecord: CashLogEntry | null = null;
+  const createdMovementIds: string[] = [];
 
-  newLift.cashLogId = cashLogRecord.id;
-
-  // Write supervisor_lift movement to cashMovements (Out from cashier drawer)
-  addMovement({
-    shiftId: getShiftId(data.cashierId, dateStr, currentBranch),
-    staffId: data.cashierId,
-    date: dateStr,
-    timestamp: newLift.timestamp,
-    type: 'supervisor_lift',
-    amount: data.totalAmount,
-    currency: 'USD',
-    direction: 'out',
-    affectsDrawer: true,
-    status: 'approved',
-    sourceModule: 'form2',
-    sourceRef: liftId,
-    notes: `Supervisor Cash Lift: ${data.supervisorName} collected $${data.totalAmount.toFixed(2)} from Cashier ${data.cashierName}${data.reason ? ` (${data.reason})` : ''}`,
-    approvedBy: data.supervisorId,
-    approvedByName: data.supervisorName,
-    approvedAt: newLift.timestamp,
-    company_id: currentCompany,
-    branch_id: currentBranch,
-  });
-
-  // Also record supervisor custody intake movement (In to supervisor expected handover cash)
-  if (data.supervisorId) {
-    addMovement({
-      shiftId: getShiftId(data.supervisorId, dateStr, currentBranch),
-      staffId: data.supervisorId,
-      date: dateStr,
-      timestamp: newLift.timestamp,
-      type: 'supervisor_lift',
-      amount: data.totalAmount,
-      currency: 'USD',
-      direction: 'in',
-      affectsDrawer: false, // In supervisor custody holding, does not artificially inflate supervisor POS till drawer
-      status: 'approved',
-      sourceModule: 'form2',
-      sourceRef: `${liftId}-SUP-CUSTODY`,
-      notes: `Cash Lift Received into Supervisor Custody: $${data.totalAmount.toFixed(2)} from Cashier ${data.cashierName}`,
-      approvedBy: data.supervisorId,
-      approvedByName: data.supervisorName,
-      approvedAt: newLift.timestamp,
-      company_id: currentCompany,
-      branch_id: currentBranch,
-    });
-  }
-
-  // Credit destination CashAccount (Branch Safe or Accounts Clerk) strictly within active tenant company
   try {
+    // 1. Auto-populate Form 2 CashLog entry for Cash Lift (keep description blind — never expose expected balance/overage to cashier)
+    cashLogRecord = addCashLog({
+      timestamp: newLift.timestamp,
+      date: dateStr,
+      staffId: data.cashierId,
+      staffName: data.cashierName,
+      companyId: currentCompany,
+      company_id: currentCompany,
+      branchId: currentBranch,
+      branch_id: currentBranch,
+      line: 'Cash',
+      description: `Supervisor Cash Lift: ${data.supervisorName} collected $${safeLiftAmount.toFixed(2)} from Cashier ${data.cashierName}${data.reason ? ` (${data.reason})` : ''}`,
+      in: 0,
+      out: safeLiftAmount, // Deducted in Form 2 CashLog as base USD so cash drawer balances!
+      category: 'Cash Lift / Supervisor Pick-Up',
+      reference: liftId,
+      notes: `Denominations: ${denomSummary || 'Denominations counted'}. Verified by Cashier (${data.cashierName}) and Supervisor (${data.supervisorName}).`,
+    });
+
+    newLift.cashLogId = cashLogRecord.id;
+
+    // 2. Write blind supervisor_lift movement to cashMovements (Out from cashier drawer)
+    const drawerMove = addMovement(
+      {
+        shiftId,
+        staffId: data.cashierId,
+        date: dateStr,
+        timestamp: newLift.timestamp,
+        type: 'supervisor_lift',
+        amount: safeLiftAmount,
+        currency: 'USD',
+        direction: 'out',
+        affectsDrawer: true,
+        status: 'approved',
+        sourceModule: 'form2',
+        sourceRef: liftId,
+        notes: `Supervisor Cash Lift: ${data.supervisorName} collected $${safeLiftAmount.toFixed(2)} from Cashier ${data.cashierName}${data.reason ? ` (${data.reason})` : ''}`,
+        approvedBy: data.supervisorId,
+        approvedByName: data.supervisorName,
+        approvedAt: newLift.timestamp,
+        company_id: currentCompany,
+        branch_id: currentBranch,
+      },
+      { allowNegativeBalance: true }
+    );
+    createdMovementIds.push(drawerMove.id);
+
+    // 3. Record supervisor custody intake movement (In to supervisor custody holding)
+    if (data.supervisorId) {
+      const supMove = addMovement(
+        {
+          shiftId: getShiftId(data.supervisorId, dateStr, currentBranch),
+          staffId: data.supervisorId,
+          date: dateStr,
+          timestamp: newLift.timestamp,
+          type: 'supervisor_lift',
+          amount: safeLiftAmount,
+          currency: 'USD',
+          direction: 'in',
+          affectsDrawer: false, // In supervisor custody holding, does not artificially inflate supervisor POS till drawer
+          status: 'approved',
+          sourceModule: 'form2',
+          sourceRef: `${liftId}-SUP-CUSTODY`,
+          notes: `Cash Lift Received into Supervisor Custody: $${safeLiftAmount.toFixed(2)} from Cashier ${data.cashierName}`,
+          approvedBy: data.supervisorId,
+          approvedByName: data.supervisorName,
+          approvedAt: newLift.timestamp,
+          company_id: currentCompany,
+          branch_id: currentBranch,
+        },
+        { allowNegativeBalance: true }
+      );
+      createdMovementIds.push(supMove.id);
+    }
+
+    // 4. Credit destination CashAccount (Branch Safe or Accounts Clerk) & create Dual Custody voucher atomically
     const rawAccounts = getStored<CashAccount[]>(STORAGE_KEYS.CASH_ACCOUNTS, []);
     const companyAccounts = rawAccounts.filter((a) => isCompanyInTenantScope(a.company_id, currentCompany));
     const compPrefix = currentCompany.slice(0, 6);
@@ -7296,7 +7323,7 @@ export const addCashLift = (data: {
       creditedAcc = saveCashAccount({
         ...targetAcc,
         company_id: targetAcc.company_id || currentCompany,
-        current_balance: Math.round(((Number(targetAcc.current_balance) || 0) + data.totalAmount) * 100) / 100,
+        current_balance: Math.round(((Number(targetAcc.current_balance) || 0) + safeLiftAmount) * 100) / 100,
         updated_at: nowIso,
         updatedAt: nowMs,
         lastUpdated: nowIso,
@@ -7311,7 +7338,7 @@ export const addCashLift = (data: {
         branch_id: currentBranch,
         account_type: targetType,
         account_name: isClerkDest ? 'Accounts Clerk Petty Float' : 'Branch Safe',
-        current_balance: Math.round(data.totalAmount * 100) / 100,
+        current_balance: safeLiftAmount,
         currency: 'USD',
         status: 'OPEN',
         created_at: nowIso,
@@ -7326,7 +7353,6 @@ export const addCashLift = (data: {
     );
     const fromTillId = companyTillAcc?.account_id || `ACC-TILL-1-${compPrefix}-${currentBranch}`;
 
-    // Also record completed CashTransfer voucher in transfer ledger via saveCashTransfer so it broadcasts over Mesh & syncs to Google Sheets
     const transferId = `TRF-LIFT-${newLift.id}`;
     const liftTransfer: CashTransfer = {
       transfer_id: transferId,
@@ -7337,7 +7363,7 @@ export const addCashLift = (data: {
       type: 'TILL_COLLECTION',
       from_account_id: fromTillId,
       to_account_id: creditedAcc.account_id,
-      amount: data.totalAmount,
+      amount: safeLiftAmount,
       currency: 'USD',
       status: 'COMPLETED',
       created_by_user_id: data.supervisorId,
@@ -7345,7 +7371,8 @@ export const addCashLift = (data: {
       created_at: nowIso,
       recipient_name: data.cashierName,
       denominations: data.denominations,
-      notes: `Supervisor Cash Lift: $${data.totalAmount.toFixed(2)} lifted from Cashier ${data.cashierName} into ${creditedAcc.account_name}.${data.reason ? ` Reason: ${data.reason}` : ''}`,
+      linked_cash_log_ids: cashLogRecord ? [cashLogRecord.id] : [],
+      notes: `Supervisor Cash Lift: $${safeLiftAmount.toFixed(2)} lifted from Cashier ${data.cashierName} into ${creditedAcc.account_name}.${data.reason ? ` Reason: ${data.reason}` : ''}`,
       approved_by_user_id: data.supervisorId,
       approved_by_user_name: data.supervisorName,
       approved_at: nowIso,
@@ -7357,16 +7384,35 @@ export const addCashLift = (data: {
       lastUpdated: nowIso,
     };
     saveCashTransfer(liftTransfer);
+
+    // 5. Persist CashLiftRecord & reconcile Safe balance deterministically from transfer ledger
+    const updatedLifts = [newLift, ...allLifts];
+    setStored(STORAGE_KEYS.CASH_LIFTS, updatedLifts);
+    enqueueSync('CashLifts' as any, 'INSERT', newLift);
+
+    reconcileCashAccountsFromTransfers({ syncChanged: true });
   } catch (err) {
-    console.warn('Failed to auto-credit destination account on cash lift:', err);
+    // Atomic rollback: NEVER leave an orphaned Form 2 / Form 4 deduction if any step fails!
+    if (cashLogRecord) {
+      try {
+        deleteCashLog(cashLogRecord.id);
+      } catch (_) {}
+    }
+    createdMovementIds.forEach((mId) => {
+      try {
+        deleteMovement(mId);
+      } catch (_) {}
+    });
+    throw err;
   }
 
-  const updatedLifts = [newLift, ...allLifts];
-  setStored(STORAGE_KEYS.CASH_LIFTS, updatedLifts);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_cash_lifts_updated', { detail: newLift }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: newLift }));
+  }
 
-  enqueueSync('CashLifts' as any, 'INSERT', newLift);
-
-  return { liftRecord: newLift, cashLogRecord };
+  return { liftRecord: newLift, cashLogRecord: cashLogRecord! };
 };
 
 export const deleteCashLift = (liftId: string): boolean => {
@@ -12536,20 +12582,44 @@ export const calculateForm4 = (
 
   const totalNonCashSales = ecocashSales + zigSales + creditExtended;
 
-  // 1. Float (Opening cash drawer float)
-  const floatLog = form2Logs.find(
+  // 1. Float (Opening cash drawer float + mid-shift top-ups — sum ALL float logs, movements, and settled Dual Custody FLOAT_ISSUE vouchers)
+  const floatLogs = form2Logs.filter(
     (l) =>
-      l.line === 'Float' ||
-      l.line === 'float' ||
-      l.category === 'Float' ||
-      (l as any).categoryGroup === 'Float & Closeout' ||
-      l.description?.toLowerCase().startsWith('float')
+      (Number(l.in) || 0) > 0 &&
+      (l.line === 'Float' ||
+        l.line === 'float' ||
+        l.category === 'Float' ||
+        (l as any).categoryGroup === 'Float & Closeout' ||
+        l.description?.toLowerCase().startsWith('float'))
   );
-  const float = floatLog ? (Number(floatLog.in) || 0) : (breakdown.openingFloat || 0);
+  const floatFromLogs = Math.round(floatLogs.reduce((sum, l) => sum + (Number(l.in) || 0), 0) * 100) / 100;
+  const floatFromMovements = Math.round((Number(breakdown.openingFloat) || 0) * 100) / 100;
+
+  // Cross-check settled Dual Custody FLOAT_ISSUE vouchers for this cashier on this date (prevents cross-device drift if CashLog lags)
+  const staffNameLower = String(staffName || '').trim().toLowerCase();
+  const floatFromTransfers = Math.round(
+    getAllCashTransfers(currentBranch)
+      .filter((t) => {
+        if (t.type !== 'FLOAT_ISSUE') return false;
+        const st = String(t.status || '').toUpperCase().trim();
+        if (st !== 'COMPLETED' && st !== 'RECEIVED' && st !== 'APPROVED') return false;
+        const tDate = toDateStringSafe(t.received_at || t.created_at);
+        if (tDate !== date) return false;
+        const recipLower = String(t.recipient_name || '').trim().toLowerCase();
+        const recNameLower = String(t.received_by_user_name || '').trim().toLowerCase();
+        return (
+          t.received_by_user_id === staffId ||
+          (Boolean(staffNameLower) && (recipLower === staffNameLower || recNameLower === staffNameLower))
+        );
+      })
+      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0) * 100
+  ) / 100;
+
+  const float = Math.max(floatFromLogs, floatFromMovements, floatFromTransfers);
 
   // 2. Direct Procurements (Out)
-  const staffPayments = getDirectGrvPaymentsForStaff(staffId, date, false, staffName);
-  const directGrvs = sortChronologicallyAsc(getDirectGrvsForStaffAndDate(staffId, date, staffName));
+  const staffPayments = getDirectGrvPaymentsForStaff(staffId, date, false, staffName, currentBranch);
+  const directGrvs = sortChronologicallyAsc(getDirectGrvsForStaffAndDate(staffId, date, staffName, currentBranch));
   let grvTotal = 0;
   const processedGrvIds = new Set<string>();
 
@@ -12560,9 +12630,8 @@ export const calculateForm4 = (
   });
 
   const allGrvRefsForDate = new Set<string>(processedGrvIds);
-  getDirectGrvs().forEach((g) => {
-    const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
-    if (gDate === date) {
+  getAllDirectGrvs(currentBranch).forEach((g) => {
+    if (isSameDaySafe(g.date, g.createdAt, date)) {
       if (g.id) allGrvRefsForDate.add(g.id);
       if (g.grvNumber) allGrvRefsForDate.add(g.grvNumber);
     }
@@ -12587,7 +12656,7 @@ export const calculateForm4 = (
         })
     )
     .reduce((sum, l) => sum + (Number(l.out) || 0), 0);
-  const directProcurements = grvTotal + nonGrvProcurements;
+  const directProcurements = Math.max(grvTotal + nonGrvProcurements, Number(breakdown.directProcurements) || 0);
 
   // 3. Cash Lift (Out: supervisor pick-ups)
   const staffLifts = sortChronologicallyAsc(getCashLiftsForStaffAndDate(staffId, date));
@@ -16176,7 +16245,7 @@ export const ingestMeshGRV = (grv: DirectGrv): boolean => {
 
   // Keep unified goodsReceivedNotes mirror synchronized with incoming Direct GRV payment/approval state
   try {
-    postDirectDelivery(savedGrv);
+    postDirectDelivery(savedGrv, { skipInventoryMutation: true });
   } catch (err) {
     console.warn('[ingestMeshGRV] postDirectDelivery mirror sync warning:', err);
   }
@@ -18412,8 +18481,23 @@ export const receiveSupplierInvoice = (params: {
   const supplierName = params.supplier?.trim() || 'General Supplier';
   const staffId = params.staffId || '001';
   const staffName = params.staffName || 'Administrator';
-  const branchId = params.branchId || 'BR001';
-  const branchName = params.branchName || 'Main Central Distribution & Warehouse';
+  const currentCompanyId = getCurrentCompanyId();
+  const activeBranches = getBranches();
+  const activeBranch = getCurrentBranch();
+  const requestedBranch = params.branchId
+    ? activeBranches.find((b) => b.branchId === params.branchId)
+    : undefined;
+  const branchId =
+    requestedBranch?.branchId ||
+    activeBranch?.branchId ||
+    activeBranches[0]?.branchId ||
+    getCurrentBranchId();
+  const branchName =
+    requestedBranch?.name ||
+    (params.branchId && params.branchId === branchId && params.branchName ? params.branchName : undefined) ||
+    activeBranch?.name ||
+    activeBranches[0]?.name ||
+    'Main Branch';
 
   const lineItems: SupplierInvoiceLineItem[] = [];
   let totalCases = 0;
@@ -18558,25 +18642,33 @@ export const receiveSupplierInvoice = (params: {
       supplier: supplierName,
       grnId: voucherId,
       invoiceNo,
+      companyId: currentCompanyId,
+      company_id: currentCompanyId,
       branchId,
+      branch_id: branchId,
       notes: (params.notes || '') + autoBreakNote + clearingNote + landedCostNote,
       createdAt: timestamp,
-    };
+    } as any;
     saveStockBatch(newBatch);
 
-    // CORE RULE 1 & 2: Total Qty On Hand in Inventory Master = Sum of all batch Qty On Hand minus remaining open negative balances
-    const allItemBatches = getBatchesByItemId(item.itemId);
-    const sumBatchesOnHand = allItemBatches.reduce((sum, b) => sum + (b.qtyOnHand || 0), 0);
-    const openNegs = getOpenNegativeBalances(item.itemId);
-    const totalOpenNegQty = openNegs.reduce((sum, n) => sum + (n.negativeQty - n.clearedQty), 0);
-    const effectiveTotalUnits = sumBatchesOnHand - totalOpenNegQty;
+    // Add newly received units directly onto existing inventory stock (preserves non-batched stock & clears negative balances naturally)
+    const prevStockCases = Number(item.stockCases) || 0;
+    const prevStockSingles = Number(item.stockSingles) || 0;
+    const unitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
+    const prevTotalUnits = (prevStockCases * unitsPerCase) + prevStockSingles;
+    const effectiveTotalUnits = prevTotalUnits + lineTotalUnits;
 
     let newStockCases = 0;
     let newStockSingles = 0;
     if (effectiveTotalUnits > 0) {
-      if (item.canSellAsCase && item.unitsPerCase > 1) {
-        newStockCases = Math.floor(effectiveTotalUnits / item.unitsPerCase);
-        newStockSingles = effectiveTotalUnits % item.unitsPerCase;
+      if (canSellAsCase && unitsPerCase > 1) {
+        if (autoBroken && effectiveTotalUnits >= unitsPerCase) {
+          newStockCases = Math.max(0, Math.floor(effectiveTotalUnits / unitsPerCase) - 1);
+          newStockSingles = effectiveTotalUnits - (newStockCases * unitsPerCase);
+        } else {
+          newStockCases = Math.floor(effectiveTotalUnits / unitsPerCase);
+          newStockSingles = effectiveTotalUnits % unitsPerCase;
+        }
       } else {
         newStockCases = 0;
         newStockSingles = effectiveTotalUnits;
@@ -18585,9 +18677,6 @@ export const receiveSupplierInvoice = (params: {
       newStockCases = 0;
       newStockSingles = effectiveTotalUnits;
     }
-
-    const prevStockCases = item.stockCases;
-    const prevStockSingles = item.stockSingles;
 
     // Moving Weighted Average Cost (AVCO) calculation:
     const priorOnHandUnits = Math.max(0, item.totalUnits || 0);
@@ -18729,9 +18818,13 @@ export const receiveSupplierInvoice = (params: {
         ? 'AUTO_BREAK_RULE_A'
         : 'GOODS_RECEIVED',
       referenceId: `${voucherId} / ${invoiceNo}${purchaseOrderNo ? ` / PO: ${purchaseOrderNo}` : ''}`,
+      companyId: currentCompanyId,
+      company_id: currentCompanyId,
+      branchId,
+      branch_id: branchId,
       timestamp,
       synced: false,
-    };
+    } as any;
     addStockMovement(movement);
   }
 
@@ -18749,7 +18842,10 @@ export const receiveSupplierInvoice = (params: {
     invoiceNo,
     purchaseOrderNo,
     supplier: supplierName,
+    companyId: currentCompanyId,
+    company_id: currentCompanyId,
     branchId,
+    branch_id: branchId,
     branchName,
     date: dateStr,
     paymentTerms: params.paymentTerms || 'Standard Terms',
@@ -18764,13 +18860,13 @@ export const receiveSupplierInvoice = (params: {
     ruleATriggeredCount,
     timestamp,
     synced: false,
-  };
+  } as any;
 
   saveSupplierInvoiceVoucher(voucher);
 
-  // Sync to unified goodsReceivedNotes store
+  // Sync to unified goodsReceivedNotes store (skipInventoryMutation since stock & batch were already recorded above)
   try {
-    postGeneralGRV(voucher, params.landedCosts);
+    postGeneralGRV(voucher, params.landedCosts, { skipInventoryMutation: true });
   } catch (err) {
     console.warn('[GRN] postGeneralGRV sync warning:', err);
   }
@@ -20176,10 +20272,123 @@ export const getBranchLockdowns = (): Record<string, BranchLockdownState> => {
   return getStored<Record<string, BranchLockdownState>>(STORAGE_KEYS.BRANCH_LOCKDOWNS, {});
 };
 
+const CLOSED_OR_INACTIVE_LOCKDOWN_STATUSES = new Set([
+  'APPROVED_POSTED',
+  'ARCHIVED',
+  'CANCELLED',
+  'DRAFT',
+  'SCHEDULED',
+]);
+
+const normalizeLockdownBranchKey = (branchId?: string | null): string => {
+  const raw = String(branchId || '').trim();
+  const upper = raw.toUpperCase();
+  if (!upper || upper === 'ALL') {
+    const current = String(getCurrentBranchId() || '').trim();
+    if (current && current.toUpperCase() !== 'ALL') {
+      return current;
+    }
+    return '';
+  }
+  return raw;
+};
+
+const canonLockdownBranchAlias = (branchId?: string | null): string => {
+  const u = String(branchId || '').trim().toUpperCase();
+  if (u === '1' || u === 'BR001' || u === 'BR-001' || u === 'BR-MAIN' || u === 'HQ-01' || u === 'MAIN') {
+    return 'BR-MAIN';
+  }
+  return u;
+};
+
+const findBranchLockdownMatch = (
+  lockdowns: Record<string, BranchLockdownState>,
+  branchId?: string | null
+): { key: string; state: BranchLockdownState } | null => {
+  const resolved = normalizeLockdownBranchKey(branchId);
+  if (!resolved) return null;
+  if (lockdowns[resolved]) {
+    return { key: resolved, state: lockdowns[resolved] };
+  }
+  const targetCanon = canonLockdownBranchAlias(resolved);
+  let matched: { key: string; state: BranchLockdownState } | null = null;
+  for (const [k, st] of Object.entries(lockdowns)) {
+    if (!st) continue;
+    const keyCanon = canonLockdownBranchAlias(k);
+    const valCanon = canonLockdownBranchAlias(st.branchId || k);
+    if (keyCanon === targetCanon || valCanon === targetCanon) {
+      if (!matched || parseTimestampMs(st.updatedAt || st.lastUpdated || 0) >= parseTimestampMs(matched.state.updatedAt || matched.state.lastUpdated || 0)) {
+        matched = { key: k, state: st };
+      }
+    }
+  }
+  return matched;
+};
+
+const isRecordTombstoned = (entityId: string, entityType: string): boolean => {
+  const cleanId = String(entityId || '').trim().toUpperCase();
+  if (!cleanId) return false;
+  const cleanType = normalizeRoomTombstoneType(entityType);
+  return getTombstones().some(
+    (t) =>
+      t &&
+      normalizeRoomTombstoneType(t.entityType) === cleanType &&
+      String(t.entityId || '').trim().toUpperCase() === cleanId
+  );
+};
+
 export const isBranchInLockdown = (branchId?: string): boolean => {
-  const br = branchId || getCurrentBranchId();
+  const resolved = normalizeLockdownBranchKey(branchId);
+  if (!resolved) return false;
   const lockdowns = getBranchLockdowns();
-  return Boolean(lockdowns[br]?.isLocked);
+  const match = findBranchLockdownMatch(lockdowns, resolved);
+  if (!match || !match.state?.isLocked) return false;
+
+  // Self-healing guard: if the locking session is already completed, archived, cancelled,
+  // tombstoned, or explicitly unlocked (isLockdownActive === false on a paused/closed session),
+  // automatically release the stale local lockdown so branches never stay stuck locked.
+  const lockSessionId = String(match.state.sessionId || '').trim();
+  if (lockSessionId) {
+    const linked = getStocktakeSessionById(lockSessionId);
+    const isDeletedTomb = isRecordTombstoned(lockSessionId, 'stocktake_session');
+    const linkedStatus = String(linked?.status || '').trim().toUpperCase();
+    const shouldAutoRelease =
+      isDeletedTomb ||
+      (linked && CLOSED_OR_INACTIVE_LOCKDOWN_STATUSES.has(linkedStatus)) ||
+      (linked && linkedStatus === 'PAUSED' && linked.isLockdownActive === false) ||
+      (linked && linked.isLockdownActive === false && linked.lockdownRequested === false);
+
+    if (shouldAutoRelease) {
+      const now = Date.now();
+      const nowIso = new Date(now).toISOString();
+      const targetCanon = canonLockdownBranchAlias(resolved);
+      const releasedState: BranchLockdownState = {
+        ...match.state,
+        branchId: resolved,
+        isLocked: false,
+        lockedAt: undefined,
+        reason: isDeletedTomb
+          ? `Auto-released: stocktake ${lockSessionId} was deleted.`
+          : `Auto-released: stocktake ${lockSessionId} is ${linkedStatus || 'complete'}.`,
+        updatedAt: Math.max(now, parseTimestampMs(match.state.updatedAt || 0) + 1),
+        lastUpdated: nowIso,
+      };
+      for (const k of Object.keys(lockdowns)) {
+        if (canonLockdownBranchAlias(k) === targetCanon || canonLockdownBranchAlias(lockdowns[k]?.branchId) === targetCanon) {
+          delete lockdowns[k];
+        }
+      }
+      lockdowns[resolved] = releasedState;
+      setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_stocktake_lockdown_updated', { detail: releasedState }));
+        window.dispatchEvent(new CustomEvent('saimetric_lockdown_updated', { detail: releasedState }));
+      }
+      return false;
+    }
+  }
+
+  return true;
 };
 
 export const setBranchLockdown = (
@@ -20190,21 +20399,31 @@ export const setBranchLockdown = (
   staffName?: string,
   reason?: string
 ): void => {
+  const resolvedBranch = normalizeLockdownBranchKey(branchId) || branchId || getCurrentBranchId();
   const now = Date.now();
   const nowIso = new Date(now).toISOString();
   const lockdowns = getBranchLockdowns();
+  const existingMatch = findBranchLockdownMatch(lockdowns, resolvedBranch);
+  const effectiveSessionId = sessionId || (!locked ? existingMatch?.state?.sessionId : undefined);
+  const targetCanon = canonLockdownBranchAlias(resolvedBranch);
   const nextState: BranchLockdownState = {
-    branchId,
+    branchId: resolvedBranch,
     isLocked: locked,
     lockedAt: locked ? nowIso : undefined,
     lockedBy: staffId,
     lockedByName: staffName,
     reason,
-    sessionId,
+    sessionId: effectiveSessionId,
     updatedAt: now,
     lastUpdated: nowIso,
   };
-  lockdowns[branchId] = nextState;
+  // Clean up any stale case/alias duplicate keys for this branch so unlock always takes effect
+  for (const k of Object.keys(lockdowns)) {
+    if (canonLockdownBranchAlias(k) === targetCanon || canonLockdownBranchAlias(lockdowns[k]?.branchId) === targetCanon) {
+      delete lockdowns[k];
+    }
+  }
+  lockdowns[resolvedBranch] = nextState;
   setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
   notifyListeners();
   if (typeof window !== 'undefined') {
@@ -20437,30 +20656,48 @@ export const syncCasualWorkersFromHub = (
 export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
   if (!lockdown || !lockdown.branchId) return;
   const lockdowns = getBranchLockdowns();
-  const existing = lockdowns[lockdown.branchId];
-
-  // Bind branch lockdown to the branch's active authoritative stocktake session:
-  // A losing/conflicting offline session must NEVER hijack or accidentally unlock an active branch lockdown.
-  const incomingSessId = String(lockdown.sessionId || '').trim().toUpperCase();
+  const resolvedBranch = normalizeLockdownBranchKey(lockdown.branchId) || lockdown.branchId;
+  const targetCanon = canonLockdownBranchAlias(resolvedBranch);
+  const existingMatch = findBranchLockdownMatch(lockdowns, resolvedBranch);
+  const existing = existingMatch?.state;
   const existingSessId = String(existing?.sessionId || '').trim().toUpperCase();
-  if (
-    existing?.isLocked &&
-    existingSessId &&
-    incomingSessId &&
-    incomingSessId !== existingSessId &&
-    !lockdown.isLocked
-  ) {
+  const incomingSessId = String(lockdown.sessionId || '').trim().toUpperCase();
+  const incomingLinkedSession = incomingSessId ? getStocktakeSessionById(incomingSessId) : undefined;
+  const incomingLinkedStatus = String(incomingLinkedSession?.status || '').trim().toUpperCase();
+  const isIncomingClosedSession = CLOSED_OR_INACTIVE_LOCKDOWN_STATUSES.has(incomingLinkedStatus);
+
+  // Never allow a stale re-lock for a session that is already completed, archived, or cancelled
+  if (lockdown.isLocked && incomingSessId && (isIncomingClosedSession || isRecordTombstoned(incomingSessId, 'stocktake_session'))) {
     console.warn(
-      `[Lockdown Guard] 🛡️ Rejected cross-session unlock for ${lockdown.branchId} (incoming ${incomingSessId} !== active lock ${existingSessId})`
+      `[Lockdown Guard] 🛡️ Ignored stale re-lock for ${resolvedBranch}: session ${incomingSessId} is already ${incomingLinkedStatus || 'DELETED'}`
     );
     return;
   }
-  if (incomingSessId) {
+
+  // Never allow an unrelated session to unlock another active session's lock
+  if (
+    existing?.isLocked &&
+    existingSessId &&
+    !lockdown.isLocked &&
+    incomingSessId &&
+    incomingSessId !== existingSessId
+  ) {
+    const existingLinked = getStocktakeSessionById(existingSessId);
+    const existingStatus = String(existingLinked?.status || '').trim().toUpperCase();
+    const existingIsClosed = !existingLinked || CLOSED_OR_INACTIVE_LOCKDOWN_STATUSES.has(existingStatus);
+    if (!existingIsClosed) {
+      console.warn(
+        `[Lockdown Guard] 🛡️ Rejected cross-session unlock for ${resolvedBranch} (incoming ${incomingSessId} !== active lock ${existingSessId})`
+      );
+      return;
+    }
+  }
+
+  if (incomingSessId && lockdown.isLocked) {
     const activeStatuses = new Set([
-      'DRAFT',
-      'SCHEDULED',
       'IN_PROGRESS',
       'COUNTING',
+      'PAUSED',
       'RECOUNTING',
       'AUDIT_REVIEW',
       'CONSOLIDATED',
@@ -20470,16 +20707,15 @@ export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
       'RECOUNT',
     ]);
     const branchActiveSession = getRawStoredStocktakeSessions().find((s) => {
-      const sBr = String((s as any).branch_id || s.branchId || '').trim().toUpperCase();
-      const targetBr = String(lockdown.branchId || '').trim().toUpperCase();
-      return sBr === targetBr && activeStatuses.has(String(s.status || '').toUpperCase().trim());
+      const sBr = canonLockdownBranchAlias((s as any).branch_id || s.branchId || '');
+      return sBr === targetCanon && activeStatuses.has(String(s.status || '').toUpperCase().trim());
     });
     if (
       branchActiveSession &&
       String(branchActiveSession.sessionId || '').trim().toUpperCase() !== incomingSessId
     ) {
       console.warn(
-        `[Lockdown Guard] 🛡️ Ignored branch_lockdown update for session ${incomingSessId} because active session is ${branchActiveSession.sessionId}`
+        `[Lockdown Guard] 🛡️ Ignored branch_lockdown lock update for session ${incomingSessId} because active session is ${branchActiveSession.sessionId}`
       );
       return;
     }
@@ -20491,19 +20727,35 @@ export const syncLockdownFromHub = (lockdown: BranchLockdownState): void => {
   const incomingTime = parseTimestampMs(
     lockdown.updatedAt || lockdown.lastUpdated || lockdown.lockedAt || 0
   );
-  if (existing && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+  const isAuthoritativeRelease =
+    !lockdown.isLocked &&
+    (isIncomingClosedSession ||
+      !existing?.isLocked ||
+      !existingSessId ||
+      !incomingSessId ||
+      incomingSessId === existingSessId);
+
+  if (!isAuthoritativeRelease && existing && existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
     console.warn(
-      `[LWW Client] 🛡️ Rejected stale branch_lockdown update for ${lockdown.branchId}`
+      `[LWW Client] 🛡️ Rejected stale branch_lockdown update for ${resolvedBranch}`
     );
     return;
   }
-  const now = incomingTime || Date.now();
+  const now = Math.max(incomingTime || Date.now(), isAuthoritativeRelease && existingTime > 0 ? existingTime + 1 : 0);
   const normalized: BranchLockdownState = {
     ...lockdown,
+    branchId: resolvedBranch,
+    isLocked: Boolean(lockdown.isLocked),
+    lockedAt: lockdown.isLocked ? (lockdown.lockedAt || new Date(now).toISOString()) : undefined,
     updatedAt: now,
     lastUpdated: lockdown.lastUpdated || new Date(now).toISOString(),
   };
-  lockdowns[lockdown.branchId] = normalized;
+  for (const k of Object.keys(lockdowns)) {
+    if (canonLockdownBranchAlias(k) === targetCanon || canonLockdownBranchAlias(lockdowns[k]?.branchId) === targetCanon) {
+      delete lockdowns[k];
+    }
+  }
+  lockdowns[resolvedBranch] = normalized;
   setStored(STORAGE_KEYS.BRANCH_LOCKDOWNS, lockdowns);
   notifyListeners();
   if (typeof window !== 'undefined') {
@@ -20797,12 +21049,22 @@ export const ingestStocktakeSessionFromMesh = (data: {
           ? Boolean(incomingSeg.comparisonFinalized)
           : Boolean(localSeg?.comparisonFinalized ?? zone?.comparisonFinalized);
 
-      const verifiedCounts =
-        (incomingSeg.verifiedCounts && incomingSeg.verifiedCounts.length > 0)
-          ? incomingSeg.verifiedCounts
-          : (localSeg?.verifiedCounts && localSeg.verifiedCounts.length > 0)
-          ? localSeg.verifiedCounts
-          : (zone?.verifiedCounts || []);
+      const mergedCount1 =
+        (Array.isArray(incomingSeg.count1) && incomingSeg.count1.length > 0)
+          ? incomingSeg.count1
+          : (localSeg?.count1 || []);
+      const mergedCount2 =
+        (Array.isArray(incomingSeg.count2) && incomingSeg.count2.length > 0)
+          ? incomingSeg.count2
+          : (localSeg?.count2 || []);
+
+      const verifiedCounts = mergeSegmentVerifiedCounts({
+        count1: mergedCount1,
+        count2: mergedCount2,
+        existingVerified: localSeg?.verifiedCounts,
+        zoneVerified: zone?.verifiedCounts,
+        resolvedLines: incomingSeg.verifiedCounts,
+      });
 
       const discrepancies =
         (incomingSeg.discrepancies && incomingSeg.discrepancies.length > 0)
@@ -21041,8 +21303,13 @@ export const ingestStocktakeSessionFromMesh = (data: {
 
   saveStocktakeSession(session, { fromSync: true });
 
-  // If session completed/archived/cancelled via mesh, ensure its casuals stay deactivated locally too
-  if (session.status === 'APPROVED_POSTED' || session.status === 'ARCHIVED' || session.status === 'CANCELLED') {
+  // If session completed/archived/cancelled via mesh, ensure its casuals AND branch lockdown stay released locally too
+  const isClosedSessionStatus =
+    session.status === 'APPROVED_POSTED' ||
+    session.status === 'ARCHIVED' ||
+    session.status === 'CANCELLED';
+
+  if (isClosedSessionStatus) {
     const allCasuals = getStored<TemporaryCasualAccount[]>(STORAGE_KEYS.TEMPORARY_CASUALS, []);
     let changedCasuals = false;
     const updatedCasuals = allCasuals.map((c) => {
@@ -21058,6 +21325,32 @@ export const ingestStocktakeSessionFromMesh = (data: {
         window.dispatchEvent(new CustomEvent('saimetric_casual_workers_updated'));
         window.dispatchEvent(new CustomEvent('saimetric_casuals_updated'));
       }
+    }
+  }
+
+  // Synchronize local branch lockdown with the ingested session's authoritative state:
+  // If this session is closed/completed OR explicitly disengaged (isLockdownActive === false),
+  // release any local branch lockdown owned by this session so remote branches never stay stuck locked.
+  if (session.branchId) {
+    const localLockdowns = getBranchLockdowns();
+    const existingLockMatch = findBranchLockdownMatch(localLockdowns, session.branchId);
+    const lockOwnerId = String(existingLockMatch?.state?.sessionId || '').trim().toUpperCase();
+    const sessIdUpper = String(session.sessionId || '').trim().toUpperCase();
+    const ownsLocalLock =
+      Boolean(existingLockMatch?.state?.isLocked) &&
+      (!lockOwnerId || lockOwnerId === sessIdUpper);
+
+    if (ownsLocalLock && (isClosedSessionStatus || session.isLockdownActive === false)) {
+      setBranchLockdown(
+        session.branchId,
+        false,
+        session.sessionId,
+        session.approvedBy || session.archivedBy || session.pausedBy,
+        session.approvedByName || session.archivedByName || session.pausedByName || 'System Sync',
+        isClosedSessionStatus
+          ? `Stocktake ${session.sessionId} ${session.status} — branch lockdown auto-released.`
+          : `Lockdown disengaged for stocktake ${session.sessionId}.`
+      );
     }
   }
 
@@ -21225,6 +21518,115 @@ export const updateZoneClaim = (
   return zone;
 };
 
+/**
+ * Canonical helper that builds a lossless segment `verifiedCounts` array.
+ * ALWAYS preserves every initially matched SKU from `count1` vs `count2`,
+ * plus any previously verified lines on the segment or zone, and then
+ * overlays newly resolved dual-recount / recount-override lines on top.
+ */
+export const mergeSegmentVerifiedCounts = (params: {
+  count1?: StocktakeLineCount[];
+  count2?: StocktakeLineCount[];
+  existingVerified?: StocktakeVerifiedLine[];
+  zoneVerified?: StocktakeVerifiedLine[];
+  resolvedLines?: any[];
+  resolvedSource?: StocktakeVerifiedLine['source'];
+  resolvedBy?: string;
+}): StocktakeVerifiedLine[] => {
+  const verifiedMap = new Map<string, StocktakeVerifiedLine>();
+  const mapA = new Map<string, StocktakeLineCount>();
+  const mapB = new Map<string, StocktakeLineCount>();
+
+  (params.count1 || []).forEach((l) => {
+    if (l?.itemId) mapA.set(String(l.itemId).trim().toUpperCase(), l);
+  });
+  (params.count2 || []).forEach((l) => {
+    if (l?.itemId) mapB.set(String(l.itemId).trim().toUpperCase(), l);
+  });
+
+  // 1. Reconstruct every initially matched line from Team A & Team B blind counts
+  if (mapA.size > 0 && mapB.size > 0) {
+    const allKeys = new Set<string>([...mapA.keys(), ...mapB.keys()]);
+    allKeys.forEach((key) => {
+      const a = mapA.get(key);
+      const b = mapB.get(key);
+      const base = a || b;
+      if (!base) return;
+      const upc = Math.max(1, Number(base.unitsPerCase || 1));
+      const aTot = a
+        ? (a.totalUnits !== undefined && a.totalUnits !== null ? Number(a.totalUnits) : (Number(a.cases || 0) * upc + Number(a.singles || 0)))
+        : 0;
+      const bTot = b
+        ? (b.totalUnits !== undefined && b.totalUnits !== null ? Number(b.totalUnits) : (Number(b.cases || 0) * upc + Number(b.singles || 0)))
+        : 0;
+      if (aTot === bTot && aTot > 0) {
+        verifiedMap.set(key, {
+          itemId: base.itemId,
+          itemName: base.itemName,
+          category: base.category,
+          sku: base.sku,
+          unitsPerCase: upc,
+          cases: Math.floor(aTot / upc),
+          singles: aTot % upc,
+          totalUnits: aTot,
+          source: 'MATCHED',
+          count1TotalUnits: aTot,
+          count2TotalUnits: bTot,
+        });
+      }
+    });
+  }
+
+  const normalizeLine = (
+    raw: any,
+    overrideSource?: StocktakeVerifiedLine['source'],
+    overrideResolvedBy?: string
+  ): StocktakeVerifiedLine | null => {
+    if (!raw || !raw.itemId) return null;
+    const key = String(raw.itemId).trim().toUpperCase();
+    const upc = Math.max(1, Number(raw.unitsPerCase || 1));
+    const tot =
+      raw.totalUnits !== undefined && raw.totalUnits !== null
+        ? Number(raw.totalUnits)
+        : Number(raw.cases || 0) * upc + Number(raw.singles || 0);
+    const prev = verifiedMap.get(key);
+    const aTot = mapA.get(key)?.totalUnits;
+    const bTot = mapB.get(key)?.totalUnits;
+    return {
+      itemId: raw.itemId,
+      itemName: raw.itemName || prev?.itemName || raw.itemId,
+      category: raw.category ?? prev?.category,
+      sku: raw.sku ?? prev?.sku,
+      unitsPerCase: upc,
+      cases: Math.floor(tot / upc),
+      singles: tot % upc,
+      totalUnits: tot,
+      source: overrideSource || raw.source || prev?.source || 'MATCHED',
+      resolvedBy: overrideResolvedBy || raw.resolvedBy || prev?.resolvedBy,
+      count1TotalUnits: raw.count1TotalUnits ?? aTot ?? prev?.count1TotalUnits,
+      count2TotalUnits: raw.count2TotalUnits ?? bTot ?? prev?.count2TotalUnits,
+    };
+  };
+
+  // 2. Preserve existing verified lines from zone and segment
+  (params.zoneVerified || []).forEach((v) => {
+    const norm = normalizeLine(v);
+    if (norm) verifiedMap.set(String(norm.itemId).trim().toUpperCase(), norm);
+  });
+  (params.existingVerified || []).forEach((v) => {
+    const norm = normalizeLine(v);
+    if (norm) verifiedMap.set(String(norm.itemId).trim().toUpperCase(), norm);
+  });
+
+  // 3. Overlay resolved / incoming lines on top (never discarding previously matched lines)
+  (params.resolvedLines || []).forEach((r) => {
+    const norm = normalizeLine(r, params.resolvedSource, params.resolvedBy);
+    if (norm) verifiedMap.set(String(norm.itemId).trim().toUpperCase(), norm);
+  });
+
+  return Array.from(verifiedMap.values());
+};
+
 export const markZoneVerified = (
   zoneId: string,
   verifiedCounts: StocktakeVerifiedLine[],
@@ -21236,7 +21638,19 @@ export const markZoneVerified = (
     getStocktakeSessions()[0]?.sessionId ||
     '';
 
-  const zone = updateZoneFromHubStatus(targetSessionId, zoneId, 'VERIFIED', undefined, verifiedCounts);
+  const existingSession = targetSessionId ? getStocktakeSessionById(targetSessionId) : undefined;
+  const existingSeg = existingSession?.segments?.find((s: any) => (s.segmentId || s.id) === zoneId);
+  const existingZone = getZoneAssignments(targetSessionId).find((z) => z.zoneId === zoneId);
+
+  const mergedVerified = mergeSegmentVerifiedCounts({
+    count1: existingSeg?.count1,
+    count2: existingSeg?.count2,
+    existingVerified: existingSeg?.verifiedCounts,
+    zoneVerified: existingZone?.verifiedCounts,
+    resolvedLines: verifiedCounts,
+  });
+
+  const zone = updateZoneFromHubStatus(targetSessionId, zoneId, 'VERIFIED', undefined, mergedVerified);
 
   if (targetSessionId) {
     const session = getStocktakeSessionById(targetSessionId);
@@ -21244,7 +21658,7 @@ export const markZoneVerified = (
       const seg = session.segments.find((s: any) => (s.segmentId || s.id) === zoneId);
       if (seg) {
         seg.status = 'VERIFIED';
-        seg.verifiedCounts = verifiedCounts;
+        seg.verifiedCounts = mergedVerified;
         seg.discrepancyCount = 0;
         seg.recount = [];
         saveStocktakeSession(session);
@@ -21258,7 +21672,7 @@ export const markZoneVerified = (
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event('saimetric_stocktake_updated'));
-    window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: { zoneId, verifiedCounts } }));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_match_verified', { detail: { zoneId, verifiedCounts: mergedVerified } }));
     window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
   }
 
@@ -21268,7 +21682,8 @@ export const markZoneVerified = (
 export const markZoneVariance = (
   zoneId: string,
   discrepancies: StocktakeVarianceItem[],
-  sessionId?: string
+  sessionId?: string,
+  matchedVerifiedCounts?: StocktakeVerifiedLine[]
 ): StocktakeZoneAssignment | null => {
   const targetSessionId =
     sessionId ||
@@ -21276,7 +21691,24 @@ export const markZoneVariance = (
     getStocktakeSessions()[0]?.sessionId ||
     '';
 
-  const zone = updateZoneFromHubStatus(targetSessionId, zoneId, 'VARIANCE_FLAGGED', discrepancies);
+  const existingSession = targetSessionId ? getStocktakeSessionById(targetSessionId) : undefined;
+  const existingSeg = existingSession?.segments?.find((s: any) => (s.segmentId || s.id) === zoneId);
+  const existingZone = getZoneAssignments(targetSessionId).find((z) => z.zoneId === zoneId);
+  const preservedMatched = mergeSegmentVerifiedCounts({
+    count1: existingSeg?.count1,
+    count2: existingSeg?.count2,
+    existingVerified: existingSeg?.verifiedCounts,
+    zoneVerified: existingZone?.verifiedCounts,
+    resolvedLines: matchedVerifiedCounts,
+  });
+
+  const zone = updateZoneFromHubStatus(
+    targetSessionId,
+    zoneId,
+    'VARIANCE_FLAGGED',
+    discrepancies,
+    preservedMatched.length > 0 ? preservedMatched : undefined
+  );
 
   if (targetSessionId) {
     const session = getStocktakeSessionById(targetSessionId);
@@ -21286,6 +21718,9 @@ export const markZoneVariance = (
         seg.status = 'DISCREPANCY_RECOUNT';
         seg.discrepancies = discrepancies;
         seg.discrepancyCount = (discrepancies || []).length;
+        if (preservedMatched.length > 0) {
+          seg.verifiedCounts = preservedMatched;
+        }
         saveStocktakeSession(session);
       }
     }
@@ -21294,7 +21729,7 @@ export const markZoneVariance = (
   notifyListeners();
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event('saimetric_stocktake_updated'));
-    window.dispatchEvent(new CustomEvent('saimetric_stocktake_variance_alert', { detail: { zoneId, discrepancies } }));
+    window.dispatchEvent(new CustomEvent('saimetric_stocktake_variance_alert', { detail: { zoneId, discrepancies, verifiedCounts: preservedMatched } }));
     window.dispatchEvent(new CustomEvent('saimetric_stocktake_zone_updated'));
   }
 
@@ -21534,7 +21969,19 @@ export const updateZoneFromHubStatus = (
 
   zone.status = status;
   if (discrepancies) zone.discrepancies = discrepancies;
-  if (verifiedCounts) zone.verifiedCounts = verifiedCounts;
+
+  const existingSessForMerge = sessionId ? getStocktakeSessionById(sessionId) : undefined;
+  const existingSegForMerge = existingSessForMerge?.segments?.find((s: any) => (s.segmentId || s.id) === zoneId);
+
+  if (verifiedCounts) {
+    zone.verifiedCounts = mergeSegmentVerifiedCounts({
+      count1: existingSegForMerge?.count1,
+      count2: existingSegForMerge?.count2,
+      existingVerified: existingSegForMerge?.verifiedCounts,
+      zoneVerified: zone.verifiedCounts,
+      resolvedLines: verifiedCounts,
+    });
+  }
 
   if (options) {
     if (options.hasCountA) {
@@ -21581,8 +22028,8 @@ export const updateZoneFromHubStatus = (
           seg.discrepancies = discrepancies;
           seg.discrepancyCount = discrepancies.length;
         }
-        if (verifiedCounts) {
-          seg.verifiedCounts = verifiedCounts;
+        if (verifiedCounts && zone.verifiedCounts) {
+          seg.verifiedCounts = zone.verifiedCounts;
         }
         if (options?.hasCountA) {
           seg.hasCountA = true;
@@ -21661,52 +22108,49 @@ export const applyJointRecountSignature = (
   const isComplete = Boolean(zone.jointRecount.signedByA && zone.jointRecount.signedByB);
   if (isComplete) {
     const resolvedIso = new Date().toISOString();
+    const targetSessionId = sessionId || zone.sessionId;
+    const session = targetSessionId ? getStocktakeSessionById(targetSessionId) : undefined;
+    const seg = session?.segments?.find((s: any) => (s.segmentId || s.id) === zoneId);
+
+    // CRITICAL: Preserve ALL initially matched lines from Team A & Team B blind counts
+    // plus any previously verified lines, and overlay only the dual-recounted variance lines on top.
+    const mergedVerifiedCounts = mergeSegmentVerifiedCounts({
+      count1: seg?.count1,
+      count2: seg?.count2,
+      existingVerified: seg?.verifiedCounts,
+      zoneVerified: zone.verifiedCounts,
+      resolvedLines: zone.jointRecount.lines || [],
+      resolvedSource: 'JOINT_RECOUNT',
+      resolvedBy: staffName,
+    });
+
     zone.status = 'VERIFIED';
     zone.comparisonFinalized = true;
     zone.comparisonFinalizedAt = resolvedIso;
     zone.comparisonFinalizedBy = staffName;
     zone.jointRecount.resolvedAt = resolvedIso;
     zone.jointRecount.resolvedByName = staffName;
-    zone.verifiedCounts = (zone.jointRecount.lines || []).map((l: any) => {
-      const upc = Math.max(1, Number(l.unitsPerCase || 1));
-      const tot = (l.totalUnits !== undefined && l.totalUnits !== null)
-        ? Number(l.totalUnits)
-        : (Number(l.cases || 0) * upc + Number(l.singles || 0));
-      return {
-        itemId: l.itemId,
-        itemName: l.itemName,
-        category: l.category,
-        sku: l.sku,
-        unitsPerCase: upc,
-        cases: Math.floor(tot / upc),
-        singles: tot % upc,
-        totalUnits: tot,
-        source: 'JOINT_RECOUNT',
-      };
-    });
+    zone.verifiedCounts = mergedVerifiedCounts;
 
     // Also update session segment in roomDatabase
-    const targetSessionId = sessionId || zone.sessionId;
-    if (targetSessionId) {
-      const session = getStocktakeSessionById(targetSessionId);
-      if (session && Array.isArray(session.segments)) {
-        const seg = session.segments.find((s: any) => (s.segmentId || s.id) === zoneId);
-        if (seg) {
-          seg.status = 'VERIFIED';
-          seg.verifiedCounts = zone.verifiedCounts;
-          seg.discrepancies = [];
-          seg.discrepancyCount = 0;
-          seg.recount = [];
-          seg.jointRecount = zone.jointRecount;
-          seg.comparisonFinalized = true;
-          seg.comparisonFinalizedAt = resolvedIso;
-          seg.comparisonFinalizedBy = staffName;
-          saveStocktakeSession(session);
-          try {
-            consolidateStocktakeSession(targetSessionId, true);
-          } catch {}
-        }
+    if (session && seg) {
+      seg.status = 'VERIFIED';
+      seg.verifiedCounts = mergedVerifiedCounts;
+      seg.discrepancies = [];
+      seg.discrepancyCount = 0;
+      seg.recount = [];
+      seg.jointRecount = zone.jointRecount;
+      seg.comparisonFinalized = true;
+      seg.comparisonFinalizedAt = resolvedIso;
+      seg.comparisonFinalizedBy = staffName;
+      const allVerified = session.segments.every((s) => s.status === 'VERIFIED');
+      if (allVerified && session.status === 'RECOUNTING') {
+        session.status = 'COUNTING';
       }
+      saveStocktakeSession(session);
+      try {
+        consolidateStocktakeSession(targetSessionId, true);
+      } catch {}
     }
   }
 
@@ -22550,40 +22994,16 @@ export const resolveSegmentRecount = (
   segment.recounterName = staffName;
   segment.recountedAt = timestamp;
 
-  const verifiedMap = new Map<string, StocktakeVerifiedLine>();
-  (segment.verifiedCounts || []).forEach((v) => verifiedMap.set(v.itemId.toUpperCase(), v));
-
-  const mapA = new Map<string, StocktakeLineCount>();
-  const mapB = new Map<string, StocktakeLineCount>();
-  (segment.count1 || []).forEach((l) => mapA.set(l.itemId.toUpperCase(), l));
-  (segment.count2 || []).forEach((l) => mapB.set(l.itemId.toUpperCase(), l));
-
-  resolvedRecountLines.forEach((r) => {
-    const upc = Math.max(1, Number(r.unitsPerCase) || 1);
-    const cs = Math.max(0, Number(r.cases) || 0);
-    const ea = Math.max(0, Number(r.singles) || 0);
-    const tot = (cs * upc) + ea;
-
-    const count1Units = mapA.get(r.itemId.toUpperCase())?.totalUnits || 0;
-    const count2Units = mapB.get(r.itemId.toUpperCase())?.totalUnits || 0;
-
-    verifiedMap.set(r.itemId.toUpperCase(), {
-      itemId: r.itemId,
-      itemName: r.itemName,
-      category: r.category,
-      sku: r.sku,
-      unitsPerCase: upc,
-      cases: cs,
-      singles: ea,
-      totalUnits: tot,
-      source: 'RESOLVED_RECOUNT',
-      resolvedBy: staffName,
-      count1TotalUnits: count1Units,
-      count2TotalUnits: count2Units,
-    });
+  const existingZone = getZoneAssignments(sessionId).find((z) => z.zoneId === segmentId);
+  segment.verifiedCounts = mergeSegmentVerifiedCounts({
+    count1: segment.count1,
+    count2: segment.count2,
+    existingVerified: segment.verifiedCounts,
+    zoneVerified: existingZone?.verifiedCounts,
+    resolvedLines: resolvedRecountLines,
+    resolvedSource: 'RESOLVED_RECOUNT',
+    resolvedBy: staffName,
   });
-
-  segment.verifiedCounts = Array.from(verifiedMap.values());
   segment.discrepancyCount = 0;
   segment.status = 'VERIFIED';
   segment.recount = resolvedRecountLines;
@@ -22737,8 +23157,22 @@ export const consolidateStocktakeSession = (
 
   const skuMap = new Map<string, SkuConsolidationAccumulator>();
 
+  const sessionZones = getZoneAssignments(sessionId);
   verifiedSegments.forEach((seg) => {
-    (seg.verifiedCounts || []).forEach((line: any) => {
+    const linkedZone = sessionZones.find((z) => z.zoneId === (seg.segmentId || (seg as any).id));
+    // Self-healing consolidation: guarantee initially matched lines from count1/count2 + zone.verifiedCounts
+    // are always included alongside resolved recount lines even for historical sessions.
+    const effectiveVerified = mergeSegmentVerifiedCounts({
+      count1: seg.count1,
+      count2: seg.count2,
+      zoneVerified: linkedZone?.verifiedCounts,
+      resolvedLines: seg.verifiedCounts || [],
+    });
+    if (effectiveVerified.length > (seg.verifiedCounts || []).length) {
+      seg.verifiedCounts = effectiveVerified;
+    }
+
+    effectiveVerified.forEach((line: any) => {
       const key = line.itemId.toUpperCase();
       let acc = skuMap.get(key);
       if (!acc) {
@@ -23458,18 +23892,26 @@ export const approveAndCommitStocktake = (
     }
   }
 
-  // Release branch lockdown if this session held the store in lockdown
-  if (session.isLockdownActive || isFullLockdown) {
+  // Release branch lockdown if this session held the store in lockdown (or branch lock matches this session)
+  const commitBranchId = session.branchId || getCurrentBranchId();
+  const existingCommitLock = findBranchLockdownMatch(getBranchLockdowns(), commitBranchId)?.state;
+  const lockBelongsToThisSession =
+    Boolean(existingCommitLock?.isLocked) &&
+    (!existingCommitLock?.sessionId ||
+      String(existingCommitLock.sessionId).trim().toUpperCase() === String(session.sessionId).trim().toUpperCase());
+
+  if (session.isLockdownActive || isFullLockdown || lockBelongsToThisSession) {
     setBranchLockdown(
-      session.branchId || getCurrentBranchId(),
+      commitBranchId,
       false,
-      undefined,
+      session.sessionId,
       adminId,
       adminName,
       `Stocktake ${session.sessionId} committed and approved by ${adminName}. Store lockdown released.`
     );
-    session.isLockdownActive = false;
   }
+  session.isLockdownActive = false;
+  session.lockdownRequested = false;
 
   const savedSession = saveStocktakeSession(session);
 
@@ -23916,17 +24358,25 @@ export const approveAndCommitStocktakeAsync = async (
     }
   }
 
-  if (session.isLockdownActive || isFullLockdown) {
+  const asyncCommitBranchId = session.branchId || getCurrentBranchId();
+  const existingAsyncCommitLock = findBranchLockdownMatch(getBranchLockdowns(), asyncCommitBranchId)?.state;
+  const asyncLockBelongsToThisSession =
+    Boolean(existingAsyncCommitLock?.isLocked) &&
+    (!existingAsyncCommitLock?.sessionId ||
+      String(existingAsyncCommitLock.sessionId).trim().toUpperCase() === String(session.sessionId).trim().toUpperCase());
+
+  if (session.isLockdownActive || isFullLockdown || asyncLockBelongsToThisSession) {
     setBranchLockdown(
-      session.branchId || getCurrentBranchId(),
+      asyncCommitBranchId,
       false,
-      undefined,
+      session.sessionId,
       adminId,
       adminName,
       `Stocktake ${session.sessionId} committed and approved by ${adminName}. Store lockdown released.`
     );
-    session.isLockdownActive = false;
   }
+  session.isLockdownActive = false;
+  session.lockdownRequested = false;
 
   const savedSession = saveStocktakeSession(session);
   const adjustmentsCount = updatedMasters.length;
@@ -25414,17 +25864,26 @@ export const getDirectGrvPaymentsForStaff = (
   staffId: string,
   date?: string,
   includeRejected: boolean = false,
-  staffName?: string
+  staffName?: string,
+  branchId?: string
 ): Array<{
   grv: DirectGrv;
   payment: DirectGrvTillPayment;
 }> => {
-  const grvs = getDirectGrvs();
+  const grvs = getAllDirectGrvs(branchId);
   const results: Array<{ grv: DirectGrv; payment: DirectGrvTillPayment }> = [];
   const knownStaffSets = getKnownStaffIdSets();
 
   const matchesOperator = (opId?: string, opName?: string): boolean => {
     return matchesStaffExclusive(opId, opName, staffId, staffName, knownStaffSets);
+  };
+
+  const isKnownStaffId = (id?: string): boolean => {
+    const clean = String(id || '').trim().toLowerCase();
+    if (!clean) return false;
+    if (knownStaffSets.exactIds.has(clean)) return true;
+    const norm = clean.replace(/^usr-|^staff-|^0+/, '');
+    return Boolean(norm && knownStaffSets.normIds.has(norm));
   };
 
   grvs.forEach((grv) => {
@@ -25437,15 +25896,20 @@ export const getDirectGrvPaymentsForStaff = (
       grv.paymentStatus === 'AWAITING_SAFE_PAYMENT';
     if (isNonTill) return;
 
-    const gDate = toDateStringSafe(grv.date) || toDateStringSafe(grv.createdAt);
-    if (date && gDate !== date) return;
+    if (date && !isSameDaySafe(grv.date, grv.createdAt, date)) return;
 
     const hasPositivePayments =
       Array.isArray(grv.payments) && grv.payments.some((p) => (Number(p.amount) || 0) > 0);
 
     if (hasPositivePayments && grv.payments) {
       grv.payments.forEach((p) => {
-        if (matchesOperator(p.userId, p.userName) && (Number(p.amount) || 0) > 0) {
+        if ((Number(p.amount) || 0) <= 0) return;
+        const directMatch = matchesOperator(p.userId, p.userName);
+        const orphanedFallbackMatch =
+          !directMatch &&
+          !isKnownStaffId(p.userId) &&
+          matchesOperator(grv.receivedByStaffId, grv.receivedByStaffName);
+        if (directMatch || orphanedFallbackMatch) {
           results.push({ grv, payment: p });
         }
       });
@@ -25471,9 +25935,10 @@ export const getDirectGrvPaymentsForStaff = (
 export const getDirectGrvsForStaffAndDate = (
   staffId: string,
   date: string,
-  staffName?: string
+  staffName?: string,
+  branchId?: string
 ): DirectGrv[] => {
-  const grvs = getDirectGrvs();
+  const grvs = getAllDirectGrvs(branchId);
   const knownStaffSets = getKnownStaffIdSets();
 
   const matchesOperator = (opId?: string, opName?: string): boolean => {
@@ -25491,8 +25956,7 @@ export const getDirectGrvsForStaffAndDate = (
     ) {
       return false;
     }
-    const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
-    if (gDate !== date) return false;
+    if (!isSameDaySafe(g.date, g.createdAt, date)) return false;
 
     if (matchesOperator(g.receivedByStaffId, g.receivedByStaffName)) return true;
 
@@ -25512,10 +25976,13 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
     grv.paymentMethod !== 'BANK' &&
     grv.paymentStatus !== 'AWAITING_SAFE_PAYMENT';
 
+  const compId = (grv as any).companyId || (grv as any).company_id || getCurrentCompanyId();
+  const brId = (grv as any).branchId || (grv as any).branch_id || getCurrentBranchId();
+
   if (grv.status === 'REJECTED' || !isPayFromTill) {
     // If rejected or non-till, deactivate movements and set CashLog out to 0 so the money is returned to the drawer
     // but the rejection reason and audit trail remain visible in Form 2
-    const existingMovements = getMovements();
+    const existingMovements = getMovements(undefined, brId);
     existingMovements
       .filter((m) => m.type === 'supplier_payment' && (m.sourceRef === grv.grvNumber || m.sourceRef?.startsWith(grv.grvNumber) || m.sourceRef === grv.id))
       .forEach((m) => {
@@ -25526,7 +25993,7 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
         });
       });
 
-    const currentLogs = getCashLogs();
+    const currentLogs = getAllCashLogs(brId);
     currentLogs
       .filter((l) => l.line === 'Direct Procurement' && (l.reference === grv.grvNumber || l.reference?.startsWith(grv.grvNumber)))
       .forEach((l) => {
@@ -25540,8 +26007,6 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
 
   const shiftDate = toDateStringSafe(grv.date) || toDateStringSafe(grv.createdAt) || getTodayDateString();
   const now = grv.createdAt || new Date().toISOString();
-  const compId = (grv as any).companyId || (grv as any).company_id || getCurrentCompanyId();
-  const brId = (grv as any).branchId || (grv as any).branch_id || getCurrentBranchId();
   const isFromMesh = Boolean((grv as any).fromMesh);
 
   // Determine payments for each till operator
@@ -25561,8 +26026,8 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
         ]
       : [];
 
-  const existingMovements = getMovements();
-  const currentLogs = getCashLogs();
+  const existingMovements = getMovements(undefined, brId);
+  const currentLogs = getAllCashLogs(brId);
 
   payments.forEach((p, pIdx) => {
     const amt = Number(p.amount) || 0;
@@ -25592,12 +26057,14 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
         existingM.status !== 'approved' ||
         !existingM.affectsDrawer ||
         existingM.sourceRef !== voucherKey ||
-        existingM.date !== shiftDate
+        existingM.date !== shiftDate ||
+        existingM.staffName !== p.userName
       ) {
         updateMovement(existingM.id, {
           amount: amt,
           date: shiftDate,
           shiftId: staffShiftId,
+          staffName: p.userName,
           status: 'approved',
           affectsDrawer: true,
           direction: 'out',
@@ -25609,6 +26076,7 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
       addMovement({
         shiftId: staffShiftId,
         staffId: p.userId,
+        staffName: p.userName,
         terminalId: p.drawerId || 'Till 1',
         date: shiftDate,
         timestamp: now,
@@ -25631,7 +26099,7 @@ export const recordDirectGrvTillPayouts = (grv: DirectGrv) => {
         (l.staffId === p.userId ||
           (Boolean(normPId) &&
             String(l.staffId || '').trim().toLowerCase().replace(/^usr-|^staff-|^0+/, '') === normPId)) &&
-        l.date === shiftDate &&
+        isSameDaySafe(l.date, l.timestamp, shiftDate) &&
         (l.reference === voucherKey || l.reference === grv.grvNumber || l.description.includes(grv.grvNumber))
     );
 
@@ -25726,9 +26194,9 @@ export const saveDirectGrv = (
     recordDirectGrvTillPayouts(normalized);
   }
 
-  // Sync to unified goodsReceivedNotes store
+  // Sync to unified goodsReceivedNotes store (skipInventoryMutation since inventory is posted on approveDirectGrv)
   try {
-    postDirectDelivery(normalized);
+    postDirectDelivery(normalized, { skipInventoryMutation: true });
   } catch (err) {
     console.warn('[GRN] postDirectDelivery sync warning:', err);
   }
@@ -26231,7 +26699,11 @@ const isCashBranchMatch = (b1?: string, b2?: string): boolean => {
   if (!b1 || !b2) return false;
   if (b1 === b2) return true;
   if ((b1 === '1' || b1 === 'BR-MAIN') && (b2 === '1' || b2 === 'BR-MAIN')) return true;
-  return false;
+  try {
+    return isRecordInBranchScope(b1, b2, getBranches(), getCurrentCompanyId());
+  } catch (_) {
+    return false;
+  }
 };
 
 const isCashCompanyMatch = (c1?: string, c2?: string): boolean => {
@@ -26271,12 +26743,16 @@ export const saveCashAccount = (
     );
   }
 
+  const existing = index >= 0 ? all[index] : undefined;
+  const existingUpdatedMs = existing
+    ? parseTimestampMs(existing.updatedAt || (existing as any).lastUpdated || existing.updated_at || (existing as any).hubTimestamp)
+    : 0;
   const effectiveUpdatedAt = options?.fromSync
     ? ((account as any).updatedAt || ((account as any).updated_at ? new Date((account as any).updated_at).getTime() : nowMs))
-    : nowMs;
+    : Math.max(nowMs, existingUpdatedMs + 1);
   const effectiveLastUpdated = options?.fromSync
     ? ((account as any).lastUpdated || (account as any).updated_at || new Date(effectiveUpdatedAt).toISOString())
-    : nowIso;
+    : new Date(effectiveUpdatedAt).toISOString();
 
   const toSave: CashAccount = {
     ...account,
@@ -26284,19 +26760,19 @@ export const saveCashAccount = (
     updated_at: effectiveLastUpdated,
     updatedAt: effectiveUpdatedAt,
     lastUpdated: effectiveLastUpdated,
-    created_at: (index >= 0 && all[index]?.created_at) ? all[index].created_at : (account.created_at || nowIso),
-  };
+    created_at: (existing?.created_at) ? existing.created_at : (account.created_at || nowIso),
+    // CRITICAL: Local balance mutations MUST clear isCloudSynced & fromMesh so Local Hub & Cloud push the updated balance!
+    ...(!options?.fromSync ? { isCloudSynced: false, fromMesh: false } : {}),
+  } as CashAccount;
 
   let updated: CashAccount[];
-  if (index >= 0) {
-    const existing = all[index];
+  if (index >= 0 && existing) {
     if (options?.fromSync) {
       // Client-Side LWW Defense-in-Depth (60000ms skew tolerance)
-      const existingTime = parseTimestampMs(existing.updatedAt || (existing as any).lastUpdated || existing.updated_at || (existing as any).hubTimestamp);
       const incomingTime = parseTimestampMs((account as any).updatedAt || (account as any).lastUpdated || (account as any).updated_at || (account as any).hubTimestamp);
-      if (existingTime > 0 && incomingTime > 0 && existingTime > incomingTime + 60000) {
+      if (existingUpdatedMs > 0 && incomingTime > 0 && existingUpdatedMs > incomingTime + 60000) {
         console.warn(
-          `[LWW Client] 🛡️ Rejected stale cash_account update for ${account.account_id || account.account_name} (Local: ${new Date(existingTime).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
+          `[LWW Client] 🛡️ Rejected stale cash_account update for ${account.account_id || account.account_name} (Local: ${new Date(existingUpdatedMs).toISOString()} > Incoming: ${new Date(incomingTime).toISOString()})`
         );
         return existing;
       }
@@ -26332,7 +26808,7 @@ export const saveCashAccount = (
     notifyCashAccountChanged(toSave);
   }
   notifyListeners();
-  if (typeof window !== 'undefined') {
+  if (typeof window !== 'undefined' && !options?.silent) {
     window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: toSave }));
   }
   return toSave;
@@ -26363,7 +26839,7 @@ const isCompanyLevelCashTransfer = (t?: Partial<CashTransfer> | null): boolean =
   );
 };
 
-const getTransferStatusRank = (status?: string): number => {
+export const getTransferStatusRank = (status?: string): number => {
   const s = String(status || '').toUpperCase().trim();
   if (s === 'DRAFT') return 0;
   if (s === 'PENDING_APPROVAL' || s === 'PENDING_ACCEPTANCE') return 1;
@@ -26371,6 +26847,224 @@ const getTransferStatusRank = (status?: string): number => {
   if (s === 'APPROVED') return 3;
   if (s === 'RECEIVED' || s === 'COMPLETED' || s === 'RETURNED' || s === 'CANCELLED' || s === 'REJECTED') return 4;
   return 0;
+};
+
+const isSettledCashTransferStatus = (status?: string): boolean => {
+  const u = String(status || '').toUpperCase().trim();
+  return u === 'COMPLETED' || u === 'RECEIVED' || u === 'APPROVED';
+};
+
+const isLedgerRefMatchingAccount = (
+  refId: string | undefined,
+  account: CashAccount,
+  transferBranchId?: string
+): boolean => {
+  if (!refId) return false;
+  if (refId === account.account_id) return true;
+
+  if (account.account_type === 'CLERK_FLOAT') {
+    if (!refId.includes('CLERK') && !refId.includes('FLOAT')) return false;
+    return isCashBranchMatch(account.branch_id, transferBranchId || refId.replace(/^ACC-CLERK-/, ''));
+  }
+  if (account.account_type === 'SAFE') {
+    if (!refId.includes('SAFE') || refId.includes('HQ')) return false;
+    return isCashBranchMatch(account.branch_id, transferBranchId || refId.replace(/^ACC-BR-SAFE-/, ''));
+  }
+  if (account.account_type === 'HQ_SAFE') {
+    return refId.includes('HQ-SAFE') || refId.includes('ACC-HQ-SAFE');
+  }
+  if (account.account_type === 'BANK_ACCOUNT') {
+    if (account.account_subtype === 'ECOCASH' || account.account_id.includes('ECOCASH')) {
+      return refId.includes('ECOCASH');
+    }
+    if (account.account_subtype === 'ZIG' || account.account_id.includes('ZIG')) {
+      return refId.includes('ZIG');
+    }
+  }
+  return false;
+};
+
+/**
+ * Deterministic Ledger Reconciliation:
+ * Recomputes SAFE, CLERK_FLOAT, HQ_SAFE, and BANK_ACCOUNT balances directly from the
+ * authoritative CashTransfer ledger so every device converges to the EXACT same balance
+ * regardless of concurrent offline edits, LWW overwrite races, clock skew, or cloud balance locks.
+ */
+export const reconcileCashAccountsFromTransfers = (options?: {
+  companyId?: string;
+  syncChanged?: boolean;
+  silent?: boolean;
+}): CashAccount[] => {
+  const currentCompany = options?.companyId || getCurrentCompanyId();
+  const rawAccounts = getRawStoredCashAccounts();
+  const rawTransfers = getRawStoredCashTransfers();
+
+  const companyTransfers = rawTransfers.filter((t) => isCashCompanyMatch(t.company_id, currentCompany));
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  let anyChanged = false;
+  const changedAccounts: CashAccount[] = [];
+
+  const updatedAll = rawAccounts.map((acc) => {
+    if (!isCashCompanyMatch(acc.company_id, currentCompany)) return acc;
+    if (
+      acc.account_type !== 'SAFE' &&
+      acc.account_type !== 'CLERK_FLOAT' &&
+      acc.account_type !== 'HQ_SAFE' &&
+      acc.account_type !== 'BANK_ACCOUNT'
+    ) {
+      return acc;
+    }
+
+    let netUsd = 0;
+    let netNative = 0;
+    let matchedCount = 0;
+
+    const legacyBankMatches = (t: CashTransfer): boolean => {
+      if (acc.account_type !== 'BANK_ACCOUNT') return false;
+      if (!t.bank_name) return false;
+      const bankNeedle = t.bank_name.toLowerCase().trim().slice(0, 4);
+      return Boolean(bankNeedle) && acc.account_name.toLowerCase().includes(bankNeedle);
+    };
+
+    for (const t of companyTransfers) {
+      const settled = isSettledCashTransferStatus(t.status);
+      const inTransit = String(t.status || '').toUpperCase().trim() === 'IN_TRANSIT';
+      if (!settled && !inTransit) continue;
+
+      const amt = Math.round((Number(t.amount) || 0) * 100) / 100;
+      if (!Number.isFinite(amt) || amt <= 0) continue;
+
+      const nativeAmt = acc.native_currency
+        ? (t.native_amount !== undefined && Number.isFinite(Number(t.native_amount))
+            ? Math.round(Number(t.native_amount) * 100) / 100
+            : Math.round(amt * (Number(t.exchange_rate) || getCurrencyRate(acc.native_currency) || 1) * 100) / 100)
+        : 0;
+
+      let deltaUsd = 0;
+      let deltaNative = 0;
+
+      if (t.type === 'CAPITAL_INFUSION') {
+        if (settled && acc.account_type !== 'BANK_ACCOUNT') {
+          const matchesTarget =
+            isLedgerRefMatchingAccount(t.to_account_id, acc, t.branch_id) ||
+            (!t.to_account_id && isLedgerRefMatchingAccount(t.from_account_id, acc, t.branch_id));
+          if (matchesTarget) {
+            deltaUsd += amt;
+          }
+        }
+      } else if (t.type === 'BANK_WITHDRAWAL') {
+        if (settled) {
+          if (acc.account_type === 'BANK_ACCOUNT') {
+            const matchesBank =
+              isLedgerRefMatchingAccount(t.from_account_id, acc, t.branch_id) ||
+              (!t.from_account_id?.includes('BANK') && legacyBankMatches(t));
+            if (matchesBank) {
+              deltaUsd -= amt;
+              deltaNative -= nativeAmt;
+            }
+          } else {
+            const matchesSafe =
+              isLedgerRefMatchingAccount(t.to_account_id, acc, t.branch_id) ||
+              (!t.to_account_id && isLedgerRefMatchingAccount(t.from_account_id, acc, t.branch_id));
+            if (matchesSafe) {
+              deltaUsd += amt;
+            }
+          }
+        }
+      } else if (t.type === 'BANK_DEPOSIT') {
+        if (acc.account_type === 'BANK_ACCOUNT') {
+          if (settled) {
+            const matchesBank =
+              isLedgerRefMatchingAccount(t.to_account_id, acc, t.branch_id) ||
+              (!t.to_account_id && legacyBankMatches(t));
+            if (matchesBank) {
+              deltaUsd += amt;
+              deltaNative += nativeAmt;
+            }
+          }
+        } else if (isLedgerRefMatchingAccount(t.from_account_id, acc, t.branch_id)) {
+          deltaUsd -= amt;
+        }
+      } else if (t.type === 'ELECTRONIC_SETTLEMENT') {
+        if (settled && acc.account_type === 'BANK_ACCOUNT') {
+          const matchesBank =
+            isLedgerRefMatchingAccount(t.to_account_id, acc, t.branch_id) ||
+            (!t.to_account_id && legacyBankMatches(t));
+          if (matchesBank) {
+            deltaUsd += amt;
+            deltaNative += nativeAmt;
+          }
+        }
+      } else {
+        // FLOAT_ISSUE, TILL_COLLECTION, BRANCH_TO_HQ, HQ_TO_BRANCH, SUPPLIER_PAYMENT, THIRD_PARTY_PAYOUT
+        const matchesFrom = isLedgerRefMatchingAccount(t.from_account_id, acc, t.branch_id);
+        const matchesTo = isLedgerRefMatchingAccount(t.to_account_id, acc, t.branch_id);
+        if (matchesFrom && matchesTo) {
+          // Self-referencing legacy transfer has zero net effect
+        } else if (matchesTo && settled) {
+          deltaUsd += amt;
+          deltaNative += nativeAmt;
+        } else if (matchesFrom) {
+          deltaUsd -= amt;
+          deltaNative -= nativeAmt;
+        }
+      }
+
+      if (Math.abs(deltaUsd) > 0.0001 || Math.abs(deltaNative) > 0.0001) {
+        netUsd += deltaUsd;
+        netNative += deltaNative;
+        matchedCount += 1;
+      }
+    }
+
+    if (matchedCount === 0) return acc;
+
+    const reconciledUsd = Math.max(0, Math.round(netUsd * 100) / 100);
+    const reconciledNative = acc.native_currency ? Math.max(0, Math.round(netNative * 100) / 100) : acc.native_balance;
+    const prevUsd = Math.round((Number(acc.current_balance) || 0) * 100) / 100;
+    const prevNative = acc.native_currency ? Math.round((Number(acc.native_balance) || 0) * 100) / 100 : acc.native_balance;
+
+    const usdDiffers = Math.abs(reconciledUsd - prevUsd) > 0.005;
+    const nativeDiffers =
+      acc.native_currency !== undefined &&
+      reconciledNative !== undefined &&
+      Math.abs((reconciledNative || 0) - (prevNative || 0)) > 0.005;
+
+    if (!usdDiffers && !nativeDiffers) return acc;
+
+    anyChanged = true;
+    const prevMs = parseTimestampMs(acc.updatedAt || (acc as any).lastUpdated || acc.updated_at);
+    const nextMs = Math.max(nowMs, prevMs + 1);
+    const nextIso = new Date(nextMs).toISOString();
+    const nextAcc: CashAccount = {
+      ...acc,
+      current_balance: reconciledUsd,
+      ...(acc.native_currency ? { native_balance: reconciledNative } : {}),
+      updated_at: nextIso,
+      updatedAt: nextMs,
+      lastUpdated: nextIso,
+    };
+    changedAccounts.push(nextAcc);
+    return nextAcc;
+  });
+
+  if (anyChanged) {
+    setStored(STORAGE_KEYS.CASH_ACCOUNTS, updatedAll);
+    if (options?.syncChanged) {
+      changedAccounts.forEach((acc) => {
+        saveCashAccount(acc, { silent: true });
+      });
+    }
+    notifyListeners();
+    if (typeof window !== 'undefined' && !options?.silent) {
+      window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated'));
+      window.dispatchEvent(new CustomEvent('saimetric_accounts_updated'));
+    }
+  }
+
+  return getAllCashAccounts();
 };
 
 export const getAllCashTransfers = (branchId?: string): CashTransfer[] => {
@@ -26401,6 +27095,7 @@ export const saveCashTransfer = (
   const currentCompany = getCurrentCompanyId();
   const transferKey = String(transfer.transfer_id || (transfer as any).id || '').trim();
   const index = all.findIndex((t) => String(t.transfer_id || (t as any).id || '').trim() === transferKey);
+  const existing = index >= 0 ? all[index] : undefined;
 
   const rawAmt = typeof transfer.amount === 'number' ? transfer.amount : parseFloat(String(transfer.amount || '0'));
   const safeAmt = Number.isFinite(rawAmt) ? Math.round(rawAmt * 100) / 100 : 0;
@@ -26411,19 +27106,33 @@ export const saveCashTransfer = (
   }
 
   const nowMs = Date.now();
-  const nowIso = new Date(nowMs).toISOString();
+  const existingMs = existing
+    ? parseTimestampMs(existing.updatedAt ?? existing.lastUpdated ?? (existing as any).hubTimestamp ?? existing.created_at)
+    : 0;
+  const isLocalMutation = !options?.fromSync && !(transfer as any).fromMesh;
+  const nextUpdatedMs = isLocalMutation
+    ? Math.max(nowMs, existingMs + 1)
+    : (transfer.updatedAt || nowMs);
+  const nextUpdatedIso = isLocalMutation
+    ? new Date(nextUpdatedMs).toISOString()
+    : (transfer.lastUpdated || new Date(nextUpdatedMs).toISOString());
   const companyLevel = isCompanyLevelCashTransfer(transfer);
+  const statusRank = Math.max(Number((transfer as any).rank || 0), getTransferStatusRank(transfer.status));
 
   const toSave: CashTransfer = {
     ...transfer,
     transfer_id: transferKey || transfer.transfer_id,
     amount: safeAmt,
+    rank: statusRank,
     company_id: transfer.company_id || currentCompany,
     target_branch_id: companyLevel ? 'ALL' : (transfer.target_branch_id || transfer.branch_id),
-    created_at: transfer.created_at || nowIso,
-    updatedAt: (options?.fromSync ? (transfer.updatedAt || nowMs) : nowMs),
-    lastUpdated: (options?.fromSync ? (transfer.lastUpdated || nowIso) : nowIso),
-  };
+    created_at: transfer.created_at || existing?.created_at || nextUpdatedIso,
+    updatedAt: nextUpdatedMs,
+    lastUpdated: nextUpdatedIso,
+    // CRITICAL: Local transitions (e.g. PENDING_ACCEPTANCE -> COMPLETED on Device B) MUST clear
+    // isCloudSynced & synced so Hub and Cloud immediately propagate the new status back to Device A!
+    ...(isLocalMutation ? { isCloudSynced: false, synced: false, fromMesh: false } : {}),
+  } as CashTransfer;
 
   let updated: CashTransfer[];
   if (index >= 0) {
@@ -26434,8 +27143,8 @@ export const saveCashTransfer = (
   }
 
   setStored(STORAGE_KEYS.CASH_TRANSFERS, updated);
-  if (!options?.fromSync && !(transfer as any).fromMesh) {
-    console.log(`[Row10] Direct enqueue: CashTransfers ${toSave.transfer_id} (fromSync=${options?.fromSync ?? false})`);
+  if (isLocalMutation) {
+    console.log(`[Row10] Direct enqueue: CashTransfers ${toSave.transfer_id} status=${toSave.status} rank=${statusRank}`);
     enqueueSync('CashTransfers' as any, index >= 0 ? 'UPDATE' : 'INSERT', toSave);
     notifyCashTransferChanged(toSave);
   }
@@ -26488,14 +27197,26 @@ export const ingestMeshCashTransfer = (transfer: CashTransfer): boolean => {
   }
 
   const companyLevel = isCompanyLevelCashTransfer(transfer);
+  const mergedLinks = Array.from(
+    new Set([
+      ...(Array.isArray(existing?.linked_cash_log_ids) ? existing.linked_cash_log_ids : []),
+      ...(Array.isArray(transfer.linked_cash_log_ids) ? transfer.linked_cash_log_ids : []),
+    ])
+  );
   const merged: CashTransfer = {
     ...(existing || {}),
     ...transfer,
     transfer_id: transferKey,
     amount: safeAmt,
+    rank: Math.max(
+      Number((existing as any)?.rank || 0),
+      Number((transfer as any)?.rank || 0),
+      getTransferStatusRank(transfer.status)
+    ),
+    linked_cash_log_ids: mergedLinks,
     company_id: transfer.company_id || existing?.company_id || currentCompany,
     target_branch_id: companyLevel ? 'ALL' : (transfer.target_branch_id || transfer.branch_id || existing?.branch_id),
-  };
+  } as CashTransfer;
 
   let updated: CashTransfer[];
   if (existingIdx >= 0) {
@@ -26506,8 +27227,66 @@ export const ingestMeshCashTransfer = (transfer: CashTransfer): boolean => {
   }
   setStored(STORAGE_KEYS.CASH_TRANSFERS, updated);
 
-  // Propagate linked GRV / Supplier Invoice PAID status across devices when transfer settles/approves
+  // Immediately reconcile SAFE / CLERK_FLOAT / HQ_SAFE / BANK_ACCOUNT balances deterministically
+  // so every peer reflects accepted floats, cash lifts, supplier payments, and safe transfers identically!
+  try {
+    reconcileCashAccountsFromTransfers({ companyId: merged.company_id || currentCompany, silent: true });
+  } catch (_) {}
+
+  // If a FLOAT_ISSUE settled on another device, ensure Form 2's CashMovement exists locally on this device
+  // (idempotently keyed by sourceRef === transfer_id) so Form 2 & Form 4 reflect it instantaneously!
   const stUpper = String(merged.status || '').toUpperCase().trim();
+  if (
+    merged.type === 'FLOAT_ISSUE' &&
+    (stUpper === 'COMPLETED' || stUpper === 'RECEIVED' || stUpper === 'APPROVED') &&
+    safeAmt > 0
+  ) {
+    try {
+      const allStaff = getAllSalespeople();
+      const recipLower = String(merged.recipient_name || '').trim().toLowerCase();
+      const targetStaff =
+        allStaff.find((s) => s.id === merged.received_by_user_id) ||
+        (recipLower ? allStaff.find((s) => s.name?.toLowerCase().trim() === recipLower) : undefined);
+
+      if (targetStaff) {
+        const effBranch = merged.branch_id || getCurrentBranchId();
+        const effDate = toDateStringSafe(merged.received_at || merged.created_at) || getTodayDateString();
+        const sId = getShiftId(targetStaff.id, effDate, effBranch);
+        const existingMoves = getMovements(undefined, effBranch);
+        const alreadyHasMove = existingMoves.some((m) => m.sourceRef === merged.transfer_id);
+        if (!alreadyHasMove) {
+          const hasOpening = existingMoves.some(
+            (m) =>
+              (m.shiftId === sId || (m.staffId === targetStaff.id && m.date === effDate)) &&
+              m.type === 'opening_float'
+          );
+          addMovement({
+            shiftId: sId,
+            staffId: targetStaff.id,
+            date: effDate,
+            timestamp: merged.received_at || merged.lastUpdated || merged.created_at || new Date().toISOString(),
+            type: hasOpening ? 'float_adjustment' : 'opening_float',
+            amount: safeAmt,
+            currency: 'USD',
+            direction: 'in',
+            affectsDrawer: true,
+            status: 'approved',
+            sourceModule: 'form2',
+            sourceRef: merged.transfer_id,
+            notes: `Till Float ${hasOpening ? 'Additional Float / Adjustment' : 'Shift Opening Float'} accepted by ${merged.received_by_user_name || targetStaff.name} (Voucher: ${merged.transfer_id})`,
+            approvedBy: merged.approved_by_user_id || merged.created_by_user_id,
+            approvedByName: merged.approved_by_user_name || merged.created_by_user_name,
+            approvedAt: merged.received_at || merged.created_at,
+            company_id: merged.company_id || currentCompany,
+            branch_id: effBranch,
+            fromMesh: true,
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Propagate linked GRV / Supplier Invoice PAID status across devices when transfer settles/approves
   if (
     merged.linked_grv_id &&
     (stUpper === 'COMPLETED' || stUpper === 'RECEIVED' || stUpper === 'APPROVED')
@@ -26601,6 +27380,7 @@ export const ingestMeshCashTransfer = (transfer: CashTransfer): boolean => {
     window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: merged }));
     window.dispatchEvent(new CustomEvent('saimetric_cash_updated', { detail: merged }));
     window.dispatchEvent(new CustomEvent('saimetric_accounts_updated', { detail: merged }));
+    window.dispatchEvent(new CustomEvent('saimetric_cash_movements_updated', { detail: merged }));
     if (merged.linked_grv_id) {
       window.dispatchEvent(new CustomEvent('saimetric_direct_grvs_updated'));
       window.dispatchEvent(new CustomEvent('saimetric_supplier_invoices_updated'));
@@ -27761,5 +28541,545 @@ export const archiveDailyBlindCount = (
     { fromSync: false }
   );
 };
+
+// ============================================================================
+// PURCHASE ORDERS — COMMERCIAL PROCUREMENT REGISTRY, APPROVAL & GRV LINKAGE
+// ============================================================================
+
+const PO_STATUS_RANK: Record<PurchaseOrderStatus, number> = {
+  DRAFT: 1,
+  REJECTED: 2,
+  PENDING_APPROVAL: 3,
+  APPROVED: 4,
+  PARTIALLY_RECEIVED: 5,
+  RECEIVED: 6,
+  CANCELLED: 7,
+};
+
+const normPoId = (val: unknown): string => String(val || '').trim().toUpperCase();
+
+export const isPurchaseOrderApprover = (user?: { role?: string } | null): boolean => {
+  const role = String(user?.role || '').trim().toUpperCase();
+  return (
+    role === 'MANAGER' ||
+    role === 'SUPERVISOR' ||
+    role === 'ADMIN' ||
+    role === 'OWNER' ||
+    role === 'SUPER_ADMIN'
+  );
+};
+
+const normalizePurchaseOrderLines = (lines: PurchaseOrderLine[]): PurchaseOrderLine[] => {
+  if (!Array.isArray(lines)) return [];
+  const seenLineIds = new Set<string>();
+  return lines
+    .filter((l) => l && (l.itemId || l.poDescription || l.masterDescription))
+    .map((l, idx) => {
+      let lineId = String(l.lineId || '').trim();
+      if (!lineId || seenLineIds.has(lineId)) {
+        lineId = `POL-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`;
+      }
+      seenLineIds.add(lineId);
+      const upc = Math.max(1, Number(l.unitsPerCase || 1));
+      const orderCases = Math.max(0, Number(l.orderCases || 0));
+      const orderSingles = Math.max(0, Number(l.orderSingles || 0));
+      const totalUnits =
+        orderCases > 0 || orderSingles > 0
+          ? Math.round(orderCases * upc + orderSingles)
+          : Math.max(0, Math.round(Number(l.totalUnits || 0)));
+      const caseCost = Math.max(0, Number(l.caseCost || 0));
+      const unitCost =
+        Number(l.unitCost || 0) > 0
+          ? Number(l.unitCost)
+          : caseCost > 0
+          ? Number((caseCost / upc).toFixed(4))
+          : 0;
+      const effectiveCaseCost = caseCost > 0 ? caseCost : Number((unitCost * upc).toFixed(2));
+      const lineTotal =
+        orderCases > 0 || orderSingles > 0
+          ? Number((orderCases * effectiveCaseCost + orderSingles * unitCost).toFixed(2))
+          : Number((totalUnits * unitCost).toFixed(2));
+      const masterDescription = String(l.masterDescription || l.poDescription || 'Unnamed Product').trim();
+      const poDescription = String(l.poDescription || masterDescription).trim();
+
+      return {
+        lineId,
+        itemId: String(l.itemId || '').trim(),
+        code: String(l.code || l.itemId || '').trim(),
+        barcode: l.barcode ? String(l.barcode).trim() : undefined,
+        masterDescription,
+        poDescription,
+        category: l.category || undefined,
+        orderCases,
+        orderSingles: orderSingles || 0,
+        unitsPerCase: upc,
+        totalUnits,
+        unitCost: Number(unitCost.toFixed(4)),
+        caseCost: Number(effectiveCaseCost.toFixed(2)),
+        lineTotal,
+        receivedCases: Math.max(0, Number(l.receivedCases || 0)),
+        receivedUnits: Math.max(0, Number(l.receivedUnits || 0)),
+        notes: l.notes ? String(l.notes).trim() : undefined,
+      };
+    });
+};
+
+const computePurchaseOrderTotals = (lines: PurchaseOrderLine[], taxPercent = 0) => {
+  const subtotal = Number(lines.reduce((acc, l) => acc + Number(l.lineTotal || 0), 0).toFixed(2));
+  const safeTax = Math.max(0, Number(taxPercent || 0));
+  const taxAmount = Number(((subtotal * safeTax) / 100).toFixed(2));
+  const grandTotal = Number((subtotal + taxAmount).toFixed(2));
+  const totalCases = Number(lines.reduce((acc, l) => acc + Number(l.orderCases || 0), 0).toFixed(2));
+  const totalUnits = Math.round(lines.reduce((acc, l) => acc + Number(l.totalUnits || 0), 0));
+  return { subtotal, taxAmount, grandTotal, totalCases, totalUnits };
+};
+
+export const getRawStoredPurchaseOrders = (): PurchaseOrder[] => {
+  const list = getStored<PurchaseOrder[]>(STORAGE_KEYS.PURCHASE_ORDERS, []);
+  return Array.isArray(list) ? list : [];
+};
+
+export const getPurchaseOrders = (
+  branchId?: string,
+  companyId?: string
+): PurchaseOrder[] => {
+  const targetCompany = companyId || getCurrentCompanyId();
+  const targetBranch = branchId || getCurrentBranchId();
+  const branches = getAllBranches();
+  const all = getRawStoredPurchaseOrders();
+
+  return all
+    .filter((rec) => {
+      if (!rec || !rec.id) return false;
+      const rComp = rec.company_id || rec.companyId;
+      if (targetCompany && rComp && normPoId(rComp) !== normPoId(targetCompany)) {
+        return false;
+      }
+      if (!targetBranch || targetBranch === 'ALL') return true;
+      return isRecordInBranchScope(rec.branch_id || rec.branchId, targetBranch, branches, targetCompany, rComp);
+    })
+    .sort((a, b) => {
+      const tA = new Date(a.createdAt || a.orderDate || 0).getTime() || Number(a.updatedAt || 0);
+      const tB = new Date(b.createdAt || b.orderDate || 0).getTime() || Number(b.updatedAt || 0);
+      return tB - tA;
+    });
+};
+
+export const getPurchaseOrderById = (idOrNumber: string): PurchaseOrder | null => {
+  if (!idOrNumber) return null;
+  const key = normPoId(idOrNumber);
+  return (
+    getRawStoredPurchaseOrders().find(
+      (r) => r && (normPoId(r.id) === key || normPoId(r.poNumber) === key)
+    ) || null
+  );
+};
+
+export const generateNextPoNumber = (branchCode?: string): string => {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const prefix = branchCode ? `PO-${String(branchCode).replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 4)}-` : 'PO-';
+  const rand = Math.floor(100 + Math.random() * 900);
+  return `${prefix}${yyyy}${mm}${dd}-${rand}`;
+};
+
+export const savePurchaseOrder = (
+  po: PurchaseOrder,
+  options?: { fromSync?: boolean }
+): PurchaseOrder => {
+  const now = Date.now();
+  const companyId = po.company_id || po.companyId || getCurrentCompanyId() || 'COMP-001';
+  const branchId = po.branch_id || po.branchId || getCurrentBranchId() || 'BR-MAIN';
+  const branchObj = getAllBranches().find(
+    (b) => normPoId(b.branchId || b.id) === normPoId(branchId)
+  );
+  const all = getRawStoredPurchaseOrders();
+  const existingIdx = all.findIndex((r) => r && normPoId(r.id) === normPoId(po.id));
+  const existing = existingIdx >= 0 ? all[existingIdx] : undefined;
+
+  const cleanLines = normalizePurchaseOrderLines(po.lines || []);
+  const totals = computePurchaseOrderTotals(cleanLines, po.taxPercent || 0);
+  const poNumber = String(po.poNumber || existing?.poNumber || po.id || generateNextPoNumber(branchObj?.code)).trim();
+  const poId = String(po.id || existing?.id || poNumber).trim();
+
+  const normalized: PurchaseOrder = {
+    ...existing,
+    ...po,
+    id: poId,
+    poNumber,
+    company_id: companyId,
+    companyId,
+    branch_id: branchId,
+    branchId,
+    branchName: po.branchName || existing?.branchName || branchObj?.name || 'Main Store',
+    lines: cleanLines,
+    ...totals,
+    linkedGrvIds: Array.from(new Set([...(existing?.linkedGrvIds || []), ...(po.linkedGrvIds || [])].filter(Boolean))),
+    createdAt: po.createdAt || existing?.createdAt || new Date().toISOString(),
+    updatedAt: options?.fromSync && po.updatedAt ? Number(po.updatedAt) : Math.max(now, Number(existing?.updatedAt || 0) + 1),
+    version: Math.max((existing?.version || 0) + 1, Number(po.version || 1)),
+    mutationSource: options?.fromSync ? po.mutationSource || 'SYNC' : 'LOCAL_UI',
+    isCloudSynced: options?.fromSync ? Boolean(po.isCloudSynced ?? true) : false,
+  };
+
+  const next =
+    existingIdx >= 0
+      ? all.map((r, idx) => (idx === existingIdx ? normalized : r))
+      : [normalized, ...all];
+
+  setStored(STORAGE_KEYS.PURCHASE_ORDERS, next);
+  notifyListeners();
+
+  if (!options?.fromSync) {
+    const envelope: SyncEnvelope<PurchaseOrder> = {
+      packetId: `purchase_order-${normalized.id}-${normalized.updatedAt}-${Math.random().toString(36).substring(2, 6)}`,
+      entityType: 'purchase_order',
+      entityId: normalized.id,
+      action: 'UPSERT',
+      data: normalized,
+      updatedAt: Number(normalized.updatedAt || now),
+      version: normalized.version || 1,
+      mutationSource: 'USER_EDIT',
+      originDeviceId: typeof localStorage !== 'undefined' ? localStorage.getItem('saimetric_device_id') || 'LOCAL' : 'LOCAL',
+      targetBranchId: branchId,
+      class: 'T2',
+      meta: {
+        companyId,
+        sheetName: 'PurchaseOrders',
+        branchCode: branchObj?.code || branchId,
+      },
+    };
+    void saveAndSyncThroughBridge(envelope).catch((err) => {
+      console.warn('[savePurchaseOrder] Bridge sync warning:', err);
+    });
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_purchase_orders_updated', { detail: { record: normalized } }));
+  }
+
+  return normalized;
+};
+
+export const submitPurchaseOrderForApproval = (
+  poId: string,
+  user: { id: string; name: string; role?: string }
+): { success: boolean; po?: PurchaseOrder; message?: string } => {
+  const existing = getPurchaseOrderById(poId);
+  if (!existing) return { success: false, message: 'Purchase Order not found.' };
+  if (!existing.lines || existing.lines.length === 0) {
+    return { success: false, message: 'Add at least one item before submitting for manager approval.' };
+  }
+  if (existing.status === 'APPROVED' || existing.status === 'PARTIALLY_RECEIVED' || existing.status === 'RECEIVED') {
+    return { success: false, message: 'This Purchase Order is already approved.' };
+  }
+  const updated = savePurchaseOrder(
+    {
+      ...existing,
+      status: 'PENDING_APPROVAL',
+      submittedAt: new Date().toISOString(),
+      rejectedAt: undefined,
+      rejectedById: undefined,
+      rejectedByName: undefined,
+      rejectionReason: undefined,
+    },
+    { fromSync: false }
+  );
+  addAuditLog({
+    action: 'PURCHASE_ORDER_SUBMITTED' as AuditAction,
+    details: `PO ${updated.poNumber} submitted for manager approval by ${user.name} ($${updated.grandTotal.toFixed(2)}, ${updated.lines.length} lines)`,
+    staffId: user.id,
+    staffName: user.name,
+  });
+  return { success: true, po: updated };
+};
+
+export const approvePurchaseOrder = (
+  poId: string,
+  manager: { id: string; name: string; role?: string }
+): { success: boolean; po?: PurchaseOrder; message?: string } => {
+  if (!isPurchaseOrderApprover(manager)) {
+    return { success: false, message: 'Only a Manager, Supervisor, Admin, or Owner can approve Purchase Orders.' };
+  }
+  const existing = getPurchaseOrderById(poId);
+  if (!existing) return { success: false, message: 'Purchase Order not found.' };
+  if (!existing.lines || existing.lines.length === 0) {
+    return { success: false, message: 'Cannot approve an empty Purchase Order.' };
+  }
+  if (existing.status === 'CANCELLED') {
+    return { success: false, message: 'Cancelled Purchase Orders cannot be approved.' };
+  }
+  const nowIso = new Date().toISOString();
+  const updated = savePurchaseOrder(
+    {
+      ...existing,
+      status: existing.status === 'PARTIALLY_RECEIVED' || existing.status === 'RECEIVED' ? existing.status : 'APPROVED',
+      approvedById: manager.id,
+      approvedByName: manager.name,
+      approvedAt: nowIso,
+      rejectedAt: undefined,
+      rejectedById: undefined,
+      rejectedByName: undefined,
+      rejectionReason: undefined,
+    },
+    { fromSync: false }
+  );
+  addAuditLog({
+    action: 'PURCHASE_ORDER_APPROVED' as AuditAction,
+    details: `PO ${updated.poNumber} APPROVED by ${manager.name} (${updated.supplierName}, $${updated.grandTotal.toFixed(2)})`,
+    staffId: manager.id,
+    staffName: manager.name,
+  });
+  return { success: true, po: updated };
+};
+
+export const rejectPurchaseOrder = (
+  poId: string,
+  manager: { id: string; name: string; role?: string },
+  reason: string
+): { success: boolean; po?: PurchaseOrder; message?: string } => {
+  if (!isPurchaseOrderApprover(manager)) {
+    return { success: false, message: 'Only a Manager, Supervisor, Admin, or Owner can reject Purchase Orders.' };
+  }
+  const existing = getPurchaseOrderById(poId);
+  if (!existing) return { success: false, message: 'Purchase Order not found.' };
+  if (existing.status === 'PARTIALLY_RECEIVED' || existing.status === 'RECEIVED') {
+    return { success: false, message: 'Cannot reject a Purchase Order that already has received deliveries.' };
+  }
+  const updated = savePurchaseOrder(
+    {
+      ...existing,
+      status: 'REJECTED',
+      rejectedById: manager.id,
+      rejectedByName: manager.name,
+      rejectedAt: new Date().toISOString(),
+      rejectionReason: String(reason || 'Returned for revision').trim(),
+    },
+    { fromSync: false }
+  );
+  addAuditLog({
+    action: 'PURCHASE_ORDER_REJECTED' as AuditAction,
+    details: `PO ${updated.poNumber} returned/rejected by ${manager.name}: ${updated.rejectionReason}`,
+    staffId: manager.id,
+    staffName: manager.name,
+  });
+  return { success: true, po: updated };
+};
+
+export const cancelPurchaseOrder = (
+  poId: string,
+  user: { id: string; name: string; role?: string },
+  reason?: string
+): { success: boolean; po?: PurchaseOrder; message?: string } => {
+  const existing = getPurchaseOrderById(poId);
+  if (!existing) return { success: false, message: 'Purchase Order not found.' };
+  if (existing.status === 'RECEIVED') {
+    return { success: false, message: 'Fully received Purchase Orders cannot be cancelled.' };
+  }
+  const canCancel = isPurchaseOrderApprover(user) || existing.status === 'DRAFT' || existing.createdById === user.id;
+  if (!canCancel) {
+    return { success: false, message: 'Only the creator (while Draft) or a Manager can cancel this Purchase Order.' };
+  }
+  const updated = savePurchaseOrder(
+    {
+      ...existing,
+      status: 'CANCELLED',
+      rejectionReason: reason ? String(reason).trim() : existing.rejectionReason,
+    },
+    { fromSync: false }
+  );
+  return { success: true, po: updated };
+};
+
+export const recordPurchaseOrderReceipt = (
+  poIdOrNumber: string,
+  grvRef: string,
+  receivedItems: Array<{
+    poLineId?: string;
+    itemId: string;
+    receivedCases?: number;
+    receivedUnits?: number;
+  }>
+): PurchaseOrder | null => {
+  if (!poIdOrNumber) return null;
+  const existing = getPurchaseOrderById(poIdOrNumber);
+  if (!existing) return null;
+
+  // Clone lines so we mutate safely
+  const nextLines = existing.lines.map((l) => ({
+    ...l,
+    receivedCases: Number(l.receivedCases || 0),
+    receivedUnits: Number(l.receivedUnits || 0),
+  }));
+
+  for (const rec of receivedItems) {
+    const addUnits = Math.max(0, Number(rec.receivedUnits || 0));
+    const addCases = Math.max(0, Number(rec.receivedCases || 0));
+    if (addUnits <= 0 && addCases <= 0) continue;
+
+    // 1. Direct match by unique poLineId (handles duplicate itemId flavour rows accurately!)
+    if (rec.poLineId) {
+      const target = nextLines.find((l) => l.lineId === rec.poLineId);
+      if (target) {
+        const upc = Math.max(1, Number(target.unitsPerCase || 1));
+        const unitsDelta = addUnits > 0 ? addUnits : Math.round(addCases * upc);
+        const casesDelta = addCases > 0 ? addCases : Number((unitsDelta / upc).toFixed(2));
+        target.receivedUnits = Number(target.receivedUnits || 0) + unitsDelta;
+        target.receivedCases = Number((Number(target.receivedCases || 0) + casesDelta).toFixed(2));
+        continue;
+      }
+    }
+
+    // 2. Fallback: match by Inventory Master itemId, filling remaining open lines in order
+    const matchingLines = nextLines.filter((l) => normPoId(l.itemId) === normPoId(rec.itemId));
+    if (matchingLines.length === 0) continue;
+    const upc = Math.max(1, Number(matchingLines[0].unitsPerCase || 1));
+    let remainingUnits = addUnits > 0 ? addUnits : Math.round(addCases * upc);
+
+    for (let i = 0; i < matchingLines.length && remainingUnits > 0; i++) {
+      const line = matchingLines[i];
+      const lineUpc = Math.max(1, Number(line.unitsPerCase || 1));
+      const lineRemaining = Math.max(0, Number(line.totalUnits || 0) - Number(line.receivedUnits || 0));
+      const isLast = i === matchingLines.length - 1;
+      const takeUnits = isLast ? remainingUnits : Math.min(remainingUnits, lineRemaining);
+      if (takeUnits > 0) {
+        line.receivedUnits = Number(line.receivedUnits || 0) + takeUnits;
+        line.receivedCases = Number((line.receivedUnits / lineUpc).toFixed(2));
+        remainingUnits -= takeUnits;
+      }
+    }
+  }
+
+  const allReceived =
+    nextLines.length > 0 &&
+    nextLines.every((l) => Number(l.receivedUnits || 0) >= Math.max(1, Number(l.totalUnits || 0)));
+  const anyReceived = nextLines.some((l) => Number(l.receivedUnits || 0) > 0);
+  const nextStatus: PurchaseOrderStatus = allReceived
+    ? 'RECEIVED'
+    : anyReceived
+    ? 'PARTIALLY_RECEIVED'
+    : existing.status;
+
+  const linkedGrvIds = Array.from(new Set([...(existing.linkedGrvIds || []), grvRef].filter(Boolean)));
+
+  return savePurchaseOrder(
+    {
+      ...existing,
+      lines: nextLines,
+      status: nextStatus,
+      linkedGrvIds,
+      lastReceivedAt: new Date().toISOString(),
+    },
+    { fromSync: false }
+  );
+};
+
+export const ingestMeshPurchaseOrder = (incoming: PurchaseOrder): boolean => {
+  if (!incoming || (!incoming.id && !incoming.poNumber)) return false;
+  const idKey = String(incoming.id || incoming.poNumber).trim();
+  const existing = getPurchaseOrderById(idKey);
+  const incomingTime = Number(incoming.updatedAt || extractRecordTimestamp(incoming) || Date.now());
+
+  if (!existing) {
+    savePurchaseOrder(
+      {
+        ...incoming,
+        id: idKey,
+        poNumber: String(incoming.poNumber || idKey).trim(),
+        updatedAt: incomingTime,
+      },
+      { fromSync: true }
+    );
+    return true;
+  }
+
+  const existingTime = Number(existing.updatedAt || extractRecordTimestamp(existing) || 0);
+  const existingRank = PO_STATUS_RANK[existing.status] || 1;
+  const incomingRank = PO_STATUS_RANK[incoming.status] || 1;
+
+  // Never downgrade an already-approved/received/cancelled PO back to DRAFT/PENDING from a stale packet
+  if (existingRank >= PO_STATUS_RANK.APPROVED && incomingRank < PO_STATUS_RANK.APPROVED && incomingTime <= existingTime + 120000) {
+    return false;
+  }
+  // Allow REJECTED -> PENDING_APPROVAL/DRAFT re-edits if strictly newer, otherwise drop stale same-rank packets
+  if (incomingRank === existingRank && incomingTime < existingTime - 2000) {
+    return false;
+  }
+
+  const useIncomingBase = incomingTime >= existingTime || incomingRank > existingRank;
+  const base = useIncomingBase ? incoming : existing;
+  const other = useIncomingBase ? existing : incoming;
+
+  // Preserve per-line received progress (max of receivedUnits/Cases by lineId)
+  const otherLineMap = new Map<string, PurchaseOrderLine>();
+  (other.lines || []).forEach((l) => {
+    if (l?.lineId) otherLineMap.set(l.lineId, l);
+  });
+
+  const mergedLines = (base.lines || other.lines || []).map((line) => {
+    const alt = line.lineId ? otherLineMap.get(line.lineId) : undefined;
+    if (!alt) return line;
+    const maxUnits = Math.max(Number(line.receivedUnits || 0), Number(alt.receivedUnits || 0));
+    const maxCases = Math.max(Number(line.receivedCases || 0), Number(alt.receivedCases || 0));
+    return {
+      ...line,
+      receivedUnits: maxUnits,
+      receivedCases: maxCases,
+    };
+  });
+
+  const mergedLinkedGrvs = Array.from(
+    new Set([...(existing.linkedGrvIds || []), ...(incoming.linkedGrvIds || [])].filter(Boolean))
+  );
+
+  // Determine monotonic final status (if receipts exist, never regress below PARTIALLY_RECEIVED)
+  let finalStatus: PurchaseOrderStatus = base.status;
+  if (existing.status === 'CANCELLED' || incoming.status === 'CANCELLED') {
+    finalStatus = incomingTime >= existingTime ? incoming.status : existing.status;
+  } else if (existingRank >= PO_STATUS_RANK.APPROVED || incomingRank >= PO_STATUS_RANK.APPROVED) {
+    const allRec =
+      mergedLines.length > 0 &&
+      mergedLines.every((l) => Number(l.receivedUnits || 0) >= Math.max(1, Number(l.totalUnits || 0)));
+    const anyRec = mergedLines.some((l) => Number(l.receivedUnits || 0) > 0) || mergedLinkedGrvs.length > 0;
+    finalStatus = allRec ? 'RECEIVED' : anyRec ? 'PARTIALLY_RECEIVED' : 'APPROVED';
+  }
+
+  savePurchaseOrder(
+    {
+      ...other,
+      ...base,
+      id: existing.id,
+      poNumber: base.poNumber || existing.poNumber,
+      status: finalStatus,
+      lines: mergedLines,
+      linkedGrvIds: mergedLinkedGrvs,
+      approvedById: base.approvedById || other.approvedById,
+      approvedByName: base.approvedByName || other.approvedByName,
+      approvedAt: base.approvedAt || other.approvedAt,
+      updatedAt: Math.max(incomingTime, existingTime),
+    },
+    { fromSync: true }
+  );
+  return true;
+};
+
+export const deletePurchaseOrder = (poId: string): boolean => {
+  const all = getRawStoredPurchaseOrders();
+  const target = all.find((r) => r && normPoId(r.id) === normPoId(poId));
+  if (!target) return false;
+  if (target.status === 'PARTIALLY_RECEIVED' || target.status === 'RECEIVED') {
+    return false;
+  }
+  const next = all.filter((r) => !(r && normPoId(r.id) === normPoId(poId)));
+  setStored(STORAGE_KEYS.PURCHASE_ORDERS, next);
+  notifyListeners();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('saimetric_purchase_orders_updated', { detail: { deletedId: poId } }));
+  }
+  return true;
+};
+
 
 

@@ -585,6 +585,16 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     uiEventName: 'saimetric_daily_blind_updated',
     description: 'Report-only Daily Blind Count submission with exact-moment frozen SOH, optional explanations, and archive state',
   },
+  purchase_order: {
+    entityType: 'purchase_order',
+    class: 'T2',
+    appendOnly: false,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: true,
+    uiEventName: 'saimetric_purchase_orders_updated',
+    description: 'Commercial Purchase Order with editable flavour/variant descriptions, manager approval workflow, and GRV receipt tracking',
+  },
   // AUDIT-NOTE: Row 3 (Hub LWW L5)
   casual_worker: {
     entityType: 'casual_worker',

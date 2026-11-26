@@ -18,19 +18,41 @@ export const POSCashierFloatModal: React.FC<POSCashierFloatModalProps> = ({
   const [errorMessage, setErrorMessage] = useState('');
   const [isDismissed, setIsDismissed] = useState(false);
 
+  const [dismissedId, setDismissedId] = useState<string | null>(null);
+
   useEffect(() => {
     const checkPendingFloats = () => {
-      if (isDismissed) return;
       const all = getCashTransfers();
-      // Find float issues awaiting cashier acceptance
-      const float = all.find((t) => t.type === 'FLOAT_ISSUE' && t.status === 'PENDING_ACCEPTANCE');
-      setPendingFloat(float || null);
+      const userNameLower = (currentUser?.name || '').toLowerCase().trim();
+      const userIdLower = (currentUser?.id || '').toLowerCase().trim();
+      // Find float issues awaiting this cashier's acceptance (or unassigned till floats)
+      const float = all.find((t) => {
+        if (t.type !== 'FLOAT_ISSUE' || t.status !== 'PENDING_ACCEPTANCE') return false;
+        const recipLower = (t.recipient_name || '').toLowerCase().trim();
+        const toAccLower = (t.to_account_id || '').toLowerCase().trim();
+        if (!recipLower) return true;
+        return recipLower === userNameLower || (Boolean(userIdLower) && toAccLower.includes(userIdLower));
+      });
+      if (float && float.transfer_id !== dismissedId) {
+        setPendingFloat(float);
+        setIsDismissed(false);
+      } else if (!float) {
+        setPendingFloat(null);
+      }
     };
 
     checkPendingFloats();
-    const interval = setInterval(checkPendingFloats, 4000);
-    return () => clearInterval(interval);
-  }, [isDismissed]);
+    const interval = setInterval(checkPendingFloats, 3000);
+    window.addEventListener('saimetric_cash_transfers_updated', checkPendingFloats);
+    window.addEventListener('saimetric_cash_updated', checkPendingFloats);
+    window.addEventListener('storage', checkPendingFloats);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('saimetric_cash_transfers_updated', checkPendingFloats);
+      window.removeEventListener('saimetric_cash_updated', checkPendingFloats);
+      window.removeEventListener('storage', checkPendingFloats);
+    };
+  }, [currentUser?.id, currentUser?.name, dismissedId]);
 
   if (!pendingFloat || isDismissed) {
     return null;
@@ -98,7 +120,10 @@ export const POSCashierFloatModal: React.FC<POSCashierFloatModalProps> = ({
           <div className="flex items-center space-x-2.5">
             <button
               type="button"
-              onClick={() => setIsDismissed(true)}
+              onClick={() => {
+                setDismissedId(pendingFloat.transfer_id);
+                setIsDismissed(true);
+              }}
               className="flex-1 min-h-[44px] px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition-colors"
             >
               Later (Keep in Drawer)

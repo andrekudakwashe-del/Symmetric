@@ -58,6 +58,7 @@ import {
   isValidBranchRecord,
   saveBranch,
   saveCashAccount,
+  reconcileCashAccountsFromTransfers,
   addSupplier,
   saveAdminSalesEntry,
   saveFinalCashCount,
@@ -86,6 +87,8 @@ import {
   getRawStoredDailyBlindCounts,
   ingestMeshDailyBlindConfig,
   ingestMeshDailyBlindCount,
+  getRawStoredPurchaseOrders,
+  ingestMeshPurchaseOrder,
 } from '../../db/roomDatabase';
 import { getMovements, addMovement } from '../../db/cashLedger';
 import {
@@ -264,6 +267,16 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
         const ts = extractRecordTimestamp(found);
         return ts > 0 ? { ...found, updatedAt: ts } : undefined;
       }
+      case 'purchase_order': {
+        const found = getRawStoredPurchaseOrders().find(
+          (p: any) =>
+            String(p.id || '').trim().toUpperCase() === cleanUpper ||
+            String(p.poNumber || '').trim().toUpperCase() === cleanUpper
+        );
+        if (!found) return undefined;
+        const ts = extractRecordTimestamp(found);
+        return ts > 0 ? { ...found, updatedAt: ts } : undefined;
+      }
       case 'stocktake_zone_assignment': {
         const found = getZoneAssignments(d?.sessionId).find(
           (z: any) => String(z.zoneId || '').trim().toUpperCase() === cleanUpper
@@ -275,7 +288,14 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
       case 'branch_lockdown': {
         const map = getBranchLockdowns();
         const targetBr = String(d?.branchId || cleanId || '').trim();
-        const found = map[targetBr];
+        const canonBr = (b?: string) => {
+          const u = String(b || '').trim().toUpperCase();
+          return u === '1' || u === 'BR001' || u === 'BR-001' || u === 'BR-MAIN' || u === 'HQ-01' || u === 'MAIN' ? 'BR-MAIN' : u;
+        };
+        const targetCanon = canonBr(targetBr);
+        const found =
+          map[targetBr] ||
+          Object.entries(map).find(([k, st]) => st && (canonBr(k) === targetCanon || canonBr(st.branchId) === targetCanon))?.[1];
         if (!found) return undefined;
         const ts = extractRecordTimestamp(found);
         return ts > 0 ? { ...found, updatedAt: ts } : undefined;
@@ -1197,6 +1217,9 @@ export function applyCloudEnvelopeToRoomDb(
           options?.onBalanceProtected?.('cash_account', accId);
         }
         saveCashAccount(accPayload, { fromSync: true });
+        try {
+          reconcileCashAccountsFromTransfers({ companyId: incComp || undefined, silent: true });
+        } catch (_) {}
         if (accTime > 0) setLastCashAccountSync(Math.max(getLastCashAccountSync(), accTime));
         if (typeof window !== 'undefined') {
           window.dispatchEvent(new CustomEvent('saimetric_cash_accounts_updated', { detail: d }));
@@ -1739,6 +1762,19 @@ export function applyCloudEnvelopeToRoomDb(
         ingestMeshDailyBlindCount({
           ...d,
           id: recId,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+        });
+      }
+      break;
+    }
+
+    case 'purchase_order': {
+      if (d) {
+        const recId = d.id || d.poNumber || envelope.entityId;
+        ingestMeshPurchaseOrder({
+          ...d,
+          id: recId,
+          poNumber: d.poNumber || recId,
           updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
         });
       }

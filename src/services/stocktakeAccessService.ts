@@ -193,22 +193,44 @@ export const resolveStocktakePersona = (
   return 'COUNTER';
 };
 
+const canonAccessBranch = (b?: string | null): string => {
+  const u = String(b || '').trim().toUpperCase();
+  if (!u || u === 'ALL') return '';
+  if (u === '1' || u === 'BR001' || u === 'BR-001' || u === 'BR-MAIN' || u === 'HQ-01' || u === 'MAIN') {
+    return 'BR-MAIN';
+  }
+  return u;
+};
+
+const resolveConcreteBranchId = (branchId?: string | null, user?: Salesperson | null): string => {
+  const candidates = [branchId, user?.branchId, user?.branch_id, getCurrentBranchId()];
+  for (const c of candidates) {
+    const clean = String(c || '').trim();
+    if (clean && clean.toUpperCase() !== 'ALL') {
+      return clean;
+    }
+  }
+  return '';
+};
+
 export const getActiveBranchStocktakeSessions = (branchId?: string): StocktakeSession[] => {
-  const targetBranch = String(branchId || getCurrentBranchId() || '').trim().toUpperCase();
+  const targetCanon = canonAccessBranch(resolveConcreteBranchId(branchId));
+  if (!targetCanon) return [];
   const sessions = getStocktakeSessions();
   return sessions.filter((s) => {
-    const sessBranch = String(s.branchId || (s as any).branch_id || '').trim().toUpperCase();
-    const branchMatches = !targetBranch || !sessBranch || sessBranch === targetBranch;
+    const sessCanon = canonAccessBranch(s.branchId || (s as any).branch_id || '');
+    const branchMatches = Boolean(sessCanon) && sessCanon === targetCanon;
     return branchMatches && isActiveStocktakeStatus(s.status);
   });
 };
 
 export const getDraftBranchStocktakeSessions = (branchId?: string): StocktakeSession[] => {
-  const targetBranch = String(branchId || getCurrentBranchId() || '').trim().toUpperCase();
+  const targetCanon = canonAccessBranch(resolveConcreteBranchId(branchId));
+  if (!targetCanon) return [];
   const sessions = getStocktakeSessions();
   return sessions.filter((s) => {
-    const sessBranch = String(s.branchId || (s as any).branch_id || '').trim().toUpperCase();
-    const branchMatches = !targetBranch || !sessBranch || sessBranch === targetBranch;
+    const sessCanon = canonAccessBranch(s.branchId || (s as any).branch_id || '');
+    const branchMatches = Boolean(sessCanon) && sessCanon === targetCanon;
     return branchMatches && isDraftStocktakeStatus(s.status);
   });
 };
@@ -253,22 +275,28 @@ export const canClaimSegmentSlot = (
 };
 
 export const getActiveLockdownSession = (branchId?: string): StocktakeSession | null => {
-  const targetBranch = branchId || getCurrentBranchId();
+  const targetBranch = resolveConcreteBranchId(branchId);
   if (!targetBranch) return null;
 
+  const targetCanon = canonAccessBranch(targetBranch);
   const lockdowns = getBranchLockdowns();
-  const lockState = lockdowns[targetBranch];
-  if (lockState?.isLocked && lockState.sessionId) {
-    const linked = getStocktakeSessionById(lockState.sessionId);
-    if (linked && isActiveStocktakeStatus(linked.status)) {
+  const matchedLock =
+    lockdowns[targetBranch] ||
+    Object.entries(lockdowns).find(
+      ([k, st]) => st && (canonAccessBranch(k) === targetCanon || canonAccessBranch(st.branchId) === targetCanon)
+    )?.[1];
+
+  if (matchedLock?.isLocked && matchedLock.sessionId) {
+    const linked = getStocktakeSessionById(matchedLock.sessionId);
+    if (linked && isActiveStocktakeStatus(linked.status) && linked.isLockdownActive !== false) {
       return linked;
     }
   }
 
-  // Fallback check if session flag is active in storage
+  // Fallback check if session flag is active in storage for THIS exact branch
   const activeSessions = getActiveBranchStocktakeSessions(targetBranch);
   const lockdownSess = activeSessions.find(
-    (s) => Boolean(s.isLockdownActive) || (s.countType === 'FULL_LOCKDOWN' && isBranchInLockdown(targetBranch))
+    (s) => Boolean(s.isLockdownActive) && s.status !== 'PAUSED'
   );
   return lockdownSess || null;
 };
@@ -390,9 +418,9 @@ export const isTabAllowedUnderLockdownOrStocktake = (
     return tab === 'stocktake';
   }
 
-  const effectiveBranch = branchId || user.branchId || user.branch_id || getCurrentBranchId();
+  const effectiveBranch = resolveConcreteBranchId(branchId, user);
   const lockdownSess = getActiveLockdownSession(effectiveBranch);
-  const branchLocked = isBranchInLockdown(effectiveBranch) || Boolean(lockdownSess);
+  const branchLocked = (Boolean(effectiveBranch) && isBranchInLockdown(effectiveBranch)) || Boolean(lockdownSess);
 
   if (!branchLocked) {
     return true;

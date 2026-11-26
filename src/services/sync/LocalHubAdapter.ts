@@ -573,8 +573,16 @@ export class LocalHubAdapter implements SyncAdapter {
     const isCatalogPacket = this.isCatalogOrCompanyWirePacket(wirePacket, topicSuffix, targetBranch);
     const isStocktakePacket =
       topicSuffix.startsWith('stocktake') ||
-      (typeof wirePacket.type === 'string' && wirePacket.type.startsWith('STOCKTAKE_')) ||
-      (typeof wirePacket.action === 'string' && wirePacket.action.startsWith('STOCKTAKE_'));
+      topicSuffix.startsWith('daily_blind') ||
+      topicSuffix === 'branch_lockdown' ||
+      (typeof wirePacket.type === 'string' &&
+        (wirePacket.type.startsWith('STOCKTAKE_') ||
+          wirePacket.type === 'DAILY_BLIND_CONFIG' ||
+          wirePacket.type === 'DAILY_BLIND_COUNT')) ||
+      (typeof wirePacket.action === 'string' &&
+        (wirePacket.action.startsWith('STOCKTAKE_') ||
+          wirePacket.action === 'DAILY_BLIND_CONFIG_SYNC' ||
+          wirePacket.action === 'DAILY_BLIND_COUNT_SYNC'));
 
     const canonHubBranchAlias = (b?: string | null): string => {
       const u = String(b || '').trim().toUpperCase();
@@ -1278,33 +1286,72 @@ export class LocalHubAdapter implements SyncAdapter {
           lastUpdated: d.lastUpdated || new Date(d.updatedAt || envelope.updatedAt || Date.now()).toISOString(),
         };
 
-      case 'daily_blind_config':
+      case 'daily_blind_config': {
+        const configRec = {
+          ...d,
+          id: d.id || envelope.entityId,
+          company_id: d.company_id || d.companyId || ctx.companyId,
+          companyId: d.company_id || d.companyId || ctx.companyId,
+          branch_id: d.branch_id || d.branchId || envelope.targetBranchId || ctx.branchId,
+          branchId: d.branch_id || d.branchId || envelope.targetBranchId || ctx.branchId,
+          updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
+        };
         return {
           ...base,
-          ...d,
+          ...configRec,
           type: 'DAILY_BLIND_CONFIG',
           action: 'DAILY_BLIND_CONFIG_SYNC',
+          entityType: 'daily_blind_config',
+          sheetName: 'DailyBlindConfigs',
+          config: configRec,
+          payload: configRec,
+        };
+      }
+
+      case 'daily_blind_count': {
+        const countRec = {
+          ...d,
           id: d.id || envelope.entityId,
-          company_id: d.company_id || ctx.companyId,
-          companyId: d.company_id || ctx.companyId,
-          branch_id: d.branch_id || ctx.branchId,
-          branchId: d.branch_id || ctx.branchId,
+          company_id: d.company_id || d.companyId || ctx.companyId,
+          companyId: d.company_id || d.companyId || ctx.companyId,
+          branch_id: d.branch_id || d.branchId || envelope.targetBranchId || ctx.branchId,
+          branchId: d.branch_id || d.branchId || envelope.targetBranchId || ctx.branchId,
           updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
         };
-
-      case 'daily_blind_count':
         return {
           ...base,
-          ...d,
+          ...countRec,
           type: 'DAILY_BLIND_COUNT',
           action: 'DAILY_BLIND_COUNT_SYNC',
-          id: d.id || envelope.entityId,
-          company_id: d.company_id || ctx.companyId,
-          companyId: d.company_id || ctx.companyId,
-          branch_id: d.branch_id || ctx.branchId,
-          branchId: d.branch_id || ctx.branchId,
+          entityType: 'daily_blind_count',
+          sheetName: 'DailyBlindCounts',
+          record: countRec,
+          payload: countRec,
+        };
+      }
+
+      case 'purchase_order': {
+        const poRec = {
+          ...d,
+          id: d.id || d.poNumber || envelope.entityId,
+          poNumber: d.poNumber || d.id || envelope.entityId,
+          company_id: d.company_id || d.companyId || ctx.companyId,
+          companyId: d.company_id || d.companyId || ctx.companyId,
+          branch_id: d.branch_id || d.branchId || envelope.targetBranchId || ctx.branchId,
+          branchId: d.branch_id || d.branchId || envelope.targetBranchId || ctx.branchId,
           updatedAt: d.updatedAt || envelope.updatedAt || Date.now(),
         };
+        return {
+          ...base,
+          ...poRec,
+          type: 'PURCHASE_ORDER',
+          action: 'PURCHASE_ORDER_SYNC',
+          entityType: 'purchase_order',
+          sheetName: 'PurchaseOrders',
+          purchaseOrder: poRec,
+          payload: poRec,
+        };
+      }
 
       case 'stocktake_session':
         return {
@@ -1826,6 +1873,18 @@ export class LocalHubAdapter implements SyncAdapter {
       entityType = 'daily_blind_count';
       data = unwrapped.record && typeof unwrapped.record === 'object' ? { ...unwrapped, ...unwrapped.record } : unwrapped;
       entityId = String(data.id || unwrapped.id || unwrapped.entityId || '');
+    } else if (
+      pTypeUpper === 'PURCHASE_ORDER' ||
+      pTypeUpper === 'PURCHASE_ORDER_SYNC' ||
+      pTypeUpper === 'PURCHASE_ORDERS' ||
+      pTypeLower === 'purchase_order'
+    ) {
+      entityType = 'purchase_order';
+      data =
+        unwrapped.purchaseOrder && typeof unwrapped.purchaseOrder === 'object'
+          ? { ...unwrapped, ...unwrapped.purchaseOrder }
+          : unwrapped;
+      entityId = String(data.id || data.poNumber || unwrapped.id || unwrapped.poNumber || unwrapped.entityId || '');
     } else if (ENTITY_REGISTRY[pTypeLower]) {
       entityType = pTypeLower;
       entityId = String(unwrapped.entityId || unwrapped.id || data?.id || 'UNKNOWN');
@@ -1851,13 +1910,26 @@ export class LocalHubAdapter implements SyncAdapter {
       unwrapped.targetBranchId || unwrapped.target_branch_id || unwrapped.branchId || unwrapped.branch_id || ''
     );
     const fallbackUniqueId = `${entityType}-${entityId || 'row'}-${updatedAt}-${Math.random().toString(36).substring(2, 7)}`;
-    // T2 mutable records (like stocktake_session, inventory_item, staff, etc.) must NEVER reuse
-    // their static entity ID as a packetId, otherwise SyncCore's seenPacketIds drops subsequent edits.
-    const isMutableT2 = spec.class === 'T2' || entityType === 'inventory_item';
+    // Mutable T2 entities AND mutable-status T1 entities (cash_transfer, sale, direct_grv, etc.)
+    // must NEVER reuse their static entity ID as a packetId, otherwise SyncCore's seenPacketIds
+    // silently drops subsequent status transitions (e.g., FLOAT_ISSUE PENDING_ACCEPTANCE -> COMPLETED).
+    const MUTABLE_STATUS_T1 = new Set([
+      'cash_transfer',
+      'sale',
+      'direct_grv',
+      'cash_count',
+      'expense',
+      'credit_sale',
+      'customer_change',
+      'supplier_invoice_voucher',
+      'goods_received',
+      'inventory_item',
+    ]);
+    const isMutableRecord = spec.class === 'T2' || MUTABLE_STATUS_T1.has(entityType);
     const packetId = String(
       unwrapped.packetId ||
         unwrapped.packet_id ||
-        (!isMutableT2 && unwrapped.id ? unwrapped.id : '') ||
+        (!isMutableRecord && unwrapped.id ? unwrapped.id : '') ||
         fallbackUniqueId
     );
 
@@ -1924,6 +1996,7 @@ export class LocalHubAdapter implements SyncAdapter {
     if (sheet === 'StocktakeSessions' || raw === 'stocktake_session') return 'stocktake_session';
     if (sheet === 'DailyBlindConfigs' || raw === 'daily_blind_config') return 'daily_blind_config';
     if (sheet === 'DailyBlindCounts' || raw === 'daily_blind_count') return 'daily_blind_count';
+    if (sheet === 'PurchaseOrders' || raw === 'purchase_order' || raw === 'purchase_orders' || payload?.poNumber) return 'purchase_order';
     if (payload?.invoiceNumber) return 'sale';
     if (payload?.staffId && (payload?.in !== undefined || payload?.out !== undefined)) return 'cash_log';
     if (payload?.movementType) return 'stock_movement';

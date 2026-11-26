@@ -70,6 +70,8 @@ import {
   getFastMovingChecklist,
 } from '../../db/roomDatabase';
 import { SupplierRegistrationModal } from '../suppliers/SupplierRegistrationModal';
+import { PurchaseOrderRegistryView } from './PurchaseOrderRegistryView';
+import type { PurchaseOrderLine } from '../../types';
 import { INITIAL_GOODS_RECEIVED, INITIAL_SUPPLIER_INVOICES, INITIAL_INVENTORY_ITEMS } from '../../data/initialData';
 
 export const STORAGE_KEY_PO_DRAFT = 'saimetric_draft_purchase_order';
@@ -77,6 +79,8 @@ export const STORAGE_KEY_PO_DRAFT = 'saimetric_draft_purchase_order';
 export interface ProcurementReorderHubProps {
   currentUser?: Salesperson | null;
   onNavigateToDirectGrv?: (prefillItems?: any[], supplierId?: string) => void;
+  onReceiveDirectGrvPo?: (poId: string) => void;
+  onReceiveNormalGrvPo?: (poId: string) => void;
   onGoToMaster?: () => void;
 }
 
@@ -216,8 +220,18 @@ export interface PoLineItem {
 export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
   currentUser,
   onNavigateToDirectGrv,
+  onReceiveDirectGrvPo,
+  onReceiveNormalGrvPo,
   onGoToMaster,
 }) => {
+  const [activeMainSection, setActiveMainSection] = useState<'purchase_orders' | 'reorder_insights'>('purchase_orders');
+  const [externalPoDraftRequest, setExternalPoDraftRequest] = useState<{
+    nonce: number;
+    lines: PurchaseOrderLine[];
+    supplierId?: string;
+    supplierName?: string;
+  } | null>(null);
+
   // Database data
   const [inventoryItems, setInventoryItems] = useState<InventoryItem[]>(() => getInventoryItems());
   const [stockMovements, setStockMovements] = useState<StockMovementEntry[]>(() => getStockMovements());
@@ -1328,70 +1342,47 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
 
     setPoTargetSupplierId(initialSupplierId || '');
 
-    if (isBlank) {
-      // Direct blank purchase order: start with 0 days-cover line items
-      setPoCustomLines([]);
-    } else {
-      // Initial lines from selected items
-      const lines: PoLineItem[] = analyzedInventoryList
-        .filter((e) => {
-          if (!selectedItemIds.has(e.item.itemId) || e.customOrderCases <= 0) return false;
-          // If an explicit supplier was selected, filter only items matching this supplier (or approved alternate)
-          if (initialSupplierId && initialSupplierId !== 'ALL' && initialSupplierId !== 'UNASSIGNED') {
-            const matchesPrimary = e.supplierId === initialSupplierId;
-            const matchesAlt = e.allSuppliers?.some((s) => s.id === initialSupplierId);
-            return matchesPrimary || matchesAlt;
-          }
-          return true;
-        })
-        .map((e) => {
-          const originalCaseCost = e.item.costPerCase !== undefined 
-            ? e.item.costPerCase 
-            : ((e.item.costPerUnit !== undefined ? e.item.costPerUnit : ((e.item as any).lastCostPrice || (e.item as any).costPrice || 0)) * e.unitsPerCase);
-          const originalUnitCost = Number((originalCaseCost / e.unitsPerCase).toFixed(4));
-          const isModified = Math.abs(e.caseCost - originalCaseCost) > 0.005;
-
-          return {
-            itemId: e.item.itemId,
-            name: getItemName(e.item),
-            code: getItemCode(e.item),
-            barcode: e.item.barcode || '',
-            category: e.item.category || 'General',
-            orderCases: e.customOrderCases,
-            unitsPerCase: e.unitsPerCase,
-            totalUnits: e.customOrderUnits,
-            unitCost: e.unitCost,
-            caseCost: e.caseCost,
-            lineTotal: e.customTotalCost,
-            sellingPrice: e.unitSellingPrice,
-            originalCaseCost,
-            originalUnitCost,
-            isCostModified: isModified,
-          };
-        });
-
-      setPoCustomLines(lines);
-    }
-
-    // Default delivery date: today + leadTime
     const supObj = suppliers.find((s) => (s.supplierId || s.id) === initialSupplierId);
-    const leadDays = supObj?.leadTimeDays || defaultLeadTimeDays;
-    const expDate = new Date(todayTime + leadDays * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    setPoDeliveryDate(expDate);
+    const syncedLines: PurchaseOrderLine[] = isBlank
+      ? []
+      : analyzedInventoryList
+          .filter((e) => {
+            if (!selectedItemIds.has(e.item.itemId) || e.customOrderCases <= 0) return false;
+            if (initialSupplierId && initialSupplierId !== 'ALL' && initialSupplierId !== 'UNASSIGNED') {
+              const matchesPrimary = e.supplierId === initialSupplierId;
+              const matchesAlt = e.allSuppliers?.some((s) => s.id === initialSupplierId);
+              return matchesPrimary || matchesAlt;
+            }
+            return true;
+          })
+          .map((e, idx) => {
+            const masterName = getItemName(e.item);
+            return {
+              lineId: `POL-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+              itemId: e.item.itemId,
+              code: getItemCode(e.item),
+              barcode: e.item.barcode || undefined,
+              masterDescription: masterName,
+              poDescription: masterName,
+              category: e.item.category || 'General',
+              orderCases: e.customOrderCases,
+              orderSingles: 0,
+              unitsPerCase: Math.max(1, e.unitsPerCase || 1),
+              totalUnits: e.customOrderUnits,
+              unitCost: e.unitCost,
+              caseCost: e.caseCost,
+              lineTotal: e.customTotalCost,
+              receivedCases: 0,
+              receivedUnits: 0,
+            };
+          });
 
-    // Payment terms from supplier
-    if (supObj?.paymentTerms) {
-      setPoPaymentTerms(supObj.paymentTerms);
-    } else {
-      setPoPaymentTerms('30-Day Account Credit');
-    }
-
-    // Default delivery bay
-    setPoDeliveryBay(branch?.name ? `${branch.name} Loading Dock (${branch.address || branch.location || 'Central'})` : 'Main Store Receiving Dock');
-
-    const poNum = `PO-${new Date().getFullYear()}-${Math.floor(1000 + Math.random() * 9000)}`;
-    setGeneratedPoNumber(poNum);
-    setIsPoModalOpen(true);
+    setExternalPoDraftRequest({
+      nonce: Date.now(),
+      lines: syncedLines,
+      supplierId: supObj?.supplierId || (initialSupplierId !== 'ALL' && initialSupplierId !== 'UNASSIGNED' ? initialSupplierId : undefined),
+      supplierName: supObj?.name || undefined,
+    });
   };
 
   // Add Ad-Hoc Item into PO Modal
@@ -1681,24 +1672,26 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
     }
   };
 
-  return (
+  const effectiveUser: Salesperson = currentUser || {
+    id: 'USR-001',
+    name: 'Staff',
+    role: 'CASHIER',
+  } as Salesperson;
+
+  const reorderInsightsView = (
     <div className="min-h-screen bg-slate-50 text-slate-900 pb-28">
-      {/* TOP NOTCH HEADER HERO */}
-      <div className="bg-gradient-to-r from-slate-950 via-slate-900 to-indigo-950 text-white border-b border-indigo-900/40 shadow-lg">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-7">
-          {/* Company & Branch Identity Header */}
-          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-800 pb-5">
+      {/* REORDER INSIGHTS SUB-SECTION HEADER */}
+      <div className="bg-slate-900 text-white border-b border-slate-800">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-5">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 border-b border-slate-800 pb-4">
             <div className="space-y-1">
               <div className="flex items-center gap-2.5 flex-wrap">
-                <span className="p-2 bg-indigo-500/20 border border-indigo-400/40 rounded-xl text-indigo-400">
-                  <TrendingUp className="w-5 h-5" />
+                <span className="p-2 bg-indigo-500/20 border border-indigo-400/30 rounded-lg text-indigo-300">
+                  <TrendingUp className="w-4 h-4" />
                 </span>
-                <h1 className="text-xl sm:text-2xl font-black tracking-tight text-white flex items-center gap-2">
-                  Procurement &amp; Reorder Planning Hub
-                  <span className="text-[11px] font-bold px-2.5 py-0.5 bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 rounded-full">
-                    Enterprise Engine
-                  </span>
-                </h1>
+                <h2 className="text-lg sm:text-xl font-bold tracking-tight text-white">
+                  Reorder Insights &amp; Purchasing Decision Support
+                </h2>
               </div>
 
               {/* Dynamic Company & Branch Profile */}
@@ -3838,5 +3831,28 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
         </div>
       )}
     </div>
+  );
+
+  return (
+    <PurchaseOrderRegistryView
+      currentUser={effectiveUser}
+      activeSection={activeMainSection}
+      onChangeSection={setActiveMainSection}
+      onGoToMaster={onGoToMaster}
+      onReceiveDirectGrv={(poId) => {
+        if (onReceiveDirectGrvPo) {
+          onReceiveDirectGrvPo(poId);
+        } else if (onNavigateToDirectGrv) {
+          onNavigateToDirectGrv();
+        }
+      }}
+      onReceiveNormalGrv={(poId) => {
+        if (onReceiveNormalGrvPo) {
+          onReceiveNormalGrvPo(poId);
+        }
+      }}
+      externalDraftRequest={externalPoDraftRequest}
+      reorderContent={reorderInsightsView}
+    />
   );
 };

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "tsx server.ts",
     "start": "node server.ts",
-    "build": "vite build",
+    "build": "npm run build:hub-ota && vite build",
     "build:hub-ota": "node scripts/build-hub-ota.mjs",
     "test": "tsx scripts/run-regression-tests.ts",
     "check:budgets": "node scripts/check-budgets.mjs",

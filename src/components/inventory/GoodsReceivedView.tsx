@@ -56,6 +56,8 @@ import {
   getSupplierInvoiceVouchers,
   getSuppliers,
   getBranches,
+  getCurrentBranch,
+  getCurrentBranchId,
   receiveSupplierInvoice,
   saveInventoryItem,
   createPackagingVariant,
@@ -64,6 +66,7 @@ import {
   getSalespeople,
   saveSupplierInvoiceVoucher,
   verifySalespersonPin,
+  recordPurchaseOrderReceipt,
 } from '../../db/roomDatabase';
 import { landedCostService } from '../../services/landedCostService';
 import { getAllGoodsReceivedNotes } from '../../db/goodsReceivedNotes';
@@ -80,6 +83,7 @@ import { ProductAddEditModal } from './ProductAddEditModal';
 import { DailyGoodsReceivedReport } from './DailyGoodsReceivedReport';
 import { LandedCostReport } from './LandedCostReport';
 import { ProcurementTripManifestView } from './ProcurementTripManifestView';
+import { PurchaseOrderPickerModal, PurchaseOrderSelectionPayload } from './PurchaseOrderPickerModal';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
 import { safeDateSlice } from '../../utils/dateUtils';
@@ -89,6 +93,8 @@ interface GoodsReceivedViewProps {
   currentUser: Salesperson | null;
   preselectedItemId?: string;
   preselectedSupplierName?: string;
+  preselectedPoId?: string | null;
+  onClearPreselectedPo?: () => void;
   onGoToMaster: () => void;
   onGoToHome?: () => void;
 }
@@ -111,6 +117,8 @@ interface ExcelVoucherRow {
   pricePerCase: number | string; // current invoice cost per case/pack/unit
   sellingPrice: number | string; // single unit selling price
   canSellAsCase: boolean;
+  poLineId?: string;
+  poFlavourNote?: string;
   category: string;
   packagingVariants?: PackagingVariant[];
   expiryDate?: string;
@@ -425,6 +433,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   currentUser,
   preselectedItemId,
   preselectedSupplierName,
+  preselectedPoId,
+  onClearPreselectedPo,
   onGoToMaster,
   onGoToHome,
 }) => {
@@ -436,8 +446,13 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
 
   const [activeTab, setActiveTab] = useState<'create_invoice' | 'invoice_history' | 'trip_manifest' | 'daily_report' | 'landed_cost_report' | 'audit_log'>('create_invoice');
 
-  // Supplier Invoice Header State
-  const [selectedBranchId, setSelectedBranchId] = useState<string>('BR001');
+  // Supplier Invoice Header State (always default to active company branch, never hardcoded BR001)
+  const [selectedBranchId, setSelectedBranchId] = useState<string>(() => {
+    const activeBr = getCurrentBranch();
+    if (activeBr?.branchId && activeBr.branchId !== 'ALL') return activeBr.branchId;
+    const allBr = getBranches();
+    return allBr[0]?.branchId || getCurrentBranchId() || 'BR-MAIN';
+  });
   const [supplierName, setSupplierName] = useState<string>(
     preselectedSupplierName || ''
   );
@@ -452,12 +467,98 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
   const [supplierInvoiceNo, setSupplierInvoiceNo] = useState<string>(
     () => `INV-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`
   );
-  const [purchaseOrderNo, setPurchaseOrderNo] = useState<string>(
-    () => `PO-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`
-  );
+  const [purchaseOrderNo, setPurchaseOrderNo] = useState<string>('');
+  const [linkedPoId, setLinkedPoId] = useState<string | null>(null);
+  const [isPoPickerOpen, setIsPoPickerOpen] = useState<boolean>(false);
   const [invoiceDate, setInvoiceDate] = useState<string>(() => new Date().toISOString().split('T')[0]);
   const [paymentTerms, setPaymentTerms] = useState<string>('30-Day Account Credit');
   const [invoiceNotes, setInvoiceNotes] = useState<string>('');
+
+  useEffect(() => {
+    if (preselectedPoId) {
+      setActiveTab('create_invoice');
+      setIsPoPickerOpen(true);
+    }
+  }, [preselectedPoId]);
+
+  const handleLoadFromPurchaseOrder = (payload: PurchaseOrderSelectionPayload) => {
+    const { po, selectedLines } = payload;
+    setLinkedPoId(po.id);
+    setPurchaseOrderNo(po.poNumber);
+    if (po.supplierName) setSupplierName(po.supplierName);
+    if (po.paymentTerms) setPaymentTerms(po.paymentTerms);
+
+    const mappedRows: ExcelVoucherRow[] = [];
+    selectedLines.forEach((line, idx) => {
+      const catalogItem = items.find(
+        (it) => it.itemId.toUpperCase() === line.itemId.toUpperCase()
+      );
+      const masterId = catalogItem?.itemId || line.itemId;
+      // ALWAYS map back to original Inventory Master code & description (never overwrite with PO flavour)
+      const masterName = catalogItem?.name || line.masterDescription;
+      const upc = Math.max(1, Number(catalogItem?.unitsPerCase || line.unitsPerCase || 1));
+      const sellingPrice =
+        catalogItem?.sellingPriceUnit !== undefined ? String(catalogItem.sellingPriceUnit) : '';
+      const flavourNote =
+        line.poDescription &&
+        line.poDescription.trim().toLowerCase() !== masterName.trim().toLowerCase()
+          ? line.poDescription.trim()
+          : undefined;
+
+      if (line.receiveCases > 0) {
+        mappedRows.push({
+          id: `po-grv-${Date.now()}-${idx}-c`,
+          itemId: masterId,
+          itemName: masterName,
+          receiveAs: 'Cases',
+          qtyPerCaseDefault: upc,
+          originalUnitsPerCase: upc,
+          quantityCases: String(line.receiveCases),
+          quantitySingles: '',
+          quantityPacks: '',
+          lastCost: Number(catalogItem?.costPriceCase || line.caseCost || 0),
+          pricePerCase: String(Number(line.caseCost || catalogItem?.costPriceCase || 0)),
+          sellingPrice,
+          canSellAsCase: Boolean(catalogItem?.canSellAsCase ?? true),
+          category: catalogItem?.category || 'General',
+          packagingVariants: catalogItem?.packagingVariants || [],
+          poLineId: line.poLineId,
+          poFlavourNote: flavourNote,
+        });
+      }
+      if (line.receiveSingles > 0) {
+        mappedRows.push({
+          id: `po-grv-${Date.now()}-${idx}-s`,
+          itemId: masterId,
+          itemName: masterName,
+          receiveAs: 'Singles',
+          qtyPerCaseDefault: upc,
+          originalUnitsPerCase: upc,
+          quantityCases: '',
+          quantitySingles: String(line.receiveSingles),
+          quantityPacks: '',
+          lastCost: Number(catalogItem?.costPriceUnit || line.unitCost || 0),
+          pricePerCase: String(Number(line.unitCost || catalogItem?.costPriceUnit || 0)),
+          sellingPrice,
+          canSellAsCase: Boolean(catalogItem?.canSellAsCase ?? true),
+          category: catalogItem?.category || 'General',
+          packagingVariants: catalogItem?.packagingVariants || [],
+          poLineId: line.poLineId,
+          poFlavourNote: flavourNote,
+        });
+      }
+    });
+
+    if (mappedRows.length > 0) {
+      setRows(mappedRows);
+    }
+    setIsPoPickerOpen(false);
+    if (onClearPreselectedPo) onClearPreselectedPo();
+    showToast(
+      'success',
+      `Loaded ${mappedRows.length} line(s) from ${po.poNumber} mapped to original Inventory Master items.`
+    );
+  };
 
   const createBlankVoucherRow = (): ExcelVoucherRow => ({
     id: `row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
@@ -496,7 +597,13 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
           parsed.rows.some((r: any) => r.itemId || r.itemName || r.quantityCases || r.pricePerCase)
         ) {
           if (parsed.supplierName) setSupplierName(parsed.supplierName);
-          if (parsed.selectedBranchId) setSelectedBranchId(parsed.selectedBranchId);
+          if (parsed.selectedBranchId) {
+            const availableBranches = getBranches();
+            const validBranch = availableBranches.find((b) => b.branchId === parsed.selectedBranchId);
+            if (validBranch) {
+              setSelectedBranchId(validBranch.branchId);
+            }
+          }
           if (parsed.supplierInvoiceNo) setSupplierInvoiceNo(parsed.supplierInvoiceNo);
           if (parsed.purchaseOrderNo) setPurchaseOrderNo(parsed.purchaseOrderNo);
           if (parsed.invoiceDate) setInvoiceDate(parsed.invoiceDate);
@@ -512,6 +619,16 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       console.error('[GoodsReceivedView] Failed to restore GRV draft:', e);
     }
   }, []);
+
+  // Ensure selectedBranchId always maps to a valid branch in the active company
+  useEffect(() => {
+    if (branches.length === 0) return;
+    if (!branches.some((b) => b.branchId === selectedBranchId)) {
+      const activeBr = getCurrentBranch();
+      const matchedActive = branches.find((b) => b.branchId === activeBr?.branchId);
+      setSelectedBranchId(matchedActive?.branchId || branches[0].branchId);
+    }
+  }, [branches, selectedBranchId]);
 
   // 2. Auto-save Goods Received Voucher Draft on any keystroke or line modification
   useEffect(() => {
@@ -1143,7 +1260,16 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       return;
     }
 
-    const selectedBranch = branches.find((b) => b.branchId === selectedBranchId);
+    const activeBranch = getCurrentBranch();
+    const selectedBranch =
+      branches.find((b) => b.branchId === selectedBranchId) ||
+      branches.find((b) => b.branchId === activeBranch?.branchId) ||
+      branches[0] ||
+      activeBranch;
+    const effectiveBranchId =
+      selectedBranch?.branchId && selectedBranch.branchId !== 'ALL'
+        ? selectedBranch.branchId
+        : (activeBranch?.branchId && activeBranch.branchId !== 'ALL' ? activeBranch.branchId : getCurrentBranchId());
 
     // Validate landed costs for by_margin requirements
     for (let i = 0; i < landedCosts.length; i++) {
@@ -1225,8 +1351,8 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     const result = receiveSupplierInvoice({
       invoiceNo: supplierInvoiceNo,
       purchaseOrderNo,
-      branchId: selectedBranchId,
-      branchName: selectedBranch ? selectedBranch.name : 'Main Central Distribution & Warehouse',
+      branchId: effectiveBranchId,
+      branchName: selectedBranch?.name || activeBranch?.name || 'Main Store',
       supplier: supplierName,
       date: invoiceDate,
       paymentTerms,
@@ -1238,6 +1364,34 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
     });
 
     if (result.success && result.voucher) {
+      // Update linked Purchase Order receipt tracking if this GRV came from a PO
+      if (linkedPoId || purchaseOrderNo.trim()) {
+        const receiptLines = rows
+          .filter(
+            (r) =>
+              r.itemId &&
+              ((r.receiveAs === 'Cases' && (Number(r.quantityCases) || 0) > 0) ||
+                (r.receiveAs === 'Singles' && (Number(r.quantitySingles) || 0) > 0) ||
+                (r.receiveAs === 'Variant' && (Number(r.quantityPacks) || 0) > 0))
+          )
+          .map((r) => {
+            const upc = Math.max(1, Number(r.qtyPerCaseDefault || 1));
+            const c = r.receiveAs === 'Cases' ? Number(r.quantityCases || 0) : 0;
+            const s = r.receiveAs === 'Singles' ? Number(r.quantitySingles || 0) : 0;
+            const p =
+              r.receiveAs === 'Variant'
+                ? Number(r.quantityPacks || 0) * Math.max(1, Number(r.unitsPerPack || 1))
+                : 0;
+            return {
+              poLineId: r.poLineId,
+              itemId: r.itemId,
+              receivedCases: c,
+              receivedUnits: Math.round(c * upc + s + p),
+            };
+          });
+        recordPurchaseOrderReceipt(linkedPoId || purchaseOrderNo.trim(), result.voucher.invoiceNo, receiptLines);
+      }
+
       refreshData();
       setViewingVoucher(result.voucher);
       showToast(
@@ -1246,7 +1400,7 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
         result.ruleATriggeredCount
       );
 
-      // Generate new invoice number and reset voucher completely to blank
+      // Generate new invoice number and reset voucher with a clean blank line ready
       try {
         localStorage.removeItem('saimetric_draft_goods_received_voucher');
       } catch (e) {
@@ -1255,10 +1409,11 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
       setHasRestoredGrvDraft(false);
       setLastGrvDraftSavedAt(null);
       setSupplierInvoiceNo(`INV-${new Date().getFullYear()}-${Math.floor(10000 + Math.random() * 90000)}`);
-      setPurchaseOrderNo(`PO-${new Date().getFullYear()}-${Math.floor(100 + Math.random() * 900)}`);
+      setPurchaseOrderNo('');
+      setLinkedPoId(null);
       setInvoiceNotes('');
       setSupplierName('');
-      setRows([]); // New voucher is blank!
+      setRows([createBlankVoucherRow()]);
       setLandedCosts([]);
     } else {
       showToast('error', result.message || 'Failed to post voucher.');
@@ -1590,20 +1745,38 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
                   />
                 </div>
 
-                {/* 3. Purchase Order Number */}
+                {/* 3. Purchase Order Number (Optional PO Selection) */}
                 <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1 flex items-center justify-between">
-                    <span>Purchase Order Number</span>
-                    <span className="text-[10px] text-slate-500">Internal PO</span>
+                  <label className="block text-xs font-medium text-slate-300 mb-1 flex items-center justify-between gap-2">
+                    <span>Purchase Order (Optional)</span>
+                    <button
+                      type="button"
+                      onClick={() => setIsPoPickerOpen(true)}
+                      className="text-[10px] text-indigo-400 hover:text-indigo-300 font-bold cursor-pointer whitespace-nowrap"
+                    >
+                      Select Approved PO
+                    </button>
                   </label>
-                  <input
-                    id="input-po-number"
-                    type="text"
-                    value={purchaseOrderNo}
-                    onChange={(e) => setPurchaseOrderNo(e.target.value)}
-                    placeholder="e.g. PO-2026-004"
-                    className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white font-mono placeholder-slate-500 focus:outline-none focus:border-emerald-500"
-                  />
+                  <div className="flex items-center gap-1.5">
+                    <input
+                      id="input-po-number"
+                      type="text"
+                      value={purchaseOrderNo}
+                      onChange={(e) => {
+                        setPurchaseOrderNo(e.target.value);
+                        if (!e.target.value.trim()) setLinkedPoId(null);
+                      }}
+                      placeholder="Optional PO # or click Select"
+                      className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white font-mono placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setIsPoPickerOpen(true)}
+                      className="px-2.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-bold shrink-0 cursor-pointer whitespace-nowrap"
+                    >
+                      Load PO
+                    </button>
+                  </div>
                 </div>
 
                 {/* 4. Searchable Supplier Selector */}
@@ -3891,6 +4064,16 @@ export const GoodsReceivedView: React.FC<GoodsReceivedViewProps> = ({
           </div>
         </div>
       )}
+      <PurchaseOrderPickerModal
+        isOpen={isPoPickerOpen}
+        initialPoId={preselectedPoId || linkedPoId}
+        branchId={selectedBranchId}
+        onClose={() => {
+          setIsPoPickerOpen(false);
+          if (onClearPreselectedPo) onClearPreselectedPo();
+        }}
+        onSelectLines={handleLoadFromPurchaseOrder}
+      />
     </div>
   );
 };

@@ -13,6 +13,7 @@ import type {
   CashierShiftReportData,
   ShiftReportDetailMode,
 } from './cashierShiftReportService';
+import type { PurchaseOrder } from '../types';
 
 export type PaperWidth = '58mm' | '80mm';
 
@@ -1836,6 +1837,199 @@ class BluetoothThermalPrinter {
     }
 
     throw new Error('Bluetooth printer is not connected. Pair/connect a Bluetooth printer or use Print / Save PDF.');
+  }
+
+  /**
+   * Generates ESC/POS bytes for a Commercial Purchase Order optimized for 58mm (32-col) and 80mm (48-col).
+   * Always prints the line's edited `poDescription` (e.g. flavour/variant) alongside SKU code without touching Inventory Master.
+   */
+  public generateEscPosPurchaseOrder(
+    po: PurchaseOrder,
+    paperWidthOverride: PaperWidth = '58mm'
+  ): Uint8Array {
+    const companyId = po.company_id || po.companyId;
+    const config = getPrinterConfig(companyId);
+    const effectiveWidth: PaperWidth = paperWidthOverride || config.paperWidth || '58mm';
+    const maxCols = effectiveWidth === '58mm' ? 32 : 48;
+    const encoder = new TextEncoder();
+    const buffer: number[] = [];
+
+    const writeBytes = (...bytes: number[]) => buffer.push(...bytes);
+    const sanitize = (str: string) =>
+      String(str || '')
+        .replace(/[^\x20-\x7E]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const writeText = (str: string) => {
+      const encoded = encoder.encode(str);
+      for (let i = 0; i < encoded.length; i++) buffer.push(encoded[i]);
+    };
+    const writeLine = (str: string = '') => writeText(str + '\n');
+    const divider = (char: string = '-') => writeLine(char.repeat(maxCols));
+    const writeWrapped = (text: string) => {
+      const clean = sanitize(text);
+      if (!clean) return;
+      const words = clean.split(' ');
+      let line = '';
+      for (const word of words) {
+        if (!line) {
+          line = word.length > maxCols ? word.slice(0, maxCols) : word;
+        } else if (line.length + 1 + word.length <= maxCols) {
+          line += ' ' + word;
+        } else {
+          writeLine(line);
+          line = word.length > maxCols ? word.slice(0, maxCols) : word;
+        }
+      }
+      if (line) writeLine(line);
+    };
+    const writeCols = (left: string, right: string) => {
+      const l = sanitize(left);
+      const r = sanitize(right);
+      const avail = maxCols - r.length - 1;
+      const leftStr = avail > 0 ? l.slice(0, avail) : '';
+      const pad = Math.max(1, maxCols - leftStr.length - r.length);
+      writeLine(leftStr + ' '.repeat(pad) + r);
+    };
+    const fmtMoney = (n: number) => `$${Number(n || 0).toFixed(2)}`;
+
+    // Init printer
+    writeBytes(0x1b, 0x40);
+    // Center header
+    writeBytes(0x1b, 0x61, 0x01);
+    writeBytes(0x1b, 0x45, 0x01);
+    writeLine(sanitize(config.storeName || 'SAIMETRIC RETAIL').toUpperCase().slice(0, maxCols));
+    if (po.branchName || config.branchName) {
+      writeBytes(0x1b, 0x45, 0x00);
+      writeLine(sanitize(po.branchName || config.branchName || '').slice(0, maxCols));
+    }
+    if (config.storePhone) {
+      writeLine(`Tel: ${sanitize(config.storePhone)}`.slice(0, maxCols));
+    }
+    writeBytes(0x1b, 0x45, 0x01);
+    writeLine('PURCHASE ORDER');
+    writeBytes(0x1b, 0x45, 0x00);
+
+    // Status Banner
+    const statusLabel =
+      po.status === 'APPROVED' || po.status === 'PARTIALLY_RECEIVED' || po.status === 'RECEIVED'
+        ? `[ ${po.status.replace('_', ' ')} ]`
+        : `[ ${po.status.replace('_', ' ')} - NOT FINAL ]`;
+    writeLine(statusLabel.slice(0, maxCols));
+
+    // Left align body
+    writeBytes(0x1b, 0x61, 0x00);
+    divider('=');
+    writeCols('PO No:', po.poNumber || po.id);
+    writeCols('Date:', po.orderDate || new Date().toISOString().split('T')[0]);
+    if (po.expectedDeliveryDate) {
+      writeCols('Deliver By:', po.expectedDeliveryDate);
+    }
+    if (po.paymentTerms) {
+      writeCols('Terms:', po.paymentTerms);
+    }
+    divider('-');
+    writeBytes(0x1b, 0x45, 0x01);
+    writeWrapped(`SUPPLIER: ${po.supplierName || 'TBD'}`);
+    writeBytes(0x1b, 0x45, 0x00);
+    if (po.supplierPhone) writeWrapped(`Phone: ${po.supplierPhone}`);
+    divider('=');
+
+    writeBytes(0x1b, 0x45, 0x01);
+    writeCols('ITEM / VARIANT', 'TOTAL');
+    writeBytes(0x1b, 0x45, 0x00);
+    divider('-');
+
+    (po.lines || []).forEach((line, idx) => {
+      const desc = sanitize(line.poDescription || line.masterDescription || 'Item');
+      const code = sanitize(line.code || line.itemId);
+      writeBytes(0x1b, 0x45, 0x01);
+      writeWrapped(`${idx + 1}. ${desc}`);
+      writeBytes(0x1b, 0x45, 0x00);
+      const qtyParts: string[] = [];
+      if (Number(line.orderCases || 0) > 0) {
+        qtyParts.push(`${line.orderCases}cs x ${line.unitsPerCase}`);
+      }
+      if (Number(line.orderSingles || 0) > 0) {
+        qtyParts.push(`${line.orderSingles}u`);
+      }
+      const qtyLabel = qtyParts.length > 0 ? qtyParts.join('+') : `${line.totalUnits}u`;
+      const rateLabel =
+        Number(line.orderCases || 0) > 0
+          ? `@${fmtMoney(line.caseCost)}/cs`
+          : `@${fmtMoney(line.unitCost)}/u`;
+      writeCols(`  [${code}] ${qtyLabel} ${rateLabel}`, fmtMoney(line.lineTotal));
+      if (line.notes) {
+        writeWrapped(`  Note: ${line.notes}`);
+      }
+    });
+
+    divider('=');
+    writeCols('Total Lines:', String((po.lines || []).length));
+    writeCols('Total Qty:', `${po.totalCases || 0} cs / ${po.totalUnits || 0} u`);
+    writeCols('Subtotal:', fmtMoney(po.subtotal));
+    if (Number(po.taxAmount || 0) > 0) {
+      writeCols(`Tax (${po.taxPercent || 0}%):`, fmtMoney(po.taxAmount));
+    }
+    writeBytes(0x1b, 0x45, 0x01);
+    writeCols('GRAND TOTAL:', fmtMoney(po.grandTotal));
+    writeBytes(0x1b, 0x45, 0x00);
+    divider('-');
+
+    if (po.notes) {
+      writeWrapped(`Notes: ${po.notes}`);
+      divider('-');
+    }
+
+    writeWrapped(`Prepared By: ${po.createdByName || 'Staff'}`);
+    if (po.approvedByName) {
+      writeBytes(0x1b, 0x45, 0x01);
+      writeWrapped(`APPROVED BY: ${po.approvedByName}`);
+      writeBytes(0x1b, 0x45, 0x00);
+      if (po.approvedAt) {
+        writeWrapped(`Approved: ${new Date(po.approvedAt).toLocaleString()}`);
+      }
+    } else {
+      writeLine('Approval: PENDING MANAGER SIGN');
+      writeLine('Sign: ________________________');
+    }
+    divider('=');
+    writeBytes(0x1b, 0x61, 0x01);
+    writeLine('Thank you for your business');
+    writeBytes(0x1b, 0x61, 0x00);
+
+    writeBytes(0x0a, 0x0a, 0x0a, 0x0a);
+    if (config.autoCut) {
+      writeBytes(0x1d, 0x56, 0x41, 0x10);
+    }
+
+    return new Uint8Array(buffer);
+  }
+
+  public async printPurchaseOrder(
+    po: PurchaseOrder,
+    paperWidthOverride: PaperWidth = '58mm'
+  ): Promise<{ success: boolean; message: string }> {
+    const bytes = this.generateEscPosPurchaseOrder(po, paperWidthOverride);
+
+    if (this.isConnected()) {
+      await this.printBytes(bytes);
+      return {
+        success: true,
+        message: `Purchase Order ${po.poNumber} printed (${paperWidthOverride}).`,
+      };
+    }
+
+    const reconnected = await this.attemptSilentReconnect();
+    if (reconnected) {
+      await this.printBytes(bytes);
+      return {
+        success: true,
+        message: `Printer reconnected and Purchase Order ${po.poNumber} printed (${paperWidthOverride}).`,
+      };
+    }
+
+    throw new Error('Bluetooth printer not connected. Use Repair or Pair Printer, or print on A4.');
   }
 }
 

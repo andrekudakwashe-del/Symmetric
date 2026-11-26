@@ -85,6 +85,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import { useClockSecurity, getTrustedTodayDateString, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
+import { isSameDaySafe } from '../../utils/dateUtils';
 import confetti from 'canvas-confetti';
 import { FormStepNavigation } from '../common/FormStepNavigation';
 import { ExchangeRatesModal } from '../common/ExchangeRatesModal';
@@ -211,7 +212,13 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
   // Sheet configuration state
   const [sheetDate, setSheetDate] = useState<string>(today);
   const [selectedStaffId, setSelectedStaffId] = useState<string>(currentUser.id);
-  const salespeople = getSalespeople();
+  const rawSalespeople = getSalespeople();
+  const salespeople = useMemo(() => {
+    if (!currentUser?.id) return rawSalespeople;
+    const cleanCurId = String(currentUser.id).trim().toLowerCase();
+    const exists = rawSalespeople.some((s) => String(s.id || '').trim().toLowerCase() === cleanCurId);
+    return exists ? rawSalespeople : [currentUser, ...rawSalespeople];
+  }, [rawSalespeople, currentUser]);
 
   const selectedStaff = useMemo(() => {
     return salespeople.find((s) => s.id === selectedStaffId) || currentUser;
@@ -243,10 +250,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
 
   // Direct GRVs that were processed on the active sheet date
   const allDateDirectGrvs = useMemo(() => {
-    return directGrvs.filter((g) => {
-      const gDate = toDateStringSafe(g.date) || toDateStringSafe(g.createdAt);
-      return gDate === sheetDate;
-    });
+    return directGrvs.filter((g) => isSameDaySafe(g.date, g.createdAt, sheetDate));
   }, [directGrvs, sheetDate]);
 
   const [viewingProcurementGrv, setViewingProcurementGrv] = useState<DirectGrv | null>(null);
@@ -375,7 +379,7 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
     const sId = getShiftId(selectedStaffId, sheetDate, getCurrentBranchId());
     return getMovements().filter((m) => {
       if (m.shiftId === sId) return true;
-      if (m.date === sheetDate && isStaffMatch(m.staffId, m.staffName)) return true;
+      if (isSameDaySafe(m.date, m.timestamp, sheetDate) && isStaffMatch(m.staffId, m.staffName)) return true;
       return false;
     });
   }, [selectedStaffId, sheetDate, ledgerRefreshKey, cashLogs, isStaffMatch]);
@@ -592,21 +596,45 @@ export const Form2CashLog: React.FC<Form2CashLogProps> = ({
       });
     });
 
+    const knownStaffExact = new Set<string>();
+    const knownStaffNorm = new Set<string>();
+    salespeople.forEach((s) => {
+      const clean = String(s.id || '').trim().toLowerCase();
+      if (clean) {
+        knownStaffExact.add(clean);
+        const norm = clean.replace(/^usr-|^staff-|^0+/, '');
+        if (norm) knownStaffNorm.add(norm);
+      }
+    });
+    const isKnownStaffId = (id?: string): boolean => {
+      const clean = String(id || '').trim().toLowerCase();
+      if (!clean) return false;
+      if (knownStaffExact.has(clean)) return true;
+      const norm = clean.replace(/^usr-|^staff-|^0+/, '');
+      return Boolean(norm && knownStaffNorm.has(norm));
+    };
+
     // 2. Also incorporate any Direct GRVs for this staff & date that may not yet have movement indexed
     directGrvs.forEach((grv) => {
       if (isNonTillGrv(grv)) return;
 
+      if (!isSameDaySafe(grv.date, grv.createdAt, sheetDate)) return;
       const grvDate = toDateStringSafe(grv.date) || toDateStringSafe(grv.createdAt);
-      if (grvDate && grvDate !== sheetDate) return;
 
       const isRejected = grv.status === 'REJECTED';
       const hasPositivePayments =
         Array.isArray(grv.payments) && grv.payments.some((p) => (Number(p.amount) || 0) > 0);
 
       if (hasPositivePayments && grv.payments) {
-        // Multi-cashier split payment: find only this cashier's portion!
+        // Multi-cashier split payment: find only this cashier's portion (or orphaned legacy/placeholder ID fallback to receiver)
         grv.payments.forEach((p) => {
-          if (isStaffMatch(p.userId, p.userName) && (Number(p.amount) || 0) > 0) {
+          if ((Number(p.amount) || 0) <= 0) return;
+          const directMatch = isStaffMatch(p.userId, p.userName);
+          const orphanedFallbackMatch =
+            !directMatch &&
+            !isKnownStaffId(p.userId) &&
+            isStaffMatch(grv.receivedByStaffId, grv.receivedByStaffName);
+          if (directMatch || orphanedFallbackMatch) {
             const vKey = `${grv.grvNumber}-${selectedStaffId}`;
             if (seenVouchers.has(vKey)) return;
             seenVouchers.add(vKey);

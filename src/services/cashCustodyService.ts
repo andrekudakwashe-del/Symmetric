@@ -39,6 +39,8 @@ import {
   enqueueSync,
   notifyDirectGrvChanged,
   notifyListeners,
+  reconcileCashAccountsFromTransfers,
+  isRecordInBranchScope,
   STORAGE_KEYS,
 } from '../db/roomDatabase';
 import {
@@ -133,7 +135,11 @@ const isCashBranchMatch = (b1?: string, b2?: string): boolean => {
   if (!b1 || !b2) return true;
   if (b1 === b2) return true;
   if ((b1 === '1' || b1 === 'BR-MAIN') && (b2 === '1' || b2 === 'BR-MAIN')) return true;
-  return false;
+  try {
+    return isRecordInBranchScope(b1, b2, getBranches(), getCurrentCompanyId());
+  } catch (_) {
+    return false;
+  }
 };
 
 /**
@@ -356,48 +362,13 @@ export const ensureDefaultCashAccounts = (companyId?: string, branchId?: string)
     }
   });
 
-  // Self-heal SAFE / CLERK_FLOAT accounts whose balance stayed $0.00 after a Cash Lift was credited to a legacy colliding ID
-  const nowMs = Date.now();
-  const healedAccountsToSync: CashAccount[] = [];
-  canonicalCompanyAccounts.forEach((acc) => {
-    if (acc.account_type !== 'CLERK_FLOAT' && acc.account_type !== 'SAFE') return;
-    if (parseSafeCurrencyAmount(acc.current_balance) !== 0) return;
-
-    let netSettled = 0;
-    let matchedCount = 0;
-    for (const t of allTransfers) {
-      if (!isSettledTransferStatus(t.status) && t.status !== 'IN_TRANSIT') continue;
-      const amt = parseSafeCurrencyAmount(t.amount);
-      if (amt <= 0) continue;
-      const isIn = isSettledTransferStatus(t.status) && isTransferRefMatchingAccount(t.to_account_id, acc, t.branch_id);
-      const isOut = isTransferRefMatchingAccount(t.from_account_id, acc, t.branch_id);
-      if (isIn) {
-        netSettled += amt;
-        matchedCount += 1;
-      } else if (isOut) {
-        netSettled -= amt;
-        matchedCount += 1;
-      }
-    }
-
-    const healedBalance = Math.round(netSettled * 100) / 100;
-    if (matchedCount > 0 && healedBalance > 0.009) {
-      acc.current_balance = healedBalance;
-      acc.updated_at = nowIso;
-      (acc as any).updatedAt = nowMs;
-      (acc as any).lastUpdated = nowIso;
-      hasChanges = true;
-      healedAccountsToSync.push({ ...acc });
-    }
-  });
-
   if (hasChanges) {
     setAllCashAccounts([...otherCompanyAccounts, ...canonicalCompanyAccounts]);
-    // Push self-healed balances through saveCashAccount so SyncEnvelope, Mesh, Local Hub, and Cloud backends receive the authoritative LWW balance
-    healedAccountsToSync.forEach((healedAcc) => {
-      saveCashAccount(healedAcc);
-    });
   }
+
+  // Deterministic Ledger Reconciliation: ensure SAFE, CLERK_FLOAT, HQ_SAFE, and BANK_ACCOUNT
+  // balances always match the authoritative CashTransfer ledger across all devices.
+  reconcileCashAccountsFromTransfers({ companyId: currentCompany, silent: true });
 
   return getCashAccounts(currentBranch);
 };
@@ -852,6 +823,7 @@ function deductSourceAccountForTransit(transfer: CashTransfer, actor?: Salespers
   transfer.updatedAt = nowMs;
   transfer.lastUpdated = nowIso;
   saveCashTransfer(transfer);
+  reconcileCashAccountsFromTransfers({ companyId: transfer.company_id, syncChanged: true, silent: true });
 }
 
 /**
@@ -1063,6 +1035,7 @@ export const returnTransitToSafe = (
     notes: `${transfer.notes ? transfer.notes + ' | ' : ''}Returned to safe: ${reason || 'Supplier premises closed'}`,
   };
   saveCashTransfer(updated);
+  reconcileCashAccountsFromTransfers({ companyId: updated.company_id, syncChanged: true, silent: true });
 
   addAuditLog({
     action: 'CASH_TRANSFER_RETURN' as any,
@@ -1834,6 +1807,9 @@ function finalizeTransferLedger(
   if (transfer.linked_grv_id) {
     markGrvAsPaid(transfer.linked_grv_id, transfer.transfer_id, { paidAmount: safeAmount });
   }
+
+  // Deterministically align all custody account balances with the completed transfer ledger
+  reconcileCashAccountsFromTransfers({ companyId: transfer.company_id, syncChanged: true, silent: true });
 }
 
 /**
@@ -2787,6 +2763,7 @@ export const recordCustodialExpense = (
     is_owner_override: params.supervisor.role === 'OWNER' || params.supervisor.role === 'SUPER_ADMIN',
   };
   saveCashTransfer(voucher);
+  reconcileCashAccountsFromTransfers({ companyId: currentCompany, syncChanged: true, silent: true });
 
   // 3. Persist ExpenseEntry into roomDatabase so IncomeStatement includes it in Profit & Loss
   const paymentMethodLabel =
@@ -2906,22 +2883,53 @@ export const getAccountTransactionLedger = (
   };
 
   const matchesToThisAccount = (t: CashTransfer): boolean => {
+    if (!account) return t.to_account_id === accountId;
+    if (t.type === 'CAPITAL_INFUSION') {
+      if (account.account_type === 'BANK_ACCOUNT') return false;
+      return (
+        t.to_account_id === accountId ||
+        isTransferRefMatchingAccount(t.to_account_id, account, t.branch_id) ||
+        (!t.to_account_id && isTransferRefMatchingAccount(t.from_account_id, account, t.branch_id))
+      );
+    }
+    if (t.type === 'BANK_WITHDRAWAL') {
+      if (account.account_type === 'BANK_ACCOUNT') return false;
+      return (
+        t.to_account_id === accountId ||
+        isTransferRefMatchingAccount(t.to_account_id, account, t.branch_id) ||
+        (!t.to_account_id && isTransferRefMatchingAccount(t.from_account_id, account, t.branch_id))
+      );
+    }
     if (t.to_account_id === accountId) return true;
-    if (account && isTransferRefMatchingAccount(t.to_account_id, account, t.branch_id)) return true;
+    if (isTransferRefMatchingAccount(t.to_account_id, account, t.branch_id)) return true;
     return isLegacyBankMatch(t) && (t.type === 'BANK_DEPOSIT' || t.type === 'ELECTRONIC_SETTLEMENT');
   };
 
   const matchesFromThisAccount = (t: CashTransfer): boolean => {
+    if (!account) return t.from_account_id === accountId;
+    if (t.type === 'CAPITAL_INFUSION') return false;
+    if (t.type === 'BANK_WITHDRAWAL') {
+      if (account.account_type !== 'BANK_ACCOUNT') return false;
+      return (
+        t.from_account_id === accountId ||
+        isTransferRefMatchingAccount(t.from_account_id, account, t.branch_id) ||
+        isLegacyBankMatch(t)
+      );
+    }
     if (t.from_account_id === accountId) return true;
-    if (account && isTransferRefMatchingAccount(t.from_account_id, account, t.branch_id)) return true;
-    return isLegacyBankMatch(t) && t.type === 'BANK_WITHDRAWAL';
+    if (isTransferRefMatchingAccount(t.from_account_id, account, t.branch_id)) return true;
+    return false;
   };
 
-  const relevantTransfers = allTransfers.filter(
-    (t) =>
-      (isSettledTransferStatus(t.status) || t.status === 'IN_TRANSIT') &&
-      (matchesFromThisAccount(t) || matchesToThisAccount(t))
-  );
+  const relevantTransfers = allTransfers.filter((t) => {
+    const settled = isSettledTransferStatus(t.status);
+    const inTransit = t.status === 'IN_TRANSIT';
+    if (!settled && !inTransit) return false;
+    const isTo = settled && matchesToThisAccount(t);
+    const isFrom = matchesFromThisAccount(t);
+    if (isTo && isFrom) return false; // self-referencing no-op
+    return isTo || isFrom;
+  });
 
   // Sort ascending chronologically to compute running balance
   relevantTransfers.sort(
@@ -2935,7 +2943,7 @@ export const getAccountTransactionLedger = (
   let totalNativeOut = 0;
 
   const entriesAsc: AccountLedgerEntry[] = relevantTransfers.map((t) => {
-    const isToThisAccount = matchesToThisAccount(t);
+    const isToThisAccount = isSettledTransferStatus(t.status) && matchesToThisAccount(t);
     const isFromThisAccount = matchesFromThisAccount(t);
     const txAmt = parseSafeCurrencyAmount(t.amount);
     const nativeCurrency = t.native_currency || account?.native_currency;

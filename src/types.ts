@@ -927,3 +927,81 @@ export interface SaleSecurityMetadata {
   isOfflineSync?: boolean;
 }
 
+export type PurchaseOrderStatus =
+  | 'DRAFT'
+  | 'PENDING_APPROVAL'
+  | 'APPROVED'
+  | 'PARTIALLY_RECEIVED'
+  | 'RECEIVED'
+  | 'REJECTED'
+  | 'CANCELLED';
+
+export interface PurchaseOrderLine {
+  lineId: string;                // Unique row ID so the same product can appear multiple times with different flavours/variants
+  itemId: string;                // Original Inventory Master itemId (never mutated)
+  code: string;                  // Original Inventory Master SKU/code
+  barcode?: string;
+  masterDescription: string;     // Original immutable Inventory Master description
+  poDescription: string;         // Editable PO description (e.g. "Bally House 2L - Orange", "Bally House 2L - Raspberry")
+  category?: string;
+  orderCases: number;
+  orderSingles?: number;
+  unitsPerCase: number;
+  totalUnits: number;
+  unitCost: number;
+  caseCost: number;
+  lineTotal: number;
+  receivedCases?: number;
+  receivedUnits?: number;
+  notes?: string;
+}
+
+export interface PurchaseOrder {
+  id: string;
+  poNumber: string;
+  company_id: string;
+  companyId?: string;
+  branch_id: string;
+  branchId?: string;
+  branchName?: string;
+  supplierId?: string;
+  supplierName: string;
+  supplierPhone?: string;
+  supplierEmail?: string;
+  supplierAddress?: string;
+  orderDate: string;             // YYYY-MM-DD
+  expectedDeliveryDate?: string; // YYYY-MM-DD
+  paymentTerms?: string;
+  taxPercent?: number;
+  subtotal: number;
+  taxAmount: number;
+  grandTotal: number;
+  totalCases: number;
+  totalUnits: number;
+  status: PurchaseOrderStatus;
+  notes?: string;
+  lines: PurchaseOrderLine[];
+  // Workflow & Approval Audit
+  createdById: string;
+  createdByName: string;
+  createdByRole?: string;
+  createdAt: string;
+  submittedAt?: string;
+  approvedById?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  rejectedById?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
+  // GRV Linkage
+  linkedGrvIds?: string[];
+  lastReceivedAt?: string;
+  // Sync Metadata
+  updatedAt?: number;
+  version?: number;
+  mutationSource?: string;
+  isCloudSynced?: boolean;
+}
+
+

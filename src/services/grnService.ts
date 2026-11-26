@@ -45,7 +45,10 @@ export interface PostGrnOptions {
  * 4. Payables generation for credit accounts
  * 5. Status management and persistence
  */
-export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
+export function postGRN(
+  grn: GoodsReceivedNote,
+  options?: { skipInventoryMutation?: boolean }
+): GoodsReceivedNote {
   // 1. Landed cost allocation (no-op if grn.landedCosts is empty)
   if (grn.landedCosts && grn.landedCosts.length > 0) {
     landedCostService.allocateLandedCosts(grn);
@@ -64,19 +67,21 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
     };
   }
 
-  // 2. Inventory cost update (unchanged from existing behavior)
-  for (const item of grn.lineItems) {
-    if (item.quantity > 0) {
-      costingService.recordReceipt(item.itemId, item.quantity, item.totalUnitCost || item.unitCost, {
-        grnId: grn.grnNumber,
-        invoiceNo: grn.paymentRef || grn.grnNumber,
-        supplier: grn.suppliers[0] || 'Supplier',
-        date: grn.dateReceived,
-        batchNumber: item.batchNumber,
-        expiryDate: item.expiryDate,
-        branchId: grn.branchId,
-        notes: grn.notes,
-      });
+  // 2. Inventory cost update (skipped when caller already posted FIFO/AVCO stock or awaiting approval)
+  if (!options?.skipInventoryMutation) {
+    for (const item of grn.lineItems) {
+      if (item.quantity > 0) {
+        costingService.recordReceipt(item.itemId, item.quantity, item.totalUnitCost || item.unitCost, {
+          grnId: grn.grnNumber,
+          invoiceNo: grn.paymentRef || grn.grnNumber,
+          supplier: grn.suppliers[0] || 'Supplier',
+          date: grn.dateReceived,
+          batchNumber: item.batchNumber,
+          expiryDate: item.expiryDate,
+          branchId: grn.branchId,
+          notes: grn.notes,
+        });
+      }
     }
   }
 
@@ -134,6 +139,7 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
         primaryMovementId = existingM.id;
         updateMovement(existingM.id, {
           amount: pAmount,
+          staffName: p.userName || existingM.staffName,
           status: initialMovementStatus,
           affectsDrawer: initialMovementStatus !== 'rejected',
           direction: 'out',
@@ -143,6 +149,7 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
         const createdM = addMovement({
           shiftId: staffShiftId,
           staffId: p.userId,
+          staffName: p.userName,
           terminalId: p.drawerId || 'Till 1',
           date: shiftDate,
           timestamp: now,
@@ -187,7 +194,10 @@ export function postGRN(grn: GoodsReceivedNote): GoodsReceivedNote {
 /**
  * Thin wrapper for posting Direct Delivery via postGRN
  */
-export function postDirectDelivery(dd: DirectGrv): DirectGrv {
+export function postDirectDelivery(
+  dd: DirectGrv,
+  options?: { skipInventoryMutation?: boolean }
+): DirectGrv {
   const isPayFromTill =
     dd.payFromTill !== false &&
     dd.paymentMethod !== 'INVOICE_ON_ACCOUNT' &&
@@ -199,7 +209,7 @@ export function postDirectDelivery(dd: DirectGrv): DirectGrv {
   grn.paymentMode = isPayFromTill ? 'cash_immediate' : 'credit_account';
   grn.requiresApproval = dd.status !== 'APPROVED';
   
-  const postedGrn = postGRN(grn);
+  const postedGrn = postGRN(grn, options);
   return grnToDirectGrv(postedGrn);
 }
 
@@ -208,7 +218,8 @@ export function postDirectDelivery(dd: DirectGrv): DirectGrv {
  */
 export function postGeneralGRV(
   g: SupplierInvoiceVoucher,
-  landedCosts?: LandedCostItem[]
+  landedCosts?: LandedCostItem[],
+  options?: { skipInventoryMutation?: boolean }
 ): SupplierInvoiceVoucher {
   const grn = supplierInvoiceToGrn(g);
   grn.sourceTemplate = 'general_grv';
@@ -220,7 +231,7 @@ export function postGeneralGRV(
     grn.landedCosts = landedCosts;
   }
 
-  const postedGrn = postGRN(grn);
+  const postedGrn = postGRN(grn, options);
   return grnToSupplierInvoice(postedGrn);
 }
 

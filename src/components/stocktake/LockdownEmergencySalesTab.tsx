@@ -21,6 +21,8 @@ import {
 } from '../../types';
 import {
   isBranchInLockdown,
+  getBranchLockdowns,
+  getCurrentBranchId,
   setBranchLockdown,
   getInventoryItems,
   logEmergencyLockdownSale,
@@ -43,7 +45,7 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
   currentUser,
   onRefreshSession,
 }) => {
-  const branchId = session.branchId || 'BR-001';
+  const branchId = session.branchId || getCurrentBranchId();
   const [isLocked, setIsLocked] = useState<boolean>(isBranchInLockdown(branchId));
   const [inventoryList, setInventoryList] = useState<InventoryItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
@@ -69,6 +71,15 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
 
   useEffect(() => {
     loadData();
+    const handleSyncUpdate = () => loadData();
+    window.addEventListener('saimetric_stocktake_lockdown_updated', handleSyncUpdate);
+    window.addEventListener('saimetric_lockdown_updated', handleSyncUpdate);
+    window.addEventListener('saimetric_stocktake_updated', handleSyncUpdate);
+    return () => {
+      window.removeEventListener('saimetric_stocktake_lockdown_updated', handleSyncUpdate);
+      window.removeEventListener('saimetric_lockdown_updated', handleSyncUpdate);
+      window.removeEventListener('saimetric_stocktake_updated', handleSyncUpdate);
+    };
   }, [session.sessionId, branchId]);
 
   const canToggleLockdown = isStocktakeLeader(currentUser) || isStocktakeAuditor(currentUser, session);
@@ -82,10 +93,15 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
       ? `Manual Store Lockdown for ${session.title}`
       : `Lockdown released by ${staffName}`;
 
+    // When disengaging, use the sessionId that currently owns the branch lock if present
+    // so Hub/Cloud unlock guards always honor the release cleanly.
+    const existingLock = getBranchLockdowns()[branchId];
+    const targetSessionId = (!nextState && existingLock?.sessionId) ? existingLock.sessionId : session.sessionId;
+
     setBranchLockdown(
       branchId,
       nextState,
-      session.sessionId,
+      targetSessionId,
       staffId,
       staffName,
       reason
@@ -94,10 +110,11 @@ export const LockdownEmergencySalesTab: React.FC<LockdownEmergencySalesTabProps>
     const updatedSession = saveStocktakeSession({
       ...session,
       isLockdownActive: nextState,
+      ...(nextState ? {} : { lockdownRequested: false }),
     });
     meshSyncService.broadcastStocktakeLockdown(
       branchId,
-      session.sessionId,
+      targetSessionId,
       nextState,
       staffName,
       reason,

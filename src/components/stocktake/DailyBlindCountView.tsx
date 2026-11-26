@@ -111,7 +111,11 @@ export const DailyBlindCountView: React.FC<DailyBlindCountViewProps> = ({
   currentUser,
   branchId,
 }) => {
-  const activeBranchId = branchId || currentUser?.branchId || currentUser?.branch_id || getCurrentBranchId();
+  const rawCandidateBranch = branchId || currentUser?.branchId || currentUser?.branch_id || getCurrentBranchId();
+  const activeBranchId =
+    !rawCandidateBranch || String(rawCandidateBranch).trim().toUpperCase() === 'ALL'
+      ? getCurrentBranchId()
+      : rawCandidateBranch;
   const activeCompanyId = getCurrentCompanyId();
 
   const [refreshTick, setRefreshTick] = useState(0);

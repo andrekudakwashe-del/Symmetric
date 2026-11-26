@@ -55,6 +55,7 @@ import {
   deduplicateSameNameStaffProfiles,
   getCurrencyRate,
   getBranches,
+  getCurrentBranchId,
 } from '../../db/roomDatabase';
 import {
   handoverTillToSafe,
@@ -246,15 +247,21 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   const [refreshKey, setRefreshKey] = useState(0);
   const [customRetainedFloats, setCustomRetainedFloats] = useState<Record<string, string>>({});
 
+  const activeBranchId = useMemo(() => {
+    return currentUser?.branchId && currentUser.branchId !== 'ALL'
+      ? currentUser.branchId
+      : getCurrentBranchId();
+  }, [currentUser?.branchId, refreshKey]);
+
   // Gatekeeper: Supervisor Pending Approvals
   const pendingApprovals = useMemo(() => {
-    return getPendingSupervisorApprovals(date, currentUser?.branchId);
-  }, [date, currentUser?.branchId, refreshKey]);
+    return getPendingSupervisorApprovals(date, activeBranchId);
+  }, [date, activeBranchId, refreshKey]);
 
   // Closed Business Day Status
   const closedDay = useMemo(() => {
-    return getBusinessDayClosureByDate(date, currentUser?.branchId);
-  }, [date, currentUser?.branchId, refreshKey]);
+    return getBusinessDayClosureByDate(date, activeBranchId);
+  }, [date, activeBranchId, refreshKey]);
   const isDayClosed = !!closedDay && closedDay.status === 'CLOSED';
 
   // Gatekeeper Drawer
@@ -342,7 +349,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
 
   // Auto-load electronic settlement record if already saved
   useEffect(() => {
-    const existing = getElectronicSettlementForDate(date, currentUser?.branchId);
+    const existing = getElectronicSettlementForDate(date, activeBranchId);
     if (existing) {
       setEcocashBatchInput(existing.ecocashBatchRef || '');
       setEcocashSettledAmount(existing.ecocashAmountSettled ? String(existing.ecocashAmountSettled) : '');
@@ -374,7 +381,7 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
       setTargetBankInput('EcoCash & ZiG Dual Custody Accounts');
       setIsElectronicSettled(false);
     }
-  }, [date, currentUser?.branchId, refreshKey]);
+  }, [date, activeBranchId, refreshKey]);
 
   // Subscribe to DB changes and window events
   useEffect(() => {
@@ -442,13 +449,20 @@ export const Form4Reconciliation: React.FC<Form4ReconciliationProps> = ({
   }, [date, salespeople]);
 
   // Calculate balancing metrics for all active salespeople on selected date
+  const effectiveSalespeople = useMemo(() => {
+    if (!currentUser?.id) return salespeople;
+    const cleanCurId = String(currentUser.id).trim().toLowerCase();
+    const exists = salespeople.some((s) => String(s.id || '').trim().toLowerCase() === cleanCurId);
+    return exists ? salespeople : [currentUser, ...salespeople];
+  }, [salespeople, currentUser]);
+
   const balancingData = useMemo(() => {
-    return salespeople.map((staff) => {
+    return effectiveSalespeople.map((staff) => {
       const rawInput = salesInputs[staff.id];
       const parsedSales = rawInput !== undefined && rawInput.trim() !== '' ? parseFloat(rawInput) || 0 : undefined;
-      return calculateSalespersonCashBalancing(staff.id, staff.name, date, parsedSales, currentUser?.branchId);
+      return calculateSalespersonCashBalancing(staff.id, staff.name, date, parsedSales, activeBranchId);
     });
-  }, [salespeople, date, salesInputs, salesList, currentUser?.branchId, refreshKey]);
+  }, [effectiveSalespeople, date, salesInputs, salesList, activeBranchId, refreshKey]);
 
   // Filtered salespeople rows
   const filteredRows = useMemo(() => {

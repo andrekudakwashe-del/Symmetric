@@ -390,8 +390,8 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
       localStorage.removeItem(draftKey);
     } catch {}
 
-    // Apply local signature for BOTH
-    applyJointRecountSignature(
+    // Apply local signature for BOTH (returns zone with full merged verifiedCounts: matched + recounted)
+    const { zone: finalizedZone } = applyJointRecountSignature(
       session.sessionId,
       segment.segmentId,
       'BOTH',
@@ -404,8 +404,25 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
       meshSyncService.broadcastStocktakeSession(latest);
     }
 
-    // Finalize across Local Hub & peers
-    meshSyncService.finalizeJointRecount(session.sessionId, segment.segmentId, linesToSubmit, staffName);
+    const fullVerifiedLines: StocktakeLineCount[] =
+      Array.isArray(finalizedZone?.verifiedCounts) && finalizedZone.verifiedCounts.length > 0
+        ? finalizedZone.verifiedCounts.map((v) => ({
+            itemId: v.itemId,
+            itemName: v.itemName,
+            category: v.category,
+            sku: v.sku,
+            unitsPerCase: v.unitsPerCase,
+            cases: v.cases,
+            singles: v.singles,
+            totalUnits: v.totalUnits,
+            countedBy: currentUser?.id || '001',
+            countedByName: v.resolvedBy || staffName,
+            timestamp: new Date().toISOString(),
+          }))
+        : linesToSubmit;
+
+    // Finalize across Local Hub & peers with the full lossless verified line set
+    meshSyncService.finalizeJointRecount(session.sessionId, segment.segmentId, fullVerifiedLines, staffName);
     setStatusMessage('Dual-Signature Complete! Both Counters agreed on 1 Device. Zone Verified & Locked.');
     setTimeout(() => {
       onResolved();
@@ -441,7 +458,7 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
     if (actingSlot === 'B') setSignedByB(true);
 
     // Apply local signature
-    const { isComplete } = applyJointRecountSignature(
+    const { zone: signedZone, isComplete } = applyJointRecountSignature(
       session.sessionId,
       segment.segmentId,
       actingSlot,
@@ -460,8 +477,25 @@ export const JointRecountModal: React.FC<JointRecountModalProps> = ({
         localStorage.removeItem(draftKey);
       } catch {}
 
-      // Both signatures present: Finalize across Local Hub
-      meshSyncService.finalizeJointRecount(session.sessionId, segment.segmentId, linesToSubmit, staffName);
+      const fullVerifiedLines: StocktakeLineCount[] =
+        Array.isArray(signedZone?.verifiedCounts) && signedZone.verifiedCounts.length > 0
+          ? signedZone.verifiedCounts.map((v) => ({
+              itemId: v.itemId,
+              itemName: v.itemName,
+              category: v.category,
+              sku: v.sku,
+              unitsPerCase: v.unitsPerCase,
+              cases: v.cases,
+              singles: v.singles,
+              totalUnits: v.totalUnits,
+              countedBy: currentUser?.id || '001',
+              countedByName: v.resolvedBy || staffName,
+              timestamp: new Date().toISOString(),
+            }))
+          : linesToSubmit;
+
+      // Both signatures present: Finalize across Local Hub with full merged verified counts
+      meshSyncService.finalizeJointRecount(session.sessionId, segment.segmentId, fullVerifiedLines, staffName);
       setStatusMessage('Dual-Signature Complete! Joint Recount Verified & Committed.');
       setTimeout(() => {
         onResolved();

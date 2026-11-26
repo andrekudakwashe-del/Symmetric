@@ -213,12 +213,12 @@ export const ALL_SYSTEM_MODULES: SystemModuleInfo[] = [
   },
   {
     id: 'procurement_reorder',
-    name: 'Procurement & Reorder Planning Hub',
-    shortLabel: 'Reorder Hub',
-    description: 'Predictive reorder horizons, days cover velocity, ROP calculator & cash-budgeted purchase order generation',
+    name: 'Purchase Orders',
+    shortLabel: 'Purchase Orders',
+    description: 'Purchase Order registry, manager approvals, 58mm & A4 PO printing, GRV receiving & Reorder Insights',
     category: 'receiving',
     categoryLabel: 'Receiving & Supply Chain',
-    iconName: 'TrendingUp',
+    iconName: 'ClipboardList',
   },
   {
     id: 'suppliers',
