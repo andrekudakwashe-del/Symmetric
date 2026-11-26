@@ -67,7 +67,7 @@ let hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1]
 // Runtime & Mutual-Auth Security Mode
 // - Termux backup defaults to HUB_REQUIRE_AUTH = false for zero-friction continuity
 // - Android Hub APK (HUB_RUNTIME=ANDROID_APK) or --require-auth enforces strict mutual HMAC auth
-const HUB_VERSION = '4.2.3';
+const HUB_VERSION = '4.2.4';
 const HUB_RUNTIME = String(process.env.HUB_RUNTIME || 'TERMUX').toUpperCase() === 'ANDROID_APK'
   ? 'ANDROID_APK'
   : 'TERMUX';
@@ -4799,18 +4799,195 @@ wss.on('connection', (ws, req) => {
             }
           }
 
+          // 1. Lossless union-merge of segments (never drop local segments or downgrade VERIFIED unless explicitly unlocked)
+          const incomingSegmentsRaw = Array.isArray(packet.segments)
+            ? packet.segments
+            : (Array.isArray(sess.segments) ? sess.segments : []);
+          const existingSegmentsRaw = Array.isArray(existing?.segments) ? existing.segments : [];
+          const exSegMap = new Map();
+          existingSegmentsRaw.forEach((es) => {
+            const k = es && (es.segmentId || es.id);
+            if (k) exSegMap.set(String(k).trim().toUpperCase(), es);
+          });
+          const incSegMap = new Map();
+          incomingSegmentsRaw.forEach((sg) => {
+            const k = sg && (sg.segmentId || sg.id);
+            if (k) incSegMap.set(String(k).trim().toUpperCase(), sg);
+          });
+
+          const segRankMap = {
+            PENDING: 0,
+            IN_PROGRESS: 1,
+            COUNTING: 1,
+            AWAITING_DUAL_COUNT: 2,
+            DISCREPANCY_REVIEW: 3,
+            VERIFIED: 4,
+          };
+          const mergeCountLinesLossless = (exArr, incArr) => {
+            const exList = Array.isArray(exArr) ? exArr : [];
+            const incList = Array.isArray(incArr) ? incArr : [];
+            if (exList.length === 0) return incList;
+            if (incList.length === 0) return exList;
+            const lineMap = new Map();
+            exList.forEach((line) => {
+              if (!line || (!line.itemId && !line.sku)) return;
+              const lk = String(line.itemId || line.sku).trim().toUpperCase();
+              lineMap.set(lk, line);
+            });
+            incList.forEach((line) => {
+              if (!line || (!line.itemId && !line.sku)) return;
+              const lk = String(line.itemId || line.sku).trim().toUpperCase();
+              const prev = lineMap.get(lk);
+              if (!prev) {
+                lineMap.set(lk, line);
+              } else {
+                const prevTs = prev.timestamp ? new Date(prev.timestamp).getTime() : 0;
+                const incTs = line.timestamp ? new Date(line.timestamp).getTime() : 0;
+                lineMap.set(lk, incTs >= prevTs ? line : prev);
+              }
+            });
+            return Array.from(lineMap.values());
+          };
+
+          const allSegKeys = [];
+          const seenSegKeys = new Set();
+          existingSegmentsRaw.forEach((es) => {
+            const k = es && (es.segmentId || es.id);
+            const norm = k ? String(k).trim().toUpperCase() : '';
+            if (norm && !seenSegKeys.has(norm)) {
+              seenSegKeys.add(norm);
+              allSegKeys.push(norm);
+            }
+          });
+          incomingSegmentsRaw.forEach((sg) => {
+            const k = sg && (sg.segmentId || sg.id);
+            const norm = k ? String(k).trim().toUpperCase() : '';
+            if (norm && !seenSegKeys.has(norm)) {
+              seenSegKeys.add(norm);
+              allSegKeys.push(norm);
+            }
+          });
+
+          const mergedSegments = allSegKeys.map((k) => {
+            const exSeg = exSegMap.get(k);
+            const sg = incSegMap.get(k);
+            if (!exSeg) return sg;
+            if (!sg) return exSeg;
+
+            const uHistMap = new Map();
+            (Array.isArray(exSeg.unlockHistory) ? exSeg.unlockHistory : []).forEach((u) => {
+              uHistMap.set(`${u.unlockedAt || ''}:${u.target || ''}:${u.actorId || ''}`, u);
+            });
+            (Array.isArray(sg.unlockHistory) ? sg.unlockHistory : []).forEach((u) => {
+              uHistMap.set(`${u.unlockedAt || ''}:${u.target || ''}:${u.actorId || ''}`, u);
+            });
+            const mergedUnlockHistory = Array.from(uHistMap.values());
+            const exUnlockLen = Array.isArray(exSeg.unlockHistory) ? exSeg.unlockHistory.length : 0;
+            const incomingHasNewUnlock = mergedUnlockHistory.length > exUnlockLen;
+
+            const exStatus = String(exSeg.status || 'PENDING').toUpperCase();
+            const incStatus = String(sg.status || 'PENDING').toUpperCase();
+            const exRank = segRankMap[exStatus] ?? 0;
+            const incRank = segRankMap[incStatus] ?? 0;
+            const resolvedStatus = incomingHasNewUnlock
+              ? (sg.status || exSeg.status)
+              : (exRank > incRank ? exSeg.status : (sg.status || exSeg.status));
+
+            const mergedCount1 = incomingHasNewUnlock
+              ? (sg.count1 !== undefined ? sg.count1 : exSeg.count1)
+              : mergeCountLinesLossless(exSeg.count1, sg.count1);
+            const mergedCount2 = incomingHasNewUnlock
+              ? (sg.count2 !== undefined ? sg.count2 : exSeg.count2)
+              : mergeCountLinesLossless(exSeg.count2, sg.count2);
+            const mergedVerifiedCounts = incomingHasNewUnlock
+              ? (sg.verifiedCounts !== undefined ? sg.verifiedCounts : exSeg.verifiedCounts)
+              : mergeCountLinesLossless(exSeg.verifiedCounts, sg.verifiedCounts);
+
+            const resolvedC1Fin = incomingHasNewUnlock
+              ? (sg.count1Finalized !== undefined ? sg.count1Finalized : exSeg.count1Finalized)
+              : Boolean(exSeg.count1Finalized || sg.count1Finalized);
+            const resolvedC2Fin = incomingHasNewUnlock
+              ? (sg.count2Finalized !== undefined ? sg.count2Finalized : exSeg.count2Finalized)
+              : Boolean(exSeg.count2Finalized || sg.count2Finalized);
+            const resolvedCompFin = incomingHasNewUnlock
+              ? (sg.comparisonFinalized !== undefined ? sg.comparisonFinalized : exSeg.comparisonFinalized)
+              : Boolean(exSeg.comparisonFinalized || sg.comparisonFinalized);
+
+            return {
+              ...exSeg,
+              ...sg,
+              status: resolvedStatus,
+              count1: mergedCount1,
+              count2: mergedCount2,
+              verifiedCounts: mergedVerifiedCounts,
+              discrepancies:
+                resolvedStatus === 'VERIFIED'
+                  ? []
+                  : (sg.discrepancies !== undefined ? sg.discrepancies : exSeg.discrepancies),
+              count1Finalized: resolvedC1Fin,
+              count2Finalized: resolvedC2Fin,
+              comparisonFinalized: resolvedCompFin,
+              count1FinalizedAt: sg.count1FinalizedAt || exSeg.count1FinalizedAt,
+              count2FinalizedAt: sg.count2FinalizedAt || exSeg.count2FinalizedAt,
+              comparisonFinalizedAt: sg.comparisonFinalizedAt || exSeg.comparisonFinalizedAt,
+              comparisonFinalizedBy: sg.comparisonFinalizedBy || exSeg.comparisonFinalizedBy,
+              unlockHistory: mergedUnlockHistory.length > 0 ? mergedUnlockHistory : undefined,
+            };
+          });
+
+          // Track which segments are currently verified so unlocked segments do not linger in breakdowns
+          const verifiedSegKeySet = new Set();
+          mergedSegments.forEach((ms) => {
+            const k = ms && (ms.segmentId || ms.id);
+            if (!k) return;
+            const st = String(ms.status || '').toUpperCase();
+            if (st === 'VERIFIED' || ms.comparisonFinalized || (Array.isArray(ms.verifiedCounts) && ms.verifiedCounts.length > 0)) {
+              verifiedSegKeySet.add(String(k).trim().toUpperCase());
+            }
+          });
+
+          // 2. Lossless union-merge of consolidatedItems with additive segmentBreakdown aggregation (NEVER last-write-wins!)
           const incomingItems = Array.isArray(packet.consolidatedItems)
             ? packet.consolidatedItems
             : (Array.isArray(sess.consolidatedItems) ? sess.consolidatedItems : undefined);
-          let mergedConsolidated = existing?.consolidatedItems || [];
+          const existingItems = Array.isArray(existing?.consolidatedItems) ? existing.consolidatedItems : [];
+          let mergedConsolidated = existingItems;
           if (Array.isArray(incomingItems) && incomingItems.length > 0) {
             const exItemMap = new Map();
-            (existing?.consolidatedItems || []).forEach((ci) => {
-              if (ci && ci.itemId) exItemMap.set(String(ci.itemId).toUpperCase(), ci);
+            existingItems.forEach((ci) => {
+              if (ci && (ci.itemId || ci.sku)) {
+                exItemMap.set(String(ci.itemId || ci.sku).trim().toUpperCase(), ci);
+              }
             });
-            mergedConsolidated = incomingItems.map((inc) => {
-              const ex = exItemMap.get(String(inc.itemId || '').toUpperCase());
+            const incItemMap = new Map();
+            incomingItems.forEach((ci) => {
+              if (ci && (ci.itemId || ci.sku)) {
+                incItemMap.set(String(ci.itemId || ci.sku).trim().toUpperCase(), ci);
+              }
+            });
+            const allItemKeys = [];
+            const seenItemKeys = new Set();
+            incomingItems.forEach((ci) => {
+              const k = ci && (ci.itemId || ci.sku) ? String(ci.itemId || ci.sku).trim().toUpperCase() : '';
+              if (k && !seenItemKeys.has(k)) {
+                seenItemKeys.add(k);
+                allItemKeys.push(k);
+              }
+            });
+            existingItems.forEach((ci) => {
+              const k = ci && (ci.itemId || ci.sku) ? String(ci.itemId || ci.sku).trim().toUpperCase() : '';
+              if (k && !seenItemKeys.has(k)) {
+                seenItemKeys.add(k);
+                allItemKeys.push(k);
+              }
+            });
+
+            mergedConsolidated = allItemKeys.map((k) => {
+              const ex = exItemMap.get(k);
+              const inc = incItemMap.get(k);
               if (!ex) return inc;
+              if (!inc) return ex;
+
               const exCT = ex.commentedAt ? new Date(ex.commentedAt).getTime() : 0;
               const incCT = inc.commentedAt ? new Date(inc.commentedAt).getTime() : 0;
               const keepEx = exCT > incCT && Boolean(ex.managerComment || ex.reasonCode);
@@ -4824,9 +5001,29 @@ wss.on('connection', (ws, req) => {
               const mergedComments = Array.from(commentMap.values()).sort(
                 (a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
               );
-              return {
+
+              // Union-merge segmentBreakdown across existing + incoming so Fridge (4) + Warehouse (10) = 14
+              const bdMap = new Map();
+              (Array.isArray(ex.segmentBreakdown) ? ex.segmentBreakdown : []).forEach((sb) => {
+                if (!sb || !sb.segmentId) return;
+                const sk = String(sb.segmentId).trim().toUpperCase();
+                if (verifiedSegKeySet.size === 0 || verifiedSegKeySet.has(sk)) {
+                  bdMap.set(sk, sb);
+                }
+              });
+              (Array.isArray(inc.segmentBreakdown) ? inc.segmentBreakdown : []).forEach((sb) => {
+                if (!sb || !sb.segmentId) return;
+                const sk = String(sb.segmentId).trim().toUpperCase();
+                if (verifiedSegKeySet.size === 0 || verifiedSegKeySet.has(sk)) {
+                  bdMap.set(sk, sb);
+                }
+              });
+              const mergedBreakdown = Array.from(bdMap.values());
+
+              const baseMerged = {
                 ...ex,
                 ...inc,
+                segmentBreakdown: mergedBreakdown.length > 0 ? mergedBreakdown : (inc.segmentBreakdown ?? ex.segmentBreakdown),
                 originalCountedCases: ex.originalCountedCases ?? inc.originalCountedCases,
                 originalCountedSingles: ex.originalCountedSingles ?? inc.originalCountedSingles,
                 originalCountedTotalUnits: ex.originalCountedTotalUnits ?? inc.originalCountedTotalUnits,
@@ -4842,42 +5039,61 @@ wss.on('connection', (ws, req) => {
                 commentedAt: keepEx ? ex.commentedAt : (inc.commentedAt ?? ex.commentedAt),
                 ownerAckStatus: inc.ownerAckStatus ?? ex.ownerAckStatus,
               };
+
+              // If unioned segments combined counts from both devices (and no completed Blind Recount overrides it), re-sum!
+              const hasBlindOverride =
+                baseMerged.recountSheetStatus === 'COMPLETED' &&
+                baseMerged.recountTotalUnits !== undefined;
+              if (!hasBlindOverride && mergedBreakdown.length > 0) {
+                const summedTotalUnits = mergedBreakdown.reduce((acc, sb) => acc + (Number(sb.totalUnits) || 0), 0);
+                if (summedTotalUnits !== Number(baseMerged.countedTotalUnits || 0)) {
+                  const upc = Math.max(1, Number(baseMerged.unitsPerCase || 1));
+                  const costPerUnit = Number(baseMerged.costPerUnit || 0);
+                  const sellPriceUnit = Number(baseMerged.sellPriceUnit || 0);
+                  const systemTotalUnits = Number(baseMerged.systemTotalUnits || 0);
+                  const systemCases = Number(baseMerged.systemCases || 0);
+                  const systemSingles = Number(baseMerged.systemSingles || 0);
+                  const customerHeld = Number(baseMerged.customerHeldStockUnits || 0);
+                  const emergencySold = Number(baseMerged.emergencySalesUnits || 0);
+                  const adjustedPhysicalUnits = Math.max(0, summedTotalUnits - customerHeld - emergencySold);
+                  const effectivePhysicalUnits =
+                    customerHeld > 0 || emergencySold > 0 ? adjustedPhysicalUnits : summedTotalUnits;
+                  const varianceTotalUnits = effectivePhysicalUnits - systemTotalUnits;
+                  const varianceCostValue = varianceTotalUnits * costPerUnit;
+                  const varianceRetailValue = varianceTotalUnits * sellPriceUnit;
+                  const hasPendingRecount =
+                    baseMerged.recountSheetStatus === 'REQUESTED' || Boolean(baseMerged.recountRequested);
+                  baseMerged.countedTotalUnits = summedTotalUnits;
+                  baseMerged.countedCases = Math.floor(summedTotalUnits / upc);
+                  baseMerged.countedSingles = summedTotalUnits % upc;
+                  baseMerged.countedCostValue = summedTotalUnits * costPerUnit;
+                  baseMerged.countedRetailValue = summedTotalUnits * sellPriceUnit;
+                  baseMerged.adjustedPhysicalUnits = adjustedPhysicalUnits;
+                  baseMerged.varianceCases = Math.floor(effectivePhysicalUnits / upc) - systemCases;
+                  baseMerged.varianceSingles = (effectivePhysicalUnits % upc) - systemSingles;
+                  baseMerged.varianceTotalUnits = varianceTotalUnits;
+                  baseMerged.varianceCostValue = varianceCostValue;
+                  baseMerged.varianceRetailValue = varianceRetailValue;
+                  baseMerged.originalCountedTotalUnits = summedTotalUnits;
+                  baseMerged.originalCountedCases = baseMerged.countedCases;
+                  baseMerged.originalCountedSingles = baseMerged.countedSingles;
+                  baseMerged.originalVarianceTotalUnits = varianceTotalUnits;
+                  baseMerged.originalVarianceUnits = varianceTotalUnits;
+                  baseMerged.originalVarianceCostValue = varianceCostValue;
+                  baseMerged.originalVarianceRetailValue = varianceRetailValue;
+                  baseMerged.status = hasPendingRecount
+                    ? 'RECOUNT_FLAGGED'
+                    : varianceTotalUnits < 0
+                    ? 'SHORTAGE'
+                    : varianceTotalUnits > 0
+                    ? 'OVERAGE'
+                    : 'MATCH';
+                }
+              }
+
+              return baseMerged;
             });
           }
-
-          const incomingSegmentsRaw = Array.isArray(packet.segments)
-            ? packet.segments
-            : (Array.isArray(sess.segments) ? sess.segments : (existing?.segments || []));
-          const exSegMap = new Map();
-          (existing?.segments || []).forEach((es) => {
-            const k = es.segmentId || es.id;
-            if (k) exSegMap.set(k, es);
-          });
-          const mergedSegments = incomingSegmentsRaw.map((sg) => {
-            const k = sg.segmentId || sg.id;
-            const exSeg = k ? exSegMap.get(k) : null;
-            if (!exSeg) return sg;
-            const uHistMap = new Map();
-            (Array.isArray(exSeg.unlockHistory) ? exSeg.unlockHistory : []).forEach((u) => {
-              uHistMap.set(`${u.unlockedAt || ''}:${u.target || ''}:${u.actorId || ''}`, u);
-            });
-            (Array.isArray(sg.unlockHistory) ? sg.unlockHistory : []).forEach((u) => {
-              uHistMap.set(`${u.unlockedAt || ''}:${u.target || ''}:${u.actorId || ''}`, u);
-            });
-            const mergedUnlockHistory = Array.from(uHistMap.values());
-            return {
-              ...exSeg,
-              ...sg,
-              count1Finalized: sg.count1Finalized !== undefined ? sg.count1Finalized : exSeg.count1Finalized,
-              count2Finalized: sg.count2Finalized !== undefined ? sg.count2Finalized : exSeg.count2Finalized,
-              comparisonFinalized: sg.comparisonFinalized !== undefined ? sg.comparisonFinalized : exSeg.comparisonFinalized,
-              count1FinalizedAt: sg.count1FinalizedAt || exSeg.count1FinalizedAt,
-              count2FinalizedAt: sg.count2FinalizedAt || exSeg.count2FinalizedAt,
-              comparisonFinalizedAt: sg.comparisonFinalizedAt || exSeg.comparisonFinalizedAt,
-              comparisonFinalizedBy: sg.comparisonFinalizedBy || exSeg.comparisonFinalizedBy,
-              unlockHistory: mergedUnlockHistory.length > 0 ? mergedUnlockHistory : undefined,
-            };
-          });
 
           const incomingPasses = Array.isArray(packet.guestPasses)
             ? packet.guestPasses
@@ -4980,11 +5196,26 @@ wss.on('connection', (ws, req) => {
             varianceReviewedById: packet.varianceReviewedById || sess.varianceReviewedById || existing?.varianceReviewedById,
             varianceReviewedByName: packet.varianceReviewedByName || sess.varianceReviewedByName || existing?.varianceReviewedByName,
             varianceReviewedAt: packet.varianceReviewedAt || sess.varianceReviewedAt || existing?.varianceReviewedAt,
-            totalSystemUnits: packet.totalSystemUnits !== undefined ? packet.totalSystemUnits : (sess.totalSystemUnits !== undefined ? sess.totalSystemUnits : (existing?.totalSystemUnits || 0)),
-            totalCountedUnits: packet.totalCountedUnits !== undefined ? packet.totalCountedUnits : (sess.totalCountedUnits !== undefined ? sess.totalCountedUnits : (existing?.totalCountedUnits || 0)),
-            varianceUnits: packet.varianceUnits !== undefined ? packet.varianceUnits : (sess.varianceUnits !== undefined ? sess.varianceUnits : (existing?.varianceUnits || 0)),
-            varianceCostValue: packet.varianceCostValue !== undefined ? packet.varianceCostValue : (sess.varianceCostValue !== undefined ? sess.varianceCostValue : (existing?.varianceCostValue || 0)),
-            varianceRetailValue: packet.varianceRetailValue !== undefined ? packet.varianceRetailValue : (sess.varianceRetailValue !== undefined ? sess.varianceRetailValue : (existing?.varianceRetailValue || 0)),
+            totalSystemUnits:
+              mergedConsolidated.length > 0
+                ? mergedConsolidated.reduce((acc, ci) => acc + (Number(ci.systemTotalUnits) || 0), 0)
+                : (packet.totalSystemUnits !== undefined ? packet.totalSystemUnits : (sess.totalSystemUnits !== undefined ? sess.totalSystemUnits : (existing?.totalSystemUnits || 0))),
+            totalCountedUnits:
+              mergedConsolidated.length > 0
+                ? mergedConsolidated.reduce((acc, ci) => acc + (Number(ci.countedTotalUnits) || 0), 0)
+                : (packet.totalCountedUnits !== undefined ? packet.totalCountedUnits : (sess.totalCountedUnits !== undefined ? sess.totalCountedUnits : (existing?.totalCountedUnits || 0))),
+            varianceUnits:
+              mergedConsolidated.length > 0
+                ? mergedConsolidated.reduce((acc, ci) => acc + (Number(ci.varianceTotalUnits) || 0), 0)
+                : (packet.varianceUnits !== undefined ? packet.varianceUnits : (sess.varianceUnits !== undefined ? sess.varianceUnits : (existing?.varianceUnits || 0))),
+            varianceCostValue:
+              mergedConsolidated.length > 0
+                ? mergedConsolidated.reduce((acc, ci) => acc + (Number(ci.varianceCostValue) || 0), 0)
+                : (packet.varianceCostValue !== undefined ? packet.varianceCostValue : (sess.varianceCostValue !== undefined ? sess.varianceCostValue : (existing?.varianceCostValue || 0))),
+            varianceRetailValue:
+              mergedConsolidated.length > 0
+                ? mergedConsolidated.reduce((acc, ci) => acc + (Number(ci.varianceRetailValue) || 0), 0)
+                : (packet.varianceRetailValue !== undefined ? packet.varianceRetailValue : (sess.varianceRetailValue !== undefined ? sess.varianceRetailValue : (existing?.varianceRetailValue || 0))),
             notes: packet.notes !== undefined ? packet.notes : (sess.notes !== undefined ? sess.notes : (existing?.notes || '')),
             version: Math.max(Number(packet.version || sess.version || 0), Number(existing?.version || 0), 1),
             mutationSource: packet.mutationSource || sess.mutationSource || existing?.mutationSource || 'USER_EDIT',

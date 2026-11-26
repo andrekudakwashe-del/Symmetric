@@ -251,7 +251,12 @@ export const StocktakeSessionDetailScreen: React.FC<StocktakeSessionDetailScreen
     if (!canManageStructure) return;
     if (!newSegmentName.trim()) return;
 
-    const nextNum = (session.segments?.length || 0) + 1;
+    const maxExistingNum = (session.segments || []).reduce((max, s) => {
+      const m = String(s.segmentId || '').match(/(\d+)$/);
+      const n = m ? parseInt(m[1], 10) : 0;
+      return Number.isFinite(n) && n > max ? n : max;
+    }, 0);
+    const nextNum = Math.max(session.segments?.length || 0, maxExistingNum) + 1;
     const segId = `SEG-${String(nextNum).padStart(3, '0')}`;
     const newSegment: StocktakeSegment = {
       segmentId: segId,

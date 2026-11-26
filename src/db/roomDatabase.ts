@@ -21013,8 +21013,10 @@ export const ingestStocktakeSessionFromMesh = (data: {
   const existingAssignments = getZoneAssignments(data.sessionId);
 
   if (Array.isArray(data.segments) && data.segments.length > 0) {
+    const incomingSegIds = new Set<string>();
     mergedSegments = data.segments.map((incomingSeg: any) => {
       const segId = incomingSeg.segmentId || incomingSeg.id;
+      if (segId) incomingSegIds.add(String(segId).trim().toUpperCase());
       const localSeg = existing?.segments?.find((s: any) => (s.segmentId || s.id) === segId);
       const zone = existingAssignments.find((z) => z.zoneId === segId);
 
@@ -21022,12 +21024,14 @@ export const ingestStocktakeSessionFromMesh = (data: {
         incomingSeg.hasCountA ||
         localSeg?.hasCountA ||
         (localSeg?.count1 && localSeg.count1.length > 0) ||
+        (incomingSeg.count1 && incomingSeg.count1.length > 0) ||
         zone?.teamA?.submitted
       );
       const hasCountB = Boolean(
         incomingSeg.hasCountB ||
         localSeg?.hasCountB ||
         (localSeg?.count2 && localSeg.count2.length > 0) ||
+        (incomingSeg.count2 && incomingSeg.count2.length > 0) ||
         zone?.teamB?.submitted
       );
 
@@ -21036,27 +21040,32 @@ export const ingestStocktakeSessionFromMesh = (data: {
       const counterBName = incomingSeg.counterBName !== undefined ? incomingSeg.counterBName : (localSeg?.counterBName || zone?.teamB?.staffName);
       const counterBId = incomingSeg.counterBId !== undefined ? incomingSeg.counterBId : (localSeg?.counterBId || zone?.teamB?.staffId);
 
-      const count1Finalized =
-        incomingSeg.count1Finalized !== undefined
-          ? Boolean(incomingSeg.count1Finalized)
-          : Boolean(localSeg?.count1Finalized ?? zone?.teamA?.finalized);
-      const count2Finalized =
-        incomingSeg.count2Finalized !== undefined
-          ? Boolean(incomingSeg.count2Finalized)
-          : Boolean(localSeg?.count2Finalized ?? zone?.teamB?.finalized);
-      const comparisonFinalized =
-        incomingSeg.comparisonFinalized !== undefined
-          ? Boolean(incomingSeg.comparisonFinalized)
-          : Boolean(localSeg?.comparisonFinalized ?? zone?.comparisonFinalized);
+      const localUnlockCount = Array.isArray(localSeg?.unlockHistory) ? localSeg.unlockHistory.length : 0;
+      const incUnlockCount = Array.isArray(incomingSeg.unlockHistory) ? incomingSeg.unlockHistory.length : 0;
+      const incomingWasExplicitlyUnlocked = incUnlockCount > localUnlockCount;
+
+      const count1Finalized = incomingWasExplicitlyUnlocked
+        ? Boolean(incomingSeg.count1Finalized)
+        : Boolean(incomingSeg.count1Finalized || localSeg?.count1Finalized || zone?.teamA?.finalized);
+      const count2Finalized = incomingWasExplicitlyUnlocked
+        ? Boolean(incomingSeg.count2Finalized)
+        : Boolean(incomingSeg.count2Finalized || localSeg?.count2Finalized || zone?.teamB?.finalized);
+      const comparisonFinalized = incomingWasExplicitlyUnlocked
+        ? Boolean(incomingSeg.comparisonFinalized)
+        : Boolean(incomingSeg.comparisonFinalized || localSeg?.comparisonFinalized || zone?.comparisonFinalized);
 
       const mergedCount1 =
-        (Array.isArray(incomingSeg.count1) && incomingSeg.count1.length > 0)
+        (Array.isArray(localSeg?.count1) && localSeg.count1.length > 0)
+          ? localSeg.count1
+          : (Array.isArray(incomingSeg.count1) && incomingSeg.count1.length > 0)
           ? incomingSeg.count1
-          : (localSeg?.count1 || []);
+          : (zone?.count1 || []);
       const mergedCount2 =
-        (Array.isArray(incomingSeg.count2) && incomingSeg.count2.length > 0)
+        (Array.isArray(localSeg?.count2) && localSeg.count2.length > 0)
+          ? localSeg.count2
+          : (Array.isArray(incomingSeg.count2) && incomingSeg.count2.length > 0)
           ? incomingSeg.count2
-          : (localSeg?.count2 || []);
+          : (zone?.count2 || []);
 
       const verifiedCounts = mergeSegmentVerifiedCounts({
         count1: mergedCount1,
@@ -21066,22 +21075,31 @@ export const ingestStocktakeSessionFromMesh = (data: {
         resolvedLines: incomingSeg.verifiedCounts,
       });
 
-      const discrepancies =
-        (incomingSeg.discrepancies && incomingSeg.discrepancies.length > 0)
-          ? incomingSeg.discrepancies
-          : (localSeg?.discrepancies && localSeg.discrepancies.length > 0)
-          ? localSeg.discrepancies
-          : (zone?.discrepancies || []);
+      const isAlreadyVerified =
+        !incomingWasExplicitlyUnlocked &&
+        (incomingSeg.status === 'VERIFIED' ||
+          localSeg?.status === 'VERIFIED' ||
+          zone?.status === 'VERIFIED' ||
+          comparisonFinalized);
 
-      const discrepancyCount =
-        incomingSeg.discrepancyCount !== undefined
-          ? incomingSeg.discrepancyCount
-          : localSeg?.discrepancyCount !== undefined
-          ? localSeg.discrepancyCount
-          : discrepancies.length;
+      const discrepancies = isAlreadyVerified
+        ? []
+        : (incomingSeg.discrepancies && incomingSeg.discrepancies.length > 0)
+        ? incomingSeg.discrepancies
+        : (localSeg?.discrepancies && localSeg.discrepancies.length > 0)
+        ? localSeg.discrepancies
+        : (zone?.discrepancies || []);
+
+      const discrepancyCount = isAlreadyVerified
+        ? 0
+        : incomingSeg.discrepancyCount !== undefined
+        ? incomingSeg.discrepancyCount
+        : localSeg?.discrepancyCount !== undefined
+        ? localSeg.discrepancyCount
+        : discrepancies.length;
 
       let status = incomingSeg.status || localSeg?.status || zone?.status || 'PENDING';
-      if (verifiedCounts.length > 0 && discrepancies.length === 0) {
+      if (isAlreadyVerified || (verifiedCounts.length > 0 && discrepancies.length === 0 && !incomingWasExplicitlyUnlocked)) {
         status = 'VERIFIED';
       } else if (discrepancies.length > 0) {
         status = 'DISCREPANCY_RECOUNT';
@@ -21114,13 +21132,21 @@ export const ingestStocktakeSessionFromMesh = (data: {
         comparisonFinalizedAt: incomingSeg.comparisonFinalizedAt ?? localSeg?.comparisonFinalizedAt ?? zone?.comparisonFinalizedAt,
         comparisonFinalizedBy: incomingSeg.comparisonFinalizedBy ?? localSeg?.comparisonFinalizedBy ?? zone?.comparisonFinalizedBy,
         unlockHistory: Array.isArray(incomingSeg.unlockHistory) ? incomingSeg.unlockHistory : localSeg?.unlockHistory,
-        count1: (localSeg?.count1 && localSeg.count1.length > 0) ? localSeg.count1 : (incomingSeg.count1 || []),
-        count2: (localSeg?.count2 && localSeg.count2.length > 0) ? localSeg.count2 : (incomingSeg.count2 || []),
+        count1: mergedCount1,
+        count2: mergedCount2,
         verifiedCounts,
         discrepancies,
         discrepancyCount,
         status,
       };
+    });
+
+    // Union-preserve any locally existing segments missing from the incoming payload (non-destructive)
+    (existing?.segments || []).forEach((localSeg: any) => {
+      const localKey = String(localSeg?.segmentId || localSeg?.id || '').trim().toUpperCase();
+      if (localKey && !incomingSegIds.has(localKey)) {
+        mergedSegments.push(localSeg);
+      }
     });
   } else {
     mergedSegments = existing?.segments || [];
@@ -21302,6 +21328,30 @@ export const ingestStocktakeSessionFromMesh = (data: {
   };
 
   saveStocktakeSession(session, { fromSync: true });
+
+  // CRITICAL: Never allow Last-Write-Wins on `consolidatedItems` across multi-segment sessions!
+  // Re-aggregate authoritatively across ALL merged verified segments while preserving comments & recounts.
+  const hasAnyVerifiedSeg = (session.segments || []).some(
+    (seg) => seg.status === 'VERIFIED' || (Array.isArray(seg.verifiedCounts) && seg.verifiedCounts.length > 0 && Number(seg.discrepancyCount || 0) === 0)
+  );
+  if (
+    hasAnyVerifiedSeg &&
+    session.status !== 'APPROVED_POSTED' &&
+    session.status !== 'ARCHIVED' &&
+    session.status !== 'CANCELLED'
+  ) {
+    try {
+      const reconsolidated = consolidateStocktakeSession(session.sessionId, true, { fromSync: true });
+      if (reconsolidated?.success && reconsolidated.session) {
+        session.consolidatedItems = reconsolidated.session.consolidatedItems;
+        session.totalSystemUnits = reconsolidated.session.totalSystemUnits;
+        session.totalCountedUnits = reconsolidated.session.totalCountedUnits;
+        session.varianceUnits = reconsolidated.session.varianceUnits;
+        session.varianceCostValue = reconsolidated.session.varianceCostValue;
+        session.varianceRetailValue = reconsolidated.session.varianceRetailValue;
+      }
+    } catch {}
+  }
 
   // If session completed/archived/cancelled via mesh, ensure its casuals AND branch lockdown stay released locally too
   const isClosedSessionStatus =
@@ -22721,7 +22771,12 @@ export const addStocktakeSegment = (
   const session = getStocktakeSessionById(sessionId);
   if (!session) return null;
 
-  const nextNum = session.segments.length + 1;
+  const maxExistingNum = (session.segments || []).reduce((max, s) => {
+    const m = String(s.segmentId || '').match(/(\d+)$/);
+    const n = m ? parseInt(m[1], 10) : 0;
+    return Number.isFinite(n) && n > max ? n : max;
+  }, 0);
+  const nextNum = Math.max(session.segments.length, maxExistingNum) + 1;
   const newSegment: StocktakeSegment = {
     segmentId: `SEG-${String(nextNum).padStart(3, '0')}`,
     name: params.name.trim(),
@@ -22950,6 +23005,14 @@ export const submitSegmentCount = (
 
   saveStocktakeSession(session);
 
+  let latestSession = session;
+  if (hasCount1 && hasCount2 && discrepanciesCount === 0) {
+    try {
+      const consRes = consolidateStocktakeSession(sessionId, true);
+      if (consRes?.session) latestSession = consRes.session;
+    } catch {}
+  }
+
   let message = `Finalized & locked Counter ${counterSlot} submission (${normalizedLines.length} products).`;
   if (hasCount1 && hasCount2) {
     if (discrepanciesCount === 0) {
@@ -22962,7 +23025,7 @@ export const submitSegmentCount = (
   return {
     success: true,
     message,
-    session,
+    session: latestSession,
     discrepanciesCount,
   };
 };
@@ -23020,10 +23083,16 @@ export const resolveSegmentRecount = (
 
   saveStocktakeSession(session);
 
+  let latestSession = session;
+  try {
+    const consRes = consolidateStocktakeSession(sessionId, true);
+    if (consRes?.session) latestSession = consRes.session;
+  } catch {}
+
   return {
     success: true,
     message: `Recount finalized for ${resolvedRecountLines.length} item(s). Segment '${segment.name}' is now VERIFIED & LOCKED.`,
-    session,
+    session: latestSession,
   };
 };
 
@@ -23112,13 +23181,57 @@ export const reopenFinalizedSegmentSlot = (
  */
 export const consolidateStocktakeSession = (
   sessionId: string,
-  allowPartial: boolean = true
+  allowPartial: boolean = true,
+  options?: { fromSync?: boolean }
 ): { success: boolean; message: string; session: StocktakeSession } => {
   const session = getStocktakeSessionById(sessionId);
   if (!session) throw new Error(`Stocktake session ${sessionId} not found.`);
 
-  const verifiedSegments = (session.segments || []).filter((s) => s.status === 'VERIFIED');
-  const unverifiedSegments = (session.segments || []).filter((s) => s.status !== 'VERIFIED');
+  const sessionZones = getZoneAssignments(sessionId);
+  const existingSegments = Array.isArray(session.segments) ? [...session.segments] : [];
+
+  // Non-destructive self-healing: recover any verified zone from IndexedDB Zone Assignments
+  // if a prior sync dropped it from session.segments or reverted its status.
+  const knownSegIds = new Set(
+    existingSegments.map((s: any) => String(s.segmentId || s.id || '').trim().toUpperCase()).filter(Boolean)
+  );
+  sessionZones.forEach((z) => {
+    const zKey = String(z.zoneId || '').trim().toUpperCase();
+    if (!zKey || knownSegIds.has(zKey)) return;
+    if (z.status === 'VERIFIED' || (Array.isArray(z.verifiedCounts) && z.verifiedCounts.length > 0)) {
+      knownSegIds.add(zKey);
+      existingSegments.push({
+        segmentId: z.zoneId,
+        name: z.zoneName || z.zoneId,
+        status: z.status === 'VERIFIED' ? 'VERIFIED' : 'COUNTING',
+        count1: z.count1 || [],
+        count2: z.count2 || [],
+        verifiedCounts: z.verifiedCounts || [],
+        discrepancyCount: Array.isArray(z.discrepancies) ? z.discrepancies.length : 0,
+        sessionId,
+      } as any);
+    }
+  });
+  session.segments = existingSegments;
+
+  // Heal each segment's effective verified status & counts from both segment and zone assignment store
+  const isSegmentEffectivelyVerified = (seg: StocktakeSegment): boolean => {
+    const segId = String(seg.segmentId || (seg as any).id || '').trim();
+    const linkedZone = sessionZones.find((z) => String(z.zoneId || '').trim().toUpperCase() === segId.toUpperCase());
+    const hasUnresolvedDiscrepancy =
+      seg.status === 'DISCREPANCY_RECOUNT' ||
+      linkedZone?.status === 'VARIANCE_FLAGGED' ||
+      (Array.isArray(seg.discrepancies) && seg.discrepancies.length > 0 && seg.status !== 'VERIFIED' && !seg.comparisonFinalized);
+    if (seg.status === 'VERIFIED') return true;
+    if (!hasUnresolvedDiscrepancy && (linkedZone?.status === 'VERIFIED' || seg.comparisonFinalized || linkedZone?.comparisonFinalized)) {
+      seg.status = 'VERIFIED';
+      return true;
+    }
+    return false;
+  };
+
+  const verifiedSegments = (session.segments || []).filter((s) => isSegmentEffectivelyVerified(s));
+  const unverifiedSegments = (session.segments || []).filter((s) => !isSegmentEffectivelyVerified(s));
 
   if (verifiedSegments.length === 0) {
     return {
@@ -23136,7 +23249,19 @@ export const consolidateStocktakeSession = (
     };
   }
 
-  // 1. Aggregate physical counts across ALL VERIFIED segments
+  // Build master lookup map by itemId / sku / barcode so counts from different segments
+  // for the same product ALWAYS combine under one canonical SKU key.
+  const allMasterItems = getInventoryItems();
+  const masterByKey = new Map<string, InventoryItem>();
+  allMasterItems.forEach((m) => {
+    if (m?.itemId) masterByKey.set(String(m.itemId).trim().toUpperCase(), m);
+    if (m?.sku) {
+      const skuKey = String(m.sku).trim().toUpperCase();
+      if (!masterByKey.has(skuKey)) masterByKey.set(skuKey, m);
+    }
+  });
+
+  // 1. Aggregate physical counts across ALL VERIFIED segments (additive sum — NEVER last-write-wins!)
   interface SkuConsolidationAccumulator {
     itemId: string;
     itemName: string;
@@ -23157,14 +23282,18 @@ export const consolidateStocktakeSession = (
 
   const skuMap = new Map<string, SkuConsolidationAccumulator>();
 
-  const sessionZones = getZoneAssignments(sessionId);
   verifiedSegments.forEach((seg) => {
-    const linkedZone = sessionZones.find((z) => z.zoneId === (seg.segmentId || (seg as any).id));
+    const segId = String(seg.segmentId || (seg as any).id || '').trim();
+    const linkedZone = sessionZones.find((z) => String(z.zoneId || '').trim().toUpperCase() === segId.toUpperCase());
+    const segDisplayName = String(seg.name || linkedZone?.zoneName || segId || 'Segment').trim();
+    const effCount1 = Array.isArray(seg.count1) && seg.count1.length > 0 ? seg.count1 : linkedZone?.count1;
+    const effCount2 = Array.isArray(seg.count2) && seg.count2.length > 0 ? seg.count2 : linkedZone?.count2;
+
     // Self-healing consolidation: guarantee initially matched lines from count1/count2 + zone.verifiedCounts
     // are always included alongside resolved recount lines even for historical sessions.
     const effectiveVerified = mergeSegmentVerifiedCounts({
-      count1: seg.count1,
-      count2: seg.count2,
+      count1: effCount1,
+      count2: effCount2,
       zoneVerified: linkedZone?.verifiedCounts,
       resolvedLines: seg.verifiedCounts || [],
     });
@@ -23172,16 +23301,56 @@ export const consolidateStocktakeSession = (
       seg.verifiedCounts = effectiveVerified;
     }
 
+    // Deduplicate lines within this single segment first so a segment can never double-count itself,
+    // while strictly SUMMING across distinct segments (e.g. Fridge 4 + Warehouse 10 = 14).
+    const perSegItemMap = new Map<string, {
+      canonicalItemId: string;
+      itemName: string;
+      category: string;
+      sku: string;
+      unitsPerCase: number;
+      cases: number;
+      singles: number;
+      totalUnits: number;
+    }>();
+
     effectiveVerified.forEach((line: any) => {
-      const key = line.itemId.toUpperCase();
+      if (!line || (!line.itemId && !line.sku)) return;
+      const rawIdKey = String(line.itemId || line.sku || '').trim().toUpperCase();
+      const rawSkuKey = String(line.sku || '').trim().toUpperCase();
+      const resolvedMaster = masterByKey.get(rawIdKey) || (rawSkuKey ? masterByKey.get(rawSkuKey) : undefined);
+      const canonicalItemId = resolvedMaster?.itemId || String(line.itemId || line.sku).trim();
+      const key = canonicalItemId.trim().toUpperCase();
+
+      const upc = Math.max(1, Number(resolvedMaster?.unitsPerCase || line.unitsPerCase || 1));
+      const lineCases = Math.max(0, Number(line.cases || 0));
+      const lineSingles = Math.max(0, Number(line.singles || 0));
+      const lineTotal =
+        line.totalUnits !== undefined && line.totalUnits !== null && Number.isFinite(Number(line.totalUnits))
+          ? Math.max(0, Number(line.totalUnits))
+          : lineCases * upc + lineSingles;
+
+      perSegItemMap.set(key, {
+        canonicalItemId,
+        itemName: resolvedMaster?.itemName || line.itemName || canonicalItemId,
+        category: resolvedMaster?.category || line.category || 'General',
+        sku: resolvedMaster?.sku || line.sku || canonicalItemId,
+        unitsPerCase: upc,
+        cases: Math.floor(lineTotal / upc),
+        singles: lineTotal % upc,
+        totalUnits: lineTotal,
+      });
+    });
+
+    perSegItemMap.forEach((segLine, key) => {
       let acc = skuMap.get(key);
       if (!acc) {
         acc = {
-          itemId: line.itemId,
-          itemName: line.itemName,
-          category: line.category,
-          sku: line.sku,
-          unitsPerCase: line.unitsPerCase || 1,
+          itemId: segLine.canonicalItemId,
+          itemName: segLine.itemName,
+          category: segLine.category,
+          sku: segLine.sku,
+          unitsPerCase: segLine.unitsPerCase,
           countedCases: 0,
           countedSingles: 0,
           countedTotalUnits: 0,
@@ -23190,16 +23359,33 @@ export const consolidateStocktakeSession = (
         skuMap.set(key, acc);
       }
 
-      acc.countedCases += line.cases;
-      acc.countedSingles += line.singles;
-      acc.countedTotalUnits += line.totalUnits;
-      acc.segmentBreakdown.push({
-        segmentId: seg.segmentId,
-        segmentName: seg.name,
-        cases: line.cases,
-        singles: line.singles,
-        totalUnits: line.totalUnits,
-      });
+      // Guard against duplicate segmentId in case session.segments had duplicate segment objects
+      const existingBreakIdx = acc.segmentBreakdown.findIndex(
+        (b) => String(b.segmentId || '').trim().toUpperCase() === segId.toUpperCase()
+      );
+      if (existingBreakIdx >= 0) {
+        const prevBreak = acc.segmentBreakdown[existingBreakIdx];
+        acc.countedTotalUnits -= prevBreak.totalUnits;
+        acc.segmentBreakdown[existingBreakIdx] = {
+          segmentId: segId,
+          segmentName: segDisplayName,
+          cases: segLine.cases,
+          singles: segLine.singles,
+          totalUnits: segLine.totalUnits,
+        };
+      } else {
+        acc.segmentBreakdown.push({
+          segmentId: segId,
+          segmentName: segDisplayName,
+          cases: segLine.cases,
+          singles: segLine.singles,
+          totalUnits: segLine.totalUnits,
+        });
+      }
+
+      acc.countedTotalUnits += segLine.totalUnits;
+      acc.countedCases = Math.floor(acc.countedTotalUnits / acc.unitsPerCase);
+      acc.countedSingles = acc.countedTotalUnits % acc.unitsPerCase;
     });
   });
 
@@ -23208,7 +23394,7 @@ export const consolidateStocktakeSession = (
   const customerHeldMap = new Map<string, number>();
   customerGoods.forEach((cg) => {
     if (!cg.collected) {
-      const k = cg.itemId.toUpperCase();
+      const k = String(cg.itemId || '').trim().toUpperCase();
       customerHeldMap.set(k, (customerHeldMap.get(k) || 0) + (Number(cg.quantity) || 0));
     }
   });
@@ -23227,13 +23413,13 @@ export const consolidateStocktakeSession = (
       const deductPolicy = l.deductPolicy || (detailsStr.includes('DEDUCT_COUNT') ? 'DEDUCT_COUNT' : 'SYSTEM_STANDARD');
       if (deductPolicy !== 'DEDUCT_COUNT') return;
 
-      let itemId = l.itemId ? String(l.itemId).toUpperCase() : '';
+      let itemId = l.itemId ? String(l.itemId).trim().toUpperCase() : '';
       let qty = Number(l.quantity) || 0;
       if (!itemId || !qty) {
         const m = detailsStr.match(/for\s+(\d+(?:\.\d+)?)x\s+.*?\(([^)]+)\)\./i);
         if (m) {
           qty = Number(m[1]) || 0;
-          itemId = String(m[2] || '').toUpperCase();
+          itemId = String(m[2] || '').trim().toUpperCase();
         }
       }
       if (itemId && qty > 0) {
@@ -23244,7 +23430,7 @@ export const consolidateStocktakeSession = (
 
   const previousByItemId = new Map<string, StocktakeConsolidatedItem>();
   (session.consolidatedItems || []).forEach((prev) => {
-    if (prev?.itemId) previousByItemId.set(prev.itemId.toUpperCase(), prev);
+    if (prev?.itemId) previousByItemId.set(String(prev.itemId).trim().toUpperCase(), prev);
   });
 
   // For FULL_LOCKDOWN: include all catalog inventory items (uncounted items default to 0 count)
@@ -23252,10 +23438,9 @@ export const consolidateStocktakeSession = (
   const isFullLockdown = session.countType === 'FULL_LOCKDOWN';
 
   if (isFullLockdown) {
-    const allMasterItems = getInventoryItems();
     allMasterItems.forEach((invItem) => {
-      const key = invItem.itemId.toUpperCase();
-      if (!skuMap.has(key)) {
+      const key = String(invItem.itemId || '').trim().toUpperCase();
+      if (key && !skuMap.has(key)) {
         skuMap.set(key, {
           itemId: invItem.itemId,
           itemName: invItem.itemName,
@@ -23281,7 +23466,7 @@ export const consolidateStocktakeSession = (
 
   skuMap.forEach((accum) => {
     const master = getInventoryItemById(accum.itemId);
-    const unitsPerCase = master?.unitsPerCase || accum.unitsPerCase || 1;
+    const unitsPerCase = Math.max(1, Number(master?.unitsPerCase || accum.unitsPerCase || 1));
     const costPerUnit = master?.costPerUnit || (master?.costPerCase ? master.costPerCase / unitsPerCase : 0);
     const costPerCase = master?.costPerCase || costPerUnit * unitsPerCase;
     const sellPriceUnit = master?.sellPriceUnit || 0;
@@ -23293,13 +23478,24 @@ export const consolidateStocktakeSession = (
     const systemCostValue = systemTotalUnits * costPerUnit;
     const systemRetailValue = systemTotalUnits * sellPriceUnit;
 
-    const countedTotalUnits = accum.countedTotalUnits;
+    const itemKey = accum.itemId.trim().toUpperCase();
+    const prev = previousByItemId.get(itemKey);
+
+    // Only carry over a completed SKU-level Blind Recount Sheet override if no new segments were added since that recount
+    const prevSegIds = (prev?.segmentBreakdown || []).map((b) => String(b.segmentId || '').toUpperCase()).sort().join(',');
+    const nextSegIds = accum.segmentBreakdown.map((b) => String(b.segmentId || '').toUpperCase()).sort().join(',');
+    const hasActiveBlindRecount =
+      prev?.recountSheetStatus === 'COMPLETED' &&
+      prev?.recountTotalUnits !== undefined &&
+      prevSegIds === nextSegIds;
+    const hasPendingBlindRecount = prev?.recountSheetStatus === 'REQUESTED' || Boolean(prev?.recountRequested);
+
+    const countedTotalUnits = hasActiveBlindRecount ? Number(prev!.recountTotalUnits) : accum.countedTotalUnits;
     const countedCases = Math.floor(countedTotalUnits / unitsPerCase);
     const countedSingles = countedTotalUnits % unitsPerCase;
     const countedCostValue = countedTotalUnits * costPerUnit;
     const countedRetailValue = countedTotalUnits * sellPriceUnit;
 
-    const itemKey = accum.itemId.toUpperCase();
     const customerHeldStockUnits = customerHeldMap.get(itemKey) || 0;
     const emergencySoldUnits = emergencySoldMap.get(itemKey) || 0;
     const adjustedPhysicalUnits = Math.max(0, countedTotalUnits - customerHeldStockUnits - emergencySoldUnits);
@@ -23317,20 +23513,23 @@ export const consolidateStocktakeSession = (
     const varianceRetailValue = varianceTotalUnits * sellPriceUnit;
 
     let status: 'MATCH' | 'SHORTAGE' | 'OVERAGE' | 'RECOUNT_FLAGGED' = 'MATCH';
-    if (varianceTotalUnits < 0) {
+    if (hasPendingBlindRecount) {
+      status = 'RECOUNT_FLAGGED';
+    } else if (varianceTotalUnits < 0) {
       status = 'SHORTAGE';
     } else if (varianceTotalUnits > 0) {
       status = 'OVERAGE';
     }
 
     const wasCountedInSession = accum.segmentBreakdown.length > 0;
-    const prev = previousByItemId.get(itemKey);
 
     totalSystemUnits += systemTotalUnits;
     totalCountedUnits += countedTotalUnits;
     totalVarianceUnits += varianceTotalUnits;
     totalVarianceCostValue += varianceCostValue;
     totalVarianceRetailValue += varianceRetailValue;
+
+    const keepOriginalSnapshot = hasActiveBlindRecount || hasPendingBlindRecount;
 
     consolidatedItems.push({
       itemId: accum.itemId,
@@ -23365,24 +23564,24 @@ export const consolidateStocktakeSession = (
       status,
       wasCountedInSession,
       segmentBreakdown: accum.segmentBreakdown,
-      ...(prev?.originalCountedCases !== undefined ? { originalCountedCases: prev.originalCountedCases } : {}),
-      ...(prev?.originalCountedSingles !== undefined ? { originalCountedSingles: prev.originalCountedSingles } : {}),
-      ...(prev?.originalCountedTotalUnits !== undefined ? { originalCountedTotalUnits: prev.originalCountedTotalUnits } : {}),
-      ...(prev?.originalVarianceTotalUnits !== undefined ? { originalVarianceTotalUnits: prev.originalVarianceTotalUnits } : {}),
-      ...(prev?.originalVarianceCostValue !== undefined ? { originalVarianceCostValue: prev.originalVarianceCostValue } : {}),
-      ...(prev?.recountRequested ? { recountRequested: prev.recountRequested } : {}),
-      ...(prev?.recountSheetStatus ? { recountSheetStatus: prev.recountSheetStatus } : {}),
-      ...(prev?.recountNotes ? { recountNotes: prev.recountNotes } : {}),
-      ...(prev?.recountReason ? { recountReason: prev.recountReason } : {}),
-      ...(prev?.recountCases !== undefined ? { recountCases: prev.recountCases } : {}),
-      ...(prev?.recountSingles !== undefined ? { recountSingles: prev.recountSingles } : {}),
-      ...(prev?.recountTotalUnits !== undefined ? { recountTotalUnits: prev.recountTotalUnits } : {}),
-      ...(prev?.recountedBy ? { recountedBy: prev.recountedBy } : {}),
-      ...(prev?.recountedById ? { recountedById: prev.recountedById } : {}),
-      ...(prev?.recountWitnessId ? { recountWitnessId: prev.recountWitnessId } : {}),
-      ...(prev?.recountWitnessName ? { recountWitnessName: prev.recountWitnessName } : {}),
-      ...(prev?.recountedAt ? { recountedAt: prev.recountedAt } : {}),
-      ...(prev?.recountReversalAlert ? { recountReversalAlert: prev.recountReversalAlert } : {}),
+      ...(keepOriginalSnapshot && prev?.originalCountedCases !== undefined ? { originalCountedCases: prev.originalCountedCases } : {}),
+      ...(keepOriginalSnapshot && prev?.originalCountedSingles !== undefined ? { originalCountedSingles: prev.originalCountedSingles } : {}),
+      ...(keepOriginalSnapshot && prev?.originalCountedTotalUnits !== undefined ? { originalCountedTotalUnits: prev.originalCountedTotalUnits } : {}),
+      ...(keepOriginalSnapshot && prev?.originalVarianceTotalUnits !== undefined ? { originalVarianceTotalUnits: prev.originalVarianceTotalUnits } : {}),
+      ...(keepOriginalSnapshot && prev?.originalVarianceCostValue !== undefined ? { originalVarianceCostValue: prev.originalVarianceCostValue } : {}),
+      ...(hasPendingBlindRecount ? { recountRequested: true } : {}),
+      ...((hasActiveBlindRecount || hasPendingBlindRecount) && prev?.recountSheetStatus ? { recountSheetStatus: prev.recountSheetStatus } : {}),
+      ...((hasActiveBlindRecount || hasPendingBlindRecount) && prev?.recountNotes ? { recountNotes: prev.recountNotes } : {}),
+      ...(hasActiveBlindRecount && prev?.recountReason ? { recountReason: prev.recountReason } : {}),
+      ...(hasActiveBlindRecount && prev?.recountCases !== undefined ? { recountCases: prev.recountCases } : {}),
+      ...(hasActiveBlindRecount && prev?.recountSingles !== undefined ? { recountSingles: prev.recountSingles } : {}),
+      ...(hasActiveBlindRecount && prev?.recountTotalUnits !== undefined ? { recountTotalUnits: prev.recountTotalUnits } : {}),
+      ...(hasActiveBlindRecount && prev?.recountedBy ? { recountedBy: prev.recountedBy } : {}),
+      ...(hasActiveBlindRecount && prev?.recountedById ? { recountedById: prev.recountedById } : {}),
+      ...(hasActiveBlindRecount && prev?.recountWitnessId ? { recountWitnessId: prev.recountWitnessId } : {}),
+      ...(hasActiveBlindRecount && prev?.recountWitnessName ? { recountWitnessName: prev.recountWitnessName } : {}),
+      ...(hasActiveBlindRecount && prev?.recountedAt ? { recountedAt: prev.recountedAt } : {}),
+      ...(hasActiveBlindRecount && prev?.recountReversalAlert ? { recountReversalAlert: prev.recountReversalAlert } : {}),
       ...(prev?.reasonCode ? { reasonCode: prev.reasonCode } : {}),
       ...(prev?.managerComment ? { managerComment: prev.managerComment } : {}),
       ...(prev?.actionTaken ? { actionTaken: prev.actionTaken } : {}),
@@ -23413,11 +23612,11 @@ export const consolidateStocktakeSession = (
     session.status = 'IN_PROGRESS';
   }
 
-  saveStocktakeSession(session);
+  saveStocktakeSession(session, options);
 
   return {
     success: true,
-    message: `Consolidated ${consolidatedItems.length} SKUs across ${session.segments.length} segments. Total variance: ${totalVarianceUnits >= 0 ? `+${totalVarianceUnits}` : totalVarianceUnits} units ($${totalVarianceCostValue.toFixed(2)} cost value).`,
+    message: `Consolidated ${consolidatedItems.length} SKUs across ${verifiedSegments.length}/${session.segments.length} verified segment(s). Total variance: ${totalVarianceUnits >= 0 ? `+${totalVarianceUnits}` : totalVarianceUnits} units ($${totalVarianceCostValue.toFixed(2)} cost value).`,
     session,
   };
 };

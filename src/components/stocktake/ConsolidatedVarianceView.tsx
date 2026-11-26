@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useDeferredValue } from 'react';
+import React, { useState, useEffect, useMemo, useDeferredValue, useRef } from 'react';
 import {
   Search,
   Filter,
@@ -24,12 +24,14 @@ import {
   ArrowDown,
   ArrowUp,
   X,
+  Layers,
 } from 'lucide-react';
 import {
   StocktakeSession,
   StocktakeConsolidatedItem,
   Salesperson,
 } from '../../types';
+import { getZoneAssignments } from '../../db/roomDatabase';
 
 interface ConsolidatedVarianceViewProps {
   session: StocktakeSession;
@@ -57,7 +59,9 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
     'ABS_COST_DESC' | 'COST_ASC' | 'COST_DESC' | 'ABS_UNITS_DESC' | 'ABS_RETAIL_DESC' | 'NAME_ASC' | 'DEFAULT'
   >('ABS_COST_DESC');
   const [expandedItemId, setExpandedItemId] = useState<string | null>(null);
+  const [breakdownItemId, setBreakdownItemId] = useState<string | null>(null);
   const [selectedForRecount, setSelectedForRecount] = useState<string[]>([]);
+  const autoReconcileSigRef = useRef<string>('');
 
   // Active SKU being recounted inline
   const [editingSkuId, setEditingSkuId] = useState<string | null>(null);
@@ -65,6 +69,11 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
   const [recountSingles, setRecountSingles] = useState<number>(0);
 
   const consolidated = session.consolidatedItems || [];
+  const activeBreakdownItem = useMemo(
+    () => (breakdownItemId ? consolidated.find((c) => c.itemId === breakdownItemId) || null : null),
+    [breakdownItemId, consolidated]
+  );
+
   const verifiedSegmentsCount = (session.segments || []).filter((s) => s.status === 'VERIFIED').length;
   const totalSegmentsCount = (session.segments || []).length;
   const queuedRecountCount = consolidated.filter(
@@ -72,12 +81,87 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
   ).length;
   const reversalAlertsCount = consolidated.filter((i) => Boolean(i.recountReversalAlert)).length;
 
-  // Auto-consolidate on mount if verified segments exist but consolidatedItems is empty
+  // Non-destructive self-healing auto-consolidation:
+  // Re-sums counts automatically if verified segments exist (including zone assignments)
+  // that are missing or stale in consolidatedItems, without altering any segment data.
   useEffect(() => {
-    if ((!session.consolidatedItems || session.consolidatedItems.length === 0) && verifiedSegmentsCount > 0) {
-      onConsolidateAgain();
+    if (
+      session.status === 'APPROVED_POSTED' ||
+      session.status === 'ARCHIVED' ||
+      session.status === 'CANCELLED'
+    ) {
+      return;
     }
-  }, [session.sessionId, session.consolidatedItems?.length, verifiedSegmentsCount, onConsolidateAgain]);
+
+    const verifiedWithCounts = new Set<string>();
+    const allVerifiedIds = new Set<string>();
+
+    (session.segments || []).forEach((seg) => {
+      const segId = String(seg.segmentId || (seg as any).id || '').trim().toUpperCase();
+      if (!segId) return;
+      const isVerified =
+        seg.status === 'VERIFIED' ||
+        Boolean((seg as any).comparisonFinalized) ||
+        (Array.isArray(seg.verifiedCounts) && seg.verifiedCounts.length > 0);
+      if (isVerified) {
+        allVerifiedIds.add(segId);
+        const hasCounts =
+          (Array.isArray(seg.verifiedCounts) && seg.verifiedCounts.length > 0) ||
+          (Array.isArray(seg.count1) && seg.count1.length > 0) ||
+          (Array.isArray(seg.count2) && seg.count2.length > 0);
+        if (hasCounts) verifiedWithCounts.add(segId);
+      }
+    });
+
+    try {
+      const zones = getZoneAssignments(session.sessionId) || [];
+      zones.forEach((z) => {
+        const zId = String(z.zoneId || '').trim().toUpperCase();
+        if (!zId) return;
+        const isVerified =
+          z.status === 'VERIFIED' ||
+          Boolean(z.comparisonFinalized) ||
+          (Array.isArray(z.verifiedCounts) && z.verifiedCounts.length > 0);
+        if (isVerified) {
+          allVerifiedIds.add(zId);
+          const hasCounts =
+            (Array.isArray(z.verifiedCounts) && z.verifiedCounts.length > 0) ||
+            (Array.isArray(z.count1) && z.count1.length > 0) ||
+            (Array.isArray(z.count2) && z.count2.length > 0);
+          if (hasCounts) verifiedWithCounts.add(zId);
+        }
+      });
+    } catch {}
+
+    if (allVerifiedIds.size === 0) return;
+
+    const coveredSegIds = new Set<string>();
+    let hasBreakdownSumMismatch = false;
+    consolidated.forEach((ci) => {
+      const bds = Array.isArray(ci.segmentBreakdown) ? ci.segmentBreakdown : [];
+      let bdSum = 0;
+      bds.forEach((b) => {
+        const bId = String(b.segmentId || '').trim().toUpperCase();
+        if (bId) coveredSegIds.add(bId);
+        bdSum += Number(b.totalUnits || 0);
+      });
+      if (bds.length > 0 && ci.recountSheetStatus !== 'COMPLETED' && bdSum !== Number(ci.countedTotalUnits || 0)) {
+        hasBreakdownSumMismatch = true;
+      }
+    });
+
+    const missingVerifiedSegment = Array.from(verifiedWithCounts).some((segId) => !coveredSegIds.has(segId));
+    const needsConsolidation =
+      consolidated.length === 0 || missingVerifiedSegment || hasBreakdownSumMismatch;
+
+    if (needsConsolidation) {
+      const sig = `${session.sessionId}|${Array.from(allVerifiedIds).sort().join(',')}|${Array.from(verifiedWithCounts).sort().join(',')}|${consolidated.length}|${Array.from(coveredSegIds).sort().join(',')}|${hasBreakdownSumMismatch ? '1' : '0'}`;
+      if (autoReconcileSigRef.current !== sig) {
+        autoReconcileSigRef.current = sig;
+        onConsolidateAgain();
+      }
+    }
+  }, [session.sessionId, session.status, session.segments, session.consolidatedItems, consolidated, onConsolidateAgain]);
 
   // Filter & Sort items (memoized for snappy typing & sorting)
   const filteredItems = useMemo(() => {
@@ -191,6 +275,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
       'Counted (Cases)',
       'Counted (Singles)',
       'Counted Total Units',
+      'Segment Breakdown',
       'Counted Cost Value ($)',
       'Variance Units',
       'Variance Cost Value ($)',
@@ -198,33 +283,39 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
       'Status',
     ];
 
-    const rows = filteredItems.map((i) => [
-      `"${i.sku}"`,
-      `"${String(i.itemName || '').replace(/"/g, '""')}"`,
-      `"${i.category}"`,
-      i.unitsPerCase,
-      i.costPerUnit.toFixed(2),
-      i.sellPriceUnit.toFixed(2),
-      i.systemCases,
-      i.systemSingles,
-      i.systemTotalUnits,
-      i.systemCostValue.toFixed(2),
-      i.originalCountedTotalUnits ?? i.countedTotalUnits,
-      i.originalVarianceTotalUnits ?? i.varianceTotalUnits,
-      `"${i.recountSheetStatus || 'NONE'}"`,
-      i.recountTotalUnits ?? '',
-      `"${(i.recountedBy || '').replace(/"/g, '""')}"`,
-      `"${(i.recountWitnessName || '').replace(/"/g, '""')}"`,
-      i.recountReversalAlert ? 'ALERT_REVERSAL' : 'OK',
-      i.countedCases,
-      i.countedSingles,
-      i.countedTotalUnits,
-      i.countedCostValue.toFixed(2),
-      i.varianceTotalUnits,
-      i.varianceCostValue.toFixed(2),
-      i.varianceRetailValue.toFixed(2),
-      `"${i.status}"`,
-    ]);
+    const rows = filteredItems.map((i) => {
+      const breakdownText = (i.segmentBreakdown || [])
+        .map((sb) => `${sb.segmentName} x ${sb.totalUnits}`)
+        .join('; ');
+      return [
+        `"${i.sku}"`,
+        `"${String(i.itemName || '').replace(/"/g, '""')}"`,
+        `"${i.category}"`,
+        i.unitsPerCase,
+        i.costPerUnit.toFixed(2),
+        i.sellPriceUnit.toFixed(2),
+        i.systemCases,
+        i.systemSingles,
+        i.systemTotalUnits,
+        i.systemCostValue.toFixed(2),
+        i.originalCountedTotalUnits ?? i.countedTotalUnits,
+        i.originalVarianceTotalUnits ?? i.varianceTotalUnits,
+        `"${i.recountSheetStatus || 'NONE'}"`,
+        i.recountTotalUnits ?? '',
+        `"${(i.recountedBy || '').replace(/"/g, '""')}"`,
+        `"${(i.recountWitnessName || '').replace(/"/g, '""')}"`,
+        i.recountReversalAlert ? 'ALERT_REVERSAL' : 'OK',
+        i.countedCases,
+        i.countedSingles,
+        i.countedTotalUnits,
+        `"${breakdownText.replace(/"/g, '""')}"`,
+        i.countedCostValue.toFixed(2),
+        i.varianceTotalUnits,
+        i.varianceCostValue.toFixed(2),
+        i.varianceRetailValue.toFixed(2),
+        `"${i.status}"`,
+      ];
+    });
 
     const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map((e) => e.join(','))].join('\n');
     const encodedUri = encodeURI(csvContent);
@@ -752,7 +843,14 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
 
                       {/* Original Baseline Count & Variance */}
                       <td className="py-2.5 px-3 text-right font-mono">
-                        <div className="font-semibold text-slate-300">{origUnits} u</div>
+                        <button
+                          type="button"
+                          onClick={() => setBreakdownItemId(item.itemId)}
+                          className="font-semibold text-slate-200 hover:text-blue-300 underline decoration-dotted decoration-slate-500 underline-offset-2 transition cursor-pointer"
+                          title="Tap to inspect segment breakdown"
+                        >
+                          {origUnits} u
+                        </button>
                         <div
                           className={`text-[10px] ${
                             origVar === 0 ? 'text-slate-500' : origVar < 0 ? 'text-rose-400' : 'text-emerald-400'
@@ -819,17 +917,40 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
                             </button>
                           </div>
                         ) : (
-                          <>
-                            <div className="font-bold text-blue-400">{item.countedTotalUnits} u</div>
-                            <div className="text-[10px] text-slate-400">
-                              {item.countedCases} cs + {item.countedSingles} ea
-                            </div>
+                          <div className="flex flex-col items-end">
+                            <button
+                              type="button"
+                              onClick={() => setBreakdownItemId(item.itemId)}
+                              className="group inline-flex flex-col items-end rounded-lg px-2 py-1 -mr-2 hover:bg-blue-500/15 border border-transparent hover:border-blue-500/40 transition cursor-pointer text-right"
+                              title="Click to view segment-by-segment count breakdown"
+                            >
+                              <span className="font-bold text-blue-400 group-hover:text-blue-300 flex items-center gap-1 underline decoration-dotted decoration-blue-400/70 underline-offset-2">
+                                <Layers className="w-3 h-3 text-blue-400/80 shrink-0" />
+                                <span>{item.countedTotalUnits} u</span>
+                              </span>
+                              <span className="text-[10px] text-slate-400">
+                                {item.countedCases} cs + {item.countedSingles} ea
+                              </span>
+                              {item.segmentBreakdown && item.segmentBreakdown.length > 1 ? (
+                                <span className="text-[10px] font-sans font-semibold text-emerald-400 mt-0.5">
+                                  {item.segmentBreakdown.length} segments • tap for breakdown
+                                </span>
+                              ) : item.segmentBreakdown && item.segmentBreakdown.length === 1 ? (
+                                <span className="text-[10px] font-sans text-slate-400 mt-0.5 truncate max-w-[140px]">
+                                  {item.segmentBreakdown[0].segmentName} × {item.segmentBreakdown[0].totalUnits}
+                                </span>
+                              ) : (
+                                <span className="text-[10px] font-sans text-slate-500 mt-0.5">
+                                  0 segments
+                                </span>
+                              )}
+                            </button>
                             {item.customerHeldStockUnits && item.customerHeldStockUnits > 0 ? (
                               <div className="text-[10px] text-amber-300 font-sans font-semibold mt-0.5">
                                 -{item.customerHeldStockUnits} u customer hold ({item.adjustedPhysicalUnits} u true)
                               </div>
                             ) : null}
-                          </>
+                          </div>
                         )}
                       </td>
 
@@ -1002,6 +1123,186 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
           </table>
         </div>
       </div>
+
+      {/* Segment Count Breakdown Modal (opened by clicking any counted quantity) */}
+      {activeBreakdownItem && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setBreakdownItemId(null)}
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Segment count breakdown for ${activeBreakdownItem.itemName}`}
+        >
+          <div
+            className="w-full max-w-md bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="px-4 py-3.5 bg-slate-800/90 border-b border-slate-700 flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-blue-400">
+                  <Layers className="w-3.5 h-3.5 shrink-0" />
+                  <span>Segment Count Breakdown</span>
+                </div>
+                <h3 className="text-sm font-bold text-white mt-0.5 break-words">
+                  {activeBreakdownItem.itemName}
+                </h3>
+                <div className="text-[11px] font-mono text-slate-400 mt-0.5 flex flex-wrap items-center gap-1.5">
+                  <span className="text-slate-300">{activeBreakdownItem.sku}</span>
+                  <span>•</span>
+                  <span>{activeBreakdownItem.category}</span>
+                  <span>•</span>
+                  <span>{activeBreakdownItem.unitsPerCase || 1} ea/cs</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setBreakdownItemId(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700 transition shrink-0"
+                aria-label="Close segment breakdown"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-4 space-y-3.5 max-h-[70vh] overflow-y-auto">
+              {activeBreakdownItem.segmentBreakdown && activeBreakdownItem.segmentBreakdown.length > 0 ? (
+                <div className="space-y-2">
+                  {activeBreakdownItem.segmentBreakdown.map((sb, idx) => (
+                    <div
+                      key={`${sb.segmentId}-${idx}`}
+                      className="flex items-center justify-between gap-3 px-3.5 py-2.5 bg-slate-950/80 border border-slate-800 rounded-xl"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-white truncate">{sb.segmentName}</div>
+                        <div className="text-[10px] font-mono text-slate-400 mt-0.5">
+                          {sb.segmentId} • {sb.cases} cs + {sb.singles} ea
+                        </div>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <div className="text-sm font-mono font-extrabold text-blue-400">
+                          × {sb.totalUnits}
+                        </div>
+                        <div className="text-[10px] text-slate-500">units</div>
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* Combined Sum Row */}
+                  {(() => {
+                    const segSum = activeBreakdownItem.segmentBreakdown.reduce(
+                      (acc, sb) => acc + Number(sb.totalUnits || 0),
+                      0
+                    );
+                    const upc = Math.max(1, Number(activeBreakdownItem.unitsPerCase || 1));
+                    const sumCases = Math.floor(segSum / upc);
+                    const sumSingles = segSum % upc;
+                    const equation =
+                      activeBreakdownItem.segmentBreakdown.length > 1
+                        ? activeBreakdownItem.segmentBreakdown.map((sb) => sb.totalUnits).join(' + ') + ` = ${segSum}`
+                        : null;
+                    return (
+                      <div className="mt-2 px-3.5 py-3 bg-blue-950/40 border border-blue-700/60 rounded-xl flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-xs font-bold text-blue-200">
+                            Combined Segment Total ({activeBreakdownItem.segmentBreakdown.length}{' '}
+                            {activeBreakdownItem.segmentBreakdown.length === 1 ? 'segment' : 'segments'})
+                          </div>
+                          <div className="text-[11px] font-mono text-blue-300/80 mt-0.5">
+                            {equation ? `${equation} u` : `${sumCases} cs + ${sumSingles} ea`}
+                          </div>
+                        </div>
+                        <div className="text-right shrink-0">
+                          <div className="text-base font-mono font-extrabold text-white">
+                            {segSum} u
+                          </div>
+                          <div className="text-[10px] font-mono text-blue-300/80">
+                            {sumCases} cs + {sumSingles} ea
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-xl text-center text-xs text-slate-400">
+                  Not counted in any verified segment yet (0 units).
+                </div>
+              )}
+
+              {activeBreakdownItem.recountSheetStatus === 'COMPLETED' &&
+                activeBreakdownItem.recountTotalUnits !== undefined && (
+                  <div className="px-3.5 py-2.5 bg-purple-950/40 border border-purple-700/60 rounded-xl text-xs text-purple-200 flex items-center justify-between gap-2">
+                    <div>
+                      <div className="font-bold">Blind Recount Sheet Override Active</div>
+                      <div className="text-[10px] text-purple-300/80">
+                        By {activeBreakdownItem.recountedBy || 'Counter'}
+                        {activeBreakdownItem.recountWitnessName
+                          ? ` + ${activeBreakdownItem.recountWitnessName}`
+                          : ''}
+                      </div>
+                    </div>
+                    <div className="font-mono font-bold text-sm text-white shrink-0">
+                      {activeBreakdownItem.recountTotalUnits} u
+                    </div>
+                  </div>
+                )}
+
+              {activeBreakdownItem.customerHeldStockUnits && activeBreakdownItem.customerHeldStockUnits > 0 ? (
+                <div className="px-3.5 py-2 bg-amber-950/40 border border-amber-700/60 rounded-xl text-[11px] text-amber-200 flex items-center justify-between">
+                  <span>Customer Goods Held Deduction</span>
+                  <span className="font-mono font-bold">-{activeBreakdownItem.customerHeldStockUnits} u</span>
+                </div>
+              ) : null}
+
+              {/* Quick SOH vs Counted vs Variance Footer */}
+              <div className="grid grid-cols-3 gap-2 pt-1">
+                <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl text-center">
+                  <div className="text-[10px] text-slate-400">System SOH</div>
+                  <div className="text-sm font-mono font-bold text-slate-200 mt-0.5">
+                    {activeBreakdownItem.systemTotalUnits} u
+                  </div>
+                </div>
+                <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl text-center">
+                  <div className="text-[10px] text-slate-400">Net Counted</div>
+                  <div className="text-sm font-mono font-bold text-blue-400 mt-0.5">
+                    {activeBreakdownItem.countedTotalUnits} u
+                  </div>
+                </div>
+                <div className="p-2.5 bg-slate-950 border border-slate-800 rounded-xl text-center">
+                  <div className="text-[10px] text-slate-400">Variance</div>
+                  <div
+                    className={`text-sm font-mono font-bold mt-0.5 ${
+                      activeBreakdownItem.varianceTotalUnits === 0
+                        ? 'text-slate-300'
+                        : activeBreakdownItem.varianceTotalUnits < 0
+                        ? 'text-rose-400'
+                        : 'text-emerald-400'
+                    }`}
+                  >
+                    {activeBreakdownItem.varianceTotalUnits > 0
+                      ? `+${activeBreakdownItem.varianceTotalUnits}`
+                      : activeBreakdownItem.varianceTotalUnits}{' '}
+                    u
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="px-4 py-3 bg-slate-800/70 border-t border-slate-700 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setBreakdownItemId(null)}
+                className="px-4 py-1.5 bg-slate-700 hover:bg-slate-600 text-white rounded-lg text-xs font-semibold transition"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

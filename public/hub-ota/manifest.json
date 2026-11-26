@@ -1,12 +1,12 @@
 {
-  "version": "4.2.3",
+  "version": "4.2.4",
   "minShellVersion": "1.0.0",
-  "bundlePath": "/hub-ota/hub-core-4.2.3.bundle.js",
-  "bundleUrl": "/hub-ota/hub-core-4.2.3.bundle.js",
-  "sha256": "b7aba4ade17c2f3222c07dadc45112596ce14f345af07628a850e83ec4d288c0",
-  "sizeBytes": 545568,
-  "signature": "6OlJDEJ7Qd5GaZYadcnTJVDHVcJmBn/EtcUTm5JZuugfcXStyhKC5v3eGYFfUK+o9ZYX4d5Uc8La++ZGRoQVCg==",
+  "bundlePath": "/hub-ota/hub-core-4.2.4.bundle.js",
+  "bundleUrl": "/hub-ota/hub-core-4.2.4.bundle.js",
+  "sha256": "b6ac781752ffb2cd823c19e40227c454fe8a3c3dfe6172c76916ec1b54435fd4",
+  "sizeBytes": 556420,
+  "signature": "",
   "signatureAlgorithm": "Ed25519",
-  "signed": true,
-  "releasedAt": "2026-11-26T11:13:51.967Z"
+  "signed": false,
+  "releasedAt": "2026-11-26T16:02:41.911Z"
 }
