@@ -154,6 +154,180 @@ export function initPWAUpdateManager(): void {
   window.addEventListener('online', () => {
     void controller.checkForUpdate();
   });
+
+  let lastFocusCheckAt = Date.now();
+  const handleFocusUpdateCheck = () => {
+    if (document.visibilityState !== 'visible' || !navigator.onLine) return;
+    const now = Date.now();
+    if (now - lastFocusCheckAt < 60_000) return;
+    lastFocusCheckAt = now;
+    void controller.checkForUpdate();
+  };
+  document.addEventListener('visibilitychange', handleFocusUpdateCheck);
+}
+
+export type ManualUpdateCheckStatus =
+  | 'offline'
+  | 'unsupported'
+  | 'update_ready'
+  | 'up_to_date'
+  | 'error';
+
+export interface ManualUpdateCheckResult {
+  status: ManualUpdateCheckStatus;
+  message: string;
+}
+
+function waitForInstallingWorker(
+  worker: ServiceWorker,
+  timeoutMs = 10_000
+): Promise<'installed' | 'timeout' | 'redundant'> {
+  return new Promise((resolve) => {
+    if (worker.state === 'installed') {
+      resolve('installed');
+      return;
+    }
+    if (worker.state === 'redundant') {
+      resolve('redundant');
+      return;
+    }
+    let settled = false;
+    const finish = (res: 'installed' | 'timeout' | 'redundant') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.removeEventListener('statechange', onStateChange);
+      resolve(res);
+    };
+    const onStateChange = () => {
+      if (worker.state === 'installed') finish('installed');
+      else if (worker.state === 'redundant') finish('redundant');
+    };
+    const timer = setTimeout(() => finish('timeout'), timeoutMs);
+    worker.addEventListener('statechange', onStateChange);
+  });
+}
+
+/**
+ * Manually checks Vercel / the origin server for a new Service Worker build right now.
+ * Waits briefly if a new Service Worker starts installing so the user gets immediate feedback.
+ */
+export async function checkForPWAUpdateManual(): Promise<ManualUpdateCheckResult> {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') {
+    return { status: 'unsupported', message: 'Updates are only available in a browser.' };
+  }
+  if (!navigator.onLine) {
+    return {
+      status: 'offline',
+      message: 'You are offline. Connect to the internet to check for updates.',
+    };
+  }
+  if (!('serviceWorker' in navigator)) {
+    return {
+      status: 'unsupported',
+      message: 'Service Worker not active here. Use Force Refresh to reload the latest version.',
+    };
+  }
+
+  try {
+    const reg = activeRegistration || (await navigator.serviceWorker.getRegistration()) || null;
+    if (reg) {
+      activeRegistration = reg;
+    }
+
+    if (controller.getState().updateAvailable || reg?.waiting) {
+      controller.notifyNeedRefresh();
+      return {
+        status: 'update_ready',
+        message: 'New version is ready — tap Update Now to apply.',
+      };
+    }
+
+    if (!reg) {
+      return {
+        status: 'unsupported',
+        message: 'No active PWA cache detected. Use Force Refresh to load the latest build.',
+      };
+    }
+
+    await reg.update();
+
+    if (reg.waiting) {
+      controller.notifyNeedRefresh();
+      return {
+        status: 'update_ready',
+        message: 'New version downloaded — tap Update Now to apply.',
+      };
+    }
+
+    if (reg.installing) {
+      const outcome = await waitForInstallingWorker(reg.installing, 10_000);
+      if (outcome === 'installed' || reg.waiting) {
+        controller.notifyNeedRefresh();
+        return {
+          status: 'update_ready',
+          message: 'New version downloaded — tap Update Now to apply.',
+        };
+      }
+    }
+
+    if (controller.getState().updateAvailable || reg.waiting) {
+      controller.notifyNeedRefresh();
+      return {
+        status: 'update_ready',
+        message: 'New version downloaded — tap Update Now to apply.',
+      };
+    }
+
+    return {
+      status: 'up_to_date',
+      message: 'Already on the latest version. Use Force Refresh if you just deployed.',
+    };
+  } catch (err: any) {
+    console.warn('[PWAUpdateManager] Manual update check failed:', err);
+    return {
+      status: 'error',
+      message: err?.message || 'Could not check for updates. Try Force Refresh.',
+    };
+  }
+}
+
+/**
+ * Clears ONLY static PWA asset caches & unregisters old Service Workers, then reloads fresh
+ * from Vercel. Never touches IndexedDB, localStorage, sales, inventory, or offline sync queues.
+ */
+export async function forceRefreshAppCache(): Promise<{ ok: boolean; message: string }> {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') {
+    return { ok: false, message: 'Reload is only available in a browser.' };
+  }
+  if (!navigator.onLine) {
+    return {
+      ok: false,
+      message: 'Cannot force refresh while offline — reconnect to the internet first.',
+    };
+  }
+  if (isPosActiveCheckout()) {
+    return {
+      ok: false,
+      message: 'Finish or park the active POS checkout cart before refreshing.',
+    };
+  }
+
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister().catch(() => {})));
+    }
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k).catch(() => {})));
+    }
+  } catch (err) {
+    console.warn('[PWAUpdateManager] Cache clear warning before reload:', err);
+  }
+
+  window.location.reload();
+  return { ok: true, message: 'Refreshing to latest version…' };
 }
 
 export const getPWAUpdateState = () => controller.getState();

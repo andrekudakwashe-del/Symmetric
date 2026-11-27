@@ -32,9 +32,21 @@ import {
   Printer,
   Crown,
   Layers,
+  RefreshCw,
+  DownloadCloud,
+  RotateCcw,
 } from 'lucide-react';
 import { getCurrentCompany, getCurrentBranchId, getBranches, isBranchInLockdown } from '../../db/roomDatabase';
 import { prefetchAppModules } from '../../services/modulePrefetcher';
+import {
+  PWAUpdateState,
+  getPWAUpdateState,
+  subscribePWAUpdateState,
+  checkForPWAUpdateManual,
+  applyPWAUpdate,
+  queuePWAUpdateAfterCheckout,
+  forceRefreshAppCache,
+} from '../../services/pwaUpdateManager';
 
 interface FunctionalHamburgerMenuProps {
   isOpen: boolean;
@@ -113,12 +125,65 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [collapsedCategories, setCollapsedCategories] = useState<Record<string, boolean>>({});
+  const [pwaState, setPwaState] = useState<PWAUpdateState>(() => getPWAUpdateState());
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [forcingRefresh, setForcingRefresh] = useState(false);
+  const [updateNotice, setUpdateNotice] = useState<{
+    tone: 'info' | 'success' | 'warn';
+    text: string;
+  } | null>(null);
+
+  React.useEffect(() => {
+    return subscribePWAUpdateState(setPwaState);
+  }, []);
 
   React.useEffect(() => {
     if (isOpen) {
       prefetchAppModules();
     }
   }, [isOpen]);
+
+  const handleCheckForUpdate = async () => {
+    if (checkingUpdate || forcingRefresh) return;
+    setCheckingUpdate(true);
+    setUpdateNotice({ tone: 'info', text: 'Checking server for latest version…' });
+    try {
+      const res = await checkForPWAUpdateManual();
+      if (res.status === 'update_ready') {
+        setUpdateNotice({ tone: 'success', text: res.message });
+      } else if (res.status === 'up_to_date') {
+        setUpdateNotice({ tone: 'info', text: res.message });
+      } else {
+        setUpdateNotice({ tone: 'warn', text: res.message });
+      }
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleApplyPwaUpdate = async () => {
+    if (pwaState.isCheckoutBusy) {
+      queuePWAUpdateAfterCheckout();
+      setUpdateNotice({
+        tone: 'info',
+        text: 'Update queued — will apply automatically once the current sale finishes.',
+      });
+      return;
+    }
+    setUpdateNotice({ tone: 'success', text: 'Applying update & reloading…' });
+    await applyPWAUpdate();
+  };
+
+  const handleForceRefresh = async () => {
+    if (forcingRefresh || checkingUpdate) return;
+    setForcingRefresh(true);
+    setUpdateNotice({ tone: 'info', text: 'Clearing static app cache & loading latest build…' });
+    const res = await forceRefreshAppCache();
+    if (!res.ok) {
+      setForcingRefresh(false);
+      setUpdateNotice({ tone: 'warn', text: res.message });
+    }
+  };
 
   const normalizedRole = String(currentUser?.role || '').trim().toUpperCase().replace(/\s+/g, '_');
   const isSuperAdmin =
@@ -360,6 +425,114 @@ export const FunctionalHamburgerMenu: React.FC<FunctionalHamburgerMenuProps> = (
               </button>
             </div>
           )}
+
+          {/* MANUAL PWA APP UPDATE & CACHE REFRESH */}
+          <div
+            className={`rounded-2xl p-3 border shadow-sm transition ${
+              pwaState.updateAvailable
+                ? 'bg-emerald-950/45 border-emerald-500/50'
+                : 'bg-slate-950/70 border-slate-800'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div
+                  className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${
+                    pwaState.updateAvailable
+                      ? 'bg-emerald-500/25 text-emerald-300'
+                      : 'bg-sky-500/20 text-sky-400'
+                  }`}
+                >
+                  {pwaState.updateAvailable ? (
+                    <DownloadCloud className="w-4 h-4" />
+                  ) : (
+                    <RefreshCw className={`w-4 h-4 ${checkingUpdate ? 'animate-spin' : ''}`} />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <h5 className="text-xs font-bold text-white flex items-center gap-1.5">
+                    <span>App Version &amp; Updates</span>
+                    {pwaState.updateAvailable && (
+                      <span className="text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-emerald-500/25 text-emerald-300 border border-emerald-400/40">
+                        New
+                      </span>
+                    )}
+                  </h5>
+                  <p className="text-[10px] text-slate-400 truncate">
+                    {pwaState.updateAvailable
+                      ? pwaState.isCheckoutBusy
+                        ? 'Ready — paused while checkout cart is active'
+                        : 'New build ready — offline data stays safe'
+                      : 'Pull latest Vercel deployment manually'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                {pwaState.updateAvailable ? (
+                  <button
+                    type="button"
+                    id="btn-hamburger-apply-update"
+                    disabled={pwaState.isApplyingUpdate}
+                    onClick={() => void handleApplyPwaUpdate()}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-slate-950 text-xs font-black shadow-sm transition cursor-pointer whitespace-nowrap"
+                  >
+                    {pwaState.isApplyingUpdate
+                      ? 'Updating…'
+                      : pwaState.isCheckoutBusy
+                        ? 'After Sale'
+                        : 'Update Now'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    id="btn-hamburger-check-update"
+                    disabled={checkingUpdate || forcingRefresh}
+                    onClick={() => void handleCheckForUpdate()}
+                    className="px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-500 disabled:opacity-60 text-white text-xs font-bold shadow-sm transition cursor-pointer whitespace-nowrap inline-flex items-center gap-1"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${checkingUpdate ? 'animate-spin' : ''}`} />
+                    <span>{checkingUpdate ? 'Checking…' : 'Check Update'}</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  id="btn-hamburger-force-refresh"
+                  disabled={forcingRefresh || checkingUpdate}
+                  onClick={() => void handleForceRefresh()}
+                  title="Clear static app cache & reload latest build (keeps all sales & inventory data)"
+                  className="p-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 hover:text-white border border-slate-700 transition cursor-pointer"
+                >
+                  <RotateCcw className={`w-3.5 h-3.5 ${forcingRefresh ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+            </div>
+
+            {updateNotice && (
+              <div
+                className={`mt-2 px-2.5 py-1.5 rounded-lg text-[11px] font-medium flex items-center justify-between gap-2 ${
+                  updateNotice.tone === 'success'
+                    ? 'bg-emerald-500/15 text-emerald-200 border border-emerald-500/30'
+                    : updateNotice.tone === 'warn'
+                      ? 'bg-amber-500/15 text-amber-200 border border-amber-500/30'
+                      : 'bg-slate-900 text-slate-300 border border-slate-800'
+                }`}
+              >
+                <span>{updateNotice.text}</span>
+                {updateNotice.tone !== 'success' && !pwaState.updateAvailable && (
+                  <button
+                    type="button"
+                    disabled={forcingRefresh}
+                    onClick={() => void handleForceRefresh()}
+                    className="text-[10px] font-bold underline text-sky-300 hover:text-sky-200 shrink-0 cursor-pointer"
+                  >
+                    Force Refresh
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
 
           {/* 1. TOP PRIMARY WORKFLOW SECTION (Ranked by Importance) */}
           {!searchQuery && primaryModules.length > 0 && (
