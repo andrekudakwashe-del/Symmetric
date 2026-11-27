@@ -224,28 +224,85 @@ export const normalizeStockFields = (raw: {
 /**
  * Resolves the canonical Moving Weighted Average Cost (MWAC) per unit for valuation (up to 4 decimals).
  * Falls back cleanly to latest costPerUnit, then costPerCase / unitsPerCase, then 0.
+ *
+ * Self-healing guards against legacy catalog corruption:
+ * 1. If `unitsPerCase > 1` and `averageCostPerUnit` accidentally stored the full `costPerCase`
+ *    (or a stale case-multiple >= `costPerUnit * unitsPerCase * 0.7`) while `costPerUnit` holds
+ *    the valid unit cost, heals to `costPerUnit`.
+ * 2. If `unitsPerCase > 1` and `costPerUnit` / `averageCostPerUnit` equals `costPerCase` while
+ *    exceeding `sellPriceUnit * 1.5` (and `costPerCase / unitsPerCase <= sellPriceUnit * 1.5`),
+ *    heals to `costPerCase / unitsPerCase`. (Preserves valid items like single-cost-in-costPerCase
+ *    where `costPerUnit <= sellPriceUnit`.)
  */
 export const resolveItemValuationUnitCost = (
   item: Partial<InventoryItem> | null | undefined
 ): number => {
   if (!item) return 0;
-  const avg = Number(item.averageCostPerUnit);
-  if (Number.isFinite(avg) && avg > 0) return roundUnitCost(avg);
-
-  const cpu = Number(item.costPerUnit);
-  if (Number.isFinite(cpu) && cpu > 0) return roundUnitCost(cpu);
-
-  const cpc = Number(item.costPerCase);
   const upc = Math.max(1, Number(item.unitsPerCase) || 1);
-  if (Number.isFinite(cpc) && cpc > 0) return roundUnitCost(cpc / upc);
+  const rawAvg = Number(item.averageCostPerUnit);
+  const avg = Number.isFinite(rawAvg) && rawAvg > 0 ? roundUnitCost(rawAvg) : 0;
+  const rawCpu = Number(item.costPerUnit);
+  const cpu = Number.isFinite(rawCpu) && rawCpu > 0 ? roundUnitCost(rawCpu) : 0;
+  const rawCpc = Number(item.costPerCase);
+  const cpc = Number.isFinite(rawCpc) && rawCpc > 0 ? roundUnitCost(rawCpc) : 0;
+  const rawSellUnit = Number(item.sellPriceUnit);
+  const sellUnit = Number.isFinite(rawSellUnit) && rawSellUnit > 0 ? rawSellUnit : 0;
+  const derivedFromCase = cpc > 0 ? roundUnitCost(cpc / upc) : 0;
+
+  if (upc > 1) {
+    // Guard 1: averageCostPerUnit holds case cost (or stale case-multiple) while costPerUnit is valid
+    if (avg > 0 && cpu > 0) {
+      const avgLooksLikeCaseCost =
+        (cpc > 0 &&
+          Math.abs(avg - cpc) <= 0.02 &&
+          Math.abs(cpu - derivedFromCase) <= Math.max(0.02, derivedFromCase * 0.1) &&
+          avg > derivedFromCase * 1.5) ||
+        (avg >= cpu * (upc * 0.7) &&
+          (sellUnit <= 0 || (avg > sellUnit * 1.5 && cpu <= sellUnit * 1.5)));
+
+      if (avgLooksLikeCaseCost) {
+        return cpu;
+      }
+    }
+
+    // Guard 2: both averageCostPerUnit and/or costPerUnit hold case cost (> 1.5x single sell price)
+    const candidate = avg > 0 ? avg : cpu;
+    if (
+      candidate > 0 &&
+      cpc > 0 &&
+      Math.abs(candidate - cpc) <= 0.02 &&
+      sellUnit > 0 &&
+      candidate > sellUnit * 1.5 &&
+      derivedFromCase > 0 &&
+      derivedFromCase <= sellUnit * 1.5
+    ) {
+      return derivedFromCase;
+    }
+  }
+
+  if (avg > 0) return avg;
+  if (cpu > 0) return cpu;
+  if (derivedFromCase > 0) return derivedFromCase;
 
   return 0;
 };
 
 /**
+ * Maximum legitimate penny-rounding drift between an integer-cent `stockValueCents` pool
+ * and `Math.round(totalUnits * averageCostPerUnit * 100)` given 4-decimal unit cost precision
+ * ($0.0001 = 0.01 cents/unit). Anything outside this envelope indicates a stale/desynced pool.
+ */
+export const getMaxValuePoolDriftCents = (totalUnits: number): number => {
+  const safeUnits = Math.max(0, Number(totalUnits) || 0);
+  return Math.max(5, Math.ceil(safeUnits * 0.02));
+};
+
+/**
  * Resolves the authoritative integer-cent inventory value pool for a positive-stock SKU.
- * - When `stockValueCents` is tracked on the item, uses it directly for zero-penny GL reconciliation.
- * - Falls back cleanly to `Math.round(totalUnits * unitCost * 100)` for legacy items without a pool.
+ * - When `stockValueCents` is tracked on the item AND consistent with `totalUnits * unitCost`
+ *   within the 4-decimal rounding envelope, uses it directly for zero-penny GL reconciliation.
+ * - Automatically rejects stale/corrupted `stockValueCents` (e.g. from out-of-band syncs or
+ *   healed cost fields) and falls back cleanly to `Math.round(totalUnits * unitCost * 100)`.
  * - Always returns 0 when `totalUnits <= 0`.
  */
 export const resolveItemStockValueCents = (
@@ -256,19 +313,135 @@ export const resolveItemStockValueCents = (
   if (totalUnits <= 0) return 0;
 
   const unitCost = resolveItemValuationUnitCost(item);
+  const expectedCents = Math.round(totalUnits * unitCost * 100);
   const rawPool = item.stockValueCents;
   if (rawPool !== undefined && rawPool !== null && rawPool !== '') {
     const poolCents = Math.round(Number(rawPool));
     if (Number.isFinite(poolCents) && poolCents >= 0) {
       // Guard against legacy zero-initialized pool when item has positive stock and positive cost
       if (poolCents === 0 && unitCost > 0) {
-        return Math.round(totalUnits * unitCost * 100);
+        return expectedCents;
+      }
+      // Guard against stale/desynced stockValueCents after un-reconciled stock or cost edits
+      if (unitCost > 0 && Math.abs(poolCents - expectedCents) > getMaxValuePoolDriftCents(totalUnits)) {
+        return expectedCents;
       }
       return poolCents;
     }
   }
 
-  return Math.round(totalUnits * unitCost * 100);
+  return expectedCents;
+};
+
+export interface ItemValuationAudit {
+  itemId: string;
+  itemName: string;
+  category: string;
+  stockCases: number;
+  stockSingles: number;
+  totalUnits: number;
+  unitsPerCase: number;
+  rawAverageCostPerUnit: number;
+  rawCostPerUnit: number;
+  rawCostPerCase: number;
+  sellPriceUnit: number;
+  resolvedUnitCost: number;
+  mwacValuationDollars: number;
+  legacyCaseSingleDollars: number;
+  deltaFromLegacyDollars: number;
+  anomalies: string[];
+  healed: boolean;
+}
+
+/**
+ * Forensic SKU-level valuation diagnostic comparing MWAC valuation against the legacy
+ * `(stockCases * costPerCase) + (stockSingles * costPerUnit)` formula and flagging
+ * cost/margin/pool anomalies so operators can pinpoint valuation jumps immediately.
+ */
+export const analyzeItemValuation = (item: Partial<InventoryItem>): ItemValuationAudit => {
+  const stock = normalizeStockFields(item);
+  const upc = stock.unitsPerCase;
+  const rawAvg = Number(item.averageCostPerUnit) > 0 ? roundUnitCost(Number(item.averageCostPerUnit)) : 0;
+  const rawCpu = Number(item.costPerUnit) > 0 ? roundUnitCost(Number(item.costPerUnit)) : 0;
+  const rawCpc = Number(item.costPerCase) > 0 ? roundUnitCost(Number(item.costPerCase)) : 0;
+  const sellUnit = Number(item.sellPriceUnit) > 0 ? Number(item.sellPriceUnit) : 0;
+
+  const resolvedUnitCost = resolveItemValuationUnitCost(item);
+  const mwacCents = stock.totalUnits > 0 ? resolveItemStockValueCents(item) : 0;
+  const mwacValuationDollars = mwacCents / 100;
+
+  const legacyCaseSingleDollars =
+    stock.totalUnits > 0
+      ? roundCurrency(stock.stockCases * rawCpc + stock.stockSingles * rawCpu)
+      : 0;
+  const deltaFromLegacyDollars = roundCurrency(mwacValuationDollars - legacyCaseSingleDollars);
+
+  const anomalies: string[] = [];
+  let healed = false;
+
+  if (rawAvg > 0 && Math.abs(rawAvg - resolvedUnitCost) > 0.005) {
+    anomalies.push(`Auto-healed stale Avg Cost ($${formatUnitCost(rawAvg)} → $${formatUnitCost(resolvedUnitCost)}/u)`);
+    healed = true;
+  } else if (rawAvg === 0 && rawCpu > 0 && Math.abs(rawCpu - resolvedUnitCost) > 0.005) {
+    anomalies.push(`Auto-healed Case Cost stored in Unit Cost ($${formatUnitCost(rawCpu)} → $${formatUnitCost(resolvedUnitCost)}/u)`);
+    healed = true;
+  }
+
+  if (stock.totalUnits > 0 && item.stockValueCents !== undefined && item.stockValueCents !== null) {
+    const rawPoolCents = Math.round(Number(item.stockValueCents));
+    const expectedCents = Math.round(stock.totalUnits * resolvedUnitCost * 100);
+    if (
+      Number.isFinite(rawPoolCents) &&
+      rawPoolCents > 0 &&
+      Math.abs(rawPoolCents - expectedCents) > getMaxValuePoolDriftCents(stock.totalUnits)
+    ) {
+      anomalies.push(`Auto-healed stale value pool ($${(rawPoolCents / 100).toFixed(2)} → $${(expectedCents / 100).toFixed(2)})`);
+      healed = true;
+    }
+  }
+
+  if (upc > 1 && rawCpc > 0 && rawCpu > 0) {
+    const impliedCase = rawCpu * upc;
+    const pctDiff = Math.abs(rawCpc - impliedCase) / Math.max(rawCpc, impliedCase, 0.01);
+    if (pctDiff > 0.15) {
+      anomalies.push(
+        `Case Cost ($${formatUnitCost(rawCpc)}) ≠ ${upc} × Unit Cost ($${formatUnitCost(rawCpu)} = $${formatUnitCost(impliedCase)})`
+      );
+    }
+  } else if (upc > 1 && stock.stockCases > 0 && rawCpc === 0 && rawCpu > 0) {
+    anomalies.push(`Missing Case Cost ($0.00) while ${stock.stockCases} case(s) on hand`);
+  }
+
+  if (sellUnit > 0 && resolvedUnitCost > sellUnit * 1.05 && stock.totalUnits > 0) {
+    anomalies.push(`Unit Cost ($${formatUnitCost(resolvedUnitCost)}) exceeds Sell Price ($${formatUnitCost(sellUnit)})`);
+  }
+
+  if (rawAvg > 0 && rawCpu > 0 && !healed) {
+    const ratio = Math.max(rawAvg, rawCpu) / Math.max(0.0001, Math.min(rawAvg, rawCpu));
+    if (ratio >= 1.5 && stock.totalUnits > 0) {
+      anomalies.push(`MWAC ($${formatUnitCost(rawAvg)}/u) diverges from Latest Cost ($${formatUnitCost(rawCpu)}/u)`);
+    }
+  }
+
+  return {
+    itemId: String(item.itemId || ''),
+    itemName: String(item.itemName || item.itemId || 'Unnamed SKU'),
+    category: String(item.category || 'General'),
+    stockCases: stock.stockCases,
+    stockSingles: stock.stockSingles,
+    totalUnits: stock.totalUnits,
+    unitsPerCase: upc,
+    rawAverageCostPerUnit: rawAvg,
+    rawCostPerUnit: rawCpu,
+    rawCostPerCase: rawCpc,
+    sellPriceUnit: sellUnit,
+    resolvedUnitCost,
+    mwacValuationDollars,
+    legacyCaseSingleDollars,
+    deltaFromLegacyDollars,
+    anomalies,
+    healed,
+  };
 };
 
 /**

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* Saimetric Local Hub Core OTA Bundle v4.2.5 — Built 2026-11-27T11:21:54.160Z */
+/* Saimetric Local Hub Core OTA Bundle v4.2.5 — Built 2026-11-27T13:14:51.357Z */
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __commonJS = (cb, mod) => function __require() {
   try {
@@ -4949,24 +4949,45 @@ function normalizeHubStockFields(item) {
 }
 function resolveHubAvgUnitCost(item) {
   if (!item) return 0;
-  const avg = Number(item.averageCostPerUnit);
-  if (Number.isFinite(avg) && avg > 0) return Number(avg.toFixed(4));
-  const cpu = Number(item.costPerUnit);
-  if (Number.isFinite(cpu) && cpu > 0) return Number(cpu.toFixed(4));
-  const cpc = Number(item.costPerCase);
   const upc = Math.max(1, Number(item.unitsPerCase || item.UnitsPerCase) || 1);
-  if (Number.isFinite(cpc) && cpc > 0) return Number((cpc / upc).toFixed(4));
+  const rawAvg = Number(item.averageCostPerUnit);
+  const avg = Number.isFinite(rawAvg) && rawAvg > 0 ? Number(rawAvg.toFixed(4)) : 0;
+  const rawCpu = Number(item.costPerUnit);
+  const cpu = Number.isFinite(rawCpu) && rawCpu > 0 ? Number(rawCpu.toFixed(4)) : 0;
+  const rawCpc = Number(item.costPerCase);
+  const cpc = Number.isFinite(rawCpc) && rawCpc > 0 ? Number(rawCpc.toFixed(4)) : 0;
+  const rawSell = Number(item.sellPriceUnit);
+  const sellUnit = Number.isFinite(rawSell) && rawSell > 0 ? rawSell : 0;
+  const derivedFromCase = cpc > 0 ? Number((cpc / upc).toFixed(4)) : 0;
+  if (upc > 1) {
+    if (avg > 0 && cpu > 0) {
+      const avgLooksLikeCase = cpc > 0 && Math.abs(avg - cpc) <= 0.02 && Math.abs(cpu - derivedFromCase) <= Math.max(0.02, derivedFromCase * 0.1) && avg > derivedFromCase * 1.5 || avg >= cpu * (upc * 0.7) && (sellUnit <= 0 || avg > sellUnit * 1.5 && cpu <= sellUnit * 1.5);
+      if (avgLooksLikeCase) return cpu;
+    }
+    const candidate = avg > 0 ? avg : cpu;
+    if (candidate > 0 && cpc > 0 && Math.abs(candidate - cpc) <= 0.02 && sellUnit > 0 && candidate > sellUnit * 1.5 && derivedFromCase > 0 && derivedFromCase <= sellUnit * 1.5) {
+      return derivedFromCase;
+    }
+  }
+  if (avg > 0) return avg;
+  if (cpu > 0) return cpu;
+  if (derivedFromCase > 0) return derivedFromCase;
   return 0;
 }
 function resolveHubPoolCents(item, currentUnits) {
   const units = Number(currentUnits || 0);
   if (units <= 0) return 0;
   const avg = resolveHubAvgUnitCost(item);
+  const expectedCents = Math.max(0, Math.round(units * avg * 100));
   const rawPool = item && item.stockValueCents !== void 0 && item.stockValueCents !== null ? Math.round(Number(item.stockValueCents)) : NaN;
+  const maxDrift = Math.max(5, Math.ceil(units * 0.02));
   if (Number.isFinite(rawPool) && rawPool >= 0 && !(rawPool === 0 && avg > 0)) {
+    if (avg > 0 && Math.abs(rawPool - expectedCents) > maxDrift) {
+      return expectedCents;
+    }
     return rawPool;
   }
-  return Math.max(0, Math.round(units * avg * 100));
+  return expectedCents;
 }
 function applyHubStockUnits(item, nextTotalUnits, options) {
   if (!item) return;

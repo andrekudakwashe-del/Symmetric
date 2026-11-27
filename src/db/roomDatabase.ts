@@ -14701,12 +14701,15 @@ export const getInventoryItems = (branchIdOverride?: string, companyIdOverride?:
       unitsPerCase: rawUnitsPerCase,
       canSellAsCase: item.canSellAsCase,
     });
-    const avgCostUnit =
-      item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
-        ? Number(item.averageCostPerUnit)
-        : rawCostPerUnit;
+    const avgCostUnit = resolveItemValuationUnitCost({
+      averageCostPerUnit: item.averageCostPerUnit,
+      costPerUnit: rawCostPerUnit,
+      costPerCase: rawCostPerCase,
+      unitsPerCase: rawUnitsPerCase,
+      sellPriceUnit: rawSellPriceUnit,
+    });
     const avgCostCase =
-      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0 && Math.abs(Number(item.averageCostPerCase) - avgCostUnit * rawUnitsPerCase) <= Math.max(0.05, avgCostUnit * rawUnitsPerCase * 0.15)
         ? Number(item.averageCostPerCase)
         : Number((avgCostUnit * rawUnitsPerCase).toFixed(2));
     const latestCostUnit =
@@ -14849,30 +14852,33 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
   const existingStock = existingRecord ? normalizeStockFields(existingRecord) : null;
   const existingAvgCost = existingRecord ? resolveItemValuationUnitCost(existingRecord) : 0;
 
-  const averageCostPerUnit = roundUnitCost(
+  const rawAvgCandidate =
     item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
       ? Number(item.averageCostPerUnit)
       : existingRecord?.averageCostPerUnit !== undefined &&
         Number(existingRecord.averageCostPerUnit) > 0 &&
         Math.abs(costPerUnit - roundUnitCost(Number(existingRecord.costPerUnit) || 0)) < 0.0001
       ? Number(existingRecord.averageCostPerUnit)
-      : costPerUnit
-  );
+      : costPerUnit;
+  const averageCostPerUnit = resolveItemValuationUnitCost({
+    averageCostPerUnit: rawAvgCandidate,
+    costPerUnit,
+    costPerCase,
+    unitsPerCase,
+    sellPriceUnit: item.sellPriceUnit,
+  });
   const latestCostPerUnit = roundUnitCost(
     item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
       ? Number(item.latestCostPerUnit)
       : costPerUnit
   );
-  const averageCostPerCase =
-    item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
-      ? Number(item.averageCostPerCase)
-      : (averageCostPerUnit * unitsPerCase);
+  const averageCostPerCase = roundUnitCost(averageCostPerUnit * unitsPerCase);
   const latestCostPerCase =
     item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
       ? Number(item.latestCostPerCase)
       : costPerCase;
 
-  // Maintain authoritative integer-cent value pool (`stockValueCents`)
+  // Maintain authoritative integer-cent value pool (`stockValueCents`) with drift guard
   let resolvedStockValueCents = 0;
   if (totalUnits > 0) {
     const incomingPool =
@@ -14895,15 +14901,21 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
       (Math.abs(totalUnits - existingStock.totalUnits) > 0.001 ||
         Math.abs(averageCostPerUnit - existingAvgCost) > 0.0001);
 
-    if (
-      incomingPool !== undefined &&
-      !stockOrCostChangedWithoutPoolUpdate &&
-      !(incomingPool === 0 && averageCostPerUnit > 0)
-    ) {
-      resolvedStockValueCents = incomingPool;
+    if (incomingPool !== undefined && !stockOrCostChangedWithoutPoolUpdate) {
+      resolvedStockValueCents = resolveItemStockValueCents({
+        stockCases,
+        stockSingles,
+        totalUnits,
+        unitsPerCase,
+        averageCostPerUnit,
+        costPerUnit,
+        costPerCase,
+        sellPriceUnit: item.sellPriceUnit,
+        stockValueCents: incomingPool,
+      });
     } else {
       resolvedStockValueCents = reconcileStockValueCents(
-        { averageCostPerUnit, costPerUnit, costPerCase, unitsPerCase },
+        { averageCostPerUnit, costPerUnit, costPerCase, unitsPerCase, sellPriceUnit: item.sellPriceUnit },
         totalUnits,
         averageCostPerUnit
       );
@@ -15287,16 +15299,22 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || extractRecordTimestamp(existing) || Date.now();
     const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
-    const resolvedAvgCostUnit =
+    const rawIncomingAvg =
       item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
         ? Number(item.averageCostPerUnit)
-        : existing.averageCostPerUnit !== undefined && Number(existing.averageCostPerUnit) > 0
+        : existing.averageCostPerUnit !== undefined &&
+          Number(existing.averageCostPerUnit) > 0 &&
+          Math.abs(roundUnitCost(costPerUnit) - roundUnitCost(Number(existing.costPerUnit) || 0)) < 0.0001
         ? Number(existing.averageCostPerUnit)
         : costPerUnit;
-    const resolvedAvgCostCase =
-      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
-        ? Number(item.averageCostPerCase)
-        : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+    const resolvedAvgCostUnit = resolveItemValuationUnitCost({
+      averageCostPerUnit: rawIncomingAvg,
+      costPerUnit,
+      costPerCase,
+      unitsPerCase,
+      sellPriceUnit,
+    });
+    const resolvedAvgCostCase = Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
     const resolvedLatestCostUnit =
       item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
         ? Number(item.latestCostPerUnit)
@@ -15313,9 +15331,17 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const resolvedStockValueCents =
       totalUnits <= 0
         ? 0
-        : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
-        ? Math.round(Number(item.stockValueCents))
-        : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+        : resolveItemStockValueCents({
+            stockCases,
+            stockSingles,
+            totalUnits,
+            unitsPerCase,
+            averageCostPerUnit: resolvedAvgCostUnit,
+            costPerUnit,
+            costPerCase,
+            sellPriceUnit,
+            stockValueCents: item.stockValueCents,
+          });
 
     savedItem = {
       ...existing,
@@ -15365,14 +15391,14 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
     const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
-    const resolvedAvgCostUnit =
-      item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
-        ? Number(item.averageCostPerUnit)
-        : costPerUnit;
-    const resolvedAvgCostCase =
-      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
-        ? Number(item.averageCostPerCase)
-        : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+    const resolvedAvgCostUnit = resolveItemValuationUnitCost({
+      averageCostPerUnit: item.averageCostPerUnit,
+      costPerUnit,
+      costPerCase,
+      unitsPerCase,
+      sellPriceUnit,
+    });
+    const resolvedAvgCostCase = Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
     const resolvedLatestCostUnit =
       item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
         ? Number(item.latestCostPerUnit)
@@ -15385,9 +15411,17 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const resolvedStockValueCents =
       totalUnits <= 0
         ? 0
-        : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
-        ? Math.round(Number(item.stockValueCents))
-        : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+        : resolveItemStockValueCents({
+            stockCases,
+            stockSingles,
+            totalUnits,
+            unitsPerCase,
+            averageCostPerUnit: resolvedAvgCostUnit,
+            costPerUnit,
+            costPerCase,
+            sellPriceUnit,
+            stockValueCents: item.stockValueCents,
+          });
 
     savedItem = {
       ...item,
@@ -15569,16 +15603,22 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || extractRecordTimestamp(existing) || Date.now();
       const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
-      const resolvedAvgCostUnit =
+      const rawIncomingAvg =
         item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
           ? Number(item.averageCostPerUnit)
-          : existing.averageCostPerUnit !== undefined && Number(existing.averageCostPerUnit) > 0
+          : existing.averageCostPerUnit !== undefined &&
+            Number(existing.averageCostPerUnit) > 0 &&
+            Math.abs(roundUnitCost(costPerUnit) - roundUnitCost(Number(existing.costPerUnit) || 0)) < 0.0001
           ? Number(existing.averageCostPerUnit)
           : costPerUnit;
-      const resolvedAvgCostCase =
-        item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
-          ? Number(item.averageCostPerCase)
-          : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+      const resolvedAvgCostUnit = resolveItemValuationUnitCost({
+        averageCostPerUnit: rawIncomingAvg,
+        costPerUnit,
+        costPerCase,
+        unitsPerCase,
+        sellPriceUnit,
+      });
+      const resolvedAvgCostCase = Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
       const resolvedLatestCostUnit =
         item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
           ? Number(item.latestCostPerUnit)
@@ -15595,9 +15635,17 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const resolvedStockValueCents =
         totalUnits <= 0
           ? 0
-          : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
-          ? Math.round(Number(item.stockValueCents))
-          : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+          : resolveItemStockValueCents({
+              stockCases,
+              stockSingles,
+              totalUnits,
+              unitsPerCase,
+              averageCostPerUnit: resolvedAvgCostUnit,
+              costPerUnit,
+              costPerCase,
+              sellPriceUnit,
+              stockValueCents: item.stockValueCents,
+            });
 
       allItems[idx] = {
         ...existing,
@@ -15647,14 +15695,14 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
       const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
-      const resolvedAvgCostUnit =
-        item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
-          ? Number(item.averageCostPerUnit)
-          : costPerUnit;
-      const resolvedAvgCostCase =
-        item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
-          ? Number(item.averageCostPerCase)
-          : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+      const resolvedAvgCostUnit = resolveItemValuationUnitCost({
+        averageCostPerUnit: item.averageCostPerUnit,
+        costPerUnit,
+        costPerCase,
+        unitsPerCase,
+        sellPriceUnit,
+      });
+      const resolvedAvgCostCase = Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
       const resolvedLatestCostUnit =
         item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
           ? Number(item.latestCostPerUnit)
@@ -15667,9 +15715,17 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const resolvedStockValueCents =
         totalUnits <= 0
           ? 0
-          : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
-          ? Math.round(Number(item.stockValueCents))
-          : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+          : resolveItemStockValueCents({
+              stockCases,
+              stockSingles,
+              totalUnits,
+              unitsPerCase,
+              averageCostPerUnit: resolvedAvgCostUnit,
+              costPerUnit,
+              costPerCase,
+              sellPriceUnit,
+              stockValueCents: item.stockValueCents,
+            });
 
       const savedItem: InventoryItem = {
         ...item,
@@ -19256,6 +19312,13 @@ export const recalculateItemPackagingRatio = (
   );
   const costPerUnit = roundUnitCost(costPerCase / newUnitsPerCase);
 
+  const prevUnitCost = resolveItemValuationUnitCost(item);
+  const costChanged =
+    costPerCaseParam !== undefined &&
+    costPerCaseParam >= 0 &&
+    Math.abs(costPerUnit - prevUnitCost) > 0.0001;
+  const nextAvgUnitCost = costChanged ? costPerUnit : prevUnitCost;
+
   const updated: InventoryItem = {
     ...item,
     unitsPerCase: newUnitsPerCase,
@@ -19263,8 +19326,13 @@ export const recalculateItemPackagingRatio = (
     costPerUnit,
     latestCostPerUnit: costPerUnit,
     latestCostPerCase: costPerCase,
-    averageCostPerCase: roundUnitCost(resolveItemValuationUnitCost(item) * newUnitsPerCase),
-    stockValueCents: resolveItemStockValueCents(item),
+    averageCostPerUnit: nextAvgUnitCost,
+    averageCostPerCase: roundUnitCost(nextAvgUnitCost * newUnitsPerCase),
+    stockValueCents: reconcileStockValueCents(
+      { ...item, unitsPerCase: newUnitsPerCase, costPerCase, costPerUnit, averageCostPerUnit: nextAvgUnitCost },
+      totalUnits,
+      nextAvgUnitCost
+    ),
     stockCases: newStockCases,
     stockSingles: newStockSingles,
     totalUnits,

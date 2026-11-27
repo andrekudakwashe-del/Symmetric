@@ -35,6 +35,7 @@ import { InventoryItem, Salesperson } from '../../types';
 import { useScrollDirection } from '../../hooks/useScrollDirection';
 import { ProductAddEditModal } from './ProductAddEditModal';
 import { ProductAuditTrailModal } from './ProductAuditTrailModal';
+import { ValuationAuditModal } from './ValuationAuditModal';
 import { VirtualList, useVirtualTableSlice } from '../common/VirtualWindow';
 import {
   downloadInventoryCsv,
@@ -63,6 +64,7 @@ import {
   computePortfolioValuation,
   computeItemValuationCents,
   resolveItemValuationUnitCost,
+  analyzeItemValuation,
   isItemBelowReorderPoint,
   formatUnitCost,
   roundUnitCost,
@@ -88,14 +90,14 @@ export const normalizeInventoryItem = (item: any): InventoryItem => {
   const costPerCase = roundUnitCost(Number(item.costPerCase !== undefined && item.costPerCase !== null ? item.costPerCase : (item.costPrice ?? item.CostPrice ?? (item.costPerUnit ? item.costPerUnit * unitsPerCase : 0))) || 0);
   const costPerUnit = roundUnitCost(Number(item.costPerUnit !== undefined && item.costPerUnit !== null ? item.costPerUnit : (unitsPerCase > 0 ? costPerCase / unitsPerCase : 0)) || 0);
   const sellPriceCase = Number(item.sellPriceCase !== undefined && item.sellPriceCase !== null ? item.sellPriceCase : (sellPriceUnit * unitsPerCase)) || 0;
-  const averageCostPerUnit =
-    item.averageCostPerUnit !== undefined && item.averageCostPerUnit !== null && !isNaN(Number(item.averageCostPerUnit)) && Number(item.averageCostPerUnit) > 0
-      ? roundUnitCost(Number(item.averageCostPerUnit))
-      : costPerUnit;
-  const averageCostPerCase =
-    item.averageCostPerCase !== undefined && item.averageCostPerCase !== null && !isNaN(Number(item.averageCostPerCase)) && Number(item.averageCostPerCase) > 0
-      ? roundUnitCost(Number(item.averageCostPerCase))
-      : roundUnitCost(averageCostPerUnit * unitsPerCase);
+  const averageCostPerUnit = resolveItemValuationUnitCost({
+    averageCostPerUnit: item.averageCostPerUnit,
+    costPerUnit,
+    costPerCase,
+    unitsPerCase,
+    sellPriceUnit,
+  });
+  const averageCostPerCase = roundUnitCost(averageCostPerUnit * unitsPerCase);
 
   return {
     ...item,
@@ -136,6 +138,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
 
   const [items, setItems] = useState<InventoryItem[]>(() => getInventoryItems().map(normalizeInventoryItem));
   const [auditTrailItem, setAuditTrailItem] = useState<InventoryItem | null>(null);
+  const [showValuationAudit, setShowValuationAudit] = useState(false);
 
   useEffect(() => {
     setItems(getInventoryItems().map(normalizeInventoryItem));
@@ -263,7 +266,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
   const [isSyncingMesh, setIsSyncingMesh] = useState(false);
 
   const refreshList = () => {
-    setItems(getInventoryItems());
+    setItems(getInventoryItems().map(normalizeInventoryItem));
   };
 
   const handleSyncWithHub = async () => {
@@ -332,6 +335,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
   const totalCasesInStock = portfolio.positiveCases;
   const totalSinglesInStock = portfolio.positiveSingles;
   const lowStockItems = useMemo(() => items.filter((i) => isItemBelowReorderPoint(i)), [items]);
+  const valuationAnomalyCount = useMemo(
+    () => items.reduce((count, i) => (i.totalUnits > 0 && analyzeItemValuation(i).anomalies.length > 0 ? count + 1 : count), 0),
+    [items]
+  );
 
   // Filtered items (Optimized with deferredSearchQuery to eliminate keystroke lag)
   const filteredItems = useMemo(() => {
@@ -411,6 +418,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     ensureCategoryExists(chosenCategory);
 
     const itemToSave: InventoryItem = {
+      ...(editingItem || {}),
       itemId: formData.itemId.trim().toUpperCase(),
       itemName: formData.itemName.trim(),
       category: chosenCategory,
@@ -418,6 +426,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
       unitsPerCase,
       costPerCase,
       costPerUnit,
+      averageCostPerUnit: costPerUnit,
+      averageCostPerCase: costPerCase,
+      latestCostPerUnit: costPerUnit,
+      latestCostPerCase: costPerCase,
       sellPriceCase: Number(formData.sellPriceCase) || 0,
       sellPriceUnit: Number(formData.sellPriceUnit) || 0,
       stockCases,
@@ -635,16 +647,26 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
 
       {/* Top Metrics Banner */}
       <div id="inventory-metrics" className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
-        <div className="bg-slate-900 text-white rounded-2xl p-3.5 sm:p-4 shadow-sm border border-slate-800 flex flex-col justify-between">
-          <div className="flex items-center justify-between">
+        <button
+          type="button"
+          onClick={() => setShowValuationAudit(true)}
+          className="text-left bg-slate-900 hover:bg-slate-800 text-white rounded-2xl p-3.5 sm:p-4 shadow-sm border border-slate-800 hover:border-emerald-500/50 transition flex flex-col justify-between cursor-pointer active:scale-[0.99]"
+          title="Tap to inspect SKU valuation breakdown and cost anomalies"
+        >
+          <div className="flex items-center justify-between w-full">
             <span className="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-slate-400">Total Valuation</span>
             <DollarSign className="w-4 h-4 text-emerald-400" />
           </div>
-          <div className="mt-1.5 sm:mt-2">
+          <div className="mt-1.5 sm:mt-2 w-full">
             <div className="text-xl sm:text-2xl font-black font-mono tracking-tight">${safeToFixed(totalValuation)}</div>
-            <div className="text-[11px] text-slate-400 mt-0.5">{items.length} Tracked SKUs • MWAC</div>
+            <div className="flex items-center justify-between gap-1 mt-0.5">
+              <span className="text-[11px] text-slate-400">{items.length} Tracked SKUs • MWAC</span>
+              <span className={`text-[10px] font-bold ${valuationAnomalyCount > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>
+                {valuationAnomalyCount > 0 ? `${valuationAnomalyCount} Check ↗` : 'Audit ↗'}
+              </span>
+            </div>
           </div>
-        </div>
+        </button>
 
         <div className="bg-white rounded-2xl p-3.5 sm:p-4 shadow-sm border border-slate-200 flex flex-col justify-between">
           <div className="flex items-center justify-between">
@@ -2132,12 +2154,32 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
             setEditingItem(null);
           }}
           onSaved={(savedItem) => {
-            const freshItems = getInventoryItems();
+            const freshItems = getInventoryItems().map(normalizeInventoryItem);
             setItems(freshItems);
             setSelectedItemVariantId(savedItem.itemId);
             setShowAddModal(false);
             setEditingItem(null);
             showToast("success", `Saved item "${savedItem.itemName}" (${savedItem.itemId})`);
+          }}
+        />
+      )}
+
+      {/* Valuation Breakdown & Cost Audit Modal */}
+      {showValuationAudit && (
+        <ValuationAuditModal
+          isOpen={showValuationAudit}
+          items={items}
+          canManageInventory={canManageInventory}
+          onClose={() => setShowValuationAudit(false)}
+          onEditItem={(item) => handleEditClick(item)}
+          onReconciled={(updatedCount) => {
+            refreshList();
+            showToast(
+              'success',
+              updatedCount > 0
+                ? `Reconciled & saved ${updatedCount} auto-healed cost/value pool record(s).`
+                : 'All inventory costs and value pools are already aligned.'
+            );
           }}
         />
       )}
@@ -2152,7 +2194,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
           onStockUpdated={() => {
             refreshList();
             const fresh = getInventoryItems().find((i) => i.itemId === auditTrailItem.itemId);
-            if (fresh) setAuditTrailItem(fresh);
+            if (fresh) setAuditTrailItem(normalizeInventoryItem(fresh));
           }}
         />
       )}

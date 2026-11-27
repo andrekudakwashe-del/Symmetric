@@ -966,6 +966,109 @@ const suites: TestCase[] = [
       assert.equal(wrongTenantAndBranch.shouldIsolate, true);
     },
   },
+  {
+    name: '12. Inventory Valuation Self-Healing Guards (Case-in-Unit Cost, Stale Value Pools & Audit Delta)',
+    run: async () => {
+      const {
+        resolveItemValuationUnitCost,
+        resolveItemStockValueCents,
+        computePortfolioValuation,
+        analyzeItemValuation,
+      } = await import('../src/utils/inventoryMath');
+
+      // 12a: Stale averageCostPerUnit holding full caseCost ($12) on 24 u/cs item with valid costPerUnit ($0.50)
+      const staleAvgItem = {
+        itemId: 'FIZZ-001',
+        itemName: 'Fizzer Sweets',
+        unitsPerCase: 24,
+        stockCases: 10,
+        stockSingles: 0,
+        totalUnits: 240,
+        costPerCase: 12.0,
+        costPerUnit: 0.5,
+        averageCostPerUnit: 12.0, // Corrupted legacy MWAC!
+        sellPriceUnit: 0.75,
+      };
+      assert.equal(resolveItemValuationUnitCost(staleAvgItem), 0.5);
+      assert.equal(resolveItemStockValueCents(staleAvgItem), 12000); // $120.00, NOT $2,880.00!
+      const auditA = analyzeItemValuation(staleAvgItem);
+      assert.equal(auditA.healed, true);
+      assert.equal(auditA.mwacValuationDollars, 120);
+      assert.equal(auditA.legacyCaseSingleDollars, 120);
+      assert.equal(auditA.deltaFromLegacyDollars, 0);
+
+      // 12b: Both costPerUnit AND averageCostPerUnit accidentally equal costPerCase ($12) above sellPriceUnit ($0.75)
+      const bothCaseInUnit = {
+        itemId: 'FIZZ-002',
+        itemName: 'Bubble Gum Jar',
+        unitsPerCase: 24,
+        stockCases: 5,
+        stockSingles: 0,
+        totalUnits: 120,
+        costPerCase: 12.0,
+        costPerUnit: 12.0,
+        averageCostPerUnit: 12.0,
+        sellPriceUnit: 0.75,
+      };
+      assert.equal(resolveItemValuationUnitCost(bothCaseInUnit), 0.5);
+      assert.equal(resolveItemStockValueCents(bothCaseInUnit), 6000); // $60.00, NOT $1,440.00!
+
+      // 12c: Opal Washing Powder 2kg (single price $3.45 in both costPerCase & costPerUnit, sellPrice $4.50) stays $3.45/u
+      const opalItem = {
+        itemId: 'SIMA-0341',
+        itemName: 'Washing Powder Opal 2kg',
+        unitsPerCase: 8,
+        stockCases: 0,
+        stockSingles: 5,
+        totalUnits: 5,
+        costPerCase: 3.45,
+        costPerUnit: 3.45,
+        averageCostPerUnit: 3.45,
+        sellPriceUnit: 4.5,
+      };
+      assert.equal(resolveItemValuationUnitCost(opalItem), 3.45);
+      assert.equal(resolveItemStockValueCents(opalItem), 1725); // $17.25
+      const auditOpal = analyzeItemValuation(opalItem);
+      assert.ok(
+        auditOpal.anomalies.some((m) => m.includes('Case Cost')),
+        'Opal with costPerCase === costPerUnit on 8 u/cs must be flagged for operator review'
+      );
+
+      // 12d: Stale/desynced stockValueCents ($500 pool on 5 units @ $1.00) is rejected and healed to $5.00
+      const stalePoolItem = {
+        itemId: 'STALE-POOL',
+        itemName: 'Bread',
+        unitsPerCase: 1,
+        stockCases: 0,
+        stockSingles: 5,
+        totalUnits: 5,
+        costPerCase: 1.0,
+        costPerUnit: 1.0,
+        averageCostPerUnit: 1.0,
+        stockValueCents: 50000, // Stale $500!
+      };
+      assert.equal(resolveItemStockValueCents(stalePoolItem), 500);
+      assert.equal(analyzeItemValuation(stalePoolItem).healed, true);
+
+      // 12e: Legitimate 4-decimal penny-dust value pool (3 units @ $3.3333 -> 1000 cents exact) is preserved
+      const exactPoolItem = {
+        itemId: 'EXACT-POOL',
+        itemName: 'Cooking Oil 2L',
+        unitsPerCase: 1,
+        stockCases: 0,
+        stockSingles: 3,
+        totalUnits: 3,
+        costPerUnit: 3.3333,
+        averageCostPerUnit: 3.3333,
+        stockValueCents: 1000,
+      };
+      assert.equal(resolveItemStockValueCents(exactPoolItem), 1000);
+
+      // 12f: Portfolio aggregation combines all healed items accurately
+      const portfolio = computePortfolioValuation([staleAvgItem, bothCaseInUnit, opalItem, stalePoolItem, exactPoolItem]);
+      assert.equal(portfolio.totalValuationDollars, 212.25); // 120 + 60 + 17.25 + 5 + 10
+    },
+  },
 ];
 
 async function main() {
