@@ -164,10 +164,14 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
     const handleSecurityUpdate = () => {
       setHubSecurity(meshSyncService.getHubSecurityStatus());
       setPairedHubs(LocalHubConfig.getPairedHubs());
+      setHubBranchId(LocalHubConfig.getHubBranchId());
+      setHubBranchName(LocalHubConfig.getHubBranchName());
       setConnStatus(meshSyncService.getConnectionStatus());
       setConnMode(meshSyncService.getConnectionMode());
     };
     window.addEventListener('saimetric_hub_security_updated', handleSecurityUpdate);
+    window.addEventListener('saimetric_hub_identity_updated', handleSecurityUpdate);
+    window.addEventListener('saimetric_cloud_only_mode_changed', handleSecurityUpdate);
 
     const unsubStorage = meshSyncService.subscribeHubStorage((snap) => {
       setHubStorageStage(snap.bannerStage);
@@ -183,6 +187,8 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
       unsubConfig();
       unsubStorage();
       window.removeEventListener('saimetric_hub_security_updated', handleSecurityUpdate);
+      window.removeEventListener('saimetric_hub_identity_updated', handleSecurityUpdate);
+      window.removeEventListener('saimetric_cloud_only_mode_changed', handleSecurityUpdate);
       stopCamera();
     };
   }, [isOpen, initialTab]);
@@ -1218,10 +1224,15 @@ export const LocalHubSettingsModal: React.FC<LocalHubSettingsModalProps> = ({
             {/* Tethered Hub Identity & Repurposing */}
             <div className="p-4 rounded-2xl bg-slate-950/60 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center flex-wrap gap-2">
                   <span className="text-xs font-black uppercase tracking-wider text-slate-200">
                     Tethered Hub Identity
                   </span>
+                  {hubSecurity.hubId && hubSecurity.isMutuallyAuthenticated && (
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-bold">
+                      {hubSecurity.hubId}
+                    </span>
+                  )}
                   {hubBranchId && hubBranchId !== 'UNASSIGNED' ? (
                     <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
                       {hubBranchId}

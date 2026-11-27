@@ -38,6 +38,7 @@ import {
 } from '../../services/purchaseOrderPrintService';
 import { bluetoothPrinter } from '../../services/bluetoothPrinter';
 import { PurchaseOrderEditorModal } from './PurchaseOrderEditorModal';
+import { formatPoLineRateLabel, resolvePoLinePackType } from '../../utils/purchaseOrderMath';
 
 interface PurchaseOrderRegistryViewProps {
   currentUser: Salesperson;
@@ -956,36 +957,47 @@ export const PurchaseOrderRegistryView: React.FC<PurchaseOrderRegistryViewProps>
                       <th className="py-2.5 px-3">Description</th>
                       <th className="py-2.5 px-3 text-right">Ordered</th>
                       <th className="py-2.5 px-3 text-right">Received</th>
-                      <th className="py-2.5 px-3 text-right">Case Cost</th>
+                      <th className="py-2.5 px-3 text-right">Cost / Pack</th>
                       <th className="py-2.5 px-3 text-right">Total</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 text-sm">
-                    {(viewingPo.lines || []).map((line, i) => (
-                      <tr key={line.lineId}>
-                        <td className="py-2.5 px-3 text-xs font-mono text-slate-500">{i + 1}</td>
-                        <td className="py-2.5 px-3">
-                          <div className="font-semibold text-slate-900">
-                            {line.poDescription || line.masterDescription}
-                          </div>
-                          {line.code && (
-                            <div className="text-[11px] text-slate-500 font-mono">{line.code}</div>
-                          )}
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs">
-                          {line.orderCases} cs {line.orderSingles ? `+ ${line.orderSingles} u` : ''} ({line.totalUnits} u)
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs">
-                          {line.receivedUnits ? `${line.receivedCases || 0} cs (${line.receivedUnits} u)` : '—'}
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs">
-                          ${Number(line.caseCost || 0).toFixed(2)}
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-mono tabular-nums font-bold text-slate-900">
-                          ${Number(line.lineTotal || 0).toFixed(2)}
-                        </td>
-                      </tr>
-                    ))}
+                    {(viewingPo.lines || []).map((line, i) => {
+                      const packType = resolvePoLinePackType(line);
+                      const orderedDisplay =
+                        packType === 'Singles'
+                          ? `${Number(line.orderSingles || line.totalUnits || 0)} singles`
+                          : packType === 'Cases'
+                          ? `${Number(line.orderCases || 0)} cs (${Number(line.totalUnits || 0)} u)`
+                          : `${Number(line.orderCases || 0)} cs + ${Number(line.orderSingles || 0)} u (${Number(line.totalUnits || 0)} u)`;
+                      return (
+                        <tr key={line.lineId}>
+                          <td className="py-2.5 px-3 text-xs font-mono text-slate-500">{i + 1}</td>
+                          <td className="py-2.5 px-3">
+                            <div className="font-semibold text-slate-900">
+                              {line.poDescription || line.masterDescription}
+                            </div>
+                            <div className="text-[11px] text-slate-500 font-mono flex items-center gap-1.5">
+                              {line.code && <span>{line.code}</span>}
+                              {line.code && <span>&middot;</span>}
+                              <span className="font-sans font-semibold text-indigo-700">{packType}</span>
+                            </div>
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs">
+                            {orderedDisplay}
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs">
+                            {line.receivedUnits ? `${line.receivedCases || 0} cs (${line.receivedUnits} u)` : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs">
+                            {formatPoLineRateLabel(line)}
+                          </td>
+                          <td className="py-2.5 px-3 text-right font-mono tabular-nums font-bold text-slate-900">
+                            ${Number(line.lineTotal || 0).toFixed(2)}
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

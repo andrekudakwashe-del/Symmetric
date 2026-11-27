@@ -758,7 +758,7 @@ const suites: TestCase[] = [
   },
   {
     name: 'Purchase Order Printing — 58mm thermal & A4 outputs render edited descriptions cleanly without Master Ref clutter',
-    run: () => {
+    run: async () => {
       const samplePo: any = {
         id: 'PO-HQ-2026-0007',
         poNumber: 'PO-HQ-2026-0007',
@@ -809,12 +809,161 @@ const suites: TestCase[] = [
       assert.ok(thermalHtml.includes('58mm'), '58mm thermal PO must configure 58mm page width');
       assert.ok(thermalHtml.includes('PO-HQ-2026-0007'), '58mm thermal PO must include PO number');
       assert.ok(thermalHtml.includes('Bally House 2L Orange Flavour'), '58mm thermal PO must include edited description');
+      assert.ok(thermalHtml.includes('[Cases]'), '58mm thermal PO must show pack type (Cases)');
+      assert.ok(!thermalHtml.includes('BH-2L'), '58mm thermal PO must replace SKU code with pack type');
+      assert.ok(!thermalHtml.includes('Items / Qty'), '58mm thermal PO must not show Total Quantity at bottom');
+      assert.ok(!thermalHtml.includes('Total Qty'), '58mm thermal PO must not show Total Qty at bottom');
       assert.ok(thermalHtml.includes('$120.00'), '58mm thermal PO must include grand total');
       assert.ok(!thermalHtml.includes('Master Ref'), '58mm thermal PO must not display Master Ref');
       assert.ok(
         !thermalHtml.includes('Bally House 2L Assorted Original Master Name'),
         '58mm thermal PO must not display original masterDescription when edited'
       );
+
+      // Verify Opal Washing Powder 2kg singles calculation fix (5 singles @ $3.45 with 8 u/cs === $17.25, NOT $2.16)
+      const { computePurchaseOrderLine, resolveCatalogPoCosts } = await import(
+        '../src/utils/purchaseOrderMath'
+      );
+      const opalSingles = computePurchaseOrderLine({
+        orderAs: 'Singles',
+        qty: 5,
+        unitsPerCase: 8,
+        costEntryMode: 'UNIT_COST',
+        enteredPackCost: 3.45,
+        enteredLineTotal: 0,
+      });
+      assert.equal(opalSingles.orderCases, 0);
+      assert.equal(opalSingles.orderSingles, 5);
+      assert.equal(opalSingles.totalUnits, 5);
+      assert.equal(opalSingles.unitCost, 3.45);
+      assert.equal(opalSingles.caseCost, 27.6);
+      assert.equal(opalSingles.lineTotal, 17.25);
+
+      // Verify Line-Total-First on Singles
+      const opalLineTotal = computePurchaseOrderLine({
+        orderAs: 'Singles',
+        qty: 5,
+        unitsPerCase: 8,
+        costEntryMode: 'LINE_TOTAL',
+        enteredPackCost: 0,
+        enteredLineTotal: 17.25,
+      });
+      assert.equal(opalLineTotal.unitCost, 3.45);
+      assert.equal(opalLineTotal.caseCost, 27.6);
+      assert.equal(opalLineTotal.lineTotal, 17.25);
+
+      // Verify legacy corrupted catalog item (costPerCase === costPerUnit on 8 u/cs item) self-heals
+      const healedCatalog = resolveCatalogPoCosts({
+        unitsPerCase: 8,
+        costPerUnit: 3.45,
+        costPerCase: 3.45,
+      });
+      assert.equal(healedCatalog.unitCost, 3.45);
+      assert.equal(healedCatalog.caseCost, 27.6);
+
+      // Verify 58mm thermal singles line shows [Singles] and omits SKU code & Total Quantity
+      const singlesPo: any = {
+        ...samplePo,
+        poNumber: 'PO-SAIH-20261127-477',
+        subtotal: 17.25,
+        grandTotal: 17.25,
+        totalCases: 0,
+        totalUnits: 5,
+        lines: [
+          {
+            lineId: 'POL-OPAL',
+            itemId: 'SIMA-0341',
+            code: 'SIMA-0341',
+            masterDescription: 'Washing Powder Opal 2kg',
+            poDescription: 'Washing Powder Opal 2kg',
+            orderAs: 'Singles',
+            orderCases: 0,
+            orderSingles: 5,
+            unitsPerCase: 8,
+            totalUnits: 5,
+            unitCost: 3.45,
+            caseCost: 27.6,
+            lineTotal: 17.25,
+          },
+        ],
+      };
+      const singles58 = buildPurchaseOrderThermal58mmHtml(singlesPo, '58mm');
+      assert.ok(singles58.includes('[Singles]'), '58mm singles PO must display [Singles] pack type');
+      assert.ok(!singles58.includes('SIMA-0341'), '58mm singles PO must not show SKU code');
+      assert.ok(singles58.includes('$17.25'), '58mm singles PO must display $17.25 line total');
+      const singlesA4 = buildPurchaseOrderA4Html(singlesPo);
+      assert.ok(singlesA4.includes('$3.45/u'), 'A4 singles PO must display unit rate ($3.45/u)');
+      assert.ok(singlesA4.includes('$17.25'), 'A4 singles PO must display $17.25 line total');
+    },
+  },
+  {
+    name: '11. Local Hub Identity Reconciliation & Synthetic HUB_INFO Guard',
+    run: async () => {
+      const {
+        isSyntheticBranchHubId,
+        resolveAuthoritativeHubId,
+        reconcileHubIdentityDecision,
+      } = await import('../src/services/sync/hubIdentityReconciler');
+
+      // 11a: Synthetic HUB-<branchId> vs cryptographic hardware Hub ID
+      assert.equal(isSyntheticBranchHubId('HUB-SAI-HQ-01', 'SAI-HQ-01'), true);
+      assert.equal(isSyntheticBranchHubId('HUB-BR-MAIN', 'BR-MAIN'), true);
+      assert.equal(isSyntheticBranchHubId('HUB-92B1A869BBC5', 'SAI-HQ-01'), false);
+
+      // 11b: Verified AUTH_OK.hubId must never be overwritten by legacy HUB_INFO.hub_id
+      const resolved = resolveAuthoritativeHubId({
+        authenticatedHubId: 'HUB-92B1A869BBC5',
+        activeHubId: 'HUB-92B1A869BBC5',
+        incomingHubInfoId: 'HUB-SAI-HQ-01',
+        incomingBranchId: 'SAI-HQ-01',
+        activeBranchId: 'BR-MAIN',
+        activeBranchCode: 'SAI-HQ-01',
+        hasPairedProfileForAuthenticated: true,
+      });
+      assert.equal(resolved, 'HUB-92B1A869BBC5');
+
+      // 11c: Mutually authenticated Hub matching active tenant or branch alias reconciles without isolation
+      const authReconcileAlias = reconcileHubIdentityDecision({
+        hubBranchId: 'SAI-HQ-01',
+        hubBranchName: 'Headquarters',
+        hubTenantId: 'COMP-001',
+        activeBranchId: 'BR-MAIN',
+        activeTenantId: 'COMP-001',
+        isMutuallyAuthenticated: true,
+      });
+      assert.equal(authReconcileAlias.shouldIsolate, false);
+      assert.equal(authReconcileAlias.reconciledBranchId, 'SAI-HQ-01');
+
+      const authReconcileSameTenant = reconcileHubIdentityDecision({
+        hubBranchId: 'BR-EAST-02',
+        hubBranchName: 'East Branch',
+        hubTenantId: 'COMP-001',
+        activeBranchId: 'BR-MAIN',
+        activeTenantId: 'COMP-001',
+        isMutuallyAuthenticated: true,
+      });
+      assert.equal(authReconcileSameTenant.shouldIsolate, false);
+      assert.equal(authReconcileSameTenant.reconciledBranchId, 'BR-EAST-02');
+
+      // 11d: Unauthenticated wrong-branch Hub MUST isolate into Cloud-Only Mode
+      const unauthWrongBranch = reconcileHubIdentityDecision({
+        hubBranchId: 'BR-OTHER-99',
+        hubTenantId: 'COMP-001',
+        activeBranchId: 'BR-MAIN',
+        activeTenantId: 'COMP-001',
+        isMutuallyAuthenticated: false,
+      });
+      assert.equal(unauthWrongBranch.shouldIsolate, true);
+
+      // 11e: Wrong-branch AND wrong-tenant Hub MUST isolate even if authenticated
+      const wrongTenantAndBranch = reconcileHubIdentityDecision({
+        hubBranchId: 'BR-FOREIGN-01',
+        hubTenantId: 'COMP-999',
+        activeBranchId: 'BR-MAIN',
+        activeTenantId: 'COMP-001',
+        isMutuallyAuthenticated: true,
+      });
+      assert.equal(wrongTenantAndBranch.shouldIsolate, true);
     },
   },
 ];

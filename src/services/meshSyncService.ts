@@ -219,6 +219,11 @@ import {
 import type { HubAuthState } from './sync/LocalHubAdapter';
 import { discoverPairedHub, DiscoveryStage } from './sync/hubRoamingDiscovery';
 import {
+  doesHubMatchActiveBranchOrTenant,
+  reconcileHubIdentityDecision,
+  resolveAuthoritativeHubId,
+} from './sync/hubIdentityReconciler';
+import {
   ColdHubHydrationQueue,
   ColdHubHydrationProgress,
   DEFAULT_COLD_HUB_ENTITY_ORDER,
@@ -466,6 +471,9 @@ class MeshSyncManager {
   private pairChallengeWaitTimer: ReturnType<typeof setTimeout> | null = null;
   private activeClientNonce: string = '';
   private activeHubId: string | null = null;
+  private authenticatedHubId: string | null = null;
+  private authenticatedHubBranchId: string | null = null;
+  private authenticatedHubTenantId: string | null = null;
   private activeHubMdnsHost: string | null = null;
   private activeHubLanIps: string[] = [];
   private activeHubVersion: string | null = null;
@@ -501,8 +509,11 @@ class MeshSyncManager {
   private lastAuthFailureWasRevoked: boolean = false;
   private revokedHubIds: Set<string> = new Set();
   private hubDiscoveryPromise: Promise<boolean> | null = null;
+  private hubDiscoveryAbortController: AbortController | null = null;
   private isDiscoveringHub: boolean = false;
   private discoveryStage: DiscoveryStage | null = null;
+  private foregroundResumePromise: Promise<void> | null = null;
+  private lastForegroundResumeAt: number = 0;
   private pendingRoamedToast: boolean = false;
   private hubOtaStatus: { status: string; targetVersion?: string; etaSeconds?: number; message?: string; updatedAt: number } | null = null;
   private pendingPairRequest: {
@@ -1099,8 +1110,20 @@ class MeshSyncManager {
       }
 
       if (pType === 'HUB_INFO') {
-        // Record metadata even during pre-auth lobby; only trigger sync if authenticated or legacy backup
-        this.activeHubId = parsed.hub_id || parsed.hubId || this.activeHubId;
+        // Record metadata even during pre-auth lobby; never allow legacy/synthetic HUB_INFO.hub_id
+        // (e.g. HUB-SAI-HQ-01) to overwrite an AUTH_OK-verified Hub identity matching pairedHubs.
+        const hasVerifiedPairedAuth = Boolean(
+          this.authenticatedHubId && LocalHubConfig.getPairedHubById(this.authenticatedHubId)
+        );
+        this.activeHubId = resolveAuthoritativeHubId({
+          authenticatedHubId: this.authenticatedHubId,
+          activeHubId: this.activeHubId,
+          incomingHubInfoId: parsed.hub_id || parsed.hubId,
+          incomingBranchId: parsed.branch_id || parsed.branchId,
+          activeBranchId: this.config.branchId,
+          activeBranchCode: this.config.branchCode,
+          hasPairedProfileForAuthenticated: hasVerifiedPairedAuth,
+        });
         this.activeHubVersion = parsed.version || this.activeHubVersion;
         if (parsed.hub_runtime === 'ANDROID_APK' || parsed.hub_runtime === 'TERMUX') {
           this.activeHubRuntime = parsed.hub_runtime;
@@ -1349,30 +1372,18 @@ class MeshSyncManager {
         }
       } catch {}
 
-      // When terminal awakens, tab regains focus or user unlocks device after being away
+      // When terminal awakens, tab returns to foreground, or user switches apps on Android/iOS:
+      // immediately test active WebSocket via PING (1.5s timeout) and run 3-step roaming reconnect if dead/closed.
       window.addEventListener('focus', () => {
-        if (!this.isLocalHubConnected && this.localHubAdapter.getAuthState() !== 'AUTH_FAILED') {
-          this.localHubReconnectAttempts = 0;
-          if (LocalHubConfig.hasAnyPairedHub()) {
-            void this.discoverAndReconnectHub();
-          } else {
-            this.connectLocalHub();
-          }
-        }
-        this.checkAndRequestCatchUpIfStale();
+        void this.handleAppForegroundResume('focus');
+      });
+      window.addEventListener('pageshow', () => {
+        void this.handleAppForegroundResume('pageshow');
       });
       if (typeof document !== 'undefined') {
         document.addEventListener('visibilitychange', () => {
           if (document.visibilityState === 'visible') {
-            if (!this.isLocalHubConnected && this.localHubAdapter.getAuthState() !== 'AUTH_FAILED') {
-              this.localHubReconnectAttempts = 0;
-              if (LocalHubConfig.hasAnyPairedHub()) {
-                void this.discoverAndReconnectHub();
-              } else {
-                this.connectLocalHub();
-              }
-            }
-            this.checkAndRequestCatchUpIfStale();
+            void this.handleAppForegroundResume('visibilitychange');
           }
         });
       }
@@ -1767,11 +1778,13 @@ class MeshSyncManager {
     pendingPair: { wsUrl: string; visualCode?: string; hubId?: string; branchName?: string } | null;
   } {
     const hubUrl = LocalHubConfig.getLocalHubUrl();
+    const authoritativeHubId = this.authenticatedHubId || this.activeHubId;
     const pairedProfile =
-      (this.activeHubId ? LocalHubConfig.getPairedHubById(this.activeHubId) : null) ||
+      (authoritativeHubId ? LocalHubConfig.getPairedHubById(authoritativeHubId) : null) ||
       LocalHubConfig.getPairedHubForUrl(hubUrl) ||
       LocalHubConfig.getPrimaryPairedHub(this.config.branchId);
     const authState = this.localHubAdapter.getAuthState();
+    const isConnectedAndAuthed = authState === 'AUTHENTICATED' && this.isLocalHubConnected;
     const effectiveRole = this.activeHubRole || pairedProfile?.hubRole || null;
     const effectivePriority =
       this.activeHubPriority !== null
@@ -1780,7 +1793,7 @@ class MeshSyncManager {
     return {
       authState,
       hubUrl,
-      hubId: this.activeHubId || pairedProfile?.hubId || null,
+      hubId: authoritativeHubId || pairedProfile?.hubId || null,
       mdnsHost: this.activeHubMdnsHost || pairedProfile?.mdnsHost || null,
       hubVersion: this.activeHubVersion || pairedProfile?.hubVersion || null,
       hubRuntime: this.activeHubRuntime !== 'UNKNOWN' ? this.activeHubRuntime : (pairedProfile?.hubRuntime || 'UNKNOWN'),
@@ -1799,8 +1812,8 @@ class MeshSyncManager {
       hasPairedHubs: LocalHubConfig.hasAnyPairedHub(),
       authError: this.hubAuthError,
       wasRevoked: this.lastAuthFailureWasRevoked,
-      isDiscovering: this.isDiscoveringHub,
-      discoveryStage: this.discoveryStage,
+      isDiscovering: isConnectedAndAuthed ? false : this.isDiscoveringHub,
+      discoveryStage: isConnectedAndAuthed ? null : this.discoveryStage,
       otaStatus: this.hubOtaStatus,
       pendingPair: this.pendingPairRequest
         ? {
@@ -2083,6 +2096,163 @@ class MeshSyncManager {
     this.emitHubSecurityEvent();
   }
 
+  private abortActiveHubDiscovery(): void {
+    if (this.hubDiscoveryAbortController) {
+      try {
+        this.hubDiscoveryAbortController.abort();
+      } catch {}
+      this.hubDiscoveryAbortController = null;
+    }
+    const wasDiscovering = this.isDiscoveringHub || this.discoveryStage !== null;
+    this.isDiscoveringHub = false;
+    this.discoveryStage = null;
+    if (wasDiscovering) {
+      this.emitHubSecurityEvent();
+    }
+  }
+
+  /**
+   * Immediately reconciles stored `tetheredHubIdentity` and Hub Isolation state whenever a Hub
+   * connects or authenticates (`AUTH_OK`, `PAIR_APPROVED`, `HUB_INFO`).
+   * Mutually authenticated Hubs matching the active branch OR active tenant automatically update
+   * `tetheredHubIdentity` and clear Cloud-Only isolation instead of blocking on manual reset.
+   */
+  private reconcileAuthenticatedHubIdentity(meta: {
+    hubBranchId?: string | null;
+    hubBranchName?: string | null;
+    hubTenantId?: string | null;
+    isMutuallyAuthenticated: boolean;
+  }): boolean {
+    const activeInfo = this.getActiveBranchInfo();
+    const decision = reconcileHubIdentityDecision({
+      hubBranchId: meta.hubBranchId,
+      hubBranchName: meta.hubBranchName,
+      hubTenantId: meta.hubTenantId,
+      activeBranchId: activeInfo.branchId || this.config.branchId,
+      activeBranchCode: this.config.branchCode,
+      activeBranchName: activeInfo.branchName || this.config.branchName,
+      activeTenantId: activeInfo.companyId || this.config.companyId,
+      isMutuallyAuthenticated: meta.isMutuallyAuthenticated,
+    });
+
+    if (decision.shouldIsolate) {
+      this.isCloudOnlyMode = true;
+      LocalHubConfig.setCloudOnlyMode(true);
+      this.addLog(
+        'SECURITY_DROP',
+        `Cloud-Only Mode Activated: Active branch [${activeInfo.branchId || this.config.branchId}] / tenant [${activeInfo.companyId || this.config.companyId}] does not match Hub [${meta.hubBranchId || 'UNKNOWN'} / ${meta.hubTenantId || 'UNKNOWN'}]. Hub sync blocked to prevent data contamination.`,
+        this.config.deviceName
+      );
+      return true;
+    }
+
+    if (decision.reconciledBranchId) {
+      this.hubBranchId = decision.reconciledBranchId;
+      this.hubBranchName = decision.reconciledBranchName || decision.reconciledBranchId;
+      LocalHubConfig.setHubBranchIdentity(
+        decision.reconciledBranchId,
+        this.hubBranchName,
+        decision.reconciledTenantId || undefined
+      );
+    }
+
+    if (this.isCloudOnlyMode || LocalHubConfig.isCloudOnlyMode()) {
+      this.isCloudOnlyMode = false;
+      LocalHubConfig.setCloudOnlyMode(false);
+    }
+    return false;
+  }
+
+  /**
+   * Called on `visibilitychange` (visible), `pageshow`, and `focus`:
+   * Tests any open WebSocket with a 1.5s PING/PONG probe; if closed or timed out, immediately
+   * triggers the 3-step roaming reconnect (`lastKnownHost -> mdnsHost -> /health` probe)
+   * without clearing `pairedHubs` or forcing Hub Isolation.
+   */
+  private async handleAppForegroundResume(source: 'visibilitychange' | 'pageshow' | 'focus'): Promise<void> {
+    if (this.foregroundResumePromise) {
+      return this.foregroundResumePromise;
+    }
+    const now = Date.now();
+    if (now - this.lastForegroundResumeAt < 400) {
+      return;
+    }
+
+    const authState = this.localHubAdapter.getAuthState();
+    if (authState === 'AUTH_FAILED' || authState === 'UPDATING' || this.pendingPairRequest) {
+      return;
+    }
+
+    this.foregroundResumePromise = (async () => {
+      try {
+        if (this.localHubAdapter.isConnected()) {
+          const alive = await this.localHubAdapter.probeActiveConnection(1500);
+          if (alive) {
+            this.lastHubPongReceivedAt = Date.now();
+            this.checkAndRequestCatchUpIfStale();
+            return;
+          }
+
+          // Active socket went half-open / dead while backgrounded — trigger immediate 3-step roaming reconnect
+          // WITHOUT clearing pairedHubs or forcing Hub Isolation.
+          this.isLocalHubConnected = false;
+          this.isWsConnected = false;
+          this.authenticatedHubId = null;
+          this.authenticatedHubBranchId = null;
+          this.authenticatedHubTenantId = null;
+          this.localHubReconnectAttempts = 0;
+          if (this.localHubReconnectTimer) {
+            clearTimeout(this.localHubReconnectTimer);
+            this.localHubReconnectTimer = null;
+          }
+          this.syncActiveAdapter();
+          this.evaluateConnectionPriority();
+          this.emitHubSecurityEvent();
+          this.notifyConnectionModeChange();
+
+          this.addLog(
+            'DISCOVERY',
+            `Foreground resume (${source}): Active Hub socket unresponsive after 1.5s probe. Running 3-step roaming reconnect...`,
+            this.config.deviceName
+          );
+
+          if (LocalHubConfig.hasAnyPairedHub()) {
+            const found = await this.discoverAndReconnectHub({ forceScan: true });
+            if (!found && !this.isLocalHubConnected && !this.localHubAdapter.hasActiveOrConnectingSocket()) {
+              this.connectLocalHub();
+            }
+          } else {
+            this.connectLocalHub();
+          }
+          return;
+        }
+
+        // Socket already closed while in background — immediately run 3-step roaming reconnect
+        if (!this.isLocalHubConnected && !this.localHubAdapter.hasActiveOrConnectingSocket()) {
+          this.localHubReconnectAttempts = 0;
+          if (this.localHubReconnectTimer) {
+            clearTimeout(this.localHubReconnectTimer);
+            this.localHubReconnectTimer = null;
+          }
+          if (LocalHubConfig.hasAnyPairedHub()) {
+            const found = await this.discoverAndReconnectHub();
+            if (!found && !this.isLocalHubConnected && !this.localHubAdapter.hasActiveOrConnectingSocket()) {
+              this.connectLocalHub();
+            }
+          } else {
+            this.connectLocalHub();
+          }
+        }
+        this.checkAndRequestCatchUpIfStale();
+      } finally {
+        this.lastForegroundResumeAt = Date.now();
+        this.foregroundResumePromise = null;
+      }
+    })();
+
+    return this.foregroundResumePromise;
+  }
+
   /**
    * Deterministic 3-Hub Failover & Wi-Fi/Hotspot IP Roaming Discovery:
    *   - Filters strictly to the logged-in user's `tenantId` and `branchId`.
@@ -2105,7 +2275,12 @@ class MeshSyncManager {
       return false;
     }
 
-    if (this.isLocalHubConnected && !options?.forceScan) {
+    if (
+      this.isLocalHubConnected &&
+      this.localHubAdapter.getAuthState() === 'AUTHENTICATED' &&
+      !options?.forceScan
+    ) {
+      this.abortActiveHubDiscovery();
       return true;
     }
 
@@ -2114,8 +2289,17 @@ class MeshSyncManager {
     const effectiveBranchId = activeInfo.branchId || this.config.branchId;
 
     const preferredHub =
+      (this.authenticatedHubId ? LocalHubConfig.getPairedHubById(this.authenticatedHubId) : null) ||
       (this.activeHubId ? LocalHubConfig.getPairedHubById(this.activeHubId) : null) ||
       LocalHubConfig.getPrimaryPairedHub(effectiveBranchId);
+
+    if (this.hubDiscoveryAbortController) {
+      try {
+        this.hubDiscoveryAbortController.abort();
+      } catch {}
+    }
+    const abortController = new AbortController();
+    this.hubDiscoveryAbortController = abortController;
 
     this.isDiscoveringHub = true;
     this.discoveryStage = options?.skipLastKnown ? 'MDNS' : 'LAST_KNOWN';
@@ -2128,11 +2312,23 @@ class MeshSyncManager {
           preferredTenantId: effectiveTenantId,
           preferredBranchId: effectiveBranchId,
           allowUnpairedActiveLeader: true,
+          signal: abortController.signal,
           onStageChange: (stage) => {
+            if (abortController.signal.aborted) return;
             this.discoveryStage = stage;
             this.emitHubSecurityEvent();
           },
         });
+
+        // Stop immediately if AUTH_OK already completed while probing was in flight
+        if (
+          abortController.signal.aborted ||
+          (this.isLocalHubConnected &&
+            this.localHubAdapter.getAuthState() === 'AUTHENTICATED' &&
+            !options?.forceScan)
+        ) {
+          return true;
+        }
 
         if (!result) {
           return false;
@@ -2167,6 +2363,16 @@ class MeshSyncManager {
           }
           this.emitHubSecurityEvent();
           return false;
+        }
+
+        // Already connected & mutually authenticated to this exact Hub and URL — do not tear down a healthy socket!
+        if (
+          this.isLocalHubConnected &&
+          this.localHubAdapter.getAuthState() === 'AUTHENTICATED' &&
+          this.authenticatedHubId?.toUpperCase() === result.hubId.toUpperCase() &&
+          normalizeHubUrl(this.localHubAdapter.getActiveHubUrl()) === normalizeHubUrl(result.wsUrl)
+        ) {
+          return true;
         }
 
         const existing = LocalHubConfig.getPairedHubById(result.hubId);
@@ -2225,6 +2431,9 @@ class MeshSyncManager {
         console.warn('[MeshSync] Roaming discovery error:', err);
         return false;
       } finally {
+        if (this.hubDiscoveryAbortController === abortController) {
+          this.hubDiscoveryAbortController = null;
+        }
         this.isDiscoveringHub = false;
         this.discoveryStage = null;
         this.hubDiscoveryPromise = null;
@@ -2323,6 +2532,9 @@ class MeshSyncManager {
     this.lastAuthFailureWasRevoked = false;
     this.pendingPairRequest = null;
     this.activeHubId = null;
+    this.authenticatedHubId = null;
+    this.authenticatedHubBranchId = null;
+    this.authenticatedHubTenantId = null;
     this.activeHubMdnsHost = null;
     this.activeHubLanIps = [];
     this.localHubAdapter.setAuthState('DISCONNECTED', null);
@@ -2617,11 +2829,26 @@ class MeshSyncManager {
     }
 
     this.activeClientNonce = '';
-    this.activeHubId = hubId || profile.hubId;
+    const authoritativeHubId = profile.hubId || hubId;
+    const effectiveBranchId = branchId || profile.branchId || '';
+    const effectiveBranchName = String(
+      packet.branchName || packet.branch_name || profile.branchName || effectiveBranchId || ''
+    ).trim();
+    const effectiveTenantId = String(
+      packet.tenantId || packet.tenant_id || profile.tenantId || ''
+    ).trim();
+
+    this.authenticatedHubId = authoritativeHubId;
+    this.authenticatedHubBranchId = effectiveBranchId || null;
+    this.authenticatedHubTenantId = effectiveTenantId || null;
+    this.activeHubId = authoritativeHubId;
     if (okMdns) this.activeHubMdnsHost = okMdns;
     if (mergedLanIps.length > 0) this.activeHubLanIps = mergedLanIps;
     this.revokedHubIds.delete(profile.hubId.toUpperCase());
     const okFailover = this.applyHubFailoverMetadata(packet);
+
+    // Immediately stop any active Step 3/3 roaming scan once AUTH_OK succeeds
+    this.abortActiveHubDiscovery();
 
     if (
       this.unpairedActiveLeader &&
@@ -2653,8 +2880,9 @@ class MeshSyncManager {
       lastPort: parsedActive.port,
       ...(okMdns ? { mdnsHost: okMdns } : {}),
       ...(mergedLanIps.length > 0 ? { lanIps: mergedLanIps } : {}),
-      ...(branchId ? { branchId } : {}),
-      ...(packet.branchName || packet.branch_name ? { branchName: String(packet.branchName || packet.branch_name) } : {}),
+      ...(effectiveBranchId ? { branchId: effectiveBranchId } : {}),
+      ...(effectiveBranchName ? { branchName: effectiveBranchName } : {}),
+      ...(effectiveTenantId ? { tenantId: effectiveTenantId } : {}),
       ...(packet.version ? { hubVersion: String(packet.version) } : {}),
       ...(this.activeHubRuntime !== 'UNKNOWN' ? { hubRuntime: this.activeHubRuntime } : {}),
       ...(okFailover.hubRole ? { hubRole: okFailover.hubRole } : {}),
@@ -2669,6 +2897,13 @@ class MeshSyncManager {
     }
 
     this.localHubAdapter.setAuthState('AUTHENTICATED', profile.deviceSecret);
+    // Automatically reconcile stored tetheredHubIdentity & clear stale Cloud-Only isolation for matching branch/tenant
+    this.reconcileAuthenticatedHubIdentity({
+      hubBranchId: effectiveBranchId || null,
+      hubBranchName: effectiveBranchName || null,
+      hubTenantId: effectiveTenantId || null,
+      isMutuallyAuthenticated: true,
+    });
     this.completePostAuthHubSession(hubUrl, true);
 
     if (this.pendingFailoverToastMessage) {
@@ -2814,6 +3049,9 @@ class MeshSyncManager {
     this.revokedHubIds.delete(hubId.toUpperCase());
     this.unpairedActiveLeader = null;
     this.pendingPairRequest = null;
+    this.authenticatedHubId = hubId;
+    this.authenticatedHubBranchId = branchId || null;
+    this.authenticatedHubTenantId = tenantId || null;
     this.activeHubId = hubId;
     if (mdnsHost) this.activeHubMdnsHost = mdnsHost;
     if (lanIps.length > 0) this.activeHubLanIps = lanIps;
@@ -2822,7 +3060,14 @@ class MeshSyncManager {
     this.hubAuthError = null;
     this.lastAuthFailureWasRevoked = false;
 
+    this.abortActiveHubDiscovery();
     this.localHubAdapter.setAuthState('AUTHENTICATED', deviceSecret);
+    this.reconcileAuthenticatedHubIdentity({
+      hubBranchId: branchId,
+      hubBranchName: branchName,
+      hubTenantId: tenantId,
+      isMutuallyAuthenticated: true,
+    });
     this.completePostAuthHubSession(hubUrl, true);
   }
 
@@ -3110,6 +3355,31 @@ class MeshSyncManager {
   public evaluateConnectionPriority(): MeshConnectionMode {
     const isOnline = typeof navigator !== 'undefined' ? navigator.onLine : true;
     const forceLocalHub = LocalHubConfig.getForceLocalHub();
+
+    // Safeguard: Never leave UI in CLOUD-ONLY MODE (HUB ISOLATED) while a WebSocket is open and
+    // MUTUALLY AUTHENTICATED for the active branch or tenant.
+    if (
+      this.isCloudOnlyMode &&
+      this.isLocalHubConnected &&
+      this.localHubAdapter.getAuthState() === 'AUTHENTICATED'
+    ) {
+      const activeInfo = this.getActiveBranchInfo();
+      const pairedProfile = this.authenticatedHubId
+        ? LocalHubConfig.getPairedHubById(this.authenticatedHubId)
+        : null;
+      const matchesActiveScope = doesHubMatchActiveBranchOrTenant({
+        hubBranchId: this.authenticatedHubBranchId || pairedProfile?.branchId || this.hubBranchId,
+        hubTenantId: this.authenticatedHubTenantId || pairedProfile?.tenantId,
+        activeBranchId: activeInfo.branchId || this.config.branchId,
+        activeBranchCode: this.config.branchCode,
+        activeTenantId: activeInfo.companyId || this.config.companyId,
+        isMutuallyAuthenticated: true,
+      });
+      if (matchesActiveScope) {
+        this.isCloudOnlyMode = false;
+        LocalHubConfig.setCloudOnlyMode(false);
+      }
+    }
 
     let newMode: MeshConnectionMode;
 
@@ -4419,6 +4689,9 @@ class MeshSyncManager {
     const wasConnected = this.isLocalHubConnected;
     this.isLocalHubConnected = false;
     this.isWsConnected = false;
+    this.authenticatedHubId = null;
+    this.authenticatedHubBranchId = null;
+    this.authenticatedHubTenantId = null;
 
     if (this.localHubDisconnectedAt === null) {
       this.localHubDisconnectedAt = Date.now();
@@ -4599,68 +4872,71 @@ class MeshSyncManager {
   public handleIncomingHubInfo(packet: any) {
     const rawBranchId = (packet.branch_id || packet.branchId || '').trim();
     const branchName = (packet.branch_name || packet.branchName || rawBranchId || 'Local Hub').trim();
-    const tenantId = packet.tenant_id || packet.tenantId;
+    const tenantId = String(packet.tenant_id || packet.tenantId || this.authenticatedHubTenantId || '').trim() || undefined;
+    const isMutuallyAuthenticated =
+      this.localHubAdapter.getAuthState() === 'AUTHENTICATED' && Boolean(this.authenticatedHubId);
 
     const isUnassigned = !rawBranchId || rawBranchId.toUpperCase() === 'UNASSIGNED';
     const branchId = isUnassigned ? 'UNASSIGNED' : rawBranchId;
-
-    this.hubBranchId = isUnassigned ? 'UNASSIGNED' : branchId;
-    this.hubBranchName = isUnassigned ? 'Unassigned Hub' : branchName;
-
-    if (!isUnassigned) {
-      LocalHubConfig.setHubBranchIdentity(branchId, branchName, tenantId);
-    } else {
-      LocalHubConfig.clearHubBranchIdentity();
-    }
 
     if (typeof packet.timestamp === 'number' && packet.timestamp > 1_600_000_000_000) {
       reportTrustedTimeSample(packet.timestamp, 'LOCAL_HUB');
     }
 
-    this.addLog(
-      'DISCOVERY',
-      `Hub Handshake Verified: Tethered to [${this.hubBranchName}] (${branchId}).`,
-      this.config.deviceName
-    );
-
     // Requirement 1: Auto-Send Handshake on HUB_INFO
     // When the app receives a HUB_INFO packet where branch_id === 'UNASSIGNED',
     // it must IMMEDIATELY send the HANDSHAKE packet using the current active user's branch (e.g., VEN-01).
-    // Do not wait for a login event—if a user is already logged in, trigger the handshake instantly.
     if (isUnassigned) {
       const activeInfo = this.getActiveBranchInfo();
+      if (isMutuallyAuthenticated) {
+        this.reconcileAuthenticatedHubIdentity({
+          hubBranchId: this.authenticatedHubBranchId || activeInfo.branchId,
+          hubBranchName: activeInfo.branchName,
+          hubTenantId: tenantId || activeInfo.companyId,
+          isMutuallyAuthenticated: true,
+        });
+      } else {
+        this.hubBranchId = 'UNASSIGNED';
+        this.hubBranchName = 'Unassigned Hub';
+        LocalHubConfig.clearHubBranchIdentity();
+      }
+
+      this.addLog(
+        'DISCOVERY',
+        `Hub Handshake Verified: Tethered to [${this.hubBranchName || 'Unassigned Hub'}] (${this.hubBranchId || 'UNASSIGNED'}).`,
+        this.config.deviceName
+      );
+
       if (activeInfo.branchId && activeInfo.branchId.toUpperCase() !== 'UNASSIGNED') {
         this.sendHandshake(activeInfo.branchId, activeInfo.branchName);
       }
+      this.syncActiveAdapter();
       this.evaluateConnectionPriority();
       this.notifyPeerSubscribers(true);
       this.notifyConnectionModeChange();
       return;
     }
 
-    // Safeguard 2: Check if logged-in user or active device branch matches Hub branch
-    const sessionUser = getSessionUser();
-    const activeBranchId = (sessionUser?.branch_id || sessionUser?.branchId || getCurrentBranchId() || '').trim().toUpperCase();
-    const targetHubBranch = (branchId || '').trim().toUpperCase();
+    // Reconcile Hub identity automatically when MUTUALLY AUTHENTICATED for the active branch/tenant.
+    // Only trigger Hub Isolation if unauthenticated mismatch or wrong-branch AND wrong-tenant Hub responds.
+    const shouldIsolate = this.reconcileAuthenticatedHubIdentity({
+      hubBranchId: branchId,
+      hubBranchName: branchName,
+      hubTenantId: tenantId,
+      isMutuallyAuthenticated,
+    });
 
-    if (
-      activeBranchId &&
-      targetHubBranch &&
-      targetHubBranch !== 'UNASSIGNED' &&
-      activeBranchId !== targetHubBranch &&
-      activeBranchId !== 'ALL'
-    ) {
-      this.isCloudOnlyMode = true;
-      LocalHubConfig.setCloudOnlyMode(true);
-      this.addLog(
-        'SECURITY_DROP',
-        `Cloud-Only Mode Activated: Active branch [${activeBranchId}] does not match Hub [${targetHubBranch}]. Hub sync blocked to prevent data contamination.`,
-        this.config.deviceName
-      );
-    } else {
-      this.isCloudOnlyMode = false;
-      LocalHubConfig.setCloudOnlyMode(false);
+    if (shouldIsolate) {
+      this.hubBranchId = branchId;
+      this.hubBranchName = branchName;
+      LocalHubConfig.setHubBranchIdentity(branchId, branchName, tenantId);
     }
+
+    this.addLog(
+      'DISCOVERY',
+      `Hub Handshake Verified: Tethered to [${this.hubBranchName || branchName}] (${this.hubBranchId || branchId}).`,
+      this.config.deviceName
+    );
 
     this.syncActiveAdapter();
     this.evaluateConnectionPriority();

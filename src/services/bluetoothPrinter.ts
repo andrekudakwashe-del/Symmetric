@@ -14,6 +14,7 @@ import type {
   ShiftReportDetailMode,
 } from './cashierShiftReportService';
 import type { PurchaseOrder } from '../types';
+import { formatPoLineRateLabel, resolvePoLinePackType } from '../utils/purchaseOrderMath';
 
 export type PaperWidth = '58mm' | '80mm';
 
@@ -1942,23 +1943,18 @@ class BluetoothThermalPrinter {
 
     (po.lines || []).forEach((line, idx) => {
       const desc = sanitize(line.poDescription || line.masterDescription || 'Item');
-      const code = sanitize(line.code || line.itemId);
+      const packType = resolvePoLinePackType(line);
       writeBytes(0x1b, 0x45, 0x01);
       writeWrapped(`${idx + 1}. ${desc}`);
       writeBytes(0x1b, 0x45, 0x00);
-      const qtyParts: string[] = [];
-      if (Number(line.orderCases || 0) > 0) {
-        qtyParts.push(`${line.orderCases}cs x ${line.unitsPerCase}`);
-      }
-      if (Number(line.orderSingles || 0) > 0) {
-        qtyParts.push(`${line.orderSingles}u`);
-      }
-      const qtyLabel = qtyParts.length > 0 ? qtyParts.join('+') : `${line.totalUnits}u`;
-      const rateLabel =
-        Number(line.orderCases || 0) > 0
-          ? `@${fmtMoney(line.caseCost)}/cs`
-          : `@${fmtMoney(line.unitCost)}/u`;
-      writeCols(`  [${code}] ${qtyLabel} ${rateLabel}`, fmtMoney(line.lineTotal));
+      const qtyLabel =
+        packType === 'Cases'
+          ? `${Number(line.orderCases || 0)}x${Number(line.unitsPerCase || 1)}`
+          : packType === 'Singles'
+          ? `${Number(line.orderSingles || line.totalUnits || 0)}`
+          : `${Number(line.orderCases || 0)}cs+${Number(line.orderSingles || 0)}u`;
+      const rateLabel = `@${formatPoLineRateLabel(line)}`;
+      writeCols(`  [${packType}] ${qtyLabel} ${rateLabel}`, fmtMoney(line.lineTotal));
       if (line.notes) {
         writeWrapped(`  Note: ${line.notes}`);
       }
@@ -1966,7 +1962,6 @@ class BluetoothThermalPrinter {
 
     divider('=');
     writeCols('Total Lines:', String((po.lines || []).length));
-    writeCols('Total Qty:', `${po.totalCases || 0} cs / ${po.totalUnits || 0} u`);
     writeCols('Subtotal:', fmtMoney(po.subtotal));
     if (Number(po.taxAmount || 0) > 0) {
       writeCols(`Tax (${po.taxPercent || 0}%):`, fmtMoney(po.taxAmount));

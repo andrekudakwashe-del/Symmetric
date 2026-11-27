@@ -944,6 +944,7 @@ export interface PurchaseOrderLine {
   masterDescription: string;     // Original immutable Inventory Master description
   poDescription: string;         // Editable PO description (e.g. "Bally House 2L - Orange", "Bally House 2L - Raspberry")
   category?: string;
+  orderAs?: 'Cases' | 'Singles';
   orderCases: number;
   orderSingles?: number;
   unitsPerCase: number;

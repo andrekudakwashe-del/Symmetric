@@ -11,6 +11,7 @@ import {
   PackageCheck,
 } from 'lucide-react';
 import { PurchaseOrder, PurchaseOrderLine } from '../../types';
+import { formatPoLineRateLabel } from '../../utils/purchaseOrderMath';
 import { getPurchaseOrders } from '../../db/roomDatabase';
 
 export interface SelectedPoReceiveLine {
@@ -308,7 +309,7 @@ export const PurchaseOrderPickerModal: React.FC<PurchaseOrderPickerModalProps> =
                     <th className="py-2.5 px-3 w-28 text-right">Ordered / Rec.</th>
                     <th className="py-2.5 px-3 w-24 text-right">Rec. Cases</th>
                     <th className="py-2.5 px-3 w-24 text-right">Rec. Singles</th>
-                    <th className="py-2.5 px-3 w-24 text-right">Case Cost</th>
+                    <th className="py-2.5 px-3 w-28 text-right">Cost / Pack</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 text-sm">
@@ -393,7 +394,7 @@ export const PurchaseOrderPickerModal: React.FC<PurchaseOrderPickerModalProps> =
                           />
                         </td>
                         <td className="py-3 px-3 text-right font-mono tabular-nums text-xs font-semibold text-slate-700">
-                          ${Number(line.caseCost || 0).toFixed(2)}
+                          {formatPoLineRateLabel(line)}
                         </td>
                       </tr>
                     );

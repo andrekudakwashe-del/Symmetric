@@ -3,10 +3,10 @@
   "minShellVersion": "1.0.0",
   "bundlePath": "/hub-ota/hub-core-4.2.5.bundle.js",
   "bundleUrl": "/hub-ota/hub-core-4.2.5.bundle.js",
-  "sha256": "f8c212383bf0bd58b224caa8528f9b0c17e3b38539608296f04bf1ad1a0a7b9d",
+  "sha256": "2feee0f6bc715fc23deb55f53f7cd45533fcbb329a9b68190b5b284126d66bf9",
   "sizeBytes": 566994,
   "signature": "",
   "signatureAlgorithm": "Ed25519",
   "signed": false,
-  "releasedAt": "2026-11-27T09:37:28.577Z"
+  "releasedAt": "2026-11-27T11:21:54.379Z"
 }

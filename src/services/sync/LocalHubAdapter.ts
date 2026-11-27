@@ -108,6 +108,8 @@ export class LocalHubAdapter implements SyncAdapter {
   private activeDeviceSecret: string | null = null;
   private keepaliveIntervalId: ReturnType<typeof setInterval> | null = null;
   private lastInboundActivityAt: number = 0;
+  private lastPingSentAt: number = 0;
+  private activeProbeWaiters: Set<(alive: boolean) => void> = new Set();
 
   // Lifecycle callbacks consumed by MeshSyncManager
   public onOpenCallback: ((url: string) => void) | null = null;
@@ -209,6 +211,7 @@ export class LocalHubAdapter implements SyncAdapter {
       ws.onmessage = async (event) => {
         if (this.ws !== ws) return;
         this.lastInboundActivityAt = Date.now();
+        this.resolveProbeWaiters(true);
         try {
           if (!event.data) return;
           let rawData: any = event.data;
@@ -219,6 +222,15 @@ export class LocalHubAdapter implements SyncAdapter {
           }
           if (typeof rawData !== 'string') return;
 
+          if (rawData.trim().toUpperCase() === 'PING') {
+            try {
+              if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'PONG', ts: Date.now() }));
+              }
+            } catch {}
+            return;
+          }
+
           const parsed = JSON.parse(rawData);
           if (!parsed) return;
 
@@ -226,7 +238,7 @@ export class LocalHubAdapter implements SyncAdapter {
           if (!Array.isArray(parsed) && typeof parsed === 'object') {
             const pType = String(parsed.type || parsed.action || '').toUpperCase();
 
-            // Immediately reply to server-side keepalive PING so Android Hub APK never drops an idle PWA
+            // Immediately reply to server-side keepalive PING so Hub dead-socket watchdog never drops healthy connections
             if (pType === 'PING' || pType === 'HEARTBEAT') {
               try {
                 if (this.ws === ws && ws.readyState === WebSocket.OPEN) {
@@ -234,6 +246,7 @@ export class LocalHubAdapter implements SyncAdapter {
                     type: 'PONG',
                     action: 'PONG',
                     ts: Date.now(),
+                    ...(typeof parsed.ts === 'number' ? { echoTs: parsed.ts } : {}),
                     deviceId: this.context.deviceId,
                   }));
                 }
@@ -376,18 +389,80 @@ export class LocalHubAdapter implements SyncAdapter {
     }
   }
 
+  /**
+   * Immediately tests whether the active WebSocket is genuinely alive after app resume
+   * (`visibilitychange` / `pageshow`) by sending a PING and awaiting any inbound frame
+   * (PONG or data) within `timeoutMs` (default 1500ms).
+   * If the socket is closed or times out, tears down the half-open socket cleanly and returns false.
+   */
+  public async probeActiveConnection(timeoutMs: number = 1500): Promise<boolean> {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (alive: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.activeProbeWaiters.delete(onSignal);
+        if (!alive && this.ws === ws) {
+          this.cleanupSocket(true);
+        }
+        resolve(alive);
+      };
+
+      const onSignal = (alive: boolean) => done(alive);
+      this.activeProbeWaiters.add(onSignal);
+
+      const timer = setTimeout(() => {
+        done(false);
+      }, timeoutMs);
+
+      try {
+        this.lastPingSentAt = Date.now();
+        ws.send(JSON.stringify({
+          type: 'PING',
+          action: 'PING',
+          ts: this.lastPingSentAt,
+          deviceId: this.context.deviceId,
+        }));
+      } catch {
+        done(false);
+      }
+    });
+  }
+
+  private resolveProbeWaiters(alive: boolean): void {
+    if (this.activeProbeWaiters.size === 0) return;
+    const waiters = Array.from(this.activeProbeWaiters);
+    this.activeProbeWaiters.clear();
+    for (const fn of waiters) {
+      try {
+        fn(alive);
+      } catch {}
+    }
+  }
+
   private startKeepaliveWatchdog(): void {
     this.stopKeepaliveWatchdog();
     if (typeof window === 'undefined') return;
+    this.lastPingSentAt = 0;
     this.keepaliveIntervalId = setInterval(() => {
       if (!this.isConnected() || !this.ws) {
         this.stopKeepaliveWatchdog();
         return;
       }
-      const idleMs = Date.now() - this.lastInboundActivityAt;
-      // If socket has had zero inbound frames for >45s (missed 2 keepalive windows), tear down half-open socket
-      if (idleMs > 45000) {
-        console.warn('[LocalHubAdapter] Keepalive timeout (>45s silence). Closing half-open socket to force reconnect.');
+      const now = Date.now();
+      const idleMs = now - this.lastInboundActivityAt;
+      const pingAwaitingMs = this.lastPingSentAt > this.lastInboundActivityAt ? now - this.lastPingSentAt : 0;
+
+      // Only tear down as half-open if BOTH idle > 45s AND a PING went unanswered for >= 6s
+      // (prevents false kills the instant a mobile OS resumes a backgrounded tab)
+      if (idleMs > 45000 && pingAwaitingMs >= 6000) {
+        console.warn('[LocalHubAdapter] Keepalive timeout (>45s silence + unanswered PING). Closing half-open socket to force reconnect.');
         const staleWs = this.ws;
         this.cleanupSocket(false);
         try {
@@ -397,17 +472,18 @@ export class LocalHubAdapter implements SyncAdapter {
         return;
       }
       try {
+        this.lastPingSentAt = now;
         this.ws.send(JSON.stringify({
           type: 'PING',
           action: 'PING',
-          ts: Date.now(),
+          ts: now,
           deviceId: this.context.deviceId,
         }));
       } catch {
         this.cleanupSocket(false);
         this.onCloseCallback?.('Local Hub keepalive send failed');
       }
-    }, 20000);
+    }, 15000);
   }
 
   private stopKeepaliveWatchdog(): void {
@@ -419,7 +495,9 @@ export class LocalHubAdapter implements SyncAdapter {
 
   private cleanupSocket(nullifyHandlers: boolean): void {
     this.stopKeepaliveWatchdog();
+    this.resolveProbeWaiters(false);
     this.activeDeviceSecret = null;
+    this.lastPingSentAt = 0;
     if (this.authState !== 'UPDATING' && this.authState !== 'AUTH_FAILED') {
       this.authState = 'DISCONNECTED';
     }

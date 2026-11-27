@@ -6,6 +6,7 @@
 import { PurchaseOrder } from '../types';
 import { getCurrentBranch, getCurrentCompany } from '../db/roomDatabase';
 import { bluetoothPrinter, PaperWidth } from './bluetoothPrinter';
+import { formatPoLineRateLabel, resolvePoLinePackType } from '../utils/purchaseOrderMath';
 
 const escapeHtml = (val: unknown): string =>
   String(val ?? '')
@@ -41,6 +42,7 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
         Number(line.receivedUnits || 0) > 0
           ? `<div class="sub-note">Received: ${line.receivedCases || 0} cs (${line.receivedUnits} u)</div>`
           : '';
+      const rateDisplay = formatPoLineRateLabel(line);
       return `
         <tr>
           <td class="num">${idx + 1}</td>
@@ -52,7 +54,7 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
           </td>
           <td class="num">${escapeHtml(qtyDisplay)}</td>
           <td class="num">${Number(line.totalUnits || 0).toLocaleString()}</td>
-          <td class="num">${fmtMoney(line.caseCost)}</td>
+          <td class="num">${escapeHtml(rateDisplay)}</td>
           <td class="num bold">${fmtMoney(line.lineTotal)}</td>
         </tr>
       `;
@@ -267,7 +269,7 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
             <th>Description</th>
             <th class="num" style="width:110px">Order Qty</th>
             <th class="num" style="width:62px">Units</th>
-            <th class="num" style="width:82px">Case Cost</th>
+            <th class="num" style="width:94px">Unit / Case Cost</th>
             <th class="num" style="width:92px">Line Total</th>
           </tr>
         </thead>
@@ -329,24 +331,20 @@ export function buildPurchaseOrderThermal58mmHtml(
   const linesHtml = (po.lines || [])
     .map((line, idx) => {
       const desc = line.poDescription || line.masterDescription || 'Item';
-      const qtyParts: string[] = [];
-      if (Number(line.orderCases || 0) > 0) {
-        qtyParts.push(`${line.orderCases}cs`);
-      }
-      if (Number(line.orderSingles || 0) > 0) {
-        qtyParts.push(`${line.orderSingles}u`);
-      }
-      const qtyText = qtyParts.length > 0 ? qtyParts.join('+') : `${line.totalUnits || 0}u`;
-      const unitRate =
-        Number(line.orderCases || 0) > 0
-          ? `${fmtMoney(line.caseCost)}/cs`
-          : `${fmtMoney(line.unitCost)}/u`;
+      const packType = resolvePoLinePackType(line);
+      const qtyText =
+        packType === 'Cases'
+          ? `${Number(line.orderCases || 0)} (${Number(line.unitsPerCase || 1)}/cs)`
+          : packType === 'Singles'
+          ? `${Number(line.orderSingles || line.totalUnits || 0)}`
+          : `${Number(line.orderCases || 0)}cs+${Number(line.orderSingles || 0)}u`;
+      const unitRate = formatPoLineRateLabel(line);
 
       return `
         <div class="line-item">
           <div class="line-desc">${idx + 1}. ${escapeHtml(desc)}</div>
           <div class="line-meta">
-            <span>${escapeHtml(qtyText)} (${Number(line.totalUnits || 0)}u) @ ${escapeHtml(unitRate)}</span>
+            <span>[${escapeHtml(packType)}] ${escapeHtml(qtyText)} @ ${escapeHtml(unitRate)}</span>
             <span class="bold">${fmtMoney(line.lineTotal)}</span>
           </div>
           ${line.notes ? `<div class="line-note">Note: ${escapeHtml(line.notes)}</div>` : ''}
@@ -424,7 +422,7 @@ export function buildPurchaseOrderThermal58mmHtml(
     </div>
     <div class="divider-solid"></div>
 
-    <div class="kv"><span>Items / Qty:</span><span>${(po.lines || []).length} lines (${po.totalCases || 0}cs / ${Number(po.totalUnits || 0)}u)</span></div>
+    <div class="kv"><span>Line Items:</span><span>${(po.lines || []).length}</span></div>
     <div class="kv"><span>Subtotal:</span><span>${fmtMoney(po.subtotal)}</span></div>
     ${Number(po.taxAmount || 0) > 0 ? `<div class="kv"><span>Tax (${po.taxPercent || 0}%):</span><span>${fmtMoney(po.taxAmount)}</span></div>` : ''}
     <div class="divider"></div>

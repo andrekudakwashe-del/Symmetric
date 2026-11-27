@@ -33,6 +33,7 @@ import {
   HubStorageCapacity,
   normalizeStorageCapacity,
 } from '../mesh/hubStorageService';
+import { canonicalizeBranchAlias } from './hubIdentityReconciler';
 
 export type DiscoveryStage = 'LAST_KNOWN' | 'MDNS' | 'HOTSPOT_PROBE' | 'SUBNET_PROBE';
 
@@ -227,7 +228,8 @@ function matchesTenantAndBranch(
     normRepBranch &&
     normRepBranch !== 'ALL' &&
     normRepBranch !== 'UNASSIGNED' &&
-    normRepBranch !== normExpectedBranch
+    normRepBranch !== normExpectedBranch &&
+    canonicalizeBranchAlias(normRepBranch) !== canonicalizeBranchAlias(normExpectedBranch)
   ) {
     return false;
   }
@@ -392,24 +394,31 @@ async function probeHttpHealthCandidate(
     const matchedProfile = pairedHubMap.get(reportedHubId.toUpperCase());
     const isPaired = Boolean(matchedProfile);
 
-    // Strict tenant & branch filter
-    if (!matchesTenantAndBranch(reportedTenant, reportedBranch, expectedTenantId, expectedBranchId)) {
-      return null;
-    }
-
-    // If not paired, only accept when tenantId + branchId are explicitly matched (never accept unknown tenant/branch!)
-    if (!isPaired) {
+    if (isPaired && matchedProfile) {
+      // Paired Hub match by data.hubId: accept unless reportedTenant explicitly belongs to a different company
+      if (
+        reportedTenant &&
+        expectedTenantId &&
+        reportedTenant.toUpperCase() !== expectedTenantId.trim().toUpperCase()
+      ) {
+        return null;
+      }
+      if (
+        reportedTenant &&
+        matchedProfile.tenantId &&
+        reportedTenant.toUpperCase() !== matchedProfile.tenantId.toUpperCase()
+      ) {
+        return null;
+      }
+    } else {
+      // Unpaired Hub discovery: strictly require BOTH tenantId and branchId match active branch/tenant
       if (!allowUnpairedForSameBranch) return null;
       if (!expectedTenantId || !expectedBranchId || !reportedTenant || !reportedBranch) {
         return null;
       }
-    } else if (
-      matchedProfile &&
-      reportedTenant &&
-      matchedProfile.tenantId &&
-      reportedTenant.toUpperCase() !== matchedProfile.tenantId.toUpperCase()
-    ) {
-      return null;
+      if (!matchesTenantAndBranch(reportedTenant, reportedBranch, expectedTenantId, expectedBranchId)) {
+        return null;
+      }
     }
 
     const hubRole = normalizeHubRole(data.hubRole || data.hub_role || matchedProfile?.hubRole);
@@ -483,13 +492,15 @@ async function runConcurrentHealthProbes(
     timeoutMs?: number;
     collectAll?: boolean;
     allowUnpairedForSameBranch?: boolean;
+    signal?: AbortSignal;
   } = {}
 ): Promise<DiscoveredHubCandidate[]> {
-  if (targets.length === 0) return [];
+  if (targets.length === 0 || options.signal?.aborted) return [];
   const concurrency = options.concurrency ?? 20;
   const timeoutMs = options.timeoutMs ?? 450;
   const collectAll = Boolean(options.collectAll);
   const allowUnpaired = Boolean(options.allowUnpairedForSameBranch);
+  const externalSignal = options.signal;
 
   return new Promise((resolve) => {
     const parentController = new AbortController();
@@ -497,9 +508,23 @@ async function runConcurrentHealthProbes(
     let settled = false;
     const found: DiscoveredHubCandidate[] = [];
 
+    const onExternalAbort = () => {
+      finish();
+    };
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        resolve([]);
+        return;
+      }
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
     const finish = () => {
       if (settled) return;
       settled = true;
+      if (externalSignal) {
+        externalSignal.removeEventListener('abort', onExternalAbort);
+      }
       parentController.abort();
       resolve(found);
     };
@@ -520,8 +545,8 @@ async function runConcurrentHealthProbes(
         );
         if (match && !settled) {
           found.push(match);
-          // For large /24 scans, stop immediately on first ACTIVE paired Hub (unless STANDBY hints another leader)
-          if (!collectAll && match.hubMode === 'ACTIVE' && match.isPaired) {
+          // Stop scanning immediately once an ACTIVE paired Hub (or matching primary Hub when unpaired) responds
+          if (!collectAll && match.hubMode === 'ACTIVE' && (match.isPaired || pairedHubMap.size === 0)) {
             finish();
             return;
           }
@@ -574,8 +599,10 @@ async function followStandbyLeaderRedirects(
   pairedHubMap: Map<string, PairedHubProfile>,
   expectedTenantId: string | undefined,
   expectedBranchId: string | undefined,
-  allowUnpaired: boolean
+  allowUnpaired: boolean,
+  signal?: AbortSignal
 ): Promise<DiscoveredHubCandidate[]> {
+  if (signal?.aborted) return candidates;
   const redirectTargets: Array<{ host: string; port: number }> = [];
   const seen = new Set(candidates.map((c) => `${c.ip}:${c.port}`.toLowerCase()));
 
@@ -603,6 +630,7 @@ async function followStandbyLeaderRedirects(
       timeoutMs: 650,
       collectAll: true,
       allowUnpairedForSameBranch: allowUnpaired,
+      signal,
     }
   );
 
@@ -658,8 +686,11 @@ export async function discoverPairedHub(
     preferredBranchId?: string;
     allowUnpairedActiveLeader?: boolean;
     onStageChange?: (stage: DiscoveryStage) => void;
+    signal?: AbortSignal;
   }
 ): Promise<HubDiscoveryResult | null> {
+  const signal = options?.signal;
+  if (signal?.aborted) return null;
   const allowUnpaired = Boolean(options?.allowUnpairedActiveLeader);
   if ((!Array.isArray(pairedHubs) || pairedHubs.length === 0) && !allowUnpaired) {
     return null;
@@ -732,8 +763,11 @@ export async function discoverPairedHub(
           timeoutMs: 1200,
           collectAll: true,
           allowUnpairedForSameBranch: allowUnpaired,
+          signal,
         }
       );
+
+      if (signal?.aborted) return null;
 
       if (step1Health.length > 0) {
         const resolved = await followStandbyLeaderRedirects(
@@ -741,15 +775,17 @@ export async function discoverPairedHub(
           pairedHubMap,
           expectedTenantId,
           expectedBranchId,
-          allowUnpaired
+          allowUnpaired,
+          signal
         );
+        if (signal?.aborted) return null;
         discoveredAll.push(...resolved);
         const ranked = rankHubCandidates(discoveredAll, pairedHubIds);
         // Fast path: if we already found an ACTIVE leader among remembered branch Hubs, return immediately!
         if (ranked.length > 0 && ranked[0].hubMode === 'ACTIVE') {
           return toDiscoveryResult(ranked[0], previousHostPort);
         }
-      } else if (primary?.lastKnownHost) {
+      } else if (primary?.lastKnownHost && !signal?.aborted) {
         // Fallback WebSocket peek if HTTP /health was blocked but WS is reachable
         const wsPeek = await probeWsEndpoint(
           `ws://${primary.lastKnownHost}`,
@@ -767,6 +803,8 @@ export async function discoverPairedHub(
     }
   }
 
+  if (signal?.aborted) return null;
+
   // ---- STEP 2: Native Android NSD Bridge + Primary mDNS Hostnames (.local) across ALL Paired Branch Hubs ----
   const nsdSeeds = getNativeNsdSeedEndpoints().filter((seed) => markTried(seed.host, seed.port));
   if (nsdSeeds.length > 0) {
@@ -782,16 +820,20 @@ export async function discoverPairedHub(
         timeoutMs: 1200,
         collectAll: true,
         allowUnpairedForSameBranch: allowUnpaired,
+        signal,
       }
     );
+    if (signal?.aborted) return null;
     if (nsdHits.length > 0) {
       const resolved = await followStandbyLeaderRedirects(
         nsdHits,
         pairedHubMap,
         expectedTenantId,
         expectedBranchId,
-        allowUnpaired
+        allowUnpaired,
+        signal
       );
+      if (signal?.aborted) return null;
       discoveredAll.push(...resolved);
       const ranked = rankHubCandidates(discoveredAll, pairedHubIds);
       if (ranked.length > 0 && ranked[0].hubMode === 'ACTIVE') {
@@ -799,6 +841,8 @@ export async function discoverPairedHub(
       }
     }
   }
+
+  if (signal?.aborted) return null;
 
   const mdnsCandidates: Array<{ hub: PairedHubProfile; mdnsHost: string; port: number }> = [];
   const seenMdns = new Set<string>();
@@ -815,6 +859,7 @@ export async function discoverPairedHub(
     options?.onStageChange?.('MDNS');
     const mdnsResults = await Promise.all(
       mdnsCandidates.map(async (cand) => {
+        if (signal?.aborted) return null;
         const mdnsWsUrl = `ws://${cand.mdnsHost}:${cand.port}`;
         const wsHit = await probeWsEndpoint(
           mdnsWsUrl,
@@ -830,6 +875,7 @@ export async function discoverPairedHub(
         return null;
       })
     );
+    if (signal?.aborted) return null;
 
     const validMdns = mdnsResults.filter((x): x is DiscoveredHubCandidate => Boolean(x));
     if (validMdns.length > 0) {
@@ -838,8 +884,10 @@ export async function discoverPairedHub(
         pairedHubMap,
         expectedTenantId,
         expectedBranchId,
-        allowUnpaired
+        allowUnpaired,
+        signal
       );
+      if (signal?.aborted) return null;
       discoveredAll.push(...resolved);
       const ranked = rankHubCandidates(discoveredAll, pairedHubIds);
       if (ranked.length > 0 && ranked[0].hubMode === 'ACTIVE') {
@@ -847,6 +895,8 @@ export async function discoverPairedHub(
       }
     }
   }
+
+  if (signal?.aborted) return null;
 
   // ---- STEP 3a: Fallback /health Hotspot, Tethering Gateways & All Vault LAN IPs ----
   options?.onStageChange?.('HOTSPOT_PROBE');
@@ -877,10 +927,12 @@ export async function discoverPairedHub(
       {
         concurrency: 20,
         timeoutMs: 450,
-        collectAll: true,
+        collectAll: false,
         allowUnpairedForSameBranch: allowUnpaired,
+        signal,
       }
     );
+    if (signal?.aborted) return null;
 
     if (gatewayMatches.length > 0) {
       const resolved = await followStandbyLeaderRedirects(
@@ -888,8 +940,10 @@ export async function discoverPairedHub(
         pairedHubMap,
         expectedTenantId,
         expectedBranchId,
-        allowUnpaired
+        allowUnpaired,
+        signal
       );
+      if (signal?.aborted) return null;
       discoveredAll.push(...resolved);
       const ranked = rankHubCandidates(discoveredAll, pairedHubIds);
       if (ranked.length > 0 && ranked[0].hubMode === 'ACTIVE') {
@@ -897,6 +951,8 @@ export async function discoverPairedHub(
       }
     }
   }
+
+  if (signal?.aborted) return null;
 
   // ---- STEP 3b: Fallback /24 Subnet Scan (lastKnownHost prefix first, then common branch subnets) ----
   options?.onStageChange?.('SUBNET_PROBE');
@@ -920,6 +976,7 @@ export async function discoverPairedHub(
   }
 
   for (const prefix of subnetOrder) {
+    if (signal?.aborted) return null;
     const subnetTargets: Array<{ host: string; port: number }> = [];
     for (let host = 1; host <= 254; host++) {
       const candidateIp = `${prefix}.${host}`;
@@ -939,8 +996,10 @@ export async function discoverPairedHub(
         timeoutMs: 450,
         collectAll: false,
         allowUnpairedForSameBranch: allowUnpaired,
+        signal,
       }
     );
+    if (signal?.aborted) return null;
 
     if (subnetMatches.length > 0) {
       const resolved = await followStandbyLeaderRedirects(
@@ -948,8 +1007,10 @@ export async function discoverPairedHub(
         pairedHubMap,
         expectedTenantId,
         expectedBranchId,
-        allowUnpaired
+        allowUnpaired,
+        signal
       );
+      if (signal?.aborted) return null;
       discoveredAll.push(...resolved);
       const ranked = rankHubCandidates(discoveredAll, pairedHubIds);
       if (ranked.length > 0 && ranked[0].hubMode === 'ACTIVE') {
