@@ -27,6 +27,7 @@ import {
   Info,
 } from 'lucide-react';
 import { Salesperson, InventoryItem, Customer, Supplier } from '../../types';
+import { formatUnitCost } from '../../utils/inventoryMath';
 import { persistentSyncEngine } from '../../services/persistentSyncEngine';
 import {
   getInventoryItems,
@@ -778,7 +779,7 @@ export const DataManagementHub: React.FC<DataManagementHubProps> = ({
                           <td className="py-1.5 px-3 font-medium text-white">{item.itemName}</td>
                           <td className="py-1.5 px-3 text-slate-400">{item.category}</td>
                           <td className="py-1.5 px-3 text-right font-mono-num">{item.unitsPerCase}</td>
-                          <td className="py-1.5 px-3 text-right font-mono-num">${item.costPerCase.toFixed(2)}</td>
+                          <td className="py-1.5 px-3 text-right font-mono-num">${formatUnitCost(item.costPerCase)}</td>
                           <td className="py-1.5 px-3 text-right font-mono-num text-emerald-400 font-bold">
                             ${item.sellPriceUnit.toFixed(2)}
                           </td>

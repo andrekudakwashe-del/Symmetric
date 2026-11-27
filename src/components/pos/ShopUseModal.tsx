@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { Salesperson, Product, ConsumptionType, InternalConsumption } from '../../types';
-import { getProducts, getSalespeople, verifySalespersonPin } from '../../db/roomDatabase';
+import { getProducts, getSalespeople, isSupervisorOrAbove, verifySalespersonPin } from '../../db/roomDatabase';
+import { isItemBelowReorderPoint, normalizeStockFields } from '../../utils/inventoryMath';
 import {
   createInternalConsumptionRequest,
   approveInternalConsumption,
@@ -492,9 +493,36 @@ export const ShopUseModal: React.FC<ShopUseModalProps> = ({ isOpen, onClose, cur
                           <div>
                             <div className="flex items-center justify-between gap-1 mb-1">
                               <span className="text-[10px] text-slate-400 font-mono truncate">{p.sku || 'SKU'}</span>
-                              <span className="text-[10px] px-1.5 py-0.2 rounded font-bold bg-slate-800 text-slate-300">
-                                Stock: {p.stock}
-                              </span>
+                              {(() => {
+                                const canSeeRawStock =
+                                  isSupervisorOrAbove(currentUser?.role) ||
+                                  Boolean(currentUser?.permissions?.canManageInventory);
+                                const totalUnits = normalizeStockFields(p).totalUnits;
+                                const isOOS = totalUnits <= 0;
+                                const isLow = !isOOS && isItemBelowReorderPoint(p);
+
+                                if (!canSeeRawStock) {
+                                  return (
+                                    <span
+                                      className={`text-[10px] px-1.5 py-0.2 rounded font-bold ${
+                                        isOOS
+                                          ? 'bg-rose-950 text-rose-400'
+                                          : isLow
+                                          ? 'bg-amber-950 text-amber-400'
+                                          : 'bg-emerald-950 text-emerald-400'
+                                      }`}
+                                    >
+                                      {isOOS ? 'OOS' : isLow ? 'Low Stock' : 'In Stock'}
+                                    </span>
+                                  );
+                                }
+
+                                return (
+                                  <span className="text-[10px] px-1.5 py-0.2 rounded font-bold bg-slate-800 text-slate-300">
+                                    Stock: {p.stock ?? totalUnits}
+                                  </span>
+                                );
+                              })()}
                             </div>
                             <h4 className="text-xs font-bold text-white line-clamp-2 group-hover:text-amber-300 transition">
                               {p.name}

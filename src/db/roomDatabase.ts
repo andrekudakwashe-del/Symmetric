@@ -108,6 +108,19 @@ import {
 import { SyncEnvelope } from '../services/sync/SyncEnvelope';
 import { createAuditLogDao } from './daos/auditLogDao';
 import { createExpenseDao } from './daos/expenseDao';
+import {
+  applyOutflowToValuePool,
+  applyReceiptToValuePool,
+  applyReturnToValuePool,
+  computeItemValuationCents,
+  decomposeStockUnits,
+  normalizeStockFields,
+  reconcileStockValueCents,
+  resolveItemStockValueCents,
+  resolveItemValuationUnitCost,
+  roundStockUnits,
+  roundUnitCost,
+} from '../utils/inventoryMath';
 export {
   getBrowserStorageHealth,
   subscribeBrowserStorageHealth,
@@ -5554,11 +5567,15 @@ export const productToInventoryItem = (prod: Product): InventoryItem => {
   const unitsPerCase = Math.max(1, prod.unitsPerCase || 1);
   const sellPriceUnit = prod.sellPriceUnit !== undefined ? Number(prod.sellPriceUnit) : (Number(prod.price) || 0);
   const sellPriceCase = prod.sellPriceCase !== undefined ? Number(prod.sellPriceCase) : (sellPriceUnit * unitsPerCase);
-  const costPerUnit = prod.costPrice !== undefined ? Number(prod.costPrice) : 0;
-  const costPerCase = prod.costPerCase !== undefined ? Number(prod.costPerCase) : (costPerUnit * unitsPerCase);
-  const stockCases = prod.stockCases !== undefined ? Math.max(0, Number(prod.stockCases)) : 0;
-  const stockSingles = prod.stockSingles !== undefined ? Math.max(0, Number(prod.stockSingles)) : Math.max(0, Number(prod.stockQuantity) || 0);
-  const totalUnits = (stockCases * unitsPerCase) + stockSingles;
+  const costPerUnit = roundUnitCost(prod.costPrice !== undefined ? Number(prod.costPrice) : 0);
+  const costPerCase = roundUnitCost(prod.costPerCase !== undefined ? Number(prod.costPerCase) : (costPerUnit * unitsPerCase));
+  const canonicalStock = normalizeStockFields({
+    stockCases: prod.stockCases !== undefined ? Number(prod.stockCases) : undefined,
+    stockSingles: prod.stockSingles !== undefined ? Number(prod.stockSingles) : undefined,
+    totalUnits: prod.totalUnits !== undefined ? Number(prod.totalUnits) : Number(prod.stockQuantity || 0),
+    unitsPerCase,
+    canSellAsCase: prod.canSellAsCase ?? false,
+  });
 
   return {
     itemId: prod.id,
@@ -5570,11 +5587,16 @@ export const productToInventoryItem = (prod: Product): InventoryItem => {
     unitsPerCase,
     costPerCase,
     costPerUnit,
+    averageCostPerUnit: costPerUnit,
+    averageCostPerCase: costPerCase,
+    latestCostPerUnit: costPerUnit,
+    latestCostPerCase: costPerCase,
+    stockValueCents: canonicalStock.totalUnits > 0 ? Math.round(canonicalStock.totalUnits * costPerUnit * 100) : 0,
     sellPriceCase,
     sellPriceUnit,
-    stockCases,
-    stockSingles,
-    totalUnits,
+    stockCases: canonicalStock.stockCases,
+    stockSingles: canonicalStock.stockSingles,
+    totalUnits: canonicalStock.totalUnits,
     reorderLevelCases: prod.reorderLevelCases || 1,
     reorderLevelUnits: prod.reorderLevelUnits || 5,
     caseReserveThreshold: prod.caseReserveThreshold !== undefined ? prod.caseReserveThreshold : 0,
@@ -5920,14 +5942,19 @@ export const updateProductStock = (
   const safeDeltaQty = Number(deltaQty) || 0;
   const safeUnitsToDeductPerQty = Math.max(0.001, Number(unitsToDeductPerQty) || 1);
   if (item && safeDeltaQty !== 0) {
-    const itemUnitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
-    const prevCases = Number(item.stockCases) || 0;
-    const prevSingles = Number(item.stockSingles) || 0;
+    const prevStock = normalizeStockFields(item);
+    const itemUnitsPerCase = prevStock.unitsPerCase;
+    const prevCases = prevStock.stockCases;
+    const prevSingles = prevStock.stockSingles;
+    const prevTotalUnits = prevStock.totalUnits;
+    const prevAvgCost = resolveItemValuationUnitCost(item);
+
+    const netUnitsDelta = sellAsCase
+      ? roundStockUnits(safeDeltaQty * itemUnitsPerCase)
+      : roundStockUnits(safeDeltaQty * safeUnitsToDeductPerQty);
 
     if (safeDeltaQty < 0) {
-      const unitsToDeduct = sellAsCase
-        ? Math.abs(safeDeltaQty) * itemUnitsPerCase
-        : Math.abs(safeDeltaQty) * safeUnitsToDeductPerQty;
+      const unitsToDeduct = Math.abs(netUnitsDelta);
       const currentUser = getCurrentUser();
       deductStockFIFO({
         itemId: realId,
@@ -5949,8 +5976,7 @@ export const updateProductStock = (
         newCases = 0;
       }
     } else {
-      const netSinglesDelta = safeDeltaQty * safeUnitsToDeductPerQty;
-      newSingles = newSingles + netSinglesDelta;
+      newSingles = newSingles + netUnitsDelta;
       // If selling singles/variants and singles run out, but cases are available, auto-break case
       if (newSingles < 0 && newCases > 0) {
         const casesNeeded = Math.ceil(Math.abs(newSingles) / itemUnitsPerCase);
@@ -5964,15 +5990,46 @@ export const updateProductStock = (
       }
     }
 
-    const finalSingles = Number((Number.isFinite(newSingles) ? newSingles : 0).toFixed(3));
-    const finalCases = Math.max(0, Number.isFinite(newCases) ? newCases : 0);
-    const finalTotalUnits = Number(((finalCases * itemUnitsPerCase) + finalSingles).toFixed(3));
+    const rawFinalTotal = roundStockUnits(prevTotalUnits + netUnitsDelta);
+    let finalCases = Math.max(0, Number.isFinite(newCases) ? roundStockUnits(newCases) : 0);
+    let finalSingles = Number.isFinite(newSingles) ? roundStockUnits(newSingles) : 0;
+
+    // Enforce negative stock invariant: stockCases MUST be 0 whenever totalUnits < 0
+    if (rawFinalTotal < 0) {
+      finalCases = 0;
+      finalSingles = rawFinalTotal;
+    } else if (finalSingles < 0 || Math.abs((finalCases * itemUnitsPerCase + finalSingles) - rawFinalTotal) > 0.001) {
+      const decomposed = decomposeStockUnits(rawFinalTotal, itemUnitsPerCase, {
+        keepCasesZero: !(item.canSellAsCase && itemUnitsPerCase > 1),
+      });
+      finalCases = decomposed.stockCases;
+      finalSingles = decomposed.stockSingles;
+    }
+    const finalTotalUnits = rawFinalTotal;
+
+    // Update integer-cent stock value pool (zero-penny GL reconciliation)
+    const nextStockValueCents =
+      netUnitsDelta < 0
+        ? applyOutflowToValuePool({
+            prevTotalUnits,
+            prevStockValueCents: item.stockValueCents,
+            prevAvgUnitCost: prevAvgCost,
+            deductedUnits: Math.abs(netUnitsDelta),
+          }).stockValueCents
+        : applyReturnToValuePool({
+            prevTotalUnits,
+            prevStockValueCents: item.stockValueCents,
+            prevAvgUnitCost: prevAvgCost,
+            returnedUnits: netUnitsDelta,
+            returnUnitCost: prevAvgCost,
+          }).stockValueCents;
 
     const updatedItem: InventoryItem = {
       ...item,
       stockCases: finalCases,
       stockSingles: finalSingles,
       totalUnits: finalTotalUnits,
+      stockValueCents: nextStockValueCents,
       lastUpdated: new Date().toISOString(),
     };
     saveInventoryItem(updatedItem, context?.fromMesh ? { fromMesh: true } : undefined);
@@ -14631,28 +14688,52 @@ export const getInventoryItems = (branchIdOverride?: string, companyIdOverride?:
     seen.add(cleanId);
 
     const override = item.branchOverrides?.[currentBranch];
-    const rawUnitsPerCase = Number(item.unitsPerCase || (item as any).UnitsPerCase) || 1;
+    const rawUnitsPerCase = Math.max(1, Number(item.unitsPerCase || (item as any).UnitsPerCase) || 1);
     const rawCostPerCase = Number(override?.costPerCase !== undefined ? override.costPerCase : (item.costPerCase !== undefined ? item.costPerCase : ((item as any).costPrice ?? (item as any).CostPrice ?? 0))) || 0;
     const rawCostPerUnit = Number(override?.costPerUnit !== undefined ? override.costPerUnit : (item.costPerUnit !== undefined ? item.costPerUnit : (rawUnitsPerCase > 0 ? rawCostPerCase / rawUnitsPerCase : 0))) || 0;
     const rawSellPriceUnit = Number(override?.sellPriceUnit !== undefined ? override.sellPriceUnit : (item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price ?? (item as any).SellingPrice ?? 0))) || 0;
     const rawSellPriceCase = Number(override?.sellPriceCase !== undefined ? override.sellPriceCase : (item.sellPriceCase !== undefined ? item.sellPriceCase : (rawSellPriceUnit * rawUnitsPerCase))) || 0;
-    const rawStockCases = Number(item.stockCases !== undefined ? item.stockCases : (rawUnitsPerCase > 1 ? Math.floor(Number(item.totalUnits ?? (item as any).stockQuantity ?? 0) / rawUnitsPerCase) : 0)) || 0;
-    const rawStockSingles = Number(item.stockSingles !== undefined ? item.stockSingles : (Number(item.totalUnits ?? (item as any).stockQuantity ?? 0) - (rawStockCases * rawUnitsPerCase))) || 0;
-    const rawTotalUnits = Number(item.totalUnits !== undefined ? item.totalUnits : ((item as any).stockQuantity ?? (rawStockCases * rawUnitsPerCase + rawStockSingles))) || 0;
+    const canonicalStock = normalizeStockFields({
+      stockCases: item.stockCases,
+      stockSingles: item.stockSingles,
+      totalUnits: item.totalUnits,
+      stockQuantity: (item as any).stockQuantity,
+      unitsPerCase: rawUnitsPerCase,
+      canSellAsCase: item.canSellAsCase,
+    });
+    const avgCostUnit =
+      item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
+        ? Number(item.averageCostPerUnit)
+        : rawCostPerUnit;
+    const avgCostCase =
+      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+        ? Number(item.averageCostPerCase)
+        : Number((avgCostUnit * rawUnitsPerCase).toFixed(2));
+    const latestCostUnit =
+      item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
+        ? Number(item.latestCostPerUnit)
+        : rawCostPerUnit;
+    const latestCostCase =
+      item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
+        ? Number(item.latestCostPerCase)
+        : rawCostPerCase;
 
     unique.push({
       ...item,
-      unitsPerCase: rawUnitsPerCase,
+      unitsPerCase: canonicalStock.unitsPerCase,
       costPerCase: rawCostPerCase,
       costPerUnit: rawCostPerUnit,
       sellPriceUnit: rawSellPriceUnit,
       sellPriceCase: rawSellPriceCase,
-      stockCases: rawStockCases,
-      stockSingles: rawStockSingles,
-      totalUnits: rawTotalUnits,
+      stockCases: canonicalStock.stockCases,
+      stockSingles: canonicalStock.stockSingles,
+      totalUnits: canonicalStock.totalUnits,
       reorderLevelCases: Number(override?.reorderLevelCases !== undefined ? override.reorderLevelCases : (item.reorderLevelCases ?? 2)),
       reorderLevelUnits: Number(item.reorderLevelUnits ?? 10),
-      averageCostPerUnit: Number(item.averageCostPerUnit ?? rawCostPerUnit),
+      averageCostPerUnit: avgCostUnit,
+      averageCostPerCase: avgCostCase,
+      latestCostPerUnit: latestCostUnit,
+      latestCostPerCase: latestCostCase,
       canSellAsCase: Boolean(item.canSellAsCase),
     });
   }
@@ -14746,26 +14827,88 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
     );
   });
 
-  // Enforce mathematical formulas (allow negative singles/total units if selling negative):
-  const unitsPerCase = Math.max(1, item.unitsPerCase || 1);
-  const costPerCase = item.costPerCase || 0;
-  const costPerUnit = item.costPerUnit || (costPerCase > 0 ? costPerCase / unitsPerCase : 0);
-  const stockCases = Math.max(0, item.stockCases || 0);
-  const stockSingles = item.stockSingles !== undefined ? item.stockSingles : 0;
-  const totalUnits = (stockCases * unitsPerCase) + stockSingles;
+  // Enforce canonical "One Number, Two Views" stock invariant & negative stock rule:
+  const unitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
+  const costPerCase = Number(item.costPerCase) || 0;
+  const costPerUnit = roundUnitCost(
+    Number(item.costPerUnit) || (costPerCase > 0 ? costPerCase / unitsPerCase : 0)
+  );
+  const canonicalStock = normalizeStockFields({
+    stockCases: item.stockCases,
+    stockSingles: item.stockSingles,
+    totalUnits: item.totalUnits,
+    stockQuantity: (item as any).stockQuantity,
+    unitsPerCase,
+    canSellAsCase: item.canSellAsCase,
+  });
+  const stockCases = canonicalStock.stockCases;
+  const stockSingles = canonicalStock.stockSingles;
+  const totalUnits = canonicalStock.totalUnits;
 
-  const averageCostPerUnit = item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0
-    ? item.averageCostPerUnit
-    : costPerUnit;
-  const latestCostPerUnit = item.latestCostPerUnit !== undefined && item.latestCostPerUnit > 0
-    ? item.latestCostPerUnit
-    : costPerUnit;
-  const averageCostPerCase = item.averageCostPerCase !== undefined && item.averageCostPerCase > 0
-    ? item.averageCostPerCase
-    : (averageCostPerUnit * unitsPerCase);
-  const latestCostPerCase = item.latestCostPerCase !== undefined && item.latestCostPerCase > 0
-    ? item.latestCostPerCase
-    : costPerCase;
+  const existingRecord = index >= 0 ? allItems[index] : null;
+  const existingStock = existingRecord ? normalizeStockFields(existingRecord) : null;
+  const existingAvgCost = existingRecord ? resolveItemValuationUnitCost(existingRecord) : 0;
+
+  const averageCostPerUnit = roundUnitCost(
+    item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
+      ? Number(item.averageCostPerUnit)
+      : existingRecord?.averageCostPerUnit !== undefined &&
+        Number(existingRecord.averageCostPerUnit) > 0 &&
+        Math.abs(costPerUnit - roundUnitCost(Number(existingRecord.costPerUnit) || 0)) < 0.0001
+      ? Number(existingRecord.averageCostPerUnit)
+      : costPerUnit
+  );
+  const latestCostPerUnit = roundUnitCost(
+    item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
+      ? Number(item.latestCostPerUnit)
+      : costPerUnit
+  );
+  const averageCostPerCase =
+    item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+      ? Number(item.averageCostPerCase)
+      : (averageCostPerUnit * unitsPerCase);
+  const latestCostPerCase =
+    item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
+      ? Number(item.latestCostPerCase)
+      : costPerCase;
+
+  // Maintain authoritative integer-cent value pool (`stockValueCents`)
+  let resolvedStockValueCents = 0;
+  if (totalUnits > 0) {
+    const incomingPool =
+      item.stockValueCents !== undefined &&
+      item.stockValueCents !== null &&
+      Number.isFinite(Number(item.stockValueCents)) &&
+      Number(item.stockValueCents) >= 0
+        ? Math.round(Number(item.stockValueCents))
+        : undefined;
+    const existingPool =
+      existingRecord?.stockValueCents !== undefined &&
+      existingRecord?.stockValueCents !== null &&
+      Number.isFinite(Number(existingRecord.stockValueCents))
+        ? Math.round(Number(existingRecord.stockValueCents))
+        : undefined;
+    const stockOrCostChangedWithoutPoolUpdate =
+      existingRecord !== null &&
+      existingStock !== null &&
+      incomingPool === existingPool &&
+      (Math.abs(totalUnits - existingStock.totalUnits) > 0.001 ||
+        Math.abs(averageCostPerUnit - existingAvgCost) > 0.0001);
+
+    if (
+      incomingPool !== undefined &&
+      !stockOrCostChangedWithoutPoolUpdate &&
+      !(incomingPool === 0 && averageCostPerUnit > 0)
+    ) {
+      resolvedStockValueCents = incomingPool;
+    } else {
+      resolvedStockValueCents = reconcileStockValueCents(
+        { averageCostPerUnit, costPerUnit, costPerCase, unitsPerCase },
+        totalUnits,
+        averageCostPerUnit
+      );
+    }
+  }
 
   const normalized: InventoryItem = {
     ...item,
@@ -14776,10 +14919,11 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
     unitsPerCase,
     costPerCase,
     costPerUnit,
-    averageCostPerUnit: Number(averageCostPerUnit.toFixed(4)),
-    latestCostPerUnit: Number(latestCostPerUnit.toFixed(4)),
+    averageCostPerUnit,
+    latestCostPerUnit,
     averageCostPerCase: Number(averageCostPerCase.toFixed(2)),
     latestCostPerCase: Number(latestCostPerCase.toFixed(2)),
+    stockValueCents: resolvedStockValueCents,
     stockCases,
     stockSingles,
     totalUnits,
@@ -14926,6 +15070,10 @@ export const saveInventoryItem = (item: InventoryItem, options?: { fromMesh?: bo
       UnitsPerCase: normalized.unitsPerCase,
       CostPerCase: normalized.costPerCase,
       CostPerUnit: normalized.costPerUnit,
+      AverageCostPerUnit: normalized.averageCostPerUnit,
+      AverageCostPerCase: normalized.averageCostPerCase,
+      LatestCostPerUnit: normalized.latestCostPerUnit,
+      LatestCostPerCase: normalized.latestCostPerCase,
       SellingPrice: normalized.sellPriceUnit,
       SellPriceUnit: normalized.sellPriceUnit,
       SellPriceCase: normalized.sellPriceCase,
@@ -15084,9 +15232,17 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
   const costPerUnit = Number(item.costPerUnit) || (costPerCase > 0 ? costPerCase / unitsPerCase : 0);
   const sellPriceUnit = Number(item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price ?? (item as any).SellingPrice ?? 0));
   const sellPriceCase = Number(item.sellPriceCase !== undefined ? item.sellPriceCase : (sellPriceUnit * unitsPerCase));
-  const stockCases = Number(item.stockCases !== undefined ? item.stockCases : 0);
-  const stockSingles = item.stockSingles !== undefined ? Number(item.stockSingles) : 0;
-  const totalUnits = Number(item.totalUnits !== undefined ? item.totalUnits : (stockCases * unitsPerCase + stockSingles));
+  const canonicalStock = normalizeStockFields({
+    stockCases: item.stockCases,
+    stockSingles: item.stockSingles,
+    totalUnits: item.totalUnits,
+    stockQuantity: (item as any).stockQuantity,
+    unitsPerCase,
+    canSellAsCase: item.canSellAsCase,
+  });
+  const stockCases = canonicalStock.stockCases;
+  const stockSingles = canonicalStock.stockSingles;
+  const totalUnits = canonicalStock.totalUnits;
 
   let savedItem: InventoryItem;
 
@@ -15131,6 +15287,36 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || extractRecordTimestamp(existing) || Date.now();
     const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
+    const resolvedAvgCostUnit =
+      item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
+        ? Number(item.averageCostPerUnit)
+        : existing.averageCostPerUnit !== undefined && Number(existing.averageCostPerUnit) > 0
+        ? Number(existing.averageCostPerUnit)
+        : costPerUnit;
+    const resolvedAvgCostCase =
+      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+        ? Number(item.averageCostPerCase)
+        : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+    const resolvedLatestCostUnit =
+      item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
+        ? Number(item.latestCostPerUnit)
+        : costPerUnit > 0
+        ? costPerUnit
+        : (existing.latestCostPerUnit || 0);
+    const resolvedLatestCostCase =
+      item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
+        ? Number(item.latestCostPerCase)
+        : costPerCase > 0
+        ? costPerCase
+        : (existing.latestCostPerCase || 0);
+
+    const resolvedStockValueCents =
+      totalUnits <= 0
+        ? 0
+        : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
+        ? Math.round(Number(item.stockValueCents))
+        : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+
     savedItem = {
       ...existing,
       ...item,
@@ -15142,7 +15328,12 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       branchId: item.branch_id || existing.branchId || 'ALL',
       unitsPerCase,
       costPerCase,
-      costPerUnit,
+      costPerUnit: roundUnitCost(costPerUnit),
+      averageCostPerUnit: roundUnitCost(resolvedAvgCostUnit),
+      averageCostPerCase: Number(resolvedAvgCostCase.toFixed(2)),
+      latestCostPerUnit: roundUnitCost(resolvedLatestCostUnit),
+      latestCostPerCase: Number(resolvedLatestCostCase.toFixed(2)),
+      stockValueCents: resolvedStockValueCents,
       sellPriceUnit,
       sellPriceCase,
       stockCases,
@@ -15174,6 +15365,30 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
     const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
     const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
+    const resolvedAvgCostUnit =
+      item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
+        ? Number(item.averageCostPerUnit)
+        : costPerUnit;
+    const resolvedAvgCostCase =
+      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+        ? Number(item.averageCostPerCase)
+        : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+    const resolvedLatestCostUnit =
+      item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
+        ? Number(item.latestCostPerUnit)
+        : costPerUnit;
+    const resolvedLatestCostCase =
+      item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
+        ? Number(item.latestCostPerCase)
+        : costPerCase;
+
+    const resolvedStockValueCents =
+      totalUnits <= 0
+        ? 0
+        : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
+        ? Math.round(Number(item.stockValueCents))
+        : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+
     savedItem = {
       ...item,
       itemId: cleanId,
@@ -15184,7 +15399,12 @@ export const ingestMeshInventoryItem = (item: InventoryItem): boolean => {
       branchId: item.branch_id || 'ALL',
       unitsPerCase,
       costPerCase,
-      costPerUnit,
+      costPerUnit: roundUnitCost(costPerUnit),
+      averageCostPerUnit: roundUnitCost(resolvedAvgCostUnit),
+      averageCostPerCase: Number(resolvedAvgCostCase.toFixed(2)),
+      latestCostPerUnit: roundUnitCost(resolvedLatestCostUnit),
+      latestCostPerCase: Number(resolvedLatestCostCase.toFixed(2)),
+      stockValueCents: resolvedStockValueCents,
       sellPriceUnit,
       sellPriceCase,
       stockCases,
@@ -15300,9 +15520,17 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
     const costPerUnit = Number(item.costPerUnit) || (costPerCase > 0 ? costPerCase / unitsPerCase : 0);
     const sellPriceUnit = Number(item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price ?? (item as any).SellingPrice ?? 0));
     const sellPriceCase = Number(item.sellPriceCase !== undefined ? item.sellPriceCase : (sellPriceUnit * unitsPerCase));
-    const stockCases = Number(item.stockCases !== undefined ? item.stockCases : 0);
-    const stockSingles = item.stockSingles !== undefined ? Number(item.stockSingles) : 0;
-    const totalUnits = Number(item.totalUnits !== undefined ? item.totalUnits : (stockCases * unitsPerCase + stockSingles));
+    const canonicalStock = normalizeStockFields({
+      stockCases: item.stockCases,
+      stockSingles: item.stockSingles,
+      totalUnits: item.totalUnits,
+      stockQuantity: (item as any).stockQuantity,
+      unitsPerCase,
+      canSellAsCase: item.canSellAsCase,
+    });
+    const stockCases = canonicalStock.stockCases;
+    const stockSingles = canonicalStock.stockSingles;
+    const totalUnits = canonicalStock.totalUnits;
 
     if (idx >= 0) {
       const existing = allItems[idx];
@@ -15341,6 +15569,36 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || extractRecordTimestamp(existing) || Date.now();
       const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
+      const resolvedAvgCostUnit =
+        item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
+          ? Number(item.averageCostPerUnit)
+          : existing.averageCostPerUnit !== undefined && Number(existing.averageCostPerUnit) > 0
+          ? Number(existing.averageCostPerUnit)
+          : costPerUnit;
+      const resolvedAvgCostCase =
+        item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+          ? Number(item.averageCostPerCase)
+          : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+      const resolvedLatestCostUnit =
+        item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
+          ? Number(item.latestCostPerUnit)
+          : costPerUnit > 0
+          ? costPerUnit
+          : (existing.latestCostPerUnit || 0);
+      const resolvedLatestCostCase =
+        item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
+          ? Number(item.latestCostPerCase)
+          : costPerCase > 0
+          ? costPerCase
+          : (existing.latestCostPerCase || 0);
+
+      const resolvedStockValueCents =
+        totalUnits <= 0
+          ? 0
+          : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
+          ? Math.round(Number(item.stockValueCents))
+          : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+
       allItems[idx] = {
         ...existing,
         ...item,
@@ -15352,7 +15610,12 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
         branchId: item.branch_id || existing.branchId || 'ALL',
         unitsPerCase,
         costPerCase,
-        costPerUnit,
+        costPerUnit: roundUnitCost(costPerUnit),
+        averageCostPerUnit: roundUnitCost(resolvedAvgCostUnit),
+        averageCostPerCase: Number(resolvedAvgCostCase.toFixed(2)),
+        latestCostPerUnit: roundUnitCost(resolvedLatestCostUnit),
+        latestCostPerCase: Number(resolvedLatestCostCase.toFixed(2)),
+        stockValueCents: resolvedStockValueCents,
         sellPriceUnit,
         sellPriceCase,
         stockCases,
@@ -15384,6 +15647,30 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
       const hubTimestamp = parseTimestampMs((item as any).hubTimestamp ?? item.updatedAt ?? item.lastUpdated) || Date.now();
       const hubLastUpdated = item.lastUpdated || new Date(hubTimestamp).toISOString();
 
+      const resolvedAvgCostUnit =
+        item.averageCostPerUnit !== undefined && Number(item.averageCostPerUnit) > 0
+          ? Number(item.averageCostPerUnit)
+          : costPerUnit;
+      const resolvedAvgCostCase =
+        item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+          ? Number(item.averageCostPerCase)
+          : Number((resolvedAvgCostUnit * unitsPerCase).toFixed(2));
+      const resolvedLatestCostUnit =
+        item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
+          ? Number(item.latestCostPerUnit)
+          : costPerUnit;
+      const resolvedLatestCostCase =
+        item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
+          ? Number(item.latestCostPerCase)
+          : costPerCase;
+
+      const resolvedStockValueCents =
+        totalUnits <= 0
+          ? 0
+          : item.stockValueCents !== undefined && Number.isFinite(Number(item.stockValueCents)) && Number(item.stockValueCents) >= 0 && !(Number(item.stockValueCents) === 0 && resolvedAvgCostUnit > 0)
+          ? Math.round(Number(item.stockValueCents))
+          : reconcileStockValueCents({ averageCostPerUnit: resolvedAvgCostUnit, costPerUnit, costPerCase, unitsPerCase }, totalUnits, resolvedAvgCostUnit);
+
       const savedItem: InventoryItem = {
         ...item,
         itemId: cleanId,
@@ -15394,7 +15681,12 @@ export const ingestMeshInventoryItemsChunk = (itemsChunk: InventoryItem[], isLas
         branchId: item.branch_id || 'ALL',
         unitsPerCase,
         costPerCase,
-        costPerUnit,
+        costPerUnit: roundUnitCost(costPerUnit),
+        averageCostPerUnit: roundUnitCost(resolvedAvgCostUnit),
+        averageCostPerCase: Number(resolvedAvgCostCase.toFixed(2)),
+        latestCostPerUnit: roundUnitCost(resolvedLatestCostUnit),
+        latestCostPerCase: Number(resolvedLatestCostCase.toFixed(2)),
+        stockValueCents: resolvedStockValueCents,
         sellPriceUnit,
         sellPriceCase,
         stockCases,
@@ -17588,8 +17880,11 @@ export const getStockBatches = (): StockBatch[] => {
     const now = new Date();
 
     items.forEach((item, idx) => {
-      const totalUnits = (item.stockCases * item.unitsPerCase) + item.stockSingles;
+      const canonicalStock = normalizeStockFields(item);
+      const totalUnits = canonicalStock.totalUnits;
       if (totalUnits > 0) {
+        const unitCost = resolveItemValuationUnitCost(item);
+        const batchCost = computeItemValuationCents(item) / 100;
         // Create 1-2 realistic batches with varying expiry and received dates
         const daysAgo = (idx % 4) * 22 + 5; // e.g. 5, 27, 49, 71 days ago
         const recDate = new Date(now.getTime() - daysAgo * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -17605,9 +17900,9 @@ export const getStockBatches = (): StockBatch[] => {
           itemName: item.itemName,
           qtyReceived: totalUnits,
           qtyOnHand: totalUnits,
-          cost: totalUnits * item.costPerUnit,
-          costPerUnit: item.costPerUnit,
-          costPerCase: item.costPerCase,
+          cost: batchCost,
+          costPerUnit: unitCost,
+          costPerCase: roundUnitCost(unitCost * canonicalStock.unitsPerCase),
           expiryDate: expDate,
           receivedDate: recDate,
           supplier: idx % 2 === 0 ? 'National Foods Wholesalers' : 'Delta Beverages Ltd',
@@ -18005,16 +18300,23 @@ export const removeManualStock = (params: {
     return { success: false, message: 'Please specify a quantity of cases or singles to remove.' };
   }
 
-  const currentTotalUnits = item.totalUnits !== undefined ? item.totalUnits : ((item.stockCases * unitsPerCase) + item.stockSingles);
+  const prevStock = normalizeStockFields(item);
+  const currentTotalUnits = prevStock.totalUnits;
   if (totalUnitsToRemove > currentTotalUnits) {
     return {
       success: false,
       message: `Cannot remove ${totalUnitsToRemove} units. Only ${currentTotalUnits} units available in stock.`,
     };
   }
+  const outflow = applyOutflowToValuePool({
+    prevTotalUnits: prevStock.totalUnits,
+    prevStockValueCents: item.stockValueCents,
+    prevAvgUnitCost: resolveItemValuationUnitCost(item),
+    deductedUnits: totalUnitsToRemove,
+  });
 
-  let newCases = item.stockCases - casesToRemove;
-  let newSingles = item.stockSingles - singlesToRemove;
+  let newCases = prevStock.stockCases - casesToRemove;
+  let newSingles = prevStock.stockSingles - singlesToRemove;
 
   // If singles go negative, break down cases
   if (newSingles < 0 && newCases > 0) {
@@ -18031,7 +18333,13 @@ export const removeManualStock = (params: {
     newCases = 0;
   }
 
-  const newTotalUnits = (Math.max(0, newCases) * unitsPerCase) + Math.max(0, newSingles);
+  const newTotalUnits = Math.max(0, outflow.newTotalUnits);
+  const finalDecomposed =
+    newCases >= 0 && newSingles >= 0 && Math.abs((newCases * unitsPerCase + newSingles) - newTotalUnits) < 0.001
+      ? { stockCases: roundStockUnits(newCases), stockSingles: roundStockUnits(newSingles), totalUnits: newTotalUnits }
+      : decomposeStockUnits(newTotalUnits, unitsPerCase, {
+          keepCasesZero: !(item.canSellAsCase && unitsPerCase > 1),
+        });
 
   // Deduct from FIFO batches
   deductStockFIFO({
@@ -18045,9 +18353,10 @@ export const removeManualStock = (params: {
 
   const updatedItem: InventoryItem = {
     ...item,
-    stockCases: Math.max(0, newCases),
-    stockSingles: Math.max(0, newSingles),
-    totalUnits: newTotalUnits,
+    stockCases: finalDecomposed.stockCases,
+    stockSingles: finalDecomposed.stockSingles,
+    totalUnits: finalDecomposed.totalUnits,
+    stockValueCents: outflow.stockValueCents,
     lastUpdated: new Date().toISOString(),
   };
 
@@ -18369,6 +18678,11 @@ export const receiveSupplierInvoice = (params: {
     costPerCase?: number;
     costPerUnit?: number;
     costPerPack?: number;
+    /** Exact supplier invoice line total in dollars (Line-Total-First mode). Preserved to the exact cent. */
+    lineTotal?: number;
+    /** Exact supplier invoice line total in integer cents. */
+    lineTotalCents?: number;
+    costEntryMode?: 'LINE_TOTAL' | 'UNIT_COST';
     sellingPrice?: number;
     marginPercent?: number;
     expiryDate?: string;
@@ -18410,11 +18724,16 @@ export const receiveSupplierInvoice = (params: {
     const cCase = Number(rawItem.costPerCase !== undefined && rawItem.costPerCase >= 0 ? rawItem.costPerCase : item.costPerCase) || 0;
     const cUnit = Number(rawItem.costPerUnit !== undefined && rawItem.costPerUnit >= 0 ? rawItem.costPerUnit : item.costPerUnit) || 0;
     const cPack = Number(rawItem.costPerPack !== undefined && rawItem.costPerPack >= 0 ? rawItem.costPerPack : cUnit * unitsPerPack) || 0;
-    const estLine = isVariant
-      ? recPacks * cPack
-      : isSingles
-      ? recSingles * cUnit
-      : recCases * cCase + recSingles * cUnit;
+    const estLine =
+      rawItem.lineTotalCents !== undefined && Number.isFinite(Number(rawItem.lineTotalCents)) && Number(rawItem.lineTotalCents) >= 0
+        ? Math.round(Number(rawItem.lineTotalCents)) / 100
+        : rawItem.lineTotal !== undefined && Number.isFinite(Number(rawItem.lineTotal)) && Number(rawItem.lineTotal) >= 0
+        ? Math.round(Number(rawItem.lineTotal) * 100) / 100
+        : isVariant
+        ? recPacks * cPack
+        : isSingles
+        ? recSingles * cUnit
+        : recCases * cCase + recSingles * cUnit;
     const roundedEstLine = Math.round(estLine * 100) / 100;
     if (!Number.isFinite(roundedEstLine) || roundedEstLine > 10_000_000) {
       return {
@@ -18449,18 +18768,26 @@ export const receiveSupplierInvoice = (params: {
             : it.receiveAs === 'Variant'
             ? (Number(it.receivedPacks) || 0) * unitsPerPack
             : Number(it.receivedSingles) || 0;
+        const explicitSubtotal =
+          it.lineTotalCents !== undefined && Number.isFinite(Number(it.lineTotalCents))
+            ? Math.round(Number(it.lineTotalCents)) / 100
+            : it.lineTotal !== undefined && Number.isFinite(Number(it.lineTotal))
+            ? Math.round(Number(it.lineTotal) * 100) / 100
+            : undefined;
         const baseCost =
-          it.costPerUnit !== undefined && it.costPerUnit >= 0
-            ? it.costPerUnit
+          explicitSubtotal !== undefined && qty > 0
+            ? roundUnitCost(explicitSubtotal / qty)
+            : it.costPerUnit !== undefined && it.costPerUnit >= 0
+            ? roundUnitCost(it.costPerUnit)
             : it.costPerCase !== undefined && unitsPerCase > 0
-            ? it.costPerCase / unitsPerCase
+            ? roundUnitCost(it.costPerCase / unitsPerCase)
             : invItem?.costPerUnit || 0;
         return {
           itemId: it.itemId,
           itemName: invItem?.itemName || it.itemId,
           quantity: qty,
           unitCost: baseCost,
-          subtotal: qty * baseCost,
+          subtotal: explicitSubtotal !== undefined ? explicitSubtotal : qty * baseCost,
           sellingPrice: it.sellingPrice !== undefined ? it.sellingPrice : (invItem?.sellPriceUnit || 0),
           weight: it.weight || 0,
         };
@@ -18525,49 +18852,83 @@ export const receiveSupplierInvoice = (params: {
 
     if (recCases === 0 && recSingles === 0 && (!isReceivingVariant || recPacks === 0)) continue;
 
+    const unitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
+    const lineTotalUnits = roundStockUnits(
+      isReceivingVariant
+        ? recPacks * unitsPerPack
+        : (recCases * unitsPerCase) + recSingles
+    );
+
     const lastCost = rawItem.lastCost !== undefined ? rawItem.lastCost : item.costPerCase;
-    let costPerCase = item.costPerCase;
-    let costPerUnit = item.costPerUnit;
+    let costPerCase = Number(item.costPerCase) || 0;
+    let costPerUnit = roundUnitCost(Number(item.costPerUnit) || (unitsPerCase > 0 ? costPerCase / unitsPerCase : 0));
     let costPerPack = rawItem.costPerPack;
 
-    if (isReceivingVariant) {
-      if (rawItem.costPerPack !== undefined && rawItem.costPerPack >= 0) {
-        costPerPack = rawItem.costPerPack;
-        costPerUnit = unitsPerPack > 0 ? costPerPack / unitsPerPack : costPerPack;
-      } else if (rawItem.costPerUnit !== undefined && rawItem.costPerUnit >= 0) {
-        costPerUnit = rawItem.costPerUnit;
-        costPerPack = costPerUnit * unitsPerPack;
-      } else {
-        costPerPack = item.costPerUnit * unitsPerPack;
-        costPerUnit = item.costPerUnit;
+    const hasExplicitLineTotal =
+      (rawItem.lineTotalCents !== undefined && Number.isFinite(Number(rawItem.lineTotalCents)) && Number(rawItem.lineTotalCents) >= 0) ||
+      (rawItem.lineTotal !== undefined && Number.isFinite(Number(rawItem.lineTotal)) && Number(rawItem.lineTotal) >= 0);
+
+    let baseLineTotalCents = 0;
+
+    if (hasExplicitLineTotal) {
+      baseLineTotalCents =
+        rawItem.lineTotalCents !== undefined && Number.isFinite(Number(rawItem.lineTotalCents))
+          ? Math.max(0, Math.round(Number(rawItem.lineTotalCents)))
+          : Math.max(0, Math.round(Number(rawItem.lineTotal) * 100));
+      const exactLineDollars = baseLineTotalCents / 100;
+      if (lineTotalUnits > 0) {
+        costPerUnit = roundUnitCost(exactLineDollars / lineTotalUnits);
+        costPerCase =
+          isReceivingCases && recCases > 0
+            ? roundUnitCost(exactLineDollars / recCases)
+            : roundUnitCost(costPerUnit * unitsPerCase);
+        if (isReceivingVariant && recPacks > 0) {
+          costPerPack = roundUnitCost(exactLineDollars / recPacks);
+        }
       }
-      costPerCase = costPerUnit * (item.unitsPerCase || 1);
+    } else if (isReceivingVariant) {
+      if (rawItem.costPerPack !== undefined && rawItem.costPerPack >= 0) {
+        costPerPack = roundUnitCost(rawItem.costPerPack);
+        costPerUnit = unitsPerPack > 0 ? roundUnitCost(costPerPack / unitsPerPack) : costPerPack;
+      } else if (rawItem.costPerUnit !== undefined && rawItem.costPerUnit >= 0) {
+        costPerUnit = roundUnitCost(rawItem.costPerUnit);
+        costPerPack = roundUnitCost(costPerUnit * unitsPerPack);
+      } else {
+        costPerPack = roundUnitCost(item.costPerUnit * unitsPerPack);
+        costPerUnit = roundUnitCost(item.costPerUnit);
+      }
+      costPerCase = roundUnitCost(costPerUnit * unitsPerCase);
+      baseLineTotalCents = Math.max(0, Math.round(recPacks * (costPerPack || 0) * 100));
     } else if (isReceivingSingles) {
       if (rawItem.costPerUnit !== undefined && rawItem.costPerUnit >= 0) {
-        costPerUnit = rawItem.costPerUnit;
+        costPerUnit = roundUnitCost(rawItem.costPerUnit);
       } else if (rawItem.costPerCase !== undefined && rawItem.costPerCase >= 0) {
-        costPerUnit = rawItem.costPerCase;
+        costPerUnit = roundUnitCost(rawItem.costPerCase);
       }
-      costPerCase = costPerUnit * (item.unitsPerCase || 1);
+      costPerCase = roundUnitCost(costPerUnit * unitsPerCase);
+      baseLineTotalCents = Math.max(0, Math.round(recSingles * costPerUnit * 100));
     } else {
       if (rawItem.costPerCase !== undefined && rawItem.costPerCase >= 0) {
-        costPerCase = rawItem.costPerCase;
+        costPerCase = roundUnitCost(rawItem.costPerCase);
       }
-      costPerUnit = item.unitsPerCase > 0 ? costPerCase / item.unitsPerCase : costPerCase;
+      costPerUnit = unitsPerCase > 0 ? roundUnitCost(costPerCase / unitsPerCase) : costPerCase;
+      baseLineTotalCents = Math.max(0, Math.round((recCases * costPerCase + recSingles * costPerUnit) * 100));
     }
 
-    // Landed cost adjustment (modifies unit cost and case cost only, without affecting cash or approvals)
-    const allocatedLanded = itemLandedCostAllocMap.get(item.itemId) || 0;
-    let landedCostNote = '';
-    const lineTotalUnitsPreview = isReceivingVariant
-      ? recPacks * unitsPerPack
-      : (recCases * item.unitsPerCase) + recSingles;
+    // Supplier invoice line total (excluding landed costs) — exact to the penny
+    const lineTotal = baseLineTotalCents / 100;
 
-    if (allocatedLanded > 0 && lineTotalUnitsPreview > 0) {
-      const addedUnitCost = allocatedLanded / lineTotalUnitsPreview;
-      costPerUnit = Number((costPerUnit + addedUnitCost).toFixed(4));
-      costPerCase = Number((costPerUnit * item.unitsPerCase).toFixed(2));
-      landedCostNote = ` [Landed Cost: +$${allocatedLanded.toFixed(2)} total (+$${addedUnitCost.toFixed(4)}/unit)]`;
+    // Landed cost adjustment (adds exact allocated landed cents into inventory value pool & landed unit cost)
+    const allocatedLanded = itemLandedCostAllocMap.get(item.itemId) || 0;
+    const allocatedLandedCents = Math.max(0, Math.round(allocatedLanded * 100));
+    const totalReceiptCents = baseLineTotalCents + allocatedLandedCents;
+    let landedCostNote = '';
+
+    if (allocatedLandedCents > 0 && lineTotalUnits > 0) {
+      const addedUnitCost = roundUnitCost(allocatedLandedCents / 100 / lineTotalUnits);
+      costPerUnit = roundUnitCost(totalReceiptCents / 100 / lineTotalUnits);
+      costPerCase = Number((costPerUnit * unitsPerCase).toFixed(2));
+      landedCostNote = ` [Landed Cost: +$${(allocatedLandedCents / 100).toFixed(2)} total (+$${addedUnitCost.toFixed(4)}/unit)]`;
     }
 
     const sellingPrice =
@@ -18579,6 +18940,7 @@ export const receiveSupplierInvoice = (params: {
         ? ((sellingPrice - costPerUnit) / sellingPrice) * 100
         : rawItem.marginPercent || 0;
 
+    const prevStock = normalizeStockFields(item);
     const canSellAsCase = Boolean(item.canSellAsCase);
     let finalRecCases = recCases;
     let finalRecSingles = recSingles;
@@ -18588,24 +18950,19 @@ export const receiveSupplierInvoice = (params: {
 
     if (!canSellAsCase && recCases > 0) {
       convertedCasesToSingles = true;
-      const gainedSingles = recCases * item.unitsPerCase;
+      const gainedSingles = recCases * unitsPerCase;
       finalRecCases = 0;
       finalRecSingles = recSingles + gainedSingles;
       autoBreakNote = ` [Converted ${recCases} received case(s) into ${gainedSingles} singles because 'Sell as Case' is deactivated]`;
-    } else if (canSellAsCase && recCases > 0 && item.stockSingles === 0) {
+    } else if (canSellAsCase && recCases > 0 && prevStock.stockSingles === 0) {
       autoBroken = true;
       ruleATriggeredCount++;
       finalRecCases = recCases - 1;
-      finalRecSingles = recSingles + item.unitsPerCase;
-      autoBreakNote = ` [Rule A Triggered: Auto-broke 1 case to ${item.unitsPerCase} singles because StockSingles was 0]`;
+      finalRecSingles = recSingles + unitsPerCase;
+      autoBreakNote = ` [Rule A Triggered: Auto-broke 1 case to ${unitsPerCase} singles because StockSingles was 0]`;
     } else if (isReceivingVariant) {
       autoBreakNote = ` [Received as ${recPacks} x ${rawItem.receiveVariantName || 'Variant'} (${unitsPerPack} units/pack = ${recSingles} total singles)]`;
     }
-
-    // Total gross units received in this line item
-    const lineTotalUnits = isReceivingVariant
-      ? recPacks * unitsPerPack
-      : (recCases * item.unitsPerCase) + recSingles;
 
     // CORE RULE 2 & 3: Clear any Negative Balance first with newly received qty
     const clearing = clearNegativeBalancesOnGRN({
@@ -18634,7 +18991,7 @@ export const receiveSupplierInvoice = (params: {
       itemName: item.itemName,
       qtyReceived: lineTotalUnits,
       qtyOnHand: clearing.remainingUnitsForNewBatch, // Individual batch Qty On Hand is whatever is left after clearing negative balances
-      cost: lineTotalUnits * costPerUnit,
+      cost: Number((totalReceiptCents / 100).toFixed(2)),
       costPerUnit,
       costPerCase,
       expiryDate: rawItem.expiryDate,
@@ -18651,70 +19008,52 @@ export const receiveSupplierInvoice = (params: {
     } as any;
     saveStockBatch(newBatch);
 
-    // Add newly received units directly onto existing inventory stock (preserves non-batched stock & clears negative balances naturally)
-    const prevStockCases = Number(item.stockCases) || 0;
-    const prevStockSingles = Number(item.stockSingles) || 0;
-    const unitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
-    const prevTotalUnits = (prevStockCases * unitsPerCase) + prevStockSingles;
-    const effectiveTotalUnits = prevTotalUnits + lineTotalUnits;
+    // Apply receipt to canonical stock + integer-cent value pool (zero-penny GL reconciliation + 4-decimal MWAC)
+    const prevStockCases = prevStock.stockCases;
+    const prevStockSingles = prevStock.stockSingles;
+    const prevTotalUnits = prevStock.totalUnits;
+    const poolResult = applyReceiptToValuePool({
+      prevTotalUnits,
+      prevStockValueCents: item.stockValueCents,
+      prevAvgUnitCost: resolveItemValuationUnitCost(item),
+      unitsPerCase,
+      receivedUnits: lineTotalUnits,
+      receivedTotalCents: totalReceiptCents,
+      fallbackUnitCost: costPerUnit,
+    });
+    const effectiveTotalUnits = poolResult.newTotalUnits;
 
     let newStockCases = 0;
     let newStockSingles = 0;
-    if (effectiveTotalUnits > 0) {
-      if (canSellAsCase && unitsPerCase > 1) {
-        if (autoBroken && effectiveTotalUnits >= unitsPerCase) {
-          newStockCases = Math.max(0, Math.floor(effectiveTotalUnits / unitsPerCase) - 1);
-          newStockSingles = effectiveTotalUnits - (newStockCases * unitsPerCase);
-        } else {
-          newStockCases = Math.floor(effectiveTotalUnits / unitsPerCase);
-          newStockSingles = effectiveTotalUnits % unitsPerCase;
-        }
-      } else {
-        newStockCases = 0;
-        newStockSingles = effectiveTotalUnits;
-      }
+    if (effectiveTotalUnits > 0 && canSellAsCase && unitsPerCase > 1 && autoBroken && effectiveTotalUnits >= unitsPerCase) {
+      newStockCases = Math.max(0, Math.floor(effectiveTotalUnits / unitsPerCase) - 1);
+      newStockSingles = roundStockUnits(effectiveTotalUnits - (newStockCases * unitsPerCase));
     } else {
-      newStockCases = 0;
-      newStockSingles = effectiveTotalUnits;
+      const decomposed = decomposeStockUnits(effectiveTotalUnits, unitsPerCase, {
+        keepCasesZero: !(canSellAsCase && unitsPerCase > 1),
+      });
+      newStockCases = decomposed.stockCases;
+      newStockSingles = decomposed.stockSingles;
     }
 
-    // Moving Weighted Average Cost (AVCO) calculation:
-    const priorOnHandUnits = Math.max(0, item.totalUnits || 0);
-    const priorAvgCost = item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0
-      ? item.averageCostPerUnit
-      : (item.costPerUnit || 0);
-
-    const totalCostPool = (priorOnHandUnits * priorAvgCost) + (lineTotalUnits * costPerUnit);
-    const combinedTotalUnits = priorOnHandUnits + lineTotalUnits;
-    const computedAverageCostPerUnit = combinedTotalUnits > 0
-      ? Number((totalCostPool / combinedTotalUnits).toFixed(4))
-      : costPerUnit;
-    const computedAverageCostPerCase = Number((computedAverageCostPerUnit * (item.unitsPerCase || 1)).toFixed(2));
-    const computedLatestCostPerUnit = Number(costPerUnit.toFixed(4));
-    const computedLatestCostPerCase = Number(costPerCase.toFixed(2));
-
-    // Update item in inventory (including average & latest cost and optionally selling price)
+    // Update item in inventory (including value pool, 4-decimal average & latest cost, and optionally selling price)
     const updatedItem: InventoryItem = {
       ...item,
-      costPerCase: costPerCase,
-      costPerUnit: costPerUnit,
-      averageCostPerUnit: computedAverageCostPerUnit,
-      averageCostPerCase: computedAverageCostPerCase,
-      latestCostPerUnit: computedLatestCostPerUnit,
-      latestCostPerCase: computedLatestCostPerCase,
+      costPerCase: poolResult.latestCostPerCase,
+      costPerUnit: poolResult.latestCostPerUnit,
+      averageCostPerUnit: poolResult.averageCostPerUnit,
+      averageCostPerCase: poolResult.averageCostPerCase,
+      latestCostPerUnit: poolResult.latestCostPerUnit,
+      latestCostPerCase: poolResult.latestCostPerCase,
+      stockValueCents: poolResult.stockValueCents,
       sellPriceUnit: sellingPrice,
-      sellPriceCase: item.sellPriceCase > 0 ? item.sellPriceCase : sellingPrice * item.unitsPerCase,
+      sellPriceCase: item.sellPriceCase > 0 ? item.sellPriceCase : sellingPrice * unitsPerCase,
       stockCases: newStockCases,
       stockSingles: newStockSingles,
       totalUnits: effectiveTotalUnits,
       lastUpdated: timestamp,
     };
     saveInventoryItem(updatedItem);
-
-    const rawLineTotal = isReceivingVariant && costPerPack !== undefined
-      ? recPacks * costPerPack
-      : recCases * costPerCase + recSingles * costPerUnit;
-    const lineTotal = Math.round((Number(rawLineTotal) || 0) * 100) / 100;
 
     totalCases += recCases;
     totalSingles += recSingles;
@@ -18725,7 +19064,7 @@ export const receiveSupplierInvoice = (params: {
       itemId: item.itemId,
       itemName: item.itemName,
       category: item.category,
-      unitsPerCase: item.unitsPerCase,
+      unitsPerCase,
       receiveAs: rawItem.receiveAs || 'Cases',
       receiveVariantId: rawItem.receiveVariantId,
       receiveVariantName: rawItem.receiveVariantName,
@@ -18902,24 +19241,30 @@ export const recalculateItemPackagingRatio = (
   const staffIdParam =
     typeof newCostPerCaseOrStaffId === 'string' ? newCostPerCaseOrStaffId : staffId;
 
-  const totalUnits =
-    item.totalUnits !== undefined
-      ? item.totalUnits
-      : item.stockCases * item.unitsPerCase + item.stockSingles;
-  const prevCases = item.stockCases;
-  const prevSingles = item.stockSingles;
+  const prevStock = normalizeStockFields(item);
+  const totalUnits = prevStock.totalUnits;
+  const prevCases = prevStock.stockCases;
+  const prevSingles = prevStock.stockSingles;
 
-  const newStockCases = Math.floor(totalUnits / newUnitsPerCase);
-  const newStockSingles = totalUnits % newUnitsPerCase;
-  const costPerCase =
-    costPerCaseParam !== undefined && costPerCaseParam >= 0 ? costPerCaseParam : item.costPerCase;
-  const costPerUnit = costPerCase / newUnitsPerCase;
+  const decomposed = decomposeStockUnits(totalUnits, newUnitsPerCase, {
+    keepCasesZero: !(item.canSellAsCase && newUnitsPerCase > 1),
+  });
+  const newStockCases = decomposed.stockCases;
+  const newStockSingles = decomposed.stockSingles;
+  const costPerCase = roundUnitCost(
+    costPerCaseParam !== undefined && costPerCaseParam >= 0 ? costPerCaseParam : item.costPerCase
+  );
+  const costPerUnit = roundUnitCost(costPerCase / newUnitsPerCase);
 
   const updated: InventoryItem = {
     ...item,
     unitsPerCase: newUnitsPerCase,
     costPerCase,
     costPerUnit,
+    latestCostPerUnit: costPerUnit,
+    latestCostPerCase: costPerCase,
+    averageCostPerCase: roundUnitCost(resolveItemValuationUnitCost(item) * newUnitsPerCase),
+    stockValueCents: resolveItemStockValueCents(item),
     stockCases: newStockCases,
     stockSingles: newStockSingles,
     totalUnits,
@@ -19451,11 +19796,18 @@ export const recordMovement = (params: {
     return { success: false, message: `Item not found: ${params.itemId}` };
   }
 
-  const updatedItem: InventoryItem = {
-    ...item,
+  const nextStock = normalizeStockFields({
     stockCases: Math.max(0, params.resultingStockCases),
     stockSingles: Math.max(0, params.resultingStockSingles),
-    totalUnits: (Math.max(0, params.resultingStockCases) * item.unitsPerCase) + Math.max(0, params.resultingStockSingles),
+    unitsPerCase: item.unitsPerCase,
+    canSellAsCase: item.canSellAsCase,
+  });
+  const updatedItem: InventoryItem = {
+    ...item,
+    stockCases: nextStock.stockCases,
+    stockSingles: nextStock.stockSingles,
+    totalUnits: nextStock.totalUnits,
+    stockValueCents: reconcileStockValueCents(item, nextStock.totalUnits),
     lastUpdated: new Date().toISOString(),
   };
   saveInventoryItem(updatedItem);
@@ -19675,16 +20027,39 @@ export const receiveStock = (params: {
     autoBreakNote = ` [Rule A Triggered: Auto-broke 1 case to ${item.unitsPerCase} singles because StockSingles was 0]`;
   }
 
-  // Update Stock
-  const newStockCases = item.stockCases + finalRecCases;
-  const newStockSingles = item.stockSingles + finalRecSingles;
-  const newTotalUnits = (newStockCases * item.unitsPerCase) + newStockSingles;
+  // Update Stock canonically & maintain integer-cent value pool
+  const prevStock = normalizeStockFields(item);
+  const recTotalUnits = roundStockUnits((recCases * prevStock.unitsPerCase) + recSingles);
+  const unitCost = resolveItemValuationUnitCost(item);
+  const poolResult = applyReceiptToValuePool({
+    prevTotalUnits: prevStock.totalUnits,
+    prevStockValueCents: item.stockValueCents,
+    prevAvgUnitCost: unitCost,
+    unitsPerCase: prevStock.unitsPerCase,
+    receivedUnits: recTotalUnits,
+    receivedTotalCents: Math.round(recTotalUnits * unitCost * 100),
+    fallbackUnitCost: unitCost,
+  });
+  const newTotalUnits = poolResult.newTotalUnits;
+  let newStockCases = 0;
+  let newStockSingles = 0;
+  if (newTotalUnits > 0 && canSellAsCase && prevStock.unitsPerCase > 1 && autoBroken && newTotalUnits >= prevStock.unitsPerCase) {
+    newStockCases = Math.max(0, Math.floor(newTotalUnits / prevStock.unitsPerCase) - 1);
+    newStockSingles = roundStockUnits(newTotalUnits - newStockCases * prevStock.unitsPerCase);
+  } else {
+    const decomposed = decomposeStockUnits(newTotalUnits, prevStock.unitsPerCase, {
+      keepCasesZero: !(canSellAsCase && prevStock.unitsPerCase > 1),
+    });
+    newStockCases = decomposed.stockCases;
+    newStockSingles = decomposed.stockSingles;
+  }
 
   const updatedItem: InventoryItem = {
     ...item,
     stockCases: newStockCases,
     stockSingles: newStockSingles,
     totalUnits: newTotalUnits,
+    stockValueCents: poolResult.stockValueCents,
     lastUpdated: new Date().toISOString(),
   };
 
@@ -19846,7 +20221,14 @@ export const sellStock = (params: {
       allowNegative: true,
     });
 
-    const newTotalUnits = item.totalUnits - totalUnitsRequired;
+    const prevStock = normalizeStockFields(item);
+    const outflow = applyOutflowToValuePool({
+      prevTotalUnits: prevStock.totalUnits,
+      prevStockValueCents: item.stockValueCents,
+      prevAvgUnitCost: resolveItemValuationUnitCost(item),
+      deductedUnits: totalUnitsRequired,
+    });
+    const newTotalUnits = outflow.newTotalUnits;
     const finalCases = 0;
     const finalSingles = newTotalUnits;
 
@@ -19855,6 +20237,7 @@ export const sellStock = (params: {
       stockCases: finalCases,
       stockSingles: finalSingles,
       totalUnits: newTotalUnits,
+      stockValueCents: outflow.stockValueCents,
       lastUpdated: new Date().toISOString(),
     };
     saveInventoryItem(updatedItem);
@@ -19994,15 +20377,23 @@ export const sellStock = (params: {
     allowNegative: false,
   });
 
+  const prevStock = normalizeStockFields(item);
+  const outflow = applyOutflowToValuePool({
+    prevTotalUnits: prevStock.totalUnits,
+    prevStockValueCents: item.stockValueCents,
+    prevAvgUnitCost: resolveItemValuationUnitCost(item),
+    deductedUnits: totalUnitsRequired,
+  });
   const finalCases = currentCases - reqCases;
-  const finalSingles = currentSingles - reqSingles;
-  const finalTotalUnits = (finalCases * item.unitsPerCase) + finalSingles;
+  const finalSingles = roundStockUnits(currentSingles - reqSingles);
+  const finalTotalUnits = roundStockUnits((finalCases * item.unitsPerCase) + finalSingles);
 
   const updatedItem: InventoryItem = {
     ...item,
     stockCases: finalCases,
     stockSingles: finalSingles,
     totalUnits: finalTotalUnits,
+    stockValueCents: outflow.stockValueCents,
     lastUpdated: new Date().toISOString(),
   };
 
@@ -23384,8 +23775,9 @@ export const consolidateStocktakeSession = (
       }
 
       acc.countedTotalUnits += segLine.totalUnits;
-      acc.countedCases = Math.floor(acc.countedTotalUnits / acc.unitsPerCase);
-      acc.countedSingles = acc.countedTotalUnits % acc.unitsPerCase;
+      const accDecomp = decomposeStockUnits(acc.countedTotalUnits, acc.unitsPerCase);
+      acc.countedCases = accDecomp.stockCases;
+      acc.countedSingles = accDecomp.stockSingles;
     });
   });
 
@@ -23467,16 +23859,23 @@ export const consolidateStocktakeSession = (
   skuMap.forEach((accum) => {
     const master = getInventoryItemById(accum.itemId);
     const unitsPerCase = Math.max(1, Number(master?.unitsPerCase || accum.unitsPerCase || 1));
-    const costPerUnit = master?.costPerUnit || (master?.costPerCase ? master.costPerCase / unitsPerCase : 0);
-    const costPerCase = master?.costPerCase || costPerUnit * unitsPerCase;
+    // Unified MWAC valuation cost (matches Inventory Master valuation, up to 4 decimals)
+    const costPerUnit = resolveItemValuationUnitCost(master);
+    const costPerCase = roundUnitCost(costPerUnit * unitsPerCase);
     const sellPriceUnit = master?.sellPriceUnit || 0;
     const sellPriceCase = master?.sellPriceCase || sellPriceUnit * unitsPerCase;
 
-    const systemCases = master?.stockCases || 0;
-    const systemSingles = master?.stockSingles || 0;
-    const systemTotalUnits = (systemCases * unitsPerCase) + systemSingles;
-    const systemCostValue = systemTotalUnits * costPerUnit;
-    const systemRetailValue = systemTotalUnits * sellPriceUnit;
+    const systemStock = master
+      ? normalizeStockFields(master)
+      : { stockCases: 0, stockSingles: 0, totalUnits: 0, unitsPerCase };
+    const systemCases = systemStock.stockCases;
+    const systemSingles = systemStock.stockSingles;
+    const systemTotalUnits = systemStock.totalUnits;
+    const systemCostValue =
+      master && systemTotalUnits > 0
+        ? computeItemValuationCents(master) / 100
+        : Math.round(systemTotalUnits * costPerUnit * 100) / 100;
+    const systemRetailValue = Math.round(systemTotalUnits * sellPriceUnit * 100) / 100;
 
     const itemKey = accum.itemId.trim().toUpperCase();
     const prev = previousByItemId.get(itemKey);
@@ -23491,10 +23890,11 @@ export const consolidateStocktakeSession = (
     const hasPendingBlindRecount = prev?.recountSheetStatus === 'REQUESTED' || Boolean(prev?.recountRequested);
 
     const countedTotalUnits = hasActiveBlindRecount ? Number(prev!.recountTotalUnits) : accum.countedTotalUnits;
-    const countedCases = Math.floor(countedTotalUnits / unitsPerCase);
-    const countedSingles = countedTotalUnits % unitsPerCase;
-    const countedCostValue = countedTotalUnits * costPerUnit;
-    const countedRetailValue = countedTotalUnits * sellPriceUnit;
+    const countedDecomp = decomposeStockUnits(countedTotalUnits, unitsPerCase);
+    const countedCases = countedDecomp.stockCases;
+    const countedSingles = countedDecomp.stockSingles;
+    const countedCostValue = Math.round(countedTotalUnits * costPerUnit * 100) / 100;
+    const countedRetailValue = Math.round(countedTotalUnits * sellPriceUnit * 100) / 100;
 
     const customerHeldStockUnits = customerHeldMap.get(itemKey) || 0;
     const emergencySoldUnits = emergencySoldMap.get(itemKey) || 0;
@@ -23503,14 +23903,19 @@ export const consolidateStocktakeSession = (
 
     const effectivePhysicalUnits =
       customerHeldStockUnits > 0 || emergencySoldUnits > 0 ? adjustedPhysicalUnits : countedTotalUnits;
-    const effectivePhysicalCases = Math.floor(effectivePhysicalUnits / unitsPerCase);
-    const effectivePhysicalSingles = effectivePhysicalUnits % unitsPerCase;
+    const effectiveDecomp = decomposeStockUnits(effectivePhysicalUnits, unitsPerCase);
+    const effectivePhysicalCases = effectiveDecomp.stockCases;
+    const effectivePhysicalSingles = effectiveDecomp.stockSingles;
 
     const varianceCases = effectivePhysicalCases - systemCases;
     const varianceSingles = effectivePhysicalSingles - systemSingles;
     const varianceTotalUnits = effectivePhysicalUnits - systemTotalUnits;
-    const varianceCostValue = varianceTotalUnits * costPerUnit;
-    const varianceRetailValue = varianceTotalUnits * sellPriceUnit;
+    const effectivePhysicalCostValue =
+      effectivePhysicalUnits === systemTotalUnits
+        ? systemCostValue
+        : Math.round(effectivePhysicalUnits * costPerUnit * 100) / 100;
+    const varianceCostValue = Math.round((effectivePhysicalCostValue - systemCostValue) * 100) / 100;
+    const varianceRetailValue = Math.round(varianceTotalUnits * sellPriceUnit * 100) / 100;
 
     let status: 'MATCH' | 'SHORTAGE' | 'OVERAGE' | 'RECOUNT_FLAGGED' = 'MATCH';
     if (hasPendingBlindRecount) {
@@ -23526,8 +23931,8 @@ export const consolidateStocktakeSession = (
     totalSystemUnits += systemTotalUnits;
     totalCountedUnits += countedTotalUnits;
     totalVarianceUnits += varianceTotalUnits;
-    totalVarianceCostValue += varianceCostValue;
-    totalVarianceRetailValue += varianceRetailValue;
+    totalVarianceCostValue = Math.round((totalVarianceCostValue + varianceCostValue) * 100) / 100;
+    totalVarianceRetailValue = Math.round((totalVarianceRetailValue + varianceRetailValue) * 100) / 100;
 
     const keepOriginalSnapshot = hasActiveBlindRecount || hasPendingBlindRecount;
 
@@ -23988,18 +24393,23 @@ export const approveAndCommitStocktake = (
             ? Number(cItem.adjustedPhysicalUnits)
             : Number(cItem.countedTotalUnits || 0)
         );
-        const prevCases = invItem.stockCases;
-        const prevSingles = invItem.stockSingles;
-        const newCases = Math.floor(effectiveUnits / upc);
-        const newSingles = effectiveUnits % upc;
-        const newTotalUnits = effectiveUnits;
+        const prevStock = normalizeStockFields(invItem);
+        const prevCases = prevStock.stockCases;
+        const prevSingles = prevStock.stockSingles;
+        const decomposed = decomposeStockUnits(effectiveUnits, upc, {
+          keepCasesZero: !(invItem.canSellAsCase && upc > 1),
+        });
+        const newCases = decomposed.stockCases;
+        const newSingles = decomposed.stockSingles;
+        const newTotalUnits = decomposed.totalUnits;
 
-        // 1. Update Inventory Master Stock Levels
+        // 1. Update Inventory Master Stock Levels & reconcile integer-cent value pool
         const updatedMaster: InventoryItem = {
           ...invItem,
           stockCases: newCases,
           stockSingles: newSingles,
           totalUnits: newTotalUnits,
+          stockValueCents: reconcileStockValueCents(invItem, newTotalUnits),
           lastUpdated: timestamp,
         };
         saveInventoryItem(updatedMaster);
@@ -24420,6 +24830,14 @@ export const approveAndCommitStocktakeAsync = async (
             UnitsPerCase: normalized.unitsPerCase,
             CostPerCase: normalized.costPerCase,
             CostPerUnit: normalized.costPerUnit,
+            AverageCostPerUnit: normalized.averageCostPerUnit,
+            AverageCostPerCase: normalized.averageCostPerCase,
+            LatestCostPerUnit: normalized.latestCostPerUnit,
+            LatestCostPerCase: normalized.latestCostPerCase,
+            averageCostPerUnit: normalized.averageCostPerUnit,
+            averageCostPerCase: normalized.averageCostPerCase,
+            latestCostPerUnit: normalized.latestCostPerUnit,
+            latestCostPerCase: normalized.latestCostPerCase,
             SellingPrice: normalized.sellPriceUnit,
             StockCases: normalized.stockCases,
             StockSingles: normalized.stockSingles,
@@ -26509,7 +26927,8 @@ export const approveDirectGrv = (
         ? Number(item.quantitySingles)
         : (item.receiveAs === 'Singles' ? Number(item.quantity || 0) : 0)
     );
-    const totalLineUnits = (recCases * unitsPerCase) + recSingles;
+    const prevStock = normalizeStockFields(invItem);
+    const totalLineUnits = roundStockUnits((recCases * unitsPerCase) + recSingles);
 
     let finalRecCases = recCases;
     let finalRecSingles = recSingles;
@@ -26525,7 +26944,7 @@ export const approveDirectGrv = (
       finalRecCases = 0;
       finalRecSingles = recSingles + gainedSingles;
       ruleNote = ` [Converted ${recCases} received case(s) into ${gainedSingles} singles because 'Sell as Case' is deactivated]`;
-    } else if (canSellAsCase && recCases > 0 && (invItem.stockSingles || 0) === 0) {
+    } else if (canSellAsCase && recCases > 0 && prevStock.stockSingles === 0) {
       // Auto-break 1 case so singles are immediately salable
       autoBroken = true;
       finalRecCases = recCases - 1;
@@ -26533,11 +26952,26 @@ export const approveDirectGrv = (
       ruleNote = ` [Rule A: Auto-broke 1 case to ${unitsPerCase} singles because StockSingles was 0]`;
     }
 
+    // Resolve exact integer-cent invoice line total (Line-Total-First preserves exact cents)
+    const fallbackIncomingUnitCost = roundUnitCost(
+      Number(item.costPrice) || (unitsPerCase > 0 ? (Number(item.costPerCase) || 0) / unitsPerCase : (invItem.costPerUnit || 0))
+    );
+    const receivedTotalCents =
+      (item as any).lineTotalCents !== undefined && Number.isFinite(Number((item as any).lineTotalCents)) && Number((item as any).lineTotalCents) >= 0
+        ? Math.round(Number((item as any).lineTotalCents))
+        : item.lineTotal !== undefined && Number.isFinite(Number(item.lineTotal)) && Number(item.lineTotal) >= 0
+        ? Math.round(Number(item.lineTotal) * 100)
+        : Math.max(0, Math.round(totalLineUnits * fallbackIncomingUnitCost * 100));
+    const exactUnitCost =
+      totalLineUnits > 0 && receivedTotalCents > 0
+        ? roundUnitCost(receivedTotalCents / 100 / totalLineUnits)
+        : fallbackIncomingUnitCost;
+
     // Clear any negative balances on receiving
     const clearing = clearNegativeBalancesOnGRN({
       itemId: invItem.itemId,
       receivedUnits: totalLineUnits,
-      newCostPerUnit: item.costPrice || (unitsPerCase > 0 ? (item.costPerCase || 0) / unitsPerCase : 0),
+      newCostPerUnit: exactUnitCost,
       grnId: grv.grvNumber,
     });
 
@@ -26550,9 +26984,9 @@ export const approveDirectGrv = (
       batchNumber: item.batchNumber || `DGRV-${grv.grvNumber}`,
       qtyReceived: totalLineUnits,
       qtyOnHand: clearing.remainingUnitsForNewBatch,
-      cost: totalLineUnits * (item.costPrice || 0),
-      costPerUnit: item.costPrice || 0,
-      costPerCase: item.costPerCase || ((item.costPrice || 0) * unitsPerCase),
+      cost: Number((receivedTotalCents / 100).toFixed(2)),
+      costPerUnit: exactUnitCost,
+      costPerCase: item.costPerCase || Number((exactUnitCost * unitsPerCase).toFixed(2)),
       expiryDate: item.expiryDate,
       receivedDate: dateStr,
       supplier: grv.supplierName,
@@ -26564,36 +26998,40 @@ export const approveDirectGrv = (
     };
     saveStockBatch(newBatch);
 
-    const prevCases = invItem.stockCases || 0;
-    const prevSingles = invItem.stockSingles || 0;
-    const newStockCases = prevCases + finalRecCases;
-    const newStockSingles = prevSingles + finalRecSingles;
-    const newTotalUnits = (newStockCases * unitsPerCase) + newStockSingles;
+    // Apply receipt to canonical stock + integer-cent value pool (zero-penny GL reconciliation + 4-decimal MWAC)
+    const poolResult = applyReceiptToValuePool({
+      prevTotalUnits: prevStock.totalUnits,
+      prevStockValueCents: invItem.stockValueCents,
+      prevAvgUnitCost: resolveItemValuationUnitCost(invItem),
+      unitsPerCase,
+      receivedUnits: totalLineUnits,
+      receivedTotalCents,
+      fallbackUnitCost: exactUnitCost,
+    });
+    const newTotalUnits = poolResult.newTotalUnits;
+    let newStockCases = 0;
+    let newStockSingles = 0;
+    if (newTotalUnits > 0 && canSellAsCase && unitsPerCase > 1 && autoBroken && newTotalUnits >= unitsPerCase) {
+      newStockCases = Math.max(0, Math.floor(newTotalUnits / unitsPerCase) - 1);
+      newStockSingles = roundStockUnits(newTotalUnits - newStockCases * unitsPerCase);
+    } else {
+      const decomposed = decomposeStockUnits(newTotalUnits, unitsPerCase, {
+        keepCasesZero: !(canSellAsCase && unitsPerCase > 1),
+      });
+      newStockCases = decomposed.stockCases;
+      newStockSingles = decomposed.stockSingles;
+    }
 
     invItem.stockCases = newStockCases;
     invItem.stockSingles = newStockSingles;
     invItem.totalUnits = newTotalUnits;
-
-    // Moving Weighted Average Cost (AVCO) calculation for Direct GRV:
-    const incomingUnitCost = item.costPrice || (unitsPerCase > 0 ? (item.costPerCase || 0) / unitsPerCase : (invItem.costPerUnit || 0));
-    const priorUnits = Math.max(0, (prevCases * unitsPerCase) + prevSingles);
-    const priorAvgCost = invItem.averageCostPerUnit !== undefined && invItem.averageCostPerUnit > 0
-      ? invItem.averageCostPerUnit
-      : (invItem.costPerUnit || 0);
-
-    const totalCostPool = (priorUnits * priorAvgCost) + (totalLineUnits * incomingUnitCost);
-    const combinedUnits = priorUnits + totalLineUnits;
-    const computedAvgCostUnit = combinedUnits > 0 ? Number((totalCostPool / combinedUnits).toFixed(4)) : incomingUnitCost;
-    const computedAvgCostCase = Number((computedAvgCostUnit * unitsPerCase).toFixed(2));
-    const computedLatestCostUnit = Number(incomingUnitCost.toFixed(4));
-    const computedLatestCostCase = item.costPerCase || Number((incomingUnitCost * unitsPerCase).toFixed(2));
-
-    invItem.costPerUnit = incomingUnitCost;
-    invItem.costPerCase = computedLatestCostCase;
-    invItem.averageCostPerUnit = computedAvgCostUnit;
-    invItem.averageCostPerCase = computedAvgCostCase;
-    invItem.latestCostPerUnit = computedLatestCostUnit;
-    invItem.latestCostPerCase = computedLatestCostCase;
+    invItem.stockValueCents = poolResult.stockValueCents;
+    invItem.costPerUnit = poolResult.latestCostPerUnit;
+    invItem.costPerCase = poolResult.latestCostPerCase;
+    invItem.averageCostPerUnit = poolResult.averageCostPerUnit;
+    invItem.averageCostPerCase = poolResult.averageCostPerCase;
+    invItem.latestCostPerUnit = poolResult.latestCostPerUnit;
+    invItem.latestCostPerCase = poolResult.latestCostPerCase;
 
     if (item.sellingPrice) {
       invItem.sellPriceUnit = item.sellingPrice;

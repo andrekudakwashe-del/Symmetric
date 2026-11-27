@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Product } from '../../types';
 import { getCurrentUser, isSupervisorOrAbove } from '../../db/roomDatabase';
+import { isItemBelowReorderPoint, normalizeStockFields } from '../../utils/inventoryMath';
 import { Scale, Plus, Minus } from 'lucide-react';
 
 interface ProductGestureListRowProps {
@@ -209,9 +210,9 @@ const ProductGestureListRowComponent: React.FC<ProductGestureListRowProps> = ({
             {(() => {
               const user = getCurrentUser();
               const canSeeRaw = isSupervisorOrAbove(user?.role) || Boolean(user?.permissions?.canManageInventory);
-              const isOOS = product.stockQuantity === 0 && (!product.stockCases || product.stockCases === 0);
-              const totalStockUnits = (Number(product.stockCases) || 0) * (product.unitsPerCase || 1) + (Number(product.stockQuantity) || 0);
-              const isLow = !isOOS && totalStockUnits <= (product.reorderLevelUnits || 5);
+              const totalStockUnits = normalizeStockFields(product).totalUnits;
+              const isOOS = totalStockUnits <= 0;
+              const isLow = !isOOS && isItemBelowReorderPoint(product);
 
               if (product.sellByFraction) {
                 return (

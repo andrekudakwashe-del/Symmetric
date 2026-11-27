@@ -33,6 +33,26 @@ import {
   SyncCircuitBreaker,
   withCrossTabSyncLock,
 } from '../src/services/sync/syncResilience';
+import {
+  roundUnitCost,
+  formatUnitCost,
+  computeGrvLineCosting,
+  applyReceiptToValuePool,
+  applyOutflowToValuePool,
+  applyReturnToValuePool,
+  computeItemValuationCents,
+  computePortfolioValuation,
+  computeReorderPointTotalUnits,
+  isItemBelowReorderPoint,
+  decomposeStockUnits,
+  normalizeStockFields,
+} from '../src/utils/inventoryMath';
+import { resolveItemCost } from '../src/utils/costResolver';
+import { filterCashierVisibleInvoices } from '../src/utils/cashierInvoiceFilter';
+import {
+  buildPurchaseOrderA4Html,
+  buildPurchaseOrderThermal58mmHtml,
+} from '../src/services/purchaseOrderPrintService';
 
 type TestCase = { name: string; run: () => Promise<void> | void };
 
@@ -371,6 +391,430 @@ const suites: TestCase[] = [
       assert.equal(acquired.acquired, true);
       assert.equal(acquired.result, 'RAN');
       assert.equal(memLS['saimetric_lock_reg_comp'], undefined);
+    },
+  },
+  {
+    name: 'Inventory Phase 1/2 — 4-decimal unit cost precision & bidirectional GRV Line-Total-First / Unit-Cost-First math',
+    run: () => {
+      assert.equal(roundUnitCost(1 / 24), 0.0417);
+      assert.equal(formatUnitCost(0.0417), '0.0417');
+      assert.equal(formatUnitCost(1.5), '1.50');
+      assert.equal(formatUnitCost(0.3333), '0.3333');
+      assert.equal(formatUnitCost(0), '0.00');
+
+      // Line-Total-First: 3 cases x 24 units = 72 units, exact supplier line total $10.00
+      const ltMode = computeGrvLineCosting({
+        receiveAs: 'Cases',
+        qty: 3,
+        unitsPerCase: 24,
+        costEntryMode: 'LINE_TOTAL',
+        enteredLineTotal: 10.0,
+      });
+      assert.equal(ltMode.totalUnits, 72);
+      assert.equal(ltMode.lineTotalCents, 1000);
+      assert.equal(ltMode.lineTotal, 10);
+      assert.equal(ltMode.costPerCase, 3.3333);
+      assert.equal(ltMode.costPerUnit, 0.1389);
+
+      // Unit-Cost-First: 120 loose units @ $0.0417/unit => $5.004 -> 500 cents
+      const ucMode = computeGrvLineCosting({
+        receiveAs: 'Singles',
+        qty: 120,
+        unitsPerCase: 24,
+        costEntryMode: 'UNIT_COST',
+        enteredUnitOrCaseCost: 0.0417,
+      });
+      assert.equal(ucMode.totalUnits, 120);
+      assert.equal(ucMode.costPerUnit, 0.0417);
+      assert.equal(ucMode.lineTotalCents, 500);
+      assert.equal(ucMode.lineTotal, 5);
+
+      // Variant prepacks in Line-Total-First mode: 5 packs of 6 = 30 units for $11.00
+      const varMode = computeGrvLineCosting({
+        receiveAs: 'Variant',
+        qty: 5,
+        unitsPerCase: 24,
+        variantUnitsPerPack: 6,
+        costEntryMode: 'LINE_TOTAL',
+        enteredLineTotal: 11.0,
+      });
+      assert.equal(varMode.totalUnits, 30);
+      assert.equal(varMode.lineTotalCents, 1100);
+      assert.equal(varMode.costPerUnit, 0.3667);
+    },
+  },
+  {
+    name: 'Inventory Phase 1/2 — stockValueCents zero-penny GL reconciliation across receipts, sales, returns, and negative stock',
+    run: () => {
+      // Receive 3 cases x 24 = 72 units for $10.00 + $1.00 allocated landed cost = 1100 cents exact
+      const receipt = applyReceiptToValuePool({
+        prevTotalUnits: 0,
+        prevStockValueCents: 0,
+        prevAvgUnitCost: 0,
+        unitsPerCase: 24,
+        receivedUnits: 72,
+        receivedTotalCents: 1100,
+      });
+      assert.equal(receipt.newTotalUnits, 72);
+      assert.equal(receipt.stockValueCents, 1100);
+      assert.equal(receipt.averageCostPerUnit, 0.1528);
+
+      // Sell in arbitrary uneven chunks (7, 13, 19, 11, 22) summing to 72 units -> COGS must sum to EXACTLY 1100 cents and pool -> 0
+      let units = receipt.newTotalUnits;
+      let poolCents = receipt.stockValueCents;
+      let totalCogsCents = 0;
+      for (const sold of [7, 13, 19, 11, 22]) {
+        const out = applyOutflowToValuePool({
+          prevTotalUnits: units,
+          prevStockValueCents: poolCents,
+          prevAvgUnitCost: receipt.averageCostPerUnit,
+          deductedUnits: sold,
+        });
+        totalCogsCents += out.cogsCents;
+        units = out.newTotalUnits;
+        poolCents = out.stockValueCents;
+      }
+      assert.equal(units, 0);
+      assert.equal(poolCents, 0);
+      assert.equal(totalCogsCents, 1100, 'Sum of COGS cents across full depletion must match received GL cents to the exact penny');
+
+      // Return 5 units at MWAC, then sell them back -> pool returns cleanly to 0
+      const ret = applyReturnToValuePool({
+        prevTotalUnits: units,
+        prevStockValueCents: poolCents,
+        prevAvgUnitCost: receipt.averageCostPerUnit,
+        returnedUnits: 5,
+      });
+      assert.equal(ret.newTotalUnits, 5);
+      assert.equal(ret.stockValueCents, Math.round(5 * receipt.averageCostPerUnit * 100));
+      const outAfterReturn = applyOutflowToValuePool({
+        prevTotalUnits: ret.newTotalUnits,
+        prevStockValueCents: ret.stockValueCents,
+        prevAvgUnitCost: receipt.averageCostPerUnit,
+        deductedUnits: 5,
+      });
+      assert.equal(outAfterReturn.newTotalUnits, 0);
+      assert.equal(outAfterReturn.stockValueCents, 0);
+      assert.equal(outAfterReturn.cogsCents, ret.stockValueCents);
+
+      // Negative stock clearance: -10 units on hand, receive 24 units for $10.00 (1000 cents)
+      // 14 positive units remain with proportional pool value = round(1000 * 14 / 24) = 583 cents, MWAC = $0.4164
+      const negRec = applyReceiptToValuePool({
+        prevTotalUnits: -10,
+        prevStockValueCents: 0,
+        prevAvgUnitCost: 0,
+        unitsPerCase: 24,
+        receivedUnits: 24,
+        receivedTotalCents: 1000,
+      });
+      assert.equal(negRec.newTotalUnits, 14);
+      assert.equal(negRec.stockValueCents, 583);
+      assert.equal(negRec.latestCostPerUnit, 0.4167);
+      assert.equal(negRec.averageCostPerUnit, 0.4164);
+
+      // Canonical decomposition invariant: negative stock always keeps stockCases === 0
+      const negDecomp = decomposeStockUnits(-10, 24);
+      assert.equal(negDecomp.stockCases, 0);
+      assert.equal(negDecomp.stockSingles, -10);
+      assert.equal(negDecomp.totalUnits, -10);
+
+      // Portfolio valuation honors exact stockValueCents and isolates negative SKUs
+      const portfolio = computePortfolioValuation([
+        {
+          itemId: 'SKU-A',
+          unitsPerCase: 24,
+          totalUnits: 72,
+          stockCases: 3,
+          stockSingles: 0,
+          averageCostPerUnit: 0.1389,
+          stockValueCents: 1000, // exact $10.00 (whereas 72 * 0.1389 = $10.0008)
+          sellPriceUnit: 0.25,
+        },
+        {
+          itemId: 'SKU-NEG',
+          unitsPerCase: 12,
+          totalUnits: -5,
+          stockCases: 0,
+          stockSingles: -5,
+          averageCostPerUnit: 1.0,
+          stockValueCents: 0,
+          sellPriceUnit: 1.5,
+        },
+      ]);
+      assert.equal(computeItemValuationCents({ totalUnits: 72, unitsPerCase: 24, stockValueCents: 1000, averageCostPerUnit: 0.1389 }), 1000);
+      assert.equal(portfolio.totalValuationCents, 1000);
+      assert.equal(portfolio.totalValuationDollars, 10);
+      assert.equal(portfolio.negativeSkuCount, 1);
+      assert.equal(portfolio.negativeTotalUnits, -5);
+      assert.equal(normalizeStockFields({ stockCases: 2, stockSingles: 5, unitsPerCase: 12 }).totalUnits, 29);
+    },
+  },
+  {
+    name: 'Inventory Phase 3–6 — Unified reorder-point parity, POS Product normalization, costResolver negative safety & multi-receipt MWAC',
+    run: () => {
+      // 1. Bulk case item: 5 cases x 24 = 120 units (0 loose singles), reorderLevelCases=2 (48u), reorderLevelUnits=10
+      const bulkHealthy = {
+        unitsPerCase: 24,
+        stockCases: 5,
+        stockSingles: 0,
+        totalUnits: 120,
+        reorderLevelCases: 2,
+        reorderLevelUnits: 10,
+      };
+      assert.equal(computeReorderPointTotalUnits(bulkHealthy), 48);
+      assert.equal(isItemBelowReorderPoint(bulkHealthy), false, '5 full cases (0 singles) must NOT be flagged low stock');
+
+      // Boundary checks: <= 48 is low, 49 is optimal
+      assert.equal(isItemBelowReorderPoint({ ...bulkHealthy, stockCases: 2, stockSingles: 0, totalUnits: 48 }), true);
+      assert.equal(isItemBelowReorderPoint({ ...bulkHealthy, stockCases: 2, stockSingles: 1, totalUnits: 49 }), false);
+
+      // Single-unit item: unitsPerCase=1, reorderLevelUnits=10
+      const singleItem = { unitsPerCase: 1, stockCases: 0, stockSingles: 10, totalUnits: 10, reorderLevelCases: 2, reorderLevelUnits: 10 };
+      assert.equal(computeReorderPointTotalUnits(singleItem), 10);
+      assert.equal(isItemBelowReorderPoint(singleItem), true);
+      assert.equal(isItemBelowReorderPoint({ ...singleItem, stockSingles: 11, totalUnits: 11 }), false);
+
+      // Negative stock is ALWAYS below reorder point even if reorder thresholds are 0
+      assert.equal(
+        isItemBelowReorderPoint({ unitsPerCase: 24, stockCases: 0, stockSingles: -3, totalUnits: -3, reorderLevelCases: 0, reorderLevelUnits: 0 }),
+        true
+      );
+
+      // POS Product case-variant shape (stockQuantity === stockCases) must NOT double-count via normalizeStockFields
+      const posCaseProduct = {
+        id: 'SKU-CASE-CASE',
+        unitsPerCase: 24,
+        stockQuantity: 2, // cases
+        stockCases: 2,
+        stockSingles: 0,
+        totalUnits: 48,
+        reorderLevelCases: 2,
+        reorderLevelUnits: 10,
+      };
+      assert.equal(normalizeStockFields(posCaseProduct).totalUnits, 48);
+      assert.equal(isItemBelowReorderPoint(posCaseProduct), true);
+
+      // 2. costResolver negative stock safety & 4-decimal MWAC preservation
+      const invItem: any = {
+        itemId: 'ITM-NEG-1',
+        itemName: 'Sugar 2kg',
+        sku: 'SUG-2KG',
+        category: 'Groceries',
+        unitsPerCase: 24,
+        stockCases: 0,
+        stockSingles: -5,
+        totalUnits: -5,
+        costPerUnit: 0.1389,
+        averageCostPerUnit: 0.1389,
+        latestCostPerUnit: 0.1458,
+        costPerCase: 3.3336,
+        averageCostPerCase: 3.3336,
+        latestCostPerCase: 3.4992,
+        sellPriceUnit: 0.25,
+        sellPriceCase: 6.0,
+        reorderLevelCases: 2,
+        reorderLevelUnits: 10,
+      };
+
+      const resolvedUnit = resolveItemCost({ id: 'ITM-NEG-1-UNIT', name: 'Sugar 2kg Each', quantity: 1, unitPrice: 0.25 }, [invItem], []);
+      assert.equal(resolvedUnit.currentStock, -5);
+      assert.equal(resolvedUnit.stockStatus, 'Out of Stock');
+      assert.equal(resolvedUnit.avgCost, 0.1389, 'costResolver must preserve 4-decimal MWAC without 2-decimal truncation');
+
+      const resolvedCase = resolveItemCost({ id: 'ITM-NEG-1-CASE', name: 'Sugar 2kg Case', quantity: 1, unitPrice: 6.0 }, [invItem], []);
+      assert.equal(resolvedCase.itemType, 'case');
+      assert.equal(resolvedCase.currentStock, 0, 'Negative totalUnits must yield 0 full cases, never -1');
+      assert.equal(resolvedCase.stockStatus, 'Out of Stock');
+      assert.equal(resolvedCase.avgCost, 3.3336);
+
+      // 3. Multi-receipt MWAC + partial sale + second receipt + stocktake GL reconciliation
+      // Receipt 1: 36 units for $10.00 (1000 cents)
+      const r1 = applyReceiptToValuePool({
+        prevTotalUnits: 0,
+        prevStockValueCents: 0,
+        prevAvgUnitCost: 0,
+        unitsPerCase: 12,
+        receivedUnits: 36,
+        receivedTotalCents: 1000,
+      });
+      // Sell 10 units -> COGS = round(1000 * 10 / 36) = 278 cents, remaining pool = 722 cents for 26 units
+      const s1 = applyOutflowToValuePool({
+        prevTotalUnits: r1.newTotalUnits,
+        prevStockValueCents: r1.stockValueCents,
+        prevAvgUnitCost: r1.averageCostPerUnit,
+        deductedUnits: 10,
+      });
+      assert.equal(s1.cogsCents, 278);
+      assert.equal(s1.stockValueCents, 722);
+
+      // Receipt 2: 24 units for $9.00 (900 cents) -> 50 units, pool = 1622 cents exact, MWAC = $0.3244
+      const r2 = applyReceiptToValuePool({
+        prevTotalUnits: s1.newTotalUnits,
+        prevStockValueCents: s1.stockValueCents,
+        prevAvgUnitCost: r1.averageCostPerUnit,
+        unitsPerCase: 12,
+        receivedUnits: 24,
+        receivedTotalCents: 900,
+      });
+      assert.equal(r2.newTotalUnits, 50);
+      assert.equal(r2.stockValueCents, 1622);
+      assert.equal(r2.averageCostPerUnit, 0.3244);
+
+      // Stocktake system cost matches exact pool cents ($16.22), and full depletion reconciles total GL (1000 + 900 = 1900 cents)
+      const systemValCents = computeItemValuationCents({
+        totalUnits: r2.newTotalUnits,
+        unitsPerCase: 12,
+        stockValueCents: r2.stockValueCents,
+        averageCostPerUnit: r2.averageCostPerUnit,
+      });
+      assert.equal(systemValCents, 1622);
+      const s2 = applyOutflowToValuePool({
+        prevTotalUnits: r2.newTotalUnits,
+        prevStockValueCents: r2.stockValueCents,
+        prevAvgUnitCost: r2.averageCostPerUnit,
+        deductedUnits: 50,
+      });
+      assert.equal(s1.cogsCents + s2.cogsCents, 1900, 'Multi-receipt cumulative COGS must equal cumulative GRV GL cents to the exact penny');
+    },
+  },
+  {
+    name: 'Blind Till Security — Cashiers only see their last 5 invoices and targeted older-invoice lookups return only referenced receipts',
+    run: () => {
+      const cashier: any = { id: 'CASH-1', name: 'Tendai Moyo', role: 'Cashier' };
+      const baseTime = new Date('2026-11-27T08:00:00Z').getTime();
+      const sales: any[] = [];
+      // 12 invoices by Tendai Moyo (oldest #1 .. newest #12)
+      for (let i = 1; i <= 12; i++) {
+        sales.push({
+          id: `INV-HQ-00${String(i).padStart(2, '0')}`,
+          date: '2026-11-27',
+          timestamp: new Date(baseTime + i * 60_000).toISOString(),
+          staffId: 'CASH-1',
+          staffName: 'Tendai Moyo',
+          customerName: i === 2 ? 'Grace Chikwanda' : 'Walk-in Customer',
+          customerPhone: i === 2 ? '0772998877' : '',
+          paymentMethod: 'Cash',
+          paymentReference: i === 3 ? 'ECOCASH-REF-7788' : undefined,
+          total: 10 + i,
+          status: 'Paid',
+        });
+      }
+      // 3 invoices by another cashier (should never appear in Tendai's default last 5)
+      for (let j = 13; j <= 15; j++) {
+        sales.push({
+          id: `INV-HQ-00${j}`,
+          date: '2026-11-27',
+          timestamp: new Date(baseTime + j * 60_000).toISOString(),
+          staffId: 'CASH-2',
+          staffName: 'Nyasha Dube',
+          customerName: 'Walk-in Customer',
+          paymentMethod: 'Cash',
+          total: 25,
+          status: 'Paid',
+        });
+      }
+
+      // 1. Default view (empty query) -> ONLY Tendai's 5 newest invoices (#12..#8)
+      const recent = filterCashierVisibleInvoices(sales, cashier, '');
+      assert.equal(recent.mode, 'recent_5');
+      assert.deepEqual(
+        recent.invoices.map((s) => s.id),
+        ['INV-HQ-0012', 'INV-HQ-0011', 'INV-HQ-0010', 'INV-HQ-0009', 'INV-HQ-0008']
+      );
+
+      // 2. Exact older invoice number lookup -> ONLY that single referenced invoice (#0004)
+      const byExactId = filterCashierVisibleInvoices(sales, cashier, 'INV-HQ-0004');
+      assert.equal(byExactId.mode, 'exact_match');
+      assert.deepEqual(byExactId.invoices.map((s) => s.id), ['INV-HQ-0004']);
+
+      // 3. Suffix lookup (#0004) -> ONLY that single referenced invoice
+      const bySuffix = filterCashierVisibleInvoices(sales, cashier, '#0004');
+      assert.equal(bySuffix.mode, 'exact_match');
+      assert.deepEqual(bySuffix.invoices.map((s) => s.id), ['INV-HQ-0004']);
+
+      // 4. Payment reference lookup -> ONLY that referenced invoice (#0003)
+      const byRef = filterCashierVisibleInvoices(sales, cashier, 'ECOCASH-REF-7788');
+      assert.equal(byRef.mode, 'exact_match');
+      assert.deepEqual(byRef.invoices.map((s) => s.id), ['INV-HQ-0003']);
+
+      // 5. Named customer & phone lookup -> ONLY Grace Chikwanda's older invoice (#0002)
+      const byCustomer = filterCashierVisibleInvoices(sales, cashier, 'Grace Chikwanda');
+      assert.equal(byCustomer.mode, 'exact_match');
+      assert.deepEqual(byCustomer.invoices.map((s) => s.id), ['INV-HQ-0002']);
+
+      const byPhone = filterCashierVisibleInvoices(sales, cashier, '0772998877');
+      assert.equal(byPhone.mode, 'exact_match');
+      assert.deepEqual(byPhone.invoices.map((s) => s.id), ['INV-HQ-0002']);
+
+      // 6. Anti-loophole guards: short queries, generic Walk-in/Cash/year queries, or cashier's own name must NOT dump shift invoices
+      assert.equal(filterCashierVisibleInvoices(sales, cashier, '00').mode, 'query_too_short');
+      assert.equal(filterCashierVisibleInvoices(sales, cashier, '00').invoices.length, 0);
+      assert.equal(filterCashierVisibleInvoices(sales, cashier, 'Walk-in').mode, 'query_too_broad');
+      assert.equal(filterCashierVisibleInvoices(sales, cashier, 'Walk-in').invoices.length, 0);
+      assert.equal(filterCashierVisibleInvoices(sales, cashier, 'Cash').mode, 'query_too_broad');
+      assert.equal(filterCashierVisibleInvoices(sales, cashier, 'Tendai').mode, 'query_too_broad');
+      assert.equal(filterCashierVisibleInvoices(sales, cashier, 'Tendai Moyo').mode, 'query_too_broad');
+    },
+  },
+  {
+    name: 'Purchase Order Printing — 58mm thermal & A4 outputs render edited descriptions cleanly without Master Ref clutter',
+    run: () => {
+      const samplePo: any = {
+        id: 'PO-HQ-2026-0007',
+        poNumber: 'PO-HQ-2026-0007',
+        company_id: 'COMP-001',
+        branch_id: 'BR-MAIN',
+        branchName: 'Main Store',
+        supplierName: 'Delta Beverages',
+        orderDate: '2026-11-27',
+        expectedDeliveryDate: '2026-11-30',
+        paymentTerms: 'COD',
+        status: 'APPROVED',
+        subtotal: 120,
+        taxPercent: 0,
+        taxAmount: 0,
+        grandTotal: 120,
+        totalCases: 10,
+        totalUnits: 60,
+        createdByName: 'Procurement Clerk',
+        approvedByName: 'Store Manager',
+        createdAt: '2026-11-27T08:00:00Z',
+        lines: [
+          {
+            lineId: 'POL-1',
+            itemId: 'ITM-BH-2L',
+            code: 'BH-2L',
+            masterDescription: 'Bally House 2L Assorted Original Master Name',
+            poDescription: 'Bally House 2L Orange Flavour',
+            orderCases: 10,
+            orderSingles: 0,
+            unitsPerCase: 6,
+            totalUnits: 60,
+            unitCost: 2.0,
+            caseCost: 12.0,
+            lineTotal: 120.0,
+          },
+        ],
+      };
+
+      const a4Html = buildPurchaseOrderA4Html(samplePo);
+      assert.ok(a4Html.includes('Bally House 2L Orange Flavour'), 'A4 PO must include edited PO description');
+      assert.ok(!a4Html.includes('Master Ref'), 'A4 PO must not display Master Ref label');
+      assert.ok(
+        !a4Html.includes('Bally House 2L Assorted Original Master Name'),
+        'A4 PO must not display original masterDescription when edited'
+      );
+
+      const thermalHtml = buildPurchaseOrderThermal58mmHtml(samplePo, '58mm');
+      assert.ok(thermalHtml.includes('58mm'), '58mm thermal PO must configure 58mm page width');
+      assert.ok(thermalHtml.includes('PO-HQ-2026-0007'), '58mm thermal PO must include PO number');
+      assert.ok(thermalHtml.includes('Bally House 2L Orange Flavour'), '58mm thermal PO must include edited description');
+      assert.ok(thermalHtml.includes('$120.00'), '58mm thermal PO must include grand total');
+      assert.ok(!thermalHtml.includes('Master Ref'), '58mm thermal PO must not display Master Ref');
+      assert.ok(
+        !thermalHtml.includes('Bally House 2L Assorted Original Master Name'),
+        '58mm thermal PO must not display original masterDescription when edited'
+      );
     },
   },
 ];

@@ -12,6 +12,7 @@ import {
   HelpCircle,
 } from 'lucide-react';
 import { InventoryItem } from '../../types';
+import { decomposeStockUnits, normalizeStockFields } from '../../utils/inventoryMath';
 
 interface PackagingRatioModalProps {
   isOpen: boolean;
@@ -38,14 +39,15 @@ export const PackagingRatioModal: React.FC<PackagingRatioModalProps> = ({
 
   if (!isOpen || !item) return null;
 
-  const totalUnitsInStock =
-    item.totalUnits !== undefined
-      ? item.totalUnits
-      : item.stockCases * currentUnitsPerCase + item.stockSingles;
+  const totalUnitsInStock = normalizeStockFields({
+    ...item,
+    unitsPerCase: currentUnitsPerCase,
+  }).totalUnits;
 
-  // Calculation for Option B: Recalculate
-  const simulatedNewCases = Math.floor(totalUnitsInStock / newUnitsPerCase);
-  const simulatedNewSingles = totalUnitsInStock % newUnitsPerCase;
+  // Calculation for Option B: Recalculate (respects negative-stock invariant)
+  const simulatedDecomp = decomposeStockUnits(totalUnitsInStock, newUnitsPerCase);
+  const simulatedNewCases = simulatedDecomp.stockCases;
+  const simulatedNewSingles = simulatedDecomp.stockSingles;
 
   return (
     <div

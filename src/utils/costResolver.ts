@@ -1,5 +1,10 @@
 import { InventoryItem, Product, SaleItem } from '../types';
 import { getAllGoodsReceivedNotes } from '../db/goodsReceivedNotes';
+import {
+  computeReorderPointTotalUnits,
+  normalizeStockFields,
+  roundUnitCost,
+} from './inventoryMath';
 
 export interface ResolvedItemCost {
   avgCost: number; // AVCO cost basis (per sold item, whether unit, pack, or case)
@@ -194,7 +199,8 @@ export function resolveItemCost(
   let canonicalKey = cleanId || cleanName || 'UNKNOWN';
 
   if (matchedInv) {
-    const unitsPerCase = Math.max(1, toNum(matchedInv.unitsPerCase, 1));
+    const canonicalStock = normalizeStockFields(matchedInv);
+    const unitsPerCase = canonicalStock.unitsPerCase;
     const invCostPerUnit = toPosNum(matchedInv.costPerUnit);
     const invCostPerCase = toPosNum(matchedInv.costPerCase);
     const invAvgUnitCost = toPosNum(matchedInv.averageCostPerUnit);
@@ -245,10 +251,7 @@ export function resolveItemCost(
                   ? invCostPerCase
                   : latestUnitCost * unitsPerCase || caseCostFallback));
 
-      currentStock =
-        matchedInv.stockCases !== undefined
-          ? toNum(matchedInv.stockCases, 0)
-          : Math.floor(toNum(matchedInv.totalUnits, 0) / unitsPerCase);
+      currentStock = canonicalStock.stockCases;
       reorderLevel = toNum(matchedInv.reorderLevelCases, 2);
       canonicalKey = `${matchedInv.itemId}-CASE`;
       resolvedDisplayName = /\bcase\b/i.test(rawName)
@@ -297,8 +300,11 @@ export function resolveItemCost(
           ? variantCostPrice
           : (latestUnitCost * unitsInPack || vCostFallback);
 
-      currentStock = Math.floor(toNum(matchedInv.totalUnits, 0) / Math.max(1, unitsInPack));
-      reorderLevel = 5;
+      currentStock =
+        canonicalStock.totalUnits < 0
+          ? canonicalStock.totalUnits
+          : Math.floor(canonicalStock.totalUnits / Math.max(1, unitsInPack));
+      reorderLevel = Math.max(1, Math.ceil(computeReorderPointTotalUnits(matchedInv) / Math.max(1, unitsInPack)));
       canonicalKey = variant
         ? `${matchedInv.itemId}__${variant.id}`
         : `${matchedInv.itemId}__PACK_${unitsInPack}`;
@@ -309,8 +315,8 @@ export function resolveItemCost(
       itemType = 'unit';
       avgCost = avgUnitCost;
       latestCost = latestUnitCost;
-      currentStock = toNum(matchedInv.totalUnits ?? matchedInv.stockSingles, 0);
-      reorderLevel = toNum(matchedInv.reorderLevelUnits, 5);
+      currentStock = canonicalStock.totalUnits;
+      reorderLevel = computeReorderPointTotalUnits(matchedInv);
       canonicalKey =
         matchedInv.canSellAsCase || (matchedInv.packagingVariants && matchedInv.packagingVariants.length > 0)
           ? `${matchedInv.itemId}-UNIT`
@@ -366,8 +372,8 @@ export function resolveItemCost(
     latestCost = avgCost;
   }
 
-  avgCost = toNum(avgCost, 0);
-  latestCost = toNum(latestCost, avgCost);
+  avgCost = roundUnitCost(toNum(avgCost, 0));
+  latestCost = roundUnitCost(toNum(latestCost, avgCost));
   currentStock = toNum(currentStock, 0);
 
   let stockStatus: 'Out of Stock' | 'Low Stock' | 'In Stock' = 'In Stock';

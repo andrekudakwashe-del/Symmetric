@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Product } from '../../types';
 import { getCurrentUser, isSupervisorOrAbove } from '../../db/roomDatabase';
+import { isItemBelowReorderPoint, normalizeStockFields } from '../../utils/inventoryMath';
 import { Scale, Trash2, Plus, Minus, Check } from 'lucide-react';
 
 interface ProductGestureCardProps {
@@ -225,10 +226,9 @@ const ProductGestureCardComponent: React.FC<ProductGestureCardProps> = ({
       {(() => {
         const user = getCurrentUser();
         const canSeeRawStock = isSupervisorOrAbove(user?.role) || Boolean(user?.permissions?.canManageInventory);
-        const isOOS = product.stockQuantity === 0 && (!product.stockCases || product.stockCases === 0);
-        const totalStockUnits = (Number(product.stockCases) || 0) * (product.unitsPerCase || 1) + (Number(product.stockQuantity) || 0);
-        const reorderLimit = product.reorderLevelUnits || 5;
-        const isLowStock = !isOOS && totalStockUnits <= reorderLimit;
+        const totalStockUnits = normalizeStockFields(product).totalUnits;
+        const isOOS = totalStockUnits <= 0;
+        const isLowStock = !isOOS && isItemBelowReorderPoint(product);
         const badgeSize = isDense ? 'top-0.5 right-0.5 text-[7px] px-1 py-0.2' : isCompact ? 'top-1 right-1 text-[7.5px] px-1 py-0.2' : 'top-2 right-2 text-[9px] px-1.5 py-0.5';
 
         if (product.sellByFraction) {

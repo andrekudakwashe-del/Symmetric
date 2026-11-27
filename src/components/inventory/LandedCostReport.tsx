@@ -19,6 +19,7 @@ import { GoodsReceivedNote, Branch, LandedCostItem } from '../../types';
 import { getAllGoodsReceivedNotes } from '../../db/goodsReceivedNotes';
 import { getBranches } from '../../db/roomDatabase';
 import { toDateStringSafe } from '../../utils/dateUtils';
+import { formatUnitCost } from '../../utils/inventoryMath';
 
 interface LandedCostReportProps {
   onViewVoucher?: (voucherIdOrInvoiceNo: string) => void;
@@ -169,7 +170,7 @@ export const LandedCostReport: React.FC<LandedCostReportProps> = ({
             `"${li.itemId}"`,
             `"${li.itemName}"`,
             li.quantity,
-            li.unitCost.toFixed(2),
+            formatUnitCost(li.unitCost),
             (li.sellingPrice || 0).toFixed(2),
             std.toFixed(2),
             act.toFixed(2),
@@ -528,7 +529,7 @@ export const LandedCostReport: React.FC<LandedCostReportProps> = ({
                                                 ({li.itemId})
                                               </span>
                                             </td>
-                                            <td className="py-1 px-2 text-right">${li.unitCost.toFixed(2)}</td>
+                                            <td className="py-1 px-2 text-right">${formatUnitCost(li.unitCost)}</td>
                                             <td className="py-1 px-2 text-right">
                                               {li.sellingPrice ? `$${li.sellingPrice.toFixed(2)}` : '-'}
                                             </td>

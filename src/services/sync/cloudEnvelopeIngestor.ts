@@ -2,6 +2,11 @@ import { SyncEnvelope } from './SyncEnvelope';
 import { ENTITY_REGISTRY } from './EntityRegistry';
 import { normalizeTombstoneEntityType } from './syncCore';
 import {
+  normalizeStockFields,
+  resolveItemValuationUnitCost,
+  roundUnitCost,
+} from '../../utils/inventoryMath';
+import {
   getAllSales,
   getRawStoredInventoryItems,
   getRawStoredSalespeople,
@@ -652,26 +657,48 @@ export function applyCloudEnvelopeToRoomDb(
       const sellPriceCase = Number(
         d.sellPriceCase ?? d.SellPriceCase ?? sellPriceUnit * unitsPerCase
       );
-      const costPerUnit = Number(
+      const costPerUnit = roundUnitCost(Number(
         d.costPerUnit ?? d.CostPerUnit ?? d.costPriceUnit ?? d.CostPriceUnit ?? d.costPrice ?? d.CostPrice ?? 0
-      );
+      ));
       const costPerCase = Number(
         d.costPerCase ?? d.CostPerCase ?? d.costPriceCase ?? d.CostPriceCase ?? costPerUnit * unitsPerCase
+      );
+      const avgUnitCost = roundUnitCost(resolveItemValuationUnitCost({
+        averageCostPerUnit: d.averageCostPerUnit ?? d.AverageCostPerUnit ?? (protectBalances ? existingInv?.averageCostPerUnit : undefined),
+        costPerUnit,
+        costPerCase,
+        unitsPerCase,
+      }));
+      const avgCaseCost = Number(
+        d.averageCostPerCase ?? d.AverageCostPerCase ?? Number((avgUnitCost * unitsPerCase).toFixed(2))
       );
 
       // GOLDEN RULE OF BALANCES:
       // If inventory item ALREADY EXISTS locally during file import, IGNORE incoming stock snapshot & update metadata only!
-      let stockCases = Number(d.stockCases ?? d.StockCases ?? 0);
-      let stockSingles = Number(d.stockSingles ?? d.StockSingles ?? 0);
-      let totalUnits = Number(
-        d.totalUnits ?? d.TotalUnits ?? d.stockQuantity ?? d.StockQuantity ?? stockCases * unitsPerCase + stockSingles
-      );
+      const incomingStock = normalizeStockFields({
+        stockCases: d.stockCases ?? d.StockCases,
+        stockSingles: d.stockSingles ?? d.StockSingles,
+        totalUnits: d.totalUnits ?? d.TotalUnits ?? d.stockQuantity ?? d.StockQuantity,
+        unitsPerCase,
+        canSellAsCase: d.canSellAsCase ?? existingInv?.canSellAsCase,
+      });
+      let stockCases = incomingStock.stockCases;
+      let stockSingles = incomingStock.stockSingles;
+      let totalUnits = incomingStock.totalUnits;
+      let stockValueCents: number | undefined =
+        d.stockValueCents !== undefined && Number.isFinite(Number(d.stockValueCents))
+          ? Math.max(0, Math.round(Number(d.stockValueCents)))
+          : undefined;
       let safeBranchOverrides = d.branchOverrides;
 
       if (protectBalances && existingInv) {
-        stockCases = Number(existingInv.stockCases ?? 0);
-        stockSingles = Number(existingInv.stockSingles ?? 0);
-        totalUnits = Number(existingInv.totalUnits ?? stockCases * unitsPerCase + stockSingles);
+        const existingStock = normalizeStockFields({ ...existingInv, unitsPerCase });
+        stockCases = existingStock.stockCases;
+        stockSingles = existingStock.stockSingles;
+        totalUnits = existingStock.totalUnits;
+        if (existingInv.stockValueCents !== undefined && Number.isFinite(Number(existingInv.stockValueCents))) {
+          stockValueCents = Math.max(0, Math.round(Number(existingInv.stockValueCents)));
+        }
         if (existingInv.branchOverrides || d.branchOverrides) {
           const mergedOverrides: Record<string, any> = { ...(existingInv.branchOverrides || {}) };
           if (d.branchOverrides && typeof d.branchOverrides === 'object') {
@@ -706,13 +733,13 @@ export function applyCloudEnvelopeToRoomDb(
         sellPriceCase,
         costPerUnit,
         costPerCase,
+        averageCostPerUnit: avgUnitCost,
+        averageCostPerCase: avgCaseCost,
+        latestCostPerUnit: roundUnitCost(Number(d.latestCostPerUnit ?? costPerUnit)),
+        latestCostPerCase: Number(d.latestCostPerCase ?? costPerCase),
+        ...(stockValueCents !== undefined ? { stockValueCents } : {}),
         stockCases,
-        stockSingles:
-          protectBalances && existingInv
-            ? stockSingles
-            : d.stockSingles !== undefined || d.StockSingles !== undefined
-            ? stockSingles
-            : totalUnits - stockCases * unitsPerCase,
+        stockSingles,
         totalUnits,
         ...(safeBranchOverrides !== undefined ? { branchOverrides: safeBranchOverrides } : {}),
         reorderLevelUnits: Number(d.reorderLevelUnits ?? d.reorderLevel ?? d.ReorderLevel ?? 5),

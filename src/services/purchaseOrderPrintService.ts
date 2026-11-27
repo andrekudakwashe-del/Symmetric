@@ -29,11 +29,6 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
 
   const rowsHtml = (po.lines || [])
     .map((line, idx) => {
-      const hasCustomDesc =
-        Boolean(line?.poDescription) &&
-        Boolean(line?.masterDescription) &&
-        String(line.poDescription || '').trim().toLowerCase() !==
-          String(line.masterDescription || '').trim().toLowerCase();
       const qtyParts: string[] = [];
       if (Number(line.orderCases || 0) > 0) {
         qtyParts.push(`${line.orderCases} cs (${line.unitsPerCase}/cs)`);
@@ -52,7 +47,6 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
           <td class="mono">${escapeHtml(line.code || line.itemId)}</td>
           <td>
             <div class="item-title">${escapeHtml(line.poDescription || line.masterDescription)}</div>
-            ${hasCustomDesc ? `<div class="sub-note">Master Ref: ${escapeHtml(line.masterDescription)}</div>` : ''}
             ${line.notes ? `<div class="sub-note">Note: ${escapeHtml(line.notes)}</div>` : ''}
             ${receivedInfo}
           </td>
@@ -270,7 +264,7 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
           <tr>
             <th class="num" style="width:32px">#</th>
             <th style="width:92px">SKU / Code</th>
-            <th>Description / Flavour Specification</th>
+            <th>Description</th>
             <th class="num" style="width:110px">Order Qty</th>
             <th class="num" style="width:62px">Units</th>
             <th class="num" style="width:82px">Case Cost</th>
@@ -319,44 +313,176 @@ export function buildPurchaseOrderA4Html(po: PurchaseOrder): string {
 </html>`;
 }
 
-/**
- * Prints an A4 commercial Purchase Order using a hidden iframe (iframe-safe, zero window.open).
- */
-export function printPurchaseOrderA4(po: PurchaseOrder): { success: boolean; message: string } {
+export function buildPurchaseOrderThermal58mmHtml(
+  po: PurchaseOrder,
+  paperWidth: PaperWidth = '58mm'
+): string {
+  const company = getCurrentCompany();
+  const branch = getCurrentBranch();
+  const companyName = company?.company_name || 'Saimetric Retail Enterprise';
+  const branchName = po.branchName || branch?.name || 'Main Store';
+  const statusLabel = String(po.status || 'DRAFT').replace(/_/g, ' ');
+  const is80 = paperWidth === '80mm';
+  const pageWidthMm = is80 ? '80mm' : '58mm';
+  const contentWidthMm = is80 ? '74mm' : '54mm';
+
+  const linesHtml = (po.lines || [])
+    .map((line, idx) => {
+      const desc = line.poDescription || line.masterDescription || 'Item';
+      const qtyParts: string[] = [];
+      if (Number(line.orderCases || 0) > 0) {
+        qtyParts.push(`${line.orderCases}cs`);
+      }
+      if (Number(line.orderSingles || 0) > 0) {
+        qtyParts.push(`${line.orderSingles}u`);
+      }
+      const qtyText = qtyParts.length > 0 ? qtyParts.join('+') : `${line.totalUnits || 0}u`;
+      const unitRate =
+        Number(line.orderCases || 0) > 0
+          ? `${fmtMoney(line.caseCost)}/cs`
+          : `${fmtMoney(line.unitCost)}/u`;
+
+      return `
+        <div class="line-item">
+          <div class="line-desc">${idx + 1}. ${escapeHtml(desc)}</div>
+          <div class="line-meta">
+            <span>${escapeHtml(qtyText)} (${Number(line.totalUnits || 0)}u) @ ${escapeHtml(unitRate)}</span>
+            <span class="bold">${fmtMoney(line.lineTotal)}</span>
+          </div>
+          ${line.notes ? `<div class="line-note">Note: ${escapeHtml(line.notes)}</div>` : ''}
+        </div>
+      `;
+    })
+    .join('');
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>PO ${escapeHtml(po.poNumber)} (${escapeHtml(paperWidth)})</title>
+  <style>
+    @page { size: ${pageWidthMm} auto; margin: 1.5mm; }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #ffffff;
+      color: #000000;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Courier New", monospace;
+      font-size: ${is80 ? '11px' : '10px'};
+      line-height: 1.32;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+    .ticket {
+      width: ${contentWidthMm};
+      max-width: 100%;
+      margin: 0 auto;
+      padding: 2mm 1mm 6mm 1mm;
+    }
+    .center { text-align: center; }
+    .bold { font-weight: 700; }
+    .company { font-size: ${is80 ? '13px' : '12px'}; font-weight: 800; text-transform: uppercase; }
+    .doc-title { font-size: ${is80 ? '13px' : '12px'}; font-weight: 800; letter-spacing: 0.04em; margin-top: 2px; }
+    .sub { font-size: ${is80 ? '10px' : '9px'}; }
+    .divider { border-top: 1px dashed #000000; margin: 5px 0; }
+    .divider-solid { border-top: 1.5px solid #000000; margin: 5px 0; }
+    .kv { display: flex; justify-content: space-between; gap: 6px; margin: 1.5px 0; }
+    .kv-label { flex-shrink: 0; }
+    .kv-val { text-align: right; word-break: break-word; }
+    .line-item { padding: 3px 0; border-bottom: 1px dotted #666666; }
+    .line-item:last-child { border-bottom: none; }
+    .line-desc { font-weight: 700; word-break: break-word; }
+    .line-meta { display: flex; justify-content: space-between; gap: 4px; font-size: ${is80 ? '10px' : '9px'}; margin-top: 1px; }
+    .line-note { font-size: 9px; margin-top: 1px; }
+    .grand { font-size: ${is80 ? '13px' : '12px'}; font-weight: 800; }
+    .notes-block { font-size: 9px; margin-top: 4px; word-break: break-word; }
+    .sig-line { margin-top: 14px; border-top: 1px dashed #000000; padding-top: 2px; font-size: 9px; }
+  </style>
+</head>
+<body>
+  <div class="ticket">
+    <div class="center">
+      <div class="company">${escapeHtml(companyName)}</div>
+      <div class="sub">${escapeHtml(branchName)}</div>
+      <div class="divider-solid"></div>
+      <div class="doc-title">PURCHASE ORDER</div>
+      <div class="bold">${escapeHtml(po.poNumber)}</div>
+      <div class="sub">[${escapeHtml(statusLabel)}]</div>
+    </div>
+
+    <div class="divider"></div>
+    <div class="kv"><span class="kv-label">Supplier:</span><span class="kv-val bold">${escapeHtml(po.supplierName || 'Unspecified')}</span></div>
+    ${po.supplierPhone ? `<div class="kv"><span class="kv-label">Phone:</span><span class="kv-val">${escapeHtml(po.supplierPhone)}</span></div>` : ''}
+    <div class="kv"><span class="kv-label">Date:</span><span class="kv-val">${escapeHtml(po.orderDate)}</span></div>
+    ${po.expectedDeliveryDate ? `<div class="kv"><span class="kv-label">Due:</span><span class="kv-val">${escapeHtml(po.expectedDeliveryDate)}</span></div>` : ''}
+    ${po.paymentTerms ? `<div class="kv"><span class="kv-label">Terms:</span><span class="kv-val">${escapeHtml(po.paymentTerms)}</span></div>` : ''}
+
+    <div class="divider-solid"></div>
+    <div class="lines">
+      ${linesHtml}
+    </div>
+    <div class="divider-solid"></div>
+
+    <div class="kv"><span>Items / Qty:</span><span>${(po.lines || []).length} lines (${po.totalCases || 0}cs / ${Number(po.totalUnits || 0)}u)</span></div>
+    <div class="kv"><span>Subtotal:</span><span>${fmtMoney(po.subtotal)}</span></div>
+    ${Number(po.taxAmount || 0) > 0 ? `<div class="kv"><span>Tax (${po.taxPercent || 0}%):</span><span>${fmtMoney(po.taxAmount)}</span></div>` : ''}
+    <div class="divider"></div>
+    <div class="kv grand"><span>GRAND TOTAL</span><span>${fmtMoney(po.grandTotal)}</span></div>
+
+    ${po.notes ? `<div class="divider"></div><div class="notes-block"><span class="bold">Notes:</span> ${escapeHtml(po.notes)}</div>` : ''}
+
+    <div class="divider"></div>
+    <div class="kv sub"><span>Prepared By:</span><span>${escapeHtml(po.createdByName || 'Staff')}</span></div>
+    <div class="kv sub"><span>Approval:</span><span>${po.approvedByName ? escapeHtml(po.approvedByName) : 'Pending Approval'}</span></div>
+    ${!po.approvedByName ? `<div class="sig-line">Manager Signature</div>` : ''}
+    <div class="divider"></div>
+    <div class="center sub">Printed ${escapeHtml(new Date().toLocaleString())}</div>
+  </div>
+</body>
+</html>`;
+}
+
+function printHtmlInHiddenIframe(
+  frameId: string,
+  html: string
+): { success: boolean; error?: string } {
   if (typeof document === 'undefined') {
-    return { success: false, message: 'Printing is only available in a browser environment.' };
+    return { success: false, error: 'Printing is only available in a browser environment.' };
   }
-  const html = buildPurchaseOrderA4Html(po);
-  const existing = document.getElementById('saimetric-po-a4-print-frame');
+  const existing = document.getElementById(frameId);
   if (existing && existing.parentNode) {
     existing.parentNode.removeChild(existing);
   }
 
   const iframe = document.createElement('iframe');
-  iframe.id = 'saimetric-po-a4-print-frame';
+  iframe.id = frameId;
+  iframe.setAttribute('aria-hidden', 'true');
   iframe.style.position = 'fixed';
   iframe.style.right = '0';
   iframe.style.bottom = '0';
-  iframe.style.width = '0';
-  iframe.style.height = '0';
+  iframe.style.width = '1px';
+  iframe.style.height = '1px';
   iframe.style.border = '0';
-  iframe.style.visibility = 'hidden';
+  iframe.style.opacity = '0';
+  iframe.style.pointerEvents = 'none';
   document.body.appendChild(iframe);
 
   const doc = iframe.contentDocument || iframe.contentWindow?.document;
   if (!doc) {
-    return { success: false, message: 'Could not initialize A4 print frame.' };
+    if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+    return { success: false, error: 'Could not initialize print frame.' };
   }
-  doc.open();
-  doc.write(html);
-  doc.close();
 
+  let printed = false;
   const triggerPrint = () => {
+    if (printed) return;
+    printed = true;
     try {
       iframe.contentWindow?.focus();
       iframe.contentWindow?.print();
     } catch (err) {
-      console.error('[printPurchaseOrderA4] print error:', err);
+      console.error(`[${frameId}] print error:`, err);
     }
     setTimeout(() => {
       if (iframe.parentNode) {
@@ -365,18 +491,91 @@ export function printPurchaseOrderA4(po: PurchaseOrder): { success: boolean; mes
     }, 60_000);
   };
 
-  if (iframe.contentWindow) {
-    setTimeout(triggerPrint, 250);
+  iframe.onload = triggerPrint;
+  doc.open();
+  doc.write(html);
+  doc.close();
+
+  // Fallback trigger in case onload already fired synchronously on doc.close()
+  setTimeout(triggerPrint, 120);
+  return { success: true };
+}
+
+/**
+ * Prints an A4 commercial Purchase Order using a hidden iframe (iframe-safe, zero window.open).
+ */
+export function printPurchaseOrderA4(po: PurchaseOrder): { success: boolean; message: string } {
+  const html = buildPurchaseOrderA4Html(po);
+  const res = printHtmlInHiddenIframe('saimetric-po-a4-print-frame', html);
+  if (!res.success) {
+    return { success: false, message: res.error || 'Could not initialize A4 print frame.' };
   }
   return { success: true, message: `Opened A4 print dialog for ${po.poNumber}.` };
 }
 
 /**
- * Prints a Purchase Order to a 58mm (or 80mm) Bluetooth ESC/POS thermal printer.
+ * Opens a 58mm (or 80mm) thermal-formatted browser/system print dialog using a hidden iframe.
+ * Works with Android RawBT / Bluetooth Print Service / USB thermal / desktop system print dialogs.
+ */
+export function printPurchaseOrderThermalFallback(
+  po: PurchaseOrder,
+  paperWidth: PaperWidth = '58mm'
+): { success: boolean; message: string } {
+  const html = buildPurchaseOrderThermal58mmHtml(po, paperWidth);
+  const res = printHtmlInHiddenIframe('saimetric-po-thermal-print-frame', html);
+  if (!res.success) {
+    return { success: false, message: res.error || `Could not initialize ${paperWidth} print frame.` };
+  }
+  return {
+    success: true,
+    message: `Opened ${paperWidth} thermal print dialog for ${po.poNumber}.`,
+  };
+}
+
+export interface ThermalPrintResult {
+  success: boolean;
+  mode: 'bluetooth' | 'browser_fallback';
+  bluetoothAvailable: boolean;
+  message: string;
+}
+
+/**
+ * Prints a Purchase Order to a 58mm (or 80mm) thermal printer.
+ * - Uses direct Web Bluetooth ESC/POS when connected (or a saved printer silently reconnects).
+ * - Automatically falls back to the 58mm thermal system/browser print dialog when Bluetooth is
+ *   not paired/connected or unsupported (so pressing Print 58mm always produces immediate output).
  */
 export async function printPurchaseOrderThermal(
   po: PurchaseOrder,
   paperWidth: PaperWidth = '58mm'
-): Promise<{ success: boolean; message: string }> {
-  return bluetoothPrinter.printPurchaseOrder(po, paperWidth);
+): Promise<ThermalPrintResult> {
+  const bluetoothAvailable = !bluetoothPrinter.isInIframe() && bluetoothPrinter.isSupported();
+  const canTryDirectBluetooth =
+    bluetoothAvailable && (bluetoothPrinter.isConnected() || Boolean(bluetoothPrinter.getSavedPrinter()));
+
+  if (canTryDirectBluetooth) {
+    try {
+      const btRes = await bluetoothPrinter.printPurchaseOrder(po, paperWidth);
+      return {
+        success: btRes.success,
+        mode: 'bluetooth',
+        bluetoothAvailable,
+        message: btRes.message,
+      };
+    } catch (err) {
+      console.warn('[printPurchaseOrderThermal] Bluetooth print unavailable, falling back to 58mm browser print:', err);
+    }
+  }
+
+  const fallback = printPurchaseOrderThermalFallback(po, paperWidth);
+  return {
+    success: fallback.success,
+    mode: 'browser_fallback',
+    bluetoothAvailable,
+    message: fallback.success
+      ? bluetoothAvailable
+        ? `Opened ${paperWidth} print dialog for ${po.poNumber}. Pair Bluetooth printer below for 1-tap direct printing.`
+        : fallback.message
+      : fallback.message,
+  };
 }

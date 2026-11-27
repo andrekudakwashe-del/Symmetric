@@ -11,6 +11,7 @@ import {
   User,
 } from 'lucide-react';
 import { UnpaidGrvRecord } from '../../services/cashCustodyService';
+import { formatUnitCost } from '../../utils/inventoryMath';
 
 interface BranchGrvPickerProps {
   unpaidGrvs: UnpaidGrvRecord[];
@@ -230,7 +231,7 @@ export const BranchGrvPicker: React.FC<BranchGrvPickerProps> = ({
                     <span className="truncate">
                       {it.productName}{' '}
                       <span className="text-slate-400 font-mono">
-                        ({it.qty} {it.unit || 'u'} × ${it.unitCost.toFixed(2)})
+                        ({it.qty} {it.unit || 'u'} × ${formatUnitCost(it.unitCost)})
                       </span>
                     </span>
                     <span className="font-mono font-semibold text-emerald-300 shrink-0">
@@ -424,7 +425,7 @@ export const BranchGrvPicker: React.FC<BranchGrvPickerProps> = ({
                                         {item.qty}
                                       </span>
                                       <span className="col-span-2 text-right font-mono text-slate-400 text-[10px]">
-                                        ${item.unitCost.toFixed(2)}
+                                        ${formatUnitCost(item.unitCost)}
                                       </span>
                                       <span className="col-span-2 text-right font-mono font-bold text-emerald-400 text-[10px]">
                                         ${item.lineTotal.toFixed(2)}

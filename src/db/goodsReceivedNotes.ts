@@ -13,6 +13,7 @@ import {
 } from './indexedDBService';
 import { toDateStringSafe } from '../utils/dateUtils';
 import { getStored, setStored } from './roomStorageEngine';
+import { decomposeStockUnits, roundUnitCost } from '../utils/inventoryMath';
 
 export const GRN_STORAGE_KEY = 'saimetric_room_goods_received_notes';
 export const IDB_GRN_STORE = 'goodsReceivedNotes';
@@ -372,11 +373,12 @@ export const grnToSupplierInvoice = (grn: GoodsReceivedNote): SupplierInvoiceVou
     staffName: grn.receivedBy,
     notes: grn.notes,
     items: (grn.lineItems || []).map((li) => {
-      const unitsPerCase = li.unitsPerCase || 1;
-      const receivedCases = li.quantityCases !== undefined ? li.quantityCases : Math.floor(li.quantity / unitsPerCase);
-      const receivedSingles = li.quantitySingles !== undefined ? li.quantitySingles : (li.quantity % unitsPerCase);
-      const costPerUnit = li.unitCost;
-      const costPerCase = costPerUnit * unitsPerCase;
+      const unitsPerCase = Math.max(1, Number(li.unitsPerCase) || 1);
+      const decomp = decomposeStockUnits(Number(li.quantity) || 0, unitsPerCase);
+      const receivedCases = li.quantityCases !== undefined ? li.quantityCases : decomp.stockCases;
+      const receivedSingles = li.quantitySingles !== undefined ? li.quantitySingles : decomp.stockSingles;
+      const costPerUnit = roundUnitCost(Number(li.unitCost) || 0);
+      const costPerCase = roundUnitCost(costPerUnit * unitsPerCase);
       const lineTotal = li.subtotal;
       return {
         itemId: li.itemId,

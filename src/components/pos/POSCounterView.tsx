@@ -36,6 +36,7 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import { useClockSecurity, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
+import { isItemBelowReorderPoint, normalizeStockFields } from '../../utils/inventoryMath';
 
 interface POSCounterViewProps {
   cart: CartItem[];
@@ -550,9 +551,51 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
                           <span>•</span>
                           <span>{p.category}</span>
                           <span>•</span>
-                          <span className={(p.stockQuantity ?? 0) <= 5 ? 'text-amber-400 font-bold' : 'text-slate-400'}>
-                            Stock: {p.stockQuantity ?? 0} {p.unit || 'ea'}
-                          </span>
+                          {(() => {
+                            const canSeeRawStock =
+                              isSupervisorOrAbove(currentUser?.role) ||
+                              Boolean(currentUser?.permissions?.canManageInventory);
+                            if (p.sellByFraction) {
+                              return (
+                                <span className="text-emerald-400 font-bold">
+                                  By {p.fractionUnit || 'kg'}
+                                </span>
+                              );
+                            }
+                            const totalUnits = normalizeStockFields(p).totalUnits;
+                            const isOOS = totalUnits <= 0;
+                            const isLow = !isOOS && isItemBelowReorderPoint(p);
+
+                            if (!canSeeRawStock) {
+                              return (
+                                <span
+                                  className={
+                                    isOOS
+                                      ? 'text-rose-400 font-bold'
+                                      : isLow
+                                      ? 'text-amber-400 font-bold'
+                                      : 'text-emerald-400 font-semibold'
+                                  }
+                                >
+                                  {isOOS ? 'OOS' : isLow ? 'Low Stock' : 'In Stock'}
+                                </span>
+                              );
+                            }
+
+                            return (
+                              <span
+                                className={
+                                  isOOS
+                                    ? 'text-rose-400 font-bold'
+                                    : isLow
+                                    ? 'text-amber-400 font-bold'
+                                    : 'text-slate-400'
+                                }
+                              >
+                                Stock: {p.stockQuantity ?? 0} {p.unit || 'ea'}
+                              </span>
+                            );
+                          })()}
                         </div>
                       </div>
 
@@ -939,7 +982,7 @@ export const POSCounterView: React.FC<POSCounterViewProps> = ({
                 {isSupervisorOrAbove(currentUser?.role) || Boolean(currentUser?.permissions?.canManageInventory) ? (
                   <> | In Stock: {editingItem.product.stockQuantity}</>
                 ) : (
-                  <> | Status: {editingItem.product.stockQuantity === 0 ? 'Out of Stock' : (editingItem.product.stockQuantity <= (editingItem.product.reorderLevelUnits || 5) ? 'Low Stock' : 'In Stock')}</>
+                  <> | Status: {normalizeStockFields(editingItem.product).totalUnits <= 0 ? 'Out of Stock' : (isItemBelowReorderPoint(editingItem.product) ? 'Low Stock' : 'In Stock')}</>
                 )}
               </div>
             </div>

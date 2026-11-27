@@ -24,6 +24,7 @@ import {
   DailyGRNReportSummary,
 } from '../../db/roomDatabase';
 import { Branch, SupplierInvoiceVoucher } from '../../types';
+import { formatUnitCost } from '../../utils/inventoryMath';
 
 interface DailyGoodsReceivedReportProps {
   onViewVoucher?: (voucher: SupplierInvoiceVoucher) => void;
@@ -108,9 +109,9 @@ export const DailyGoodsReceivedReport: React.FC<DailyGoodsReceivedReportProps> =
       l.unitsPerCase,
       l.receivedCases,
       l.receivedSingles,
-      l.lastCost !== undefined ? l.lastCost.toFixed(2) : l.costPerCase.toFixed(2),
-      l.costPerCase.toFixed(2),
-      l.costPerUnit.toFixed(2),
+      l.lastCost !== undefined ? formatUnitCost(l.lastCost) : formatUnitCost(l.costPerCase),
+      formatUnitCost(l.costPerCase),
+      formatUnitCost(l.costPerUnit),
       l.sellingPrice !== undefined ? l.sellingPrice.toFixed(2) : '',
       l.marginPercent !== undefined ? l.marginPercent.toFixed(1) + '%' : '',
       l.lineTotal.toFixed(2),
@@ -458,16 +459,16 @@ export const DailyGoodsReceivedReport: React.FC<DailyGoodsReceivedReportProps> =
                       {line.receivedSingles}
                     </td>
                     <td className="py-2.5 px-2 text-right font-mono text-slate-400">
-                      ${(line.lastCost !== undefined ? line.lastCost : line.costPerCase).toFixed(2)}
+                      ${formatUnitCost(line.lastCost !== undefined ? line.lastCost : line.costPerCase)}
                     </td>
                     <td className="py-2.5 px-2 text-right font-mono text-slate-300 font-medium">
-                      ${line.costPerCase.toFixed(2)}
+                      ${formatUnitCost(line.costPerCase)}
                     </td>
                     <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400 bg-emerald-950/20">
                       ${line.lineTotal.toFixed(2)}
                     </td>
                     <td className="py-2.5 px-2 text-right font-mono text-slate-300">
-                      ${line.costPerUnit.toFixed(2)}
+                      ${formatUnitCost(line.costPerUnit)}
                     </td>
                     <td className="py-2.5 px-2 text-right font-mono text-slate-200 font-semibold">
                       {line.sellingPrice !== undefined && line.sellingPrice > 0

@@ -5,6 +5,13 @@ import {
   getBatchesByItemId,
 } from '../db/roomDatabase';
 import { StockBatch, InventoryItem } from '../types';
+import {
+  applyReceiptToValuePool,
+  decomposeStockUnits,
+  normalizeStockFields,
+  resolveItemValuationUnitCost,
+  roundUnitCost,
+} from '../utils/inventoryMath';
 
 export interface CostingReceiptMeta {
   grnId?: string;
@@ -16,14 +23,18 @@ export interface CostingReceiptMeta {
   branchId?: string;
   notes?: string;
   costingMethod?: 'last_cost' | 'moving_weighted_average' | 'fifo';
+  /** Exact total receipt cost in integer cents (invoice line + allocated landed costs) for zero-penny GL value-pool tracking. */
+  lineTotalCents?: number;
+  /** Optional exact total receipt cost in dollars (converted to integer cents if lineTotalCents is omitted). */
+  lineTotal?: number;
 }
 
 /**
- * Costing service supporting Last Cost, Moving Weighted Average, and FIFO batch tracking.
+ * Costing service supporting Last Cost, Moving Weighted Average, integer-cent Value-Pool tracking, and FIFO batch tracking.
  */
 export const costingService = {
   /**
-   * Records stock receipt and updates inventory costing.
+   * Records stock receipt and updates inventory costing & stockValueCents value pool.
    */
   recordReceipt(
     itemId: string,
@@ -37,29 +48,46 @@ export const costingService = {
       return null;
     }
 
-    const unitsPerCase = item.unitsPerCase || 1;
+    const unitsPerCase = Math.max(1, Number(item.unitsPerCase) || 1);
     const now = new Date().toISOString();
     const dateStr = meta?.date || now.split('T')[0];
 
-    // Calculate updated unit and case costs based on totalUnitCost
-    const lastCost = totalUnitCost;
-    const prevUnits = Math.max(0, item.totalUnits || 0);
-    const prevUnitCost = item.costPerUnit || 0;
+    const safeReceivedQty = Math.max(0, Number(quantity) || 0);
+    const safeUnitCost = roundUnitCost(Math.max(0, Number(totalUnitCost) || 0));
 
-    // Moving weighted average cost calculation
-    const totalQty = prevUnits + Math.max(0, quantity);
-    const weightedAvgUnitCost =
-      totalQty > 0
-        ? Number((((prevUnits * prevUnitCost) + (quantity * totalUnitCost)) / totalQty).toFixed(4))
-        : totalUnitCost;
+    // Resolve exact integer-cent receipt total (prefer exact invoice+landed cents when provided)
+    const receivedTotalCents =
+      meta?.lineTotalCents !== undefined && Number.isFinite(Number(meta.lineTotalCents)) && Number(meta.lineTotalCents) >= 0
+        ? Math.round(Number(meta.lineTotalCents))
+        : meta?.lineTotal !== undefined && Number.isFinite(Number(meta.lineTotal)) && Number(meta.lineTotal) >= 0
+        ? Math.round(Number(meta.lineTotal) * 100)
+        : Math.round(safeReceivedQty * safeUnitCost * 100);
 
-    // By default, system updates costPerUnit to lastCost (which includes landed cost),
-    // and stores weighted average for reporting
-    const costPerUnit = totalUnitCost;
-    const costPerCase = Number((costPerUnit * unitsPerCase).toFixed(2));
+    // Normalize prior stock & apply receipt to integer-cent value pool (MWAC + zero-penny GL reconciliation)
+    const currentStock = normalizeStockFields(item);
+    const prevAvgUnitCost = resolveItemValuationUnitCost(item);
+
+    const poolResult = applyReceiptToValuePool({
+      prevTotalUnits: currentStock.totalUnits,
+      prevStockValueCents: item.stockValueCents,
+      prevAvgUnitCost,
+      unitsPerCase,
+      receivedUnits: safeReceivedQty,
+      receivedTotalCents,
+      fallbackUnitCost: safeUnitCost,
+    });
+
+    const latestCostPerUnit = poolResult.latestCostPerUnit;
+    const latestCostPerCase = poolResult.latestCostPerCase;
+    const averageCostPerUnit = poolResult.averageCostPerUnit;
+    const averageCostPerCase = poolResult.averageCostPerCase;
+
+    // Keep costPerUnit / costPerCase as latest landed cost (4-decimal unit precision) while persisting MWAC + stockValueCents
+    const costPerUnit = latestCostPerUnit;
+    const costPerCase = latestCostPerCase;
 
     // Create or append FIFO StockBatch if quantity > 0
-    if (quantity > 0) {
+    if (safeReceivedQty > 0) {
       const batchId = `BAT-${dateStr.replace(/-/g, '')}-${Date.now().toString().slice(-4)}-${item.itemId}`;
       const batchNumber = meta?.batchNumber || `BATCH-${dateStr.replace(/-/g, '')}-${item.itemId}`;
       const newBatch: StockBatch = {
@@ -67,10 +95,10 @@ export const costingService = {
         batchNumber,
         itemId: item.itemId,
         itemName: item.itemName,
-        qtyReceived: quantity,
-        qtyOnHand: quantity,
-        cost: Number((quantity * totalUnitCost).toFixed(2)),
-        costPerUnit: totalUnitCost,
+        qtyReceived: safeReceivedQty,
+        qtyOnHand: safeReceivedQty,
+        cost: Number((receivedTotalCents / 100).toFixed(2)),
+        costPerUnit: latestCostPerUnit,
         costPerCase,
         expiryDate: meta?.expiryDate,
         receivedDate: dateStr,
@@ -78,7 +106,7 @@ export const costingService = {
         grnId: meta?.grnId || `GRN-${dateStr}`,
         invoiceNo: meta?.invoiceNo,
         branchId: meta?.branchId || item.branch_id || 'BR-MAIN',
-        notes: meta?.notes || `Received ${quantity} units at $${totalUnitCost.toFixed(4)}/unit`,
+        notes: meta?.notes || `Received ${safeReceivedQty} units at $${latestCostPerUnit.toFixed(4)}/unit`,
         createdAt: now,
       };
       try {
@@ -88,26 +116,23 @@ export const costingService = {
       }
     }
 
-    // Update item stock counts and cost in Inventory Master
-    const newTotalUnits = prevUnits + Math.max(0, quantity);
-    let newCases = item.stockCases;
-    let newSingles = item.stockSingles;
-
-    if (item.canSellAsCase && unitsPerCase > 1) {
-      newCases = Math.floor(newTotalUnits / unitsPerCase);
-      newSingles = newTotalUnits % unitsPerCase;
-    } else {
-      newCases = 0;
-      newSingles = newTotalUnits;
-    }
+    // Update item stock counts canonically (preserving negative debt offset when receiving against negative stock)
+    const decomposed = decomposeStockUnits(poolResult.newTotalUnits, unitsPerCase, {
+      keepCasesZero: !(item.canSellAsCase && unitsPerCase > 1),
+    });
 
     const updatedItem: InventoryItem = {
       ...item,
       costPerUnit,
       costPerCase,
-      stockCases: newCases,
-      stockSingles: newSingles,
-      totalUnits: newTotalUnits,
+      averageCostPerUnit,
+      averageCostPerCase,
+      latestCostPerUnit,
+      latestCostPerCase,
+      stockValueCents: poolResult.stockValueCents,
+      stockCases: decomposed.stockCases,
+      stockSingles: decomposed.stockSingles,
+      totalUnits: decomposed.totalUnits,
       lastUpdated: now,
     };
 
@@ -123,10 +148,10 @@ export const costingService = {
     const activeBatches = batches.filter((b) => (b.qtyOnHand || 0) > 0);
     if (activeBatches.length === 0) {
       const item = getInventoryItemById(itemId);
-      return item?.costPerUnit || 0;
+      return resolveItemValuationUnitCost(item);
     }
     const totalCost = activeBatches.reduce((sum, b) => sum + (b.qtyOnHand * (b.costPerUnit || 0)), 0);
     const totalQty = activeBatches.reduce((sum, b) => sum + b.qtyOnHand, 0);
-    return totalQty > 0 ? Number((totalCost / totalQty).toFixed(4)) : 0;
+    return totalQty > 0 ? roundUnitCost(totalCost / totalQty) : 0;
   },
 };

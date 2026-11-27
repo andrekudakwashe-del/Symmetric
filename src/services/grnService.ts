@@ -71,6 +71,17 @@ export function postGRN(
   if (!options?.skipInventoryMutation) {
     for (const item of grn.lineItems) {
       if (item.quantity > 0) {
+        const baseSubtotal =
+          item.subtotal !== undefined && Number.isFinite(Number(item.subtotal))
+            ? Number(item.subtotal)
+            : item.quantity * (item.unitCost || 0);
+        const allocatedLanded = Number(item.allocatedLandedCost || 0);
+        const exactLineDollars =
+          item.totalLineCost !== undefined && Number.isFinite(Number(item.totalLineCost))
+            ? Number(item.totalLineCost)
+            : baseSubtotal + allocatedLanded;
+        const lineTotalCents = Math.max(0, Math.round(exactLineDollars * 100));
+
         costingService.recordReceipt(item.itemId, item.quantity, item.totalUnitCost || item.unitCost, {
           grnId: grn.grnNumber,
           invoiceNo: grn.paymentRef || grn.grnNumber,
@@ -80,6 +91,7 @@ export function postGRN(
           expiryDate: item.expiryDate,
           branchId: grn.branchId,
           notes: grn.notes,
+          lineTotalCents,
         });
       }
     }

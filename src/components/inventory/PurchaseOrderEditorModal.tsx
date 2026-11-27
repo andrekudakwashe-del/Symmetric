@@ -582,7 +582,7 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-semibold uppercase tracking-wider text-slate-600">
                     <th className="py-2.5 px-3 w-10">#</th>
-                    <th className="py-2.5 px-3">PO Description (Editable Flavour / Variant)</th>
+                    <th className="py-2.5 px-3">Description</th>
                     <th className="py-2.5 px-3 w-24 text-right">Cases</th>
                     <th className="py-2.5 px-3 w-24 text-right">Singles</th>
                     <th className="py-2.5 px-3 w-20 text-right">Units</th>
@@ -603,11 +603,7 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
                       </td>
                     </tr>
                   ) : (
-                    lines.map((line, idx) => {
-                      const isEdited =
-                        String(line.poDescription || '').trim().toLowerCase() !==
-                        String(line.masterDescription || '').trim().toLowerCase();
-                      return (
+                    lines.map((line, idx) => (
                         <tr key={line.lineId} className="hover:bg-slate-50/70 align-top">
                           <td className="py-3 px-3 text-xs font-mono text-slate-500 pt-4">{idx + 1}</td>
                           <td className="py-2.5 px-3">
@@ -624,14 +620,7 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
                             <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500 flex-wrap">
                               <span className="font-mono">{line.code}</span>
                               <span>&middot;</span>
-                              <span>
-                                Master: <span className="text-slate-700 font-medium">{line.masterDescription}</span>
-                              </span>
-                              <span>&middot;</span>
                               <span>{line.unitsPerCase} u/cs</span>
-                              {isEdited && (
-                                <span className="text-indigo-700 font-semibold">Custom PO flavour</span>
-                              )}
                             </div>
                           </td>
                           <td className="py-2.5 px-3">
@@ -692,8 +681,7 @@ export const PurchaseOrderEditorModal: React.FC<PurchaseOrderEditorModalProps> =
                             </div>
                           </td>
                         </tr>
-                      );
-                    })
+                      ))
                   )}
                 </tbody>
               </table>

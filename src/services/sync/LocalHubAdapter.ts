@@ -3,6 +3,7 @@ import { SyncEnvelope, SyncAction } from './SyncEnvelope';
 import { ENTITY_REGISTRY } from './EntityRegistry';
 import { LocalHubConfig, normalizeHubUrl } from '../../utils/localHubConfig';
 import { computeCommandSignature } from '../../utils/hubAuthCrypto';
+import { normalizeStockFields, resolveItemValuationUnitCost } from '../../utils/inventoryMath';
 
 const PENDING_QUEUE_STORAGE_KEY = 'saimetric_pending_local_hub_queue';
 
@@ -997,10 +998,38 @@ export class LocalHubAdapter implements SyncAdapter {
         const cleanId = envelope.entityId || d.itemId || d.id || '';
         const now = envelope.updatedAt || Date.now();
         const nowIso = d.lastUpdated || new Date(now).toISOString();
+        const stock = normalizeStockFields(d);
+        const avgCostUnit = resolveItemValuationUnitCost(d);
+        const avgCostCase =
+          d.averageCostPerCase !== undefined && Number(d.averageCostPerCase) > 0
+            ? Number(d.averageCostPerCase)
+            : Number((avgCostUnit * stock.unitsPerCase).toFixed(2));
+        const latestCostUnit =
+          d.latestCostPerUnit !== undefined && Number(d.latestCostPerUnit) > 0
+            ? Number(d.latestCostPerUnit)
+            : Number(d.costPerUnit || avgCostUnit || 0);
+        const latestCostCase =
+          d.latestCostPerCase !== undefined && Number(d.latestCostPerCase) > 0
+            ? Number(d.latestCostPerCase)
+            : Number(d.costPerCase || Number((latestCostUnit * stock.unitsPerCase).toFixed(2)) || 0);
+        const resolvedStockValueCents =
+          stock.totalUnits <= 0
+            ? 0
+            : d.stockValueCents !== undefined && Number.isFinite(Number(d.stockValueCents)) && Number(d.stockValueCents) >= 0
+            ? Math.round(Number(d.stockValueCents))
+            : Math.round(stock.totalUnits * avgCostUnit * 100);
         const enriched = {
           ...d,
-          totalUnits: Number(d.totalUnits || 0),
-          stockSingles: Number(d.stockSingles !== undefined ? d.stockSingles : d.totalUnits || 0),
+          unitsPerCase: stock.unitsPerCase,
+          stockCases: stock.stockCases,
+          stockSingles: stock.stockSingles,
+          totalUnits: stock.totalUnits,
+          costPerUnit: Number(Number(d.costPerUnit ?? latestCostUnit ?? 0).toFixed(4)),
+          averageCostPerUnit: Number(avgCostUnit.toFixed(4)),
+          averageCostPerCase: Number(avgCostCase.toFixed(2)),
+          latestCostPerUnit: Number(latestCostUnit.toFixed(4)),
+          latestCostPerCase: Number(latestCostCase.toFixed(2)),
+          stockValueCents: resolvedStockValueCents,
           snapshotTimestamp: now,
           updatedAt: now,
           hubTimestamp: now,
@@ -1017,13 +1046,18 @@ export class LocalHubAdapter implements SyncAdapter {
           itemName: d.itemName,
           sellPriceUnit: d.sellPriceUnit,
           sellPriceCase: d.sellPriceCase,
-          costPerUnit: d.costPerUnit,
+          costPerUnit: enriched.costPerUnit,
           costPerCase: d.costPerCase,
-          unitsPerCase: d.unitsPerCase,
+          averageCostPerUnit: enriched.averageCostPerUnit,
+          averageCostPerCase: enriched.averageCostPerCase,
+          latestCostPerUnit: enriched.latestCostPerUnit,
+          latestCostPerCase: enriched.latestCostPerCase,
+          stockValueCents: enriched.stockValueCents,
+          unitsPerCase: stock.unitsPerCase,
           canSellAsCase: Boolean(d.canSellAsCase),
-          stockCases: d.stockCases,
-          stockSingles: enriched.stockSingles,
-          totalUnits: enriched.totalUnits,
+          stockCases: stock.stockCases,
+          stockSingles: stock.stockSingles,
+          totalUnits: stock.totalUnits,
           snapshotTimestamp: now,
           category: d.category,
           sku: d.sku,

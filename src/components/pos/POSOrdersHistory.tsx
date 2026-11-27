@@ -35,6 +35,7 @@ import { ItemExchangeModal } from './ItemExchangeModal';
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
 import { useClockSecurity, isDeviceTimeAutomatic } from '../../utils/clockSecurity';
+import { filterCashierVisibleInvoices } from '../../utils/cashierInvoiceFilter';
 
 interface POSOrdersHistoryProps {
   currentUser?: Salesperson | null;
@@ -100,6 +101,10 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     currentUser?.role === 'Admin' ||
     currentUser?.role === 'OWNER' ||
     currentUser?.role === 'SUPER_ADMIN';
+
+  // Blind-till control: cashiers / till operators only see their last 5 invoices by default
+  // and must search by receipt #, customer name, phone, or ref to retrieve a specific older invoice
+  const isCashierBlindMode = !isSupervisorOrAbove(currentUser?.role);
 
   // Branch Scope: Defaults strictly to current branch with zero cross-branch leakage
   const [scopeFilter, setScopeFilter] = useState<'branch' | 'all'>('branch');
@@ -226,7 +231,16 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
     });
   }, [sales, activePeriodType, startDateInput, endDateInput, defaultOlder.start, defaultOlder.end]);
 
+  const cashierFilterResult = useMemo(() => {
+    if (!isCashierBlindMode) return null;
+    return filterCashierVisibleInvoices(sales, currentUser, searchQuery);
+  }, [isCashierBlindMode, sales, currentUser, searchQuery]);
+
   const filteredSales = useMemo(() => {
+    if (isCashierBlindMode && cashierFilterResult) {
+      return cashierFilterResult.invoices;
+    }
+
     return periodFilteredSales.filter((sale) => {
       const matchesPayment =
         paymentFilter === 'All' ||
@@ -255,7 +269,7 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         (sale.itemsSummary && sale.itemsSummary.toLowerCase().includes(q));
       return matchesPayment && matchesStatus && matchesSearch;
     });
-  }, [periodFilteredSales, paymentFilter, statusFilter, searchQuery]);
+  }, [isCashierBlindMode, cashierFilterResult, periodFilteredSales, paymentFilter, statusFilter, searchQuery]);
 
   const receiptsTableScrollRef = useRef<HTMLDivElement | null>(null);
   const receiptVirtualSlice = useVirtualTableSlice({
@@ -400,11 +414,17 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
             <div className="flex items-center space-x-2">
               <h1 className="text-xl font-bold text-white tracking-tight">Receipts</h1>
               <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 font-mono font-bold border border-blue-500/30">
-                {periodLabel}
+                {isCashierBlindMode
+                  ? searchQuery.trim()
+                    ? 'Invoice Lookup'
+                    : 'Last 5 Receipts'
+                  : periodLabel}
               </span>
             </div>
             <p className="text-xs text-slate-400">
-              Electronic customer receipts • View, reprint invoices &amp; transaction audit
+              {isCashierBlindMode
+                ? 'Your 5 most recent receipts • Search by receipt #, customer, or phone for an older invoice'
+                : 'Electronic customer receipts • View, reprint invoices & transaction audit'}
             </p>
           </div>
         </div>
@@ -442,28 +462,32 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
             </div>
           )}
 
-          {/* Get Older Receipts Button */}
-          <button
-            type="button"
-            id="btn-get-older-receipts"
-            onClick={() => setShowOlderReceiptsModal(true)}
-            className="flex items-center space-x-1.5 px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-2xl text-xs font-bold shadow-sm transition active:scale-95"
-            title="Select date or period for older receipts (default: yesterday and 2 more days going backwards)"
-          >
-            <Clock className="w-4 h-4 text-amber-400" />
-            <span>Get Older Receipts</span>
-          </button>
+          {/* Get Older Receipts Button (Supervisors/Managers only — hidden in Blind Cashier Mode) */}
+          {!isCashierBlindMode && (
+            <>
+              <button
+                type="button"
+                id="btn-get-older-receipts"
+                onClick={() => setShowOlderReceiptsModal(true)}
+                className="flex items-center space-x-1.5 px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-2xl text-xs font-bold shadow-sm transition active:scale-95"
+                title="Select date or period for older receipts (default: yesterday and 2 more days going backwards)"
+              >
+                <Clock className="w-4 h-4 text-amber-400" />
+                <span>Get Older Receipts</span>
+              </button>
 
-          {activePeriodType !== 'today' && (
-            <button
-              type="button"
-              onClick={() => {
-                setActivePeriodType('today');
-              }}
-              className="px-3 py-2 bg-slate-800/80 hover:bg-slate-700 text-xs font-bold text-slate-300 rounded-2xl transition border border-slate-700"
-            >
-              Back to Today
-            </button>
+              {activePeriodType !== 'today' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActivePeriodType('today');
+                  }}
+                  className="px-3 py-2 bg-slate-800/80 hover:bg-slate-700 text-xs font-bold text-slate-300 rounded-2xl transition border border-slate-700"
+                >
+                  Back to Today
+                </button>
+              )}
+            </>
           )}
 
           {onNavigate && !isModal && (
@@ -490,74 +514,114 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         </div>
       </div>
 
-      {/* Receipts Summary Badges */}
-      <div className="grid grid-cols-2 gap-2.5">
-        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3">
-          <span className="text-[10px] text-slate-400 block font-semibold uppercase">Total Receipts</span>
-          <div className="flex items-baseline justify-between mt-0.5">
-            <span className="text-lg font-black font-mono text-white">{filteredSales.length}</span>
-            <span className="text-[10px] text-slate-500">Invoices</span>
+      {/* Receipts Summary Badges (Hidden from Cashiers to prevent shift self-balancing) */}
+      {!isCashierBlindMode ? (
+        <div className="grid grid-cols-2 gap-2.5">
+          <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3">
+            <span className="text-[10px] text-slate-400 block font-semibold uppercase">Total Receipts</span>
+            <div className="flex items-baseline justify-between mt-0.5">
+              <span className="text-lg font-black font-mono text-white">{filteredSales.length}</span>
+              <span className="text-[10px] text-slate-500">Invoices</span>
+            </div>
           </div>
-        </div>
 
-        <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3">
-          <span className="text-[10px] text-slate-400 block font-semibold uppercase">Voided / Refunded</span>
-          <div className="flex items-baseline justify-between mt-0.5">
-            <span className="text-lg font-black font-mono text-rose-400">{refundedCount + voidedCount}</span>
-            <span className="text-[10px] text-rose-400/70">Reversed</span>
+          <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-3">
+            <span className="text-[10px] text-slate-400 block font-semibold uppercase">Voided / Refunded</span>
+            <div className="flex items-baseline justify-between mt-0.5">
+              <span className="text-lg font-black font-mono text-rose-400">{refundedCount + voidedCount}</span>
+              <span className="text-[10px] text-rose-400/70">Reversed</span>
+            </div>
           </div>
         </div>
-      </div>
+      ) : (
+        <div className="bg-slate-900/90 border border-indigo-500/30 rounded-2xl px-3.5 py-2.5 flex items-center justify-between gap-2 text-xs">
+          <div className="flex items-center gap-2 text-indigo-200">
+            <ShieldCheck className="w-4 h-4 text-indigo-400 shrink-0" />
+            <span>
+              {searchQuery.trim()
+                ? cashierFilterResult?.hint || 'Showing only the referenced invoice matching your lookup.'
+                : 'Blind Till Mode: Only your last 5 receipts are shown. Search by receipt #, customer name, phone, or payment ref for an older invoice.'}
+            </span>
+          </div>
+          {searchQuery.trim() && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              className="px-2.5 py-1 rounded-xl bg-slate-800 hover:bg-slate-700 text-[11px] font-bold text-slate-200 shrink-0 transition"
+            >
+              Back to Last 5
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Search & Filter Bar */}
       <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-3.5 space-y-2.5">
         <div className="grid grid-cols-1 sm:grid-cols-12 gap-2.5">
-          <div className="sm:col-span-6 relative">
+          <div className={`${isCashierBlindMode ? 'sm:col-span-12' : 'sm:col-span-6'} relative`}>
             <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
             <input
               type="text"
-              placeholder="Search by receipt #, customer name, cashier, item name..."
+              placeholder={
+                isCashierBlindMode
+                  ? 'Search older invoice by receipt #, customer name, phone, or payment ref...'
+                  : 'Search by receipt #, customer name, cashier, item name...'
+              }
               value={searchQuery}
               onChange={(e) => {
                 setSearchQuery(e.target.value);
               }}
-              className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-10 pr-4 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
+              className="w-full bg-slate-950 border border-slate-800 rounded-2xl pl-10 pr-9 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
             />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => setSearchQuery('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white p-0.5 rounded-full"
+                title="Clear search"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
 
-          <div className="sm:col-span-3 flex items-center space-x-1.5">
-            <Filter className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
-            <select
-              value={paymentFilter}
-              onChange={(e) => {
-                setPaymentFilter(e.target.value);
-              }}
-              className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-2.5 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
-            >
-              <option value="All">All Payment Methods</option>
-              <option value="Cash">Cash (USD)</option>
-              <option value="ZiG">ZiG (Zimbabwe Gold)</option>
-              <option value="EcoCash">EcoCash Mobile Money</option>
-              <option value="Credit">Form 3 Credit</option>
-              <option value="Card">Bank Card / POS</option>
-              <option value="Bank Transfer">Bank Transfer</option>
-            </select>
-          </div>
+          {!isCashierBlindMode && (
+            <>
+              <div className="sm:col-span-3 flex items-center space-x-1.5">
+                <Filter className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" />
+                <select
+                  value={paymentFilter}
+                  onChange={(e) => {
+                    setPaymentFilter(e.target.value);
+                  }}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-2.5 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
+                >
+                  <option value="All">All Payment Methods</option>
+                  <option value="Cash">Cash (USD)</option>
+                  <option value="ZiG">ZiG (Zimbabwe Gold)</option>
+                  <option value="EcoCash">EcoCash Mobile Money</option>
+                  <option value="Credit">Form 3 Credit</option>
+                  <option value="Card">Bank Card / POS</option>
+                  <option value="Bank Transfer">Bank Transfer</option>
+                </select>
+              </div>
 
-          <div className="sm:col-span-3 flex items-center space-x-1.5">
-            <select
-              value={statusFilter}
-              onChange={(e) => {
-                setStatusFilter(e.target.value);
-              }}
-              className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-2.5 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
-            >
-              <option value="All">All Statuses</option>
-              <option value="Paid">Paid / Settled Only</option>
-              <option value="Refunded">Refunded Only</option>
-              <option value="Voided">Voided Only</option>
-            </select>
-          </div>
+              <div className="sm:col-span-3 flex items-center space-x-1.5">
+                <select
+                  value={statusFilter}
+                  onChange={(e) => {
+                    setStatusFilter(e.target.value);
+                  }}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-2.5 py-2 text-xs text-slate-200 focus:outline-none focus:ring-2 focus:ring-[#6A4DFF]"
+                >
+                  <option value="All">All Statuses</option>
+                  <option value="Paid">Paid / Settled Only</option>
+                  <option value="Refunded">Refunded Only</option>
+                  <option value="Voided">Voided Only</option>
+                </select>
+              </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -786,10 +850,26 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
                 <tr>
                   <td colSpan={8} className="py-12 text-center text-slate-500">
                     <Receipt className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                    <p className="text-sm font-semibold">No receipts found for this period</p>
-                    <p className="text-xs text-slate-600 mt-0.5">
-                      Click &ldquo;Get Older Receipts&rdquo; to query prior dates or switch filters
-                    </p>
+                    {isCashierBlindMode ? (
+                      <>
+                        <p className="text-sm font-semibold text-slate-300">
+                          {searchQuery.trim()
+                            ? 'No matching invoice shown'
+                            : 'No recent receipts for your shift yet'}
+                        </p>
+                        <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
+                          {cashierFilterResult?.hint ||
+                            'Your 5 most recent receipts will appear here. Search by exact receipt #, registered customer name, phone, or payment ref to find an older invoice.'}
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-sm font-semibold">No receipts found for this period</p>
+                        <p className="text-xs text-slate-600 mt-0.5">
+                          Click &ldquo;Get Older Receipts&rdquo; to query prior dates or switch filters
+                        </p>
+                      </>
+                    )}
                   </td>
                 </tr>
               )}
@@ -800,11 +880,27 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         {/* Virtualized Table Status Bar */}
         {filteredSales.length > 0 && (
           <div className="px-4 py-2.5 border-t border-slate-800 bg-slate-950/50 flex items-center justify-between text-[11px] text-slate-400">
-            <span>
-              Viewing <strong className="text-white">{receiptVirtualSlice.startIndex + 1}–{receiptVirtualSlice.endIndex}</strong> of{' '}
-              <strong className="text-white">{filteredSales.length.toLocaleString()}</strong> receipts
-            </span>
-            {receiptVirtualSlice.isVirtualized && (
+            {isCashierBlindMode ? (
+              <span>
+                {searchQuery.trim() ? (
+                  <>
+                    Referenced lookup: <strong className="text-white">{filteredSales.length}</strong>{' '}
+                    {filteredSales.length === 1 ? 'invoice' : 'invoices'} matched
+                  </>
+                ) : (
+                  <>
+                    Showing your last <strong className="text-white">{filteredSales.length}</strong>{' '}
+                    {filteredSales.length === 1 ? 'receipt' : 'receipts'} (max 5 in Blind Till Mode)
+                  </>
+                )}
+              </span>
+            ) : (
+              <span>
+                Viewing <strong className="text-white">{receiptVirtualSlice.startIndex + 1}–{receiptVirtualSlice.endIndex}</strong> of{' '}
+                <strong className="text-white">{filteredSales.length.toLocaleString()}</strong> receipts
+              </span>
+            )}
+            {receiptVirtualSlice.isVirtualized && !isCashierBlindMode && (
               <span className="font-mono text-[10px] text-emerald-400">
                 Virtualized ({displayedSales.length} rows mounted)
               </span>
@@ -813,8 +909,8 @@ export const POSOrdersHistory: React.FC<POSOrdersHistoryProps> = ({
         )}
       </div>
 
-      {/* GET OLDER RECEIPTS MODAL */}
-      {showOlderReceiptsModal && (
+      {/* GET OLDER RECEIPTS MODAL (Supervisors/Managers only) */}
+      {!isCashierBlindMode && showOlderReceiptsModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn">
           <div className="bg-slate-900 border border-slate-800 rounded-3xl p-5 max-w-md w-full shadow-2xl space-y-4">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">

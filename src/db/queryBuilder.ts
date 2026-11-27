@@ -15,6 +15,13 @@ import {
 } from './roomDatabase';
 import { INITIAL_DATA_DICTIONARY } from './dataDictionary';
 import { toTimeStringSafe } from '../utils/dateUtils';
+import {
+  computeItemValuationCents,
+  computeReorderPointTotalUnits,
+  isItemBelowReorderPoint,
+  normalizeStockFields,
+  resolveItemValuationUnitCost,
+} from '../utils/inventoryMath';
 
 /**
  * Converts a ReportJsonConfig into parameterized SQL suitable for Room @RawQuery
@@ -225,9 +232,19 @@ function getTableData(tableName: string): Record<string, any>[] {
     case 'inventory': {
       const invItems = getInventoryItems();
       return invItems.map((item) => {
-        const units = item.totalUnits || item.stockSingles || 0;
-        const reorder = item.reorderLevelUnits || 5;
-        const unitCost = item.costPerUnit || 0;
+        const stock = normalizeStockFields(item);
+        const units = stock.totalUnits;
+        const reorder = computeReorderPointTotalUnits(item);
+        const unitCost = resolveItemValuationUnitCost(item);
+        const totalValue = computeItemValuationCents(item) / 100;
+        const status =
+          units < 0
+            ? 'Negative Stock'
+            : units === 0
+            ? 'Out of Stock'
+            : isItemBelowReorderPoint(item)
+            ? 'Low Stock'
+            : 'Optimal';
         return {
           'inventory.id': item.itemId,
           'inventory.product_id': item.itemId,
@@ -236,8 +253,8 @@ function getTableData(tableName: string): Record<string, any>[] {
           'inventory.stock_level': units,
           'inventory.min_stock': reorder,
           'inventory.unit_cost': unitCost,
-          'inventory.total_value': units * unitCost,
-          'inventory.status': units <= reorder ? 'Low Stock' : 'Optimal',
+          'inventory.total_value': totalValue,
+          'inventory.status': status,
         };
       });
     }

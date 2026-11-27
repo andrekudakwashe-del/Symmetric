@@ -68,6 +68,13 @@ import { PurchaseOrderPickerModal, PurchaseOrderSelectionPayload } from './Purch
 import { SyncStatusDot } from '../common/SyncStatusDot';
 import { retrySyncInvoice } from '../../services/googleSheetsSync';
 import { formatDisplayId } from '../../utils/idFormatters';
+import {
+  computeGrvLineCosting,
+  formatUnitCost,
+  roundCurrency,
+  roundUnitCost,
+  GrvCostEntryMode,
+} from '../../utils/inventoryMath';
 
 interface DirectGoodsReceivedViewProps {
   currentUser: Salesperson | null;
@@ -91,7 +98,9 @@ interface DirectRow {
   qtyPerCaseDefault: number | string;
   quantityCases: number | string;
   quantitySingles: number | string;
-  pricePerCase: number | string; // cost price (per case or unit depending on receiveAs)
+  pricePerCase: number | string; // cost price (per case or unit depending on receiveAs), up to 4 decimals
+  lineTotalInput?: number | string; // optional explicit line total ($) entered by user (Line-Total-First mode)
+  costEntryMode?: GrvCostEntryMode; // which field anchors this row ('LINE_TOTAL' | 'UNIT_COST')
   lastCost: number;
   sellingPrice: number | string; // Read-only from catalog for cashiers
   batchNumber?: string;
@@ -213,6 +222,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           : undefined;
 
       if (line.receiveCases > 0) {
+        const cCost = roundUnitCost(Number(line.caseCost || rawCaseCost || 0));
+        const cTotal = roundCurrency(cCost * Number(line.receiveCases));
         mappedRows.push({
           id: `po-row-${Date.now()}-${idx}-c`,
           productId: masterId,
@@ -222,7 +233,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           qtyPerCaseDefault: upc,
           quantityCases: String(line.receiveCases),
           quantitySingles: '',
-          pricePerCase: String(Number(line.caseCost || rawCaseCost || 0)),
+          pricePerCase: String(cCost),
+          lineTotalInput: cTotal > 0 ? cTotal.toFixed(2) : '',
+          costEntryMode: defaultCostEntryMode,
           lastCost: Number(rawCaseCost || line.caseCost || 0),
           sellingPrice,
           batchNumber: '',
@@ -234,6 +247,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
         });
       }
       if (line.receiveSingles > 0) {
+        const uCost = roundUnitCost(Number(line.unitCost || rawUnitCost || 0));
+        const sTotal = roundCurrency(uCost * Number(line.receiveSingles));
         mappedRows.push({
           id: `po-row-${Date.now()}-${idx}-s`,
           productId: masterId,
@@ -243,7 +258,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           qtyPerCaseDefault: upc,
           quantityCases: '',
           quantitySingles: String(line.receiveSingles),
-          pricePerCase: String(Number(line.unitCost || rawUnitCost || 0)),
+          pricePerCase: String(uCost),
+          lineTotalInput: sTotal > 0 ? sTotal.toFixed(2) : '',
+          costEntryMode: defaultCostEntryMode,
           lastCost: Number(rawUnitCost || line.unitCost || 0),
           sellingPrice,
           batchNumber: '',
@@ -271,6 +288,26 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
   const [lastDirectDraftSavedAt, setLastDirectDraftSavedAt] = useState<string | null>(null);
   const [hasRestoredDirectDraft, setHasRestoredDirectDraft] = useState<boolean>(false);
 
+  // Cost Entry Mode (Line Total First vs Unit / Case Cost)
+  const [defaultCostEntryMode, setDefaultCostEntryMode] = useState<GrvCostEntryMode>('LINE_TOTAL');
+
+  const createBlankDirectRow = (mode: GrvCostEntryMode = defaultCostEntryMode): DirectRow => ({
+    id: `row-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+    productId: '',
+    productName: '',
+    receiveAs: 'Cases',
+    qtyPerCaseDefault: 1,
+    quantityCases: '',
+    quantitySingles: '',
+    pricePerCase: '',
+    lineTotalInput: '',
+    costEntryMode: mode,
+    lastCost: 0,
+    sellingPrice: '',
+    batchNumber: '',
+    expiryDate: '',
+  });
+
   // Rows Table (Functions identical to Goods Received Voucher)
   const [rows, setRows] = useState<DirectRow[]>([
     {
@@ -282,6 +319,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       quantityCases: '',
       quantitySingles: '',
       pricePerCase: '',
+      lineTotalInput: '',
+      costEntryMode: 'LINE_TOTAL',
       lastCost: 0,
       sellingPrice: '',
       batchNumber: '',
@@ -515,22 +554,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     setSupplierFilterTerm('');
     setInvoiceNo('');
     setPurchaseOrderNo('');
-    setRows([
-      {
-        id: `row-${Date.now()}`,
-        productId: '',
-        productName: '',
-        receiveAs: 'Cases',
-        qtyPerCaseDefault: 1,
-        quantityCases: '',
-        quantitySingles: '',
-        pricePerCase: '',
-        lastCost: 0,
-        sellingPrice: '',
-        batchNumber: '',
-        expiryDate: '',
-      },
-    ]);
+    setRows([createBlankDirectRow(defaultCostEntryMode)]);
     hasManuallySelectedOperatorRef.current = false;
     setPaymentRows([
       {
@@ -567,33 +591,50 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     };
   }, []);
 
-  // Row Calculation Helper (Identical to Goods Received Voucher)
+  // Row Calculation Helper (Bidirectional Line-Total-First & 4-decimal Unit/Case Cost)
   const getRowCalculations = (r: DirectRow) => {
     const qtyCases = Math.max(0, Number(r.quantityCases) || 0);
     const qtySingles = Math.max(0, Number(r.quantitySingles) || 0);
-    const pricePerCase = Math.max(0, Number(r.pricePerCase) || 0);
     const qtyPerCase = Math.max(1, Number(r.qtyPerCaseDefault) || 1);
+    const activeQty = r.receiveAs === 'Singles' ? qtySingles : qtyCases;
 
-    let unitCost = 0;
-    let lineTotal = 0;
-    let totalUnits = 0;
+    const hasLineTotalInput =
+      r.lineTotalInput !== undefined &&
+      r.lineTotalInput !== '' &&
+      Number.isFinite(Number(r.lineTotalInput));
+    const effectiveMode: GrvCostEntryMode =
+      r.costEntryMode === 'LINE_TOTAL' && hasLineTotalInput
+        ? 'LINE_TOTAL'
+        : 'UNIT_COST';
 
-    if (r.receiveAs === 'Singles') {
-      unitCost = pricePerCase;
-      lineTotal = unitCost * qtySingles;
-      totalUnits = qtySingles;
-    } else {
-      // Cases
-      unitCost = qtyPerCase > 0 ? pricePerCase / qtyPerCase : pricePerCase;
-      lineTotal = pricePerCase * qtyCases;
+    const costing = computeGrvLineCosting({
+      receiveAs: r.receiveAs === 'Singles' ? 'Singles' : 'Cases',
+      qty: activeQty,
+      unitsPerCase: qtyPerCase,
+      costEntryMode: effectiveMode,
+      enteredUnitOrCaseCost: Math.max(0, Number(r.pricePerCase) || 0),
+      enteredLineTotal: hasLineTotalInput ? Math.max(0, Number(r.lineTotalInput) || 0) : 0,
+    });
+
+    let totalUnits = costing.totalUnits;
+    let lineTotalCents = costing.lineTotalCents;
+    let lineTotal = costing.lineTotal;
+    let unitCost = costing.costPerUnit;
+    let pricePerCase = r.receiveAs === 'Singles' ? costing.costPerUnit : costing.costPerCase;
+
+    // Preserve legacy mixed cases+singles edge case if both fields are populated
+    if (r.receiveAs === 'Cases' && qtySingles > 0) {
       totalUnits = (qtyCases * qtyPerCase) + qtySingles;
-      if (qtySingles > 0) {
-        lineTotal += unitCost * qtySingles;
+      if (effectiveMode === 'UNIT_COST') {
+        lineTotalCents = Math.round((costing.lineTotal + unitCost * qtySingles) * 100);
+        lineTotal = lineTotalCents / 100;
+      } else if (totalUnits > 0) {
+        unitCost = roundUnitCost(lineTotal / totalUnits);
+        pricePerCase = roundUnitCost(unitCost * qtyPerCase);
       }
     }
 
     const sellingPrice = Math.max(0, Number(r.sellingPrice) || 0);
-    lineTotal = Math.round((Number(lineTotal) || 0) * 100) / 100;
     const profit = Math.round(Math.max(0, sellingPrice - unitCost) * 100) / 100;
     const markupPercent = unitCost > 0 ? Math.round((((sellingPrice - unitCost) / unitCost) * 100) * 100) / 100 : 0;
 
@@ -604,6 +645,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       qtyPerCase,
       unitCost,
       lineTotal,
+      lineTotalCents,
+      costEntryMode: effectiveMode,
       totalUnits,
       sellingPrice,
       profit,
@@ -677,21 +720,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
   // Row Manipulation
   const handleAddRow = () => {
-    const newRow: DirectRow = {
-      id: `row-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
-      productId: '',
-      productName: '',
-      receiveAs: 'Cases',
-      qtyPerCaseDefault: 1,
-      quantityCases: '',
-      quantitySingles: '',
-      pricePerCase: '',
-      lastCost: 0,
-      sellingPrice: '',
-      batchNumber: '',
-      expiryDate: '',
-    };
-    setRows((prev) => [...prev, newRow]);
+    setRows((prev) => [...prev, createBlankDirectRow(defaultCostEntryMode)]);
   };
 
   const handleRemoveRow = (rowId: string) => {
@@ -721,6 +750,82 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
     );
   };
 
+  const handleRowLineTotalChange = (rowId: string, rawVal: string) => {
+    const val = cleanNumberInput(rawVal, true, 2);
+    setRows((prev) =>
+      prev.map((r) => {
+        if (r.id !== rowId) return r;
+        const activeQty =
+          r.receiveAs === 'Singles'
+            ? Math.max(0, Number(r.quantitySingles) || 0)
+            : Math.max(0, Number(r.quantityCases) || 0);
+        const totalNum = Math.max(0, Number(val) || 0);
+        const derivedPrice = activeQty > 0 && totalNum > 0 ? roundUnitCost(totalNum / activeQty) : r.pricePerCase;
+        return {
+          ...r,
+          lineTotalInput: val,
+          costEntryMode: 'LINE_TOTAL',
+          pricePerCase: val === '' ? '' : derivedPrice,
+        };
+      })
+    );
+  };
+
+  const handleRowPriceChange = (rowId: string, rawVal: string) => {
+    const val = cleanNumberInput(rawVal, true, 4);
+    setRows((prev) =>
+      prev.map((r) => {
+        if (r.id !== rowId) return r;
+        const activeQty =
+          r.receiveAs === 'Singles'
+            ? Math.max(0, Number(r.quantitySingles) || 0)
+            : Math.max(0, Number(r.quantityCases) || 0);
+        const priceNum = Math.max(0, Number(val) || 0);
+        const derivedLineTotal = activeQty > 0 && priceNum > 0 ? roundCurrency(priceNum * activeQty).toFixed(2) : '';
+        return {
+          ...r,
+          pricePerCase: val,
+          costEntryMode: 'UNIT_COST',
+          lineTotalInput: derivedLineTotal,
+        };
+      })
+    );
+  };
+
+  const handleRowQtyChange = (
+    rowId: string,
+    field: 'quantityCases' | 'quantitySingles',
+    val: string | number
+  ) => {
+    setRows((prev) =>
+      prev.map((r) => {
+        if (r.id !== rowId) return r;
+        const nextRow = { ...r, [field]: val };
+        const activeQty =
+          nextRow.receiveAs === 'Singles'
+            ? Math.max(0, Number(nextRow.quantitySingles) || 0)
+            : Math.max(0, Number(nextRow.quantityCases) || 0);
+        const hasLineTotal =
+          nextRow.lineTotalInput !== undefined &&
+          nextRow.lineTotalInput !== '' &&
+          Number(nextRow.lineTotalInput) > 0;
+
+        if (nextRow.costEntryMode === 'LINE_TOTAL' && hasLineTotal) {
+          const totalNum = Number(nextRow.lineTotalInput) || 0;
+          return {
+            ...nextRow,
+            pricePerCase: activeQty > 0 ? roundUnitCost(totalNum / activeQty) : nextRow.pricePerCase,
+          };
+        }
+        const priceNum = Math.max(0, Number(nextRow.pricePerCase) || 0);
+        return {
+          ...nextRow,
+          lineTotalInput: activeQty > 0 && priceNum > 0 ? roundCurrency(priceNum * activeQty).toFixed(2) : '',
+        };
+      })
+    );
+  };
+
   // Product Selection (Cashier cannot create new stockline - catalog selection only)
   const handleSelectProduct = (rowId: string, item: InventoryItem) => {
     setRows((prev) => {
@@ -728,12 +833,18 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       const updated = prev.map((r) => {
         if (r.id !== rowId) return r;
         const unitsPerCase = item.unitsPerCase || 1;
-        const costPrice = item.costPerCase || (item.costPerUnit ? item.costPerUnit * unitsPerCase : 0);
-        const unitCost = item.costPerUnit || (unitsPerCase > 0 ? costPrice / unitsPerCase : 0);
+        const costPrice = roundUnitCost(item.costPerCase || (item.costPerUnit ? item.costPerUnit * unitsPerCase : 0));
+        const unitCost = roundUnitCost(item.costPerUnit || (unitsPerCase > 0 ? costPrice / unitsPerCase : 0));
         const sellingPrice = item.sellPriceUnit || 0;
 
         // Determine price depending on current receiveAs
         const initialCost = r.receiveAs === 'Singles' ? unitCost : costPrice;
+        const activeQty =
+          r.receiveAs === 'Singles'
+            ? Math.max(0, Number(r.quantitySingles) || 0)
+            : Math.max(0, Number(r.quantityCases) || 0);
+        const rowMode: GrvCostEntryMode = r.costEntryMode || defaultCostEntryMode;
+        const initialLineTotal = activeQty > 0 && initialCost > 0 ? roundCurrency(activeQty * initialCost).toFixed(2) : '';
 
         return {
           ...r,
@@ -743,6 +854,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
           qtyPerCaseDefault: unitsPerCase,
           originalUnitsPerCase: unitsPerCase,
           pricePerCase: initialCost,
+          lineTotalInput: rowMode === 'LINE_TOTAL' ? initialLineTotal : r.lineTotalInput ?? '',
+          costEntryMode: rowMode,
           lastCost: costPrice,
           sellingPrice, // Locked from master catalog for cashier
           trackExpiry: Boolean(item.trackExpiry),
@@ -754,20 +867,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
       });
 
       if (isLast) {
-        updated.push({
-          id: `row-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-          productId: '',
-          productName: '',
-          receiveAs: 'Cases',
-          qtyPerCaseDefault: 1,
-          quantityCases: '',
-          quantitySingles: '',
-          pricePerCase: '',
-          lastCost: 0,
-          sellingPrice: '',
-          batchNumber: '',
-          expiryDate: '',
-        });
+        updated.push(createBlankDirectRow(defaultCostEntryMode));
       }
 
       return updated;
@@ -896,7 +996,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
         r.productName.trim() !== '' ||
         (Number(r.quantityCases) || 0) > 0 ||
         (Number(r.quantitySingles) || 0) > 0 ||
-        (Number(r.pricePerCase) || 0) > 0
+        (Number(r.pricePerCase) || 0) > 0 ||
+        (Number(r.lineTotalInput) || 0) > 0
     );
 
     if (activeRows.length === 0) {
@@ -965,6 +1066,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
         costPerCase: calc.pricePerCase,
         sellingPrice: calc.sellingPrice,
         lineTotal: calc.lineTotal,
+        lineTotalCents: calc.lineTotalCents,
+        costEntryMode: calc.costEntryMode,
         markupPercent: calc.markupPercent,
         profit: calc.profit,
         batchNumber: r.batchNumber || undefined,
@@ -1676,6 +1779,59 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
+                {/* Cost Entry Mode Toggle: Line Total First vs Unit / Case Cost */}
+                <div
+                  className="flex items-center bg-slate-950 p-0.5 rounded-xl border border-slate-800"
+                  title="Choose default cost entry mode — both Line Total and Unit/Case Price remain editable on every row"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDefaultCostEntryMode('LINE_TOTAL');
+                      setRows((prev) =>
+                        prev.map((r) => {
+                          const c = getRowCalculations(r);
+                          return {
+                            ...r,
+                            costEntryMode: 'LINE_TOTAL',
+                            lineTotalInput: c.lineTotal > 0 ? c.lineTotal.toFixed(2) : r.lineTotalInput ?? '',
+                          };
+                        })
+                      );
+                    }}
+                    className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition cursor-pointer ${
+                      defaultCostEntryMode === 'LINE_TOTAL'
+                        ? 'bg-emerald-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Line Total First
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDefaultCostEntryMode('UNIT_COST');
+                      setRows((prev) =>
+                        prev.map((r) => {
+                          const c = getRowCalculations(r);
+                          return {
+                            ...r,
+                            costEntryMode: 'UNIT_COST',
+                            pricePerCase: c.pricePerCase > 0 ? roundUnitCost(c.pricePerCase) : r.pricePerCase,
+                          };
+                        })
+                      );
+                    }}
+                    className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition cursor-pointer ${
+                      defaultCostEntryMode === 'UNIT_COST'
+                        ? 'bg-blue-600 text-white shadow-sm'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Unit / Case Cost
+                  </button>
+                </div>
+
                 {/* View Mode Toggle: Cards vs Table for Mobile Ergonomics */}
                 <div className="flex items-center bg-slate-950 p-0.5 rounded-xl border border-slate-800">
                   <button
@@ -1863,8 +2019,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                               onClick={() => {
                                 if (row.receiveAs !== 'Cases') {
                                   const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
-                                  const currentUnitCost = calc.unitCost;
-                                  const converted = Number((currentUnitCost * ratio).toFixed(2));
+                                  const converted = roundUnitCost(calc.unitCost * ratio);
                                   updateRow(row.id, {
                                     receiveAs: 'Cases',
                                     pricePerCase: converted || row.pricePerCase,
@@ -1885,9 +2040,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                               type="button"
                               onClick={() => {
                                 if (row.receiveAs !== 'Singles') {
-                                  const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
-                                  const currentCaseCost = Number(row.pricePerCase) || 0;
-                                  const converted = Number((currentCaseCost / ratio).toFixed(2));
+                                  const converted = roundUnitCost(calc.unitCost);
                                   updateRow(row.id, {
                                     receiveAs: 'Singles',
                                     pricePerCase: converted || row.pricePerCase,
@@ -1917,9 +2070,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 type="button"
                                 onClick={() => {
                                   if (row.receiveAs === 'Cases') {
-                                    updateRow(row.id, { quantityCases: Math.max(0, (Number(row.quantityCases) || 0) - 1) });
+                                    handleRowQtyChange(row.id, 'quantityCases', Math.max(0, (Number(row.quantityCases) || 0) - 1));
                                   } else {
-                                    updateRow(row.id, { quantitySingles: Math.max(0, (Number(row.quantitySingles) || 0) - 1) });
+                                    handleRowQtyChange(row.id, 'quantitySingles', Math.max(0, (Number(row.quantitySingles) || 0) - 1));
                                   }
                                 }}
                                 className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center text-sm active:scale-95 cursor-pointer"
@@ -1933,8 +2086,8 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 value={row.receiveAs === 'Cases' ? row.quantityCases ?? '' : row.quantitySingles ?? ''}
                                 onChange={(e) => {
                                   const val = Number(e.target.value) || 0;
-                                  if (row.receiveAs === 'Cases') updateRow(row.id, { quantityCases: val });
-                                  else updateRow(row.id, { quantitySingles: val });
+                                  if (row.receiveAs === 'Cases') handleRowQtyChange(row.id, 'quantityCases', val);
+                                  else handleRowQtyChange(row.id, 'quantitySingles', val);
                                 }}
                                 placeholder="0"
                                 className="w-full text-center font-mono font-black text-amber-300 text-base bg-transparent focus:outline-none"
@@ -1943,9 +2096,9 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 type="button"
                                 onClick={() => {
                                   if (row.receiveAs === 'Cases') {
-                                    updateRow(row.id, { quantityCases: (Number(row.quantityCases) || 0) + 1 });
+                                    handleRowQtyChange(row.id, 'quantityCases', (Number(row.quantityCases) || 0) + 1);
                                   } else {
-                                    updateRow(row.id, { quantitySingles: (Number(row.quantitySingles) || 0) + 1 });
+                                    handleRowQtyChange(row.id, 'quantitySingles', (Number(row.quantitySingles) || 0) + 1);
                                   }
                                 }}
                                 className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold flex items-center justify-center text-sm active:scale-95 cursor-pointer"
@@ -1959,38 +2112,77 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                             </div>
                           </div>
 
-                          {/* Price / Case or Unit */}
+                          {/* Price / Case or Unit (4 decimals) */}
                           <div>
-                            <span className="text-[10px] font-bold uppercase text-slate-400 block mb-1">
-                              Price / {row.receiveAs === 'Singles' ? 'Unit' : 'Case'} ($):
-                            </span>
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-[10px] font-bold uppercase text-slate-400">
+                                Price / {row.receiveAs === 'Singles' ? 'Unit' : 'Case'} ($):
+                              </span>
+                              {calc.costEntryMode === 'UNIT_COST' && (
+                                <span className="text-[9px] font-bold text-blue-300 uppercase">Anchored</span>
+                              )}
+                            </div>
                             <div className="relative">
                               <span className="absolute left-3 top-2.5 text-xs text-slate-400 font-mono">$</span>
                               <input
                                 type="text"
                                 inputMode="decimal"
-                                value={row.pricePerCase ?? ''}
-                                placeholder="0.00"
-                                onChange={(e) => {
-                                  const val = cleanNumberInput(e.target.value, true);
-                                  updateRow(row.id, { pricePerCase: val });
-                                }}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-xl pl-7 pr-3 py-2 text-sm text-white font-mono font-bold focus:outline-none focus:border-amber-500"
+                                value={
+                                  calc.costEntryMode === 'LINE_TOTAL'
+                                    ? calc.pricePerCase > 0
+                                      ? formatUnitCost(calc.pricePerCase)
+                                      : ''
+                                    : row.pricePerCase ?? ''
+                                }
+                                placeholder="0.0000"
+                                onFocus={(e) => e.target.select()}
+                                onClick={(e) => (e.target as HTMLInputElement).select()}
+                                onChange={(e) => handleRowPriceChange(row.id, e.target.value)}
+                                className={`w-full bg-slate-900 rounded-xl pl-7 pr-3 py-2 text-sm text-white font-mono font-bold focus:outline-none ${
+                                  calc.costEntryMode === 'UNIT_COST'
+                                    ? 'border border-blue-500/70 focus:border-blue-400'
+                                    : 'border border-slate-700 focus:border-amber-500'
+                                }`}
                               />
                             </div>
                             <div className="text-[10px] text-slate-400 mt-1 font-mono">
-                              Unit Cost: ${calc.unitCost.toFixed(2)}
+                              Unit Cost: ${formatUnitCost(calc.unitCost)}
                             </div>
                           </div>
                         </div>
 
-                        {/* Line Total & Selling Price */}
-                        <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs font-mono">
-                          <div>
-                            <span className="text-[10px] text-slate-400 block uppercase font-sans font-bold">Line Total</span>
-                            <span className="text-base font-black text-emerald-400 font-mono">
-                              ${calc.lineTotal.toFixed(2)}
-                            </span>
+                        {/* Line Total (Editable) & Selling Price */}
+                        <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between gap-3 text-xs font-mono">
+                          <div className="flex-1 max-w-[165px]">
+                            <div className="flex items-center justify-between mb-1">
+                              <span className="text-[10px] text-emerald-400 uppercase font-sans font-bold">Line Total ($)</span>
+                              {calc.costEntryMode === 'LINE_TOTAL' && (
+                                <span className="text-[9px] font-sans font-bold text-emerald-300 uppercase">Anchored</span>
+                              )}
+                            </div>
+                            <div className="relative">
+                              <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-xs text-emerald-400 font-mono">$</span>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                value={
+                                  calc.costEntryMode === 'LINE_TOTAL'
+                                    ? row.lineTotalInput ?? ''
+                                    : calc.lineTotal > 0
+                                    ? calc.lineTotal.toFixed(2)
+                                    : ''
+                                }
+                                placeholder="0.00"
+                                onFocus={(e) => e.target.select()}
+                                onClick={(e) => (e.target as HTMLInputElement).select()}
+                                onChange={(e) => handleRowLineTotalChange(row.id, e.target.value)}
+                                className={`w-full bg-slate-900 rounded-xl pl-6 pr-2.5 py-1.5 text-sm font-black text-emerald-300 font-mono focus:outline-none ${
+                                  calc.costEntryMode === 'LINE_TOTAL'
+                                    ? 'border border-emerald-500/70 focus:border-emerald-400'
+                                    : 'border border-slate-700 focus:border-emerald-500'
+                                }`}
+                              />
+                            </div>
                           </div>
                           <div className="text-right">
                             <span className="text-[10px] text-slate-400 block uppercase font-sans font-bold">Selling Price</span>
@@ -2244,8 +2436,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 onClick={() => {
                                   if (row.receiveAs !== 'Cases') {
                                     const ratio = Math.max(1, Number(row.qtyPerCaseDefault) || 1);
-                                    const currentUnitCost = calc.unitCost;
-                                    const converted = Number((currentUnitCost * ratio).toFixed(2));
+                                    const converted = roundUnitCost(calc.unitCost * ratio);
                                     updateRow(row.id, {
                                       receiveAs: 'Cases',
                                       pricePerCase: converted || row.pricePerCase,
@@ -2265,10 +2456,10 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 type="button"
                                 onClick={() => {
                                   if (row.receiveAs !== 'Singles') {
-                                    const currentUnitCost = calc.unitCost;
+                                    const converted = roundUnitCost(calc.unitCost);
                                     updateRow(row.id, {
                                       receiveAs: 'Singles',
-                                      pricePerCase: Number(currentUnitCost.toFixed(2)) || row.pricePerCase,
+                                      pricePerCase: converted || row.pricePerCase,
                                     });
                                   }
                                 }}
@@ -2312,7 +2503,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 <div className="flex items-center justify-center gap-1">
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantityCases: Math.max(0, (Number(row.quantityCases) || 0) - 1) })}
+                                    onClick={() => handleRowQtyChange(row.id, 'quantityCases', Math.max(0, (Number(row.quantityCases) || 0) - 1))}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     -
@@ -2326,13 +2517,13 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                     onClick={(e) => (e.target as HTMLInputElement).select()}
                                     onChange={(e) => {
                                       const val = cleanNumberInput(e.target.value, false);
-                                      updateRow(row.id, { quantityCases: val });
+                                      handleRowQtyChange(row.id, 'quantityCases', val);
                                     }}
                                     className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-bold font-mono focus:outline-none focus:border-amber-500"
                                   />
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantityCases: (Number(row.quantityCases) || 0) + 1 })}
+                                    onClick={() => handleRowQtyChange(row.id, 'quantityCases', (Number(row.quantityCases) || 0) + 1)}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     +
@@ -2347,7 +2538,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                 <div className="flex items-center justify-center gap-1">
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantitySingles: Math.max(0, (Number(row.quantitySingles) || 0) - 1) })}
+                                    onClick={() => handleRowQtyChange(row.id, 'quantitySingles', Math.max(0, (Number(row.quantitySingles) || 0) - 1))}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     -
@@ -2361,13 +2552,13 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                                     onClick={(e) => (e.target as HTMLInputElement).select()}
                                     onChange={(e) => {
                                       const val = cleanNumberInput(e.target.value, false);
-                                      updateRow(row.id, { quantitySingles: val });
+                                      handleRowQtyChange(row.id, 'quantitySingles', val);
                                     }}
                                     className="w-14 bg-slate-900 border border-slate-700 rounded-lg px-1.5 py-1 text-center text-xs text-amber-300 font-bold font-mono focus:outline-none focus:border-amber-500"
                                   />
                                   <button
                                     type="button"
-                                    onClick={() => updateRow(row.id, { quantitySingles: (Number(row.quantitySingles) || 0) + 1 })}
+                                    onClick={() => handleRowQtyChange(row.id, 'quantitySingles', (Number(row.quantitySingles) || 0) + 1)}
                                     className="w-6 h-6 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold flex items-center justify-center text-xs"
                                   >
                                     +
@@ -2382,43 +2573,89 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
 
                           {/* 7. Last Cost */}
                           <td className="py-2.5 px-3 text-right font-mono text-slate-400">
-                            ${(row.lastCost || 0).toFixed(2)}
+                            ${formatUnitCost(row.lastCost || 0)}
                           </td>
 
-                          {/* 8. Price / Cost (Per Case or Per Unit depending on receiveAs) */}
+                          {/* 8. Price / Cost (Per Case or Per Unit depending on receiveAs, up to 4 decimals) */}
                           <td className="py-2.5 px-3">
                             <div className="flex flex-col items-end">
-                              <span className={`text-[10px] font-bold block mb-0.5 tracking-tight ${row.receiveAs === 'Singles' ? 'text-amber-400' : 'text-slate-400'}`}>
+                              <span
+                                className={`text-[10px] font-bold block mb-0.5 tracking-tight ${
+                                  calc.costEntryMode === 'UNIT_COST'
+                                    ? 'text-blue-300'
+                                    : row.receiveAs === 'Singles'
+                                    ? 'text-amber-400'
+                                    : 'text-slate-400'
+                                }`}
+                              >
                                 {row.receiveAs === 'Singles' ? 'Price / Unit' : 'Price / Case'}
+                                {calc.costEntryMode === 'UNIT_COST' ? ' •' : ''}
                               </span>
                               <div className="relative">
                                 <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs font-mono">$</span>
                                 <input
                                   type="text"
                                   inputMode="decimal"
-                                  value={row.pricePerCase ?? ''}
-                                  placeholder={row.receiveAs === 'Singles' ? '0.00' : '0.00'}
+                                  value={
+                                    calc.costEntryMode === 'LINE_TOTAL'
+                                      ? calc.pricePerCase > 0
+                                        ? formatUnitCost(calc.pricePerCase)
+                                        : ''
+                                      : row.pricePerCase ?? ''
+                                  }
+                                  placeholder="0.0000"
                                   onFocus={(e) => e.target.select()}
                                   onClick={(e) => (e.target as HTMLInputElement).select()}
-                                  onChange={(e) => {
-                                    const val = cleanNumberInput(e.target.value, true);
-                                    updateRow(row.id, { pricePerCase: val });
-                                  }}
-                                  className="w-32 bg-slate-900 border border-slate-700 focus:border-amber-500 rounded-lg pl-6 pr-2.5 py-1 text-right text-xs text-white font-mono font-bold focus:outline-none"
-                                  required
+                                  onChange={(e) => handleRowPriceChange(row.id, e.target.value)}
+                                  className={`w-32 bg-slate-900 rounded-lg pl-6 pr-2.5 py-1 text-right text-xs text-white font-mono font-bold focus:outline-none ${
+                                    calc.costEntryMode === 'UNIT_COST'
+                                      ? 'border border-blue-500/70 focus:border-blue-400'
+                                      : 'border border-slate-700 focus:border-amber-500'
+                                  }`}
                                 />
                               </div>
                             </div>
                           </td>
 
-                          {/* 9. Line Total */}
-                          <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400">
-                            ${calc.lineTotal.toFixed(2)}
+                          {/* 9. Line Total (Editable — Line-Total-First Entry) */}
+                          <td className="py-2.5 px-3 text-right">
+                            <div className="flex flex-col items-end">
+                              <span
+                                className={`text-[10px] font-bold block mb-0.5 tracking-tight ${
+                                  calc.costEntryMode === 'LINE_TOTAL' ? 'text-emerald-400' : 'text-slate-500'
+                                }`}
+                              >
+                                Line Total{calc.costEntryMode === 'LINE_TOTAL' ? ' •' : ''}
+                              </span>
+                              <div className="relative">
+                                <span className="absolute left-2 top-1/2 -translate-y-1/2 text-emerald-400 text-xs font-mono">$</span>
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={
+                                    calc.costEntryMode === 'LINE_TOTAL'
+                                      ? row.lineTotalInput ?? ''
+                                      : calc.lineTotal > 0
+                                      ? calc.lineTotal.toFixed(2)
+                                      : ''
+                                  }
+                                  placeholder="0.00"
+                                  onFocus={(e) => e.target.select()}
+                                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                                  onChange={(e) => handleRowLineTotalChange(row.id, e.target.value)}
+                                  className={`w-28 bg-slate-900 rounded-lg pl-5 pr-2 py-1 text-right text-xs text-emerald-300 font-mono font-black focus:outline-none ${
+                                    calc.costEntryMode === 'LINE_TOTAL'
+                                      ? 'border border-emerald-500/70 focus:border-emerald-400'
+                                      : 'border border-slate-700 focus:border-emerald-500'
+                                  }`}
+                                />
+                              </div>
+                            </div>
                           </td>
 
-                          {/* 10. Unit Cost */}
+                          {/* 10. Unit Cost (4 decimals) */}
                           <td className="py-2.5 px-3 text-right font-mono text-slate-300">
-                            ${calc.unitCost.toFixed(2)}
+                            ${formatUnitCost(calc.unitCost)}
                           </td>
 
                           {/* 11. Selling Price (LOCKED for Cashier, editable for Supervisor) */}
@@ -3493,7 +3730,7 @@ export const DirectGoodsReceivedView: React.FC<DirectGoodsReceivedViewProps> = (
                       <td className="py-2 text-right font-mono">{item.quantityCases || 0}</td>
                       <td className="py-2 text-right font-mono">{item.quantitySingles || 0}</td>
                       <td className="py-2 text-right font-mono">{item.quantity}</td>
-                      <td className="py-2 text-right font-mono">${item.costPrice.toFixed(2)}</td>
+                      <td className="py-2 text-right font-mono">${formatUnitCost(item.costPrice)}</td>
                       <td className="py-2 text-right font-mono font-bold">${item.lineTotal.toFixed(2)}</td>
                     </tr>
                   ))}

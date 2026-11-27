@@ -15,6 +15,12 @@ import {
   parsePackagingVariantsString,
   serializePackagingVariants,
 } from './dataExportImportService';
+import {
+  decomposeStockUnits,
+  normalizeStockFields,
+  roundCurrency,
+  roundUnitCost,
+} from '../utils/inventoryMath';
 
 export type MigrationEntityType = 'inventory' | 'customers' | 'suppliers';
 
@@ -1350,14 +1356,25 @@ export function commitMigrationJob(
         if (!existing && row.sku) existing = itemMap.get(`sku_${String(row.sku).toUpperCase().trim()}`);
         if (!existing && row.name) existing = itemMap.get(`name_${String(row.name).toLowerCase().trim()}`);
 
-        const costPerUnit = Number(row.costPrice) || 0;
-        const sellPriceUnit = Number(row.sellingPrice) || 0;
-        const unitsPerCase = Number(row.caseQuantity) || 1;
-        const costPerCase = Number(row.caseCost) || (costPerUnit * unitsPerCase);
-        const sellPriceCase = sellPriceUnit * unitsPerCase;
-        const totalUnits = Number(row.stockQuantity) || 0;
-        const stockCases = Number(row.stockCases) || (unitsPerCase > 1 ? Math.floor(totalUnits / unitsPerCase) : 0);
-        const stockSingles = Number(row.stockSingles) || (unitsPerCase > 1 ? totalUnits % unitsPerCase : totalUnits);
+        const unitsPerCase = Math.max(1, Number(row.caseQuantity) || 1);
+        const rawCostUnit = Number(row.costPrice) || 0;
+        const rawCostCase = Number(row.caseCost) || 0;
+        const costPerUnit = roundUnitCost(rawCostUnit > 0 ? rawCostUnit : (rawCostCase > 0 ? rawCostCase / unitsPerCase : 0));
+        const costPerCase = roundUnitCost(rawCostCase > 0 ? rawCostCase : costPerUnit * unitsPerCase);
+        const sellPriceUnit = roundCurrency(Number(row.sellingPrice) || 0);
+        const sellPriceCase = roundCurrency(sellPriceUnit * unitsPerCase);
+        const hasStockTotal = row.stockQuantity !== undefined && row.stockQuantity !== '' && row.stockQuantity !== null;
+        const rawCases = row.stockCases !== undefined && row.stockCases !== '' && row.stockCases !== null ? Number(row.stockCases) || 0 : undefined;
+        const rawSingles = row.stockSingles !== undefined && row.stockSingles !== '' && row.stockSingles !== null ? Number(row.stockSingles) || 0 : undefined;
+        const normStock = normalizeStockFields({
+          unitsPerCase,
+          totalUnits: hasStockTotal ? Number(row.stockQuantity) || 0 : ((rawCases || 0) * unitsPerCase + (rawSingles || 0)),
+          stockCases: rawCases,
+          stockSingles: rawSingles,
+        });
+        const totalUnits = normStock.totalUnits;
+        const stockCases = normStock.stockCases;
+        const stockSingles = normStock.stockSingles;
 
         const parsedVariants: PackagingVariant[] =
           Array.isArray(row._parsedVariants) && row._parsedVariants.length > 0
@@ -1375,9 +1392,9 @@ export function commitMigrationJob(
             itemMap.get(`name_${parentKey.toLowerCase()}`);
 
           if (parentItem) {
-            const varUnits = Number(row.variantUnits) || Number(row.caseQuantity) || 1;
-            const varSell = Number(row.sellingPrice) || Number((parentItem.sellPriceUnit * varUnits).toFixed(2));
-            const varCost = Number(row.costPrice) || Number((parentItem.costPerUnit * varUnits).toFixed(2));
+            const varUnits = Math.max(1, Number(row.variantUnits) || Number(row.caseQuantity) || 1);
+            const varSell = roundCurrency(Number(row.sellingPrice) || (parentItem.sellPriceUnit * varUnits));
+            const varCost = roundUnitCost(Number(row.costPrice) || (parentItem.costPerUnit * varUnits));
 
             const curVariants: PackagingVariant[] = Array.isArray(parentItem.packagingVariants)
               ? [...parentItem.packagingVariants]
@@ -1411,14 +1428,13 @@ export function commitMigrationJob(
             // Convert variant stock to parent units (Question 3: convert to parent units)
             const addedUnits = totalUnits > 0 ? totalUnits * varUnits : 0;
             if (addedUnits > 0) {
-              parentItem.totalUnits = (parentItem.totalUnits || 0) + addedUnits;
-              if (parentItem.unitsPerCase > 1) {
-                parentItem.stockCases = Math.floor(parentItem.totalUnits / parentItem.unitsPerCase);
-                parentItem.stockSingles = parentItem.totalUnits % parentItem.unitsPerCase;
-              } else {
-                parentItem.stockCases = 0;
-                parentItem.stockSingles = parentItem.totalUnits;
-              }
+              const nextTotal = normalizeStockFields(parentItem).totalUnits + addedUnits;
+              const decomp = decomposeStockUnits(nextTotal, parentItem.unitsPerCase || 1);
+              parentItem.totalUnits = decomp.totalUnits;
+              parentItem.stockCases = decomp.stockCases;
+              parentItem.stockSingles = decomp.stockSingles;
+              const unitBasis = parentItem.averageCostPerUnit ?? parentItem.costPerUnit ?? 0;
+              parentItem.stockValueCents = decomp.totalUnits > 0 ? Math.round(decomp.totalUnits * unitBasis * 100) : 0;
             }
 
             parentItem.lastUpdated = new Date().toISOString();
@@ -1435,18 +1451,30 @@ export function commitMigrationJob(
             recordsSkipped++;
             continue;
           } else if (conflictPolicy === 'update') {
+            const mergedTotal = normalizeStockFields(existing).totalUnits + totalUnits;
+            const mergedDecomp = decomposeStockUnits(mergedTotal, unitsPerCase);
+            const effUnitCost = costPerUnit > 0 ? costPerUnit : roundUnitCost(existing.costPerUnit || 0);
+            const effCaseCost = costPerCase > 0 ? costPerCase : roundUnitCost(effUnitCost * unitsPerCase);
+            const effAvgUnit = existing.averageCostPerUnit !== undefined && existing.averageCostPerUnit > 0
+              ? roundUnitCost(existing.averageCostPerUnit)
+              : effUnitCost;
             const updatedItem: InventoryItem = {
               ...existing,
               itemId: row.itemId || existing.itemId,
               itemName: row.name || existing.itemName,
-              costPerUnit,
+              costPerUnit: effUnitCost,
+              averageCostPerUnit: effAvgUnit,
+              latestCostPerUnit: effUnitCost,
               sellPriceUnit,
               unitsPerCase,
-              costPerCase,
+              costPerCase: effCaseCost,
+              averageCostPerCase: roundUnitCost(effAvgUnit * unitsPerCase),
+              latestCostPerCase: effCaseCost,
               sellPriceCase,
-              totalUnits: (existing.totalUnits || 0) + totalUnits,
-              stockCases: (existing.stockCases || 0) + stockCases,
-              stockSingles: (existing.stockSingles || 0) + stockSingles,
+              totalUnits: mergedDecomp.totalUnits,
+              stockCases: mergedDecomp.stockCases,
+              stockSingles: mergedDecomp.stockSingles,
+              stockValueCents: mergedDecomp.totalUnits > 0 ? Math.round(mergedDecomp.totalUnits * effAvgUnit * 100) : 0,
               category: row.category || existing.category || 'General',
               sku: row.sku || existing.sku,
               barcode: row.barcode || existing.barcode,
@@ -1480,11 +1508,16 @@ export function commitMigrationJob(
           unitsPerCase,
           costPerCase,
           costPerUnit,
+          averageCostPerUnit: costPerUnit,
+          averageCostPerCase: costPerCase,
+          latestCostPerUnit: costPerUnit,
+          latestCostPerCase: costPerCase,
           sellPriceCase,
           sellPriceUnit,
           stockCases,
           stockSingles,
           totalUnits,
+          stockValueCents: totalUnits > 0 ? Math.round(totalUnits * costPerUnit * 100) : 0,
           canSellAsCase: ['y', 'yes', 'true', '1'].includes(String(row.canSellAsCase || '').toLowerCase()),
           packagingVariants: parsedVariants.length > 0 ? parsedVariants : undefined,
           description: row.description || '',
@@ -1646,14 +1679,26 @@ export async function commitMigrationJobAsync(
         if (!existing && row.sku) existing = itemMap.get(`sku_${String(row.sku).toUpperCase().trim()}`);
         if (!existing && row.name) existing = itemMap.get(`name_${String(row.name).toLowerCase().trim()}`);
 
-        const costPerUnit = Number(row.costPrice) || 0;
-        const sellPriceUnit = Number(row.sellingPrice) || 0;
-        const unitsPerCase = Number(row.caseQuantity) || 1;
-        const costPerCase = Number(row.caseCost) || (costPerUnit * unitsPerCase);
-        const sellPriceCase = sellPriceUnit * unitsPerCase;
-        const totalUnits = Number(row.stockQuantity) || 0;
-        const stockCases = Number(row.stockCases) || (unitsPerCase > 1 ? Math.floor(totalUnits / unitsPerCase) : 0);
-        const stockSingles = Number(row.stockSingles) || (unitsPerCase > 1 ? totalUnits % unitsPerCase : totalUnits);
+        const unitsPerCase = Math.max(1, Number(row.caseQuantity) || 1);
+        const rawCostUnit = Number(row.costPrice) || 0;
+        const rawCostCase = Number(row.caseCost) || 0;
+        const costPerUnit = roundUnitCost(rawCostUnit > 0 ? rawCostUnit : (rawCostCase > 0 ? rawCostCase / unitsPerCase : 0));
+        const costPerCase = roundUnitCost(rawCostCase > 0 ? rawCostCase : costPerUnit * unitsPerCase);
+        const sellPriceUnit = roundCurrency(Number(row.sellingPrice) || 0);
+        const sellPriceCase = roundCurrency(sellPriceUnit * unitsPerCase);
+        const hasStockTotal = row.stockQuantity !== undefined && row.stockQuantity !== '' && row.stockQuantity !== null;
+        const rawCases = row.stockCases !== undefined && row.stockCases !== '' && row.stockCases !== null ? Number(row.stockCases) || 0 : undefined;
+        const rawSingles = row.stockSingles !== undefined && row.stockSingles !== '' && row.stockSingles !== null ? Number(row.stockSingles) || 0 : undefined;
+        const hasAnyStockInput = hasStockTotal || rawCases !== undefined || rawSingles !== undefined;
+        const normStock = normalizeStockFields({
+          unitsPerCase,
+          totalUnits: hasStockTotal ? Number(row.stockQuantity) || 0 : ((rawCases || 0) * unitsPerCase + (rawSingles || 0)),
+          stockCases: rawCases,
+          stockSingles: rawSingles,
+        });
+        const totalUnits = normStock.totalUnits;
+        const stockCases = normStock.stockCases;
+        const stockSingles = normStock.stockSingles;
 
         const parsedVariants: PackagingVariant[] =
           Array.isArray(row._parsedVariants) && row._parsedVariants.length > 0
@@ -1670,9 +1715,9 @@ export async function commitMigrationJobAsync(
             itemMap.get(`name_${parentKey.toLowerCase()}`);
 
           if (parentItem) {
-            const varUnits = Number(row.variantUnits) || Number(row.caseQuantity) || 1;
-            const varSell = Number(row.sellingPrice) || Number((parentItem.sellPriceUnit * varUnits).toFixed(2));
-            const varCost = Number(row.costPrice) || Number((parentItem.costPerUnit * varUnits).toFixed(2));
+            const varUnits = Math.max(1, Number(row.variantUnits) || Number(row.caseQuantity) || 1);
+            const varSell = roundCurrency(Number(row.sellingPrice) || (parentItem.sellPriceUnit * varUnits));
+            const varCost = roundUnitCost(Number(row.costPrice) || (parentItem.costPerUnit * varUnits));
 
             const curVariants: PackagingVariant[] = Array.isArray(parentItem.packagingVariants)
               ? [...parentItem.packagingVariants]
@@ -1705,14 +1750,13 @@ export async function commitMigrationJobAsync(
 
             const addedUnits = totalUnits > 0 ? totalUnits * varUnits : 0;
             if (addedUnits > 0) {
-              parentItem.totalUnits = (parentItem.totalUnits || 0) + addedUnits;
-              if (parentItem.unitsPerCase > 1) {
-                parentItem.stockCases = Math.floor(parentItem.totalUnits / parentItem.unitsPerCase);
-                parentItem.stockSingles = parentItem.totalUnits % parentItem.unitsPerCase;
-              } else {
-                parentItem.stockCases = 0;
-                parentItem.stockSingles = parentItem.totalUnits;
-              }
+              const nextTotal = normalizeStockFields(parentItem).totalUnits + addedUnits;
+              const decomp = decomposeStockUnits(nextTotal, parentItem.unitsPerCase || 1);
+              parentItem.totalUnits = decomp.totalUnits;
+              parentItem.stockCases = decomp.stockCases;
+              parentItem.stockSingles = decomp.stockSingles;
+              const unitBasis = parentItem.averageCostPerUnit ?? parentItem.costPerUnit ?? 0;
+              parentItem.stockValueCents = decomp.totalUnits > 0 ? Math.round(decomp.totalUnits * unitBasis * 100) : 0;
             }
 
             parentItem.lastUpdated = new Date().toISOString();
@@ -1729,20 +1773,34 @@ export async function commitMigrationJobAsync(
             recordsSkipped++;
             continue;
           }
+          const effUnitsPerCase = unitsPerCase || existing.unitsPerCase || 1;
+          const effUnitCost = costPerUnit || roundUnitCost(existing.costPerUnit || 0);
+          const effCaseCost = costPerCase || roundUnitCost(effUnitCost * effUnitsPerCase);
+          const effAvgUnit = existing.averageCostPerUnit !== undefined && existing.averageCostPerUnit > 0
+            ? roundUnitCost(existing.averageCostPerUnit)
+            : effUnitCost;
+          const nextStock = hasAnyStockInput
+            ? decomposeStockUnits(totalUnits, effUnitsPerCase)
+            : decomposeStockUnits(normalizeStockFields(existing).totalUnits, effUnitsPerCase);
           const updatedItem: InventoryItem = {
             ...existing,
             itemName: row.name || existing.itemName,
             category: row.category || existing.category,
-            costPrice: costPerUnit || existing.costPrice,
-            costPerUnit: costPerUnit || existing.costPerUnit,
-            costPerCase: costPerCase || existing.costPerCase,
+            costPrice: effUnitCost,
+            costPerUnit: effUnitCost,
+            averageCostPerUnit: effAvgUnit,
+            latestCostPerUnit: effUnitCost,
+            costPerCase: effCaseCost,
+            averageCostPerCase: roundUnitCost(effAvgUnit * effUnitsPerCase),
+            latestCostPerCase: effCaseCost,
             sellingPrice: sellPriceUnit || existing.sellingPrice,
             sellPriceUnit: sellPriceUnit || existing.sellPriceUnit,
             sellPriceCase: sellPriceCase || existing.sellPriceCase,
-            unitsPerCase: unitsPerCase || existing.unitsPerCase,
-            stockCases: stockCases !== undefined ? stockCases : existing.stockCases,
-            stockSingles: stockSingles !== undefined ? stockSingles : existing.stockSingles,
-            totalUnits: totalUnits !== undefined ? totalUnits : existing.totalUnits,
+            unitsPerCase: effUnitsPerCase,
+            stockCases: nextStock.stockCases,
+            stockSingles: nextStock.stockSingles,
+            totalUnits: nextStock.totalUnits,
+            stockValueCents: nextStock.totalUnits > 0 ? Math.round(nextStock.totalUnits * effAvgUnit * 100) : 0,
             barcode: row.barcode || existing.barcode,
             sku: row.sku || existing.sku,
             packagingVariants: parsedVariants.length > 0 ? parsedVariants : existing.packagingVariants,
@@ -1762,7 +1820,11 @@ export async function commitMigrationJobAsync(
             category: row.category || 'General',
             costPrice: costPerUnit,
             costPerUnit,
+            averageCostPerUnit: costPerUnit,
+            latestCostPerUnit: costPerUnit,
             costPerCase,
+            averageCostPerCase: costPerCase,
+            latestCostPerCase: costPerCase,
             sellingPrice: sellPriceUnit,
             sellPriceUnit,
             sellPriceCase,
@@ -1770,6 +1832,7 @@ export async function commitMigrationJobAsync(
             stockCases,
             stockSingles,
             totalUnits,
+            stockValueCents: totalUnits > 0 ? Math.round(totalUnits * costPerUnit * 100) : 0,
             reorderLevelCases: 2,
             reorderLevelUnits: 10,
             barcode: row.barcode || '',

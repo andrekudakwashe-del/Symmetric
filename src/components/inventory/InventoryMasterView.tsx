@@ -58,6 +58,15 @@ import {
   subscribeRoomDatabase,
 } from '../../db/roomDatabase';
 import { meshSyncService } from '../../services/meshSyncService';
+import {
+  normalizeStockFields,
+  computePortfolioValuation,
+  computeItemValuationCents,
+  resolveItemValuationUnitCost,
+  isItemBelowReorderPoint,
+  formatUnitCost,
+  roundUnitCost,
+} from '../../utils/inventoryMath';
 
 export const getCasePlural = (item?: { casePackageName?: string } | null): string => {
   const name = item?.casePackageName?.trim();
@@ -73,17 +82,20 @@ export const safeToFixed = (val: any, decimals = 2): string => {
 
 export const normalizeInventoryItem = (item: any): InventoryItem => {
   if (!item) return item;
-  const unitsPerCase = Math.max(1, Number(item.unitsPerCase || item.UnitsPerCase || 1) || 1);
+  const canonicalStock = normalizeStockFields(item);
+  const unitsPerCase = canonicalStock.unitsPerCase;
   const sellPriceUnit = Number(item.sellPriceUnit !== undefined && item.sellPriceUnit !== null ? item.sellPriceUnit : (item.price ?? item.SellingPrice ?? 0)) || 0;
-  const costPerCase = Number(item.costPerCase !== undefined && item.costPerCase !== null ? item.costPerCase : (item.costPrice ?? item.CostPrice ?? (item.costPerUnit ? item.costPerUnit * unitsPerCase : 0))) || 0;
-  const costPerUnit = Number(item.costPerUnit !== undefined && item.costPerUnit !== null ? item.costPerUnit : (unitsPerCase > 0 ? costPerCase / unitsPerCase : 0)) || 0;
+  const costPerCase = roundUnitCost(Number(item.costPerCase !== undefined && item.costPerCase !== null ? item.costPerCase : (item.costPrice ?? item.CostPrice ?? (item.costPerUnit ? item.costPerUnit * unitsPerCase : 0))) || 0);
+  const costPerUnit = roundUnitCost(Number(item.costPerUnit !== undefined && item.costPerUnit !== null ? item.costPerUnit : (unitsPerCase > 0 ? costPerCase / unitsPerCase : 0)) || 0);
   const sellPriceCase = Number(item.sellPriceCase !== undefined && item.sellPriceCase !== null ? item.sellPriceCase : (sellPriceUnit * unitsPerCase)) || 0;
-  const stockCases = Number(item.stockCases !== undefined && item.stockCases !== null ? item.stockCases : (unitsPerCase > 1 ? Math.floor(Number(item.totalUnits ?? item.stockQuantity ?? 0) / unitsPerCase) : 0)) || 0;
-  const stockSingles = Number(item.stockSingles !== undefined && item.stockSingles !== null ? item.stockSingles : (Number(item.totalUnits ?? item.stockQuantity ?? 0) - (stockCases * unitsPerCase))) || 0;
-  const totalUnits = Number(item.totalUnits !== undefined && item.totalUnits !== null ? item.totalUnits : (item.stockQuantity ?? (stockCases * unitsPerCase + stockSingles))) || 0;
-  const averageCostPerUnit = item.averageCostPerUnit !== undefined && item.averageCostPerUnit !== null && !isNaN(Number(item.averageCostPerUnit))
-    ? Number(item.averageCostPerUnit)
-    : costPerUnit;
+  const averageCostPerUnit =
+    item.averageCostPerUnit !== undefined && item.averageCostPerUnit !== null && !isNaN(Number(item.averageCostPerUnit)) && Number(item.averageCostPerUnit) > 0
+      ? roundUnitCost(Number(item.averageCostPerUnit))
+      : costPerUnit;
+  const averageCostPerCase =
+    item.averageCostPerCase !== undefined && item.averageCostPerCase !== null && !isNaN(Number(item.averageCostPerCase)) && Number(item.averageCostPerCase) > 0
+      ? roundUnitCost(Number(item.averageCostPerCase))
+      : roundUnitCost(averageCostPerUnit * unitsPerCase);
 
   return {
     ...item,
@@ -92,10 +104,11 @@ export const normalizeInventoryItem = (item: any): InventoryItem => {
     costPerCase,
     costPerUnit,
     sellPriceCase,
-    stockCases,
-    stockSingles,
-    totalUnits,
+    stockCases: canonicalStock.stockCases,
+    stockSingles: canonicalStock.stockSingles,
+    totalUnits: canonicalStock.totalUnits,
     averageCostPerUnit,
+    averageCostPerCase,
     canSellAsCase: Boolean(item.canSellAsCase),
   };
 };
@@ -153,6 +166,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [selectedCategory, setSelectedCategory] = useState('ALL');
   const [filterLowStockOnly, setFilterLowStockOnly] = useState(false);
+  const [filterNegativeStockOnly, setFilterNegativeStockOnly] = useState(false);
   const [viewMode, setViewMode] = useState<'simplistic' | 'table'>('simplistic');
 
   // Smart sticky search: hides on scroll down, slides down & freezes at top on scroll up
@@ -312,20 +326,12 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     return allCategoryNames.filter((c) => (c || '').toLowerCase().includes(term));
   }, [allCategoryNames, categorySearchTerm]);
 
-  // Metrics
-  const totalValuation = items.reduce((sum, i) => {
-    const sc = Number(i.stockCases) || 0;
-    const cc = Number(i.costPerCase) || 0;
-    const ss = Number(i.stockSingles) || 0;
-    const upc = Number(i.unitsPerCase) || 1;
-    const cpu = cc / upc;
-    return sum + (sc * cc) + (ss * cpu);
-  }, 0);
-  const totalCasesInStock = items.reduce((sum, i) => sum + (Number(i.stockCases) || 0), 0);
-  const totalSinglesInStock = items.reduce((sum, i) => sum + (Number(i.stockSingles) || 0), 0);
-  const lowStockItems = items.filter(
-    (i) => (Number(i.stockCases) || 0) <= (Number(i.reorderLevelCases) || 2) || (Number(i.stockSingles) || 0) <= (Number(i.reorderLevelUnits) || 10)
-  );
+  // Metrics: Unified integer-cent MWAC valuation (positive stock only) + isolated negative stock exposure
+  const portfolio = useMemo(() => computePortfolioValuation(items), [items]);
+  const totalValuation = portfolio.totalValuationDollars;
+  const totalCasesInStock = portfolio.positiveCases;
+  const totalSinglesInStock = portfolio.positiveSingles;
+  const lowStockItems = useMemo(() => items.filter((i) => isItemBelowReorderPoint(i)), [items]);
 
   // Filtered items (Optimized with deferredSearchQuery to eliminate keystroke lag)
   const filteredItems = useMemo(() => {
@@ -339,9 +345,10 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
         (item.category && item.category.toLowerCase().includes(q));
 
       const matchesCategory = selectedCategory === 'ALL' || item.category === selectedCategory;
-      const matchesLowStock = !filterLowStockOnly || (Number(item.stockCases) || 0) <= (Number(item.reorderLevelCases) || 2);
+      const matchesLowStock = !filterLowStockOnly || isItemBelowReorderPoint(item);
+      const matchesNegative = !filterNegativeStockOnly || (Number(item.totalUnits) || 0) < 0;
 
-      return matchesSearch && matchesCategory && matchesLowStock;
+      return matchesSearch && matchesCategory && matchesLowStock && matchesNegative;
     });
 
     const seen = new Set<string>();
@@ -359,7 +366,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
     return deduped.sort((a, b) =>
       (a.itemName || '').localeCompare(b.itemName || '', undefined, { sensitivity: 'base' })
     );
-  }, [items, deferredSearchQuery, selectedCategory, filterLowStockOnly]);
+  }, [items, deferredSearchQuery, selectedCategory, filterLowStockOnly, filterNegativeStockOnly]);
 
   const inventoryTableScrollRef = useRef<HTMLDivElement | null>(null);
   const inventoryTableSlice = useVirtualTableSlice({
@@ -635,7 +642,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
           </div>
           <div className="mt-1.5 sm:mt-2">
             <div className="text-xl sm:text-2xl font-black font-mono tracking-tight">${safeToFixed(totalValuation)}</div>
-            <div className="text-[11px] text-slate-400 mt-0.5">{items.length} Tracked SKUs</div>
+            <div className="text-[11px] text-slate-400 mt-0.5">{items.length} Tracked SKUs • MWAC</div>
           </div>
         </div>
 
@@ -662,7 +669,11 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
         </div>
 
         <div
-          onClick={() => setFilterLowStockOnly(!filterLowStockOnly)}
+          onClick={() => {
+            const next = !filterLowStockOnly;
+            setFilterLowStockOnly(next);
+            if (next) setFilterNegativeStockOnly(false);
+          }}
           className={`cursor-pointer rounded-2xl p-3.5 sm:p-4 shadow-sm border transition-all flex flex-col justify-between ${
             filterLowStockOnly
               ? 'bg-rose-600 text-white border-rose-700 ring-2 ring-rose-300'
@@ -702,6 +713,44 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Isolated Negative Stock Exposure Banner (excluded from positive valuation & stock-on-hand counts) */}
+      {portfolio.negativeSkuCount > 0 && (
+        <div
+          className={`rounded-2xl px-4 py-3 border flex flex-wrap items-center justify-between gap-3 transition-all ${
+            filterNegativeStockOnly
+              ? 'bg-rose-700 text-white border-rose-800 shadow-md'
+              : 'bg-amber-50 text-amber-950 border-amber-200'
+          }`}
+        >
+          <div className="flex items-center gap-2.5">
+            <AlertTriangle className={`w-4 h-4 shrink-0 ${filterNegativeStockOnly ? 'text-amber-200' : 'text-rose-600'}`} />
+            <div className="text-xs sm:text-sm font-bold leading-snug">
+              <span>
+                Negative Stock Exposure: {portfolio.negativeSkuCount} SKU{portfolio.negativeSkuCount === 1 ? '' : 's'} ({portfolio.negativeTotalUnits} units • -${safeToFixed(portfolio.negativeExposureDollars)} cost)
+              </span>
+              <span className={`block text-[11px] font-medium ${filterNegativeStockOnly ? 'text-rose-100' : 'text-amber-800'}`}>
+                Isolated from Positive Store Valuation and Stock on Hand counts so deficits never distort asset totals.
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              const next = !filterNegativeStockOnly;
+              setFilterNegativeStockOnly(next);
+              if (next) setFilterLowStockOnly(false);
+            }}
+            className={`px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition cursor-pointer ${
+              filterNegativeStockOnly
+                ? 'bg-white text-rose-700 hover:bg-rose-50'
+                : 'bg-rose-600 text-white hover:bg-rose-700'
+            }`}
+          >
+            {filterNegativeStockOnly ? 'Show All SKUs' : `View ${portfolio.negativeSkuCount} Negative`}
+          </button>
+        </div>
+      )}
 
       {/* Floating Quick Search Button when scrolled down */}
       {!isAtTop && (
@@ -1026,7 +1075,9 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                   renderItem={(item) => {
                     const isSelected = activeSelectedItem?.itemId === item.itemId;
                     const canSellCase = Boolean(item.canSellAsCase);
-                    const isLow = item.stockCases <= item.reorderLevelCases || item.stockSingles <= item.reorderLevelUnits;
+                    const isLow = isItemBelowReorderPoint(item);
+                    const isNegative = item.totalUnits < 0;
+                    const mwacUnitCost = resolveItemValuationUnitCost(item);
 
                     return (
                       <div
@@ -1073,7 +1124,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                               <span className={`text-[11px] font-mono font-bold px-2 py-0.5 rounded-md ${
                                 isSelected ? 'bg-amber-500/25 text-amber-200 border border-amber-400/30' : 'bg-amber-50 text-amber-900 border border-amber-200'
                               }`}>
-                                Avg Cost: ${safeToFixed(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || (item.costPerCase / (item.unitsPerCase || 1))))}/ea
+                                Avg Cost: ${formatUnitCost(mwacUnitCost)}/ea
                               </span>
                             </div>
                           </div>
@@ -1091,11 +1142,15 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                             )}
                             <div className="mt-1 flex items-center gap-1">
                               <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded-md ${
-                                isLow
+                                isNegative
+                                  ? isSelected ? 'bg-rose-500/40 text-rose-100' : 'bg-rose-600 text-white'
+                                  : isLow
                                   ? isSelected ? 'bg-rose-500/30 text-rose-200' : 'bg-rose-100 text-rose-800'
                                   : isSelected ? 'bg-slate-800 text-slate-200' : 'bg-slate-100 text-slate-700'
                               }`}>
-                                {item.stockSingles} Singles {item.stockCases > 0 ? `+ ${item.stockCases} ${getCasePlural(item)}` : ''}
+                                {isNegative
+                                  ? `0 ${getCasePlural(item)}, ${item.totalUnits} u`
+                                  : `${item.stockSingles} Singles ${item.stockCases > 0 ? `+ ${item.stockCases} ${getCasePlural(item)}` : ''}`}
                               </span>
                             </div>
                           </div>
@@ -1233,7 +1288,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockSingles} Units</span>
                       </div>
                       <div className="text-[10px] text-slate-400 mt-0.5">
-                        Latest Cost: ${safeToFixed((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))}/ea
+                        Latest Cost: ${formatUnitCost(activeSelectedItem.costPerUnit || ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1)))}/ea
                       </div>
                     </div>
 
@@ -1273,13 +1328,13 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-200 text-amber-900 font-mono">Real-time</span>
                       </div>
                       <div className="text-base font-black font-mono text-amber-950 mt-0.5">
-                        ${safeToFixed(activeSelectedItem.averageCostPerUnit !== undefined && activeSelectedItem.averageCostPerUnit > 0 ? activeSelectedItem.averageCostPerUnit : (activeSelectedItem.costPerUnit || ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))))} / unit
+                        ${formatUnitCost(resolveItemValuationUnitCost(activeSelectedItem))} / unit
                       </div>
                     </div>
                     <div className="text-right">
                       <div className="text-amber-800 text-[10px] uppercase font-bold">Latest Purchase Invoice</div>
                       <div className="text-xs font-mono font-bold text-slate-700 mt-0.5">
-                        ${safeToFixed((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))} / unit
+                        ${formatUnitCost(activeSelectedItem.latestCostPerUnit || activeSelectedItem.costPerUnit || ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1)))} / unit
                       </div>
                     </div>
                   </div>
@@ -1295,7 +1350,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                     <div className="text-right">
                       <div className="text-slate-400 text-[10px] uppercase font-bold">Inventory Valuation</div>
                       <div className="text-base font-black font-mono text-emerald-400 mt-0.5">
-                        ${safeToFixed(((activeSelectedItem.stockCases || 0) * (activeSelectedItem.costPerCase || 0)) + ((activeSelectedItem.stockSingles || 0) * ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))))}
+                        ${safeToFixed(computeItemValuationCents(activeSelectedItem) / 100)}
                       </div>
                     </div>
                   </div>
@@ -1429,9 +1484,11 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                     )}
                     {visibleTableItems.map((item, localIdx) => {
                       const idx = inventoryTableSlice.startIndex + localIdx;
-                      const isLowCases = item.stockCases <= item.reorderLevelCases;
+                      const isLowStock = isItemBelowReorderPoint(item);
+                      const isNegativeStock = item.totalUnits < 0;
                       const isZeroSingles = item.stockSingles === 0;
-                      const costPerUnit = item.costPerCase / (item.unitsPerCase || 1);
+                      const costPerUnit = item.costPerUnit || (item.costPerCase / (item.unitsPerCase || 1));
+                      const mwacUnitCost = resolveItemValuationUnitCost(item);
 
                       return (
                         <tr
@@ -1476,7 +1533,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                             className={`font-mono font-bold text-sm px-2.5 py-1 rounded-lg ${
                               item.stockCases === 0
                                 ? 'bg-slate-100 text-slate-500'
-                                : isLowCases
+                                : isLowStock
                                 ? 'bg-amber-50 text-amber-800 border border-amber-200'
                                 : 'text-slate-900'
                             }`}
@@ -1488,7 +1545,9 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         <td className="py-3.5 px-4 text-center">
                           <span
                             className={`font-mono font-bold text-sm px-2.5 py-1 rounded-lg ${
-                              isZeroSingles
+                              isNegativeStock
+                                ? 'bg-rose-600 text-white'
+                                : isZeroSingles && isLowStock
                                 ? 'bg-rose-50 text-rose-800 border border-rose-200'
                                 : 'text-slate-900'
                             }`}
@@ -1498,19 +1557,19 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                         </td>
 
                         <td className="py-3.5 px-4 text-center bg-slate-50/50">
-                          <div className="font-mono font-black text-slate-950 text-base">
+                          <div className={`font-mono font-black text-base ${isNegativeStock ? 'text-rose-700' : 'text-slate-950'}`}>
                             {item.totalUnits}
                           </div>
                         </td>
 
                         <td className="py-3.5 px-3 text-right font-mono">
-                          <div className="text-slate-900 font-bold">${safeToFixed(item.costPerCase)}</div>
-                          <div className="text-xs text-slate-500">${safeToFixed(costPerUnit)}</div>
+                          <div className="text-slate-900 font-bold">${formatUnitCost(item.costPerCase)}</div>
+                          <div className="text-xs text-slate-500">${formatUnitCost(costPerUnit)}</div>
                         </td>
 
                         <td className="py-3.5 px-3 text-right font-mono bg-amber-50/40 border-x border-amber-100">
                           <span className="text-xs font-black text-amber-950 bg-amber-100/90 px-2 py-0.5 rounded border border-amber-300 inline-block shadow-2xs">
-                            ${safeToFixed(item.averageCostPerUnit !== undefined && item.averageCostPerUnit > 0 ? item.averageCostPerUnit : (item.costPerUnit || costPerUnit))}
+                            ${formatUnitCost(mwacUnitCost)}
                           </span>
                           <span className="text-[10px] text-amber-700 block mt-0.5 font-sans font-semibold">/ea</span>
                         </td>
@@ -1679,7 +1738,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
                   Stock: <span className="font-bold text-slate-900 font-mono">{activeSelectedItem.stockSingles} Units</span>
                 </div>
                 <div className="text-[10px] text-slate-400 mt-0.5">
-                  Cost: ${safeToFixed((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))}/ea
+                  Cost: ${formatUnitCost(activeSelectedItem.costPerUnit || ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1)))}/ea
                 </div>
               </div>
 
@@ -1722,7 +1781,7 @@ export const InventoryMasterView: React.FC<InventoryMasterViewProps> = ({
               <div className="text-right">
                 <div className="text-slate-400 text-[10px] uppercase font-bold">Inventory Valuation</div>
                 <div className="text-lg font-black font-mono text-emerald-400 mt-0.5">
-                  ${safeToFixed(((activeSelectedItem.stockCases || 0) * (activeSelectedItem.costPerCase || 0)) + ((activeSelectedItem.stockSingles || 0) * ((activeSelectedItem.costPerCase || 0) / (activeSelectedItem.unitsPerCase || 1))))}
+                  ${safeToFixed(computeItemValuationCents(activeSelectedItem) / 100)}
                 </div>
               </div>
             </div>

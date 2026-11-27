@@ -12,6 +12,7 @@ import {
   InternalConsumption,
   StocktakeSession,
 } from '../types';
+import { normalizeStockFields, resolveItemValuationUnitCost } from '../utils/inventoryMath';
 import type { MqttClient } from 'mqtt';
 import {
   getSales,
@@ -9530,10 +9531,30 @@ class MeshSyncManager {
     console.log('[DEBUG] Broadcasting price to Hub:', item.itemName);
 
     const packetId = `ITEM-UPDATE-${cleanId || now}-${now}-${Math.random().toString(36).substring(2, 6)}`;
+    const stock = normalizeStockFields(item);
+    const avgCostUnit = resolveItemValuationUnitCost(item);
+    const avgCostCase =
+      item.averageCostPerCase !== undefined && Number(item.averageCostPerCase) > 0
+        ? Number(item.averageCostPerCase)
+        : Number((avgCostUnit * stock.unitsPerCase).toFixed(2));
+    const latestCostUnit =
+      item.latestCostPerUnit !== undefined && Number(item.latestCostPerUnit) > 0
+        ? Number(item.latestCostPerUnit)
+        : Number(item.costPerUnit || avgCostUnit || 0);
+    const latestCostCase =
+      item.latestCostPerCase !== undefined && Number(item.latestCostPerCase) > 0
+        ? Number(item.latestCostPerCase)
+        : Number(item.costPerCase || Number((latestCostUnit * stock.unitsPerCase).toFixed(2)) || 0);
     const enrichedItem = {
       ...item,
-      totalUnits: Number(item.totalUnits || 0),
-      stockSingles: Number(item.stockSingles !== undefined ? item.stockSingles : item.totalUnits || 0),
+      unitsPerCase: stock.unitsPerCase,
+      stockCases: stock.stockCases,
+      stockSingles: stock.stockSingles,
+      totalUnits: stock.totalUnits,
+      averageCostPerUnit: Number(avgCostUnit.toFixed(4)),
+      averageCostPerCase: Number(avgCostCase.toFixed(2)),
+      latestCostPerUnit: Number(latestCostUnit.toFixed(4)),
+      latestCostPerCase: Number(latestCostCase.toFixed(2)),
       snapshotTimestamp: now,
       updatedAt: now,
       hubTimestamp: now,

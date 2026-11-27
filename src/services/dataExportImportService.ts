@@ -14,6 +14,13 @@ import {
   PackagingVariant,
 } from '../types';
 import {
+  computePortfolioValuation,
+  decomposeStockUnits,
+  formatUnitCost,
+  normalizeStockFields,
+  roundUnitCost,
+} from '../utils/inventoryMath';
+import {
   getInventoryItems,
   saveInventoryItem,
   getCustomers,
@@ -255,19 +262,20 @@ export function exportInventoryToCsv(customItems?: InventoryItem[]): string {
   const rows: string[] = [INVENTORY_CSV_HEADERS.join(',')];
 
   items.forEach((item) => {
+    const stock = normalizeStockFields(item);
     const row = [
       escapeCsvValue(item.itemId),
       escapeCsvValue(item.itemName),
       escapeCsvValue(item.category || 'General'),
       escapeCsvValue(item.canSellAsCase ? 'Y' : 'N'),
-      escapeCsvValue(item.unitsPerCase || 1),
-      escapeCsvValue(item.costPerCase?.toFixed(2) || '0.00'),
-      escapeCsvValue(item.costPerUnit?.toFixed(2) || '0.00'),
+      escapeCsvValue(stock.unitsPerCase),
+      escapeCsvValue(formatUnitCost(item.costPerCase || 0)),
+      escapeCsvValue(formatUnitCost(item.costPerUnit || 0)),
       escapeCsvValue(item.sellPriceCase?.toFixed(2) || '0.00'),
       escapeCsvValue(item.sellPriceUnit?.toFixed(2) || '0.00'),
-      escapeCsvValue(item.stockCases || 0),
-      escapeCsvValue(item.stockSingles || 0),
-      escapeCsvValue(item.totalUnits || (item.stockCases * item.unitsPerCase + item.stockSingles)),
+      escapeCsvValue(stock.stockCases),
+      escapeCsvValue(stock.stockSingles),
+      escapeCsvValue(stock.totalUnits),
       escapeCsvValue(item.reorderLevelCases || 1),
       escapeCsvValue(item.reorderLevelUnits || 5),
       escapeCsvValue(item.sku || item.itemId),
@@ -292,20 +300,21 @@ export function exportInventoryExpandedVariantsToCsv(customItems?: InventoryItem
   const rows: string[] = [INVENTORY_CSV_HEADERS.join(',')];
 
   items.forEach((item) => {
+    const stock = normalizeStockFields(item);
     // 1. Master product row
     const masterRow = [
       escapeCsvValue(item.itemId),
       escapeCsvValue(item.itemName),
       escapeCsvValue(item.category || 'General'),
       escapeCsvValue(item.canSellAsCase ? 'Y' : 'N'),
-      escapeCsvValue(item.unitsPerCase || 1),
-      escapeCsvValue(item.costPerCase?.toFixed(2) || '0.00'),
-      escapeCsvValue(item.costPerUnit?.toFixed(2) || '0.00'),
+      escapeCsvValue(stock.unitsPerCase),
+      escapeCsvValue(formatUnitCost(item.costPerCase || 0)),
+      escapeCsvValue(formatUnitCost(item.costPerUnit || 0)),
       escapeCsvValue(item.sellPriceCase?.toFixed(2) || '0.00'),
       escapeCsvValue(item.sellPriceUnit?.toFixed(2) || '0.00'),
-      escapeCsvValue(item.stockCases || 0),
-      escapeCsvValue(item.stockSingles || 0),
-      escapeCsvValue(item.totalUnits || (item.stockCases * item.unitsPerCase + item.stockSingles)),
+      escapeCsvValue(stock.stockCases),
+      escapeCsvValue(stock.stockSingles),
+      escapeCsvValue(stock.totalUnits),
       escapeCsvValue(item.reorderLevelCases || 1),
       escapeCsvValue(item.reorderLevelUnits || 5),
       escapeCsvValue(item.sku || item.itemId),
@@ -321,9 +330,9 @@ export function exportInventoryExpandedVariantsToCsv(customItems?: InventoryItem
     if (item.packagingVariants && Array.isArray(item.packagingVariants) && item.packagingVariants.length > 0) {
       item.packagingVariants.forEach((v) => {
         const units = v.unitsPerPack || 1;
-        const costPrice = v.costPrice !== undefined ? v.costPrice : Number((item.costPerUnit * units).toFixed(2));
-        const sellPrice = v.sellPrice !== undefined ? v.sellPrice : Number((item.sellPriceUnit * units).toFixed(2));
-        const unitCost = Number((costPrice / units).toFixed(2));
+        const costPrice = v.costPrice !== undefined ? roundUnitCost(v.costPrice) : roundUnitCost((item.costPerUnit || 0) * units);
+        const sellPrice = v.sellPrice !== undefined ? v.sellPrice : Number(((item.sellPriceUnit || 0) * units).toFixed(2));
+        const unitCost = roundUnitCost(costPrice / units);
         const unitSell = Number((sellPrice / units).toFixed(2));
 
         const variantRow = [
@@ -332,8 +341,8 @@ export function exportInventoryExpandedVariantsToCsv(customItems?: InventoryItem
           escapeCsvValue(item.category || 'General'),
           escapeCsvValue('N'),
           escapeCsvValue(units),
-          escapeCsvValue(costPrice.toFixed(2)),
-          escapeCsvValue(unitCost.toFixed(2)),
+          escapeCsvValue(formatUnitCost(costPrice)),
+          escapeCsvValue(formatUnitCost(unitCost)),
           escapeCsvValue(sellPrice.toFixed(2)),
           escapeCsvValue(unitSell.toFixed(2)),
           escapeCsvValue(0),
@@ -507,9 +516,12 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
     let costPerUnit = parseFloat(costUnitIdx >= 0 ? row[costUnitIdx]?.replace(/[^0-9.]/g, '') : '0') || 0;
 
     if (costPerCase > 0 && costPerUnit === 0) {
-      costPerUnit = costPerCase / unitsPerCase;
+      costPerUnit = roundUnitCost(costPerCase / unitsPerCase);
     } else if (costPerUnit > 0 && costPerCase === 0) {
-      costPerCase = costPerUnit * unitsPerCase;
+      costPerCase = roundUnitCost(costPerUnit * unitsPerCase);
+    } else {
+      costPerCase = roundUnitCost(costPerCase);
+      costPerUnit = roundUnitCost(costPerUnit);
     }
 
     let sellPriceUnit = parseFloat(sellUnitIdx >= 0 ? row[sellUnitIdx]?.replace(/[^0-9.]/g, '') : '0') || 0;
@@ -520,8 +532,14 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
     }
 
     const stockCases = Math.max(0, parseInt(stockCaseIdx >= 0 ? row[stockCaseIdx] : '0', 10) || 0);
-    const stockSingles = Math.max(0, parseInt(stockSingleIdx >= 0 ? row[stockSingleIdx] : '0', 10) || 0);
-    const totalUnits = stockCases * unitsPerCase + stockSingles;
+    const stockSingles = parseInt(stockSingleIdx >= 0 ? row[stockSingleIdx] : '0', 10) || 0;
+    const canonicalStock = normalizeStockFields({
+      stockCases,
+      stockSingles,
+      unitsPerCase,
+      canSellAsCase,
+    });
+    const totalUnits = canonicalStock.totalUnits;
 
     const sku = (skuIdx >= 0 && row[skuIdx]?.trim()) || itemId;
     const barcode = (barcodeIdx >= 0 && row[barcodeIdx]?.trim()) || '';
@@ -587,7 +605,7 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
             name: varName,
             unitsPerPack: varUnits || 1,
             sellPrice: varPrice || 0,
-            costPrice: costPerUnit > 0 ? costPerUnit * (varUnits || 1) : undefined,
+            costPrice: costPerUnit > 0 ? roundUnitCost(costPerUnit * (varUnits || 1)) : undefined,
             barcode: barcode || undefined,
             sku: sku || undefined,
           };
@@ -598,18 +616,21 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
             parentItem.packagingVariants.push(newVariant);
           }
 
-          // Convert variant stock into parent units (Question 3: convert to parent units)
+          // Convert variant stock into parent units (canonical decomposition)
           const variantStockQty = stockCases > 0 ? stockCases : stockSingles;
           const convertedUnits = variantStockQty * (varUnits || 1);
           if (convertedUnits > 0) {
-            parentItem.totalUnits = (parentItem.totalUnits || 0) + convertedUnits;
-            if (parentItem.unitsPerCase > 1) {
-              parentItem.stockCases = Math.floor(parentItem.totalUnits / parentItem.unitsPerCase);
-              parentItem.stockSingles = parentItem.totalUnits % parentItem.unitsPerCase;
-            } else {
-              parentItem.stockCases = 0;
-              parentItem.stockSingles = parentItem.totalUnits;
-            }
+            const nextParentTotal = (parentItem.totalUnits || 0) + convertedUnits;
+            const parentDecomp = decomposeStockUnits(nextParentTotal, Math.max(1, parentItem.unitsPerCase || 1), {
+              keepCasesZero: (parentItem.unitsPerCase || 1) <= 1,
+            });
+            parentItem.totalUnits = parentDecomp.totalUnits;
+            parentItem.stockCases = parentDecomp.stockCases;
+            parentItem.stockSingles = parentDecomp.stockSingles;
+            parentItem.stockValueCents =
+              parentDecomp.totalUnits > 0
+                ? Math.round(parentDecomp.totalUnits * (parentItem.averageCostPerUnit || parentItem.costPerUnit || 0) * 100)
+                : 0;
           }
           // Do not add expanded variant row as standalone master item
           continue;
@@ -627,10 +648,15 @@ export function parseInventoryCsv(csvText: string): ParsedInventoryResult {
       unitsPerCase,
       costPerCase,
       costPerUnit,
+      averageCostPerUnit: costPerUnit,
+      averageCostPerCase: costPerCase,
+      latestCostPerUnit: costPerUnit,
+      latestCostPerCase: costPerCase,
+      stockValueCents: totalUnits > 0 ? Math.round(totalUnits * costPerUnit * 100) : 0,
       sellPriceCase,
       sellPriceUnit,
-      stockCases,
-      stockSingles,
+      stockCases: canonicalStock.stockCases,
+      stockSingles: canonicalStock.stockSingles,
       totalUnits,
       reorderLevelCases: 2,
       reorderLevelUnits: Math.max(5, unitsPerCase),
@@ -1419,8 +1445,8 @@ export function generateReportCsv(reportType: SystemReportType): string {
           escapeCsvValue(l.receiveAs),
           escapeCsvValue(l.receivedCases),
           escapeCsvValue(l.receivedSingles),
-          escapeCsvValue(l.costPerCase.toFixed(2)),
-          escapeCsvValue(l.costPerUnit.toFixed(2)),
+          escapeCsvValue(formatUnitCost(l.costPerCase)),
+          escapeCsvValue(formatUnitCost(l.costPerUnit)),
           escapeCsvValue(l.sellingPrice?.toFixed(2) || '0.00'),
           escapeCsvValue(l.marginPercent?.toFixed(1) || '0.0'),
           escapeCsvValue(l.lineTotal.toFixed(2)),
@@ -1537,14 +1563,15 @@ export function generateReportCsv(reportType: SystemReportType): string {
       const changes = getCustomerChangeReport();
       const recons = getReconciliations();
 
-      const totalInventoryValuation = items.reduce(
-        (acc, i) => acc + (i.stockCases * i.costPerCase + i.stockSingles * i.costPerUnit),
-        0
-      );
-      const totalInventorySellValue = items.reduce(
-        (acc, i) => acc + (i.stockCases * (i.sellPriceCase || i.sellPriceUnit * i.unitsPerCase) + i.stockSingles * i.sellPriceUnit),
-        0
-      );
+      const portfolio = computePortfolioValuation(items);
+      const totalInventoryValuation = portfolio.totalValuationDollars;
+      const totalInventorySellCents = items.reduce((acc, i) => {
+        const { totalUnits } = normalizeStockFields(i);
+        if (totalUnits <= 0) return acc;
+        const unitSell = Number(i.sellPriceUnit) || 0;
+        return acc + Math.round(totalUnits * unitSell * 100);
+      }, 0);
+      const totalInventorySellValue = totalInventorySellCents / 100;
       const totalSalesRevenue = sales.reduce((acc, s) => acc + s.total, 0);
       const totalCreditDebt = credits.summary.totalOutstandingDebt;
       const totalCustomerTrustChange = changes.summary.totalChangeOwed;

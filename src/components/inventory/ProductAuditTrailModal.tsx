@@ -26,6 +26,7 @@ import {
   removeManualStock,
   subscribeRoomDatabase,
 } from '../../db/roomDatabase';
+import { formatUnitCost, normalizeStockFields } from '../../utils/inventoryMath';
 
 interface ProductAuditTrailModalProps {
   isOpen: boolean;
@@ -173,10 +174,11 @@ export const ProductAuditTrailModal: React.FC<ProductAuditTrailModalProps> = ({
 
   if (!isOpen || !item) return null;
 
-  const unitsPerCase = Math.max(1, item.unitsPerCase || 1);
+  const canonicalStock = normalizeStockFields(item);
+  const unitsPerCase = canonicalStock.unitsPerCase;
   const casePkgName = item.casePackageName || 'Case';
   const casePkgPlural = casePkgName.toLowerCase().endsWith('s') ? casePkgName : `${casePkgName}s`;
-  const totalUnits = (item.stockCases * unitsPerCase) + item.stockSingles;
+  const totalUnits = canonicalStock.totalUnits;
 
   // Filter trail
   const filteredTrail = trail.filter((entry) => {
@@ -440,10 +442,10 @@ export const ProductAuditTrailModal: React.FC<ProductAuditTrailModalProps> = ({
               Current Balance
             </span>
             <div className="text-lg font-mono font-black text-white">
-              {item.stockCases} {casePkgPlural}, {item.stockSingles} ea
+              {canonicalStock.stockCases} {casePkgPlural}, {canonicalStock.stockSingles} ea
             </div>
             <span className="text-[11px] font-mono text-slate-400 block mt-0.5">
-              Total Units: <strong className="text-amber-400">{totalUnits}</strong> (Cost: ${item.costPerUnit.toFixed(2)})
+              Total Units: <strong className="text-amber-400">{totalUnits}</strong> (Cost: ${formatUnitCost(item.costPerUnit)})
             </span>
           </div>
 

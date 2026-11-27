@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Salesperson, ActiveTab, ParkedSale } from '../../types';
-import { getParkedSales, getSales, getCashLogs, getTodayDateString, subscribeToDatabase } from '../../db/roomDatabase';
+import { getParkedSales, getSales, getCashLogs, getTodayDateString, isSupervisorOrAbove, subscribeToDatabase } from '../../db/roomDatabase';
 import { isSameDaySafe } from '../../utils/dateUtils';
 import {
   Menu,
@@ -472,7 +472,9 @@ export const POSHomeView: React.FC<POSHomeViewProps> = ({
         >
           <div className="text-[10px] text-slate-400 font-bold uppercase">Today's Shift</div>
           <div className="text-sm sm:text-base font-black text-white mt-0.5">Orders List</div>
-          <div className="text-[10px] text-blue-400 font-medium">{todaySales.length} Processed</div>
+          <div className="text-[10px] text-blue-400 font-medium">
+            {isSupervisorOrAbove(currentUser?.role) ? `${todaySales.length} Processed` : 'Last 5 & Lookup'}
+          </div>
         </div>
       </div>
 

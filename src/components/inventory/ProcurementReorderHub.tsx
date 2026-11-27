@@ -73,6 +73,12 @@ import { SupplierRegistrationModal } from '../suppliers/SupplierRegistrationModa
 import { PurchaseOrderRegistryView } from './PurchaseOrderRegistryView';
 import type { PurchaseOrderLine } from '../../types';
 import { INITIAL_GOODS_RECEIVED, INITIAL_SUPPLIER_INVOICES, INITIAL_INVENTORY_ITEMS } from '../../data/initialData';
+import {
+  computeReorderPointTotalUnits,
+  formatUnitCost,
+  normalizeStockFields,
+  roundUnitCost,
+} from '../../utils/inventoryMath';
 
 export const STORAGE_KEY_PO_DRAFT = 'saimetric_draft_purchase_order';
 
@@ -708,11 +714,11 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
 
     // Step 1: Analyze each product
     const list: Omit<ReorderItemAnalysis, 'isFundedInBudget' | 'selected'>[] = inventoryItems.map((item) => {
-      const unitsPerCase = Math.max(1, item.unitsPerCase || 1);
-      const casesStock = Math.max(0, item.stockCases !== undefined ? item.stockCases : ((item as any).stockQuantityCases || 0));
-      const singlesStock = Math.max(0, item.stockSingles !== undefined ? item.stockSingles : ((item as any).singleUnits || 0));
-      const currentStockUnits = casesStock * unitsPerCase + singlesStock;
-      const currentStockCases = casesStock + singlesStock / unitsPerCase;
+      const normStock = normalizeStockFields(item);
+      const unitsPerCase = normStock.unitsPerCase;
+      const singlesStock = normStock.stockSingles;
+      const currentStockUnits = normStock.totalUnits;
+      const currentStockCases = currentStockUnits / unitsPerCase;
 
       const supRecord = productSuppliersMap.get(item.itemId);
       const supInfo = supRecord?.primary || { name: 'Unassigned Vendor', leadTimeDays: defaultLeadTimeDays, id: undefined };
@@ -776,15 +782,15 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       // Projected Stockout Days
       const projectedStockoutDays =
         avgDailySales <= 0
-          ? currentStockUnits === 0
+          ? currentStockUnits <= 0
             ? 0
             : 999
-          : currentStockUnits / avgDailySales;
+          : Math.max(0, currentStockUnits / avgDailySales);
 
       // Supplier Lead Time & Safety Stock
       const leadTimeDays = item.leadTimeDays && item.leadTimeDays > 0 ? item.leadTimeDays : (supInfo.leadTimeDays || defaultLeadTimeDays);
       const safetyStockUnits = Math.max(
-        item.reorderLevelUnits || 0,
+        computeReorderPointTotalUnits(item),
         Math.round(avgDailySales * leadTimeDays * (safetyBufferPercent / 100))
       );
 
@@ -795,7 +801,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       const baseUnitCost = item.costPerUnit !== undefined ? item.costPerUnit : ((item as any).lastCostPrice || (item as any).costPrice || 0);
       const baseCaseCost = item.costPerCase !== undefined ? item.costPerCase : (baseUnitCost * unitsPerCase);
       const caseCost = orderCostOverrides[item.itemId] !== undefined ? orderCostOverrides[item.itemId] : baseCaseCost;
-      const unitCost = Number((caseCost / unitsPerCase).toFixed(4));
+      const unitCost = roundUnitCost(caseCost / unitsPerCase);
       const unitSellingPrice = item.sellPriceUnit !== undefined ? item.sellPriceUnit : ((item as any).price || 0);
       const grossMarginPercent =
         unitSellingPrice > 0 ? Math.max(0, ((unitSellingPrice - unitCost) / unitSellingPrice) * 100) : 0;
@@ -818,8 +824,11 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       let priorityTier: PriorityTier = 'HEALTHY';
       let urgencyReason = '';
 
-      if (currentStockUnits === 0) {
-        if (isSlowMover && avgDailySales <= 0 && salesStats.sales30d === 0) {
+      if (currentStockUnits <= 0) {
+        if (currentStockUnits < 0) {
+          priorityTier = 'CRITICAL';
+          urgencyReason = `NEGATIVE STOCK (${currentStockUnits} un — Immediate Restock)`;
+        } else if (isSlowMover && avgDailySales <= 0 && salesStats.sales30d === 0) {
           priorityTier = 'PLAN';
           urgencyReason = 'OUT OF STOCK (Zero 30d Velocity / Slow Mover)';
         } else {
@@ -849,7 +858,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
         if (suggestedOrderUnits > 0) {
           suggestedOrderCases = Math.max(1, Math.ceil(suggestedOrderUnits / unitsPerCase));
           suggestedOrderUnits = suggestedOrderCases * unitsPerCase;
-        } else if (currentStockUnits === 0) {
+        } else if (currentStockUnits <= 0) {
           suggestedOrderCases = 1;
           suggestedOrderUnits = unitsPerCase;
         }
@@ -1505,14 +1514,18 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     const originalItem = inventoryItems.find((it) => it.itemId === line.itemId);
     if (!originalItem) return;
 
+    const nextCaseCost = roundUnitCost(line.caseCost);
+    const nextUnitCost = roundUnitCost(line.unitCost);
     const updatedItem: InventoryItem = {
       ...originalItem,
-      costPerCase: line.caseCost,
-      costPerUnit: line.unitCost,
-      lastCostPrice: line.unitCost,
+      costPerCase: nextCaseCost,
+      costPerUnit: nextUnitCost,
+      latestCostPerCase: nextCaseCost,
+      latestCostPerUnit: nextUnitCost,
+      lastCostPrice: nextUnitCost,
     };
     saveInventoryItem(updatedItem);
-    setToastNotification(`Updated catalog master cost for "${line.name}" to $${line.caseCost.toFixed(2)}/case ($${line.unitCost.toFixed(2)}/unit).`);
+    setToastNotification(`Updated catalog master cost for "${line.name}" to $${formatUnitCost(nextCaseCost)}/case ($${formatUnitCost(nextUnitCost)}/unit).`);
 
     setPoCustomLines((prev) =>
       prev.map((l) =>
@@ -1530,11 +1543,15 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       if (line.isCostModified) {
         const originalItem = inventoryItems.find((it) => it.itemId === line.itemId);
         if (originalItem) {
+          const nextCaseCost = roundUnitCost(line.caseCost);
+          const nextUnitCost = roundUnitCost(line.unitCost);
           saveInventoryItem({
             ...originalItem,
-            costPerCase: line.caseCost,
-            costPerUnit: line.unitCost,
-            lastCostPrice: line.unitCost,
+            costPerCase: nextCaseCost,
+            costPerUnit: nextUnitCost,
+            latestCostPerCase: nextCaseCost,
+            latestCostPerUnit: nextUnitCost,
+            lastCostPrice: nextUnitCost,
           });
           count++;
         }
@@ -1593,8 +1610,8 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
       line.orderCases,
       line.unitsPerCase,
       line.totalUnits,
-      line.unitCost.toFixed(2),
-      line.caseCost.toFixed(2),
+      formatUnitCost(line.unitCost),
+      formatUnitCost(line.caseCost),
       line.lineTotal.toFixed(2),
     ]);
 
@@ -1616,7 +1633,7 @@ export const ProcurementReorderHub: React.FC<ProcurementReorderHubProps> = ({
     const linesText = poCustomLines
       .map(
         (l, idx) =>
-          `${idx + 1}. *${l.name}* (${l.code})\n   • Qty: *${l.orderCases} Cases* (${l.totalUnits} units @ $${l.caseCost.toFixed(2)}/cs)\n   • Line Total: $${l.lineTotal.toFixed(2)}`
+          `${idx + 1}. *${l.name}* (${l.code})\n   • Qty: *${l.orderCases} Cases* (${l.totalUnits} units @ $${formatUnitCost(l.caseCost)}/cs)\n   • Line Total: $${l.lineTotal.toFixed(2)}`
       )
       .join('\n\n');
 
@@ -2416,7 +2433,7 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                     <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-slate-100 text-center font-mono">
                       <div className="bg-slate-50 p-2 rounded-xl border border-slate-100">
                         <div className="text-[10px] text-slate-500 uppercase font-sans font-bold">Stock on Hand</div>
-                        <div className={`text-xs font-black ${entry.currentStockUnits === 0 ? 'text-rose-600' : 'text-slate-900'}`}>
+                        <div className={`text-xs font-black ${entry.currentStockUnits <= 0 ? 'text-rose-600' : 'text-slate-900'}`}>
                           {entry.currentStockUnits === 0 ? '0 Units' : `${entry.currentStockUnits} un`}
                         </div>
                         <div className="text-[10px] text-slate-400">
@@ -2744,7 +2761,7 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
 
                           {/* Stock On Hand */}
                           <td className="py-3 px-3 text-right font-mono">
-                            <div className={`font-black text-xs ${entry.currentStockUnits === 0 ? 'text-rose-600' : 'text-slate-900'}`}>
+                            <div className={`font-black text-xs ${entry.currentStockUnits <= 0 ? 'text-rose-600' : 'text-slate-900'}`}>
                               {entry.currentStockUnits === 0 ? '0 UNITS' : `${entry.currentStockUnits} units`}
                             </div>
                             {entry.unitsPerCase > 1 && (
@@ -2828,7 +2845,7 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                               {entry.grossMarginPercent.toFixed(1)}%
                             </span>
                             <div className="text-[10px] text-slate-500">
-                              Cost ${entry.unitCost.toFixed(2)}
+                              Cost ${formatUnitCost(entry.unitCost)}
                             </div>
                           </td>
 
@@ -3510,9 +3527,9 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
                                           ? 'bg-rose-50 text-rose-700 border border-rose-200'
                                           : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                                       }`}
-                                      title={`Catalog master cost: $${orig.toFixed(2)}/cs`}
+                                      title={`Catalog master cost: $${formatUnitCost(orig)}/cs`}
                                     >
-                                      {isIncrease ? '▲ +' : '▼ -'}${Math.abs(diff).toFixed(2)} ({pct > 0 ? `+${pct.toFixed(1)}%` : `${pct.toFixed(1)}%`})
+                                      {isIncrease ? '▲ +' : '▼ -'}${formatUnitCost(Math.abs(diff))} ({pct > 0 ? `+${pct.toFixed(1)}%` : `${pct.toFixed(1)}%`})
                                     </span>
                                     <button
                                       type="button"
@@ -3529,9 +3546,9 @@ ${poTotals.freight > 0 ? `• Freight / Delivery: *$${poTotals.freight.toFixed(2
 
                             {/* On Print: Clean Typography */}
                             <div className="hidden print:block font-mono text-slate-900 font-medium">
-                              ${line.caseCost.toFixed(2)}/cs
+                              ${formatUnitCost(line.caseCost)}/cs
                               <div className="text-[9px] text-slate-500 font-sans font-normal">
-                                (${line.unitCost.toFixed(2)}/ea)
+                                (${formatUnitCost(line.unitCost)}/ea)
                               </div>
                             </div>
                           </td>

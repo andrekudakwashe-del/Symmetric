@@ -32,6 +32,7 @@ import {
   Salesperson,
 } from '../../types';
 import { getZoneAssignments } from '../../db/roomDatabase';
+import { formatUnitCost } from '../../utils/inventoryMath';
 
 interface ConsolidatedVarianceViewProps {
   session: StocktakeSession;
@@ -292,7 +293,7 @@ export const ConsolidatedVarianceView: React.FC<ConsolidatedVarianceViewProps> =
         `"${String(i.itemName || '').replace(/"/g, '""')}"`,
         `"${i.category}"`,
         i.unitsPerCase,
-        i.costPerUnit.toFixed(2),
+        formatUnitCost(i.costPerUnit),
         i.sellPriceUnit.toFixed(2),
         i.systemCases,
         i.systemSingles,

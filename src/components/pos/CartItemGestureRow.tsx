@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { CartItem } from '../../types';
 import { getCurrentUser, isSupervisorOrAbove } from '../../db/roomDatabase';
+import { isItemBelowReorderPoint, normalizeStockFields } from '../../utils/inventoryMath';
 import { Pencil, Scale, Trash2 } from 'lucide-react';
 
 interface CartItemGestureRowProps {
@@ -165,7 +166,8 @@ export const CartItemGestureRow: React.FC<CartItemGestureRowProps> = ({
   const unitPrice =
     item.customPrice !== undefined ? item.customPrice : item.product.price;
   const lineTotal = unitPrice * item.quantity;
-  const isOOS = item.product.stockQuantity === 0;
+  const totalStockUnits = normalizeStockFields(item.product).totalUnits;
+  const isOOS = totalStockUnits <= 0;
   const isFractional = item.isFractional || item.product.sellByFraction;
   const unitLabel = item.fractionUnit || item.product.fractionUnit || item.product.unit || 'unit';
 
@@ -261,8 +263,7 @@ export const CartItemGestureRow: React.FC<CartItemGestureRowProps> = ({
           {(() => {
             const user = getCurrentUser();
             const canSeeRaw = isSupervisorOrAbove(user?.role) || Boolean(user?.permissions?.canManageInventory);
-            const totalStockUnits = (Number(item.product.stockCases) || 0) * (item.product.unitsPerCase || 1) + (Number(item.product.stockQuantity) || 0);
-            const isLow = !isOOS && totalStockUnits <= (item.product.reorderLevelUnits || 5);
+            const isLow = !isOOS && isItemBelowReorderPoint(item.product);
 
             if (isOOS) {
               return (

@@ -34,6 +34,7 @@ import {
 import { meshSyncService } from '../../services/meshSyncService';
 import { PackagingRatioModal } from './PackagingRatioModal';
 import { cleanNumberInput } from './GoodsReceivedView';
+import { formatUnitCost, roundUnitCost } from '../../utils/inventoryMath';
 
 export interface ProductAddEditModalProps {
   isOpen: boolean;
@@ -101,6 +102,8 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
   const [canSellAsCase, setCanSellAsCase] = useState(false);
   const [caseReserveThreshold, setCaseReserveThreshold] = useState<string | number>(0);
   const [costPerCase, setCostPerCase] = useState<string | number>('');
+  const [costPerUnitInput, setCostPerUnitInput] = useState<string | number>('');
+  const [costAnchor, setCostAnchor] = useState<'CASE' | 'UNIT'>('CASE');
   const [sellPriceUnit, setSellPriceUnit] = useState<string | number>('');
   const [sellPriceCase, setSellPriceCase] = useState<string | number>('');
   const [stockCases, setStockCases] = useState<string | number>(0);
@@ -169,7 +172,17 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       setUnitsPerCase(initialItem.unitsPerCase ?? 24);
       setCanSellAsCase(Boolean(initialItem.canSellAsCase));
       setCaseReserveThreshold(initialItem.caseReserveThreshold !== undefined ? initialItem.caseReserveThreshold : 0);
-      setCostPerCase(initialItem.costPerCase !== undefined ? initialItem.costPerCase : '');
+      const initUpc = Math.max(1, Number(initialItem.unitsPerCase) || 1);
+      const initCostCase = initialItem.costPerCase !== undefined ? roundUnitCost(Number(initialItem.costPerCase) || 0) : '';
+      const initCostUnit =
+        initialItem.costPerUnit !== undefined && Number(initialItem.costPerUnit) > 0
+          ? roundUnitCost(Number(initialItem.costPerUnit))
+          : initCostCase !== '' && Number(initCostCase) > 0
+          ? roundUnitCost(Number(initCostCase) / initUpc)
+          : '';
+      setCostPerCase(initCostCase);
+      setCostPerUnitInput(initCostUnit);
+      setCostAnchor('CASE');
       setSellPriceUnit(initialItem.sellPriceUnit !== undefined ? initialItem.sellPriceUnit : '');
       setSellPriceCase(initialItem.sellPriceCase !== undefined ? initialItem.sellPriceCase : '');
       setStockCases(initialItem.stockCases !== undefined ? initialItem.stockCases : 0);
@@ -193,6 +206,8 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       setUnitsPerCase(24);
       setCanSellAsCase(false);
       setCostPerCase('');
+      setCostPerUnitInput('');
+      setCostAnchor('CASE');
       setSellPriceUnit('');
       setSellPriceCase('');
       setStockCases(0);
@@ -239,10 +254,32 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
 
   if (!isOpen) return null;
 
-  // Safe numerical calculations allowing typing
+  // Safe numerical calculations allowing typing (supports 4-decimal unit cost precision)
   const safeUnitsPerCase = Math.max(1, Number(unitsPerCase) || 1);
-  const safeCostPerCase = Math.max(0, Number(costPerCase) || 0);
-  const calculatedCostPerUnit = safeUnitsPerCase > 0 ? safeCostPerCase / safeUnitsPerCase : 0;
+  const calculatedCostPerUnit =
+    costAnchor === 'UNIT'
+      ? roundUnitCost(Math.max(0, Number(costPerUnitInput) || 0))
+      : roundUnitCost(safeUnitsPerCase > 0 ? Math.max(0, Number(costPerCase) || 0) / safeUnitsPerCase : 0);
+  const safeCostPerCase =
+    costAnchor === 'UNIT'
+      ? roundUnitCost(calculatedCostPerUnit * safeUnitsPerCase)
+      : roundUnitCost(Math.max(0, Number(costPerCase) || 0));
+
+  const handleCostPerCaseChange = (rawVal: string) => {
+    const cleaned = cleanNumberInput(rawVal, true, 4);
+    setCostAnchor('CASE');
+    setCostPerCase(cleaned);
+    const num = Math.max(0, Number(cleaned) || 0);
+    setCostPerUnitInput(cleaned === '' ? '' : roundUnitCost(num / safeUnitsPerCase));
+  };
+
+  const handleCostPerUnitChange = (rawVal: string) => {
+    const cleaned = cleanNumberInput(rawVal, true, 4);
+    setCostAnchor('UNIT');
+    setCostPerUnitInput(cleaned);
+    const num = Math.max(0, Number(cleaned) || 0);
+    setCostPerCase(cleaned === '' ? '' : roundUnitCost(num * safeUnitsPerCase));
+  };
   const safeSellPriceUnit = Math.max(0, Number(sellPriceUnit) || 0);
   const safeSellPriceCase = canSellAsCase
     ? Math.max(0, Number(sellPriceCase) || 0)
@@ -271,7 +308,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       name: newVarName.trim(),
       unitsPerPack: numUnits,
       sellPrice: numPrice,
-      costPrice: Number((calculatedCostPerUnit * numUnits).toFixed(2)),
+      costPrice: roundUnitCost(calculatedCostPerUnit * numUnits),
     };
     setPackagingVariants([...packagingVariants, newVar]);
     setNewVarName('');
@@ -296,7 +333,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       name: presetName,
       unitsPerPack: units,
       sellPrice: calculatedPrice,
-      costPrice: Number((calculatedCostPerUnit * units).toFixed(2)),
+      costPrice: roundUnitCost(calculatedCostPerUnit * units),
     };
     setPackagingVariants([...packagingVariants, newVar]);
   };
@@ -344,6 +381,19 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       caseReserveThreshold: Math.max(0, Number(caseReserveThreshold) || 0),
       costPerCase: safeCostPerCase,
       costPerUnit: calculatedCostPerUnit,
+      latestCostPerCase: safeCostPerCase,
+      latestCostPerUnit: calculatedCostPerUnit,
+      ...(isEditing && initialItem && Math.abs((initialItem.costPerUnit || 0) - calculatedCostPerUnit) > 0.00005
+        ? {
+            averageCostPerUnit: calculatedCostPerUnit,
+            averageCostPerCase: safeCostPerCase,
+          }
+        : !isEditing
+        ? {
+            averageCostPerUnit: calculatedCostPerUnit,
+            averageCostPerCase: safeCostPerCase,
+          }
+        : {}),
       sellPriceUnit: safeSellPriceUnit,
       sellPriceCase: safeSellPriceCase,
       stockCases: safeStockCases,
@@ -767,7 +817,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
               </div>
 
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                {/* Cost per Case */}
+                {/* Cost per Case (up to 4 decimals) */}
                 <div>
                   <label className="block text-[11px] font-bold text-slate-700 mb-1">
                     Cost / {casePackageName || 'Case'} ($)
@@ -775,7 +825,15 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                   <input
                     type="text"
                     inputMode="decimal"
-                    value={costPerCase === 0 || costPerCase === '0' || costPerCase === '' ? '' : costPerCase}
+                    value={
+                      costAnchor === 'UNIT'
+                        ? safeCostPerCase > 0
+                          ? formatUnitCost(safeCostPerCase)
+                          : ''
+                        : costPerCase === 0 || costPerCase === '0' || costPerCase === ''
+                        ? ''
+                        : costPerCase
+                    }
                     onFocus={(e) => {
                       if (costPerCase === 0 || costPerCase === '0') {
                         setCostPerCase('');
@@ -784,20 +842,45 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                       }
                     }}
                     onClick={(e) => (e.target as HTMLInputElement).select()}
-                    onChange={(e) => setCostPerCase(cleanNumberInput(e.target.value, true))}
-                    placeholder="0.00"
-                    className="w-full py-2 px-3 bg-white border border-slate-300 rounded-xl text-sm font-mono font-bold text-slate-950 focus:outline-none focus:ring-2 focus:ring-indigo-600"
+                    onChange={(e) => handleCostPerCaseChange(e.target.value)}
+                    placeholder="0.0000"
+                    className={`w-full py-2 px-3 bg-white border rounded-xl text-sm font-mono font-bold text-slate-950 focus:outline-none focus:ring-2 focus:ring-indigo-600 ${
+                      costAnchor === 'CASE' ? 'border-indigo-400' : 'border-slate-300'
+                    }`}
                   />
                 </div>
 
-                {/* Single Unit Cost (calculated) */}
+                {/* Single Unit Cost (editable, up to 4 decimals) */}
                 <div>
                   <label className="block text-[11px] font-bold text-slate-700 mb-1">
                     Single Cost ($)
                   </label>
-                  <div className="w-full py-2 px-3 bg-slate-100 border border-slate-200 rounded-xl text-sm font-mono font-bold text-slate-700">
-                    ${calculatedCostPerUnit.toFixed(2)}
-                  </div>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={
+                      costAnchor === 'CASE'
+                        ? calculatedCostPerUnit > 0
+                          ? formatUnitCost(calculatedCostPerUnit)
+                          : ''
+                        : costPerUnitInput === 0 || costPerUnitInput === '0' || costPerUnitInput === ''
+                        ? ''
+                        : costPerUnitInput
+                    }
+                    onFocus={(e) => {
+                      if (costPerUnitInput === 0 || costPerUnitInput === '0') {
+                        setCostPerUnitInput('');
+                      } else {
+                        e.target.select();
+                      }
+                    }}
+                    onClick={(e) => (e.target as HTMLInputElement).select()}
+                    onChange={(e) => handleCostPerUnitChange(e.target.value)}
+                    placeholder="0.0000"
+                    className={`w-full py-2 px-3 bg-white border rounded-xl text-sm font-mono font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-600 ${
+                      costAnchor === 'UNIT' ? 'border-indigo-400' : 'border-slate-300'
+                    }`}
+                  />
                 </div>
 
                 {/* Selling Price Singles */}

@@ -8,6 +8,7 @@ import {
   AccountLedgerEntry,
 } from '../../services/cashCustodyService';
 import { toTimeStringSafe } from '../../utils/dateUtils';
+import { formatUnitCost } from '../../utils/inventoryMath';
 import {
   X,
   Download,
@@ -748,7 +749,7 @@ export const AccountStatementModal: React.FC<AccountStatementModalProps> = ({
                                   <span className="text-slate-200 truncate">
                                     {it.productName}{' '}
                                     <span className="text-slate-400 font-mono text-[10px]">
-                                      ({it.qty} {it.unit || 'u'} × ${it.unitCost.toFixed(2)})
+                                      ({it.qty} {it.unit || 'u'} × ${formatUnitCost(it.unitCost)})
                                     </span>
                                   </span>
                                   <span className="font-mono font-bold text-emerald-400 shrink-0">

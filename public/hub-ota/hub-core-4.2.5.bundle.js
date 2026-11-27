@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* Saimetric Local Hub Core OTA Bundle v4.2.4 — Built 2026-11-26T16:02:41.814Z */
+/* Saimetric Local Hub Core OTA Bundle v4.2.5 — Built 2026-11-27T09:37:28.416Z */
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __commonJS = (cb, mod) => function __require() {
   try {
@@ -3776,7 +3776,7 @@ var branchNameArgIdx = process.argv.indexOf("--branch-name");
 var hubBranchName = branchNameArgIdx !== -1 && process.argv[branchNameArgIdx + 1] ? process.argv[branchNameArgIdx + 1] : process.env.HUB_BRANCH_NAME || "Harare Main";
 var tenantIdArgIdx = process.argv.indexOf("--tenant-id");
 var hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1] ? process.argv[tenantIdArgIdx + 1] : process.env.HUB_TENANT_ID || "COMP-001";
-var HUB_VERSION = "4.2.4";
+var HUB_VERSION = "4.2.5";
 var HUB_RUNTIME = String(process.env.HUB_RUNTIME || "TERMUX").toUpperCase() === "ANDROID_APK" ? "ANDROID_APK" : "TERMUX";
 var HUB_OTA_SLOT = String(process.env.HUB_OTA_SLOT || (HUB_RUNTIME === "ANDROID_APK" ? "A" : "TERMUX"));
 var HUB_REQUIRE_AUTH = process.argv.includes("--require-auth") || String(process.env.HUB_REQUIRE_AUTH || "").toLowerCase() === "true" || HUB_RUNTIME === "ANDROID_APK" && String(process.env.HUB_REQUIRE_AUTH || "").toLowerCase() !== "false";
@@ -4903,34 +4903,142 @@ function pushToCloud(entityType, record) {
     console.log(`[Edge Gateway] Cloud push notice: ${err.message}`);
   }
 }
+function roundHubUnits(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  const r = Number(n.toFixed(3));
+  return Object.is(r, -0) ? 0 : r;
+}
+function decomposeHubStockUnits(totalUnits, unitsPerCase, keepCasesZero) {
+  const upc = Math.max(1, Number(unitsPerCase) || 1);
+  const total = roundHubUnits(totalUnits);
+  if (total < 0) {
+    return { stockCases: 0, stockSingles: total, totalUnits: total, unitsPerCase: upc };
+  }
+  if (upc <= 1 || keepCasesZero) {
+    return { stockCases: 0, stockSingles: total, totalUnits: total, unitsPerCase: upc };
+  }
+  const stockCases = Math.floor(total / upc);
+  const stockSingles = roundHubUnits(total - stockCases * upc);
+  return {
+    stockCases,
+    stockSingles,
+    totalUnits: roundHubUnits(stockCases * upc + stockSingles),
+    unitsPerCase: upc
+  };
+}
+function normalizeHubStockFields(item) {
+  if (!item) return { stockCases: 0, stockSingles: 0, totalUnits: 0, unitsPerCase: 1 };
+  const upc = Math.max(1, Number(item.unitsPerCase || item.UnitsPerCase) || 1);
+  const rawCases = item.stockCases !== void 0 && item.stockCases !== null && item.stockCases !== "" ? Number(item.stockCases) : NaN;
+  const rawSingles = item.stockSingles !== void 0 && item.stockSingles !== null && item.stockSingles !== "" ? Number(item.stockSingles) : NaN;
+  const totalCandidate = item.totalUnits !== void 0 && item.totalUnits !== null && item.totalUnits !== "" ? item.totalUnits : item.stockQuantity;
+  const rawTotal = totalCandidate !== void 0 && totalCandidate !== null && totalCandidate !== "" ? Number(totalCandidate) : NaN;
+  const casesFinite = Number.isFinite(rawCases);
+  const singlesFinite = Number.isFinite(rawSingles);
+  const totalFinite = Number.isFinite(rawTotal);
+  if (casesFinite && singlesFinite && rawCases >= 0 && rawSingles >= 0) {
+    const pairSum = roundHubUnits(rawCases * upc + rawSingles);
+    if (!totalFinite || Math.abs(pairSum - rawTotal) < 1e-3) {
+      return { stockCases: roundHubUnits(rawCases), stockSingles: roundHubUnits(rawSingles), totalUnits: pairSum, unitsPerCase: upc };
+    }
+  }
+  const resolvedTotal = totalFinite ? roundHubUnits(rawTotal) : roundHubUnits((casesFinite ? rawCases : 0) * upc + (singlesFinite ? rawSingles : 0));
+  const keepCasesZero = upc <= 1 || item.canSellAsCase === false && (!casesFinite || rawCases <= 0);
+  return decomposeHubStockUnits(resolvedTotal, upc, keepCasesZero);
+}
+function resolveHubAvgUnitCost(item) {
+  if (!item) return 0;
+  const avg = Number(item.averageCostPerUnit);
+  if (Number.isFinite(avg) && avg > 0) return Number(avg.toFixed(4));
+  const cpu = Number(item.costPerUnit);
+  if (Number.isFinite(cpu) && cpu > 0) return Number(cpu.toFixed(4));
+  const cpc = Number(item.costPerCase);
+  const upc = Math.max(1, Number(item.unitsPerCase || item.UnitsPerCase) || 1);
+  if (Number.isFinite(cpc) && cpc > 0) return Number((cpc / upc).toFixed(4));
+  return 0;
+}
+function resolveHubPoolCents(item, currentUnits) {
+  const units = Number(currentUnits || 0);
+  if (units <= 0) return 0;
+  const avg = resolveHubAvgUnitCost(item);
+  const rawPool = item && item.stockValueCents !== void 0 && item.stockValueCents !== null ? Math.round(Number(item.stockValueCents)) : NaN;
+  if (Number.isFinite(rawPool) && rawPool >= 0 && !(rawPool === 0 && avg > 0)) {
+    return rawPool;
+  }
+  return Math.max(0, Math.round(units * avg * 100));
+}
+function applyHubStockUnits(item, nextTotalUnits, options) {
+  if (!item) return;
+  const prevStock = normalizeHubStockFields(item);
+  const prevUnits = prevStock.totalUnits;
+  const upc = Math.max(1, Number(item.unitsPerCase || item.UnitsPerCase) || 1);
+  const keepCasesZero = upc <= 1 || item.canSellAsCase === false && !(Number(item.stockCases) > 0);
+  const decomposed = decomposeHubStockUnits(nextTotalUnits, upc, keepCasesZero);
+  if (!options || options.skipPoolUpdate !== true) {
+    const avgCost = resolveHubAvgUnitCost(item);
+    if (decomposed.totalUnits <= 0) {
+      item.stockValueCents = 0;
+    } else if (decomposed.totalUnits < prevUnits && prevUnits > 0) {
+      const prevPool = resolveHubPoolCents(item, prevUnits);
+      const deduct = roundHubUnits(prevUnits - decomposed.totalUnits);
+      const cogsCents = Math.min(prevPool, Math.round(prevPool * deduct / prevUnits));
+      item.stockValueCents = Math.max(0, prevPool - cogsCents);
+    } else if (decomposed.totalUnits > prevUnits) {
+      const added = roundHubUnits(decomposed.totalUnits - prevUnits);
+      if (prevUnits >= 0) {
+        const prevPool = resolveHubPoolCents(item, prevUnits);
+        item.stockValueCents = prevPool + Math.round(added * avgCost * 100);
+      } else {
+        item.stockValueCents = Math.round(decomposed.totalUnits * avgCost * 100);
+      }
+    }
+  }
+  item.unitsPerCase = decomposed.unitsPerCase;
+  item.stockCases = decomposed.stockCases;
+  item.stockSingles = decomposed.stockSingles;
+  item.totalUnits = decomposed.totalUnits;
+}
 function broadcastInventorySnapshot(item) {
   if (!item) return;
   const snapTime = Date.now();
+  const stock = normalizeHubStockFields(item);
+  item.unitsPerCase = stock.unitsPerCase;
+  item.stockCases = stock.stockCases;
+  item.stockSingles = stock.stockSingles;
+  item.totalUnits = stock.totalUnits;
+  item.stockValueCents = stock.totalUnits <= 0 ? 0 : resolveHubPoolCents(item, stock.totalUnits);
   item.snapshotTimestamp = snapTime;
   item.updatedAt = snapTime;
   item.hubTimestamp = snapTime;
   item.lastUpdated = new Date(snapTime).toISOString();
   scheduleSave();
+  const snapshotPayload = {
+    ...item,
+    unitsPerCase: stock.unitsPerCase,
+    stockCases: stock.stockCases,
+    stockSingles: stock.stockSingles,
+    totalUnits: stock.totalUnits,
+    stockValueCents: item.stockValueCents,
+    snapshotTimestamp: snapTime
+  };
   const pktStr = JSON.stringify({
     type: "INVENTORY_UPDATE",
     action: "INVENTORY_UPDATE",
     entityType: "INVENTORY",
     itemId: item.itemId || item.id,
-    item: {
-      ...item,
-      totalUnits: Number(item.totalUnits || 0),
-      stockSingles: Number(item.stockSingles !== void 0 ? item.stockSingles : item.totalUnits || 0),
-      snapshotTimestamp: snapTime
-    },
-    payload: {
-      ...item,
-      totalUnits: Number(item.totalUnits || 0),
-      stockSingles: Number(item.stockSingles !== void 0 ? item.stockSingles : item.totalUnits || 0),
-      snapshotTimestamp: snapTime
-    },
+    item: snapshotPayload,
+    payload: snapshotPayload,
     snapshotTimestamp: snapTime,
-    totalUnits: Number(item.totalUnits || 0),
-    stockSingles: Number(item.stockSingles !== void 0 ? item.stockSingles : item.totalUnits || 0),
+    unitsPerCase: stock.unitsPerCase,
+    stockCases: stock.stockCases,
+    stockSingles: stock.stockSingles,
+    totalUnits: stock.totalUnits,
+    stockValueCents: item.stockValueCents,
+    averageCostPerUnit: item.averageCostPerUnit,
+    averageCostPerCase: item.averageCostPerCase,
+    latestCostPerUnit: item.latestCostPerUnit,
+    latestCostPerCase: item.latestCostPerCase,
     origin_device_id: "LOCAL_HUB",
     origin_device_name: "Termux Local Hub",
     timestamp: snapTime
@@ -9278,17 +9386,16 @@ wss.on("connection", (ws, req) => {
             if (!it || !it.id) continue;
             const invIdx = inventoryStore.findIndex((i) => i.itemId === it.id || i.id === it.id);
             if (invIdx >= 0) {
-              const curUnits = Number(inventoryStore[invIdx].totalUnits || 0);
+              const curUnits = normalizeHubStockFields(inventoryStore[invIdx]).totalUnits;
               const qty = Number(it.quantity || 0);
               let newUnits = curUnits;
               if (isNewRefund || isNewVoid) {
-                newUnits = Number((curUnits + qty).toFixed(3));
+                newUnits = roundHubUnits(curUnits + qty);
                 console.log(`[Termux Hub] Restocked ${qty}x ${it.name || it.id} from ${isNewRefund ? "Refund" : "Void"} on #${saleId}`);
               } else if (!prevSale && saleObj.status !== "Refunded" && saleObj.status !== "Voided") {
-                newUnits = Number((curUnits - qty).toFixed(3));
+                newUnits = roundHubUnits(curUnits - qty);
               }
-              inventoryStore[invIdx].totalUnits = newUnits;
-              inventoryStore[invIdx].stockSingles = newUnits;
+              applyHubStockUnits(inventoryStore[invIdx], newUnits);
               broadcastInventorySnapshot(inventoryStore[invIdx]);
             }
           }
@@ -9300,10 +9407,9 @@ wss.on("connection", (ws, req) => {
             if (ex.returnedItem?.id && ex.returnedItem.restockCondition === "restock") {
               const retIdx = inventoryStore.findIndex((i) => i.itemId === ex.returnedItem.id || i.id === ex.returnedItem.id);
               if (retIdx >= 0) {
-                const cur = Number(inventoryStore[retIdx].totalUnits || 0);
-                const retUnits = Number((cur + Number(ex.returnedItem.quantity || 1)).toFixed(3));
-                inventoryStore[retIdx].totalUnits = retUnits;
-                inventoryStore[retIdx].stockSingles = retUnits;
+                const cur = normalizeHubStockFields(inventoryStore[retIdx]).totalUnits;
+                const retUnits = roundHubUnits(cur + Number(ex.returnedItem.quantity || 1));
+                applyHubStockUnits(inventoryStore[retIdx], retUnits);
                 broadcastInventorySnapshot(inventoryStore[retIdx]);
                 console.log(`[Termux Hub] Restocked returned exchange item: +${ex.returnedItem.quantity}x ${ex.returnedItem.name}`);
               }
@@ -9311,10 +9417,9 @@ wss.on("connection", (ws, req) => {
             if (ex.replacementItem?.id) {
               const repIdx = inventoryStore.findIndex((i) => i.itemId === ex.replacementItem.id || i.id === ex.replacementItem.id);
               if (repIdx >= 0) {
-                const cur = Number(inventoryStore[repIdx].totalUnits || 0);
-                const repUnits = Number((cur - Number(ex.replacementItem.quantity || 1)).toFixed(3));
-                inventoryStore[repIdx].totalUnits = repUnits;
-                inventoryStore[repIdx].stockSingles = repUnits;
+                const cur = normalizeHubStockFields(inventoryStore[repIdx]).totalUnits;
+                const repUnits = roundHubUnits(cur - Number(ex.replacementItem.quantity || 1));
+                applyHubStockUnits(inventoryStore[repIdx], repUnits);
                 broadcastInventorySnapshot(inventoryStore[repIdx]);
                 console.log(`[Termux Hub] Depleted replacement exchange item: -${ex.replacementItem.quantity}x ${ex.replacementItem.name}`);
               }
@@ -9460,9 +9565,9 @@ wss.on("connection", (ws, req) => {
                 (i) => i.itemId === cleanId || i.id === cleanId || item.productName && i.itemName === item.productName
               );
               if (invIdx >= 0) {
-                const curUnits = Number(inventoryStore[invIdx].totalUnits || 0);
-                inventoryStore[invIdx].totalUnits = Math.max(0, Number((curUnits - unitsToDeduct).toFixed(3)));
-                inventoryStore[invIdx].stockSingles = inventoryStore[invIdx].totalUnits;
+                const curUnits = normalizeHubStockFields(inventoryStore[invIdx]).totalUnits;
+                applyHubStockUnits(inventoryStore[invIdx], Math.max(0, roundHubUnits(curUnits - unitsToDeduct)));
+                broadcastInventorySnapshot(inventoryStore[invIdx]);
                 console.log(`[Termux Hub] Reverted ${unitsToDeduct}x ${item.productName || cleanId} from rejected GRV #${gId}`);
               }
             }
@@ -9475,21 +9580,63 @@ wss.on("connection", (ws, req) => {
                 (i) => i.itemId === cleanId || i.id === cleanId || item.productName && i.itemName === item.productName
               );
               if (invIdx >= 0) {
-                const curUnits = Number(inventoryStore[invIdx].totalUnits || 0);
-                inventoryStore[invIdx].totalUnits = Number((curUnits + unitsToAdd).toFixed(3));
-                inventoryStore[invIdx].stockSingles = inventoryStore[invIdx].totalUnits;
-                if (item.costPrice) inventoryStore[invIdx].costPrice = item.costPrice;
-                if (item.costPerCase) inventoryStore[invIdx].costPerCase = item.costPerCase;
-                broadcastInventorySnapshot(inventoryStore[invIdx]);
+                const target = inventoryStore[invIdx];
+                const curUnits = normalizeHubStockFields(target).totalUnits;
+                const upc = Math.max(1, Number(target.unitsPerCase) || 1);
+                const fallbackUnitCost = Number(item.costPrice || (item.costPerCase ? Number(item.costPerCase) / upc : 0)) || 0;
+                const receivedTotalCents = item.lineTotalCents !== void 0 && Number.isFinite(Number(item.lineTotalCents)) && Number(item.lineTotalCents) >= 0 ? Math.round(Number(item.lineTotalCents)) : item.lineTotal !== void 0 && Number.isFinite(Number(item.lineTotal)) && Number(item.lineTotal) >= 0 ? Math.round(Number(item.lineTotal) * 100) : Math.max(0, Math.round(unitsToAdd * fallbackUnitCost * 100));
+                const incomingUnitCost = unitsToAdd > 0 && receivedTotalCents > 0 ? Number((receivedTotalCents / 100 / unitsToAdd).toFixed(4)) : Number(fallbackUnitCost.toFixed(4));
+                const nextUnits = roundHubUnits(curUnits + unitsToAdd);
+                if (unitsToAdd > 0 && (receivedTotalCents > 0 || incomingUnitCost > 0)) {
+                  const prevAvg = resolveHubAvgUnitCost(target);
+                  let nextPoolCents = 0;
+                  let nextAvg = incomingUnitCost;
+                  if (curUnits >= 0) {
+                    const prevPoolCents = resolveHubPoolCents(target, curUnits);
+                    nextPoolCents = prevPoolCents + receivedTotalCents;
+                    nextAvg = nextUnits > 0 ? Number((nextPoolCents / 100 / nextUnits).toFixed(4)) : incomingUnitCost;
+                  } else if (nextUnits > 0) {
+                    nextPoolCents = Math.round(receivedTotalCents * nextUnits / unitsToAdd);
+                    nextAvg = Number((nextPoolCents / 100 / nextUnits).toFixed(4));
+                  } else {
+                    nextPoolCents = 0;
+                    nextAvg = incomingUnitCost > 0 ? incomingUnitCost : prevAvg;
+                  }
+                  target.stockValueCents = Math.max(0, nextPoolCents);
+                  target.averageCostPerUnit = nextAvg;
+                  target.averageCostPerCase = Number((nextAvg * upc).toFixed(2));
+                  target.latestCostPerUnit = incomingUnitCost;
+                  target.latestCostPerCase = Number((incomingUnitCost * upc).toFixed(2));
+                  target.costPerUnit = target.latestCostPerUnit;
+                  target.costPerCase = target.latestCostPerCase;
+                }
+                if (item.costPrice) target.costPrice = Number(incomingUnitCost.toFixed(4));
+                if (item.costPerCase) target.costPerCase = item.costPerCase;
+                applyHubStockUnits(target, nextUnits, { skipPoolUpdate: true });
+                broadcastInventorySnapshot(target);
               } else {
+                const upc = Math.max(1, Number(item.unitsPerCase) || 1);
+                const initStock = decomposeHubStockUnits(unitsToAdd, upc, upc <= 1);
+                const fallbackUnitCost = Number(item.costPrice || (item.costPerCase ? Number(item.costPerCase) / upc : 0)) || 0;
+                const receivedTotalCents = item.lineTotalCents !== void 0 && Number.isFinite(Number(item.lineTotalCents)) && Number(item.lineTotalCents) >= 0 ? Math.round(Number(item.lineTotalCents)) : item.lineTotal !== void 0 && Number.isFinite(Number(item.lineTotal)) && Number(item.lineTotal) >= 0 ? Math.round(Number(item.lineTotal) * 100) : Math.max(0, Math.round(unitsToAdd * fallbackUnitCost * 100));
+                const unitCost = unitsToAdd > 0 && receivedTotalCents > 0 ? Number((receivedTotalCents / 100 / unitsToAdd).toFixed(4)) : Number(fallbackUnitCost.toFixed(4));
+                const caseCost = Number(item.costPerCase || Number((unitCost * upc).toFixed(2))) || 0;
                 const newInvRecord = {
                   id: cleanId,
                   itemId: cleanId,
                   itemName: item.productName || cleanId,
-                  totalUnits: unitsToAdd,
-                  stockSingles: unitsToAdd,
-                  costPrice: item.costPrice || 0,
-                  costPerCase: item.costPerCase || 0,
+                  unitsPerCase: upc,
+                  stockCases: initStock.stockCases,
+                  stockSingles: initStock.stockSingles,
+                  totalUnits: initStock.totalUnits,
+                  stockValueCents: initStock.totalUnits > 0 ? receivedTotalCents : 0,
+                  costPrice: unitCost,
+                  costPerUnit: Number(unitCost.toFixed(4)),
+                  costPerCase: Number(caseCost.toFixed(2)),
+                  averageCostPerUnit: Number(unitCost.toFixed(4)),
+                  averageCostPerCase: Number(caseCost.toFixed(2)),
+                  latestCostPerUnit: Number(unitCost.toFixed(4)),
+                  latestCostPerCase: Number(caseCost.toFixed(2)),
                   sellPriceUnit: item.sellingPrice || 0,
                   company_id: grv.companyId || grv.company_id || packet.companyId || "COMP-001",
                   branch_id: grv.branchId || grv.branch_id || packet.branchId || "BR-MAIN",
@@ -9581,17 +9728,31 @@ wss.on("connection", (ws, req) => {
           }
           const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, it);
           const resolvedCloudSynced = incomingCloudSynced || exIdx >= 0 && inventoryStore[exIdx].isCloudSynced === true;
+          const existingInv = exIdx >= 0 ? inventoryStore[exIdx] : null;
+          const mergedRaw = existingInv ? { ...existingInv, ...it } : it;
+          const canonicalStock = normalizeHubStockFields(mergedRaw);
+          const resolvedAvgCostUnit = it.averageCostPerUnit !== void 0 && Number(it.averageCostPerUnit) > 0 ? Number(it.averageCostPerUnit) : existingInv && Number(existingInv.averageCostPerUnit) > 0 ? Number(existingInv.averageCostPerUnit) : Number(mergedRaw.costPerUnit || (mergedRaw.costPerCase ? Number(mergedRaw.costPerCase) / canonicalStock.unitsPerCase : 0)) || 0;
+          const resolvedAvgCostCase = it.averageCostPerCase !== void 0 && Number(it.averageCostPerCase) > 0 ? Number(it.averageCostPerCase) : Number((resolvedAvgCostUnit * canonicalStock.unitsPerCase).toFixed(2));
+          const resolvedStockValueCents = canonicalStock.totalUnits <= 0 ? 0 : it.stockValueCents !== void 0 && Number.isFinite(Number(it.stockValueCents)) && Number(it.stockValueCents) >= 0 && !(Number(it.stockValueCents) === 0 && resolvedAvgCostUnit > 0) ? Math.round(Number(it.stockValueCents)) : Math.round(canonicalStock.totalUnits * resolvedAvgCostUnit * 100);
           const stamped = {
-            ...it,
+            ...mergedRaw,
             itemId: cleanId,
             id: cleanId,
+            unitsPerCase: canonicalStock.unitsPerCase,
+            stockCases: canonicalStock.stockCases,
+            stockSingles: canonicalStock.stockSingles,
+            totalUnits: canonicalStock.totalUnits,
+            stockValueCents: resolvedStockValueCents,
+            costPerUnit: Number((Number(mergedRaw.costPerUnit) || resolvedAvgCostUnit || 0).toFixed(4)),
+            averageCostPerUnit: Number(resolvedAvgCostUnit.toFixed(4)),
+            averageCostPerCase: Number(resolvedAvgCostCase.toFixed(2)),
             updatedAt: hubNow,
             hubTimestamp: hubNow,
             lastUpdated: hubIso,
             ...resolvedCloudSynced ? { isCloudSynced: true } : {}
           };
           if (exIdx >= 0) {
-            inventoryStore[exIdx] = { ...inventoryStore[exIdx], ...stamped };
+            inventoryStore[exIdx] = stamped;
           } else {
             inventoryStore.push(stamped);
           }

@@ -23,7 +23,9 @@ import {
   getCurrentCompanyId,
   getCompanies,
   getCurrentCompany,
+  isSupervisorOrAbove,
 } from '../../db/roomDatabase';
+import { isItemBelowReorderPoint, normalizeStockFields } from '../../utils/inventoryMath';
 import { bluetoothPrinter } from '../../services/bluetoothPrinter';
 
 interface ItemExchangeModalProps {
@@ -620,7 +622,12 @@ export const ItemExchangeModal: React.FC<ItemExchangeModalProps> = ({
                     const id = it.itemId || it.id;
                     const name = it.itemName || it.name;
                     const price = Number(it.sellingPrice || it.price || 0);
-                    const stock = (Number(it.stockCases || 0) * Number(it.unitsPerCase || 1)) + Number(it.stockSingles || 0);
+                    const totalUnits = normalizeStockFields(it).totalUnits;
+                    const isOOS = totalUnits <= 0;
+                    const isLow = !isOOS && isItemBelowReorderPoint(it);
+                    const canSeeRawStock =
+                      isSupervisorOrAbove(currentStaff?.role) ||
+                      Boolean(currentStaff?.permissions?.canManageInventory);
                     const isSelected = selectedReplacementId === id;
 
                     return (
@@ -636,7 +643,13 @@ export const ItemExchangeModal: React.FC<ItemExchangeModalProps> = ({
                       >
                         <div className="truncate mr-2">
                           <p className="font-semibold text-white truncate">{name}</p>
-                          <p className="text-[10px] text-slate-500">Stock: {stock} units</p>
+                          {canSeeRawStock ? (
+                            <p className="text-[10px] text-slate-500">Stock: {totalUnits} units</p>
+                          ) : (
+                            <p className={`text-[10px] font-bold ${isOOS ? 'text-rose-400' : isLow ? 'text-amber-400' : 'text-emerald-400'}`}>
+                              {isOOS ? 'OOS' : isLow ? 'Low Stock' : 'In Stock'}
+                            </p>
+                          )}
                         </div>
                         <div className="text-right shrink-0">
                           <span className="font-bold text-emerald-400">${price.toFixed(2)}</span>
