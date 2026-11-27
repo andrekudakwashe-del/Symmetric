@@ -104,6 +104,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
   const [costPerCase, setCostPerCase] = useState<string | number>('');
   const [costPerUnitInput, setCostPerUnitInput] = useState<string | number>('');
   const [costAnchor, setCostAnchor] = useState<'CASE' | 'UNIT'>('CASE');
+  const [syncMwacToLatest, setSyncMwacToLatest] = useState(false);
   const [sellPriceUnit, setSellPriceUnit] = useState<string | number>('');
   const [sellPriceCase, setSellPriceCase] = useState<string | number>('');
   const [stockCases, setStockCases] = useState<string | number>(0);
@@ -183,6 +184,16 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       setCostPerCase(initCostCase);
       setCostPerUnitInput(initCostUnit);
       setCostAnchor('CASE');
+      const existingAvg = Number(initialItem.averageCostPerUnit || 0);
+      const initUnitNum = Number(initCostUnit || 0);
+      const initSellNum = Number(initialItem.sellPriceUnit || 0);
+      const mwacDiverges =
+        existingAvg > 0 &&
+        initUnitNum > 0 &&
+        Math.abs(existingAvg - initUnitNum) > 0.005 &&
+        ((initSellNum > 0 && existingAvg > initSellNum) ||
+          Math.max(existingAvg, initUnitNum) / Math.max(0.0001, Math.min(existingAvg, initUnitNum)) >= 1.5);
+      setSyncMwacToLatest(mwacDiverges);
       setSellPriceUnit(initialItem.sellPriceUnit !== undefined ? initialItem.sellPriceUnit : '');
       setSellPriceCase(initialItem.sellPriceCase !== undefined ? initialItem.sellPriceCase : '');
       setStockCases(initialItem.stockCases !== undefined ? initialItem.stockCases : 0);
@@ -208,6 +219,7 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       setCostPerCase('');
       setCostPerUnitInput('');
       setCostAnchor('CASE');
+      setSyncMwacToLatest(false);
       setSellPriceUnit('');
       setSellPriceCase('');
       setStockCases(0);
@@ -383,15 +395,25 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
       costPerUnit: calculatedCostPerUnit,
       latestCostPerCase: safeCostPerCase,
       latestCostPerUnit: calculatedCostPerUnit,
-      ...(isEditing && initialItem && Math.abs((initialItem.costPerUnit || 0) - calculatedCostPerUnit) > 0.00005
+      ...(isEditing &&
+      initialItem &&
+      (syncMwacToLatest || Math.abs((initialItem.costPerUnit || 0) - calculatedCostPerUnit) > 0.00005)
         ? {
             averageCostPerUnit: calculatedCostPerUnit,
             averageCostPerCase: safeCostPerCase,
+            stockValueCents:
+              currentTotalUnits > 0
+                ? Math.round(currentTotalUnits * calculatedCostPerUnit * 100)
+                : 0,
           }
         : !isEditing
         ? {
             averageCostPerUnit: calculatedCostPerUnit,
             averageCostPerCase: safeCostPerCase,
+            stockValueCents:
+              currentTotalUnits > 0
+                ? Math.round(currentTotalUnits * calculatedCostPerUnit * 100)
+                : 0,
           }
         : {}),
       sellPriceUnit: safeSellPriceUnit,
@@ -935,6 +957,30 @@ export const ProductAddEditModal: React.FC<ProductAddEditModalProps> = ({
                   />
                 </div>
               </div>
+
+              {/* Stale MWAC Reset Control when Stored Average Cost diverges from Latest Single Cost */}
+              {isEditing &&
+                initialItem &&
+                Number(initialItem.averageCostPerUnit || 0) > 0 &&
+                calculatedCostPerUnit > 0 &&
+                Math.abs(Number(initialItem.averageCostPerUnit) - calculatedCostPerUnit) > 0.005 && (
+                  <label className="mt-2 p-2.5 rounded-xl bg-amber-50 border border-amber-200 flex items-start gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={syncMwacToLatest}
+                      onChange={(e) => setSyncMwacToLatest(e.target.checked)}
+                      className="mt-0.5 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                    />
+                    <div className="text-xs leading-snug">
+                      <div className="font-bold text-amber-950">
+                        Reset Valuation MWAC (${formatUnitCost(initialItem.averageCostPerUnit)}/u) → Single Cost (${formatUnitCost(calculatedCostPerUnit)}/u)
+                      </div>
+                      <div className="text-[11px] text-amber-800 mt-0.5">
+                        Recalculates this item&apos;s inventory valuation and value pool using your current Single Cost when you save.
+                      </div>
+                    </div>
+                  </label>
+                )}
 
               {/* Live Margin Indicators */}
               <div className="grid grid-cols-2 gap-3 pt-1 text-xs">
