@@ -1005,4 +1005,96 @@ export interface PurchaseOrder {
   isCloudSynced?: boolean;
 }
 
+export type StockAdjustmentDirection = 'SUBTRACT' | 'ADD';
+
+export type StockAdjustmentEntryMode = 'DELTA' | 'PHYSICAL_COUNT';
+
+export type StockAdjustmentStatus =
+  | 'PENDING_OWNER_APPROVAL'
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'CANCELLED';
+
+export type StockAdjustmentReasonCode =
+  | 'DAMAGED_SPOILAGE'
+  | 'EXPIRED_DISPOSAL'
+  | 'THEFT_SUSPECTED'
+  | 'INTERNAL_CONSUMPTION'
+  | 'COUNT_VARIANCE_SHORT'
+  | 'RETURN_TO_SUPPLIER'
+  | 'COUNT_VARIANCE_SURPLUS'
+  | 'FOUND_STOCK'
+  | 'DATA_ENTRY_CORRECTION'
+  | 'CUSTOMER_RETURN_RESTOCK'
+  | 'REVERSAL';
+
+export interface StockAdjustmentRecord {
+  id: string;
+  company_id: string;
+  companyId?: string;
+  branch_id: string;
+  branchId?: string;
+  branchName?: string;
+  date: string; // YYYY-MM-DD
+  itemId: string;
+  itemName: string;
+  sku?: string;
+  unitsPerCase: number;
+  entryMode: StockAdjustmentEntryMode;
+  direction: StockAdjustmentDirection;
+  reasonCode: StockAdjustmentReasonCode;
+  auditNote: string;
+  // Signed canonical deltas (negative for write-offs, positive for additions)
+  deltaCases: number;
+  deltaSingles: number;
+  deltaUnits: number;
+  // Snapshot at submission time (used to detect stock drift before approval)
+  submittedStockCases: number;
+  submittedStockSingles: number;
+  submittedTotalUnits: number;
+  // Frozen before/after snapshot captured at approval/posting time
+  beforeCases?: number;
+  beforeSingles?: number;
+  beforeTotalUnits?: number;
+  afterCases?: number;
+  afterSingles?: number;
+  afterTotalUnits?: number;
+  // Financial / MWAC valuation impact
+  mwacUnitCost: number;
+  valuationImpactUsd: number;
+  // Optional compressed photographic evidence (damaged goods / signed sheet)
+  evidencePhotoDataUrl?: string;
+  // Maker-Checker Lifecycle
+  status: StockAdjustmentStatus;
+  createdBy: string;
+  createdByName: string;
+  createdByRole: string;
+  createdAt: string;
+  createdDeviceId?: string;
+  approvedBy?: string;
+  approvedByName?: string;
+  approvedByRole?: string;
+  approvedAt?: string;
+  approvedDeviceId?: string;
+  rejectedBy?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
+  cancelledBy?: string;
+  cancelledByName?: string;
+  cancelledAt?: string;
+  // Strict immutability reversal linkage
+  reversesAdjustmentId?: string;
+  reversedByAdjustmentId?: string;
+  // Downstream audit / accounting links
+  movementId?: string;
+  shrinkageExpenseId?: string;
+  anomalyFlags?: string[];
+  // Sync metadata
+  updatedAt: number;
+  lastUpdated: string;
+  isCloudSynced?: boolean;
+}
+
+
 

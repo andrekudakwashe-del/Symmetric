@@ -53,4 +53,5 @@ export const STORAGE_KEYS = {
   DAILY_BLIND_CONFIGS: 'saimetric_room_daily_blind_configs',
   DAILY_BLIND_COUNTS: 'saimetric_room_daily_blind_counts',
   PURCHASE_ORDERS: 'saimetric_room_purchase_orders',
+  STOCK_ADJUSTMENTS: 'saimetric_room_stock_adjustments',
 } as const;

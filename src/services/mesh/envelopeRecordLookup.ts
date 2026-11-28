@@ -34,6 +34,7 @@ import {
 } from '../../db/roomDatabase';
 import { getMovements } from '../../db/cashLedger';
 import { getInternalConsumptions } from '../walletService';
+import { getRawStoredStockAdjustments } from '../../db/daos/stockAdjustmentDao';
 import { getRoleDefinitionsUpdatedAt } from '../roleNavigationService';
 import { SyncEnvelope } from '../sync/SyncEnvelope';
 import { ENTITY_REGISTRY } from '../sync/EntityRegistry';
@@ -237,6 +238,17 @@ export function lookupExistingRecordForEnvelope(envelope: SyncEnvelope): any {
         (data?.status && data.status !== existing.status) ||
         envelope.action === 'UPSERT';
       return statusChanged ? undefined : existing;
+    }
+    case 'stock_adjustment': {
+      const existing = getRawStoredStockAdjustments().find(
+        (a: any) => String(a.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (!existing) return undefined;
+      const changed =
+        (data?.status && data.status !== existing.status) ||
+        Boolean(data?.reversedByAdjustmentId && !existing.reversedByAdjustmentId) ||
+        envelope.action === 'UPSERT';
+      return changed ? undefined : existing;
     }
     case 'customer_change': {
       const existing = getRawStoredCustomerChanges().find(

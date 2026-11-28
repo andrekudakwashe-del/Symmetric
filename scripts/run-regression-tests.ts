@@ -1069,6 +1069,254 @@ const suites: TestCase[] = [
       assert.equal(portfolio.totalValuationDollars, 212.25); // 120 + 60 + 17.25 + 5 + 10
     },
   },
+  {
+    name: '13. Stock Adjustment Maker-Checker RBAC, Owner PIN Authorization, Idempotent Sync Delta & Immutable Reversal',
+    run: async () => {
+      const {
+        isStockAdjustmentOwner,
+        canPrepareStockAdjustment,
+        createStockAdjustmentRequest,
+        approveStockAdjustment,
+        reverseApprovedStockAdjustment,
+        ingestMeshStockAdjustment,
+        getRawStoredStockAdjustments,
+      } = await import('../src/db/daos/stockAdjustmentDao');
+      const { setStored, getRawStoredInventoryItems, getRawStoredStockMovements } = await import(
+        '../src/db/roomDatabase'
+      );
+
+      // Clean test stores
+      setStored(STORAGE_KEYS.STOCK_ADJUSTMENTS, []);
+      setStored(STORAGE_KEYS.STOCK_MOVEMENTS, []);
+      setStored(STORAGE_KEYS.EXPENSES, []);
+
+      const cashier: any = { id: 'STF-CASH', name: 'Cashier Kim', role: 'Cashier', pin: '1111', active: true };
+      const manager: any = { id: 'STF-MGR', name: 'Manager Sam', role: 'Manager', pin: '2222', active: true };
+      const owner: any = { id: 'STF-OWN', name: 'Owner Alex', role: 'Owner', pin: '9999', active: true };
+      setStored(STORAGE_KEYS.SALESPEOPLE, [cashier, manager, owner]);
+
+      const seedItem: any = {
+        itemId: 'SKU-ADJ-01',
+        itemName: 'Cooking Oil 2L',
+        sku: 'OIL-2L',
+        category: 'Groceries',
+        unitsPerCase: 12,
+        stockCases: 2,
+        stockSingles: 0,
+        totalUnits: 24,
+        costPerUnit: 2.5,
+        averageCostPerUnit: 2.5,
+        costPerCase: 30.0,
+        sellPriceUnit: 3.5,
+        sellPriceCase: 42.0,
+        stockValueCents: 6000,
+      };
+      setStored(STORAGE_KEYS.INVENTORY_ITEMS, [seedItem]);
+
+      // 13a: Strict role gates
+      assert.equal(isStockAdjustmentOwner('Owner'), true);
+      assert.equal(isStockAdjustmentOwner('Admin'), true);
+      assert.equal(isStockAdjustmentOwner('Manager'), false);
+      assert.equal(isStockAdjustmentOwner('Cashier'), false);
+      assert.equal(canPrepareStockAdjustment('Manager'), true);
+      assert.equal(canPrepareStockAdjustment('Supervisor'), true);
+      assert.equal(canPrepareStockAdjustment('Cashier'), false);
+
+      // 13b: Cashier blocked from creating adjustment
+      const cashierAttempt = createStockAdjustmentRequest(
+        {
+          itemId: 'SKU-ADJ-01',
+          entryMode: 'DELTA',
+          direction: 'SUBTRACT',
+          deltaCases: 0,
+          deltaSingles: 2,
+          reasonCode: 'DAMAGED_SPOILAGE',
+          auditNote: 'Two broken bottles in backroom aisle',
+        },
+        cashier
+      );
+      assert.equal(cashierAttempt.success, false);
+
+      // 13c: Manager prepares PENDING request — ZERO inventory mutation before Owner approval
+      const mgrReq = createStockAdjustmentRequest(
+        {
+          itemId: 'SKU-ADJ-01',
+          entryMode: 'DELTA',
+          direction: 'SUBTRACT',
+          deltaCases: 0,
+          deltaSingles: 4,
+          reasonCode: 'DAMAGED_SPOILAGE',
+          auditNote: 'Four bottles leaked during unloading inspected by manager',
+        },
+        manager
+      );
+      assert.equal(mgrReq.success, true);
+      assert.equal(mgrReq.record?.status, 'PENDING_OWNER_APPROVAL');
+      assert.equal(
+        getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')?.totalUnits,
+        24,
+        'Pending adjustment MUST NOT mutate inventory before Owner approval'
+      );
+
+      // 13d: Manager PIN rejected when trying to approve
+      const mgrSelfApprove = approveStockAdjustment(mgrReq.record!.id, manager, '2222');
+      assert.equal(mgrSelfApprove.success, false);
+      assert.equal(getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')?.totalUnits, 24);
+
+      // 13e: Owner PIN approves -> atomic -4u applied once (24u -> 20u = 1cs 8ea = 5000 cents)
+      const ownerApprove = approveStockAdjustment(mgrReq.record!.id, owner, '9999');
+      assert.equal(ownerApprove.success, true);
+      assert.equal(ownerApprove.record?.status, 'APPROVED');
+      const afterApprove = getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')!;
+      assert.equal(afterApprove.totalUnits, 20);
+      assert.equal(afterApprove.stockCases, 1);
+      assert.equal(afterApprove.stockSingles, 8);
+      assert.equal(afterApprove.stockValueCents, 5000);
+
+      // 13f: Re-ingesting the same APPROVED adjustment (or stale PENDING) is strictly idempotent
+      ingestMeshStockAdjustment({ ...ownerApprove.record!, status: 'PENDING_OWNER_APPROVAL' });
+      assert.equal(
+        getRawStoredStockAdjustments().find((r) => r.id === ownerApprove.record!.id)?.status,
+        'APPROVED',
+        'Finalized APPROVED status must never downgrade to PENDING'
+      );
+      ingestMeshStockAdjustment({ ...ownerApprove.record! });
+      assert.equal(
+        getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')?.totalUnits,
+        20,
+        'Re-ingesting same APPROVED adjustment must NOT double-deduct stock'
+      );
+
+      // 13g: Forged remote APPROVED packet from Cashier role is rejected
+      const forgedIngested = ingestMeshStockAdjustment({
+        id: 'ADJ-FORGED-REMOTE',
+        itemId: 'SKU-ADJ-01',
+        itemName: 'Cooking Oil 2L',
+        deltaUnits: -10,
+        status: 'APPROVED',
+        approvedByRole: 'Cashier',
+        createdByRole: 'Cashier',
+      });
+      assert.equal(forgedIngested, false);
+      assert.equal(getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')?.totalUnits, 20);
+
+      // 13h: Remote legitimate Owner APPROVED packet applies atomic delta (+2u -> 22u) once
+      const remoteLegit = ingestMeshStockAdjustment({
+        id: 'ADJ-REMOTE-OK-1',
+        itemId: 'SKU-ADJ-01',
+        itemName: 'Cooking Oil 2L',
+        unitsPerCase: 12,
+        entryMode: 'DELTA',
+        direction: 'ADD',
+        reasonCode: 'FOUND_STOCK',
+        auditNote: 'Found two intact bottles in storeroom overflow bin',
+        deltaCases: 0,
+        deltaSingles: 2,
+        deltaUnits: 2,
+        submittedStockCases: 1,
+        submittedStockSingles: 8,
+        submittedTotalUnits: 20,
+        mwacUnitCost: 2.5,
+        valuationImpactUsd: 5.0,
+        status: 'APPROVED',
+        createdBy: 'STF-MGR',
+        createdByName: 'Manager Sam',
+        createdByRole: 'Manager',
+        createdAt: new Date().toISOString(),
+        approvedBy: 'STF-OWN',
+        approvedByName: 'Owner Alex',
+        approvedByRole: 'Owner',
+        approvedAt: new Date().toISOString(),
+        updatedAt: Date.now(),
+      });
+      assert.equal(remoteLegit, true);
+      assert.equal(getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')?.totalUnits, 22);
+      // Second arrival of identical remote packet must be a no-op
+      ingestMeshStockAdjustment({
+        id: 'ADJ-REMOTE-OK-1',
+        itemId: 'SKU-ADJ-01',
+        deltaUnits: 2,
+        status: 'APPROVED',
+        approvedByRole: 'Owner',
+      });
+      assert.equal(getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')?.totalUnits, 22);
+
+      // 13i: Immutable Reversal posts offsetting entry (+4u -> 26u) without deleting original record
+      const rev = reverseApprovedStockAdjustment(
+        ownerApprove.record!.id,
+        owner,
+        '9999',
+        'Original damaged bottles were actually supplier credit replacement'
+      );
+      assert.equal(rev.success, true);
+      assert.equal(rev.record?.status, 'APPROVED');
+      assert.equal(rev.record?.deltaUnits, 4);
+      assert.equal(getRawStoredInventoryItems().find((i) => i.itemId === 'SKU-ADJ-01')?.totalUnits, 26);
+      assert.ok(
+        getRawStoredStockMovements().some((m) => m.referenceId === ownerApprove.record!.id),
+        'Original approved StockMovement entry must remain in immutable ledger'
+      );
+    },
+  },
+  {
+    name: '14. Hub OTA v4.2.7 Bundle — Isolated CommonJS Contract, Zero Sibling Requires & Manifest Integrity',
+    run: async () => {
+      const fs = await import('node:fs');
+      const os = await import('node:os');
+      const path = await import('node:path');
+      const { createRequire } = await import('node:module');
+      const cjsRequire = createRequire(import.meta.url);
+
+      const manifestPath = path.join(process.cwd(), 'public', 'hub-ota', 'manifest.json');
+      const pubKeyPath = path.join(process.cwd(), 'public', 'hub-ota', 'public-key.pem');
+      assert.ok(fs.existsSync(manifestPath), 'public/hub-ota/manifest.json must exist');
+      assert.ok(fs.existsSync(pubKeyPath), 'public/hub-ota/public-key.pem must exist');
+
+      const pubKeyPem = fs.readFileSync(pubKeyPath, 'utf8');
+      assert.ok(
+        pubKeyPem.includes('MCowBQYDK2VwAyEA9i689lrmyLHU8FfsOK3hy4oO07oXRAEprSO97PJXc90='),
+        'Pinned Ed25519 SPKI public key must never be overwritten'
+      );
+
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      assert.equal(manifest.version, '4.2.7');
+      assert.equal(manifest.minShellVersion, '1.0.0');
+      assert.equal(manifest.bundlePath, '/hub-ota/hub-core-4.2.7.bundle.js');
+      assert.equal(manifest.signatureAlgorithm, 'Ed25519');
+
+      const bundlePath = path.join(process.cwd(), 'public', 'hub-ota', 'hub-core-4.2.7.bundle.js');
+      assert.ok(fs.existsSync(bundlePath), 'Compiled OTA bundle hub-core-4.2.7.bundle.js must exist');
+      const bundleBuf = fs.readFileSync(bundlePath);
+      const actualSha = crypto.createHash('sha256').update(bundleBuf).digest('hex');
+      assert.equal(manifest.sha256, actualSha, 'manifest.sha256 must match bundle file SHA-256');
+      assert.equal(manifest.sizeBytes, bundleBuf.length, 'manifest.sizeBytes must match bundle byte length');
+
+      // Copy ONLY the single bundle file into an isolated temp slot directory (no package.json, no node_modules)
+      const isolatedSlot = fs.mkdtempSync(path.join(os.tmpdir(), 'saimetric-ota-regtest-'));
+      try {
+        const isolatedBundle = path.join(isolatedSlot, 'hub-core-4.2.7.bundle.js');
+        fs.copyFileSync(bundlePath, isolatedBundle);
+        const mod = cjsRequire(isolatedBundle);
+        assert.equal(mod.engineVersion, '4.2.7');
+        for (const fn of [
+          'startHubEngine',
+          'stopHubEngine',
+          'getHubStats',
+          'promoteHub',
+          'setHubRole',
+          'setHubMode',
+          'ingestPeerHubBeacon',
+          'recomputeHubElectionState',
+          'triggerReconSweep',
+        ]) {
+          assert.equal(typeof mod[fn], 'function', `Missing required OTA export: ${fn}`);
+        }
+        assert.equal(mod.getHubStats().running, false, 'Bundle must never auto-start server on require()');
+      } finally {
+        fs.rmSync(isolatedSlot, { recursive: true, force: true });
+      }
+    },
+  },
 ];
 
 async function main() {

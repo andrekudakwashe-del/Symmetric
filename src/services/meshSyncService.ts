@@ -184,6 +184,10 @@ import {
   getInternalConsumptions,
 } from './walletService';
 import {
+  onStockAdjustmentChanged,
+  ingestMeshStockAdjustment,
+} from '../db/daos/stockAdjustmentDao';
+import {
   getStoredRoleDefinitions,
   getRoleDefinitionsUpdatedAt,
   ingestMeshRoleDefinitions,
@@ -1477,6 +1481,11 @@ class MeshSyncManager {
     // Auto-hook into Shop Use / Internal Consumption (Create / Approve / Reject): broadcast to Local Hub & mesh
     onInternalConsumptionChanged((req: InternalConsumption) => {
       this.broadcastInternalConsumption(req);
+    });
+
+    // Auto-hook into Maker-Checker Stock Adjustments (Submit / Owner Approve / Reject / Reverse)
+    onStockAdjustmentChanged((adj) => {
+      this.broadcastStockAdjustment(adj);
     });
 
     // Auto-hook into POS Inventory: broadcast product changes
@@ -3793,6 +3802,14 @@ class MeshSyncManager {
           if (ingestMeshStockMovement(d) && !isSilent && typeof window !== 'undefined') {
             window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
           }
+        }
+        break;
+
+      case 'stock_adjustment':
+        if (d && d.id && ingestMeshStockAdjustment(d) && !isSilent && typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('saimetric_stock_adjustments_updated', { detail: d }));
+          window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+          window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
         }
         break;
 
@@ -8487,6 +8504,18 @@ class MeshSyncManager {
       }
     }
 
+    // 7c. Ingest Stock Adjustments (Applies atomic delta ONCE locally when status === APPROVED)
+    if (Array.isArray((delta as any).stockAdjustments) && (delta as any).stockAdjustments.length > 0) {
+      for (const adj of (delta as any).stockAdjustments) {
+        if (adj && adj.id) ingestMeshStockAdjustment(adj);
+      }
+      overallProcessed += (delta as any).stockAdjustments.length;
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_stock_adjustments_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      }
+    }
+
     // 8. Ingest Cash Accounts (T2 via SyncCore) & Transfers (T1)
     if (Array.isArray(delta.cashAccounts) && delta.cashAccounts.length > 0) {
       for (const acc of delta.cashAccounts) {
@@ -9601,6 +9630,24 @@ class MeshSyncManager {
       meta: { isReconPush },
     });
     this.addLog('BROADCAST', `Shop Use #${cleanRec.id} (${cleanRec.status}) broadcasted to WiFi mesh`, this.config.deviceName);
+    this.notifyPeerSubscribers();
+  }
+
+  public broadcastStockAdjustment(record: any, options?: { isReconPush?: boolean }) {
+    const isReconPush = Boolean(options?.isReconPush);
+    if (this.isIngestingFromHub && !isReconPush) return;
+    if (!record || !record.id) return;
+    const cleanRec: any = { ...record, updatedAt: record.updatedAt || Date.now(), lastUpdated: record.lastUpdated || new Date().toISOString() };
+    delete cleanRec.fromMesh;
+    delete cleanRec.fromSync;
+    const stUpper = String(cleanRec.status || '').toUpperCase();
+    void this.dispatchEnvelope('stock_adjustment', cleanRec.id, cleanRec, {
+      action: stUpper && stUpper !== 'PENDING_OWNER_APPROVAL' ? 'UPSERT' : 'APPEND',
+      updatedAt: cleanRec.updatedAt,
+      topicSuffix: 'stock_adjustment',
+      packetId: `ADJ-PKT-${cleanRec.id}-${Date.now()}`,
+      meta: { isReconPush },
+    });
     this.notifyPeerSubscribers();
   }
 

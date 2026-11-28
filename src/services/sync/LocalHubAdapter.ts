@@ -1364,6 +1364,15 @@ export class LocalHubAdapter implements SyncAdapter {
           payload: d,
         };
 
+      case 'stock_adjustment':
+        return {
+          ...base,
+          type: 'stock_adjustment',
+          action: 'STOCK_ADJUSTMENT_RECORD',
+          stockAdjustment: d,
+          payload: d,
+        };
+
       case 'tombstone':
         return {
           ...base,
@@ -1774,6 +1783,11 @@ export class LocalHubAdapter implements SyncAdapter {
       data = unwrapped.movement || unwrapped.payload || unwrapped;
       entityId = String(data?.id || data?.txnId || data?.movementId || unwrapped.id || '');
       action = 'APPEND';
+    } else if (pTypeLower === 'stock_adjustment' || pTypeUpper === 'STOCK_ADJUSTMENT' || pTypeUpper === 'STOCK_ADJUSTMENT_RECORD') {
+      entityType = 'stock_adjustment';
+      data = unwrapped.stockAdjustment || unwrapped.payload || unwrapped;
+      entityId = String(data?.id || data?.adjustmentId || unwrapped.id || '');
+      action = data?.status && data.status !== 'PENDING_OWNER_APPROVAL' ? 'UPSERT' : 'APPEND';
     } else if (pTypeLower === 'grv' || pTypeUpper === 'GRV_RECORD' || pTypeLower === 'direct_grv' || pTypeUpper === 'DIRECT_GRV') {
       entityType = 'direct_grv';
       data = unwrapped.directGrv || unwrapped.grv || unwrapped.payload || unwrapped;
@@ -2092,7 +2106,8 @@ export class LocalHubAdapter implements SyncAdapter {
     if (sheet === 'CashTransfers' || raw === 'cash_transfer') return 'cash_transfer';
     if (sheet === 'GoodsReceived' || payload?.grnId) return 'goods_received';
     if (sheet === 'DirectGRVs' || raw === 'grv' || raw === 'direct_grv') return 'direct_grv';
-    if (sheet === 'StockMovement' || raw === 'stock_movement') return 'stock_movement';
+    if (sheet === 'StockMovement' || sheet === 'StockMovements' || raw === 'stock_movement') return 'stock_movement';
+    if (sheet === 'StockAdjustment' || sheet === 'StockAdjustments' || raw === 'stock_adjustment') return 'stock_adjustment';
     if (sheet === 'Expenses' || raw === 'expense') return 'expense';
     if (sheet === 'InternalConsumption' || raw === 'internal_consumption') return 'internal_consumption';
     if (sheet === 'Reconciliations' || raw === 'reconciliation') return 'reconciliation';

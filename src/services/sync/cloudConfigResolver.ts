@@ -226,6 +226,8 @@ export const ENTITY_TO_CLOUD_TABLE: Record<string, string> = {
   goods_received: 'goods_received',
   stock_movement: 'stock_movements',
   stock_movements: 'stock_movements',
+  stock_adjustment: 'stock_adjustments',
+  stock_adjustments: 'stock_adjustments',
   expense: 'expenses',
   expenses: 'expenses',
   internal_consumption: 'internal_consumption',

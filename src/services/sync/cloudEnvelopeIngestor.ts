@@ -106,6 +106,10 @@ import {
   getInternalConsumptions,
   ingestMeshInternalConsumption,
 } from '../walletService';
+import {
+  getRawStoredStockAdjustments,
+  ingestMeshStockAdjustment,
+} from '../../db/daos/stockAdjustmentDao';
 import { payablesLedger } from '../payablesLedger';
 import { getAllCustomerLedgerEntries, addCustomerLedgerEntry } from '../../db/customerLedger';
 import { getAllTripManifests, saveTripManifest } from '../tripManifestService';
@@ -402,6 +406,17 @@ export function lookupLocalRecordForCloudEnvelope(envelope: SyncEnvelope): any |
       if (!existing) return undefined;
       const statusChanged = (d?.status && d.status !== existing.status) || envelope.action === 'UPSERT';
       return statusChanged ? undefined : existing;
+    }
+    case 'stock_adjustment': {
+      const existing = getRawStoredStockAdjustments().find(
+        (a: any) => String(a.id || '').trim().toUpperCase() === cleanUpper
+      );
+      if (!existing) return undefined;
+      const changed =
+        (d?.status && d.status !== existing.status) ||
+        Boolean(d?.reversedByAdjustmentId && !existing.reversedByAdjustmentId) ||
+        envelope.action === 'UPSERT';
+      return changed ? undefined : existing;
     }
     case 'customer_change': {
       const existing = getRawStoredCustomerChanges().find(
@@ -866,6 +881,14 @@ export function applyCloudEnvelopeToRoomDb(
     case 'stock_movement':
       if (d && ingestMeshStockMovement({ ...d, isCloudSynced: markCloudSynced }) && typeof window !== 'undefined') {
         window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+      }
+      break;
+
+    case 'stock_adjustment':
+      if (d && ingestMeshStockAdjustment({ ...d, isCloudSynced: markCloudSynced }) && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('saimetric_stock_adjustments_updated', { detail: d }));
+        window.dispatchEvent(new CustomEvent('saimetric_inventory_updated'));
+        window.dispatchEvent(new CustomEvent('saimetric_expenses_updated'));
       }
       break;
 

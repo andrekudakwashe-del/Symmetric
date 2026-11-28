@@ -21,6 +21,7 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { createRequire } from 'module';
@@ -112,9 +113,16 @@ async function buildOta() {
     }
   }
 
-  // Bundle public/termux-hub.js + ws into a single zero-dependency Node CommonJS file
+  // Bundle public/termux-hub.js + ws into a single zero-dependency Node CommonJS file.
+  // Use sourcefile 'termux-hub.cjs' so root package.json ("type": "module") never misclassifies
+  // CommonJS module.exports as an unbound ESM global.
   await esbuild.build({
-    entryPoints: [SOURCE_HUB],
+    stdin: {
+      contents: sourceCode,
+      resolveDir: path.dirname(SOURCE_HUB),
+      sourcefile: 'termux-hub.cjs',
+      loader: 'js',
+    },
     outfile: bundleOutPath,
     bundle: true,
     platform: 'node',
@@ -122,12 +130,49 @@ async function buildOta() {
     format: 'cjs',
     minify: false,
     legalComments: 'none',
-    // Keep optional native ws accelerators and optional mongodb driver external
-    external: ['bufferutil', 'utf-8-validate', 'mongodb'],
+    // Keep optional native ws accelerators, rn-bridge, and optional mongodb driver external
+    external: ['rn-bridge', 'bufferutil', 'utf-8-validate', 'mongodb'],
     banner: {
       js: `/* Saimetric Local Hub Core OTA Bundle v${version} — Built ${new Date().toISOString()} */`,
     },
   });
+
+  // Post-build Android APK CommonJS Contract Verification:
+  // Copies ONLY the single bundle into an isolated temp slot directory (no package.json,
+  // no sibling .js files, no node_modules) — matching Android <filesDir>/hub-slots/slot-a/.
+  const isolatedSlotDir = fs.mkdtempSync(path.join(os.tmpdir(), 'saimetric-hub-ota-verify-'));
+  try {
+    const isolatedBundlePath = path.join(isolatedSlotDir, bundleFilename);
+    fs.copyFileSync(bundleOutPath, isolatedBundlePath);
+    const loadedMod = require(isolatedBundlePath);
+    const requiredFns = [
+      'startHubEngine',
+      'stopHubEngine',
+      'getHubStats',
+      'promoteHub',
+      'setHubRole',
+      'setHubMode',
+      'ingestPeerHubBeacon',
+      'recomputeHubElectionState',
+      'triggerReconSweep',
+    ];
+    if (loadedMod.engineVersion !== version) {
+      throw new Error(
+        `[Hub OTA] Contract check failed: exported engineVersion "${loadedMod.engineVersion}" !== "${version}"`
+      );
+    }
+    for (const fnName of requiredFns) {
+      if (typeof loadedMod[fnName] !== 'function') {
+        throw new Error(`[Hub OTA] Contract check failed: missing required export function "${fnName}"`);
+      }
+    }
+    const idleStats = loadedMod.getHubStats();
+    if (idleStats.running) {
+      throw new Error('[Hub OTA] Contract check failed: bundle auto-started server on require()!');
+    }
+  } finally {
+    fs.rmSync(isolatedSlotDir, { recursive: true, force: true });
+  }
 
   const bundleBuffer = fs.readFileSync(bundleOutPath);
   const sha256 = crypto.createHash('sha256').update(bundleBuffer).digest('hex');
@@ -169,10 +214,11 @@ async function buildOta() {
 
   console.log('================================================================');
   console.log(`[Hub OTA] Built bundle:  ${bundleOutPath} (${(bundleBuffer.length / 1024).toFixed(1)} KB)`);
+  console.log(`[Hub OTA] Contract:      VERIFIED (CJS exports, engineVersion=${version}, lazy boot)`);
   console.log(`[Hub OTA] Manifest:      ${MANIFEST_PATH}`);
   console.log(`[Hub OTA] Version:       ${version} (minShell: ${minShellVersion})`);
   console.log(`[Hub OTA] SHA-256:       ${sha256}`);
-  console.log(`[Hub OTA] Signed:        ${signed ? 'YES (Ed25519 verified)' : 'NO (run --keygen on your private machine, then re-run build:hub-ota)'}`);
+  console.log(`[Hub OTA] Signed:        ${signed ? 'YES (Ed25519 verified)' : 'NO (provide HUB_OTA_PRIVATE_KEY env var or .hub-ota-private.pem to sign)'}`);
   console.log('================================================================');
 }
 

@@ -28,6 +28,7 @@ export const DEFAULT_COLD_HUB_ENTITY_ORDER: readonly string[] = [
   'credit_sales',
   'cash_logs',
   'stock_movements',
+  'stock_adjustments',
   'direct_grvs',
   'expenses',
 ];
@@ -96,6 +97,7 @@ function normalizeEntityKey(raw: string): string {
   if (s === 'credit_sale') return 'credit_sales';
   if (s === 'cash_log') return 'cash_logs';
   if (s === 'stock_movement') return 'stock_movements';
+  if (s === 'stock_adjustment') return 'stock_adjustments';
   if (s === 'direct_grv' || s === 'grv') return 'direct_grvs';
   if (s === 'expense') return 'expenses';
   return s;

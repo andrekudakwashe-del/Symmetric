@@ -216,7 +216,8 @@ var BASE_TAB_COLUMNS = {
   "DirectGRVs": ["GRVID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "GRVNumber", "SupplierName", "InvoiceNumber", "ItemsCount", "TotalCost", "CashPaid", "UnpaidBalance", "PaymentMethod", "PaymentStatus", "PaidVoucherID", "AccountID", "Status", "RecordedBy", "ApprovedBy", "Notes", "SyncedAt"],
   "GoodsReceived": ["GRNID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "SupplierID", "SupplierName", "InvoiceRef", "TotalAmount", "ItemsCount", "Status", "ReceivedBy", "Notes", "SyncedAt"],
   "GoodsReceivedItems": ["GRNItemID", "CompanyID", "BranchID", "GRNID", "ProductID", "ProductName", "QtyReceived", "UnitCost", "LineTotal", "BatchNo", "ExpiryDate"],
-  "StockMovements": ["MovementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "ProductID", "ProductName", "MovementType", "QtyChange", "BalanceBefore", "BalanceAfter", "ReferenceID", "StaffID", "StaffName", "Notes", "SyncedAt"],
+  "StockMovements": ["MovementID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "ProductID", "ProductName", "MovementType", "CasesChange", "SinglesChange", "QtyChange", "BalanceBefore", "BalanceAfter", "UnitCost", "ValuationImpact", "ReferenceID", "StaffID", "StaffName", "ApprovedBy", "Notes", "SyncedAt"],
+  "StockAdjustments": ["AdjustmentID", "CompanyID", "BranchID", "BranchName", "Date", "ItemID", "ItemName", "SKU", "EntryMode", "Direction", "ReasonCode", "AuditNote", "DeltaCases", "DeltaSingles", "DeltaUnits", "BeforeTotalUnits", "AfterTotalUnits", "MwacUnitCost", "ValuationImpactUsd", "Status", "CreatedBy", "CreatedByName", "CreatedByRole", "CreatedAt", "ApprovedBy", "ApprovedByName", "ApprovedAt", "RejectedByName", "RejectionReason", "ReversesAdjustmentID", "ReversedByAdjustmentID", "MovementID", "AnomalyFlagsJSON", "UpdatedAt"],
   "StockBatches": ["BatchID", "CompanyID", "BranchID", "ProductID", "ProductName", "BatchNumber", "Quantity", "UnitCost", "ExpiryDate", "ReceivedAt", "SupplierName", "Status"],
   "Expenses": ["ExpenseID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "Category", "Description", "VendorOrCustomer", "Amount", "Currency", "PaymentMethod", "StaffID", "StaffName", "ReceiptRef", "Status", "ApprovedBy", "SyncedAt"],
   "InternalConsumption": ["ConsumptionID", "CompanyID", "BranchID", "BranchName", "Date", "Timestamp", "StaffID", "StaffName", "Department", "Reason", "TotalCost", "ItemsCount", "Status", "ApprovedBy", "Notes"],
@@ -281,6 +282,7 @@ var MASTER_BLUEPRINT = {
 var SHEET_ALIASES = {
   "Salespeople": "Staff",
   "StockMovement": "StockMovements",
+  "StockAdjustment": "StockAdjustments",
   "Audit_Log": "AuditLog",
   "Settings": "SystemSettings",
   "Inventory": "InventoryMaster"
@@ -303,6 +305,7 @@ var ENTITY_TO_TAB = {
   "direct_grv": "DirectGRVs",
   "goods_received": "GoodsReceived",
   "stock_movement": "StockMovements",
+  "stock_adjustment": "StockAdjustments",
   "expense": "Expenses",
   "internal_consumption": "InternalConsumption",
   "supervisor_approval": "AuditLog",
@@ -2736,6 +2739,7 @@ function getIdColumnsForEntityType(entityType) {
     case "direct_grv": return ["GRVID", "GRVNumber", "id"];
     case "goods_received": return ["GRNID", "id"];
     case "stock_movement": return ["MovementID", "id"];
+    case "stock_adjustment": return ["AdjustmentID", "id"];
     case "expense": return ["ExpenseID", "id"];
     case "internal_consumption": return ["ConsumptionID", "id"];
     case "reconciliation": return ["ReconID", "id"];
@@ -3968,6 +3972,7 @@ function handleLegacyActionAsEnvelope(actionNorm, req, masterSsOpt, targetSs, co
     "direct_grvs": "direct_grv",
     "goods_received_notes": "goods_received",
     "stock_movements": "stock_movement",
+    "stock_adjustments": "stock_adjustment",
     "expenses": "expense",
     "suppliers": "supplier",
     "categories": "inventory_category",

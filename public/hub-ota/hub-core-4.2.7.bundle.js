@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* Saimetric Local Hub Core OTA Bundle v4.2.5 — Built 2026-11-27T13:14:51.357Z */
+/* Saimetric Local Hub Core OTA Bundle v4.2.7 — Built 2026-11-28T07:30:46.370Z */
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __commonJS = (cb, mod) => function __require() {
   try {
@@ -3761,7 +3761,7 @@ var require_ws = __commonJS({
   }
 });
 
-// public/termux-hub.js
+// public/termux-hub.cjs
 var { WebSocketServer, WebSocket } = require_ws();
 var http = require("http");
 var fs = require("fs");
@@ -3776,12 +3776,21 @@ var branchNameArgIdx = process.argv.indexOf("--branch-name");
 var hubBranchName = branchNameArgIdx !== -1 && process.argv[branchNameArgIdx + 1] ? process.argv[branchNameArgIdx + 1] : process.env.HUB_BRANCH_NAME || "Harare Main";
 var tenantIdArgIdx = process.argv.indexOf("--tenant-id");
 var hubTenantId = tenantIdArgIdx !== -1 && process.argv[tenantIdArgIdx + 1] ? process.argv[tenantIdArgIdx + 1] : process.env.HUB_TENANT_ID || "COMP-001";
-var HUB_VERSION = "4.2.5";
+var HUB_VERSION = "4.2.7";
+var HUB_ENGINE_VERSION = HUB_VERSION;
 var HUB_RUNTIME = String(process.env.HUB_RUNTIME || "TERMUX").toUpperCase() === "ANDROID_APK" ? "ANDROID_APK" : "TERMUX";
 var HUB_OTA_SLOT = String(process.env.HUB_OTA_SLOT || (HUB_RUNTIME === "ANDROID_APK" ? "A" : "TERMUX"));
 var HUB_REQUIRE_AUTH = process.argv.includes("--require-auth") || String(process.env.HUB_REQUIRE_AUTH || "").toLowerCase() === "true" || HUB_RUNTIME === "ANDROID_APK" && String(process.env.HUB_REQUIRE_AUTH || "").toLowerCase() !== "false";
 var mdnsHostArgIdx = process.argv.indexOf("--mdns-host");
 var HUB_MDNS_HOST = (mdnsHostArgIdx !== -1 && process.argv[mdnsHostArgIdx + 1] ? process.argv[mdnsHostArgIdx + 1] : process.env.HUB_MDNS_HOST || "").trim().toLowerCase();
+var hubActivationCode = String(process.env.HUB_ACTIVATION_CODE || "").trim();
+var hubEventCallback = null;
+var hubEngineRunning = false;
+var hubDataDir = path.resolve(process.env.HUB_DATA_DIR || process.cwd());
+var wsKeepaliveIntervalHandle = null;
+var reconSweepIntervalHandle = null;
+var initialCloudSyncTimeoutHandle = null;
+var peerHubBeacons = /* @__PURE__ */ new Map();
 function getHubLanIps() {
   try {
     const nets = os.networkInterfaces();
@@ -3862,6 +3871,26 @@ function getHubFailoverMeta() {
     activeLeaderInfo: effectiveLeaderInfo
   };
 }
+function broadcastHubRoleStatus() {
+  if (typeof wss === "undefined" || !wss) return;
+  const payload = JSON.stringify({
+    type: "HUB_ROLE_STATUS",
+    action: "HUB_ROLE_STATUS",
+    hubId: hubSecurityState?.hubId || null,
+    tenantId: hubTenantId,
+    branchId: hubBranchId,
+    ...getHubFailoverMeta(),
+    timestamp: Date.now()
+  });
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(payload);
+      } catch {
+      }
+    }
+  });
+}
 var cloudUrlArgIdx = process.argv.indexOf("--cloud-url");
 var cloudSyncUrl = cloudUrlArgIdx !== -1 && process.argv[cloudUrlArgIdx + 1] ? process.argv[cloudUrlArgIdx + 1] : process.env.CLOUD_SYNC_URL || process.env.VITE_GOOGLE_APPS_SCRIPT_URL || "";
 var supabaseUrlArgIdx = process.argv.indexOf("--supabase-url");
@@ -3938,8 +3967,8 @@ function isBlockedMasterSheetWrite(companyId, spreadsheetId) {
   const blockedList = Array.isArray(hubRuntimePolicy.blockedMasterSheetIds) ? hubRuntimePolicy.blockedMasterSheetIds : DEFAULT_HUB_RUNTIME_POLICY.blockedMasterSheetIds;
   return blockedList.includes(sid);
 }
-var CLOUD_CONFIG_FILE = path.join(process.cwd(), "hub-cloud-config.enc");
-var CLOUD_CONFIG_KEY_FILE = path.join(process.cwd(), ".hub-config.key");
+var CLOUD_CONFIG_FILE = path.join(hubDataDir, "hub-cloud-config.enc");
+var CLOUD_CONFIG_KEY_FILE = path.join(hubDataDir, ".hub-config.key");
 var cloudConfig = null;
 function getCloudConfigMasterSecret() {
   if (process.env.HUB_CONFIG_SECRET && String(process.env.HUB_CONFIG_SECRET).trim()) {
@@ -3956,7 +3985,7 @@ function getCloudConfigMasterSecret() {
   } catch (e) {
     fileKey = "saimetric-hub-fallback-key";
   }
-  return `${fileKey}|${os.hostname()}|${process.cwd()}`;
+  return `${fileKey}|${os.hostname()}|${hubDataDir}`;
 }
 function encryptAndSaveCloudConfig(cfgObj) {
   try {
@@ -4143,6 +4172,7 @@ function mapEntityTypeToTable(entityType) {
   if (t === "CUSTOMER_CHANGE" || t === "CUSTOMER_CHANGES") return "customer_changes";
   if (t === "CREDIT_SALE" || t === "CREDIT_SALES") return "credit_sales";
   if (t === "STOCK_MOVEMENT" || t === "STOCK_MOVEMENTS") return "stock_movements";
+  if (t === "STOCK_ADJUSTMENT" || t === "STOCK_ADJUSTMENTS") return "stock_adjustments";
   return String(entityType || "records").toLowerCase();
 }
 function hasIncomingCloudSyncFlag(packet, ...records) {
@@ -4415,6 +4445,7 @@ function mapHubEntityToCanonicalType(entityType) {
   if (t === "EXPENSE" || t === "EXPENSES") return "expense";
   if (t === "INTERNAL_CONSUMPTION" || t === "SHOP_USE" || t === "INTERNAL_CONSUMPTIONS") return "internal_consumption";
   if (t === "STOCK_MOVEMENT" || t === "STOCK_MOVEMENTS") return "stock_movement";
+  if (t === "STOCK_ADJUSTMENT" || t === "STOCK_ADJUSTMENTS") return "stock_adjustment";
   if (t === "RECONCILIATION" || t === "RECONCILIATIONS") return "reconciliation";
   if (t === "SUPPLIER" || t === "SUPPLIERS") return "supplier";
   if (t === "ADMIN_SALE" || t === "ADMIN_SALES") return "admin_sale";
@@ -5073,8 +5104,8 @@ function broadcastInventorySnapshot(item) {
     }
   });
 }
-var DATA_FILE = path.join(process.cwd(), "termux-hub-data.json");
-var BLIND_VAULT_FILE = path.join(process.cwd(), "hub-blind-vault.json");
+var DATA_FILE = path.join(hubDataDir, "termux-hub-data.json");
+var BLIND_VAULT_FILE = path.join(hubDataDir, "hub-blind-vault.json");
 var MAX_STORAGE_BYTES = 2 * 1024 * 1024 * 1024;
 var ROTATION_DAYS = 30;
 var salesStore = [];
@@ -5087,6 +5118,7 @@ var customerChangesStore = [];
 var creditSalesStore = [];
 var creditGroupsStore = [];
 var stockMovementsStore = [];
+var stockAdjustmentsStore = [];
 var expensesStore = [];
 var cashTransfersStore = [];
 var internalConsumptionsStore = [];
@@ -5341,6 +5373,7 @@ function pruneOldRecords() {
   creditSalesStore = creditSalesStore.filter(shouldRetain);
   creditGroupsStore = creditGroupsStore.filter(shouldRetain);
   stockMovementsStore = stockMovementsStore.filter(shouldRetain);
+  stockAdjustmentsStore = stockAdjustmentsStore.filter((a) => a && (a.status === "PENDING_OWNER_APPROVAL" || shouldRetain(a)));
   expensesStore = expensesStore.filter(shouldRetain);
   cashTransfersStore = cashTransfersStore.filter(shouldRetain);
   internalConsumptionsStore = internalConsumptionsStore.filter(shouldRetain);
@@ -5423,6 +5456,7 @@ function loadData() {
       if (Array.isArray(parsed.creditSales)) creditSalesStore = parsed.creditSales;
       if (Array.isArray(parsed.creditGroups)) creditGroupsStore = parsed.creditGroups;
       if (Array.isArray(parsed.stockMovements)) stockMovementsStore = deduplicateHubStockMovements(parsed.stockMovements);
+      if (Array.isArray(parsed.stockAdjustments)) stockAdjustmentsStore = parsed.stockAdjustments;
       if (Array.isArray(parsed.expenses)) expensesStore = parsed.expenses;
       if (Array.isArray(parsed.cashTransfers)) cashTransfersStore = parsed.cashTransfers;
       if (Array.isArray(parsed.internalConsumptions)) internalConsumptionsStore = parsed.internalConsumptions;
@@ -5531,6 +5565,7 @@ function buildSerializedDataPayload() {
     creditSales: creditSalesStore,
     creditGroups: creditGroupsStore,
     stockMovements: stockMovementsStore,
+    stockAdjustments: stockAdjustmentsStore,
     expenses: expensesStore,
     cashTransfers: cashTransfersStore,
     internalConsumptions: internalConsumptionsStore,
@@ -5645,19 +5680,41 @@ async function saveData() {
     saveInFlight = false;
   }
 }
-loadData();
-loadBlindVault();
-var SECURITY_FILE = path.join(process.cwd(), "hub-security.json");
+var SECURITY_FILE = path.join(hubDataDir, "hub-security.json");
 var SECURITY_TMP_FILE = `${SECURITY_FILE}.tmp`;
 var SECURITY_BACKUP_FILE = `${SECURITY_FILE}.bak`;
 var hubSecurityState = {
-  hubId: `HUB-${hubBranchId}-${crypto.randomBytes(3).toString("hex").toUpperCase()}`,
+  hubId: `HUB-${crypto.randomBytes(6).toString("hex").toUpperCase()}`,
   pairedDevices: {},
   activePairCode: null,
   pairCodeExpiresAt: 0
 };
 var pendingPairRequests = /* @__PURE__ */ new Map();
 var pairRateLimitMap = /* @__PURE__ */ new Map();
+function getStableHubId() {
+  if (!hubSecurityState.hubId || !/^HUB-[A-Z0-9_-]{6,}$/i.test(String(hubSecurityState.hubId))) {
+    hubSecurityState.hubId = `HUB-${crypto.randomBytes(6).toString("hex").toUpperCase()}`;
+  }
+  return hubSecurityState.hubId;
+}
+function configureHubPaths(targetDir) {
+  hubDataDir = path.resolve(targetDir || process.env.HUB_DATA_DIR || process.cwd());
+  try {
+    fs.mkdirSync(hubDataDir, { recursive: true });
+  } catch (err) {
+    console.warn("[Termux Hub] Failed to ensure dataDir:", hubDataDir, err.message);
+  }
+  CLOUD_CONFIG_FILE = path.join(hubDataDir, "hub-cloud-config.enc");
+  CLOUD_CONFIG_KEY_FILE = path.join(hubDataDir, ".hub-config.key");
+  DATA_FILE = path.join(hubDataDir, "termux-hub-data.json");
+  DATA_TMP_FILE = `${DATA_FILE}.tmp`;
+  DATA_BACKUP_FILE = `${DATA_FILE}.bak`;
+  BLIND_VAULT_FILE = path.join(hubDataDir, "hub-blind-vault.json");
+  SECURITY_FILE = path.join(hubDataDir, "hub-security.json");
+  SECURITY_TMP_FILE = `${SECURITY_FILE}.tmp`;
+  SECURITY_BACKUP_FILE = `${SECURITY_FILE}.bak`;
+  return hubDataDir;
+}
 function loadHubSecurityState() {
   try {
     let parsed = null;
@@ -5753,6 +5810,12 @@ function emitHubIpcEvent(eventObj) {
     console.log(`[HUB_IPC] ${JSON.stringify(eventObj)}`);
   } catch {
   }
+  if (typeof hubEventCallback === "function") {
+    try {
+      hubEventCallback(eventObj);
+    } catch {
+    }
+  }
 }
 function approveDevicePairing(ws, deviceInfo) {
   const deviceId = String(deviceInfo.deviceId || "").trim();
@@ -5823,11 +5886,11 @@ function readJsonBody(req) {
     req.on("error", () => resolve({}));
   });
 }
-loadHubSecurityState();
 var server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Access-Control-Request-Private-Network");
+  res.setHeader("Access-Control-Allow-Private-Network", "true");
   if (req.method === "OPTIONS") {
     res.writeHead(204);
     return res.end();
@@ -6430,6 +6493,9 @@ function getStoreByEntityType(norm) {
     case "stock_movements":
     case "stock_movement":
       return stockMovementsStore;
+    case "stock_adjustments":
+    case "stock_adjustment":
+      return stockAdjustmentsStore;
     case "direct_grvs":
     case "direct_grv":
     case "grv":
@@ -7002,34 +7068,37 @@ var UNAUTH_ALLOWED_OUTBOUND = /* @__PURE__ */ new Set([
   "HUB_UPDATING",
   "HUB_UPDATE_STATUS"
 ]);
-setInterval(() => {
-  const now = Date.now();
-  wss.clients.forEach((client) => {
-    if (client.readyState !== WebSocket.OPEN) return;
-    if (HUB_REQUIRE_AUTH && !client.isAuthenticated) {
-      const limitMs = client.hasPendingPair ? 12e4 : 3e4;
-      if (client.connectedAt && now - client.connectedAt > limitMs) {
+function startWsKeepaliveTimer() {
+  if (wsKeepaliveIntervalHandle) clearInterval(wsKeepaliveIntervalHandle);
+  wsKeepaliveIntervalHandle = setInterval(() => {
+    const now = Date.now();
+    wss.clients.forEach((client) => {
+      if (client.readyState !== WebSocket.OPEN) return;
+      if (HUB_REQUIRE_AUTH && !client.isAuthenticated) {
+        const limitMs = client.hasPendingPair ? 12e4 : 3e4;
+        if (client.connectedAt && now - client.connectedAt > limitMs) {
+          try {
+            client.send(JSON.stringify({ type: "AUTH_FAILED", reason: "Authentication/pairing timeout." }));
+            client.close(4002, "Auth timeout");
+          } catch {
+          }
+          return;
+        }
+      }
+      if (client.lastActivityAt && now - client.lastActivityAt > 12e4) {
         try {
-          client.send(JSON.stringify({ type: "AUTH_FAILED", reason: "Authentication/pairing timeout." }));
-          client.close(4002, "Auth timeout");
+          client.terminate();
         } catch {
         }
         return;
       }
-    }
-    if (client.lastActivityAt && now - client.lastActivityAt > 5e4) {
       try {
-        client.terminate();
+        client.send(JSON.stringify({ type: "PING", ts: now }));
       } catch {
       }
-      return;
-    }
-    try {
-      client.send(JSON.stringify({ type: "PING", ts: now }));
-    } catch {
-    }
-  });
-}, 2e4);
+    });
+  }, 2e4);
+}
 wss.on("connection", (ws, req) => {
   const remoteIp = req.socket.remoteAddress;
   console.log(`[Termux Hub] \u{1F7E2} POS Terminal connected from ${remoteIp} (AuthRequired=${HUB_REQUIRE_AUTH})`);
@@ -7610,6 +7679,7 @@ wss.on("connection", (ws, req) => {
         creditSalesStore = [];
         creditGroupsStore = [];
         stockMovementsStore = [];
+        stockAdjustmentsStore = [];
         expensesStore = [];
         cashTransfersStore = [];
         internalConsumptionsStore = [];
@@ -10208,6 +10278,120 @@ wss.on("connection", (ws, req) => {
           scheduleSave();
         }
       }
+      const adjObj = packet.stockAdjustment || payload;
+      const isStockAdjustmentPkt = pType === "STOCK_ADJUSTMENT" || pType === "STOCK_ADJUSTMENT_RECORD" || entityType === "stock_adjustment" || sheetName === "StockAdjustment" || sheetName === "StockAdjustments";
+      if (isStockAdjustmentPkt && adjObj && (adjObj.id || adjObj.adjustmentId)) {
+        const adjId = String(adjObj.id || adjObj.adjustmentId).trim();
+        const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, adjObj);
+        const incStatus = String(adjObj.status || "PENDING_OWNER_APPROVAL").trim().toUpperCase();
+        const isOwnerRoleHub = (role) => {
+          const r = String(role || "").trim().toUpperCase();
+          return r === "OWNER" || r === "SUPER_ADMIN" || r === "ADMIN";
+        };
+        if (incStatus === "APPROVED") {
+          const authRole = adjObj.approvedByRole || adjObj.createdByRole;
+          if (authRole && !isOwnerRoleHub(authRole)) {
+            console.warn(`[Termux Hub] \u{1F6E1}\uFE0F Blocked unauthorized APPROVED stock adjustment [${adjId}] from role "${authRole}"`);
+            return;
+          }
+        }
+        const exIdx = stockAdjustmentsStore.findIndex((a) => String(a.id || "").trim() === adjId);
+        const resolvedCloudSynced = incomingCloudSynced || exIdx >= 0 && stockAdjustmentsStore[exIdx].isCloudSynced === true;
+        let storedAdj = null;
+        if (exIdx >= 0) {
+          const prevAdj = stockAdjustmentsStore[exIdx];
+          const prevSt = String(prevAdj.status || "").trim().toUpperCase();
+          const prevFinal = prevSt === "APPROVED" || prevSt === "REJECTED" || prevSt === "CANCELLED";
+          const incPending = !incStatus || incStatus === "PENDING_OWNER_APPROVAL";
+          if (prevFinal && incPending || prevSt === "APPROVED" && incStatus !== "APPROVED") {
+            try {
+              ws.send(JSON.stringify({
+                type: "STOCK_ADJUSTMENT",
+                action: "STOCK_ADJUSTMENT_RECORD",
+                stockAdjustment: prevAdj,
+                payload: prevAdj,
+                origin_device_id: "LOCAL_HUB",
+                origin_device_name: "Termux Local Hub",
+                timestamp: Date.now()
+              }));
+            } catch (e) {
+            }
+            return;
+          }
+          const nowAdjMs = Date.now();
+          storedAdj = {
+            ...prevAdj,
+            ...adjObj,
+            id: adjId,
+            status: incStatus,
+            updatedAt: Math.max(nowAdjMs, Number(adjObj.updatedAt) || 0),
+            hubTimestamp: nowAdjMs,
+            lastUpdated: new Date(nowAdjMs).toISOString(),
+            ...resolvedCloudSynced ? { isCloudSynced: true } : {}
+          };
+          stockAdjustmentsStore[exIdx] = storedAdj;
+        } else {
+          const nowAdjMs = Date.now();
+          storedAdj = {
+            ...adjObj,
+            id: adjId,
+            status: incStatus,
+            updatedAt: Number(adjObj.updatedAt) || nowAdjMs,
+            hubTimestamp: nowAdjMs,
+            lastUpdated: adjObj.lastUpdated || new Date(nowAdjMs).toISOString(),
+            ...resolvedCloudSynced ? { isCloudSynced: true } : {}
+          };
+          stockAdjustmentsStore.unshift(storedAdj);
+        }
+        if (storedAdj && storedAdj.status === "APPROVED") {
+          const targetItemId = String(storedAdj.itemId || "").trim();
+          const deltaUnits = Number(storedAdj.deltaUnits || 0);
+          const movRefUpper = adjId.toUpperCase();
+          const expectedMovId = String(storedAdj.movementId || `MOV-ADJ-${adjId}`).trim();
+          const alreadyApplied = stockMovementsStore.some((m) => {
+            const mRef = String(m.referenceId || m.reference || "").trim().toUpperCase();
+            const mId = String(m.id || m.movementId || m.txnId || "").trim().toUpperCase();
+            return mRef === movRefUpper || mId === expectedMovId.toUpperCase();
+          });
+          if (!alreadyApplied && targetItemId && Math.abs(deltaUnits) > 1e-4) {
+            const invIdx = inventoryStore.findIndex((i) => String(i.itemId || i.id || "").trim() === targetItemId);
+            if (invIdx >= 0) {
+              const targetItem = inventoryStore[invIdx];
+              const curUnits = Number(targetItem.totalUnits !== void 0 ? targetItem.totalUnits : Number(targetItem.stockCases || 0) * Math.max(1, Number(targetItem.unitsPerCase || 1)) + Number(targetItem.stockSingles || 0));
+              const nextUnits = Math.max(0, roundHubUnits(curUnits + deltaUnits));
+              applyHubStockUnits(targetItem, nextUnits);
+              targetItem.updatedAt = Date.now();
+              targetItem.lastUpdated = (/* @__PURE__ */ new Date()).toISOString();
+              stockMovementsStore.unshift({
+                id: expectedMovId,
+                movementId: expectedMovId,
+                txnId: expectedMovId,
+                itemId: targetItemId,
+                itemName: storedAdj.itemName || targetItem.itemName || targetItemId,
+                movementType: storedAdj.deltaUnits < 0 ? "DAMAGE_LOSS" : "ADJUSTMENT",
+                casesChange: Number(storedAdj.deltaCases || 0),
+                singlesChange: Number(storedAdj.deltaSingles || 0),
+                deltaUnits,
+                resultingStockCases: targetItem.stockCases,
+                resultingStockSingles: targetItem.stockSingles,
+                referenceId: adjId,
+                reason: `[${storedAdj.reasonCode || "ADJUSTMENT"}] ${storedAdj.auditNote || ""}`,
+                staffId: storedAdj.createdBy,
+                staffName: `${storedAdj.createdByName || "Staff"} -> Owner: ${storedAdj.approvedByName || "Owner"}`,
+                approvedBy: storedAdj.approvedBy,
+                approvedByName: storedAdj.approvedByName,
+                company_id: storedAdj.company_id || hubTenantId,
+                branch_id: storedAdj.branch_id || hubBranchId,
+                date: storedAdj.date || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10),
+                timestamp: storedAdj.approvedAt || (/* @__PURE__ */ new Date()).toISOString()
+              });
+              console.log(`[Termux Hub] \u2705 Applied Approved Stock Adjustment [${adjId}] (${deltaUnits >= 0 ? "+" : ""}${deltaUnits}u) to ${targetItemId} -> ${nextUnits}u`);
+            }
+          }
+        }
+        scheduleSave();
+        if (incomingCloudSynced) broadcastCloudSyncAck(ws, "STOCK_ADJUSTMENT", adjId);
+      }
       if ((pType === "EXPENSE" || pType === "expense" || sheetName === "Expenses" || packet.entityType === "expense") && payload && payload.id) {
         const incomingCloudSynced = hasIncomingCloudSyncFlag(packet, payload);
         const exIdx = expensesStore.findIndex((e) => e.id === payload.id);
@@ -11564,6 +11748,9 @@ wss.on("connection", (ws, req) => {
         const missedStockMovements = deduplicateHubStockMovements(
           stockMovementsStore.filter((sm) => isMatch(sm, reqComp, reqBranch) && (getTimestamp(sm) >= sinceTime || packet.isForced || isExplicitZero))
         );
+        const missedStockAdjustments = stockAdjustmentsStore.filter(
+          (sa) => isMatch(sa, reqComp, reqBranch) && (sa.status === "PENDING_OWNER_APPROVAL" || getTimestamp(sa) >= sinceTime || packet.isForced || isExplicitZero)
+        );
         const missedExpenses = expensesStore.filter((ex) => isMatch(ex, reqComp, reqBranch) && (getTimestamp(ex) >= sinceTime || packet.isForced || isExplicitZero));
         const missedInternalConsumptions = internalConsumptionsStore.filter((ic) => isMatch(ic, reqComp, reqBranch) && (getTimestamp(ic) >= sinceTime || packet.isForced || isExplicitZero));
         const isGlobalCashTransferRec = (tr) => {
@@ -11666,6 +11853,7 @@ wss.on("connection", (ws, req) => {
             customerChanges: missedCustomerChanges,
             creditSales: missedCreditSales,
             stockMovements: missedStockMovements,
+            stockAdjustments: missedStockAdjustments,
             expenses: missedExpenses,
             internalConsumptions: missedInternalConsumptions,
             cashTransfers: missedCashTransfers,
@@ -11751,37 +11939,13 @@ wss.on("connection", (ws, req) => {
     console.warn("[Termux Hub] Client WebSocket error:", err.message);
   });
 });
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`================================================================`);
-  console.log(`\u{1F680} Saimetric POS - Universal Freeze-Once Local Hub (v${HUB_VERSION})`);
-  console.log(`\u{1F4E1} WebSocket URL:  ws://0.0.0.0:${PORT}`);
-  console.log(`\u{1F310} HTTP Status:    http://0.0.0.0:${PORT}/health`);
-  console.log(`\u{1F194} Hub ID:         ${hubSecurityState.hubId} (${HUB_RUNTIME} / Slot ${HUB_OTA_SLOT})`);
-  console.log(`\u{1F510} Mutual Auth:    ${HUB_REQUIRE_AUTH ? "STRICT (Paired Devices Only)" : "OPTIONAL (Termux Backup Mode \u2014 pass --require-auth to enforce)"}`);
-  console.log(`\u{1F3E2} Branch ID:      ${hubBranchId} ("${hubBranchName}")`);
-  console.log(`\u{1F3E2} Tenant ID:      ${hubTenantId}`);
-  console.log(`\u{1F4BE} Data File:      ${DATA_FILE}`);
-  console.log(`\u26A1 Dual-Sync:      Transactional (Append-Only) & Config (Strict LWW)`);
-  console.log(`\u{1F6E1}\uFE0F  Staff LWW handler registered (v3.4.0)`);
-  console.log(`\u{1F6E1}\uFE0F  Customer LWW handler registered (v3.4.0)`);
-  console.log(`\u{1F6E1}\uFE0F  Branch LWW handler registered (v3.4.0)`);
-  console.log(`\u{1F6E1}\uFE0F  Casual Workers LWW handler registered (v3.4.0)`);
-  console.log(`\u{1F6E1}\uFE0F  Stocktake Session LWW handler registered (v3.4.0)`);
-  console.log(`\u{1F6E1}\uFE0F  Cash Account LWW handler registered (v3.4.0)`);
-  console.log(`\u{1F4E6} Supplier sync registered (v3.5.0)`);
-  console.log(`\u{1F4E6} Admin Sales sync registered (v3.5.0)`);
-  console.log(`\u{1F4E6} Cash Count sync registered (v3.5.0)`);
-  console.log(`\u{1F4E6} Voucher sync registered (v3.5.0)`);
-  console.log(`\u{1F4E6} Closures & Settlements sync registered (v3.6.0)`);
-  console.log(`\u{1F4E6} Categories sync registered (v3.6.0)`);
-  console.log(`\u{1F9F9} Automated Reconciliation Sweep Engine active (30m interval + connection trigger)`);
-  console.log(`\u2601\uFE0F  Edge-to-Cloud (Hub to Supabase) Bridge active (v3.7.0)`);
-  console.log(`================================================================`);
-});
 var RECON_SWEEP_INTERVAL_MS = 30 * 60 * 1e3;
-setInterval(() => {
-  triggerAllClientsReconSweep();
-}, RECON_SWEEP_INTERVAL_MS);
+function startReconSweepTimer() {
+  if (reconSweepIntervalHandle) clearInterval(reconSweepIntervalHandle);
+  reconSweepIntervalHandle = setInterval(() => {
+    triggerAllClientsReconSweep();
+  }, RECON_SWEEP_INTERVAL_MS);
+}
 async function syncEdgeToCloudSupabase() {
   const adapterCfg = resolveCloudAdapterConfig();
   if (adapterCfg.databaseType === "none") {
@@ -11793,6 +11957,7 @@ async function syncEdgeToCloudSupabase() {
     { name: "credit_sales", entityType: "credit_sales", isT2: false, store: creditSalesStore },
     { name: "cash_logs", entityType: "cash_logs", isT2: false, store: cashLogsStore },
     { name: "stock_movements", entityType: "stock_movements", isT2: false, store: stockMovementsStore },
+    { name: "stock_adjustments", entityType: "stock_adjustments", isT2: false, store: stockAdjustmentsStore },
     { name: "direct_grvs", entityType: "direct_grvs", isT2: false, store: directGrvsStore },
     { name: "expenses", entityType: "expenses", isT2: false, store: expensesStore },
     { name: "inventory", entityType: "inventory", isT2: true, store: inventoryStore },
@@ -11973,6 +12138,7 @@ async function syncEdgeToCloudSupabase() {
         expense: { arr: expensesStore, keyFn: (r) => r.id },
         internal_consumption: { arr: internalConsumptionsStore, keyFn: (r) => r.id },
         stock_movement: { arr: stockMovementsStore, keyFn: (r) => r.id || r.movementId || r.txnId },
+        stock_adjustment: { arr: stockAdjustmentsStore, keyFn: (r) => r.id || r.adjustmentId },
         admin_sale: { arr: adminSalesStore, keyFn: (r) => r.id || r.invoice_id },
         cash_count: { arr: cashCountsStore, keyFn: (r) => r.id || r.countId },
         supplier_invoice_voucher: { arr: vouchersStore, keyFn: (r) => r.id || r.voucherNumber || r.voucherId },
@@ -12033,7 +12199,7 @@ async function syncEdgeToCloudSupabase() {
             targetSpec.arr[idx] = { ...ex2, ...rec, ...linked.length > 0 ? { linked_cash_log_ids: linked } : {}, isCloudSynced: true };
             return true;
           }
-        } else if (eType === "credit_sale" || eType === "expense" || eType === "internal_consumption" || eType === "direct_grv") {
+        } else if (eType === "credit_sale" || eType === "expense" || eType === "internal_consumption" || eType === "stock_adjustment" || eType === "direct_grv") {
           if (cloudTs > getRecordTimestamp(ex2) && rec.status !== ex2.status) {
             targetSpec.arr[idx] = { ...ex2, ...rec, isCloudSynced: true };
             return true;
@@ -12169,6 +12335,7 @@ async function syncEdgeToCloudSupabase() {
       { hubType: "EXPENSE", store: expensesStore },
       { hubType: "INTERNAL_CONSUMPTION", store: internalConsumptionsStore },
       { hubType: "STOCK_MOVEMENT", store: stockMovementsStore },
+      { hubType: "STOCK_ADJUSTMENT", store: stockAdjustmentsStore },
       { hubType: "ADMIN_SALE", store: adminSalesStore },
       { hubType: "CASH_COUNT", store: cashCountsStore },
       { hubType: "VOUCHER", store: vouchersStore },
@@ -12511,20 +12678,341 @@ function restartCloudSyncTimer() {
     syncEdgeToCloudSupabase();
   }, intervalMs);
 }
-setTimeout(() => {
-  syncEdgeToCloudSupabase();
-}, 1e4);
-restartCloudSyncTimer();
+function setHubRole(nextRole, nextPriority) {
+  hubRole = normalizeTermuxHubRole(nextRole);
+  const pNum = Number(nextPriority);
+  hubPriority = Number.isFinite(pNum) && pNum > 0 ? Math.floor(pNum) : defaultTermuxHubPriority(hubRole);
+  broadcastHubRoleStatus();
+  emitHubIpcEvent({ type: "HUB_ROLE_CHANGED", ...getHubFailoverMeta(), hubId: getStableHubId() });
+  return { ok: true, ...getHubFailoverMeta() };
+}
+function setHubMode(nextMode) {
+  const norm = String(nextMode || "").trim().toUpperCase();
+  hubMode = norm === "STANDBY" ? "STANDBY" : "ACTIVE";
+  if (hubMode === "ACTIVE") {
+    activeLeaderHubId = getStableHubId();
+  }
+  broadcastHubRoleStatus();
+  emitHubIpcEvent({ type: "HUB_MODE_CHANGED", ...getHubFailoverMeta(), hubId: getStableHubId() });
+  return { ok: true, ...getHubFailoverMeta() };
+}
+function promoteHub(opts = {}) {
+  if (opts && opts.hubRole) {
+    hubRole = normalizeTermuxHubRole(opts.hubRole);
+  }
+  if (opts && Number.isFinite(Number(opts.hubPriority)) && Number(opts.hubPriority) > 0) {
+    hubPriority = Math.floor(Number(opts.hubPriority));
+  }
+  hubBranchEpoch = Math.max(hubBranchEpoch + 1, Number(opts?.branchEpoch) || 1);
+  hubMode = "ACTIVE";
+  activeLeaderHubId = getStableHubId();
+  activeLeaderInfo = null;
+  scheduleSave();
+  broadcastHubRoleStatus();
+  emitHubIpcEvent({ type: "HUB_PROMOTED", ...getHubFailoverMeta(), hubId: getStableHubId() });
+  return { ok: true, ...getHubFailoverMeta() };
+}
+function recomputeHubElectionState() {
+  const now = Date.now();
+  const selfId = getStableHubId();
+  let bestPeer = null;
+  for (const [peerId, b] of peerHubBeacons.entries()) {
+    if (!b || now - (Number(b.lastSeenAt) || 0) > 45e3) {
+      peerHubBeacons.delete(peerId);
+      continue;
+    }
+    if (peerId === selfId) continue;
+    if (String(b.hubMode || "").toUpperCase() !== "ACTIVE") continue;
+    const pEpoch = Number(b.branchEpoch) || 1;
+    const pPrio = Number(b.hubPriority) || 0;
+    const better = pEpoch > hubBranchEpoch || pEpoch === hubBranchEpoch && pPrio > hubPriority || pEpoch === hubBranchEpoch && pPrio === hubPriority && String(peerId) < String(selfId);
+    if (better) {
+      if (!bestPeer || pEpoch > (Number(bestPeer.branchEpoch) || 1) || pEpoch === (Number(bestPeer.branchEpoch) || 1) && pPrio > (Number(bestPeer.hubPriority) || 0)) {
+        bestPeer = b;
+      }
+    }
+  }
+  if (bestPeer) {
+    hubMode = "STANDBY";
+    activeLeaderHubId = bestPeer.hubId;
+    activeLeaderInfo = {
+      hubId: bestPeer.hubId,
+      hubRole: bestPeer.hubRole,
+      hubPriority: bestPeer.hubPriority,
+      branchEpoch: bestPeer.branchEpoch,
+      lanIp: bestPeer.lanIp,
+      wsPort: bestPeer.wsPort || PORT,
+      wsUrl: bestPeer.wsUrl || (bestPeer.lanIp ? `ws://${bestPeer.lanIp}:${bestPeer.wsPort || PORT}` : "")
+    };
+  } else {
+    hubMode = "ACTIVE";
+    activeLeaderHubId = selfId;
+    activeLeaderInfo = null;
+  }
+  broadcastHubRoleStatus();
+  return getHubFailoverMeta();
+}
+function ingestPeerHubBeacon(beacon) {
+  if (!beacon || typeof beacon !== "object") return getHubFailoverMeta();
+  const peerId = String(beacon.hubId || beacon.hub_id || "").trim();
+  if (!peerId || peerId === getStableHubId()) return getHubFailoverMeta();
+  peerHubBeacons.set(peerId, {
+    ...beacon,
+    hubId: peerId,
+    lastSeenAt: Date.now()
+  });
+  return recomputeHubElectionState();
+}
+function triggerReconSweep() {
+  triggerAllClientsReconSweep();
+  return { ok: true, clientsNotified: wss ? wss.clients.size : 0 };
+}
+function getHubStats() {
+  let connectedClients = 0;
+  let authenticatedClients = 0;
+  if (wss && wss.clients) {
+    wss.clients.forEach((c) => {
+      if (c.readyState === WebSocket.OPEN) {
+        connectedClients++;
+        if (c.isAuthenticated !== false) authenticatedClients++;
+      }
+    });
+  }
+  return {
+    running: hubEngineRunning,
+    version: HUB_VERSION,
+    engineVersion: HUB_ENGINE_VERSION,
+    otaSlot: HUB_OTA_SLOT,
+    hubRuntime: HUB_RUNTIME,
+    hubId: getStableHubId(),
+    port: PORT,
+    dataDir: hubDataDir,
+    branchId: hubBranchId,
+    branchName: hubBranchName,
+    tenantId: hubTenantId,
+    mdnsHost: getHubMdnsHost(),
+    lanIps: getHubLanIps(),
+    authRequired: HUB_REQUIRE_AUTH,
+    connectedClients,
+    authenticatedClients,
+    pairedDevicesCount: Object.values(hubSecurityState.pairedDevices || {}).filter((d) => d && !d.revoked).length,
+    salesCount: salesStore.length,
+    inventoryCount: inventoryStore.length,
+    stockAdjustmentsCount: stockAdjustmentsStore.length,
+    pendingStockAdjustmentsCount: stockAdjustmentsStore.filter((a) => a && a.status === "PENDING_OWNER_APPROVAL").length,
+    uptime: process.uptime(),
+    ...getHubFailoverMeta()
+  };
+}
+function listenWithEaddrInUseRetry(targetPort, maxRetries = 12, retryDelayMs = 250) {
+  return new Promise((resolve, reject) => {
+    let attempts = 0;
+    const tryListen = () => {
+      attempts++;
+      const onError = (err) => {
+        server.removeListener("listening", onListening);
+        if (err && err.code === "EADDRINUSE" && attempts < maxRetries) {
+          console.warn(`[Termux Hub] Port ${targetPort} busy (EADDRINUSE), retry ${attempts}/${maxRetries} in ${retryDelayMs}ms...`);
+          setTimeout(tryListen, retryDelayMs);
+          return;
+        }
+        reject(err);
+      };
+      const onListening = () => {
+        server.removeListener("error", onError);
+        resolve();
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      try {
+        server.listen(targetPort, "0.0.0.0");
+      } catch (syncErr) {
+        onError(syncErr);
+      }
+    };
+    tryListen();
+  });
+}
+async function startHubEngine(options = {}) {
+  try {
+    if (hubEngineRunning) {
+      return { ok: true, alreadyRunning: true, ...getHubStats() };
+    }
+    isShuttingDown = false;
+    if (options && typeof options === "object") {
+      if (options.dataDir) configureHubPaths(options.dataDir);
+      else configureHubPaths(hubDataDir);
+      if (options.port !== void 0 && Number.isFinite(Number(options.port)) && Number(options.port) > 0) {
+        PORT = Math.floor(Number(options.port));
+      }
+      if (options.branchId) hubBranchId = String(options.branchId).trim();
+      if (options.branchName) hubBranchName = String(options.branchName).trim();
+      if (options.tenantId) hubTenantId = String(options.tenantId).trim();
+      if (options.mdnsHost !== void 0) HUB_MDNS_HOST = String(options.mdnsHost || "").trim().toLowerCase();
+      if (options.hubRole) hubRole = normalizeTermuxHubRole(options.hubRole);
+      if (options.hubPriority !== void 0 && Number.isFinite(Number(options.hubPriority)) && Number(options.hubPriority) > 0) {
+        hubPriority = Math.floor(Number(options.hubPriority));
+      } else if (options.hubRole) {
+        hubPriority = defaultTermuxHubPriority(hubRole);
+      }
+      if (options.branchEpoch !== void 0 && Number.isFinite(Number(options.branchEpoch)) && Number(options.branchEpoch) >= 1) {
+        hubBranchEpoch = Math.floor(Number(options.branchEpoch));
+      }
+      if (options.hubMode) {
+        hubMode = String(options.hubMode).trim().toUpperCase() === "STANDBY" ? "STANDBY" : "ACTIVE";
+      }
+      if (options.hubRuntime) {
+        HUB_RUNTIME = String(options.hubRuntime).trim().toUpperCase() === "ANDROID_APK" ? "ANDROID_APK" : "TERMUX";
+      }
+      if (options.otaSlot !== void 0 && String(options.otaSlot).trim()) {
+        HUB_OTA_SLOT = String(options.otaSlot).trim();
+      }
+      if (options.requireAuth !== void 0) {
+        HUB_REQUIRE_AUTH = Boolean(options.requireAuth);
+      } else if (options.enforceSecurity !== void 0) {
+        HUB_REQUIRE_AUTH = Boolean(options.enforceSecurity);
+      }
+      if (options.activationCode !== void 0) {
+        hubActivationCode = String(options.activationCode || "").trim();
+      }
+      if (typeof options.onEvent === "function") {
+        hubEventCallback = options.onEvent;
+      }
+    } else {
+      configureHubPaths(hubDataDir);
+    }
+    loadData();
+    loadBlindVault();
+    loadHubSecurityState();
+    getStableHubId();
+    await listenWithEaddrInUseRetry(PORT, 12, 250);
+    hubEngineRunning = true;
+    startWsKeepaliveTimer();
+    startReconSweepTimer();
+    if (initialCloudSyncTimeoutHandle) clearTimeout(initialCloudSyncTimeoutHandle);
+    initialCloudSyncTimeoutHandle = setTimeout(() => {
+      syncEdgeToCloudSupabase();
+    }, 1e4);
+    restartCloudSyncTimer();
+    console.log(`================================================================`);
+    console.log(`\u{1F680} Saimetric POS - Universal Freeze-Once Local Hub (v${HUB_VERSION})`);
+    console.log(`\u{1F4E1} WebSocket URL:  ws://0.0.0.0:${PORT}`);
+    console.log(`\u{1F310} HTTP Status:    http://0.0.0.0:${PORT}/health`);
+    console.log(`\u{1F194} Hub ID:         ${getStableHubId()} (${HUB_RUNTIME} / Slot ${HUB_OTA_SLOT})`);
+    console.log(`\u{1F510} Mutual Auth:    ${HUB_REQUIRE_AUTH ? "STRICT (Paired Devices Only)" : "OPTIONAL (Termux Backup Mode)"}`);
+    console.log(`\u{1F3E2} Branch ID:      ${hubBranchId} ("${hubBranchName}") | Tenant: ${hubTenantId}`);
+    console.log(`\u{1F4BE} Data Dir:       ${hubDataDir}`);
+    console.log(`================================================================`);
+    emitHubIpcEvent({ type: "HUB_STARTED", ...getHubStats() });
+    return { ok: true, ...getHubStats() };
+  } catch (err) {
+    hubEngineRunning = false;
+    const message = err && err.message ? err.message : String(err);
+    console.error("[Termux Hub] Failed to start Hub Engine:", message);
+    emitHubIpcEvent({ type: "HUB_START_ERROR", error: message });
+    return { ok: false, error: message };
+  }
+}
+async function stopHubEngine() {
+  isShuttingDown = true;
+  hubEngineRunning = false;
+  try {
+    if (wsKeepaliveIntervalHandle) {
+      clearInterval(wsKeepaliveIntervalHandle);
+      wsKeepaliveIntervalHandle = null;
+    }
+    if (reconSweepIntervalHandle) {
+      clearInterval(reconSweepIntervalHandle);
+      reconSweepIntervalHandle = null;
+    }
+    if (cloudSyncIntervalHandle) {
+      clearInterval(cloudSyncIntervalHandle);
+      cloudSyncIntervalHandle = null;
+    }
+    if (initialCloudSyncTimeoutHandle) {
+      clearTimeout(initialCloudSyncTimeoutHandle);
+      initialCloudSyncTimeoutHandle = null;
+    }
+    if (saveTimeout) {
+      clearTimeout(saveTimeout);
+      saveTimeout = null;
+    }
+    if (saveDirty) {
+      saveDataSyncAtomic();
+    }
+    if (wss && wss.clients) {
+      wss.clients.forEach((client) => {
+        try {
+          client.close(1001, "Hub restarting");
+        } catch {
+        }
+        try {
+          client.terminate();
+        } catch {
+        }
+      });
+    }
+    await new Promise((resolve) => {
+      if (!server.listening) return resolve();
+      const safetyTimer = setTimeout(resolve, 1500);
+      try {
+        if (typeof server.closeAllConnections === "function") {
+          server.closeAllConnections();
+        }
+      } catch {
+      }
+      try {
+        server.close(() => {
+          clearTimeout(safetyTimer);
+          resolve();
+        });
+      } catch {
+        clearTimeout(safetyTimer);
+        resolve();
+      }
+    });
+    emitHubIpcEvent({ type: "HUB_STOPPED", version: HUB_VERSION, otaSlot: HUB_OTA_SLOT });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+}
 function flushBeforeExit(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   if (saveDirty || saveTimeout) {
     saveDataSyncAtomic();
   }
-  if (signal) {
+  if (signal && require.main === module) {
     process.exit(0);
   }
 }
-process.once("SIGINT", () => flushBeforeExit("SIGINT"));
-process.once("SIGTERM", () => flushBeforeExit("SIGTERM"));
-process.once("beforeExit", () => flushBeforeExit(null));
+if (require.main === module) {
+  process.once("SIGINT", () => flushBeforeExit("SIGINT"));
+  process.once("SIGTERM", () => flushBeforeExit("SIGTERM"));
+  process.once("beforeExit", () => flushBeforeExit(null));
+  startHubEngine().then((res) => {
+    if (!res || !res.ok) {
+      process.exit(1);
+    }
+  });
+}
+module.exports = {
+  engineVersion: HUB_ENGINE_VERSION,
+  HUB_VERSION,
+  HUB_ENGINE_VERSION,
+  startHubEngine,
+  stopHubEngine,
+  getHubStats,
+  promoteHub,
+  setHubRole,
+  setHubMode,
+  ingestPeerHubBeacon,
+  recomputeHubElectionState,
+  triggerReconSweep,
+  getStableHubId,
+  roundHubUnits,
+  decomposeHubStockUnits,
+  normalizeHubStockFields,
+  applyHubStockUnits
+};

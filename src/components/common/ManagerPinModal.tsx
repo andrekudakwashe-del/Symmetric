@@ -36,7 +36,8 @@ interface ManagerPinModalProps {
   reasonRequired?: boolean;
   defaultReasons?: string[];
   currentStaff?: Salesperson | null;
-  onAuthorize: (manager: Salesperson, reason: string) => void;
+  ownerOnly?: boolean;
+  onAuthorize: (manager: Salesperson, reason: string, verifiedPin?: string) => void;
 }
 
 const DEFAULT_REASONS_MAP: Record<'REFUND' | 'VOID' | 'DISCOUNT' | 'APPROVAL', string[]> = {
@@ -80,6 +81,7 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
   reasonRequired = true,
   defaultReasons,
   currentStaff,
+  ownerOnly = false,
   onAuthorize,
 }) => {
   const [pin, setPin] = useState<string>('');
@@ -193,11 +195,17 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
         return;
       }
 
-      const isAuthorized = isSupervisorOrAbove(matched.role) || Boolean(matched.permissions?.canPinOverride);
+      const normRole = String(matched.role || '').trim().toUpperCase();
+      const isOwnerOrAdmin = normRole === 'OWNER' || normRole === 'SUPER_ADMIN' || normRole === 'ADMIN';
+      const isAuthorized = ownerOnly
+        ? isOwnerOrAdmin
+        : (isSupervisorOrAbove(matched.role) || Boolean(matched.permissions?.canPinOverride));
 
       if (!isAuthorized) {
         setError(
-          `Entered PIN belongs to ${matched.name} (${matched.role}). Authorization requires a Supervisor, Manager, or Administrator PIN.`
+          ownerOnly
+            ? `Entered PIN belongs to ${matched.name} (${matched.role}). Stock adjustments require an Owner or Administrator PIN.`
+            : `Entered PIN belongs to ${matched.name} (${matched.role}). Authorization requires a Supervisor, Manager, or Administrator PIN.`
         );
         setPin('');
         scrambleKeypad();
@@ -218,7 +226,7 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
       }
 
       setIsVerifying(false);
-      onAuthorize(matched, finalReason);
+      onAuthorize(matched, finalReason, cleanPin);
       onClose();
     }, 180);
   };
@@ -226,7 +234,13 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
   const staffPool = getSalespeople().length > 0 ? getSalespeople() : getAllSalespeople();
   const authorizedManagers = staffPool
     .filter((s) => s.active === 'Y')
-    .filter((s) => isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride));
+    .filter((s) => {
+      if (ownerOnly) {
+        const r = String(s.role || '').trim().toUpperCase();
+        return r === 'OWNER' || r === 'SUPER_ADMIN' || r === 'ADMIN';
+      }
+      return isSupervisorOrAbove(s.role) || Boolean(s.permissions?.canPinOverride);
+    });
 
   return (
     <div
@@ -338,7 +352,7 @@ export const ManagerPinModal: React.FC<ManagerPinModalProps> = ({
           <div className="flex items-center justify-between px-1">
             <span className="flex items-center space-x-1.5 text-xs font-semibold text-slate-300">
               <Lock className="w-3.5 h-3.5 text-amber-400" />
-              <span>Enter Supervisor / Manager 6-Digit PIN</span>
+              <span>{ownerOnly ? 'Enter Owner / Admin 6-Digit PIN' : 'Enter Supervisor / Manager 6-Digit PIN'}</span>
             </span>
             <button
               id="btn-scramble-manager-keypad"

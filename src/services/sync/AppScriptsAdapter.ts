@@ -71,6 +71,7 @@ const ENTITY_TO_SHEET: Record<string, string> = {
   direct_grv: 'DirectGRVs',
   goods_received: 'GoodsReceived',
   stock_movement: 'StockMovements',
+  stock_adjustment: 'StockAdjustments',
   expense: 'Expenses',
   internal_consumption: 'InternalConsumption',
   supervisor_approval: 'AuditLog',
@@ -145,6 +146,8 @@ function extractCanonicalEntityId(entityType: string, p: Record<string, any>, fa
       return pick(p.grnId, p.GRNID, p.id, p.reference, fallbackId);
     case 'stock_movement':
       return pick(p.movementId, p.txnId, p.MovementID, p.id, fallbackId);
+    case 'stock_adjustment':
+      return pick(p.id, p.adjustmentId, p.AdjustmentID, fallbackId);
     case 'reconciliation':
       return pick(p.ReconID, p.reconId, p.id, fallbackId);
     case 'supplier':

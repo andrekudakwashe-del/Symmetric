@@ -79,6 +79,16 @@ export const ENTITY_REGISTRY: Record<string, EntitySpec> = {
     uiEventName: 'saimetric_inventory_updated',
     description: 'Inventory adjustment / transfer movement log',
   },
+  stock_adjustment: {
+    entityType: 'stock_adjustment',
+    class: 'T1',
+    appendOnly: true,
+    requiresBroadcast: true,
+    requiresIngest: true,
+    requiresHubLWW: false,
+    uiEventName: 'saimetric_stock_adjustments_updated',
+    description: 'Maker-checker manual stock adjustment request with atomic delta approval and audit trail',
+  },
   // AUDIT-NOTE: Row 10 (Systemic indirect mutation broadcast L1)
   cash_movement: {
     entityType: 'cash_movement',
